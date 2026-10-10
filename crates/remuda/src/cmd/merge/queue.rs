@@ -540,20 +540,27 @@ fn cleanup_queue_pins(ctx: &QueueCtx) {
 /// * only `remuda-mq-<pid>-` prefixes are inspected (`pid` is the lane this
 ///   queue spawned for that branch; the final sweep uses `lane_pids` — the
 ///   exact set of pids THIS queue launched), never a blanket prefix sweep;
-/// * the worktree is removed only when git registers it against THIS repo;
+/// * a scratch root containing a `worktree` directory is removed ONLY when
+///   git registers that worktree against THIS repo: a pid this kernel reused
+///   for another live gate must never have its root pulled (no `worktree`
+///   directory — a lane that died before registering one — is safe to remove);
 /// * scratch deletion goes through the containment-checked primitive.
 ///
 /// Without the pid allowlist a queue on a shared host could delete another
-/// queue's live scratch root (they all use the same OS temp dir).
-fn cleanup_temp_worktrees(repo: &std::path::Path, lane_pids: &[u32]) {
+/// queue's live scratch root (they all use the same OS temp dir). The
+/// registration guard closes the pid-reuse hole that allowlist alone leaves.
+fn cleanup_temp_worktrees(
+    repo: &std::path::Path,
+    tmp: &std::path::Path,
+    lane_pids: &[u32],
+) {
     let list = git(repo, &["worktree", "list", "--porcelain"]).unwrap_or_default();
     let mut registered_paths = std::collections::HashSet::new();
     for line in list.lines().filter(|line| line.starts_with("worktree ")) {
         registered_paths.insert(PathBuf::from(line.trim_start_matches("worktree ")));
     }
 
-    let tmp = std::env::temp_dir();
-    let entries = match std::fs::read_dir(&tmp) {
+    let entries = match std::fs::read_dir(tmp) {
         Ok(entries) => entries,
         Err(_) => return,
     };
@@ -561,19 +568,32 @@ fn cleanup_temp_worktrees(repo: &std::path::Path, lane_pids: &[u32]) {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if !name.starts_with(super::scratch::SCRATCH_PREFIX) {
+        if !name.starts_with(crate::cmd::merge::scratch::SCRATCH_PREFIX) {
             continue;
         }
         // Restrict to pids this queue actually spawned.
         let owned = lane_pids
             .iter()
-            .any(|pid| name.starts_with(&format!("{}{pid}-", super::scratch::SCRATCH_PREFIX)));
+            .any(|pid| name.starts_with(&format!("{}{pid}-", crate::cmd::merge::scratch::SCRATCH_PREFIX)));
         if !owned {
             continue;
         }
-        let root = entry.path();
+        let root = match entry.path().canonicalize() {
+            Ok(root) => root,
+            Err(_) => continue,
+        };
         let worktree = root.join("worktree");
-        if registered_paths.contains(&worktree) {
+        if worktree.exists() {
+            // A live worktree: only touch it when THIS repo registered it.
+            // Registered elsewhere (or unregistered but present) it belongs
+            // to another gate whose pid this kernel may have recycled.
+            let registered = registered_paths.contains(&worktree)
+                || worktree
+                    .canonicalize()
+                    .is_ok_and(|real| registered_paths.contains(&real));
+            if !registered {
+                continue;
+            }
             let _ = git(
                 repo,
                 &["worktree", "remove", "--force", &worktree.to_string_lossy()],
@@ -668,14 +688,14 @@ fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
         match machine.next_serial() {
             Decision::Done => {
                 drain_lanes(&rx, &mut active, &mut busy, &mut machine, watchdog_grace);
-                cleanup_temp_worktrees(&ctx.repo, &spawned_pids);
+                cleanup_temp_worktrees(&ctx.repo, &std::env::temp_dir(), &spawned_pids);
                 break resolve(&ctx.repo, "refs/heads/main")?;
             }
             Decision::StopBaseMoved { idx, current_main } => {
                 // Drain still-running speculative lanes so their child
                 // processes and temporary worktrees do not outlive the queue.
                 drain_lanes(&rx, &mut active, &mut busy, &mut machine, watchdog_grace);
-                cleanup_temp_worktrees(&ctx.repo, &spawned_pids);
+                cleanup_temp_worktrees(&ctx.repo, &std::env::temp_dir(), &spawned_pids);
                 cleanup_queue_pins(&ctx);
                 let mut outcomes = machine.records(&names);
                 outcomes[idx].status = "base_moved".into();
@@ -735,7 +755,7 @@ fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
                         {
                             // The lane never ran destructors; reap its
                             // temporary worktree before it can block cleanup.
-                            cleanup_temp_worktrees(&ctx.repo, &[lane.pid]);
+                            cleanup_temp_worktrees(&ctx.repo, &std::env::temp_dir(), &[lane.pid]);
                         } else {
                             active.remove(&job.idx);
                         }
@@ -770,7 +790,7 @@ fn drive(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
 
     // Landed branches settle in order; failed branches remain unlanded.
     // Reap any temporary worktree a signalled lane could not drop itself.
-    cleanup_temp_worktrees(&ctx.repo, &spawned_pids);
+    cleanup_temp_worktrees(&ctx.repo, &std::env::temp_dir(), &spawned_pids);
     cleanup_queue_pins(&ctx);
     let outcomes = machine.records(&names);
     let failed = outcomes
@@ -1143,6 +1163,19 @@ fn descendant_pids(root: u32) -> Vec<u32> {
     found
 }
 
+/// Kill a lane's whole descendant tree and process group, but only while its
+/// pid still names a live, non-zombie process. A pid the kernel has already
+/// recycled after the lane exited must never be signalled: the negative-pid
+/// group kill could otherwise target an unrelated process group that took the
+/// same id. Returns whether the lane was alive.
+fn kill_lane_if_alive(pid: u32) -> bool {
+    if !pid_running(pid) {
+        return false;
+    }
+    kill_lane_group(pid);
+    true
+}
+
 fn kill_lane_group(pid: u32) {
     let raw = i32::try_from(pid).unwrap_or(0);
     // Steps spawned by the gate run in their own sessions; kill the whole
@@ -1223,7 +1256,7 @@ fn wait_event(
                     reap_grace().as_secs()
                 );
                 if running {
-                    kill_lane_group(lane.pid);
+                    kill_lane_if_alive(lane.pid);
                 }
                 lane.noticed = Some(now);
             }
@@ -1262,7 +1295,9 @@ fn drain_lanes(
 ) {
     let now = Instant::now();
     for lane in active.values_mut() {
-        kill_lane_group(lane.pid);
+        // Guarded inside: a lane already exited (or reaped and pid-reused)
+        // is past needing a signal, and its recycled pid must not be touched.
+        kill_lane_if_alive(lane.pid);
         // Start the reap grace immediately rather than after the next tick.
         lane.noticed = Some(now);
     }
@@ -1296,6 +1331,7 @@ fn drain_lanes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::merge::scratch::SCRATCH_PREFIX;
 
     fn finish(
         machine: &mut Machine,
@@ -1513,5 +1549,149 @@ mod tests {
         let records = m.records(&["wt/a".into()]);
         assert_eq!(records[0].status, "gate_failed");
         assert_eq!(records[0].verifications[0].merge, None);
+    }
+
+    // ------------------------------------------------------------------
+    // Reaper safety: pid reuse must never reach a foreign gate or a recycled pid
+    // ------------------------------------------------------------------
+
+    /// Run `git` in `repo`, asserting success.
+    fn reap_git(repo: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn reap_git_repo(path: &std::path::Path) {
+        reap_git(path, &["init", "-q", "-b", "main"]);
+        reap_git(path, &["config", "user.email", "t@example.com"]);
+        reap_git(path, &["config", "user.name", "T"]);
+        std::fs::write(path.join("seed.txt"), "seed\n").unwrap();
+        reap_git(path, &["add", "."]);
+        reap_git(path, &["commit", "-q", "-m", "seed"]);
+    }
+
+    /// A scratch root whose `worktree` is registered to ANOTHER repo must
+    /// survive a reaper sweep keyed on that (recycled) pid; one registered to
+    /// THIS repo (and one without a worktree dir) is removed.
+    #[test]
+    fn cleanup_spares_a_worktree_registered_elsewhere_and_reaps_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The reaping repo.
+        let owner = tempfile::tempdir().unwrap();
+        reap_git_repo(owner.path());
+        // An unrelated repo that "reused the pid" and registered a live
+        // worktree under a remuda-mq-<pid>- root in the shared TMPDIR.
+        let other = tempfile::tempdir().unwrap();
+        reap_git_repo(other.path());
+
+        let recycled_pid = 424242u32;
+        let foreign_root = tmp
+            .path()
+            .join(format!("{SCRATCH_PREFIX}{recycled_pid}-0-111"));
+        let foreign_worktree = foreign_root.join("worktree");
+        std::fs::create_dir_all(&foreign_worktree).unwrap();
+        // Register the worktree against the OTHER repo.
+        reap_git(
+            other.path(),
+            &["worktree", "add", "-q", "--detach", foreign_worktree.to_str().unwrap(), "main"],
+        );
+
+        // Same recycled pid, but a root this OWNER registered (a dead lane of
+        // ours the destructor missed).
+        let own_root = tmp
+            .path()
+            .join(format!("{SCRATCH_PREFIX}{recycled_pid}-0-222"));
+        let own_worktree = own_root.join("worktree");
+        std::fs::create_dir_all(&own_worktree).unwrap();
+        reap_git(
+            owner.path(),
+            &["worktree", "add", "-q", "--detach", own_worktree.to_str().unwrap(), "main"],
+        );
+
+        // A lane that died before registering its worktree: directory absent,
+        // the empty root must still be reaped.
+        let empty_root = tmp
+            .path()
+            .join(format!("{SCRATCH_PREFIX}{recycled_pid}-0-333"));
+        std::fs::create_dir_all(&empty_root).unwrap();
+        std::fs::write(empty_root.join("gate.jsonl"), "{}\n").unwrap();
+
+        cleanup_temp_worktrees(owner.path(), tmp.path(), &[recycled_pid]);
+
+        assert!(
+            foreign_root.exists(),
+            "a worktree registered to another repo must never be deleted"
+        );
+        assert!(
+            !own_root.exists(),
+            "this repo's own dead lane scratch root must be reaped"
+        );
+        assert!(
+            !empty_root.exists(),
+            "a root without a worktree directory must be reaped"
+        );
+        // The foreign registration is intact, not pruned.
+        assert!(reap_git(other.path(), &["worktree", "list"])
+            .contains(foreign_worktree.to_str().unwrap()));
+
+        // Tear the foreign root down explicitly; nothing the reaper created may
+        // leak out of the test.
+        reap_git(
+            other.path(),
+            &["worktree", "remove", "--force", foreign_worktree.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(&foreign_root).ok();
+    }
+
+    /// `kill_lane_if_alive` must not signal an exited/reaped lane pid, and must
+    /// take down a live lane group.
+    #[test]
+    fn kill_lane_if_alive_skips_an_exited_pid_and_kills_a_live_one() {
+        // Exited and already reaped child: the guard reports "not alive" and
+        // sends nothing.
+        let exited = std::process::Command::new("true").spawn().unwrap();
+        let pid = exited.id();
+        let _ = exited.wait_with_output().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pid_running(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !kill_lane_if_alive(pid),
+            "an exited lane pid must not be signalled"
+        );
+
+        // Live lane in its own group with a descendant: the guard kills both.
+        let mut live = std::process::Command::new("bash")
+            .args(["-c", "sleep 300 & sleep 300"])
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let live_pid = live.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pid_running(live_pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(kill_lane_if_alive(live_pid));
+        let _ = live.wait();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pid_running(live_pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!pid_running(live_pid), "the live lane group must be gone");
     }
 }

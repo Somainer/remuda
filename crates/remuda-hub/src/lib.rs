@@ -187,6 +187,10 @@ pub mod store_test_support {
     /// D-057 §7.3 commit-time check error (the initiator suite matches on it).
     pub use crate::store::StoreError;
 
+    /// Test-only gate-cancel writer-race seam (cancel handler pre-read vs.
+    /// the state observed inside the writer job).
+    pub use crate::gatequeue::TestGateCancelRace;
+
     /// D-057 continuation-resume inputs/outcomes for the race suite.
     pub use crate::store::{ContinuationResumeRequest, ContinuationResumeResult};
 

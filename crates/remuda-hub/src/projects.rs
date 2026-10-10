@@ -322,8 +322,12 @@ async fn set_project(
         None
     };
     // D-047 project-layer override. `apiVia: null` clears; a bare `apiRoute`
-    // without a stored or supplied `apiVia` is a 400.
-    if body.api_via.is_some() || body.api_route.is_some() {
+    // without a stored or supplied `apiVia` is a 400. The override write is
+    // folded INTO the patch writer job below (one authority check, one
+    // commit): a fenced PATCH must never commit one half and refuse the
+    // other.
+    let route_touched = body.api_via.is_some() || body.api_route.is_some();
+    let route_next = if route_touched {
         let existing = state
             .store
             .get_project_route_override(id.clone())
@@ -349,27 +353,21 @@ async fn set_project(
                 Some(doc)
             }
             Some(None) => None,
-            None if body.api_route.is_some() => {
+            None => {
                 return Err(HubError::BadRequest(
                     "apiRoute requires apiVia on the same or a previous update".into(),
                 ));
             }
-            None => existing,
         };
-        state
-            .store
-            .set_project_route_override(
-                id.clone(),
-                next,
-                crate::agent_scope::CallerAuthority::for_device(&state, &device).await?,
-            )
-            .await
-            .map_err(map_store)?;
-    }
+        Some(next)
+    } else {
+        None
+    };
     let updated = state
         .store
-        .patch_project(
+        .patch_project_with_route(
             id.clone(),
+            route_next,
             move |project| {
                 if let Some(name) = body.name {
                     if name.trim().is_empty() {
@@ -705,7 +703,32 @@ impl Store {
     where
         F: FnOnce(&mut Project) -> Result<(), StoreError> + Send + 'static,
     {
-        self.run_named("patch_project", move |conn| {
+        self.patch_project_with_route(project_id, None, mutate, authority)
+            .await
+    }
+
+    /// D-057 §7.3: patch the project doc AND its route override in ONE writer
+    /// job behind one authority check. A PATCH that carries both kinds of
+    /// fields must be atomic — with separate writer jobs a fence landing
+    /// between them committed one half and refused the other. `route`:
+    /// `None` leaves the side table untouched; `Some(None)` clears it;
+    /// `Some(Some(doc))` upserts it.
+    #[allow(clippy::option_option)]
+    pub async fn patch_project_with_route<F>(
+        &self,
+        project_id: String,
+        route: Option<Option<Value>>,
+        mutate: F,
+        authority: crate::agent_scope::CallerAuthority,
+    ) -> Result<Option<Project>, StoreError>
+    where
+        F: FnOnce(&mut Project) -> Result<(), StoreError> + Send + 'static,
+    {
+        let armed_fence = self.take_test_project_patch_fence();
+        self.run_named("patch_project_with_route", move |conn| {
+            if let Some(fenced_instance) = armed_fence {
+                crate::store::test_apply_fence(conn, &fenced_instance)?;
+            }
             let (initiator, device_id) = authority.as_check();
             crate::store::check_initiator(conn, initiator, device_id)?;
             let Some(mut project) = load_project(conn, &project_id)? else {
@@ -723,6 +746,24 @@ impl Store {
                  WHERE id = ?4",
                 params![doc, project.name, now, project_id],
             )?;
+            if let Some(route) = route {
+                match route {
+                    Some(doc) => {
+                        conn.execute(
+                            "INSERT INTO project_route_overrides (project_id, doc_json)
+                             VALUES (?1, ?2)
+                             ON CONFLICT(project_id) DO UPDATE SET doc_json = excluded.doc_json",
+                            params![project_id, doc.to_string()],
+                        )?;
+                    }
+                    None => {
+                        conn.execute(
+                            "DELETE FROM project_route_overrides WHERE project_id = ?1",
+                            params![project_id],
+                        )?;
+                    }
+                }
+            }
             load_project(conn, &project_id)
         })
         .await

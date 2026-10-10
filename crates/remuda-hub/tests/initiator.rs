@@ -15,16 +15,107 @@ use futures::{SinkExt, StreamExt};
 use remuda_hub::{HubConfig, spawn};
 use remuda_protocol::HostId;
 use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 type AppendFrame = (String, Value);
 
 const BRIEF: &str = "Do the tiny task.\nReply DONE <sha> or BLOCKED <reason>.\n";
 
+/// A deterministic reply hold: after the fake records the RPC frame whose
+/// `params.opId` matches, `arrived` fires and the canned reply is withheld
+/// until the test calls [`ReplyHold::release`].
+#[derive(Clone)]
+struct ReplyHold {
+    arrived: Arc<Notify>,
+    released: Arc<AtomicBool>,
+    release: Arc<Notify>,
+}
+
+impl ReplyHold {
+    async fn wait_arrived(&self) {
+        self.arrived.notified().await;
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+/// Service one inbound Hub RPC frame: track answer state, record the frame
+/// for assertions, honor a reply hold, then answer with a canned result.
+async fn service_inbound<S>(
+    node: &mut WebSocketStream<S>,
+    frames: &mpsc::UnboundedSender<AppendFrame>,
+    pending: &tokio::sync::Mutex<HashSet<String>>,
+    holds: &std::sync::Mutex<HashMap<String, ReplyHold>>,
+    frame: Value,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // journal.append is node→hub: the Hub never sends it as an RPC request.
+    let Some(method) = frame.get("method").and_then(Value::as_str) else {
+        return;
+    };
+    if method == "journal.append" {
+        return;
+    }
+    if method == "interaction.answer" {
+        let id = frame["params"]["interactionId"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        pending.lock().await.remove(&id);
+    }
+    // Record BEFORE honoring the hold: arrival is observable as soon as the
+    // frame is parsed, while the reply is still withheld.
+    let _ = frames.send((method.to_owned(), frame["params"].clone()));
+    // Take the hold out of the std mutex and DROP THE GUARD before any await
+    // (a non-Send guard held across .await makes the node task !Send).
+    let hold = frame
+        .pointer("/params/opId")
+        .and_then(Value::as_str)
+        .and_then(|op_id| holds.lock().expect("holds").get(op_id).cloned());
+    if let Some(hold) = hold {
+        hold.arrived.notify_waiters();
+        while !hold.released.load(Ordering::SeqCst) {
+            hold.release.notified().await;
+        }
+    }
+    if frame.get("id").is_none() {
+        return;
+    }
+    let result = match method {
+        "worker.provision" => json!({
+            "name": frame["params"]["name"].clone(),
+            "branch": "wt/x/work",
+            "worktreePath": "/tmp/remuda-wt/x",
+            "targetDir": "/tmp/remuda-target/x"
+        }),
+        "worker.remove" => json!({
+            "name":"x","worktreeRemoved":true,"targetRemoved":true,"reclaimedBytes":"4096"
+        }),
+        "instance.create" => json!({"accepted": true}),
+        "interaction.answer" => json!({"accepted": true}),
+        _ => json!({"accepted": true}),
+    };
+    let _ = node
+        .send(Message::Text(
+            json!({"jsonrpc":"2.0","id":frame["id"],"result":result})
+                .to_string()
+                .into(),
+        ))
+        .await;
+}
+
 /// Fake Node: accepts every Hub RPC, records `(method, params)`, and lets the
-/// test push journal events.
+/// test push journal events and hold individual RPC replies.
 struct FakeNode {
     task: tokio::task::JoinHandle<()>,
     frames: mpsc::UnboundedReceiver<AppendFrame>,
@@ -32,7 +123,9 @@ struct FakeNode {
     /// interactionId ids still pending at the fake Node (an
     /// `interaction.requested` journal event inserts; an answer would
     /// remove — the Hub never answers for the Node).
-    pending: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    pending: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// opId -> held reply (deterministic in-flight seam).
+    holds: Arc<std::sync::Mutex<HashMap<String, ReplyHold>>>,
 }
 
 /// Node credentials returned on first hello (D-018: re-enrollment of the same
@@ -94,10 +187,12 @@ impl FakeNode {
             mpsc::UnboundedSender<AppendFrame>,
             mpsc::UnboundedReceiver<AppendFrame>,
         ) = mpsc::unbounded_channel();
-        let pending =
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+        let pending = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
         let pending_task = pending.clone();
         let answered_task = pending.clone();
+        let holds: Arc<std::sync::Mutex<HashMap<String, ReplyHold>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let holds_task = holds.clone();
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -125,49 +220,48 @@ impl FakeNode {
                             "params":{"instanceId":instance_id,"event":event}
                         });
                         if node.send(Message::Text(frame.to_string().into())).await.is_err() { break; }
-                        // Drain the Hub's append ack so the select goes back to
-                        // watching RPC requests; the pending set above is
-                        // already populated.
-                        let _ = node.next().await;
+                        // Wait for the append ack matched BY ID. A Hub RPC
+                        // that lands on the socket here is a REAL frame — it
+                        // is recorded and answered, never swallowed as if it
+                        // were the ack (that would hide a leaked forbidden
+                        // frame and lose its response).
+                        'ack: loop {
+                            match node.next().await {
+                                Some(Ok(Message::Text(text))) => {
+                                    let Ok(fr) = serde_json::from_str::<Value>(&text) else {
+                                        continue;
+                                    };
+                                    if fr.get("method").is_none()
+                                        && fr.get("id").and_then(Value::as_str) == Some("append")
+                                    {
+                                        break 'ack;
+                                    }
+                                    service_inbound(
+                                        &mut node,
+                                        &frame_tx,
+                                        &answered_task,
+                                        &holds_task,
+                                        fr,
+                                    )
+                                    .await;
+                                }
+                                Some(Ok(Message::Close(_))) | None => return,
+                                _ => {}
+                            }
+                        }
                     }
                     frame = node.next() => {
                         match frame {
                             Some(Ok(Message::Text(text))) => {
                                 let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
-                                // journal.append is node→hub: never a Hub RPC
-                                // request to record or answer.
-                                if frame.get("method").and_then(Value::as_str)
-                                    == Some("journal.append") { continue; }
-                                let Some(method) = frame.get("method").and_then(Value::as_str) else {
-                                    continue;
-                                };
-                                if method == "interaction.answer" {
-                                    let id = frame["params"]["interactionId"]
-                                        .as_str()
-                                        .unwrap_or("")
-                                        .to_owned();
-                                    answered_task.lock().await.remove(&id);
-                                }
-                                let _ = frame_tx.send((method.to_owned(), frame["params"].clone()));
-                                let result = match method {
-                                    "worker.provision" => json!({
-                                        "name": frame["params"]["name"].clone(),
-                                        "branch": "wt/x/work",
-                                        "worktreePath": "/tmp/remuda-wt/x",
-                                        "targetDir": "/tmp/remuda-target/x"
-                                    }),
-                                    "worker.remove" => json!({
-                                        "name":"x","worktreeRemoved":true,"targetRemoved":true,"reclaimedBytes":"4096"
-                                    }),
-                                    "instance.create" => json!({"accepted": true}),
-                                    "interaction.answer" => json!({"accepted": true}),
-                                    _ => json!({"accepted": true}),
-                                };
-                                if frame.get("id").is_some()
-                                    && node.send(Message::Text(json!({
-                                        "jsonrpc":"2.0","id":frame["id"],"result":result
-                                    }).to_string().into())).await.is_err()
-                                { break; }
+                                service_inbound(
+                                    &mut node,
+                                    &frame_tx,
+                                    &answered_task,
+                                    &holds_task,
+                                    frame,
+                                )
+                                .await;
                             }
                             Some(Ok(Message::Close(_))) | None => break,
                             _ => {}
@@ -182,6 +276,7 @@ impl FakeNode {
                 frames: frame_rx,
                 appends: append_tx,
                 pending: pending.clone(),
+                holds,
             },
             hello["result"]["nodeToken"]
                 .as_str()
@@ -230,11 +325,23 @@ impl FakeNode {
             .expect("sender alive")
     }
 
-    /// Send a Human command sentinel, then drain frames until it arrives:
-    /// every earlier frame is a known fan-out, and an
-    /// `interaction.answer` among them fails the test. Watchdog timeout
-    /// only — no no-frame window is part of the assertion.
-    async fn drain_until_sentinel_and_assert_no_answer(&mut self, ctx: &Ctx) {
+    /// Post a Human command sentinel, then assert it is the next frame the
+    /// Node receives: nothing the call produced may queue ahead of it.
+    /// Frames recorded before the assertion but emitted by the TEST ITSELF
+    /// (e.g. the `interaction.list` reads of a Hub-side wait) are drained
+    /// first; a frame in `forbidden` fails even there. With an empty
+    /// forbidden set ANY pre-existing frame is a leak.
+    async fn assert_sentinel_follows(&mut self, ctx: &Ctx, forbidden: &[&str]) {
+        while let Ok((method, params)) = self.frames.try_recv() {
+            if forbidden.contains(&method.as_str()) {
+                panic!("forbidden frame reached the Node: {method} {params}");
+            }
+            if forbidden.is_empty() {
+                panic!("a frame reached the Node before the sentinel: {method}");
+            }
+            // Non-empty forbidden set: this is a benign frame the test
+            // itself emitted (e.g. interaction.list while waiting).
+        }
         let (status, sentinel) = ctx
             .send(
                 "POST",
@@ -245,16 +352,31 @@ impl FakeNode {
             )
             .await;
         assert_eq!(status, 200, "{sentinel}");
-        loop {
-            let (method, params) = self.next().await;
-            if method == "instance.send" {
-                return;
-            }
-            assert_ne!(
-                method, "interaction.answer",
-                "fenced answer reached the Node: {params}"
-            );
-        }
+        let (method, params) = self.next().await;
+        assert_eq!(
+            method, "instance.send",
+            "a frame reached the Node before the sentinel: {method} {params}"
+        );
+    }
+
+    /// Strict sentinel: the call produced no frame at all.
+    async fn assert_next_frame_is_sentinel(&mut self, ctx: &Ctx) {
+        self.assert_sentinel_follows(ctx, &[]).await;
+    }
+
+    /// Install a deterministic reply hold (see [`ReplyHold`]) for the RPC
+    /// frame carrying `opId` in its params.
+    fn hold_reply_for(&self, op_id: String) -> ReplyHold {
+        let hold = ReplyHold {
+            arrived: Arc::new(Notify::new()),
+            released: Arc::new(AtomicBool::new(false)),
+            release: Arc::new(Notify::new()),
+        };
+        self.holds
+            .lock()
+            .expect("holds")
+            .insert(op_id, hold.clone());
+        hold
     }
 
     /// Push one journal event (synchronous channel send; the WS send and
@@ -466,6 +588,28 @@ impl Ctx {
             .await
             .unwrap();
         value["commands"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// One interaction's Hub-projected state from the Hub's own list
+    /// (`None` when the row is absent).
+    async fn interaction_state(&self, interaction_id: &str) -> Option<String> {
+        let list: Value = self
+            .http
+            .get(format!("{}/v1/interactions", self.base()))
+            .bearer_auth(&self.human)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["interactionId"] == json!(interaction_id))
+            .and_then(|row| row["state"].as_str())
+            .map(str::to_string)
     }
 
     async fn create_task(&self, title: &str) -> Value {
@@ -1066,20 +1210,25 @@ async fn fenced_interaction_answer_never_reaches_the_node_and_stays_pending() {
         }),
     );
 
-    // Deterministic wait: the fake Node knows the requested interaction is
-    // pending locally once the append is acked. The Hub's journal
-    // projection is driven from the same append, so the local set and the
-    // HTTP list are consistent without any poll.
+    // Deterministic wait on the HUB's own state: the journal append projects
+    // the requested interaction into the Hub's list (pending) once its ack is
+    // matched by id — no fixed window, and nothing about this wait depends on
+    // the fake's local bookkeeping.
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if node.is_pending(&interaction_id).await {
+            if ctx.interaction_state(&interaction_id).await.as_deref() == Some("pending") {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("interaction becomes pending at the Node");
+    .expect("Hub projects the requested interaction pending");
+    // The fake Node holds it pending too (same append).
+    assert!(
+        node.is_pending(&interaction_id).await,
+        "requested interaction pending at the Node"
+    );
 
     // Fence lands inside the answer's admission writer job.
     ctx.store()
@@ -1096,29 +1245,27 @@ async fn fenced_interaction_answer_never_reaches_the_node_and_stays_pending() {
         .await;
     assert_fenced(status, &body);
 
-    // The fake Node never saw an answer (sentinel drains the frames and
-    // fails on an interaction.answer queueing ahead).
-    node.drain_until_sentinel_and_assert_no_answer(&ctx).await;
+    // The fake Node never saw an answer. The Hub-state wait above legitimately
+    // emitted interaction.list reads; those drain away, and no
+    // interaction.answer may be among them — the sentinel is then the next
+    // frame.
+    node.assert_sentinel_follows(&ctx, &["interaction.answer"])
+        .await;
+
+    // R8c: the fake Node's OWN pending state is unchanged — the answer frame
+    // that removes it never arrived (the Hub list assertion below alone
+    // cannot prove the Node side).
+    assert!(
+        node.is_pending(&interaction_id).await,
+        "the Node stopped holding the interaction pending despite the refused answer"
+    );
 
     // The Hub never mirrored an answer: still pending in the list.
-    let list: Value = ctx
-        .http
-        .get(format!("{}/v1/interactions", ctx.base()))
-        .bearer_auth(&ctx.human)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let state = list["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["interactionId"] == json!(interaction_id))
-        .and_then(|row| row["state"].as_str())
-        .unwrap_or("missing");
-    assert_eq!(state, "pending", "answer committed before the Node: {list}");
+    assert_eq!(
+        ctx.interaction_state(&interaction_id).await.as_deref(),
+        Some("pending"),
+        "answer committed before the Node"
+    );
 }
 
 /// Process-global D-051 feature switch, on for the test's lifetime.
@@ -1170,7 +1317,7 @@ async fn gate_job_fenced_before_the_tick_is_canceled_and_never_dispatched() {
         .expect("job still exists");
     assert_eq!(doc["state"], json!("canceled"), "{doc}");
     assert_eq!(doc["reason"], json!("fenced"), "{doc}");
-    node.drain_until_sentinel_and_assert_no_answer(&ctx).await;
+    node.assert_next_frame_is_sentinel(&ctx).await;
 }
 
 #[tokio::test]
@@ -1209,7 +1356,7 @@ async fn gate_job_whose_authenticating_device_was_deleted_is_canceled_at_claim()
         doc.get("initiatorDeviceId").is_none(),
         "device id stays off the API doc: {doc}"
     );
-    node.drain_until_sentinel_and_assert_no_answer(&ctx).await;
+    node.assert_next_frame_is_sentinel(&ctx).await;
 
     // The launch credential is untouched.
     let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
@@ -1297,6 +1444,111 @@ async fn fenced_cancel_of_a_queued_or_running_gate_job_is_refused_before_the_nod
     assert_eq!(method, "instance.send", "a gate.cancel frame leaked");
 }
 
+// ── 6b'. Cancel branches on the state observed INSIDE the writer ──────────
+
+/// Race A: the handler pre-reads `queued`, but the 1 s scheduler tick claims
+/// the job (running, gate.run spawned) before the cancel writer job reads it.
+/// The cancel must follow the RUNNING branch — stamp canceling AND deliver
+/// gate.cancel — instead of 409-ing over a transition it itself committed.
+#[tokio::test]
+async fn cancel_of_a_job_claimed_between_preread_and_writer_still_sends_gate_cancel() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    let job_id = queued_job(&ctx).await;
+    ctx.configure_gate_lane().await;
+
+    // Deterministic seam: inside the cancel writer job, before its read, the
+    // scheduler claim commits (queued -> running, pinned to the lane) —
+    // exactly what the 1 s tick can do between the handler's pre-read and
+    // the writer. No gate.run is sent in this test; the seam models the row
+    // transition, and gate.cancel below is the frame under test.
+    ctx.store().test_arm_gate_cancel_race(
+        remuda_hub::store_test_support::TestGateCancelRace::Claimed {
+            lane_id: "lane1".to_string(),
+            host_id: ctx.host.clone(),
+        },
+    );
+
+    let (status, body) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate/jobs/{job_id}/cancel", ctx.project),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200, "a claimed job must accept the cancel: {body}");
+    assert_eq!(body["state"], json!("canceling"), "{body}");
+
+    // The writer-observed Running branch OWES gate.cancel: it is the very
+    // next frame, carrying the jobId and lane.
+    let (method, params) = node.next().await;
+    assert_eq!(method, "gate.cancel", "gate.cancel was not delivered");
+    assert_eq!(params["jobId"], json!(job_id), "{params}");
+    assert_eq!(params["laneId"], json!("lane1"), "{params}");
+
+    // The row really committed canceling (not terminal canceled, which would
+    // skip the frame after the grace expiry).
+    let doc = ctx
+        .hub
+        .test_get_gate_job(&job_id)
+        .await
+        .unwrap()
+        .expect("job exists");
+    assert_eq!(doc["state"], json!("canceling"), "{doc}");
+    assert!(
+        !doc["cancelRequestedAt"].is_null(),
+        "cancel stamp missing: {doc}"
+    );
+}
+
+/// Race B: the handler pre-reads `running`, but the dispatch finishes the
+/// job before the cancel writer reads it. The terminal row is left untouched,
+/// the answer is 409, and no gate.cancel frame reaches the Node.
+#[tokio::test]
+async fn cancel_of_a_job_finished_between_preread_and_writer_is_409_and_sends_nothing() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    let job_id = queued_job(&ctx).await;
+
+    // Pin the job running the way the scheduler does.
+    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+    db.execute(
+        "UPDATE gate_jobs
+            SET state = 'running', lane_id = 'lane1',
+                doc_json = json_set(json_set(json_set(doc_json,
+                    '$.state', 'running'),
+                    '$.laneId', 'lane1'),
+                    '$.hostId', ?2)
+          WHERE id = ?1",
+        rusqlite::params![job_id, ctx.host],
+    )
+    .unwrap();
+    drop(db);
+
+    // The dispatch passes before the writer's read.
+    ctx.store().test_arm_gate_cancel_race(
+        remuda_hub::store_test_support::TestGateCancelRace::Finished { state: "passed" },
+    );
+
+    let (status, body) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate/jobs/{job_id}/cancel", ctx.project),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 409, "a terminal job cannot be canceled: {body}");
+
+    // Untouched terminal row.
+    let doc = ctx
+        .hub
+        .test_get_gate_job(&job_id)
+        .await
+        .unwrap()
+        .expect("job exists");
+    assert_eq!(doc["state"], json!("passed"), "{doc}");
+    assert!(doc["cancelRequestedAt"].is_null(), "{doc}");
+
+    // No gate.cancel frame: the sentinel arrives first.
+    node.assert_next_frame_is_sentinel(&ctx).await;
+}
+
 // ── 6c. A narrowed Bot token acts for the live chapter (CLI path) ─────────
 
 #[tokio::test]
@@ -1377,22 +1629,26 @@ async fn human_token_narrowed_to_a_fenced_chapter_is_refused() {
 async fn fence_before_lease_admission_refuses_fenced_and_writes_no_task_or_lease() {
     let (ctx, mut node) = Ctx::boot().await.unwrap();
 
-    // F before the request: admit_node_op (worktree.lease) refuses inside
-    // the handler; lease_refusal must keep the 409 `fenced` shape instead
-    // of remapping it to a directory-binding CONFLICT.
-    ctx.fence().await;
+    // Deterministic seam (NOT a pre-request fence): the fence applies INSIDE
+    // the next admit_node_op writer job (consumed only by admit_node_op and
+    // claim_gate_job) — so create_task commits healthy first, then the
+    // worktree.lease admission refuses. With a pre-request ctx.fence() the
+    // request died at create_task and this test proved nothing about
+    // bind_task_directory / admit_node_op / lease_refusal.
+    ctx.store()
+        .test_arm_fence_before_authority_check(ctx.instance.clone());
     let (status, body) = ctx.post_pool_task("fence-before-lease").await;
     assert_fenced(status, &body);
     assert!(
         ctx.task_list().await.is_empty(),
-        "task row survived a pre-lease fence: {body}"
+        "task row survived a fenced lease admission: {body}"
     );
     assert!(
         ctx.lease_rows().is_empty(),
         "lease row written despite a fenced admission"
     );
     // No worktree.lease reached the Node: the next frame is the sentinel.
-    node.drain_until_sentinel_and_assert_no_answer(&ctx).await;
+    node.assert_next_frame_is_sentinel(&ctx).await;
 }
 
 #[tokio::test]
@@ -1432,7 +1688,7 @@ async fn fence_between_lease_and_bind_mutate_returns_the_lease_and_drops_the_tas
     let rows = ctx.lease_rows();
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(rows[0].1.is_none(), "lease holder retained: {rows:?}");
-    node.drain_until_sentinel_and_assert_no_answer(&ctx).await;
+    node.assert_next_frame_is_sentinel(&ctx).await;
     let _ = lease_params;
 }
 
@@ -1534,7 +1790,105 @@ async fn fenced_instance_create_unwinds_the_instance_row_and_writes_nothing() {
     assert_eq!(instance_count, 1, "only the boot chapter survives: {body}");
 
     // No frame reached the Node: the create command never admitted.
-    node.drain_until_sentinel_and_assert_no_answer(&ctx).await;
+    node.assert_next_frame_is_sentinel(&ctx).await;
+}
+
+// ── 9b. A fenced CONTINUITY child also unwinds its lineage (seat) row ─────
+
+#[tokio::test]
+async fn fenced_continuity_child_create_unwinds_its_lineage_row_as_well() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+
+    // The boot coordinator is itself a continuity chapter (it holds grants),
+    // so it already owns exactly one lineage row.
+    let lineages_before = {
+        let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+        db.query_row::<i64, _, _>("SELECT COUNT(*) FROM lineages", [], |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(lineages_before, 1);
+
+    // A grant-bearing child creates a SECOND lineage row at insert time; the
+    // `land` grant (held by the parent) has no one-per-* uniqueness rule.
+    ctx.store()
+        .test_arm_fence_before_queue(ctx.instance.clone());
+    let (status, body) = ctx
+        .agent_post(
+            "/v1/instances",
+            json!({"hostId":ctx.host,"projectId":ctx.project,"kind":"claude",
+                   "driver":"claude-print","grants":["land"],
+                   "permissionMode":"manual","prompt":"continuity child"}),
+        )
+        .await;
+    assert_fenced(status, &body);
+
+    // Both the orphaned chapter AND its lineage reservation are gone; the
+    // parent's lineage row is untouched.
+    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+    let instances: i64 = db
+        .query_row("SELECT COUNT(*) FROM instances", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(instances, 1, "only the boot chapter survives: {body}");
+    let lineages_after: i64 = db
+        .query_row("SELECT COUNT(*) FROM lineages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        lineages_after, 1,
+        "the purged child's lineage seat row must be unwound too"
+    );
+}
+
+// ── 9c. A fenced project PATCH is atomic: no half-written doc/route ───────
+
+#[tokio::test]
+async fn fenced_project_patch_writes_neither_the_doc_nor_the_route_override() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    assert!(
+        ctx.store()
+            .get_project_route_override(ctx.project.clone())
+            .await
+            .unwrap()
+            .is_none(),
+        "no route override before the PATCH"
+    );
+
+    // The fence lands INSIDE the (single) PATCH writer job.
+    ctx.store()
+        .test_arm_fence_before_project_patch(ctx.instance.clone());
+
+    // One PATCH carrying BOTH a doc field and the side-table field.
+    let (status, body) = ctx
+        .agent_patch(
+            &format!("/v1/projects/{}", ctx.project),
+            json!({"name":"half-written-after-fence","apiVia":"self"}),
+        )
+        .await;
+    assert_fenced(status, &body);
+
+    // Neither half committed.
+    let project: Value = ctx
+        .http
+        .get(format!("{}/v1/projects/{}", ctx.base(), ctx.project))
+        .bearer_auth(&ctx.human)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        project["name"],
+        json!("initiator-project"),
+        "the project doc half-wrote despite the fence: {project}"
+    );
+    assert!(
+        ctx.store()
+            .get_project_route_override(ctx.project.clone())
+            .await
+            .unwrap()
+            .is_none(),
+        "the route override half-wrote in a separate writer job"
+    );
 }
 
 // ── 10. Worker routes stay 403 for Agents; the node_ops admission boundary ─
@@ -1636,22 +1990,40 @@ async fn agent_worker_routes_are_forbidden_and_provision_admission_is_fence_chec
 
 #[tokio::test]
 async fn node_op_send_intent_precedes_the_call_and_a_missing_host_is_not_sent() {
-    let (ctx, _node) = Ctx::boot().await.unwrap();
+    let (ctx, node) = Ctx::boot().await.unwrap();
     let (initiator, device_id) = ctx.agent_authority();
 
-    // Connected host: admitted → sent intent → Node reply → settled.
+    // Connected host, with the fake's reply HELD after frame arrival: while
+    // the RPC is in flight (up to the timeout on main), the row must already
+    // read `sent` — the send intent commits BEFORE nodes.call writes the
+    // frame, not when the reply comes back. Asserted against the row while
+    // the call is still pending.
     let op_sent = format!("nop_{}", uuid::Uuid::now_v7());
-    let reached = ctx
+    let hold = node.hold_reply_for(op_sent.clone());
+    let call_fut = ctx.hub.test_call_node_op(
+        &ctx.host,
+        "worker.provision",
+        op_sent.clone(),
+        Some(initiator.clone()),
+        Some(device_id.clone()),
+    );
+    tokio::pin!(call_fut);
+    tokio::select! {
+        r = &mut call_fut => panic!("call completed while its reply was held: {r:?}"),
+        _ = hold.wait_arrived() => {}
+    }
+    let (state, _outcome) = ctx
         .hub
-        .test_call_node_op(
-            &ctx.host,
-            "worker.provision",
-            op_sent.clone(),
-            Some(initiator.clone()),
-            Some(device_id.clone()),
-        )
+        .test_node_op_state(&op_sent, &ctx.host)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("admitted op row exists");
+    assert_eq!(
+        state, "sent",
+        "send intent must commit while the frame is on the wire"
+    );
+    hold.release();
+    let reached = call_fut.await.unwrap();
     assert!(reached, "the connected fake Node must answer");
     let (state, _outcome) = ctx
         .hub

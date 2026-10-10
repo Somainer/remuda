@@ -229,6 +229,13 @@ pub struct Store {
     /// Test-only seam: arm a fence applied at the top of the NEXT
     /// `mutate_task` writer job only (task bind post-lease commit race).
     test_fence_before_task_mutate: Arc<std::sync::Mutex<Option<String>>>,
+    /// Test-only seam: a claim/finish transition that the NEXT
+    /// `request_gate_job_cancel` writer job applies before its own row read
+    /// (cancel handler pre-read vs. writer-observed state race).
+    test_gate_cancel_race: Arc<std::sync::Mutex<Option<crate::gatequeue::TestGateCancelRace>>>,
+    /// Test-only seam: a fence applied at the top of the NEXT
+    /// `patch_project_with_route` writer job (atomic project PATCH).
+    test_fence_before_project_patch: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Delete one chapter's rows and write its interaction tombstones /
@@ -2290,6 +2297,8 @@ impl Store {
             test_delete_device_before_queue: Arc::new(std::sync::Mutex::new(None)),
             test_fence_before_authority: Arc::new(std::sync::Mutex::new(None)),
             test_fence_before_task_mutate: Arc::new(std::sync::Mutex::new(None)),
+            test_gate_cancel_race: Arc::new(std::sync::Mutex::new(None)),
+            test_fence_before_project_patch: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -2411,6 +2420,48 @@ impl Store {
         self.test_fence_before_task_mutate
             .lock()
             .expect("task mutate seam lock")
+            .take()
+    }
+
+    /// Test-only: arm the gate-cancel writer race: the NEXT
+    /// `request_gate_job_cancel` writer job applies `race` to the row before
+    /// its own read, reproducing the tick/finish committing between the
+    /// handler's pre-read and the writer.
+    #[doc(hidden)]
+    pub fn test_arm_gate_cancel_race(&self, race: crate::gatequeue::TestGateCancelRace) {
+        *self
+            .test_gate_cancel_race
+            .lock()
+            .expect("gate cancel race seam lock") = Some(race);
+    }
+
+    /// Test-only: drain (at most) the armed gate-cancel writer race.
+    pub(crate) fn take_test_gate_cancel_race(
+        &self,
+    ) -> Option<crate::gatequeue::TestGateCancelRace> {
+        self.test_gate_cancel_race
+            .lock()
+            .expect("gate cancel race seam lock")
+            .take()
+    }
+
+    /// Test-only: arm a fence applied inside the NEXT
+    /// `patch_project_with_route` writer job, immediately before its
+    /// authority check (atomic project PATCH: doc + route override share one
+    /// job, so the fence refuses both).
+    #[doc(hidden)]
+    pub fn test_arm_fence_before_project_patch(&self, instance_id: String) {
+        *self
+            .test_fence_before_project_patch
+            .lock()
+            .expect("project patch seam lock") = Some(instance_id);
+    }
+
+    /// Test-only: drain (at most) the armed project-patch fence.
+    pub(crate) fn take_test_project_patch_fence(&self) -> Option<String> {
+        self.test_fence_before_project_patch
+            .lock()
+            .expect("project patch seam lock")
             .take()
     }
 
@@ -3187,6 +3238,18 @@ impl Store {
                 "UPDATE worktree_leases SET holder_instance_id = NULL, updated_at = ?2
                  WHERE holder_instance_id = ?1",
                 params![&instance_id, now_rfc3339()],
+            )?;
+            // A continuity chapter (any grant or a restart policy) also holds
+            // a `lineages` row — its reservation of the lineage seat. A
+            // never-accepted chapter has no successors or journal, so the row
+            // goes with the instance; leaving it would strand a `starting`
+            // lineage pointing at a purged chapter (and keep its seat
+            // counted). The instance row still exists at this point; the
+            // lineage id is read from it.
+            conn.execute(
+                "DELETE FROM lineages
+                  WHERE lineage_id = (SELECT lineage_id FROM instances WHERE id = ?1)",
+                params![&instance_id],
             )?;
             conn.execute("DELETE FROM instances WHERE id = ?1", params![&instance_id])?;
             Ok(())

@@ -489,7 +489,7 @@ test.describe("composer control bar and effort", () => {
     );
   });
 
-  test("structured Grok session shows four chips including its editable permission menu", async ({ page }) => {
+  test("structured Grok session keeps a READ-ONLY native permission chip (no Claude-id menu)", async ({ page }) => {
     const mobile = test.info().project.name === "mobile-webkit";
     await page.goto("/sessions");
     await row(page, "Grok 会话").click();
@@ -499,40 +499,28 @@ test.describe("composer control bar and effort", () => {
     await structured.click();
     await expect(page.getByTestId("composer-bar")).toBeVisible();
     await expect(page.getByTestId("model-effort-chip")).toBeVisible();
-    // This fixture reports a structured-workflow capability, so SessionPage
-    // provides the permission menu rather than the raw-PTY read-only label.
+    // c-effortui r3 item 7: a non-Claude live session never gets the Claude
+    // shift+tab wheel (the Node maps acceptEdits/auto to different native
+    // modes for grok); the chip is read-only and opens no Claude-id menu.
     if (mobile) {
-      // D-042: the harness chip, context chip and the permission control
-      // live in the options sheet; the fused trigger is the expanded anchor.
+      // D-042: the harness chip, context chip and the read-only permission
+      // chip live in the options sheet; the fused trigger is the anchor.
       const trigger = page.getByTestId("model-effort-chip");
       await expect(trigger).toHaveAttribute("aria-expanded", "false");
       await trigger.click();
       await expect(trigger).toHaveAttribute("aria-expanded", "true");
       await expect(page.getByTestId("harness-chip")).toHaveAttribute("data-readonly", "1");
-      // Context usage also lives in the sheet (dispatch plan §C default 4).
       await expect(page.getByTestId("context-chip")).toBeVisible();
-      // The structured-workflow capability can land a tick after the page
-      // paints; poll for the editable menu instead of accepting a read-only
-      // fallback the fixture must not end in.
-      await expect
-        .poll(
-          async () => page.getByTestId("permission-menu").count(),
-          { timeout: 10_000 },
-        )
-        .toBe(1);
-      await expect(page.getByTestId("permission-option-manual")).toBeVisible();
-      await expect(page.getByTestId("permission-menu").getByRole("button")).toHaveCount(4);
+      const permission = page.getByTestId("permission-chip");
+      await expect(permission).toHaveAttribute("data-readonly", "1");
+      await expect(page.getByTestId("permission-menu")).toHaveCount(0);
     } else {
       await expect(page.getByTestId("harness-chip")).toHaveAttribute("data-readonly", "1");
       await expect(page.getByTestId("context-chip")).toBeVisible();
       const permission = page.getByTestId("permission-chip");
-      await expect(permission).toContainText("询问");
-      await expect(permission).toHaveAttribute("aria-expanded", "false");
-      await permission.click();
-      await expect(permission).toHaveAttribute("aria-expanded", "true");
-      await expect(page.getByTestId("permission-menu")).toBeVisible();
-      await expect(page.getByTestId("permission-option-manual")).toBeVisible();
-      await expect(page.getByTestId("permission-menu").getByRole("button")).toHaveCount(4);
+      await expect(permission).toHaveAttribute("data-readonly", "1");
+      // It is a static chip, not a button: no wheel ever opens.
+      await expect(page.getByTestId("permission-menu")).toHaveCount(0);
     }
   });
 

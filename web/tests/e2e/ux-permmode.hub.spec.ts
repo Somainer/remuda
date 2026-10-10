@@ -47,8 +47,10 @@ async function clearApprovals(page: Page, instanceId: string) {
  * Runtime permission-mode switching against the fake Node in
  * `crates/remuda-hub/examples/hub_e2e.rs`.
  *
- * 1. the composer menu lists Claude's six real modes (dontAsk is launch-only
- *    and therefore greyed);
+ * 1. the LIVE wheel is the CLI's measured shift+tab cycle
+ *    (manual → acceptEdits → plan → auto): dontAsk never joins, bypass joins
+ *    only when the launch carried the allowance. The six-mode vocabulary
+ *    (dontAsk/bypass included) belongs to the New Session LAUNCH fieldset;
  * 2. picking a mode posts `instance.configure` with `permissionMode`; the fake
  *    node appends a `permission` observation, and the chip settles;
  * 3. a mode changed in the terminal itself (sent as `__perm__:<mode>`) folds
@@ -59,6 +61,14 @@ async function clearApprovals(page: Page, instanceId: string) {
  */
 
 test.describe.configure({ mode: "serial" });
+
+// The sentinel words (__queued__/__degrade__) and the fake-node session are
+// provided only by the in-process hub_e2e harness (HUB_E2E_FAKE_NODE=1, set
+// by playwright.hub.config for its own webServer).
+test.skip(
+  process.env.HUB_E2E_FAKE_NODE !== "1",
+  "set HUB_E2E_FAKE_NODE=1 for the in-process hub_e2e fake Node",
+);
 
 const created: string[] = [];
 
@@ -94,33 +104,46 @@ test.afterEach(async ({ page }) => {
   }
 });
 
-test("the composer permission menu lists the six real Claude modes with dontAsk launch-only", async ({
+test("the live wheel walks the CLI cycle; launch-only modes are absent but offered at launch", async ({
   page,
 }) => {
   await createSession(page, "perm menu vocabulary");
   await page.getByTestId("permission-chip").click();
-  const ids = [
+  // Exactly the measured shift+tab order for a normally launched (manual)
+  // session: manual → acceptEdits → plan → auto.
+  for (const id of ["manual", "acceptEdits", "plan", "auto"]) {
+    await expect(page.getByTestId(`permission-option-${id}`)).toBeVisible();
+  }
+  // dontAsk never joins a live wheel; bypass joins only with the launch
+  // allowance this session did not carry.
+  await expect(page.getByTestId("permission-option-dontAsk")).toHaveCount(0);
+  await expect(page.getByTestId("permission-option-bypassPermissions")).toHaveCount(0);
+  await mkdir(evidenceDir, { recursive: true });
+  await page.screenshot({
+    path: path.join(evidenceDir, "permission-modes-1-menu-1440.png"),
+    animations: "disabled",
+  });
+
+  // The full six-mode vocabulary (plan AND dontAsk included) is the LAUNCH
+  // fieldset on New Session, not the live wheel.
+  await page.goto("/sessions/new");
+  const hostPicker = page.getByTestId("new-session-host");
+  await expect(hostPicker).toContainText("e2e-fake-node", { timeout: 20_000 });
+  const hostId = await hostPicker
+    .locator("option")
+    .filter({ hasText: "e2e-fake-node" })
+    .getAttribute("value");
+  await hostPicker.selectOption(hostId!);
+  for (const id of [
     "manual",
     "acceptEdits",
     "plan",
     "auto",
     "bypassPermissions",
     "dontAsk",
-  ];
-  for (const id of ids) {
-    await expect(page.getByTestId(`permission-option-${id}`)).toBeVisible();
+  ]) {
+    await expect(page.getByTestId(`new-session-perm-${id}`)).toBeVisible();
   }
-  // dontAsk is the one launch-only row in a normal session.
-  await expect(page.getByTestId("permission-option-dontAsk")).toBeDisabled();
-  await expect(page.getByTestId("permission-option-dontAsk")).toHaveAttribute(
-    "data-launch-only",
-    "1",
-  );
-  await mkdir(evidenceDir, { recursive: true });
-  await page.screenshot({
-    path: path.join(evidenceDir, "permission-modes-1-menu-1440.png"),
-    animations: "disabled",
-  });
 });
 
 test("picking a live mode posts a configure and settles the chip from the read-back", async ({

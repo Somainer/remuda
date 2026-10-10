@@ -1,11 +1,20 @@
 // Service worker source. This file is NOT copied verbatim: the build plugin
-// (sw-build.ts, wired from vite.config.ts) stamps the single placeholder token
-// on the const CACHE line below with a per-build cache name (see
-// cacheNameForBuild in src/lib/swCache.ts) and emits the result as dist/sw.js.
-// Because the cache name carries the build identity the worker's bytes change
-// on every deploy, so the browser's byte-compare update check sees a new
-// worker and the activate sweep below reclaims the old shell.
+// (sw-build.ts, wired from vite.config.ts) stamps two placeholder tokens:
+//   * on the const CACHE line — a per-build cache name (see
+//     cacheNameForBuild in src/lib/swCache.ts),
+//   * on the const PRECACHE_URLS line — the build-derived precache manifest:
+//     the index.html entry closure plus EVERY lazy route chunk and their
+//     imported CSS/assets, so an offline first visit to a never-visited route
+//     loads. The list comes from the Vite build graph at build time and is
+//     never hand-maintained.
+// The result is emitted as dist/sw.js. Because the cache name (and the
+// hashed asset list) carries the build identity the worker's bytes change on
+// every deploy, so the browser's byte-compare update check sees a new worker
+// and the activate sweep below reclaims the old shell. Old builds keep their
+// OWN cache until the replacement worker activates (no skipWaiting): a tab
+// still running the old build keeps every hashed asset it needs.
 const CACHE = "__CACHE_NAME__";
+const PRECACHE_URLS = __PRECACHE_MANIFEST__;
 const SHELL = ["/", "/index.html", "/manifest.webmanifest", "/favicon.svg", "/icons/icon-192.png", "/icons/icon-512.png"];
 
 self.addEventListener("install", (event) => {
@@ -13,7 +22,11 @@ self.addEventListener("install", (event) => {
   // tab is driven by the old one, so the page can offer the "new version" bar
   // instead of being yanked mid-session. It takes over only when the client
   // posts ACTIVATE_UPDATE (the message handler below calls skipWaiting).
-  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));
+  // addAll is atomic: every route chunk and import must exist or the worker
+  // fails install rather than taking control with a hole in the precache.
+  event.waitUntil(
+    caches.open(CACHE).then((cache) => cache.addAll(SHELL.concat(PRECACHE_URLS))),
+  );
 });
 
 self.addEventListener("activate", (event) => {

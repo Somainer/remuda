@@ -661,6 +661,67 @@ fn message_delta_revises_provisional_per_call_usage_to_final() {
 }
 
 #[test]
+fn message_delta_with_only_output_tokens_overlays_the_revision1_buckets() {
+    // c-usagefu r3 item 2: Anthropic's documented message_delta shape carries
+    // only the changed usage keys; Bedrock/Vertex/gateway profiles commonly
+    // send {"output_tokens": n} with NO input/cache buckets. Building revision
+    // 2 from that delta alone zeroed the buckets and the Hub rejected the
+    // "decrease", leaving the provisional per-call output count frozen.
+    let mut mapper = mapper();
+    event(
+        &mut mapper,
+        json!({"type": "message_start", "message": {
+            "id": "msg_gw",
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 1, "cache_read_input_tokens": 100,
+                      "cache_creation_input_tokens": 50, "output_tokens": 8}
+        }}),
+    );
+    let assistant = map(
+        &mut mapper,
+        json!({"type": "assistant", "uuid": "u1", "message": {
+            "id": "msg_gw", "role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 1, "cache_read_input_tokens": 100,
+                      "cache_creation_input_tokens": 50, "output_tokens": 8}
+        }}),
+    );
+    // Sparse gateway delta: output tokens only.
+    let delta = event(
+        &mut mapper,
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 30}}),
+    );
+
+    let mut usage: Vec<_> = assistant
+        .into_iter()
+        .chain(delta)
+        .filter_map(|obs| match obs.body {
+            ObservationPayload::Usage(payload) => Some(payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        usage.len(),
+        2,
+        "rev 1 still emits; sparse delta still revises"
+    );
+    let rev2 = usage.pop().unwrap();
+    let rev1 = usage.pop().unwrap();
+    assert_eq!(rev2.metric_revision, U64(2));
+    assert_eq!(rev2.output_tokens, Knowledge::Known { value: U64(30) });
+    // The omitted buckets are carried over from revision 1, not read as zero.
+    assert_eq!(rev2.input_tokens, rev1.input_tokens);
+    assert_eq!(rev2.cache_read_tokens, rev1.cache_read_tokens);
+    assert_eq!(rev2.cache_write_tokens, rev1.cache_write_tokens);
+
+    // message_stop also retires the remembered revision-1 blob.
+    event(&mut mapper, json!({"type": "message_stop"}));
+    assert!(!mapper.stream.message_usage.contains_key("msg_gw"));
+}
+
+#[test]
 fn nested_message_delta_emits_no_usage() {
     let mut mapper = mapper();
     let start = nested_event(

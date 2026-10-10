@@ -27,6 +27,14 @@ pub(super) struct StreamState {
     /// so the revision-2 per-call payload reads it from here (c-usagefu r2
     /// item 2).
     pub(super) message_models: HashMap<String, String>,
+    /// Raw revision-1 `message.usage` blob per native message id (the
+    /// provisional usage on the first assistant / `message_start` frame).
+    /// Some gateway profiles (Bedrock/Vertex Anthropic-Messages gateways)
+    /// send `message_delta.usage` as a PATCH carrying only changed keys,
+    /// commonly `{"output_tokens": n}` alone; revision 2 is that delta
+    /// overlaid on this revision-1 blob, so omitted input/cache buckets are
+    /// not read as zero and rejected as a decrease (c-usagefu r3 item 2).
+    pub(super) message_usage: HashMap<String, Value>,
     /// Mapped ids of TOP-LEVEL (`parent_tool_use_id == null`) ExitPlanMode
     /// tool_use blocks seen on assistant messages. D-051 (6a): only such a
     /// call is minted as a PlanReview; sub-agent (nested) ExitPlanMode calls
@@ -189,12 +197,25 @@ pub(super) fn map_stream(
     // sub-agent deltas are sidechains.
     if kind == "message_delta" {
         if frame.parent_tool_use_id.is_none()
-            && let Some(usage) = event.get("usage")
+            && let Some(delta_usage) = event.get("usage")
         {
             // Clone out before the mutable helper borrows the mapper.
             let model = mapper.stream.message_models.get(&native).cloned();
+            // Revision 2 is the delta overlaid on the revision-1 blob: a
+            // Bedrock/Vertex/gateway delta may carry only output_tokens, and
+            // building the revision from the delta alone would zero the input
+            // and cache buckets, a "decrease" the Hub rejects — leaving the
+            // per-call output count stuck at its provisional value. No
+            // revision-1 blob (ungated pty hydration, sparse stream) falls
+            // back to the delta exactly as before.
+            let final_usage = mapper
+                .stream
+                .message_usage
+                .get(&native)
+                .map(|base_usage| overlay_usage_patch(base_usage, delta_usage))
+                .unwrap_or_else(|| delta_usage.clone());
             if let Some(usage_obs) =
-                super::turn_usage_observation(mapper, &native, model.as_deref(), usage, 2)?
+                super::turn_usage_observation(mapper, &native, model.as_deref(), &final_usage, 2)?
             {
                 return Ok(vec![usage_obs]);
             }
@@ -301,10 +322,36 @@ pub(super) fn map_stream(
         if kind == "message_stop" {
             mapper.stream.active.remove(&frame.parent_tool_use_id);
             mapper.stream.message_models.remove(&native);
+            mapper.stream.message_usage.remove(&native);
         }
     }
     mapper.stream.blocks.insert(key, blocks);
     Ok(out)
+}
+
+/// Merge a `message_delta.usage` PATCH onto the revision-1 usage blob.
+///
+/// Only keys present on the delta change the blob; buckets the provider
+/// omits keep their revision-1 values (the Anthropic documented
+/// `message_delta` shape carries just the output count on many
+/// Bedrock/Vertex/gateway profiles). Nested objects merge key-by-key under
+/// the same rule; scalars and arrays are replaced.
+fn overlay_usage_patch(base: &Value, patch: &Value) -> Value {
+    match (base, patch) {
+        (Value::Object(base_map), Value::Object(patch_map)) => {
+            let mut merged = base_map.clone();
+            for (key, patch_value) in patch_map {
+                merged
+                    .entry(key.clone())
+                    .and_modify(|base_value| {
+                        *base_value = overlay_usage_patch(base_value, patch_value)
+                    })
+                    .or_insert_with(|| patch_value.clone());
+            }
+            Value::Object(merged)
+        }
+        _ => patch.clone(),
+    }
 }
 
 pub(super) fn map_assistant(

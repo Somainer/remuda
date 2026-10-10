@@ -1570,6 +1570,16 @@ fn turn_usage_observation(
     usage: &Value,
     revision: u64,
 ) -> DriverResult<Option<Observation>> {
+    // Remember the revision-1 blob so a sparse message_delta PATCH (output
+    // tokens only, common behind Bedrock/Vertex/gateway profiles) overlays
+    // onto it instead of zeroing the omitted input/cache buckets
+    // (c-usagefu r3 item 2). First frame wins, matching the rev-1 dedupe.
+    if revision == 1 && usage.is_object() && !mapper.stream.message_usage.contains_key(message_id) {
+        mapper
+            .stream
+            .message_usage
+            .insert(message_id.to_owned(), usage.clone());
+    }
     let Some(event) =
         crate::usage::claude::usage_from_message_usage(Some(message_id), None, model, usage)
     else {

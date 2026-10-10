@@ -814,8 +814,14 @@ function SessionPageBody({
       </div>
       {resolvedView === "tty" || resolvedView === "events" ? (
         // Terminal segments and raw events carry no dock, but an ended session
-        // still offers its one resume entry under the pane.
-        endedBar ? <div className={session.endedDock}>{endedBar}</div> : null
+        // still offers its one resume entry under the pane. Publish its height
+        // too: on /events there is no tty chrome, and without this the notify
+        // stack's safe-bottom fallback painted over the Resume button.
+        endedBar ? (
+          <div ref={setDockEl} className={session.endedDock} data-testid="session-ended-dock">
+            {endedBar}
+          </div>
+        ) : null
       ) : <div ref={setDockEl} className={session.dock} data-testid="session-dock">
         {/* Zero-flow floating chip row anchored at the dock top (c-composerpop
             r2/r3): rests just above the composer over the transcript edge and

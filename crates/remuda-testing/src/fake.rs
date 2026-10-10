@@ -143,36 +143,11 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
         if close_stdin && !was_initialized && session.saw_initialize {
             #[cfg(unix)]
             {
-                use std::os::fd::AsRawFd;
-                let dbg = std::fs::read_dir("/proc/self/fd")
-                    .map(|rd| {
-                        rd.flatten()
-                            .map(|e| {
-                                let n = e.file_name().to_string_lossy().into_owned();
-                                let tgt = std::fs::read_link(e.path())
-                                    .map(|p| p.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                                format!("{n}->{tgt}")
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })
-                    .unwrap_or_default();
-                eprintln!(
-                    "CLOSESTDIN before close fd0_raw={} fds={dbg}",
-                    std::io::stdin().as_raw_fd()
-                );
-                let rc = nix::unistd::close(0);
-                eprintln!(
-                    "CLOSESTDIN close rc={rc:?} fds_after_close: {}",
-                    std::fs::read_dir("/proc/self/fd")
-                        .map(|rd| rd
-                            .flatten()
-                            .map(|e| e.file_name().to_string_lossy().into_owned())
-                            .collect::<Vec<_>>()
-                            .join(" "))
-                        .unwrap_or_default()
-                );
+                // The read end is closed on THIS iteration: the first prompt
+                // frame is never consumed, so its write fails while the child
+                // parks alive. `std::io::stdin()` only borrows fd 0, so close
+                // the fd outright.
+                let _ = nix::unistd::close(0);
             }
             std::thread::sleep(std::time::Duration::from_secs(300));
         }

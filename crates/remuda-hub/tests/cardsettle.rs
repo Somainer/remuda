@@ -969,7 +969,10 @@ async fn host_loss_sweep_keeps_cards_and_revives_a_live_inventory_row_on_reconne
     assert_eq!(status, 200, "{body}");
     let swept_row: Value = serde_json::from_str(&body)?;
     assert_eq!(swept_row["lifecycle"], "exited");
-    assert_eq!(swept_row["lastError"], json!("host-lost"));
+    // ma-sdk-state merge: this branch's sweep writes the NEW contact-loss
+    // marker (ma-lineage r7 item 5(b)); the no-ended-at/no-card-settle
+    // invariants under test come from c-cardsettle r8 and are unchanged.
+    assert_eq!(swept_row["lastError"], json!("host-contact-lost"));
     assert!(
         swept_row.get("endedAt").is_none() || swept_row["endedAt"].is_null(),
         "contact loss must not stamp process-end evidence: {swept_row}"

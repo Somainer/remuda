@@ -14141,6 +14141,9 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
         .pointer("/relatedIds/settledRootTurn")
         .and_then(Value::as_str)
         == Some("true");
+    let affects_completion = payload.get("affectsCompletion").and_then(Value::as_str)
+        == Some("true")
+        || payload.get("affectsCompletion").and_then(Value::as_bool) == Some(true);
     if payload_type == "native" && topic == "turn" && !subagent_scoped {
         if (native_name, status) == ("turn_started", Some("working")) {
             return (Some("running"), Some("working"));
@@ -14151,15 +14154,27 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
             if settled_root_turn && matches!(status, Some("error" | "turn_done")) {
                 return (Some("running"), Some("idle"));
             }
-            // c-cardsettle r5 item 4: an UNSETTLED root result that reports a
-            // failed turn outcome still frees the composer (idle, retryable);
-            // lifecycle stays running. An unsettled SUCCESS intermediate
-            // (open workflow) changes neither.
-            if root_turn_failed(payload, native_name, status) {
+            // ma-sdk-state r4 item 2: an UNSETTLED result changes NOTHING
+            // while another turn is queued or a workflow is open (its flag is
+            // absent precisely in those cases). The sole legacy exception is
+            // the one-shot print shape — a failed result that explicitly
+            // claims affectsCompletion (final result, no queued turn): that
+            // still frees the composer. Intermediate index-0 / queued results
+            // never carry the claim, so they keep the row working.
+            if affects_completion && root_turn_failed(payload, native_name, status) {
                 return (Some("running"), Some("idle"));
             }
-            // An intermediate successful result changes neither.
             return (None, None);
+        }
+        // A ROOT StopFailure reporting a failed turn outcome ends the TURN
+        // (idle, retryable) even without a settled flag; lifecycle runs on.
+        if native_name == "StopFailure"
+            && payload
+                .pointer("/relatedIds/outcome")
+                .and_then(Value::as_str)
+                .is_some_and(|outcome| outcome.eq_ignore_ascii_case("failed"))
+        {
+            return (Some("running"), Some("idle"));
         }
     }
 

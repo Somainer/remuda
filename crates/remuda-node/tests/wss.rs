@@ -2474,3 +2474,172 @@ async fn sdk_failed_first_turn_keeps_child_and_card_until_the_driver_exit() {
 
     let _ = hub.shutdown().await;
 }
+
+/// ma-sdk-state r4 item 3 (OA6), end to end through the Node runtime and the
+/// Hub: the fake child closes its OWN stdin right after the handshake and
+/// parks alive. The later instance.send write fails in the Node, but there is
+/// no process-end evidence (process_gone stays false), so:
+/// * the command settles with a journaled rejection but the instance
+///   lifecycle stays live — never failed/exited;
+/// * zero turn_started observations reach the Hub;
+/// * the address-owner grant the seat holds stays held (second holder 409).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_child_with_closed_stdin_rejects_the_send_without_failing_the_instance_or_releasing_the_grant()
+ {
+    use remuda_node::{DevServerConfig, LocalDrivers, NativeDriverConfig, ServeConfig, compose};
+    use remuda_testing::{ScriptKind, ensure_workspace_bin, script_path};
+
+    let dir = tempfile::tempdir().expect("tmp");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("hub")))
+        .await
+        .expect("hub");
+    let mut node_http = DevServerConfig::loopback(0);
+    node_http.workspace_root = workspace.clone();
+    node_http.workspace_roots = Some(remuda_testing::test_workspace_roots!());
+    let mut native = NativeDriverConfig::new(dir.path().join("node"))
+        .with_claude_binary(ensure_workspace_bin("fake-claude"));
+    native.extra_env.insert(
+        "FAKE_CLAUDE_SCRIPT".to_owned(),
+        script_path(ScriptKind::Ok).to_string_lossy().into_owned(),
+    );
+    // The child closes its stdin after initialize and parks alive.
+    native
+        .extra_env
+        .insert("FAKE_CLAUDE_CLOSE_STDIN".to_owned(), "1".to_owned());
+    let node = compose(&ServeConfig {
+        http: node_http,
+        data_dir: dir.path().join("node-data"),
+        drivers: LocalDrivers::Native(native),
+    })
+    .expect("compose");
+    let host_id = node.host().meta.id.as_id().as_str().to_owned();
+    let link = tokio::time::timeout(
+        TIMEOUT,
+        WssLink::connect_runtime(
+            WssConfig::loopback(hub.addr, enroll_token(&hub).await, host_id.clone()),
+            node,
+        ),
+    )
+    .await
+    .expect("connect timeout")
+    .expect("wss runtime connect");
+    let (cookie, _) = login(hub.addr, &hub.bootstrap_token).await;
+
+    // Bring the seat up WITHOUT a create-time prompt.
+    let create = json!({
+        "hostId": host_id,
+        "kind": "claude",
+        "driver": "claude-sdk",
+        "name": "broken-stdin",
+        "grants": ["address-owner", "dispatch"],
+        "prompt": ""
+    })
+    .to_string();
+    let (status, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", cookie.as_str())],
+        Some(&create),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let created: Value = serde_json::from_str(body.trim()).expect("create json");
+    let instance_id = created["instance"]["instanceId"]
+        .as_str()
+        .expect("instanceId")
+        .to_owned();
+
+    // Wait for the live session (the child completed initialize, then closed
+    // its stdin), giving that close a deterministic window.
+    let journal_path = format!("/v1/instances/{instance_id}/journal");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // The write fails: HTTP accepts the async command…
+    let send = json!({
+        "operation": "instance.send",
+        "payload": {"prompt": "into a closed stdin"}
+    })
+    .to_string();
+    let (status, body) = http(
+        hub.addr,
+        "POST",
+        &format!("/v1/instances/{instance_id}/commands"),
+        &[("Cookie", cookie.as_str())],
+        Some(&send),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // …and the rejection becomes durable in the mirrored journal.
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let mut journal = String::new();
+    while tokio::time::Instant::now() < deadline {
+        let (jstatus, body) = http(
+            hub.addr,
+            "GET",
+            &journal_path,
+            &[("Cookie", cookie.as_str())],
+            None,
+        )
+        .await;
+        assert_eq!(jstatus, 200, "{body}");
+        journal = body;
+        if journal.contains("rejected") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        journal.contains("rejected"),
+        "the failed write must settle the command rejected: {journal}"
+    );
+    assert!(
+        !journal.contains("turn_started"),
+        "a failed write emits zero turn_started observations: {journal}"
+    );
+
+    // The instance never terminalized.
+    let (status, body) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let row: Value = serde_json::from_str(body.trim()).expect("instance json");
+    assert_ne!(
+        row["lifecycle"], "failed",
+        "a closed stdin on a LIVE child is not process loss: {row}"
+    );
+    assert_ne!(row["lifecycle"], "exited", "{row}");
+
+    // The address-owner grant stays held: another seat holder is refused.
+    let second = json!({
+        "hostId": host_id,
+        "kind": "claude",
+        "driver": "claude-sdk",
+        "grants": ["address-owner"],
+        "prompt": ""
+    })
+    .to_string();
+    let (status, conflict) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", cookie.as_str())],
+        Some(&second),
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "the address-owner grant stays held while the child is alive: {conflict}"
+    );
+
+    link.shutdown().await;
+    let _ = hub.shutdown().await;
+}

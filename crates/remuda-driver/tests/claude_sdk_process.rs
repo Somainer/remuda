@@ -977,21 +977,10 @@ async fn a_result_queued_during_the_write_window_starts_then_results() {
 ///   `process_gone()` stays false — the Node must not terminalize on this.
 #[tokio::test]
 async fn a_live_child_that_closed_its_stdin_errors_the_send_without_any_turn_start() {
-    let marker = std::env::temp_dir().join(format!(
-        "close-stdin-frames-{}.txt",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let env = BTreeMap::from([
-        ("FAKE_CLAUDE_CLOSE_STDIN".into(), "1".into()),
-        (
-            "FAKE_CLAUDE_STDIN_FILE".into(),
-            marker.to_string_lossy().into_owned(),
-        ),
-    ]);
-    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let (_tmp, driver, spec) = driver_with_env(
+        ScriptKind::Ok,
+        BTreeMap::from([("FAKE_CLAUDE_CLOSE_STDIN".into(), "1".into())]),
+    );
     let mut handle = driver.start(spec).await.expect("start");
     let pid = handle
         .ack()
@@ -1003,13 +992,6 @@ async fn a_live_child_that_closed_its_stdin_errors_the_send_without_any_turn_sta
 
     // Give the child a beat to run its post-handshake stdin close.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let environ = std::fs::read_to_string(format!(
-        "/proc/{pid}/environ",
-        pid = handle.ack().native_ids.get("pid").expect("pid")
-    ))
-    .unwrap_or_default();
-    eprintln!("CHILD ENV: {}", environ.replace('\0', " | "));
-    eprintln!("STDIN MARKER: {:?}", std::fs::read_to_string(&marker).ok());
     assert!(
         process_alive(&pid),
         "the child parked alive with stdin closed"

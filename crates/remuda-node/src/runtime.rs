@@ -2819,8 +2819,15 @@ fn root_turn_failure_activity(observation: &remuda_protocol::Observation) -> Opt
         .related_ids
         .get("outcome")
         .is_some_and(|outcome| outcome.eq_ignore_ascii_case("failed"));
+    // ma-sdk-state r4 item 2: an UNSETTLED result error frees the composer
+    // only for the one-shot print shape that explicitly claims
+    // affects_completion (the final, unqueued result). A queued/intermediate
+    // (open-workflow) result carries no claim and keeps the turn working;
+    // settled results are handled by `engine_turn_activity` before this
+    // fallback runs.
     let result_error = native.native_name == "result"
-        && matches!(&native.status, remuda_protocol::Knowledge::Known { value } if value == "error");
+        && matches!(&native.status, remuda_protocol::Knowledge::Known { value } if value == "error")
+        && native.affects_completion;
     let stop_failure = native.native_name == "StopFailure" && outcome_failed;
     (result_error || stop_failure).then_some(Activity::Idle)
 }

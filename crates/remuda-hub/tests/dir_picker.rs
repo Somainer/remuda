@@ -1488,6 +1488,11 @@ mod abort {
             .mark_forward_intent(command.command_id.clone())
             .await?;
         store.mark_accepted(command.command_id.clone()).await?;
+        // Model the reconnect hello adopting a new link before the sweep
+        // runs; the stuck command stays stamped with the previous generation.
+        store
+            .bump_host_link_generation(fixture.host.clone())
+            .await?;
 
         // The node.hello reconciliation runs and must abort it.
         fixture
@@ -1549,6 +1554,11 @@ mod abort {
             .mark_forward_intent(command.command_id.clone())
             .await?;
         store.mark_accepted(command.command_id.clone()).await?;
+        // The stuck command rode the previous link; the reconnect hello must
+        // adopt a new generation before its sweep can attribute it.
+        store
+            .bump_host_link_generation(fixture.host.clone())
+            .await?;
 
         // The Node reports the abort as an already-settled commit.
         fixture.node.next_abort_reports_settled();
@@ -1874,10 +1884,13 @@ async fn reconnect_after_dropped_prepare_aborts_on_the_new_socket_and_unblocks_t
     first.await??;
 
     let store = hub.store().expect("store");
-    // Model the reconnect cutoff (r9 item 2): any instant after the stuck
-    // command was created and before the new link's hello.
+    // The stuck DELETE was stamped with the FIRST link's generation when it
+    // was forwarded. The second link's hello is about to adopt the next
+    // generation, so ask for intents older than that — the exact set the
+    // post-hello sweep will abort (r10 item 1: generations, not a clock).
+    let next_generation = store.host_link_generation(host.clone()).await? + 1;
     let pending = store
-        .list_unsettled_workspace_unregisters(&host, "2099-01-01T00:00:00.000Z")
+        .list_unsettled_workspace_unregisters(&host, next_generation)
         .await?;
     assert_eq!(pending.len(), 1, "{pending:?}");
     let stuck_command = pending[0].command_id.clone();

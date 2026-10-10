@@ -4198,6 +4198,12 @@ impl Store {
     }
 
     /// Persist forward intent. Returns false if already forwarded (do not resend).
+    ///
+    /// c-dirpicker r10 item 1: also stamp the host's CURRENT link generation
+    /// on the row. A command is only ever forwarded over the link the host
+    /// holds right now (DELETEs against an offline host fail before queueing),
+    /// so the stamp attributes the command to that link independent of wall
+    /// clocks; the reconnect sweep aborts rows stamped by an older link.
     pub async fn mark_forward_intent(&self, command_id: String) -> Result<bool, StoreError> {
         self.run_named("mark_forward_intent", move |conn| {
             let Some(row) = load_command(conn, &command_id)? else {
@@ -4208,10 +4214,61 @@ impl Store {
             }
             let now = now_rfc3339();
             conn.execute(
-                "UPDATE commands SET forwarded = 1, resolution = 'unknown', updated_at = ?1 WHERE id = ?2",
+                "UPDATE commands
+                    SET forwarded = 1,
+                        resolution = 'unknown',
+                        link_generation = (
+                            SELECT h.link_generation FROM hosts h
+                             WHERE h.id = commands.host_id
+                        ),
+                        updated_at = ?1
+                  WHERE id = ?2",
                 params![now, command_id],
             )?;
             Ok(true)
+        })
+        .await
+    }
+
+    /// c-dirpicker r10 item 1: atomically adopt a new link for a host. Called
+    /// by the authenticated `node.hello` path BEFORE the transport is
+    /// registered: every command forwarded after this point (forwarding
+    /// requires the registry slot the hello is about to install) stamps the
+    /// new generation, so the post-hello sweep attributes it to THIS link and
+    /// never aborts it. Returns the new generation (first adopting hello makes
+    /// it 1; hosts whose link a hello has never adopted stay at 0).
+    pub async fn bump_host_link_generation(&self, host_id: String) -> Result<i64, StoreError> {
+        let host = host_id.clone();
+        self.run_named("bump_host_link_generation", move |conn| {
+            let updated = conn.execute(
+                "UPDATE hosts SET link_generation = link_generation + 1 WHERE id = ?1",
+                params![host],
+            )?;
+            if updated == 0 {
+                return Err(StoreError::Id("unknown host".into()));
+            }
+            let generation = conn.query_row(
+                "SELECT link_generation FROM hosts WHERE id = ?1",
+                params![host_id],
+                |row| row.get(0),
+            )?;
+            Ok(generation)
+        })
+        .await
+    }
+
+    /// c-dirpicker r10 item 1: the link generation a host's hello last
+    /// adopted. The reconnect sweep aborts unregister intents stamped below
+    /// it; errors if the host row is missing.
+    pub async fn host_link_generation(&self, host_id: String) -> Result<i64, StoreError> {
+        let host = host_id;
+        self.read("host_link_generation", move |conn| {
+            let generation = conn.query_row(
+                "SELECT link_generation FROM hosts WHERE id = ?1",
+                params![host],
+                |row| row.get(0),
+            )?;
+            Ok(generation)
         })
         .await
     }
@@ -4451,19 +4508,20 @@ impl Store {
     /// frame was queued when a link died). The hello reconnect path aborts
     /// them so the Node's durable unbinding mark is released.
     ///
-    /// r9 item 2: only rows created strictly before `created_before` (the new
-    /// link's hello instant). A DELETE accepted on the NEW link is created at
-    /// or after that instant; aborting it would kill an in-flight removal the
-    /// operator just issued. Timestamps are fixed-width millisecond UTC
-    /// RFC3339 (see [`crate::config::now_rfc3339`]), so the lexical SQL
-    /// comparison is chronological.
+    /// r10 item 1 (replaces the r9 wall-clock cutoff): attribution is by LINK
+    /// GENERATION, stamped on the command at [`Store::mark_forward_intent`].
+    /// Every `node.hello` that adopts a link bumps the host generation, so a
+    /// command belongs here exactly when its stamp is older than the link the
+    /// sweep is running on. A command stamped by the CURRENT link is never
+    /// returned regardless of its `created_at`, and commands with a NULL stamp
+    /// (rows persisted before the column existed) are treated as dead-link
+    /// intent and aborted. Clock steps cannot change the result.
     pub async fn list_unsettled_workspace_unregisters(
         &self,
         host_id: &str,
-        created_before: &str,
+        current_generation: i64,
     ) -> Result<Vec<CommandRecord>, StoreError> {
         let host = host_id.to_owned();
-        let cutoff = created_before.to_owned();
         self.run_named("list_unsettled_workspace_unregisters", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
@@ -4474,11 +4532,11 @@ impl Store {
                  WHERE host_id = ?1
                    AND operation = 'workspace.unregister'
                    AND state IN ('queued', 'accepted')
-                   AND created_at < ?2
+                   AND (link_generation IS NULL OR link_generation < ?2)
                  ORDER BY created_at ASC, id ASC",
             )?;
             let rows = stmt
-                .query_map(params![host, cutoff], command_from_row)?
+                .query_map(params![host, current_generation], command_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
@@ -5618,7 +5676,12 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             resources_json TEXT,
             max_instances INTEGER NOT NULL DEFAULT 8,
             hostname TEXT,
-            os TEXT
+            os TEXT,
+            -- c-dirpicker r10 item 1: bumped by every node.hello that adopts
+            -- a new link; commands stamp it at mark_forward_intent so the
+            -- reconnect sweep can attribute a command to a link without any
+            -- clock comparison.
+            link_generation INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS objects (
             id TEXT PRIMARY KEY,
@@ -5678,7 +5741,12 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             settlement_outcome TEXT,
             settlement_reason TEXT,
             settlement_http_status INTEGER,
-            settlement_http_body TEXT
+            settlement_http_body TEXT,
+            -- Generation of the host link this command's forward intent was
+            -- recorded on (c-dirpicker r10 item 1); NULL for rows written
+            -- before the column existed, which the reconnect sweep treats as
+            -- belonging to a dead pre-upgrade link.
+            link_generation INTEGER
         );
         CREATE TABLE IF NOT EXISTS journal (
             instance_id TEXT NOT NULL,
@@ -5967,6 +6035,16 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // Last `nodeEpoch` announced by this host, used to detect a Node restart.
     ensure_column(&conn, "hosts", "node_epoch", "TEXT")?;
     ensure_column(&conn, "hosts", "offline_since", "TEXT")?;
+    // c-dirpicker r10 item 1: durable per-host link generation. Every adopting
+    // node.hello bumps it; commands stamp it when forwarded. Never derived
+    // from a timestamp: wall-clock steps (NTP, skew) must not change which
+    // unregister intents a reconnect sweep aborts.
+    ensure_column(
+        &conn,
+        "hosts",
+        "link_generation",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_column(&conn, "devices", "token_prefix", "TEXT")?;
     ensure_column(&conn, "hosts", "token_prefix", "TEXT")?;
     // 2026-09-15: [Image #n] anchor assigned by the send manifest.
@@ -5992,6 +6070,10 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // exact HTTP status and body; NULL for 200 rows and pre-round-2 data.
     ensure_column(&conn, "commands", "settlement_http_status", "INTEGER")?;
     ensure_column(&conn, "commands", "settlement_http_body", "TEXT")?;
+    // c-dirpicker r10 item 1: the host link generation current when this
+    // command's forward intent was recorded. NULL on pre-upgrade rows; the
+    // reconnect sweep attributes those to a dead link and aborts them.
+    ensure_column(&conn, "commands", "link_generation", "INTEGER")?;
     // One-time cleanup of the round-2 shape: a failed delivery was briefly a
     // fourth `state='failed'` value held in a `reason` column. Fold any rows an
     // older build persisted into the §2.5 form (`settled` + a `rejected`

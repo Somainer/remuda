@@ -796,17 +796,10 @@ async fn abort_unregister(
 /// behind the hello reply on the bounded FIFO, and commands whose abort is not
 /// delivered stay `queued`/`accepted` and are retried by the sweep on the
 /// NEXT hello.
-///
-/// r9 item 2: `connected_at` is the reconnect instant (captured by the
-/// carrier just after the hello). A DELETE accepted on the NEW link has a
-/// command row created at/after that instant and must not be aborted — its
-/// prepare/commit are in flight on the very link the sweep is using.
-pub fn spawn_unregister_abort_sweep(state: &AppState, host_id: String, connected_at: String) {
+pub fn spawn_unregister_abort_sweep(state: &AppState, host_id: String) {
     let state = state.clone();
     tokio::spawn(async move {
-        if let Err(error) =
-            abort_unsettled_unregisters_on_reconnect(&state, &host_id, &connected_at).await
-        {
+        if let Err(error) = abort_unsettled_unregisters_on_reconnect(&state, &host_id).await {
             tracing::warn!(%host_id, %error, "post-hello unregister abort sweep failed");
         }
     });
@@ -814,20 +807,29 @@ pub fn spawn_unregister_abort_sweep(state: &AppState, host_id: String, connected
 
 /// Reconcile unregister commands left unsettled across a Node (re)connect
 /// (r7 item 1): for every `workspace.unregister` command on this host still
-/// `queued` or `accepted` that was queued BEFORE this link's hello
-/// (`connected_at`), send the idempotent abort so the Node drops a durable
-/// unbinding mark a dead previous connection prepared. Commands created at
-/// or after `connected_at` belong to in-flight DELETEs on the new link and
-/// are left strictly alone (r9 item 2). Called from the authenticated
-/// `node.hello` path of both carriers.
+/// `queued` or `accepted` that was forwarded over a link OLDER than the one
+/// the adopting `node.hello` installed, send the idempotent abort so the Node
+/// drops a durable unbinding mark a dead previous connection prepared.
+///
+/// r10 item 1: "older" is decided purely by the durable per-host link
+/// generation (see [`Store::bump_host_link_generation`] and
+/// [`Store::mark_forward_intent`]), never by a timestamp. A DELETE accepted
+/// on the NEW link was stamped with the current generation and is left
+/// strictly alone even if its `created_at` predates the hello under a skewed
+/// or backward-stepped clock; a stale command stamped by the previous link is
+/// aborted even when the clock says it was created "just now". Called from
+/// the authenticated `node.hello` path of both carriers.
 pub async fn abort_unsettled_unregisters_on_reconnect(
     state: &AppState,
     host_id: &str,
-    connected_at: &str,
 ) -> Result<(), HubError> {
+    // Read the generation the adopting hello just installed. The bump itself
+    // happens in the hello handler before the transport is registered, so
+    // every command forwarded on the new link already carries this value.
+    let current_generation = state.store.host_link_generation(host_id.to_owned()).await?;
     let pending = state
         .store
-        .list_unsettled_workspace_unregisters(host_id, connected_at)
+        .list_unsettled_workspace_unregisters(host_id, current_generation)
         .await?;
     for command in pending {
         let node_path = command
@@ -1304,12 +1306,13 @@ mod tests {
         }
     }
 
-    /// r9 item 2: the post-reconnect sweep must abort only DELETEs a dead
-    /// previous link left behind. A command created on the NEW link — a DELETE
-    /// whose prepare/commit are in flight while the post-hello sweep runs —
-    /// must never be aborted.
+    /// r10 item 1: the post-reconnect sweep aborts by LINK GENERATION, not by
+    /// timestamp. The old command was forwarded on the dead previous link and
+    /// stamped with its generation; a command forwarded on the NEW link is
+    /// stamped with the generation the adopting hello just installed and must
+    /// never be aborted, no matter what either row's `created_at` says.
     #[tokio::test]
-    async fn reconnect_sweep_skips_unregisters_created_on_the_new_link() {
+    async fn reconnect_sweep_aborts_only_intents_from_older_links() {
         use crate::HubConfig;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1320,7 +1323,11 @@ mod tests {
         let store = state.store.clone();
         let host = crate::config::new_id("hst").unwrap();
         hub.test_insert_host(&host).await.unwrap();
+        // A freshly inserted host has never been adopted by a hello: the
+        // first link the dead command rode on is generation 0.
+        assert_eq!(store.host_link_generation(host.clone()).await.unwrap(), 0);
 
+        // The old command rode the dead previous link (generation 0).
         let (old, _) = store
             .queue_command(
                 None,
@@ -1332,6 +1339,15 @@ mod tests {
             )
             .await
             .unwrap();
+        store
+            .mark_forward_intent(old.command_id.clone())
+            .await
+            .unwrap();
+
+        // The reconnect hello adopts a new link before its transport is
+        // registered; every command forwarded after that stamps generation 1.
+        let adopted = store.bump_host_link_generation(host.clone()).await.unwrap();
+        assert_eq!(adopted, 1);
         let (new, _) = store
             .queue_command(
                 None,
@@ -1343,25 +1359,15 @@ mod tests {
             )
             .await
             .unwrap();
-        // The old command belongs to the dead previous link (created before
-        // the hello); the NEW one is post-dated to model a DELETE accepted on
-        // the new link while the post-hello sweep is running.
-        let new_id = new.command_id.clone();
         store
-            .run_named("test_postdate_new_command", move |conn| {
-                conn.execute(
-                    "UPDATE commands SET created_at = '2099-01-01T00:00:00.000Z' WHERE id = ?1",
-                    params![new_id],
-                )?;
-                Ok(())
-            })
+            .mark_forward_intent(new.command_id.clone())
             .await
             .unwrap();
 
         let node = Arc::new(RecordingAbortNode::default());
         hub.test_set_node_transport(&host, node.clone()).await;
 
-        abort_unsettled_unregisters_on_reconnect(&state, &host, &crate::config::now_rfc3339())
+        abort_unsettled_unregisters_on_reconnect(&state, &host)
             .await
             .unwrap();
 
@@ -1390,16 +1396,17 @@ mod tests {
             "a DELETE accepted on the new link must not be aborted by the sweep"
         );
 
-        // The cutoff is strict: a cutoff before both rows selects nothing.
-        let before_both = store
-            .list_unsettled_workspace_unregisters(&host, "2000-01-01T00:00:00.000Z")
+        // Generation boundary: the current link's own generation selects
+        // nothing (the comparison is strict), and a generation past the new
+        // link returns only the still-queued new row — the old one is settled
+        // and filtered by state.
+        let current = store
+            .list_unsettled_workspace_unregisters(&host, 1)
             .await
             .unwrap();
-        assert!(before_both.is_empty(), "{before_both:?}");
-        // A cutoff after both timestamps still returns only the new row: the
-        // old one is settled now and filtered by state.
+        assert!(current.is_empty(), "{current:?}");
         let later = store
-            .list_unsettled_workspace_unregisters(&host, "2100-01-01T00:00:00.000Z")
+            .list_unsettled_workspace_unregisters(&host, 2)
             .await
             .unwrap();
         assert_eq!(later.len(), 1, "{later:?}");

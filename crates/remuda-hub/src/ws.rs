@@ -419,19 +419,19 @@ pub(crate) fn spawn_egress_reinstall(state: &AppState, host_id: String) {
 /// Post-`node.hello` reconciliation that EVERY carrier must run once the new
 /// transport is registered and the hello reply is queued: the D-048 B.2
 /// egress re-push and the c-dirpicker unregister-abort sweep (r7 item 1,
-/// r8 item 1, r9 item 1).
+/// r8 item 1, r9 item 1, r10 item 1).
 ///
 /// Both run in spawned tasks: they share the session's bounded outbound
 /// FIFO, which the session task itself drains, so awaiting them inline
 /// would fill the FIFO ahead of the reply (parking the hello behind ~32
 /// routed instances) and the sweep's RPC would deadlock the read loop on
-/// its own reply. The timestamp captured here is the reconnect instant:
-/// the sweep (see [`crate::workspaces::abort_unsettled_unregisters_on_reconnect`])
-/// must not abort DELETEs accepted on THIS new link, so only commands
-/// created before it are touched.
+/// its own reply. The sweep decides which intents to abort by the durable
+/// link generation the hello just bumped (see
+/// [`crate::workspaces::abort_unsettled_unregisters_on_reconnect`]), not by
+/// the clock, so no reconnect instant is plumbed here.
 pub(crate) fn spawn_post_hello_tasks(state: &AppState, host_id: String) {
     spawn_egress_reinstall(state, host_id.clone());
-    crate::workspaces::spawn_unregister_abort_sweep(state, host_id, crate::config::now_rfc3339());
+    crate::workspaces::spawn_unregister_abort_sweep(state, host_id);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -536,6 +536,18 @@ pub(crate) async fn handle_node_method(
                     .await?;
             }
             reconcile_lost_instances(state, &host.host_id, &params).await?;
+            // c-dirpicker r10 item 1: adopt the new link generation BEFORE the
+            // transport is registered. Commands can only be forwarded once
+            // the registry slot below exists, so every DELETE issued on this
+            // new link stamps the new generation and the post-hello sweep
+            // attributes it to the live link; unregister intents the dead
+            // previous link left behind carry the old value and are aborted.
+            // Durable and monotonic, so hub restarts and backward wall-clock
+            // steps neither reuse nor move a generation.
+            state
+                .store
+                .bump_host_link_generation(host.host_id.clone())
+                .await?;
             let generation = state
                 .nodes
                 .insert(

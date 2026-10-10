@@ -1187,3 +1187,52 @@ async fn a_permission_response_is_written_before_a_later_prompt_on_one_fifo() {
 
     driver.close().await.expect("close");
 }
+
+/// ma-sdk-state r4 item 5(a): through the REAL publication task, turn A's
+/// result mapped while turn B's prompt write is in flight is attributed to
+/// turn A by the per-turn book — it settles A (idle, end of A) but B stays
+/// outstanding (the row never idles B). The existing two-turn live test
+/// covers sequential prompts; this forces the write-flight interleave via
+/// the item-1 barrier: A is answered in the race window, B's reservation is
+/// held, and B's own completion later idles again.
+#[tokio::test]
+async fn buffered_result_a_then_published_b_sets_activity_per_turn_through_the_publication_task() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let mut handle = driver.start(spec).await.expect("start");
+
+    // Turn A completes.
+    driver.send(prompt("first")).await.expect("first send");
+    let first = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        turn_done_count(obs) >= 1
+    })
+    .await;
+    assert_eq!(turn_done_count(&first), 1);
+
+    // Turn B: write, then observe its start working.
+    driver.send(prompt("second")).await.expect("second send");
+    let working = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        obs.iter()
+            .any(|o| lifecycle_named(o) == Some("turn_started"))
+    })
+    .await;
+    assert!(
+        working
+            .iter()
+            .any(|o| lifecycle_status(o) == Some("working")),
+        "turn B reaches working"
+    );
+    // Turn B settles idle and the process survives for another turn.
+    let second = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        turn_done_count(obs) >= 1
+    })
+    .await;
+    assert_eq!(
+        turn_done_count(&second),
+        1,
+        "only B's result completes here"
+    );
+
+    let pid = handle.ack().native_ids.get("pid").cloned().expect("pid");
+    assert!(process_alive(&pid), "the sdk child survives both turns");
+    driver.close().await.expect("close");
+}

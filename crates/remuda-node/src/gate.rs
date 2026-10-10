@@ -2146,11 +2146,46 @@ JSON
         );
     }
 
-    /// A `gate.jsonl` under ANOTHER merge's pid scratch root in the same
-    /// TMPDIR must never be streamed into this job: the tailer is scoped to
-    /// the child pid this runner spawned.
+    /// A `gate.jsonl` under ANOTHER merge's pid scratch root must never be
+    /// streamed into this job: the tailer is scoped to the child pid this
+    /// runner spawned. Re-exec'd under a private TMPDIR (see the inner test)
+    /// so the planted foreign root never lands in the host's ambient temp dir.
+    #[test]
+    fn a_foreign_runs_gate_report_is_not_streamed() {
+        let scratch = TempDir::new().expect("private TMPDIR");
+        let exe = std::env::current_exe().expect("test binary");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "gate::tests::foreign_gate_report_is_not_streamed_inner",
+                "--ignored",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env("TMPDIR", scratch.path())
+            .output()
+            .expect("re-exec the foreign-report test under a private TMPDIR");
+        assert!(
+            output.status.success(),
+            "foreign-report test broke under a private TMPDIR\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("1 passed"),
+            "the inner foreign-report test did not run: {stdout}"
+        );
+    }
+
+    /// Inner half of [`a_foreign_runs_gate_report_is_not_streamed`]: runs in a
+    /// re-exec'd process whose TMPDIR is private, so the foreign root it
+    /// plants can neither collide with another test run's nor pollute the
+    /// host ambient temp dir.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_foreign_runs_gate_report_is_not_streamed() {
+    #[ignore = "re-exec'd by a_foreign_runs_gate_report_is_not_streamed under a private TMPDIR"]
+    async fn foreign_gate_report_is_not_streamed_inner() {
         let fixture = fixture(PASSING_SCRIPT);
         // Simulate a concurrent gate on this host: fresh, mtime-fresh report
         // under a pid this runner did not spawn.

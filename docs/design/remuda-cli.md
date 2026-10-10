@@ -301,10 +301,14 @@ branch 1's not-yet-landed merge commit. When branch 1 lands, branch 2 lands
 directly if its base *is* the new main; otherwise (branch 1 failed, or a
 third party moved main) it is re-verified onto the real main. Each lane gets
 its own target directory (`<target-dir>-lane<N>`, lane 1 unchanged) and a
-derived Hub e2e port pair: `--e2e-port-base` (default 58980) and
-`+10*(lane-1)` / that `+9`, so lanes are 58980/58989, 58990/58999, …
-sharing one Playwright browser endpoint. The web e2e step is serialised
-across lanes with an advisory `flock(1)` on `--e2e-lock`
+derived Hub e2e port triple: `--e2e-port-base` (default 58980) and
+`+10*(lane-1)` / that `+9` (web) / that `+1` (upstream), so lanes are
+58980/58989/58981, 58990/58999/58991, … sharing one Playwright browser
+endpoint. With the flag absent, lane 1 keeps inherited `HUB_E2E_LISTEN` /
+`HUB_E2E_WEB_PORT` / `HUB_E2E_UPSTREAM_LISTEN` values verbatim; an explicit
+flag overrides them (see the gate runbook in `coordinator-guide.md` for the
+full precedence). The web e2e step is serialised across lanes with an
+advisory `flock(1)` on `--e2e-lock`
 (default `<git-common-dir>/remuda/e2e.lock`); all Cargo steps run fully
 parallel. Concurrency defaults to 2 lanes (`--lanes N`).
 

@@ -50,14 +50,27 @@ import { endReason, NODE_EPOCH_CHANGED } from "../lib/endReason";
 import { bindingChipText, transcriptBinding } from "../lib/transcriptBinding";
 import type { ResumeMode } from "../lib/api";
 import { hubStore, type HubState } from "../lib/store";
+import { e2eSeamsEnabled } from "../lib/e2eSeams";
+import { usePublishedElementHeight } from "../lib/usePublishedElementHeight";
 import type { Id } from "../types/wire";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { readSessionView, writeSessionView, type SessionView } from "../lib/viewPref";
 import { FilesView } from "../features/files/FilesView";
 import session from "../chrome/sessionPage.module.css";
+import annCss from "../features/tasks/annotation.module.css";
 import { profilingEnabled, reportProbe } from "../lib/profileFlags";
 import type { Observation } from "../types/generated";
+import type { UsageRollup } from "../features/session/contextUsage";
+
+declare global {
+  interface Window {
+    /** c-composerpop e2e seam; installed by SessionPage. */
+    __usageLab?: {
+      setRollup: (rollup: UsageRollup) => void;
+    };
+  }
+}
 
 /** Stable empty list so an unfollowed session does not re-project every render. */
 const NO_EVENTS: Observation[] = [];
@@ -289,6 +302,20 @@ function SessionPageBody({
     if (instanceId && !isTtyLabFixtureId(instanceId)) void hubStore.follow(instanceId);
   }, [instanceId]);
 
+  // c-composerpop e2e seam: inject a Hub-computed usage rollup as if a poll
+  // had delivered it (fake-node sessions never report usage). Installed ONLY
+  // when the e2e seam marker is set (hub-auth addInitScript); a production
+  // session never gets this handle.
+  useEffect(() => {
+    if (!e2eSeamsEnabled() || !instanceId || isTtyLabFixtureId(instanceId)) return;
+    window.__usageLab = {
+      setRollup: (rollup: UsageRollup) => hubStore.setUsageRollupForTest(instanceId, rollup),
+    };
+    return () => {
+      delete window.__usageLab;
+    };
+  }, [instanceId]);
+
   useEffect(() => {
     if (instanceId && (view === "tty" || view === "structured")) writeSessionView(instanceId, view);
   }, [instanceId, view]);
@@ -322,17 +349,31 @@ function SessionPageBody({
     return () => window.removeEventListener("keydown", onKey, true);
   }, [view, backTo, navigate]);
 
-  const events = hub.events ?? NO_EVENTS;
-  const pending = hub.pending;
-  // c-endreason: the shared human sentence (「Node 重启，会话已中断」 for a
-  // restart), toned — only a failed ending is ever painted red. It reads the
-  // durable lifecycle only: the Hub marks an ended row disconnected (a Node
-  // restart does exactly that), and projectStatus answers "unknown" for any
+  // c-composerpop r4 item 1: publish the bottom chrome's measured height as a
+  // global custom property so the notify stack can anchor ABOVE the lowest
+  // interactive surface on /s/:id. Shell renders ShellNotify as a sibling of
+  // <main>, so a value set on a SessionPage node would not inherit to the
+  // stack; ride documentElement (its common ancestor). The structured views
+  // render the session dock (composer control bar); the tty view renders no
+  // dock, so TerminalView hands up its bottom chrome (local input dock +
+  // phone key bar, + the byte-route note on desktop). Exactly one is mounted
+  // at a time and SessionPage is the single writer — two writers would race
+  // on the same property across the tty/structured switch. The hook clears
+  // the value with no element so non-session routes never see a stale height.
+  const [dockEl, setDockEl] = useState<HTMLDivElement | null>(null);
+  const [ttyChromeEl, setTtyChromeEl] = useState<HTMLDivElement | null>(null);
+  usePublishedElementHeight(dockEl ?? ttyChromeEl, "--session-dock-h");
+  // Durable-lifecycle end state (a failed process is red; a Node restart is
+  // toned — only a failed ending is ever painted red). It reads the durable
+  // lifecycle only: the Hub marks an ended row disconnected (a Node restart
+  // does exactly that), and projectStatus answers "unknown" for any
   // disconnected row before it looks at the lifecycle. An ended session must
   // keep its EndedBar and Resume, and must never mount a live Composer, while
   // its host is away.
   const ended = instance ? endReason(instance) : null;
   const status = ended ? "exited" : instance ? projectStatus(instance) : "unknown";
+  const events = hub.events ?? NO_EVENTS;
+  const pending = hub.pending;
   // The turn-end decision folds every channel (hook latch, screen, transcript
   // tail, pending interactions), not the hook latch alone — so a turn whose
   // Stop hook never lands still ends once the screen/pty says idle. It is the
@@ -738,6 +779,7 @@ function SessionPageBody({
         ) : resolvedView === "tty" ? (
           <TerminalView
             instance={instance}
+            bottomChromeRef={setTtyChromeEl}
             onAttachFailed={(reason) => {
               hubStore.toast(reason);
               navigate(`/s/${instance.id}/structured`, { replace: true });
@@ -774,9 +816,29 @@ function SessionPageBody({
         // Terminal segments and raw events carry no dock, but an ended session
         // still offers its one resume entry under the pane.
         endedBar ? <div className={session.endedDock}>{endedBar}</div> : null
-      ) : <div className={session.dock} data-testid="session-dock">
-        {/* §2.2 dock order: pending cards → notifications → live row →
-            批注行 → TaskTrack → Composer / EndedBar. */}
+      ) : <div ref={setDockEl} className={session.dock} data-testid="session-dock">
+        {/* Zero-flow floating chip row anchored at the dock top (c-composerpop
+            r2/r3): rests just above the composer over the transcript edge and
+            never shrinks the session body's measured viewport share. */}
+        <div className={annCss.floatLayer}>
+          <div data-testid="annotation-dock" className={annCss.annotationBar}>
+            <AnnotationBadge instanceId={instance.id} readonly={annotationReadonly} />
+            {annotationAllowed ? (
+              <button
+                type="button"
+                className={annCss.badge}
+                data-testid="annotation-add"
+                onClick={() => annotationPanel.openPanel(instance.id, "card", null)}
+              >
+                ＋ 加批注
+              </button>
+            ) : annotationReadonly ? (
+              <span className={annCss.readonlyTag} data-testid="annotation-readonly-tag">
+                只读预览 · 不可批注
+              </span>
+            ) : null}
+          </div>
+        </div>
         {pending.length > 0 ? (
           <div className={session.pendingArea} data-testid="pending-area">
             {pending.map((item) =>
@@ -827,7 +889,7 @@ function SessionPageBody({
             decision={turnDecision}
             onInterrupt={() => hubStore.cancel(instance.id)}
           />
-        )}        <AnnotationBadge instanceId={instance.id} readonly={annotationReadonly} />
+        )}
         <TaskTrack tasks={tasks} />
         {genericPty ? (
           <div className={session.keys} data-testid="keys-row">

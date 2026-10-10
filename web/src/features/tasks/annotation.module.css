@@ -7,6 +7,24 @@
  * wire and no queue structure (D-042 untouched).
  */
 
+/* Zero-height anchor at the top of the session dock; the bar floats above
+   the dock edge (over the transcript) so it consumes no flow height and the
+   session body keeps its measured viewport share. */
+.floatLayer {
+  position: relative;
+  height: 0;
+  /* Above popovers/menus (--z-popover 40) so the 批注 bar is never covered by
+     an open slider, below sheets (--z-sheet 60). Was 6, which painted under
+     menus once popovers rose to the token scale (c-composerpop r2 item 3). */
+  z-index: var(--z-annotation-dock);
+  pointer-events: none;
+}
+
+.annotationBar {
+  position: absolute;
+  right: 18px;
+  bottom: calc(100% + 6px);
+  display: inline-flex;
 /* The dock's 批注行 (ui-spec §2.2 item 5): a quiet 24px row in the dock's own
    flow, only while drafts exist. The entry point is the ⋯ menu's 加批注. */
 .badgeRow {

@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -179,6 +180,9 @@ class GateDriverEndToEndTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.stub = self.root / "stub.py"
         self.report = self.root / "gate.jsonl"
+        # The orphan grandchild records its own pid here so tearDown can kill
+        # exactly that process — never a host-wide pkill.
+        self.orphan_pidfile = self.root / "orphan.pid"
         self.stub.write_text(
             "#!" + sys.executable + "\n"
             "import os, sys, time\n"
@@ -188,6 +192,8 @@ class GateDriverEndToEndTests(unittest.TestCase):
             "    # would keep subprocess.run() waiting for EOF forever.\n"
             "    if os.fork() == 0:\n"
             "        os.setsid()\n"
+            "        with open(os.environ['REMUDA_TEST_ORPHAN_PIDFILE'], 'w') as f:\n"
+            "            f.write(str(os.getpid()))\n"
             "        null = os.open(os.devnull, os.O_RDWR)\n"
             "        os.dup2(null, 0); os.dup2(null, 1); os.dup2(null, 2)\n"
             "        time.sleep(300)\n"
@@ -198,13 +204,35 @@ class GateDriverEndToEndTests(unittest.TestCase):
         self.stub.chmod(0o755)
 
     def tearDown(self):
-        # The orphan is reparented to init; clean it up explicitly.
-        subprocess.run(["pkill", "-9", "-f", "time.sleep(300)"], check=False)
+        # Kill only the orphan THIS test forked (pid it recorded itself); a
+        # host-wide pkill -f would also reap unrelated processes on the box.
+        try:
+            pid = int(self.orphan_pidfile.read_text().strip())
+        except (OSError, ValueError):
+            pid = None
+        if pid is not None:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                # Re-check visibility before EACH signal: once SIGTERM makes
+                # the pid disappear it may already be recycled, so the SIGKILL
+                # escalation must never reach a process this test did not
+                # start.
+                if not supervisor.pid_visible(pid):
+                    break
+                try:
+                    os.kill(pid, sig)
+                except OSError:
+                    break
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if not supervisor.pid_visible(pid):
+                        break
+                    time.sleep(0.05)
         self.tmp.cleanup()
 
     def test_hanging_step_times_out_and_fails_the_gate(self):
         env = dict(os.environ)
         env["REMUDA_MERGE_GATE_COMMAND"] = str(self.stub)
+        env["REMUDA_TEST_ORPHAN_PIDFILE"] = str(self.orphan_pidfile)
         env["REMUDA_GATE_STEP_TIMEOUTS"] = json.dumps({"web-install": 1})
         env["CARGO_TARGET_DIR"] = str(self.root / "target")
         proc = subprocess.run(
@@ -223,6 +251,12 @@ class GateDriverEndToEndTests(unittest.TestCase):
         install = next(step for step in steps if step["name"] == "web-install")
         self.assertEqual(install["status"], "failed")
         self.assertEqual(install["reason"], "timeout")
+        # The escaping grandchild really forked and recorded its own pid;
+        # tearDown kills exactly that pid.
+        self.assertTrue(
+            self.orphan_pidfile.exists(),
+            "the orphan grandchild never recorded its pid",
+        )
         self.assertTrue(
             all(
                 step["status"] == "skipped"

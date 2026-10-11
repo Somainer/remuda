@@ -1443,11 +1443,14 @@ pub fn rollup_instance(
     // item 5; scope_id is the RESPONSE id but the row carries turn_id). The
     // turn count is therefore the number of DISTINCT turns: scope_id for
     // turn rows, turn_id (stamped on every adapter observation) for messages.
+    // Legacy pre-scopeId Turn rows (NULL scope_id, one per seq) are counted by
+    // seq fallback so upgraded instances do not report zero turns (r7 item 8).
     let totals = conn.query_row(
         "SELECT
-            COUNT(DISTINCT CASE WHEN scope='turn' THEN scope_id
+            COUNT(DISTINCT CASE WHEN scope='turn' AND scope_id IS NOT NULL THEN scope_id
                                 WHEN scope='message' THEN turn_id
-                                WHEN scope='workflow-member' THEN scope_id END),
+                                WHEN scope='workflow-member' THEN scope_id END)
+            + COUNT(CASE WHEN scope='turn' AND scope_id IS NULL THEN 1 END),
             SUM(CASE WHEN scope IN ('turn','message') THEN input_tokens END),
             SUM(CASE WHEN scope IN ('turn','message') THEN output_tokens END),
             SUM(CASE WHEN scope IN ('turn','message') THEN cache_read_tokens END),
@@ -1699,14 +1702,19 @@ mod tests {
             scope_id.is_none(),
             "old row has no scope_id, so is not deduped"
         );
-        // Rollup still works after upgrade (legacy turn row has NULL
-        // scope_id/turn_id, but the session-stock/fallback paths still
-        // produce a rollup).
-        assert!(
-            rollup_fold(&conn, "ins_old", "claude", Some("fake"))
-                .unwrap()
-                .is_some()
-        );
+        // Rollup works after upgrade AND counts the legacy NULL-scope_id Turn
+        // row correctly (r7 item 8): one turn, its tokens in totals, and it is
+        // eligible for the rate-window flow (native timestamp present).
+        let upgraded = rollup_fold(&conn, "ins_old", "claude", Some("fake"))
+            .unwrap()
+            .expect("legacy row rolls up");
+        assert_eq!(upgraded.turns, 1, "legacy NULL-scope_id turn is counted");
+        assert_eq!(upgraded.session_input_tokens, Some(500));
+        assert_eq!(upgraded.session_output_tokens, Some(500));
+        // Legacy rows were written before the native/ingest source split;
+        // they default to observed_at_source='ingest', so lastTurnAt is not
+        // driven from them (r7 item 8 asserts the COUNT fix, not source repair
+        // of pre-split rows).
     }
 
     #[test]

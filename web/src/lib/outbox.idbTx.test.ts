@@ -290,6 +290,64 @@ it("a write whose request succeeds but whose transaction aborts afterwards is no
   expect((await storage.all()).map((r) => r.commandId)).toContain("cmd_retry_ok");
 });
 
+it("GATE16 item 2: a tracked same-owner claim that becomes FOREIGN hands off — the Outbox wake cancels and never triggers a flush", async () => {
+  // One expiry scheduler per lease: Outbox owns same-owner inactive claims,
+  // the store scheduler owns foreign ones. If the Outbox wake adopted the
+  // foreign lease it would fire onClaimWake (a second, independent
+  // flushAllOutbox with its own attempted set) at the deadline — the exact
+  // path that re-POSTed a 'held' command before its retry delay.
+  const install = installFakeIndexedDB();
+  void install;
+  const opened = await openOutboxStorage();
+  const storage = opened.storage;
+  const originalLocks = (globalThis.navigator as { locks?: LockManager }).locks;
+  Object.defineProperty(globalThis.navigator, "locks", { value: undefined, configurable: true });
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(1_300_000);
+    const owner = "owner_same_then_foreign";
+    const foreign = "owner_other_document";
+    const T = Date.now() + 30_000;
+    await storage.put({
+      ...probeRecord("cmd_handoff"),
+      instanceId: "ins_hf",
+      state: "inflight",
+      lease: { owner, until: T },
+    });
+    const box = await Outbox.load(storage, owner);
+    expect(box.pendingClaimWakeups()).toEqual(["cmd_handoff"]);
+    const wakes = vi.fn();
+    box.onClaimWake = wakes;
+
+    // Before the deadline another document claims the same row with its OWN
+    // lease at the same deadline (a renewal by a different recovery owner).
+    const replaceP = storage.put({
+      ...probeRecord("cmd_handoff"),
+      instanceId: "ins_hf",
+      state: "inflight",
+      lease: { owner: foreign, until: T },
+    });
+    await vi.advanceTimersByTimeAsync(5);
+    await replaceP;
+    // Any refresh (the store refreshes inside every flush) must hand the wake
+    // off rather than adopt the foreign lease.
+    await box.refreshDurable();
+    expect(box.pendingClaimWakeups()).toEqual([]);
+    expect(box.get("cmd_handoff")?.lease?.owner).toBe(foreign);
+
+    // Well past the deadline: no Outbox-driven delivery trigger — the store's
+    // foreign-lease scheduler is the only one allowed to recover this row.
+    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(wakes).not.toHaveBeenCalled();
+    expect(box.pendingClaimWakeups()).toEqual([]);
+    box.dispose();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis.navigator, "locks", { value: originalLocks, configurable: true });
+  }
+});
+
 it("GATE15 item 2: a same-owner inflight claim appearing AFTER load gets an expiry wake and delivers at the deadline; an active delivery is not woken", async () => {
   const db = installFakeIndexedDB();
   const opened = await openOutboxStorage();

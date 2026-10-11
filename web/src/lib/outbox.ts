@@ -818,7 +818,11 @@ export class Outbox {
           // terminal here — adopt its lease (future deadline armed, overdue
           // reclaimed immediately by the scheduled wake).
           box.cache.set(id, stored);
-          if (stored.state === "inflight" && stored.lease) {
+          if (stored.state === "inflight" && stored.lease && stored.lease.owner === box.owner) {
+            // Same-owner inflight replacement: adopt its lease (future armed,
+            // overdue reclaimed immediately). A FOREIGN replacement is handed
+            // off to the store's foreign-lease scheduler — do not arm (gate 16
+            // item 2: exactly one scheduler per lease).
             box.scheduleClaimWakeup(id, instanceId, stored.lease, 0);
           } else {
             box.clearClaimWakeup(id);
@@ -1018,6 +1022,7 @@ export class Outbox {
       | { kind: "failure" }
       | { kind: "stop"; rec: OutboxRecord | null }
       | { kind: "adopt"; lease: { owner: Id; until: number } }
+      | { kind: "handoff"; lease: { owner: Id; until: number } }
       | { kind: "deliver"; rec: OutboxRecord };
     let outcome: Outcome;
     try {
@@ -1038,12 +1043,18 @@ export class Outbox {
       }
       const lease = current.lease;
       if (lease.owner !== snapshot.owner || lease.until !== snapshot.until) {
-        // Gate 13 item 1 (a/b): the authoritative row is STILL inflight under
-        // a different lease — the live owner renewed it, or this throttled
-        // timer fired after the replacement also expired. "Still inflight" is
-        // never terminal: ADOPT {owner, until}; the caller arms with
-        // delay max(0, until-now) and resets the failure count, so an overdue
-        // replacement is reclaimed immediately under this lock.
+        if (lease.owner !== this.owner) {
+          // Gate 16 item 2: ownership changed to a FOREIGN owner. The store's
+          // lease-expiry scheduler (scheduleLeaseExpiryWakeup) is the single
+          // owner of foreign-lease recovery; this Outbox wake must HAND OFF —
+          // cancel itself instead of adopting — or both schedulers fire, run
+          // two independent flushes and re-POST a `held` row past its delay.
+          return { kind: "handoff", lease };
+        }
+        // Same owner, different deadline: a renewal by this recovery identity.
+        // Gate 13 item 1 (a/b): "still inflight" is never terminal — ADOPT
+        // {owner, until}; delay max(0, until-now), failure count reset, so an
+        // overdue same-owner replacement reclaims immediately.
         return { kind: "adopt", lease };
       }
       // Same exact snapshot. Gate 13 item 2: a timer firing is NOT proof of
@@ -1067,10 +1078,12 @@ export class Outbox {
         if (!reclaimed) return { kind: "stop", rec: null };
         if (reclaimed.state === "pending") return { kind: "deliver", rec: reclaimed };
         // Gate 13 item 1 (b): a concurrent renewal between read and claim
-        // makes the conditional return the replacement inflight row — adopt
-        // its lease rather than stopping (or delivering stale).
+        // makes the conditional return the replacement inflight row. Same
+        // owner -> adopt; foreign owner -> hand off to the store scheduler.
         if (reclaimed.state === "inflight" && reclaimed.lease) {
-          return { kind: "adopt", lease: reclaimed.lease };
+          return reclaimed.lease.owner === this.owner
+            ? { kind: "adopt", lease: reclaimed.lease }
+            : { kind: "handoff", lease: reclaimed.lease };
         }
         return { kind: "stop", rec: reclaimed };
       } catch {
@@ -1098,6 +1111,13 @@ export class Outbox {
       // Fresh failure counter for the new lease; scheduleClaimWakeup turns an
       // overdue deadline into an immediate wake.
       this.scheduleClaimWakeup(commandId, instanceId, outcome.lease, 0);
+      return;
+    }
+    if (outcome.kind === "handoff") {
+      // Foreign owner now: stop tracking it in the Outbox (the cache still
+      // imports the row from the read). The store's foreign-lease scheduler
+      // owns expiry recovery from here (gate 16 item 2).
+      this.clearClaimWakeup(commandId);
       return;
     }
     if (outcome.rec) this.cache.set(commandId, outcome.rec);
@@ -1237,8 +1257,15 @@ export class Outbox {
       }
       const lease = fresh.lease;
       if (lease.owner === entry.snapshot.owner && lease.until === entry.snapshot.until) continue;
-      // Adopt the replacement lease — future deadline armed, overdue armed
-      // immediately (delay max(0, until-now)), failure count reset.
+      if (lease.owner !== this.owner) {
+        // Ownership changed to a foreign owner: HAND OFF to the store's
+        // foreign-lease scheduler (gate 16 item 2). Adopting here too would
+        // run two schedulers for one lease.
+        this.clearClaimWakeup(id);
+        continue;
+      }
+      // Same-owner replacement lease — adopt (future deadline armed, overdue
+      // armed immediately, failure count reset).
       this.scheduleClaimWakeup(id, entry.instanceId, lease, 0);
     }
     // Discover NEWLY APPEARED inactive SAME-OWNER claims with no wake yet —

@@ -213,6 +213,7 @@ async fn broadcast(
                 body.operation.clone(),
                 payload,
                 key,
+                None,
             )
             .await
             .map_err(crate::http::map_store);
@@ -467,6 +468,7 @@ async fn fleet_commands(
                 host_id.clone(),
                 body.operation.clone(),
                 payload,
+                None,
                 None,
             )
             .await

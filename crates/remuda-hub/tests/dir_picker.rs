@@ -1482,12 +1482,28 @@ mod abort {
                 "workspace.unregister".into(),
                 json!({"path": root, "workspaceId": WORKSPACE}),
                 None,
+                None,
             )
             .await?;
         store
-            .mark_forward_intent(command.command_id.clone())
+            .mark_forward_intent(command.command_id.clone(), 0)
             .await?;
         store.mark_accepted(command.command_id.clone()).await?;
+        // Model the reconnect hello adopting a new link before the sweep
+        // runs; the stuck command stays stamped with the previous generation.
+        store
+            .bump_host_link_generation(fixture.host.clone())
+            .await?;
+        // r10 item 2: make the clock LIE in the stale command's favour —
+        // postdate it past the reconnect hello, exactly the row the old
+        // created_at cutoff would have hidden. The generation comparison
+        // must abort it anyway, deterministically (no sleeps, no now()).
+        store
+            .test_set_command_created_at(
+                command.command_id.clone(),
+                "2099-01-01T00:00:00.000Z".to_owned(),
+            )
+            .await?;
 
         // The node.hello reconciliation runs and must abort it.
         fixture
@@ -1543,12 +1559,26 @@ mod abort {
                 "workspace.unregister".into(),
                 json!({"path": root, "workspaceId": WORKSPACE}),
                 None,
+                None,
             )
             .await?;
         store
-            .mark_forward_intent(command.command_id.clone())
+            .mark_forward_intent(command.command_id.clone(), 0)
             .await?;
         store.mark_accepted(command.command_id.clone()).await?;
+        // The stuck command rode the previous link; the reconnect hello must
+        // adopt a new generation before its sweep can attribute it. A
+        // postdated created_at ("created just now" per the clock) must not
+        // hide it from that generation-based sweep (r10 item 2).
+        store
+            .bump_host_link_generation(fixture.host.clone())
+            .await?;
+        store
+            .test_set_command_created_at(
+                command.command_id.clone(),
+                "2099-01-01T00:00:00.000Z".to_owned(),
+            )
+            .await?;
 
         // The Node reports the abort as an already-settled commit.
         fixture.node.next_abort_reports_settled();
@@ -1874,13 +1904,31 @@ async fn reconnect_after_dropped_prepare_aborts_on_the_new_socket_and_unblocks_t
     first.await??;
 
     let store = hub.store().expect("store");
-    // Model the reconnect cutoff (r9 item 2): any instant after the stuck
-    // command was created and before the new link's hello.
+    // The stuck DELETE was stamped with the FIRST link's generation when it
+    // was forwarded. The second link's hello is about to adopt the next
+    // generation, so ask for intents older than that — the exact set the
+    // post-hello sweep will abort (r10 item 1: generations, not a clock).
+    let next_generation = store.host_link_generation(host.clone()).await? + 1;
     let pending = store
-        .list_unsettled_workspace_unregisters(&host, "2099-01-01T00:00:00.000Z")
+        .list_unsettled_workspace_unregisters(&host, next_generation)
         .await?;
     assert_eq!(pending.len(), 1, "{pending:?}");
     let stuck_command = pending[0].command_id.clone();
+    // r10 item 2: postdate the stale intent to AFTER the reconnect instant
+    // — under the old wall-clock cutoff it would have been hidden from the
+    // sweep forever. On the real node.hello path the generation stamp must
+    // still make it the one aborted command.
+    store
+        .test_set_command_created_at(stuck_command.clone(), "2099-01-01T00:00:00.000Z".to_owned())
+        .await?;
+    assert_eq!(
+        store
+            .list_unsettled_workspace_unregisters(&host, next_generation)
+            .await?
+            .len(),
+        1,
+        "a postdated stale intent must still be selected for abort"
+    );
 
     // --- Reconnect through the REAL node.hello path on a fresh socket. The
     // post-hello sweep (spawned after state.nodes.insert, queued after the
@@ -1960,6 +2008,446 @@ async fn reconnect_after_dropped_prepare_aborts_on_the_new_socket_and_unblocks_t
     );
 
     second.abort();
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// Scripted Node for the r11 item 2 transport/generation pinning tests.
+/// `dead` answers every `workspace.unregister` RPC with an error (a half-open
+/// link whose writes fail); a live node answers the protocol phases.
+struct InterleaveNode {
+    name: &'static str,
+    calls: Mutex<Vec<&'static str>>,
+    dead: std::sync::atomic::AtomicBool,
+}
+
+impl InterleaveNode {
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn list_reply(&self) -> Value {
+        json!({
+            "workspaceRevision": 1,
+            "workspaces": [{
+                "workspaceId": WORKSPACE,
+                "hostId": "hst_interleave",
+                "root": ROOT,
+            }],
+        })
+    }
+}
+
+impl NodeTransport for InterleaveNode {
+    fn kind(&self) -> TransportKind {
+        TransportKind::OutboundWss
+    }
+
+    fn call(
+        &self,
+        method: &str,
+        params: Value,
+        _timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, remuda_hub::HubError>> + Send + '_>>
+    {
+        let method = method.to_owned();
+        let phase = params
+            .get("phase")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let command_id = params.get("commandId").cloned().unwrap_or(Value::Null);
+        Box::pin(async move {
+            match method.as_str() {
+                "workspace.list" => Ok(Some(self.list_reply())),
+                "workspace.resolve" => Ok(Some(json!({
+                    "workspaceId": WORKSPACE,
+                    "canonicalRoot": ROOT,
+                }))),
+                "workspace.unregister" => {
+                    let label: &'static str = match phase.as_str() {
+                        "prepare" => "prepare",
+                        "commit" => "commit",
+                        "abort" => "abort",
+                        _ => "other",
+                    };
+                    self.calls.lock().unwrap().push(label);
+                    if self.dead.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(remuda_hub::HubError::Internal(format!(
+                            "{} link is dead (simulated broken pipe)",
+                            self.name
+                        )));
+                    }
+                    let reply_phase = match phase.as_str() {
+                        "prepare" => "prepared",
+                        "commit" => "settled",
+                        // Any non-"settled" ack is positive abort evidence.
+                        _ => "aborted",
+                    };
+                    Ok(Some(json!({
+                        "workspaceRevision": 2,
+                        "workspaces": [],
+                        "workspaceId": WORKSPACE,
+                        "commandId": command_id,
+                        "phase": reply_phase,
+                    })))
+                }
+                other => Err(remuda_hub::HubError::Internal(format!(
+                    "unexpected {other}"
+                ))),
+            }
+        })
+    }
+
+    fn notify(
+        &self,
+        _method: &str,
+        _params: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, remuda_hub::HubError>> + Send + '_>> {
+        Box::pin(std::future::ready(Ok(true)))
+    }
+}
+
+/// r11 item 2 interleaving (i): the DELETE has stamped the forward intent and
+/// pinned the half-open L1 when the L2 hello bumps to gen 2 and registers.
+/// Prepare (and the failure abort) must ride L1 — never L2 — so the operator
+/// error is L1's dead-link failure rather than an L2 answer for a gen-1 row,
+/// and L2's post-hello sweep is what aborts the stale command. Interleaving
+/// (ii): a DELETE that arrives AFTER L2 registered pins gen 2; prepare+commit
+/// ride L2 and settle, and no sweep aborts it.
+///
+/// The park point is the ForwardMarked barrier: after the mark, before the
+/// prepare. Code that re-resolved the transport only at send time (the old
+/// mark→call_node ordering) would ride L2 here and answer 200; the pinned
+/// ordering fails on dead L1 instead.
+#[tokio::test]
+async fn forward_pin_keeps_prepare_commit_on_one_link_across_a_hello() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config = HubConfig::for_test(dir.path().join("data"));
+    let bootstrap = config.bootstrap_token.clone();
+    let hub = spawn(config).await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    let host = HostId::new().as_id().as_str().to_owned();
+    hub.test_insert_host(&host).await?;
+    let store = hub.store().expect("store");
+
+    // L1 adopts gen 1 — a half-open link whose writes now fail.
+    assert_eq!(store.bump_host_link_generation(host.clone()).await?, 1);
+    let l1 = Arc::new(InterleaveNode {
+        name: "L1",
+        calls: Mutex::new(Vec::new()),
+        dead: std::sync::atomic::AtomicBool::new(true),
+    });
+    hub.test_set_node_transport_with_generation(&host, l1.clone(), 1)
+        .await;
+
+    // Observe the snapshot so the DELETE resolves by exact root.
+    let (status, _) = json_request(
+        hub.addr,
+        "GET",
+        &format!("/v1/hosts/{}/workspaces", host),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200);
+
+    // DELETE parks after the mark/pin, before the prepare.
+    let (reached, release) = hub.test_arm_forward_marked_barrier(&host, WORKSPACE);
+    let addr = hub.addr;
+    let host_for_delete = host.clone();
+    let cookie_for_delete = cookie.clone();
+    let delete = tokio::spawn(async move {
+        json_request(
+            addr,
+            "DELETE",
+            &format!("/v1/hosts/{}/workspaces", host_for_delete),
+            &[("Cookie", &cookie_for_delete)],
+            Some(&json!({"path": ROOT}).to_string()),
+        )
+        .await
+    });
+    reached.notified().await;
+
+    // The L2 hello lands while the DELETE is parked: durable bump and the new
+    // transport register (the real hello arm order).
+    assert_eq!(store.bump_host_link_generation(host.clone()).await?, 2);
+    let l2 = Arc::new(InterleaveNode {
+        name: "L2",
+        calls: Mutex::new(Vec::new()),
+        dead: std::sync::atomic::AtomicBool::new(false),
+    });
+    hub.test_set_node_transport_with_generation(&host, l2.clone(), 2)
+        .await;
+    release.send(()).expect("release the parked DELETE");
+
+    // The pinned L1 prepare fails (dead link); the best-effort abort rides the
+    // SAME pinned L1. The operator gets a failure, never an L2 answer for a
+    // gen-1 row.
+    let (status, body) = delete.await.expect("delete task joined")?;
+    assert_ne!(
+        status, 200,
+        "a dead pinned link must not report success: {body}"
+    );
+    assert_eq!(
+        l1.calls(),
+        vec!["prepare", "abort"],
+        "prepare and the best-effort abort both stayed on L1"
+    );
+    assert!(l2.calls().is_empty(), "the parked DELETE never rode L2");
+
+    // L2's post-hello sweep aborts the gen-1 row over L2.
+    hub.test_reconcile_unsettled_unregisters(&host).await;
+    assert_eq!(
+        l2.calls(),
+        vec!["abort"],
+        "only L2 runs the gen-2 sweep abort"
+    );
+    assert_eq!(
+        l1.calls(),
+        vec!["prepare", "abort"],
+        "the sweep does not retry the dead L1 transport"
+    );
+
+    // Interleaving (ii): a DELETE after L2 registered pins gen 2 and the whole
+    // prepare→commit rides L2 and settles.
+    let (status, body) = json_request(
+        hub.addr,
+        "DELETE",
+        &format!("/v1/hosts/{}/workspaces", host),
+        &[("Cookie", &cookie)],
+        Some(&json!({"path": ROOT}).to_string()),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(l2.calls(), vec!["abort", "prepare", "commit"]);
+    assert_eq!(
+        l1.calls(),
+        vec!["prepare", "abort"],
+        "a gen-2 forwarding attempt never touches the stale L1"
+    );
+
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// r12 item 1: the DELETE pins (L1, N) BEFORE queueing. A hello that bumps the
+/// hosts counter to N+1 between the pin and the INSERT used to make the INSERT
+/// stamp N+1; a sweep between the INSERT and mark_forward_intent then skipped
+/// the row, the mark rewrote it to N, and the command rode dead L1 unswept
+/// until L3. The INSERT now stamps the PINNED N, so a sweep at N+1 running in
+/// the INSERT→mark gap selects the row.
+#[tokio::test]
+async fn pinned_generation_at_insert_keeps_the_row_selectable_in_the_mark_window() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config = HubConfig::for_test(dir.path().join("data"));
+    let bootstrap = config.bootstrap_token.clone();
+    let hub = spawn(config).await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    let host = HostId::new().as_id().as_str().to_owned();
+    hub.test_insert_host(&host).await?;
+    let store = hub.store().expect("store");
+
+    // L1 adopts generation 1 and is the registered transport.
+    assert_eq!(store.bump_host_link_generation(host.clone()).await?, 1);
+    let l1 = Arc::new(InterleaveNode {
+        name: "L1",
+        calls: Mutex::new(Vec::new()),
+        dead: std::sync::atomic::AtomicBool::new(false),
+    });
+    hub.test_set_node_transport_with_generation(&host, l1.clone(), 1)
+        .await;
+
+    // Observe the snapshot so the DELETE resolves by exact root.
+    let (status, _) = json_request(
+        hub.addr,
+        "GET",
+        &format!("/v1/hosts/{}/workspaces", host),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200);
+
+    // Arm both park points: after the pin (before INSERT) and after the INSERT
+    // (before mark).
+    let (pinned_reached, release_pinned) = hub.test_arm_forward_pinned_barrier(&host, WORKSPACE);
+    let (queued_reached, release_queued) = hub.test_arm_forward_queued_barrier(&host, WORKSPACE);
+    let addr = hub.addr;
+    let host_for_delete = host.clone();
+    let cookie_for_delete = cookie.clone();
+    let delete = tokio::spawn(async move {
+        json_request(
+            addr,
+            "DELETE",
+            &format!("/v1/hosts/{}/workspaces", host_for_delete),
+            &[("Cookie", &cookie_for_delete)],
+            Some(&json!({"path": ROOT}).to_string()),
+        )
+        .await
+    });
+    pinned_reached.notified().await;
+
+    // The hello lands AFTER the pin but BEFORE the INSERT: hosts goes 1 → 2.
+    // The registry still carries the half-open L1 the pinned frame will ride.
+    assert_eq!(store.bump_host_link_generation(host.clone()).await?, 2);
+    release_pinned.send(()).expect("let the INSERT run");
+
+    // The handler INSERTs the row and parks again before the mark.
+    queued_reached.notified().await;
+
+    // The post-hello sweep at generation 2, running BEFORE the mark, must
+    // already select the row: its INSERT stamp is the PINNED 1, not the hosts
+    // counter's new 2.
+    let pending = store.list_unsettled_workspace_unregisters(&host, 2).await?;
+    assert_eq!(
+        pending.len(),
+        1,
+        "the sweep in the INSERT→mark window must select the row stamped with the pinned generation"
+    );
+    let queued_id = pending[0].command_id.clone();
+
+    // Release: the mark refreshes the same pinned 1 and the frame rides L1 and
+    // settles (no new transport was installed).
+    release_queued.send(()).expect("release the parked DELETE");
+    let (status, body) = delete.await.expect("delete task joined")?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(l1.calls(), vec!["prepare", "commit"]);
+    assert_eq!(
+        store.get_command(queued_id).await?.expect("row").state,
+        "settled"
+    );
+
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// Scripted Node for the r12 item 2 forward_if_online test: accepts
+/// `instance.create`. Records every create call so the test can tell which
+/// link the frame reached.
+struct CreateNode {
+    creates: Mutex<Vec<String>>,
+}
+
+impl NodeTransport for CreateNode {
+    fn kind(&self) -> TransportKind {
+        TransportKind::OutboundWss
+    }
+
+    fn call(
+        &self,
+        method: &str,
+        params: Value,
+        _timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, remuda_hub::HubError>> + Send + '_>>
+    {
+        let method = method.to_owned();
+        Box::pin(async move {
+            if method != "instance.create" {
+                return Err(remuda_hub::HubError::Internal(format!(
+                    "CreateNode got unexpected {method}"
+                )));
+            }
+            let command_id = params
+                .get("commandId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            self.creates.lock().unwrap().push(command_id.clone());
+            Ok(Some(
+                json!({"accepted": true, "instanceId": params["instanceId"]}),
+            ))
+        })
+    }
+
+    fn notify(
+        &self,
+        _method: &str,
+        _params: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, remuda_hub::HubError>> + Send + '_>> {
+        Box::pin(std::future::ready(Ok(true)))
+    }
+}
+
+/// r12 item 2: `forward_if_online` (instance.create/resume/send) must resolve
+/// the transport at SEND time, not pin it before mark_forward_intent — the pin
+/// spanned several DB round-trips (mark, instance_token, launch secret), and a
+/// hello replacing the registry slot in that span used to send the frame to
+/// the retired link. A link swapped in the mark→send window must receive the
+/// create. The generation stamp is irrelevant here: the reconnect sweep only
+/// reads it for `workspace.unregister` rows.
+#[tokio::test]
+async fn instance_create_reaches_the_link_installed_between_mark_and_send() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let store = hub.store().expect("store");
+    let host = HostId::new().as_id().as_str().to_owned();
+    hub.test_insert_host(&host).await?;
+    let instance = HostId::new().as_id().as_str().to_owned();
+    store
+        .insert_instance(
+            host.clone(),
+            Some(instance.clone()),
+            "claude".into(),
+            "generic-pty".into(),
+            None,
+            json!({}),
+        )
+        .await?;
+
+    // The link present at mark time.
+    let l1 = Arc::new(CreateNode {
+        creates: Mutex::new(Vec::new()),
+    });
+    hub.test_set_node_transport(&host, l1.clone()).await;
+
+    let command_id = "cmd_r12_item2_create_0001";
+    let payload = json!({"instanceId": instance});
+    let (queued, created) = store
+        .queue_command(
+            Some(command_id.to_owned()),
+            Some(instance.clone()),
+            host.clone(),
+            "instance.create".into(),
+            payload,
+            None,
+            None,
+        )
+        .await?;
+    assert!(created);
+    assert_eq!(queued.command_id, command_id);
+
+    // Park forward_if_online right before the send lookup.
+    let handle = hub.test_handle();
+    let (reached, release) = handle.test_arm_forward_send_barrier(&host, command_id);
+    let handle_for_task = handle.clone();
+    let cid = command_id.to_owned();
+    let forward =
+        tokio::spawn(async move { handle_for_task.test_forward_command_online(&cid).await });
+    reached.notified().await;
+
+    // A hello replaces the slot in the mark→send window.
+    let l2 = Arc::new(CreateNode {
+        creates: Mutex::new(Vec::new()),
+    });
+    handle.test_set_node_transport(&host, l2.clone()).await;
+    release.send(()).expect("release the parked forward");
+
+    let result = forward
+        .await
+        .expect("forward task joined")
+        .expect("forward_if_online succeeds on L2");
+    assert!(
+        l1.creates.lock().unwrap().is_empty(),
+        "the retired L1 must never receive the frame"
+    );
+    assert_eq!(
+        l2.creates.lock().unwrap().as_slice(),
+        &[command_id.to_owned()],
+        "the frame reaches the new link installed before the send"
+    );
+    assert_eq!(result.state, "accepted");
+
     hub.shutdown().await;
     Ok(())
 }

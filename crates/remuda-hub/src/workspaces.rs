@@ -105,6 +105,15 @@ pub(crate) struct RaceBarriers {
     /// Parks task creation right after it acquires the per-workspace guard
     /// and before the binding is published.
     task_bind: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
+    /// Parks the unregister handler after the forward intent was stamped and
+    /// the transport pinned, before the prepare is sent (r11 item 2).
+    forward_marked: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
+    /// Parks after the pin, before the INSERT (r12 item 1).
+    forward_pinned: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
+    /// Parks after the command INSERT, before the mark (r12 item 1).
+    forward_queued: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
+    /// Parks forward_if_online right before the send lookup (r12 item 2).
+    forward_send: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), BarrierSlot>>>,
 }
 
 impl RaceBarriers {
@@ -113,6 +122,10 @@ impl RaceBarriers {
         let table = match phase {
             RacePhase::Unregister => &self.unregister,
             RacePhase::TaskBind => &self.task_bind,
+            RacePhase::ForwardMarked => &self.forward_marked,
+            RacePhase::ForwardPinned => &self.forward_pinned,
+            RacePhase::ForwardQueued => &self.forward_queued,
+            RacePhase::ForwardSend => &self.forward_send,
         };
         table.lock().unwrap().insert(key, slot);
     }
@@ -124,6 +137,10 @@ impl RaceBarriers {
             let table = match phase {
                 RacePhase::Unregister => &self.unregister,
                 RacePhase::TaskBind => &self.task_bind,
+                RacePhase::ForwardMarked => &self.forward_marked,
+                RacePhase::ForwardPinned => &self.forward_pinned,
+                RacePhase::ForwardQueued => &self.forward_queued,
+                RacePhase::ForwardSend => &self.forward_send,
             };
             table
                 .lock()
@@ -143,6 +160,19 @@ impl RaceBarriers {
 pub(crate) enum RacePhase {
     Unregister,
     TaskBind,
+    /// c-dirpicker r11 item 2: parks the unregister handler right AFTER the
+    /// forward intent was stamped and BEFORE the prepare is sent. At this
+    /// point the new code has already PINNED the transport the prepare rides;
+    /// the mark-then-resolve ordering this replaces had not, so a hello that
+    /// lands during the park moves only the new code's pin nowhere.
+    ForwardMarked,
+    /// Parks after the transport pin, before the command INSERT (r12 item 1).
+    ForwardPinned,
+    /// Parks between the command INSERT and mark_forward_intent (r12 item 1).
+    ForwardQueued,
+    /// Parks forward_if_online right before the send-time transport lookup
+    /// (r12 item 2); key is (host_id, command_id).
+    ForwardSend,
 }
 
 /// Stable substrings the Node's unregister prepare emits for occupancy/race
@@ -566,14 +596,65 @@ async fn mutate(
         payload["workspaceId"] = json!(workspace_id);
     }
     crate::agent_scope::stamp(&mut payload, &device);
+    // c-dirpicker r11 item 2 / r12 item 1: pin the (transport, link generation)
+    // pair BEFORE queueing. The INSERT stamps the PINNED generation (not the
+    // hosts counter, which a hello in this span may already have bumped); the
+    // mark refreshes the same value; prepare, commit and every best-effort
+    // abort below ride THIS transport. A hello installing a new link between
+    // any of those steps can no longer move one frame onto a different link
+    // than the row is attributed to.
+    let pinned = state.nodes.pin(&id).await.ok_or(HubError::HostOffline {
+        host_id: id.clone(),
+    })?;
+    // r12 item 1 test seam: park AFTER the pin, BEFORE the INSERT. A hello
+    // bumping the hosts counter here must not make the INSERT stamp the new
+    // value — the row carries the pinned generation. No-op in production.
+    state
+        .race_barriers
+        .wait_if_armed(
+            RacePhase::ForwardPinned,
+            &id,
+            node_workspace_id.as_deref().unwrap_or(""),
+        )
+        .await;
     let (command, _) = state
         .store
-        .queue_command(None, None, id.clone(), method.into(), payload, None)
+        .queue_command(
+            None,
+            None,
+            id.clone(),
+            method.into(),
+            payload,
+            None,
+            Some(pinned.link_generation()),
+        )
         .await?;
+    // r12 item 1 test seam: park AFTER the INSERT, before the mark, so the
+    // test can run the post-hello sweep while the row is queued. No-op in
+    // production.
+    state
+        .race_barriers
+        .wait_if_armed(
+            RacePhase::ForwardQueued,
+            &id,
+            node_workspace_id.as_deref().unwrap_or(""),
+        )
+        .await;
     state
         .store
-        .mark_forward_intent(command.command_id.clone())
+        .mark_forward_intent(command.command_id.clone(), pinned.link_generation())
         .await?;
+    // r11 item 2 test seam: park AFTER the stamp with the pinned transport
+    // already held. A hello during the park installs a new link, but the
+    // prepare below must ride THIS pin. No-op in production.
+    state
+        .race_barriers
+        .wait_if_armed(
+            RacePhase::ForwardMarked,
+            &id,
+            node_workspace_id.as_deref().unwrap_or(""),
+        )
+        .await;
     let mut rpc_params = json!({
         "path": node_path,
         "commandId": command.command_id,
@@ -582,7 +663,7 @@ async fn mutate(
     if let Some(workspace_id) = &node_workspace_id {
         rpc_params["workspaceId"] = json!(workspace_id);
     }
-    let prepared = crate::http::call_node(state, &id, method, rpc_params).await;
+    let prepared = crate::http::call_node_pinned(&id, &pinned, method, rpc_params).await;
     let prepared = match prepared {
         Err(HubError::BadRequest(reason)) if method == "workspace.unregister" => {
             // The Node enforces the same occupancy rule at prepare (its view
@@ -607,6 +688,7 @@ async fn mutate(
             // returning; an unreachable host is reconciled on reconnect.
             abort_unregister(
                 state,
+                Some(&pinned),
                 &id,
                 &node_path,
                 &node_workspace_id,
@@ -637,7 +719,7 @@ async fn mutate(
     if let Some(workspace_id) = &node_workspace_id {
         commit_params["workspaceId"] = json!(workspace_id);
     }
-    let settled = match crate::http::call_node(state, &id, method, commit_params).await {
+    let settled = match crate::http::call_node_pinned(&id, &pinned, method, commit_params).await {
         Ok(answer) => answer,
         Err(HubError::BadRequest(reason)) if node_unregister_conflict(&reason).is_some() => {
             // r7 item 1: a commit refusal must release the prepared unbinding
@@ -645,6 +727,7 @@ async fn mutate(
             // this abort is the explicit, idempotent reconciliation).
             abort_unregister(
                 state,
+                Some(&pinned),
                 &id,
                 &node_path,
                 &node_workspace_id,
@@ -659,6 +742,7 @@ async fn mutate(
             // the reconnect sweep reconciles the command.
             abort_unregister(
                 state,
+                Some(&pinned),
                 &id,
                 &node_path,
                 &node_workspace_id,
@@ -689,6 +773,7 @@ async fn mutate(
         {
             abort_unregister(
                 state,
+                Some(&pinned),
                 &id,
                 &node_path,
                 &node_workspace_id,
@@ -726,6 +811,7 @@ async fn mutate(
 ///  - any transport error — leave the row unsettled; the next hello retries.
 async fn abort_unregister(
     state: &AppState,
+    pinned: Option<&crate::transport::PinnedNodeCall>,
     host_id: &str,
     node_path: &str,
     node_workspace_id: &Option<String>,
@@ -739,7 +825,16 @@ async fn abort_unregister(
     if let Some(workspace_id) = node_workspace_id {
         params["workspaceId"] = json!(workspace_id);
     }
-    match crate::http::call_node(state, host_id, "workspace.unregister", params).await {
+    // r11 item 2: inside a forwarding attempt the abort rides the SAME pinned
+    // transport the prepare/commit used; the reconnect sweep has no attempt in
+    // flight and resolves the freshly registered transport normally.
+    let rpc = match pinned {
+        Some(pin) => {
+            crate::http::call_node_pinned(host_id, pin, "workspace.unregister", params).await
+        }
+        None => crate::http::call_node(state, host_id, "workspace.unregister", params).await,
+    };
+    match rpc {
         Ok(answer) if answer.get("phase").and_then(Value::as_str) == Some("settled") => {
             // The commit really landed on the Node before the abort arrived.
             // Mark completed FIRST (the row is still accepted here), then
@@ -796,17 +891,10 @@ async fn abort_unregister(
 /// behind the hello reply on the bounded FIFO, and commands whose abort is not
 /// delivered stay `queued`/`accepted` and are retried by the sweep on the
 /// NEXT hello.
-///
-/// r9 item 2: `connected_at` is the reconnect instant (captured by the
-/// carrier just after the hello). A DELETE accepted on the NEW link has a
-/// command row created at/after that instant and must not be aborted — its
-/// prepare/commit are in flight on the very link the sweep is using.
-pub fn spawn_unregister_abort_sweep(state: &AppState, host_id: String, connected_at: String) {
+pub fn spawn_unregister_abort_sweep(state: &AppState, host_id: String) {
     let state = state.clone();
     tokio::spawn(async move {
-        if let Err(error) =
-            abort_unsettled_unregisters_on_reconnect(&state, &host_id, &connected_at).await
-        {
+        if let Err(error) = abort_unsettled_unregisters_on_reconnect(&state, &host_id).await {
             tracing::warn!(%host_id, %error, "post-hello unregister abort sweep failed");
         }
     });
@@ -814,20 +902,29 @@ pub fn spawn_unregister_abort_sweep(state: &AppState, host_id: String, connected
 
 /// Reconcile unregister commands left unsettled across a Node (re)connect
 /// (r7 item 1): for every `workspace.unregister` command on this host still
-/// `queued` or `accepted` that was queued BEFORE this link's hello
-/// (`connected_at`), send the idempotent abort so the Node drops a durable
-/// unbinding mark a dead previous connection prepared. Commands created at
-/// or after `connected_at` belong to in-flight DELETEs on the new link and
-/// are left strictly alone (r9 item 2). Called from the authenticated
-/// `node.hello` path of both carriers.
+/// `queued` or `accepted` that was forwarded over a link OLDER than the one
+/// the adopting `node.hello` installed, send the idempotent abort so the Node
+/// drops a durable unbinding mark a dead previous connection prepared.
+///
+/// r10 item 1: "older" is decided purely by the durable per-host link
+/// generation (see [`Store::bump_host_link_generation`] and
+/// [`Store::mark_forward_intent`]), never by a timestamp. A DELETE accepted
+/// on the NEW link was stamped with the current generation and is left
+/// strictly alone even if its `created_at` predates the hello under a skewed
+/// or backward-stepped clock; a stale command stamped by the previous link is
+/// aborted even when the clock says it was created "just now". Called from
+/// the authenticated `node.hello` path of both carriers.
 pub async fn abort_unsettled_unregisters_on_reconnect(
     state: &AppState,
     host_id: &str,
-    connected_at: &str,
 ) -> Result<(), HubError> {
+    // Read the generation the adopting hello just installed. The bump itself
+    // happens in the hello handler before the transport is registered, so
+    // every command forwarded on the new link already carries this value.
+    let current_generation = state.store.host_link_generation(host_id.to_owned()).await?;
     let pending = state
         .store
-        .list_unsettled_workspace_unregisters(host_id, connected_at)
+        .list_unsettled_workspace_unregisters(host_id, current_generation)
         .await?;
     for command in pending {
         let node_path = command
@@ -843,6 +940,7 @@ pub async fn abort_unsettled_unregisters_on_reconnect(
             .map(str::to_owned);
         abort_unregister(
             state,
+            None,
             host_id,
             &node_path,
             &workspace_id,
@@ -1304,13 +1402,23 @@ mod tests {
         }
     }
 
-    /// r9 item 2: the post-reconnect sweep must abort only DELETEs a dead
-    /// previous link left behind. A command created on the NEW link — a DELETE
-    /// whose prepare/commit are in flight while the post-hello sweep runs —
-    /// must never be aborted.
+    /// r10 item 2: the sweep decision is a pure GENERATION comparison, so the
+    /// test tampers with `created_at` as hard as a broken clock can and
+    /// asserts nothing moves:
+    /// - a previous-link intent stamped 2099 ("created just now" by the
+    ///   clock) is STILL aborted;
+    /// - a new-link intent stamped 2000 (a backward clock step that makes a
+    ///   fresh DELETE look ancient) is NEVER aborted;
+    /// - a pre-upgrade intent with a NULL stamp is treated as dead-link
+    ///   intent regardless of its timestamp.
+    /// No sleeps and no `now()` arithmetic anywhere: the constants below are
+    /// the whole clock.
     #[tokio::test]
-    async fn reconnect_sweep_skips_unregisters_created_on_the_new_link() {
+    async fn reconnect_sweep_aborts_only_intents_from_older_links() {
         use crate::HubConfig;
+
+        const FUTURE: &str = "2099-01-01T00:00:00.000Z";
+        const PAST: &str = "2000-01-01T00:00:00.000Z";
 
         let dir = tempfile::tempdir().unwrap();
         let hub = crate::spawn(HubConfig::for_test(dir.path().join("data")))
@@ -1320,7 +1428,12 @@ mod tests {
         let store = state.store.clone();
         let host = crate::config::new_id("hst").unwrap();
         hub.test_insert_host(&host).await.unwrap();
+        // A freshly inserted host has never been adopted by a hello: the
+        // first link the dead commands rode on is generation 0.
+        assert_eq!(store.host_link_generation(host.clone()).await.unwrap(), 0);
 
+        // Dead-link intent #1: rode the previous link (stamped generation 0)
+        // but postdated to the FUTURE, as if it had been created "just now".
         let (old, _) = store
             .queue_command(
                 None,
@@ -1329,9 +1442,46 @@ mod tests {
                 "workspace.unregister".into(),
                 json!({"path": "/srv/old", "workspaceId": "wsp_old"}),
                 None,
+                None,
             )
             .await
             .unwrap();
+        store
+            .mark_forward_intent(old.command_id.clone(), 0)
+            .await
+            .unwrap();
+
+        // Dead-link intent #2: a genuine pre-upgrade row (NULL stamp), also
+        // postdated. r11 stamps the generation at INSERT, so the NULL has to be
+        // forced through the test seam: an unmarked row queued THIS instant is
+        // NOT a pre-upgrade row — it carries the current link's generation and
+        // must be spared. NULL means "no link generation recorded", which the
+        // sweep must keep reconciling rather than hide behind a cutoff.
+        let (legacy, _) = store
+            .queue_command(
+                None,
+                None,
+                host.clone(),
+                "workspace.unregister".into(),
+                json!({"path": "/srv/legacy", "workspaceId": "wsp_legacy"}),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .test_set_command_link_generation(legacy.command_id.clone(), None)
+            .await
+            .unwrap();
+
+        // The reconnect hello adopts a new link before its transport is
+        // registered; every command forwarded after that stamps generation 1.
+        let adopted = store.bump_host_link_generation(host.clone()).await.unwrap();
+        assert_eq!(adopted, 1);
+        // Live-link intent: stamped generation 1 but backdated to the PAST,
+        // as if the hub clock stepped straight to year 2000 after the row
+        // was written. Under the old timestamp cutoff this row looked like
+        // the stalest intent on the host and would be wrongly aborted.
         let (new, _) = store
             .queue_command(
                 None,
@@ -1340,46 +1490,64 @@ mod tests {
                 "workspace.unregister".into(),
                 json!({"path": "/srv/new", "workspaceId": "wsp_new"}),
                 None,
+                None,
             )
             .await
             .unwrap();
-        // The old command belongs to the dead previous link (created before
-        // the hello); the NEW one is post-dated to model a DELETE accepted on
-        // the new link while the post-hello sweep is running.
-        let new_id = new.command_id.clone();
         store
-            .run_named("test_postdate_new_command", move |conn| {
-                conn.execute(
-                    "UPDATE commands SET created_at = '2099-01-01T00:00:00.000Z' WHERE id = ?1",
-                    params![new_id],
-                )?;
-                Ok(())
-            })
+            .mark_forward_intent(new.command_id.clone(), 1)
+            .await
+            .unwrap();
+
+        // The clock goes mad AFTER every stamp: dead intents look fresh, the
+        // live intent looks ancient. The sweep must not consult any of it.
+        store
+            .test_set_command_created_at(old.command_id.clone(), FUTURE.to_owned())
+            .await
+            .unwrap();
+        store
+            .test_set_command_created_at(legacy.command_id.clone(), FUTURE.to_owned())
+            .await
+            .unwrap();
+        store
+            .test_set_command_created_at(new.command_id.clone(), PAST.to_owned())
             .await
             .unwrap();
 
         let node = Arc::new(RecordingAbortNode::default());
         hub.test_set_node_transport(&host, node.clone()).await;
 
-        abort_unsettled_unregisters_on_reconnect(&state, &host, &crate::config::now_rfc3339())
+        abort_unsettled_unregisters_on_reconnect(&state, &host)
             .await
             .unwrap();
 
-        // Exactly one abort, for the OLD command: the in-flight new-link
-        // DELETE is untouched.
+        // Exactly two aborts, in created_at order: the two dead-link intents.
+        // The future timestamps do not rescue them and the past timestamp
+        // does not condemn the new-link row.
         let calls = node.calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls.len(), 2, "{calls:?}");
         assert_eq!(calls[0].0, "workspace.unregister");
         assert_eq!(calls[0].1, old.command_id);
-        assert_ne!(calls[0].1, new.command_id);
+        assert_eq!(calls[1].1, legacy.command_id);
+        assert!(
+            calls.iter().all(|call| call.1 != new.command_id),
+            "the new-link DELETE must never be aborted regardless of its timestamp: {calls:?}"
+        );
 
-        let old_row = store
-            .get_command(old.command_id.clone())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(old_row.state, "settled");
-        assert_eq!(old_row.settlement_outcome.as_deref(), Some("rejected"));
+        for dead in [&old, &legacy] {
+            let row = store
+                .get_command(dead.command_id.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.state, "settled", "{}", dead.command_id);
+            assert_eq!(
+                row.settlement_outcome.as_deref(),
+                Some("rejected"),
+                "{}",
+                dead.command_id
+            );
+        }
         let new_row = store
             .get_command(new.command_id.clone())
             .await
@@ -1387,23 +1555,247 @@ mod tests {
             .unwrap();
         assert_eq!(
             new_row.state, "queued",
-            "a DELETE accepted on the new link must not be aborted by the sweep"
+            "a DELETE accepted on the new link must not be aborted by the sweep, even backdated"
         );
 
-        // The cutoff is strict: a cutoff before both rows selects nothing.
-        let before_both = store
-            .list_unsettled_workspace_unregisters(&host, "2000-01-01T00:00:00.000Z")
+        // Generation boundary: the current link's own generation selects
+        // nothing (the comparison is strict), and a generation past the new
+        // link returns only the still-queued new row — the dead ones are
+        // settled now and filtered by state. Pure integer comparisons.
+        let current = store
+            .list_unsettled_workspace_unregisters(&host, 1)
             .await
             .unwrap();
-        assert!(before_both.is_empty(), "{before_both:?}");
-        // A cutoff after both timestamps still returns only the new row: the
-        // old one is settled now and filtered by state.
+        assert!(current.is_empty(), "{current:?}");
         let later = store
-            .list_unsettled_workspace_unregisters(&host, "2100-01-01T00:00:00.000Z")
+            .list_unsettled_workspace_unregisters(&host, 2)
             .await
             .unwrap();
         assert_eq!(later.len(), 1, "{later:?}");
         assert_eq!(later[0].command_id, new.command_id);
+
+        hub.shutdown().await;
+    }
+
+    /// r11 item 1: the queue→mark window is closed at INSERT. A fresh DELETE
+    /// committed by `queue_command` after a reconnect hello adopted the new
+    /// link, but on which `mark_forward_intent` has not run yet, carries the
+    /// CURRENT generation from the INSERT — the post-hello sweep must skip it.
+    /// Before the fix the row had a NULL stamp and was aborted, so the Node
+    /// wrote an aborted tombstone for a command the new link was about to run
+    /// and the operator received a spurious 409/400. Only a genuine pre-upgrade
+    /// NULL row remains abortable in the same window.
+    #[tokio::test]
+    async fn queued_unmarked_command_on_current_link_is_skipped_by_sweep() {
+        use crate::HubConfig;
+
+        const FUTURE: &str = "2099-01-01T00:00:00.000Z";
+
+        let dir = tempfile::tempdir().unwrap();
+        let hub = crate::spawn(HubConfig::for_test(dir.path().join("data")))
+            .await
+            .unwrap();
+        let store = hub.state.store.clone();
+        let host = crate::config::new_id("hst").unwrap();
+        hub.test_insert_host(&host).await.unwrap();
+
+        // Two hellos have adopted links; the row is queued on link generation 2.
+        assert_eq!(
+            store.bump_host_link_generation(host.clone()).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            store.bump_host_link_generation(host.clone()).await.unwrap(),
+            2
+        );
+
+        let (fresh, _) = store
+            .queue_command(
+                None,
+                None,
+                host.clone(),
+                "workspace.unregister".into(),
+                json!({"path": "/srv/fresh", "workspaceId": "wsp_fresh"}),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        // Deliberately NO mark_forward_intent: the forward is still queued.
+        store
+            .test_set_command_created_at(fresh.command_id.clone(), FUTURE.to_owned())
+            .await
+            .unwrap();
+
+        // The post-hello sweep at the CURRENT generation skips it, even
+        // postdated.
+        assert!(
+            store
+                .list_unsettled_workspace_unregisters(&host, 2)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an unmarked row stamped at INSERT with the current generation must not be swept"
+        );
+        // It surfaces once the host adopts a LATER link (stamp 2 < 3), proving
+        // the INSERT stamp really is the current generation rather than NULL.
+        let after_next_hello = store
+            .list_unsettled_workspace_unregisters(&host, 3)
+            .await
+            .unwrap();
+        assert_eq!(after_next_hello.len(), 1, "{after_next_hello:?}");
+        assert_eq!(after_next_hello[0].command_id, fresh.command_id);
+
+        // A genuine pre-upgrade NULL row in the same window is still aborted.
+        let (legacy, _) = store
+            .queue_command(
+                None,
+                None,
+                host.clone(),
+                "workspace.unregister".into(),
+                json!({"path": "/srv/legacy2", "workspaceId": "wsp_legacy2"}),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .test_set_command_link_generation(legacy.command_id.clone(), None)
+            .await
+            .unwrap();
+        let listed = store
+            .list_unsettled_workspace_unregisters(&host, 2)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].command_id, legacy.command_id);
+
+        hub.shutdown().await;
+    }
+
+    /// r11 item 2: the registry pairs a transport with the durable generation
+    /// its adopting hello stamped, and `pin` hands the pair out atomically.
+    /// During the bump→insert hello window the half-open L1 stays paired with
+    /// gen 1 (so an in-window attempt marks 1, rides L1, and the gen-2 sweep
+    /// aborts it); after L2 registers every pin pairs gen 2 with L2.
+    #[tokio::test]
+    async fn forward_pin_pairs_transport_with_its_link_generation() {
+        use crate::HubConfig;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hub = crate::spawn(HubConfig::for_test(dir.path().join("data")))
+            .await
+            .unwrap();
+        let state = hub.state.clone();
+        let store = state.store.clone();
+        let host = crate::config::new_id("hst").unwrap();
+        hub.test_insert_host(&host).await.unwrap();
+        assert_eq!(
+            store.bump_host_link_generation(host.clone()).await.unwrap(),
+            1
+        );
+
+        let l1 = Arc::new(RecordingAbortNode::default());
+        hub.test_set_node_transport_with_generation(&host, l1.clone(), 1)
+            .await;
+
+        let pin1 = state.nodes.pin(&host).await.expect("L1 live");
+        assert_eq!(pin1.link_generation(), 1);
+
+        // The hello window: durable counter already bumped, registry still
+        // carrying the half-open L1 slot.
+        assert_eq!(
+            store.bump_host_link_generation(host.clone()).await.unwrap(),
+            2
+        );
+        let window_pin = state.nodes.pin(&host).await.expect("L1 still registered");
+        assert_eq!(
+            window_pin.link_generation(),
+            1,
+            "the stale L1 transport must stay paired with gen 1, never read the bumped 2"
+        );
+
+        // An in-window forwarding attempt marks the PINNED 1 and the gen-2
+        // sweep attributes it to a dead link even though the frame reaches L1.
+        let (stuck, _) = store
+            .queue_command(
+                None,
+                None,
+                host.clone(),
+                "workspace.unregister".into(),
+                json!({"path": "/srv/window", "workspaceId": "wsp_window"}),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_forward_intent(stuck.command_id.clone(), window_pin.link_generation())
+            .await
+            .unwrap();
+        window_pin
+            .call(
+                "workspace.unregister",
+                json!({"commandId": stuck.command_id, "phase": "prepare"}),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_unsettled_workspace_unregisters(&host, 2)
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.command_id == stuck.command_id),
+            "a gen-1 stamp rides the gen-2 sweep even though the registry was mid-hello"
+        );
+        assert!(
+            store
+                .list_unsettled_workspace_unregisters(&host, 1)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the gen-1 sweep spares it"
+        );
+        assert!(
+            l1.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(method, id)| method == "workspace.unregister" && id == &stuck.command_id)
+        );
+
+        // L2 lands: every new pin pairs L2 with gen 2 and the frame can no
+        // longer reach L1 or be stamped with 1.
+        let l2 = Arc::new(RecordingAbortNode::default());
+        hub.test_set_node_transport_with_generation(&host, l2.clone(), 2)
+            .await;
+        let pin2 = state.nodes.pin(&host).await.expect("L2 live");
+        assert_eq!(pin2.link_generation(), 2);
+        pin2.call(
+            "workspace.unregister",
+            json!({"commandId": "cmd-on-l2", "phase": "prepare"}),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(
+            l2.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(method, id)| method == "workspace.unregister" && id == "cmd-on-l2")
+        );
+        assert!(
+            !l1.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, id)| id == "cmd-on-l2"),
+            "after L2 registers a pinned frame never rides the stale L1"
+        );
 
         hub.shutdown().await;
     }

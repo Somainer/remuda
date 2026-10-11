@@ -677,6 +677,13 @@ export class Outbox {
    * a suspended IndexedDB reclaim cannot leave a durable pending write behind.
    */
   private lifetime = new AbortController();
+  /**
+   * Commands THIS document is currently POSTing (claimed via
+   * {@link beginActiveDelivery}/{@link endActiveDelivery}). While present, a
+   * durable inflight row for the command belongs to this live delivery and
+   * must NOT get an expiry wake of its own (c-reconnfu gate 15 item 2).
+   */
+  private activeDeliveries = new Set<Id>();
 
   /**
    * Store hook fired exactly once when a tracked wakeup reclaims a row: the
@@ -960,6 +967,26 @@ export class Outbox {
   }
 
   /**
+   * Mark a command as being actively delivered BY THIS document (store calls
+   * this right after winning its claim, for the duration of the POST). Suppresses
+   * expiry recovery for our own live claim even when its lease owner equals the
+   * persisted recovery owner (a cloned sibling shares that id).
+   */
+  beginActiveDelivery(commandId: Id) {
+    this.activeDeliveries.add(commandId);
+    this.clearClaimWakeup(commandId);
+  }
+
+  /** The live delivery finished (or was skipped after claim) — reconcile anew. */
+  endActiveDelivery(commandId: Id) {
+    this.activeDeliveries.delete(commandId);
+  }
+
+  isDeliveryActive(commandId: Id): boolean {
+    return this.activeDeliveries.has(commandId);
+  }
+
+  /**
    * Run `fn` under the per-instance Web Lock whenever the API exists —
    * independent of whether locks.query was usable at load (gate 12 item 5 for
    * the load path; the deadline path uses it regardless). With no Web Locks
@@ -1096,6 +1123,7 @@ export class Outbox {
     this.lifetime.abort();
     for (const entry of this.claimWakeups.values()) clearTimeout(entry.handle);
     this.claimWakeups.clear();
+    this.activeDeliveries.clear();
     this.onClaimWake = null;
   }
 
@@ -1190,12 +1218,16 @@ export class Outbox {
    * longer inflight; re-arm for the new FUTURE lease when the observed lease
    * changed. Gate 13 item 1 (d): a changed lease that is ALREADY expired is
    * adopted and scheduled immediately (conditional reclaim under the lock),
-   * never cancelled — "still inflight" is not terminal. The command whose own
-   * wakeup is firing is not in the map yet, so this never disturbs the
-   * in-flight critical section.
+   * never cancelled — "still inflight" is not terminal.
+   *
+   * Gate 15 item 2: ALSO discover NEWLY APPEARED inactive claims — inflight
+   * rows (including SAME-owner ones, e.g. a cloned sibling document that
+   * claimed the row after this Outbox loaded and then crashed) that this
+   * document is not actively delivering get an expiry wake. Rows this
+   * document is POSTing are skipped (activeDeliveries).
    */
   private reconcileClaimWakeups(durable: OutboxRecord[]) {
-    if (this.disposed || this.claimWakeups.size === 0) return;
+    if (this.disposed) return;
     const byId = new Map(durable.map((r) => [r.commandId, r]));
     for (const [id, entry] of [...this.claimWakeups]) {
       const fresh = byId.get(id);
@@ -1208,6 +1240,16 @@ export class Outbox {
       // Adopt the replacement lease — future deadline armed, overdue armed
       // immediately (delay max(0, until-now)), failure count reset.
       this.scheduleClaimWakeup(id, entry.instanceId, lease, 0);
+    }
+    // Discover inactive claims with no wake yet — including same-owner rows
+    // another context created after our load (gate 15 item 2). Our own live
+    // deliveries never need a wake.
+    for (const rec of durable) {
+      if (rec.state !== "inflight" || !rec.lease) continue;
+      if (this.activeDeliveries.has(rec.commandId)) continue;
+      if (this.claimWakeups.has(rec.commandId)) continue;
+      if (!commandIdFromKey(rec.commandId)) continue;
+      this.scheduleClaimWakeup(rec.commandId, rec.instanceId, rec.lease, 0);
     }
   }
 

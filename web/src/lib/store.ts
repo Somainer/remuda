@@ -2162,6 +2162,9 @@ class HubStore {
     if (claimed.state === "done") return false;
     if (claimed.lease?.owner !== box.ownerId) return "claim-aborted";
     this.syncBubbleFromOutbox(commandId);
+    // Gate 15 item 2: this document owns the live claim for the duration of the
+    // POST — suppress expiry recovery for our own inflight row on refresh.
+    box.beginActiveDelivery(commandId);
 
     const finish = async (patch: Partial<OutboxRecord>) => {
       await this.safePatch(commandId, { ...patch, lease: undefined });
@@ -2227,6 +2230,8 @@ class HubStore {
       } else if (err instanceof HubHttpError) {
         await finish({ state: "rejected", lastError: err.message });
       }
+    } finally {
+      box.endActiveDelivery(commandId);
     }
     this.syncBubbleFromOutbox(commandId);
     if (!box.pendingFor(current0.instanceId).length) this.clearOutboxRetry(current0.instanceId);

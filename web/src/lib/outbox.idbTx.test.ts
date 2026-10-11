@@ -284,6 +284,60 @@ it("a write whose request succeeds but whose transaction aborts afterwards is no
   expect((await storage.all()).map((r) => r.commandId)).toContain("cmd_retry_ok");
 });
 
+it("GATE15 item 2: a same-owner inflight claim appearing AFTER load gets an expiry wake and delivers at the deadline; an active delivery is not woken", async () => {
+  const db = installFakeIndexedDB();
+  const opened = await openOutboxStorage();
+  const storage = opened.storage;
+  const originalLocks = (globalThis.navigator as { locks?: LockManager }).locks;
+  Object.defineProperty(globalThis.navigator, "locks", { value: undefined, configurable: true });
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(1_200_000);
+    const owner = "owner_late_claim";
+    const box = await Outbox.load(storage, owner);
+    const wakes = vi.fn();
+    box.onClaimWake = wakes;
+
+    // A cloned sibling document claims the row AFTER this Outbox loaded (same
+    // persisted owner) and then crashes without finishing.
+    const T = Date.now() + 30_000;
+    const putP = storage.put({
+      ...probeRecord("cmd_late_claim"),
+      instanceId: "ins_lc",
+      state: "inflight",
+      lease: { owner, until: T },
+    });
+    await vi.advanceTimersByTimeAsync(5);
+    await putP;
+    expect(box.pendingClaimWakeups()).toEqual([]); // not at load time
+
+    await box.refreshDurable(); // appears now
+    expect(box.pendingClaimWakeups()).toEqual(["cmd_late_claim"]);
+
+    // An active delivery of the same row suppresses its wake (this document
+    // is POSTing it — it must not steal its own claim).
+    box.beginActiveDelivery("cmd_late_claim");
+    await box.refreshDurable();
+    expect(box.pendingClaimWakeups()).toEqual([]);
+    box.endActiveDelivery("cmd_late_claim");
+
+    // Inactive again: the next refresh re-adopts the expiry recovery.
+    await box.refreshDurable();
+    expect(box.pendingClaimWakeups()).toEqual(["cmd_late_claim"]);
+
+    // The sibling never finishes; at the deadline, with no other trigger, the
+    // wake reclaims pending and fires delivery exactly once.
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(db.rows.get("cmd_late_claim")?.state).toBe("pending");
+    expect(wakes).toHaveBeenCalledTimes(1);
+    box.dispose();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis.navigator, "locks", { value: originalLocks, configurable: true });
+  }
+});
+
 it("GATE15 item 1: two cloned-owner documents without Web Locks are mutually excluded by the instance lease — exactly one POST", async () => {
   // Two documents that cloned sessionStorage share the PERSISTED owner id;
   // without Web Locks they must still serialize on the durable instance

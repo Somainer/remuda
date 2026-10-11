@@ -6781,4 +6781,151 @@ mod api_relay_launch_test {
             node2.shutdown().await.expect("shutdown");
         }
     }
+
+    /// c-cardsettle-fu2 r1 item 3: a generic-PTY pane exit built through the
+    /// DRIVER's failure_lifecycle + pane_exit_diagnostic flows through the
+    /// REAL observation pump into the Node store AND the Hub projection, and
+    /// the exit code (not "failed") is the durable failure reason in both.
+    ///
+    /// The observation is constructed with the exact driver helpers (the test
+    /// does NOT hand-stamp related_ids["reason"]), so reverting the driver's
+    /// reason stamping collapses the stored failure to "failed".
+    #[tokio::test]
+    async fn generic_pty_code_42_flows_through_pump_to_node_and_hub() {
+        use remuda_driver::generic_pty::{failure_lifecycle, pane_exit_diagnostic};
+
+        // Build the observation exactly the way the generic_pty status pump
+        // does for a pane exiting with code 42.
+        let diagnostic = pane_exit_diagnostic(&serde_json::json!({ "exitCode": 42 }));
+        assert_eq!(diagnostic, "agent process exited with code 42");
+        let payload: remuda_protocol::Observation = remuda_protocol::Observation {
+            schema_version: remuda_protocol::SchemaVersion,
+            event_id: remuda_protocol::EventId::new(),
+            journal_id: Id::new("obj").expect("journal id"),
+            instance_id: InstanceId::new(),
+            run_id: None,
+            host_id: HostId::new(),
+            process_generation: U64(1),
+            run_generation: None,
+            seq: U64(1),
+            observed_at: timestamp_now().expect("now"),
+            native_at: unknown("test"),
+            source: crate::driver::runtime_source(
+                &fixture_instance(
+                    InstanceId::new(),
+                    HostId::new(),
+                    WorkspaceId::new(),
+                    DriverKind::ShellPty,
+                )
+                .expect("fixture"),
+                U64(1),
+            ),
+            completeness: Completeness::ScreenDerived,
+            raw_ref: None,
+            evidence_event_ids: Vec::new(),
+            body: failure_lifecycle("exit", "agent-42", "pane-42", &diagnostic),
+        };
+        let instance_id = payload.instance_id.clone();
+
+        // The DRIVER's producer contract: failure_lifecycle must stamp the
+        // real diagnostic into related_ids["reason"] (the field the Node's
+        // classifier reads first). Reverting the driver's reason stamping
+        // removes this field and fails here before any persistence.
+        let ObservationPayload::Lifecycle(box_lc) = &payload.body else {
+            panic!("expected a lifecycle payload");
+        };
+        let LifecyclePayload::Native(native) = box_lc.as_ref() else {
+            panic!("expected a native lifecycle");
+        };
+        assert_eq!(
+            native.related_ids.get("reason").map(String::as_str),
+            Some("agent process exited with code 42"),
+            "failure_lifecycle must stamp related_ids.reason (driver contract)"
+        );
+
+        // ── Node side: seed a live row, deliver through the REAL pump. ──
+        let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
+        store
+            .insert_instance(
+                fixture_instance(
+                    instance_id.clone(),
+                    HostId::new(),
+                    WorkspaceId::new(),
+                    DriverKind::ShellPty,
+                )
+                .expect("fixture"),
+            )
+            .expect("seed");
+        let interactions = InteractionRuntime::spawn(Arc::clone(&store)).unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let pump = spawn_observation_pump(
+            Arc::clone(&store),
+            interactions,
+            instance_id.clone(),
+            rx,
+            Arc::new(FakeDriver::default()),
+            Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
+        );
+        tx.send(payload).await.expect("send pane-exit observation");
+        drop(tx);
+        pump.await.unwrap();
+
+        // Node-stored failure names the exit code.
+        let node_row = store.get_instance(&instance_id).expect("node instance");
+        assert_eq!(node_row.lifecycle, InstanceLifecycle::Failed);
+        assert_eq!(
+            node_row.last_error.as_deref(),
+            Some("agent process exited with code 42"),
+            "the Node store must persist the code, not \"failed\""
+        );
+
+        // ── Hub side: replay the same committed observation through a real
+        // Hub Store, mirroring the uplink conversion. ──
+        let hub_dir = tempfile::tempdir().unwrap();
+        let hub_store =
+            remuda_hub::store_test_support::Store::open(hub_dir.path()).expect("hub store");
+        let hub_host = HostId::new().as_id().to_string();
+        let hub_instance = instance_id.clone().as_id().to_string();
+        hub_store
+            .ensure_instance(hub_host.clone(), hub_instance.clone())
+            .await
+            .unwrap();
+        // Re-read the observation from the Node journal (the pump committed
+        // it) to feed the Hub exactly what the uplink would send.
+        let committed = store
+            .read_events(
+                &store.get_instance(&instance_id).unwrap().journal_id,
+                None,
+                64,
+            )
+            .expect("node events")
+            .events;
+        assert!(!committed.is_empty(), "the pump committed the observation");
+        for event in committed {
+            // Only the Instance variant carries a pump observation; the
+            // uplink converts it to hub journal wire JSON.
+            let remuda_protocol::JournalEvent::Instance(observation) = event else {
+                continue;
+            };
+            let mut value = serde_json::to_value(*observation).expect("observation wire json");
+            value["instance_id"] = serde_json::json!(hub_instance);
+            hub_store
+                .append_journal(hub_host.clone(), hub_instance.clone(), None, value)
+                .await
+                .expect("hub append");
+        }
+
+        let hub_row = hub_store
+            .get_instance(hub_instance.clone())
+            .await
+            .unwrap()
+            .expect("hub row");
+        assert_eq!(hub_row.lifecycle, "failed");
+        assert_eq!(
+            hub_row.last_error.as_deref(),
+            Some("agent process exited with code 42"),
+            "the Hub projection must persist the code, not \"failed\""
+        );
+        hub_store.close().await;
+    }
 }

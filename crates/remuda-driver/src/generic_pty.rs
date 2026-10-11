@@ -994,7 +994,10 @@ async fn emit_startup_failure(
 /// uninformative literal "failed". Returns the generic fallback only when
 /// none of those fields is present. Field names are checked across the
 /// snake_case and camelCase shapes the herdr wire uses.
-fn pane_exit_diagnostic(data: &serde_json::Value) -> String {
+/// Build the human-facing diagnostic for a pane-exit event; pub so the Node
+/// integration tests can construct observations with the exact production
+/// helpers instead of hand-stamping fields.
+pub fn pane_exit_diagnostic(data: &serde_json::Value) -> String {
     const FALLBACK: &str = "pane exited; agent process is gone";
     let str_field = |names: &[&str]| -> Option<String> {
         names
@@ -1077,67 +1080,232 @@ fn sanitize_exit_stderr(raw: &str) -> Option<String> {
     Some(redact_secret(&truncated))
 }
 
-/// Replace credential-bearing substrings with `[redacted]`. Covers HTTP
-/// Authorization headers, Bearer tokens, and `token=`/`key=` values.
-/// Single forward byte scan over the lowercased input; output is assembled
-/// once, so it always terminates and handles overlapping/repeated markers.
-/// Byte offsets are safe because all markers and delimiters are ASCII.
+/// Characters that can appear in a credential token. Used both for key-word
+/// boundaries (so "key" does not match inside "keyboard") and for the bare
+/// long-token fallback.
+const SECRET_TOKEN_CHARS: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-";
+
+/// Header-style keys whose ENTIRE value (to end of line) is secret:
+/// `Authorization: …`, `Cookie: …`, etc.
+const SECRET_HEADER_KEYS: &[&str] = &[
+    "proxy-authorization",
+    "set-cookie",
+    "authorization",
+    "x-auth-token",
+    "x-api-key",
+    "api-key",
+    "cookie",
+];
+
+/// `key=value` / `key: value` pairs whose VALUE token (or quoted string) is
+/// secret.
+const SECRET_PAIR_KEYS: &[&str] = &[
+    "access_token",
+    "refresh_token",
+    "client_secret",
+    "api_key",
+    "apikey",
+    "session",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "key",
+];
+
+/// Minimum length for the bare long-token fallback (a ≥24-char run of
+/// token characters with no structured key around it).
+const BARE_TOKEN_MIN_CHARS: usize = 24;
+
+/// Characters that terminate an unquoted secret value.
+const VALUE_DELIMITERS: &[u8] = b" \t\r\n&,;:\"'";
+
+/// One credential match found by [`find_next_secret`].
+enum SecretMatch {
+    /// Header-style key: keep the `key:` prefix, redact to end of line.
+    /// `(key_start, value_start, end_of_line)`.
+    Header(usize, usize, usize),
+    /// key=value pair: `(key_start, value_start, value_end)`; value_end skips
+    /// a closing quote when the value was quoted.
+    Pair(usize, usize, usize),
+    /// URL userinfo `scheme://user:pass@`: redact between `://` and `@`.
+    /// `(after_scheme_sep, at_position)`.
+    UserInfo(usize, usize),
+    /// Bare long token `(start, end)`.
+    Bare(usize, usize),
+}
+
+/// Find a key word followed (after optional whitespace) by `:` or `=` in the
+/// lowercased bytes. Returns `(key_start, value_start)` where value_start is
+/// the first byte after the separator and any whitespace. Requires a
+/// non-token character (or line start) on both sides of the key so "key"
+/// never matches inside "keyboard" / "x-api-key".
+fn find_keyed(lb: &[u8], tb: &[u8], from: usize, key: &str) -> Option<(usize, usize)> {
+    let kb = key.as_bytes();
+    if kb.is_empty() {
+        return None;
+    }
+    let rel = lb[from..].windows(kb.len()).position(|w| w == kb)?;
+    let key_start = from + rel;
+    // Word boundary before the key.
+    if key_start > 0 && SECRET_TOKEN_CHARS.contains(&tb[key_start - 1]) {
+        return None;
+    }
+    // Word boundary after the key. The separator byte (`:` or `=`) is not a
+    // word character for boundary purposes even though '=' appears in
+    // SECRET_TOKEN_CHARS.
+    let after_key = key_start + kb.len();
+    if after_key < tb.len()
+        && SECRET_TOKEN_CHARS.contains(&tb[after_key])
+        && tb[after_key] != b':'
+        && tb[after_key] != b'='
+    {
+        return None;
+    }
+    let mut p = after_key;
+    while p < tb.len() && tb[p].is_ascii_whitespace() {
+        p += 1;
+    }
+    if p >= tb.len() || (tb[p] != b':' && tb[p] != b'=') {
+        return None;
+    }
+    p += 1;
+    while p < tb.len() && tb[p].is_ascii_whitespace() {
+        p += 1;
+    }
+    Some((key_start, p))
+}
+
+/// Find the earliest credential match of any kind at or after byte `from`.
+fn find_next_secret(lb: &[u8], tb: &[u8], from: usize) -> Option<SecretMatch> {
+    let mut best: Option<(usize, SecretMatch)> = None;
+    let consider = |slot: &mut Option<(usize, SecretMatch)>, pos: usize, m: SecretMatch| {
+        if slot.as_ref().is_none_or(|(p, _)| pos < *p) {
+            *slot = Some((pos, m));
+        }
+    };
+
+    for key in SECRET_HEADER_KEYS {
+        if let Some((ks, vs)) = find_keyed(lb, tb, from, key) {
+            consider(&mut best, ks, SecretMatch::Header(ks, vs, tb.len()));
+        }
+    }
+    for key in SECRET_PAIR_KEYS {
+        if let Some((ks, vs)) = find_keyed(lb, tb, from, key) {
+            // Value end: skip a matching quote when quoted, else to delimiter.
+            let end = if vs < tb.len() && (tb[vs] == b'"' || tb[vs] == b'\'') {
+                let quote = tb[vs];
+                tb[vs + 1..]
+                    .iter()
+                    .position(|b| *b == quote)
+                    .map_or(tb.len(), |rel| vs + 1 + rel + 1)
+            } else {
+                tb[vs..]
+                    .iter()
+                    .position(|b| VALUE_DELIMITERS.contains(b))
+                    .map_or(tb.len(), |rel| vs + rel)
+            };
+            if end > vs {
+                consider(&mut best, ks, SecretMatch::Pair(ks, vs, end));
+            }
+        }
+    }
+
+    // URL userinfo: scheme://user:pass@host  ->  scheme://[redacted]@host.
+    let mut p = from;
+    while p + 3 <= tb.len() {
+        if let Some(rel) = lb[p..].windows(3).position(|w| w == b"://") {
+            let after_sep = p + rel + 3;
+            // The '@' must come before any whitespace/quote (same line URL).
+            if let Some(at_rel) = tb[after_sep..].iter().position(|b| *b == b'@') {
+                let at = after_sep + at_rel;
+                let stops_at_ws = tb[after_sep..at]
+                    .iter()
+                    .any(|b| b.is_ascii_whitespace() || *b == b'"' || *b == b'\'');
+                // Require a ':' (user:pass) so plain path/port URLs are safe.
+                let has_password_colon = tb[after_sep..at].contains(&b':');
+                if !stops_at_ws && has_password_colon {
+                    consider(&mut best, after_sep, SecretMatch::UserInfo(after_sep, at));
+                }
+            }
+            p = after_sep;
+        } else {
+            break;
+        }
+    }
+
+    // Bare long token: earliest run of token chars >= BARE_TOKEN_MIN_CHARS.
+    let mut i = from;
+    while i < tb.len() {
+        if !SECRET_TOKEN_CHARS.contains(&tb[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < tb.len() && SECRET_TOKEN_CHARS.contains(&tb[i]) {
+            i += 1;
+        }
+        if i - start >= BARE_TOKEN_MIN_CHARS {
+            consider(&mut best, start, SecretMatch::Bare(start, i));
+        }
+    }
+
+    best.map(|(_, m)| m)
+}
+
+/// Replace credential-bearing substrings with `[redacted]`.
+///
+/// One left-to-right pass over the line: at every position the EARLIEST
+/// match among all rules wins —
+/// - whole-value headers (Authorization/Proxy-Authorization/Cookie/
+///   Set-Cookie/X-Api-Key/Api-Key/X-Auth-Token) to end of line;
+/// - key=value / key: value pairs (token/access_token/refresh_token/secret/
+///   password/passwd/key/apikey/api_key/client_secret/session), quoted
+///   values consumed through the closing quote;
+/// - URL userinfo (`scheme://user:pass@`);
+/// - a bare run of ≥24 token characters.
+///
+/// After each replacement scanning continues past it, so a line carrying
+/// several secrets (e.g. `token=… Authorization: Bearer …`) redacts all of
+/// them regardless of rule priority.
 fn redact_secret(text: &str) -> String {
-    // Order matters: "bearer " is inside an "authorization: bearer …" header;
-    // scanning it first redacts the token itself (the header name then has no
-    // value left to redact). "authorization:" alone still catches headers
-    // without a Bearer scheme.
-    const MARKERS: &[(&str, &[u8])] = &[
-        ("bearer ", b" \t,;\"\n\r"),
-        ("authorization:", b" \t,;\"\n\r"),
-        ("token=", b" \t&,;\"\n\r"),
-        ("key=", b" \t&,;\"\n\r"),
-    ];
     let lower = text.to_ascii_lowercase();
     let lb = lower.as_bytes();
     let tb = text.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(tb.len());
-    let mut cursor: usize = 0;
+    let mut cursor = 0usize;
     while cursor < tb.len() {
-        // Markers are checked IN ORDER (priority, not position): "bearer "
-        // must win over "authorization:" even though it sits later in the
-        // header, so the token — not the scheme word — is redacted.
-        let mut hit: Option<(usize, usize, &[u8])> = None; // (at, marker_len, delims)
-        for (marker, delims) in MARKERS {
-            let mb = marker.as_bytes();
-            if let Some(rel) = lb[cursor..].windows(mb.len()).position(|w| w == mb) {
-                hit = Some((cursor + rel, mb.len(), *delims));
-                break;
-            }
-        }
-        let Some((at, marker_len, delims)) = hit else {
+        let Some(m) = find_next_secret(lb, tb, cursor) else {
             out.extend_from_slice(&tb[cursor..]);
             break;
         };
-        out.extend_from_slice(&tb[cursor..at]);
-        let value_start = at + marker_len;
-        // Skip ASCII whitespace between marker and value.
-        let mut start = value_start;
-        while start < tb.len() && tb[start].is_ascii_whitespace() {
-            start += 1;
-        }
-        let end = tb[start..]
-            .iter()
-            .position(|b| delims.contains(b))
-            .map_or(tb.len(), |r| start + r);
-        if end > start {
-            out.extend_from_slice(b"[redacted]");
-            cursor = end;
-        } else {
-            // Trailing marker, no value: keep the rest verbatim and finish.
-            out.extend_from_slice(&tb[at..]);
-            break;
+        match m {
+            SecretMatch::Header(_ks, vs, end) | SecretMatch::Pair(_ks, vs, end) => {
+                // Keep the key/separator prefix (useful: names which header
+                // leaked), redact only the value span.
+                out.extend_from_slice(&tb[cursor..vs]);
+                out.extend_from_slice(b"[redacted]");
+                cursor = end;
+            }
+            SecretMatch::UserInfo(after_sep, at) => {
+                out.extend_from_slice(&tb[cursor..after_sep]);
+                out.extend_from_slice(b"[redacted]");
+                cursor = at;
+            }
+            SecretMatch::Bare(start, end) => {
+                out.extend_from_slice(&tb[cursor..start]);
+                out.extend_from_slice(b"[redacted]");
+                cursor = end;
+            }
         }
     }
-    String::from_utf8(out).expect("redaction operates on utf8 boundaries")
+    String::from_utf8(out).expect("redaction keeps utf8 boundaries")
 }
 
-fn failure_lifecycle(
+/// Test/integration-visible builder for the pane-exit lifecycle payload;
+/// production callers use the private wrapper inside the status pump.
+pub fn failure_lifecycle(
     native_name: &str,
     agent_name: &str,
     pane_id: &str,
@@ -1498,47 +1666,130 @@ mod tests {
     /// journal, instances.last_error, and the session end bar.
     #[test]
     fn pane_exit_stderr_is_capped_and_redacted() {
-        let data = |stderr: &str| serde_json::json!({ "pane_id": "p1", "lastStderr": stderr });
+        // (input lastStderr line, fragment that MUST NOT survive)
+        #[derive(Clone, Copy)]
+        struct Case<'a> {
+            name: &'a str,
+            line: &'a str,
+            leaked: &'a str,
+        }
+        let cases = [
+            // Combined pair + header: earliest-match ordering must redact both.
+            Case {
+                name: "combined pair + bearer header",
+                line: "token=secret-one Authorization: Bearer secret-two",
+                leaked: "secret-",
+            },
+            // Quoted value: consume through the closing quote, stop scanning
+            // only after it.
+            Case {
+                name: "quoted token",
+                line: r#"token="x-y-z-super-secret" trailing"#,
+                leaked: "x-y-z-super-secret",
+            },
+            Case {
+                name: "single-quoted bearer",
+                line: "Authorization: Bearer 'a.b.c-d.e_f/g' ok",
+                leaked: "a.b.c-d.e_f/g",
+            },
+            // Basic auth scheme: whole header value (not just the word Basic).
+            Case {
+                name: "basic auth header",
+                line: "Authorization: Basic dXNlcjpwYXNz",
+                leaked: "dXNlcjpwYXNz",
+            },
+            // Cookie / Set-Cookie headers.
+            Case {
+                name: "cookie header",
+                line: "Cookie: session=abc123def456; other=z",
+                leaked: "abc123def456",
+            },
+            Case {
+                name: "x-api-key header",
+                line: "X-Api-Key: AKIA-DEAD-BEEF-9999",
+                leaked: "AKIA-DEAD-BEEF-9999",
+            },
+            // URL userinfo.
+            Case {
+                name: "url userinfo",
+                line: "GET https://deploy:hunter2@git.example.com/x.git failed",
+                leaked: "hunter2",
+            },
+            // Bare long token (no key around it).
+            Case {
+                name: "bare long token",
+                line: "fatal abcdefghij0123456789ABCD-x_y+z/= end",
+                leaked: "abcdefghij0123456789ABCD-x_y+z/=",
+            },
+            // access_token / password / client_secret pairs.
+            Case {
+                name: "access_token pair",
+                line: "access_token=tok_live_1234567890&x=1",
+                leaked: "tok_live_1234567890",
+            },
+            Case {
+                name: "password colon pair",
+                line: "password: hunter-2-hunter2!!",
+                leaked: "hunter-2-hunter2!!",
+            },
+            Case {
+                name: "client secret",
+                line: "client_secret=shh-dont-tell-anyone-0001;",
+                leaked: "shh-dont-tell-anyone-0001",
+            },
+        ];
+        for case in cases {
+            let data = serde_json::json!({ "pane_id": "p1", "lastStderr": case.line });
+            let diag = pane_exit_diagnostic(&data);
+            assert!(
+                !diag.contains(case.leaked),
+                "[{}] secret leaked: {diag}",
+                case.name
+            );
+            assert!(
+                diag.contains("[redacted]"),
+                "[{}] no redaction: {diag}",
+                case.name
+            );
+        }
 
-        // (a) Authorization header + Bearer token.
-        let raw = "GET /v1 HTTP/1.1\n\
-                   Authorization: Bearer abc.def-ghi_123";
-        let diag = pane_exit_diagnostic(&data(raw));
-        assert!(
-            !diag.contains("abc.def-ghi_123"),
-            "bearer token leaked: {diag}"
+        // Non-secret prose is left intact (including short tokens / a normal
+        // "key" word without a separator).
+        let data = serde_json::json!({
+            "pane_id": "p1",
+            "lastStderr": "the keyboard key broke after 3 retries"
+        });
+        let diag = pane_exit_diagnostic(&data);
+        assert_eq!(
+            diag, "agent process exited: the keyboard key broke after 3 retries",
+            "normal prose must not be redacted"
         );
-        assert!(
-            diag.contains("[redacted]"),
-            "redaction marker present: {diag}"
-        );
 
-        // (b) token= query/body pair (case-insensitive).
-        let raw = "POST failed token=super-secret-value&other=1";
-        let diag = pane_exit_diagnostic(&data(raw));
-        assert!(
-            !diag.contains("super-secret-value"),
-            "token= leaked: {diag}"
-        );
-        assert!(diag.contains("[redacted]"));
-
-        // (c) key= pair.
-        let raw = "error key=AKIADEADBEEF123456 done";
-        let diag = pane_exit_diagnostic(&data(raw));
-        assert!(!diag.contains("AKIADEADBEEF123456"), "key= leaked: {diag}");
-
-        // (d) Only the LAST non-empty line is kept.
-        let raw = "line one with garbage\npanic: the real failure";
-        let diag = pane_exit_diagnostic(&data(raw));
+        // Only the LAST non-empty line is kept.
+        let raw = "line one with garbage
+panic: the real failure";
+        let diag = pane_exit_diagnostic(&serde_json::json!({ "lastStderr": raw }));
         assert!(diag.ends_with("the real failure"));
         assert!(!diag.contains("line one with garbage"));
 
-        // (e) Oversized: capped to 300 chars + an ellipsis.
-        let long = "x".repeat(5000);
-        let diag = pane_exit_diagnostic(&data(&long));
-        // "agent process exited: " prefix + 300 chars + ellipsis
+        // Oversized: capped to 300 chars + an ellipsis, UTF-8 safe.
+        let long = "é".repeat(5000);
+        let diag = pane_exit_diagnostic(&serde_json::json!({ "lastStderr": &long }));
         let kept: String = diag.chars().skip("agent process exited: ".len()).collect();
         assert_eq!(kept.chars().count(), 301, "300 chars + ellipsis");
         assert!(kept.ends_with('…'));
+
+        // Multi-byte content right at the cap boundary stays valid UTF-8 and
+        // does not panic; the redacted form of a long token on a multi-byte
+        // line is still capped.
+        let mixed = format!("token={} 日本語", "a".repeat(400));
+        let diag = pane_exit_diagnostic(&serde_json::json!({ "lastStderr": mixed }));
+        let kept: String = diag.chars().skip("agent process exited: ".len()).collect();
+        assert!(
+            kept.chars().count() <= 301,
+            "multi-byte capped: {}",
+            kept.chars().count()
+        );
+        assert!(!diag.contains(&"a".repeat(400)));
     }
 }

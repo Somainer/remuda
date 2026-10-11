@@ -57,11 +57,13 @@ pub(crate) struct FaultState {
     gate_cv: Condvar,
     abort_residual: Mutex<bool>,
     abort_residual_cv: Condvar,
+    #[cfg(feature = "test-faults")]
     /// Acknowledged once the abort-residual terminal has REGISTERED and parked
     /// in its claim behind the elected owner terminal - hard proof the second
     /// terminal exists, instead of inferring it from an elapsed delay
     /// (c-ctxusage r11 item 3).
     abort_terminal_waiting: Mutex<bool>,
+    #[cfg(feature = "test-faults")]
     abort_terminal_waiting_cv: Condvar,
     flusher_exited: Mutex<bool>,
     flusher_exited_cv: Condvar,
@@ -237,6 +239,7 @@ impl FaultState {
     /// Acknowledge that the abort residual's terminal registered and is parked
     /// in its claim, waiting behind the elected owner terminal (c-ctxusage
     /// r11 item 3). Fired from the gate's terminal-yield hook.
+    #[cfg(feature = "test-faults")]
     pub(crate) fn note_abort_terminal_waiting(&self) {
         *self
             .abort_terminal_waiting

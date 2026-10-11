@@ -414,8 +414,10 @@ mod tests {
     fn join_bounded<T: Send + 'static>(handle: std::thread::JoinHandle<T>, what: &str) -> T {
         let (tx, rx) = sync_channel(1);
         // The handle is moved onto a watcher so a join that would block
-        // forever is observed through the bounded channel instead.
-        let watcher = std::thread::spawn(move || {
+        // forever is observed through the bounded channel instead. The
+        // JoinHandle is dropped on purpose: the watcher thread runs on and is
+        // reaped by process exit if the bounded wait ever times out.
+        let _watcher = std::thread::spawn(move || {
             let _ = tx.send(handle.join());
         });
         match rx.recv_timeout(TEST_WAIT) {

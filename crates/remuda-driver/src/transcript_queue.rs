@@ -43,6 +43,13 @@ pub(super) struct BoundedPending<T> {
     /// parked producer as pending work: stop + empty queue is not retirement
     /// while a producer still holds frames.
     waiting: AtomicUsize,
+    #[cfg(test)]
+    /// Test-only rendezvous: a producer signals here the moment it parks for
+    /// capacity and again when its push completes, so tests block on
+    /// acknowledgements instead of sleep-polling `producer_parked`/`finished`.
+    park_barrier: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    done_barrier: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     capacity: usize,
 }
 
@@ -55,7 +62,54 @@ impl<T> BoundedPending<T> {
             notify,
             closed: AtomicBool::new(false),
             waiting: AtomicUsize::new(0),
+            #[cfg(test)]
+            park_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            done_barrier: std::sync::Mutex::new(None),
             capacity,
+        }
+    }
+
+    #[cfg(test)]
+    /// Install the test-only "producer parked for capacity" acknowledgement.
+    pub(super) fn set_park_barrier(&self, tx: std::sync::mpsc::Sender<()>) {
+        *self
+            .park_barrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+    }
+
+    #[cfg(test)]
+    /// Install the test-only "push completed" acknowledgement.
+    pub(super) fn set_done_barrier(&self, tx: std::sync::mpsc::Sender<()>) {
+        *self
+            .done_barrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+    }
+
+    #[cfg(test)]
+    fn note_parked(&self) {
+        if let Some(tx) = self
+            .park_barrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            // Rendezvous: blocks until the test acknowledges the parked state.
+            let _ = tx.send(());
+        }
+    }
+
+    #[cfg(test)]
+    fn note_done(&self) {
+        if let Some(tx) = self
+            .done_barrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = tx.send(());
         }
     }
 
@@ -107,6 +161,8 @@ impl<T> BoundedPending<T> {
                 // wait returned.
                 self.notify.notify_one();
                 self.waiting.fetch_add(1, Ordering::SeqCst);
+                #[cfg(test)]
+                self.note_parked();
                 while guard.len() >= self.capacity && !self.closed.load(Ordering::SeqCst) {
                     guard = self
                         .space
@@ -116,6 +172,8 @@ impl<T> BoundedPending<T> {
                 self.waiting.fetch_sub(1, Ordering::SeqCst);
             }
             if self.closed.load(Ordering::SeqCst) {
+                #[cfg(test)]
+                self.note_done();
                 return;
             }
             let was_empty = guard.is_empty();
@@ -127,6 +185,8 @@ impl<T> BoundedPending<T> {
                 self.notify.notify_one();
             }
         }
+        #[cfg(test)]
+        self.note_done();
     }
 
     /// Pop the frame at the front for delivery. The flusher pops BEFORE it
@@ -177,51 +237,39 @@ impl<T> BoundedPending<T> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::mpsc::channel;
     use std::time::Duration;
-
-    /// Block until the producer parks and its park is observed, bounded so a
-    /// regression fails instead of hanging the test binary.
-    fn wait_for_waiting(queue: &BoundedPending<usize>) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !queue.producer_parked() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert!(
-            queue.producer_parked(),
-            "producer never parked for capacity"
-        );
-    }
 
     #[test]
     fn stalled_consumer_caps_the_queue_and_drain_resumes_collection() {
         let notify = Arc::new(Notify::new());
         let queue = Arc::new(BoundedPending::<usize>::new(3, Arc::clone(&notify)));
-        let producer_queue = Arc::clone(&queue);
+        // One acknowledgement channel: the producer rendezvous on every park
+        // for capacity and once more when the push completes, so the consumer
+        // drains strictly on acknowledgements (no idle-gap polling).
+        let (event_tx, event_rx) = channel();
+        queue.set_park_barrier(event_tx.clone());
+        queue.set_done_barrier(event_tx);
         let finished = Arc::new(AtomicBool::new(false));
         let producer_finished = Arc::clone(&finished);
+        let producer_queue = Arc::clone(&queue);
         let producer = std::thread::spawn(move || {
             producer_queue.push_all_blocking(0..6);
             producer_finished.store(true, Ordering::SeqCst);
         });
 
-        // The producer must block at exactly the bound with a stalled
-        // consumer, having parked frame 3.
-        wait_for_waiting(&queue);
-        assert_eq!(queue.len(), 3);
-        assert!(!finished.load(Ordering::SeqCst));
-
-        // Drain as the producer refills; it can park temporarily after each
-        // pop, so a transiently-empty queue is not the end — producer
-        // completion is. Every frame arrives once and in order.
         let mut delivered = Vec::new();
-        while !finished.load(Ordering::SeqCst) {
+        while delivered.len() < 6 {
+            // Block until the producer says it parked (capacity wanted) or
+            // finished; the very first rendezvous proves the bound.
+            event_rx.recv().expect("producer barrier closed");
+            assert!(queue.producer_parked() || finished.load(Ordering::SeqCst));
+            if delivered.is_empty() {
+                assert_eq!(queue.len(), 3, "parked at exactly the capacity");
+            }
             while let Some(frame) = queue.pop_for_send() {
                 delivered.push(frame);
             }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        while let Some(frame) = queue.pop_for_send() {
-            delivered.push(frame);
         }
         producer.join().expect("producer thread");
         assert!(finished.load(Ordering::SeqCst));
@@ -232,17 +280,23 @@ mod tests {
     fn close_releases_a_parked_producer_and_discards_the_remainder() {
         let notify = Arc::new(Notify::new());
         let queue = Arc::new(BoundedPending::<usize>::new(2, notify));
+        let (park_tx, park_rx) = channel();
+        let (done_tx, done_rx) = channel();
+        queue.set_park_barrier(park_tx);
+        queue.set_done_barrier(done_tx);
         queue.push_all_blocking(0..2);
 
         let producer_queue = Arc::clone(&queue);
         let producer = std::thread::spawn(move || {
             producer_queue.push_all_blocking(2..6);
         });
-        wait_for_waiting(&queue);
+        park_rx.recv().expect("producer never parked for capacity");
         assert_eq!(queue.len(), 2);
 
         // Simulates the flusher exiting after the event channel closes.
         queue.close_and_clear();
+        // The early-return completion acknowledgement (remainder discarded).
+        done_rx.recv().expect("producer never returned after close");
         producer.join().expect("producer thread");
         assert_eq!(queue.len(), 0);
         assert!(queue.is_closed());
@@ -258,11 +312,16 @@ mod tests {
         let queue = Arc::new(BoundedPending::<usize>::new(4, Arc::clone(&notify)));
 
         // The consumer starts drained and parks exactly like the production
-        // flusher: it only ever wakes on the queue-integrated Notify.
+        // flusher: it only ever wakes on the queue-integrated Notify. The
+        // barrier proves it has REACHED the notified().await park (an
+        // acknowledgement, replacing the r9 settling sleep).
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let consumer_entered = Arc::clone(&entered);
         let consumer_queue = Arc::clone(&queue);
         let consumer = tokio::spawn(async move {
             let mut delivered = Vec::new();
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            consumer_entered.wait().await;
             while delivered.len() < 50 && std::time::Instant::now() < deadline {
                 notify.notified().await;
                 while let Some(frame) = consumer_queue.pop_for_send() {
@@ -271,8 +330,7 @@ mod tests {
             }
             delivered
         });
-        // Let the consumer enter notified().await with the queue empty.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        entered.wait().await;
 
         let producer_queue = Arc::clone(&queue);
         let producer = std::thread::spawn(move || {

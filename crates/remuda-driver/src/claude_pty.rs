@@ -1811,16 +1811,21 @@ fn run_terminal_finish(
     pending: &TranscriptPending,
     faults: Option<&Arc<crate::test_faults::FaultState>>,
 ) {
-    if !gate.register_terminal() {
+    let Some(ticket) = gate.register_terminal() else {
         // The epoch retired racing this registration; nothing left to do.
         return;
+    };
+    // Test-only seam: park a registered terminal finaliser BEFORE its claim,
+    // modelling the closure merely queued on the blocking pool (r10 item 1).
+    if let Some(faults) = &faults {
+        faults.terminal_finalise_queued();
     }
     // claim blocks off-runtime while a registered collector (even one merely
-    // queued) or an earlier terminal owns the hydrator — a condvar wait,
-    // never a polled sleep or an elapsed budget.
-    let Some(mut hydrated) = gate.claim_terminal() else {
+    // queued) or the earlier ticket owner holds the hydrator — a condvar
+    // wait, never a polled sleep or an elapsed budget.
+    let Some(mut hydrated) = gate.claim_terminal(ticket) else {
         if gate.is_retired() {
-            gate.complete_terminal();
+            gate.complete_terminal(ticket);
         } else {
             // Unbound epoch: the residual still retires so the flusher exits.
             gate.retire();

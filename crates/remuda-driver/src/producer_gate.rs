@@ -30,15 +30,19 @@
 //!   retirement. Every registered closure is finite (a capacity push is
 //!   released by `close_and_clear`), so the wait always terminates.
 
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::collections::VecDeque;
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+
+/// Registration ticket: terminals finish strictly in registration order.
+pub(crate) type TerminalTicket = usize;
 
 /// Hydrator lifecycle state for one transcript pump epoch.
 struct Phase<T> {
     /// Producers registered (queued or running). Zero is idle.
     count: usize,
     /// Of those, non-terminal collectors (poll maps). The remainder are
-    /// terminal finishes: a terminal claimant yields to every registered
-    /// collector and to a terminal that registered ahead of it.
+    /// terminal finishes: every terminal yields to every registered
+    /// collector.
     collectors: usize,
     /// The live hydrator. `None` while a producer has claimed it, when the
     /// epoch is unbound, or after retirement.
@@ -46,6 +50,21 @@ struct Phase<T> {
     /// Set once the hydrator is permanently finished: no further frames can
     /// be produced and the flusher may drain and exit.
     retired: bool,
+    /// Tickets handed out to terminal registrations, in registration order.
+    terminal_next: usize,
+    /// Terminals still owed a claim decision, in registration order. The
+    /// front ticket is the sole owner-elect once collectors drain; a later
+    /// terminal waits for that owner to finish and then no-ops, so two
+    /// registered terminals can never each wait on the other (c-ctxusage
+    /// r10 item 1).
+    terminal_queue: VecDeque<TerminalTicket>,
+    /// Ticket of the terminal currently owning the hydrator, if any.
+    terminal_owner: Option<TerminalTicket>,
+    #[cfg(test)]
+    /// Test-only acknowledgement: signalled (blocking rendezvous) the moment
+    /// a thread enters a condvar wait, so a test can prove "parked" without a
+    /// load-dependent sleep.
+    wait_barrier: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
 }
 
 /// The single synchronization point between every producer and the shutdown
@@ -66,13 +85,51 @@ impl<T> ProducerGate<T> {
                 collectors: 0,
                 hydrator: None,
                 retired: false,
+                terminal_next: 0,
+                terminal_queue: VecDeque::new(),
+                terminal_owner: None,
+                #[cfg(test)]
+                wait_barrier: std::sync::Mutex::new(None),
             }),
             cv: Condvar::new(),
         }
     }
 
+    #[cfg(test)]
+    /// Install the test-only condvar-wait acknowledgement channel.
+    pub(crate) fn set_wait_barrier(&self, tx: std::sync::mpsc::SyncSender<()>) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .wait_barrier
+            .lock()
+            .unwrap() = Some(tx);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Phase<T>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Condvar wait with a test-only acknowledgement fired the instant a
+    /// thread parks. Inert in every non-test build.
+    fn wait<'a>(&self, guard: MutexGuard<'a, Phase<T>>) -> MutexGuard<'a, Phase<T>> {
+        #[cfg(test)]
+        {
+            // Clone the sender while holding only the barrier lock, then
+            // rendezvous OUTSIDE both locks.
+            let tx = guard
+                .wait_barrier
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(std::clone::Clone::clone);
+            if let Some(tx) = tx {
+                // Blocks until the test acknowledges the parked thread.
+                let _ = tx.send(());
+            }
+        }
+        self.cv.wait(guard).unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Publish the live hydrator (first bind). Completes instantly when the
@@ -106,16 +163,20 @@ impl<T> ProducerGate<T> {
     }
 
     /// Register a terminal finisher (cooperative finalise or abort residual).
-    /// A terminal claimant yields to every registered collector and to any
-    /// terminal registered ahead of it, so a finish can never steal a
-    /// hydrator from a queued collect (c-ctxusage r9 item 2).
-    pub(crate) fn register_terminal(&self) -> bool {
+    /// Returns the registration ticket, or `None` when the epoch had already
+    /// retired. Every terminal yields to every registered collector; among
+    /// terminals the ticket order elects EXACTLY ONE owner, so two registered
+    /// terminals can never each wait on the other (c-ctxusage r10 item 1).
+    pub(crate) fn register_terminal(&self) -> Option<TerminalTicket> {
         let mut state = self.lock();
         if state.retired {
-            return false;
+            return None;
         }
+        let ticket = state.terminal_next;
+        state.terminal_next += 1;
         state.count += 1;
-        true
+        state.terminal_queue.push_back(ticket);
+        Some(ticket)
     }
 
     /// Whether at least one producer is registered (queued or running).
@@ -123,29 +184,53 @@ impl<T> ProducerGate<T> {
         self.lock().count > 0
     }
 
-    /// Claim the hydrator as a TERMINAL finisher. Yields to every registered
-    /// collector and to a terminal registered earlier, blocking this
-    /// (blocking) thread on a condvar — never a polled sleep or an elapsed
-    /// budget. Returns `None` when the epoch is unbound or already retired.
-    pub(crate) fn claim_terminal(&self) -> Option<T> {
+    /// Claim the hydrator as a TERMINAL finisher. Terminals finish in strict
+    /// registration order: this call yields, on a condvar (never a polled
+    /// sleep or an elapsed budget), while any collector is registered, while
+    /// another terminal owns the hydrator, or while an earlier-registered
+    /// terminal has yet to claim.
+    ///
+    /// The front terminal claims exactly once: it gets `Some(hydrator)` and
+    /// becomes the owner; every later terminal is released with `None` once
+    /// that owner finishes (retirement or an epoch boundary), so each frame
+    /// is delivered once and no thread waits forever. `None` is also returned
+    /// for an unbound epoch at the front of the queue (nobody will publish a
+    /// hydrator); the caller then retires or boundary-finishes.
+    pub(crate) fn claim_terminal(&self, ticket: TerminalTicket) -> Option<T> {
         let mut state = self.lock();
         loop {
             if state.retired {
                 return None;
             }
-            // Other registered producers that must go first: any collector
-            // (queued or running) OR another terminal ahead of this one.
-            let other_terminals = state.count - state.collectors - 1;
-            let must_yield =
-                state.collectors > 0 || other_terminals > 0 || state.hydrator.is_none();
-            if !must_yield {
-                return state.hydrator.take();
+            // Every registered collector — queued or running — goes first.
+            if state.collectors > 0 {
+                state = self.wait(state);
+                continue;
             }
-            // Unbound and alone: nobody will ever publish a hydrator.
-            if state.count <= 1 && state.hydrator.is_none() {
-                return None;
+            // The elected owner is finishing: no-op once it is done.
+            if state.terminal_owner.is_some() {
+                state = self.wait(state);
+                continue;
             }
-            state = self.cv.wait(state).unwrap_or_else(PoisonError::into_inner);
+            // Strict registration order among the queued terminals.
+            if state.terminal_queue.front() != Some(&ticket) {
+                state = self.wait(state);
+                continue;
+            }
+            // My turn, and no collector or owner stands ahead.
+            state.terminal_queue.pop_front();
+            match state.hydrator.take() {
+                Some(hydrator) => {
+                    state.terminal_owner = Some(ticket);
+                    return Some(hydrator);
+                }
+                None => {
+                    // Unbound with every other registration behind me (they
+                    // are later terminals, which never publish hydrators):
+                    // nobody is coming to bind THIS epoch.
+                    return None;
+                }
+            }
         }
     }
 
@@ -169,7 +254,7 @@ impl<T> ProducerGate<T> {
             }
             // Another registered producer owns the slot; wait for its
             // completion rather than a polled sleep or an elapsed budget.
-            state = self.cv.wait(state).unwrap_or_else(PoisonError::into_inner);
+            state = self.wait(state);
         }
     }
 
@@ -196,8 +281,9 @@ impl<T> ProducerGate<T> {
 
     /// Drop a TERMINAL registration that found the epoch already retired
     /// (another terminal finished first).
-    pub(crate) fn complete_terminal(&self) {
+    pub(crate) fn complete_terminal(&self, ticket: TerminalTicket) {
         let mut state = self.lock();
+        state.terminal_queue.retain(|queued| *queued != ticket);
         state.count = state.count.saturating_sub(1);
         self.cv.notify_all();
     }
@@ -209,6 +295,7 @@ impl<T> ProducerGate<T> {
     pub(crate) fn finish_boundary(&self) {
         let mut state = self.lock();
         state.hydrator = None;
+        state.terminal_owner = None;
         state.count = state.count.saturating_sub(1);
         self.cv.notify_all();
     }
@@ -225,6 +312,7 @@ impl<T> ProducerGate<T> {
     pub(crate) fn retire(&self) {
         let mut state = self.lock();
         state.count = state.count.saturating_sub(1);
+        state.terminal_owner = None;
         state.hydrator = None;
         state.retired = true;
         self.cv.notify_all();
@@ -251,7 +339,7 @@ impl<T> ProducerGate<T> {
     pub(crate) fn wait_retired(&self) {
         let mut state = self.lock();
         while !state.retired {
-            state = self.cv.wait(state).unwrap_or_else(PoisonError::into_inner);
+            state = self.wait(state);
         }
     }
 }
@@ -260,7 +348,7 @@ impl<T> ProducerGate<T> {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::sync::mpsc::sync_channel;
 
     #[test]
     fn a_queued_producer_blocks_the_abort_decision_until_retirement() {
@@ -271,12 +359,15 @@ mod tests {
         assert!(gate.producer_active());
         assert!(!gate.is_retired());
 
-        // Abort-side waiter on a detached thread: must not return while the
-        // closure is merely queued (the r9 item 2 race).
+        // The barrier proves the abort-side waiter is actually PARKED in the
+        // condvar (an acknowledgement, not a load-dependent settling sleep).
+        let (wait_tx, wait_rx) = sync_channel(0);
+        gate.set_wait_barrier(wait_tx);
         let waiter_gate = Arc::clone(&gate);
         let waiter = std::thread::spawn(move || waiter_gate.wait_retired());
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(!waiter.is_finished(), "waiter returned before retirement");
+        wait_rx
+            .recv()
+            .expect("waiter never entered the retirement wait");
 
         // The queued closure runs, claims, finishes and retires.
         let claimed = gate.claim();
@@ -293,23 +384,36 @@ mod tests {
         let gate = Arc::new(ProducerGate::<u32>::new());
         gate.publish(1);
         gate.register(); // collect, queued
-        gate.register(); // abort residual, queued behind it
+        gate.register(); // residual, queued behind it
 
+        // A claims the hydrator, then parks holding it until the test opens
+        // its release rendezvous.
+        let (got_tx, got_rx) = sync_channel(0);
+        let (release_tx, release_rx) = sync_channel(0);
         let first_gate = Arc::clone(&gate);
         let first = std::thread::spawn(move || {
             let h = first_gate.claim().expect("collect claims");
-            std::thread::sleep(Duration::from_millis(20));
-            // restore both returns the hydrator and drops the registration.
+            got_tx.send(()).expect("acknowledge ownership");
+            release_rx.recv().expect("await release");
             first_gate.restore(h);
         });
-        // Give the first claimant time to own the slot.
-        std::thread::sleep(Duration::from_millis(10));
+        got_rx.recv().expect("first claimant never owned the slot");
+
+        // B must park waiting for the owned hydrator; the wait barrier makes
+        // that state observable without a sleep.
+        let (wait_tx, wait_rx) = sync_channel(0);
+        gate.set_wait_barrier(wait_tx);
         let second_gate = Arc::clone(&gate);
         let second = std::thread::spawn(move || {
             let h = second_gate.claim().expect("residual claims after restore");
             second_gate.retire();
             h
         });
+        wait_rx
+            .recv()
+            .expect("second claimant never parked on the slot");
+
+        release_tx.send(()).expect("release the first claimant");
         first.join().expect("first");
         let finished_by = second.join().expect("second");
         assert_eq!(finished_by, 1);
@@ -326,22 +430,18 @@ mod tests {
         let gate = Arc::new(ProducerGate::<u32>::new());
         gate.publish(42);
         gate.register(); // queued collector (not yet claimed)
-        gate.register_terminal(); // abort residual
+        let ticket = gate.register_terminal().expect("terminal registers");
 
+        let (wait_tx, wait_rx) = sync_channel(0);
+        gate.set_wait_barrier(wait_tx);
         let terminal_gate = Arc::clone(&gate);
-        let terminal = std::thread::spawn(move || terminal_gate.claim_terminal());
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(
-            !terminal.is_finished(),
-            "terminal stole from a queued collector"
-        );
+        let terminal = std::thread::spawn(move || terminal_gate.claim_terminal(ticket));
+        // Hard acknowledgement: the terminal is parked yielding, rather than
+        // a "still running after N ms" timing guess.
+        wait_rx.recv().expect("terminal never parked to yield");
 
         // The collector claims and runs only now.
         assert_eq!(gate.claim(), Some(42));
-        assert!(
-            !terminal.is_finished(),
-            "terminal must not finish mid-collect"
-        );
         gate.restore(42);
         let claimed = terminal.join().expect("terminal thread");
         assert_eq!(claimed, Some(42), "terminal claims the restored hydrator");
@@ -350,13 +450,95 @@ mod tests {
     }
 
     #[test]
+    fn two_terminals_registered_before_either_claims_elect_one_owner() {
+        // c-ctxusage r10 item 1: the cooperative finalise registers a
+        // terminal and its closure sits queued BEFORE claiming; close then
+        // aborts and the residual thread registers a SECOND terminal. The old
+        // "other_terminals > 0" rule made BOTH wait on each other forever.
+        // Tickets elect the earlier terminal owner exactly once; the later
+        // one no-ops after retirement.
+        let gate = Arc::new(ProducerGate::<u32>::new());
+        gate.publish(99);
+        // Both registered while neither closure has run.
+        let ticket_a = gate.register_terminal().expect("A");
+        let ticket_b = gate.register_terminal().expect("B");
+
+        // The residual B reaches its claim FIRST (A is still merely queued)
+        // and must park because A is ahead in ticket order.
+        let (wait_tx, wait_rx) = sync_channel(0);
+        gate.set_wait_barrier(wait_tx);
+        let b_gate = Arc::clone(&gate);
+        let b = std::thread::spawn(move || {
+            // Mirror run_terminal_finalise exactly, including the retired
+            // no-op's registration drop.
+            match b_gate.claim_terminal(ticket_b) {
+                Some(hydrator) => {
+                    b_gate.retire();
+                    Some(hydrator)
+                }
+                None => {
+                    if b_gate.is_retired() {
+                        b_gate.complete_terminal(ticket_b);
+                    } else {
+                        b_gate.retire();
+                    }
+                    None
+                }
+            }
+        });
+        wait_rx
+            .recv()
+            .expect("B parked while A was ahead in ticket order");
+
+        // A now runs: it is the sole owner and takes the hydrator.
+        let a_gate = Arc::clone(&gate);
+        let a = std::thread::spawn(move || {
+            let Some(hydrator) = a_gate.claim_terminal(ticket_a) else {
+                panic!("the earlier terminal must be the owner, never a no-op");
+            };
+            a_gate.retire();
+            hydrator
+        });
+        assert_eq!(a.join().expect("A thread"), 99, "A owns the hydrator");
+
+        // B wakes retired and returns the no-op: exactly-once delivery.
+        let b_claim = b.join().expect("B thread");
+        assert_eq!(b_claim, None, "the later terminal never finishes twice");
+        assert!(gate.is_retired());
+        assert!(!gate.producer_active());
+        // A terminal arriving after retirement does not even register.
+        assert!(gate.register_terminal().is_none());
+    }
+
+    #[test]
+    fn a_later_terminal_noops_after_an_epoch_boundary_then_close_retires() {
+        // In-life demote/rebind: the owner finishes at a boundary (no
+        // retirement); a later terminal then finds the epoch unbound and its
+        // caller boundary/retire choice releases it.
+        let gate = ProducerGate::<u32>::new();
+        gate.publish(1);
+        let ticket_a = gate.register_terminal().expect("A");
+        let ticket_b = gate.register_terminal().expect("B");
+        assert_eq!(gate.claim_terminal(ticket_a), Some(1));
+        // A boundary-finishes (in-life rebind): owner clears but the epoch
+        // lives; B is now the front with no hydrator.
+        gate.finish_boundary();
+        assert!(!gate.is_retired());
+        assert_eq!(gate.claim_terminal(ticket_b), None, "unbound front no-ops");
+        // B's abort caller retires to release the flusher.
+        gate.retire();
+        assert!(gate.is_retired());
+        assert!(!gate.producer_active());
+    }
+
+    #[test]
     fn an_epoch_boundary_finish_allows_a_later_rebind_but_a_close_does_not() {
         // In-life demote/rebind finalise: the hydrator is dropped but the
         // epoch stays alive, so a following publish binds a new hydrator.
         let gate = ProducerGate::<u32>::new();
         gate.publish(1);
-        assert!(gate.register_terminal());
-        let hydrator = gate.claim_terminal().expect("boundary claims");
+        assert!(gate.register_terminal().is_some());
+        let hydrator = gate.claim_terminal(0).expect("boundary claims");
         assert_eq!(hydrator, 1);
         gate.finish_boundary();
         assert!(!gate.is_retired());
@@ -365,11 +547,11 @@ mod tests {
         assert!(gate.has_hydrator());
 
         // The terminal close finish retires for good: publish is a no-op.
-        assert!(gate.register_terminal());
-        assert_eq!(gate.claim_terminal(), Some(2));
+        let ticket = gate.register_terminal().expect("close terminal");
+        assert_eq!(gate.claim_terminal(ticket), Some(2));
         gate.retire();
         gate.publish(3);
         assert!(!gate.has_hydrator());
-        assert!(!gate.register_terminal());
+        assert!(gate.register_terminal().is_none());
     }
 }

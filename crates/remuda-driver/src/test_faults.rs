@@ -39,12 +39,20 @@ pub(crate) struct FaultState {
     pump_armed: AtomicBool,
     finish_armed: AtomicBool,
     queued_armed: AtomicBool,
+    /// Arms the ONE-SHOT gate that parks the first registered terminal
+    /// finaliser before its claim (c-ctxusage r10 item 1).
+    terminal_armed: AtomicBool,
+    /// One-shot: only the FIRST terminal finaliser parks, so the abort
+    /// residual reaches the claim (and blocks there) instead of parking too.
+    terminal_taken: AtomicBool,
     pump_entered: Mutex<bool>,
     pump_entered_cv: Condvar,
     finish_entered: Mutex<bool>,
     finish_entered_cv: Condvar,
     queued_entered: Mutex<bool>,
     queued_entered_cv: Condvar,
+    terminal_entered: Mutex<bool>,
+    terminal_entered_cv: Condvar,
     gate_open: Mutex<bool>,
     gate_cv: Condvar,
     abort_residual: Mutex<bool>,
@@ -77,12 +85,16 @@ impl FaultState {
             pump_armed: AtomicBool::new(false),
             finish_armed: AtomicBool::new(false),
             queued_armed: AtomicBool::new(false),
+            terminal_armed: AtomicBool::new(false),
+            terminal_taken: AtomicBool::new(false),
             pump_entered: Mutex::new(false),
             pump_entered_cv: Condvar::new(),
             finish_entered: Mutex::new(false),
             finish_entered_cv: Condvar::new(),
             queued_entered: Mutex::new(false),
             queued_entered_cv: Condvar::new(),
+            terminal_entered: Mutex::new(false),
+            terminal_entered_cv: Condvar::new(),
             gate_open: Mutex::new(false),
             gate_cv: Condvar::new(),
             abort_residual: Mutex::new(false),
@@ -154,6 +166,39 @@ impl FaultState {
     /// abort decision must see an active producer.
     pub(crate) fn blocking_closure_queued(&self) {
         self.enter(Phase::Queued);
+    }
+
+    /// Park a registered TERMINAL finaliser BEFORE it claims the hydrator
+    /// (c-ctxusage r10 item 1). ONE-SHOT: the first terminal parks (the
+    /// cooperative finalise, merely queued); a later terminal (the abort
+    /// residual) passes through and blocks inside the gate's claim, which is
+    /// the exact production deadlock shape.
+    pub(crate) fn terminal_finalise_queued(&self) {
+        if !self.terminal_armed.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.terminal_taken.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        *self
+            .terminal_entered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.terminal_entered_cv.notify_all();
+        let mut open = self
+            .gate_open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*open {
+            let (guard, timeout) = self
+                .gate_cv
+                .wait_timeout(open, GATE_WAIT)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            open = guard;
+            if timeout.timed_out() {
+                break;
+            }
+        }
     }
 
     /// When true, the cooperative reading finalise is a no-op so the abort
@@ -254,6 +299,12 @@ impl TranscriptFaults {
         self.inner.queued_armed.store(true, Ordering::SeqCst);
     }
 
+    /// Arm the ONE-SHOT gate that parks the first registered terminal
+    /// finaliser before it claims the hydrator (c-ctxusage r10 item 1).
+    pub fn arm_terminal_gate(&self) {
+        self.inner.terminal_armed.store(true, Ordering::SeqCst);
+    }
+
     /// Make the cooperative reading finalise a no-op.
     pub fn set_skip_cooperative_finalise(&self, value: bool) {
         self.inner
@@ -311,6 +362,16 @@ impl TranscriptFaults {
         Self::wait_true(
             &self.inner.queued_entered,
             &self.inner.queued_entered_cv,
+            Duration::from_secs(60),
+        )
+    }
+
+    /// Block until the first registered terminal finaliser signals it parked
+    /// before its claim (bounded, c-ctxusage r10 item 1).
+    pub fn wait_terminal_entered(&self) -> bool {
+        Self::wait_true(
+            &self.inner.terminal_entered,
+            &self.inner.terminal_entered_cv,
             Duration::from_secs(60),
         )
     }

@@ -2256,17 +2256,17 @@ fn run_terminal_finalise(
     pending: &PendingEmissions,
     faults: Option<&Arc<crate::test_faults::FaultState>>,
 ) {
-    if !gate.register_terminal() {
+    let Some(ticket) = gate.register_terminal() else {
         // Retired racing this call: the cooperative and abort callers can
         // overlap, but the gate admits only one terminal claim.
         return;
-    }
+    };
     if let Some(faults) = faults {
-        faults.blocking_closure_queued();
+        faults.terminal_finalise_queued();
     }
-    let Some(mut hydrator) = gate.claim_terminal() else {
+    let Some(mut hydrator) = gate.claim_terminal(ticket) else {
         if gate.is_retired() {
-            gate.complete_terminal();
+            gate.complete_terminal(ticket);
         } else {
             // Unbound epoch: the residual still retires to release the
             // flusher.
@@ -2324,20 +2324,21 @@ async fn finalize_hydrator(
         }
         return;
     }
-    // Register synchronously, before spawn_blocking enqueues the closure.
-    if !gate.register_terminal() {
+    // Register synchronously, before spawn_blocking enqueues the closure; the
+    // ticket fixes terminal ownership order (r10 item 1).
+    let Some(ticket) = gate.register_terminal() else {
         return;
-    }
+    };
     let gate = Arc::clone(gate);
     let pending = Arc::clone(pending);
     let finish_faults = faults.cloned();
     let join = tokio::task::spawn_blocking(move || {
         if let Some(faults) = &finish_faults {
-            faults.blocking_closure_queued();
+            faults.terminal_finalise_queued();
         }
-        let Some(mut hydrator) = gate.claim_terminal() else {
+        let Some(mut hydrator) = gate.claim_terminal(ticket) else {
             if gate.is_retired() {
-                gate.complete_terminal();
+                gate.complete_terminal(ticket);
             } else if final_close {
                 gate.retire();
             } else {

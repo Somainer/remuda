@@ -1492,11 +1492,16 @@ async fn flush_pending(
     ctx: &PromoteCtx,
 ) -> bool {
     loop {
+        // c-ctxusage r8 item 4: pop the OWNED frame under the lock BEFORE
+        // awaiting send. The old clone-front → send → pop sequence raced a
+        // concurrent rebind prepending the launch snapshot: the post-send
+        // pop_front removed the snapshot (lost) while the in-flight frame was
+        // sent twice. A failed send requeues the frame at the front, so
+        // delivery is at-least-once from the queue and strictly FIFO.
         let Some(stamped) = pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .front()
-            .cloned()
+            .pop_front()
         else {
             return true;
         };
@@ -1505,25 +1510,24 @@ async fn flush_pending(
             seq.fetch_add(1, Ordering::SeqCst) + 1,
             SourceChannel::Transcript,
             stamped.completeness,
-            stamped.body,
-            stamped.native_at,
+            stamped.body.clone(),
+            stamped.native_at.clone(),
         ) else {
             // An un-stampable frame is dropped rather than wedging the queue.
-            pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pop_front();
             continue;
         };
-        observation.evidence_event_ids = stamped.evidence_event_ids;
+        observation.evidence_event_ids = stamped.evidence_event_ids.clone();
         match events.send(observation).await {
-            Ok(()) => {
+            Ok(()) => {}
+            Err(_) => {
+                // Channel gone: requeue so the abort path owns the frames and
+                // nothing is lost to a transient closed receiver.
                 pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .pop_front();
+                    .push_front(stamped);
+                return false;
             }
-            Err(_) => return false,
         }
     }
 }
@@ -2277,35 +2281,37 @@ impl Hydrator {
         if let Some(faults) = &self.faults {
             faults.pump_collect_entered();
         }
-        let launch = std::mem::take(&mut self.pending);
+        let mut launch: std::collections::VecDeque<Observation> =
+            std::mem::take(&mut self.pending).into_iter().collect();
         let lines = self.tail.poll()?;
-        // The launch model snapshot must reach the consumer AHEAD of any
-        // replayed transcript frame (a replayed model edge must not overwrite
-        // the launch baseline). Park it at the FRONT of the shared queue before
-        // any mapped chunk is appended; the FIFO flusher then emits it first.
-        if !launch.is_empty() {
-            let mut guard = parked
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let existing: std::collections::VecDeque<Observation> = guard.drain(..).collect();
-            guard.extend(launch);
-            guard.extend(existing);
-            drop(guard);
-            notify.notify_one();
-        }
+        // c-ctxusage r8 item 4: the launch model snapshot must precede THIS
+        // collect's replayed frames, but must not jump ahead of a prior
+        // epoch's backlog. It is merged into the FRONT of the first chunk this
+        // collect parks; appending the chunk leaves every already-queued frame
+        // ahead of it while a concurrent flusher still drains FIFO. (The old
+        // version moved the whole existing queue behind the snapshot, and a
+        // concurrent rebind could pop the snapshot itself.)
+        let mut front_parked = launch.is_empty();
         // The mapper buffers an assistant run until something supersedes it, so
         // the last message of a batch would otherwise sit unseen until the next
         // record arrives — which, at the end of a turn, may be minutes away.
         // Flushing at the end of each poll is what makes a finished turn appear.
         let mut chunk: Vec<Observation> = Vec::with_capacity(EMIT_CHUNK);
-        let park = |frames: &mut Vec<Observation>| {
-            if frames.is_empty() {
+        let mut park = |frames: &mut Vec<Observation>| {
+            if frames.is_empty() && (front_parked || launch.is_empty()) {
                 return;
             }
-            parked
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend(frames.drain(..));
+            {
+                let mut guard = parked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !front_parked {
+                    // Snapshot first, then this chunk: backlog stays ahead.
+                    guard.extend(launch.drain(..));
+                    front_parked = true;
+                }
+                guard.extend(frames.drain(..));
+            }
             notify.notify_one();
         };
         for line in &lines {
@@ -2325,6 +2331,17 @@ impl Hydrator {
             Err(error) => tracing::debug!(%error, "transcript flush failed"),
         }
         park(&mut chunk);
+        // No mapped frames this collect: the snapshot still has to queue, after
+        // the prior backlog (it never overtakes an earlier epoch).
+        if !front_parked && !launch.is_empty() {
+            {
+                let mut guard = parked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.extend(launch.drain(..));
+            }
+            notify.notify_one();
+        }
         Ok(Vec::new())
     }
 }
@@ -3762,5 +3779,233 @@ mod tests {
         assert_eq!(known(&payload.output_tokens), 13);
         // After the guard ran, the slot is empty (finalised once).
         assert!(slot_lock(&slot).is_none());
+    }
+
+    /// c-ctxusage r8 item 4: the flusher pops the OWNED frame under the queue
+    /// lock BEFORE it awaits send. With a zero-capacity channel the send parks
+    /// until the receiver reads, and while parked the frame must already be out
+    /// of the queue — the old clone-front/send/pop sequence left it in place,
+    /// so a concurrent rebind prepending the snapshot lost the snapshot to the
+    /// later pop and duplicated the in-flight frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flusher_pops_the_owned_frame_before_the_send_awaits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx_in(dir.path());
+        let (tx, mut rx) = mpsc::channel(1);
+        let pending: PendingEmissions =
+            Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let notify = Arc::new(Notify::new());
+        let marker_obs = |text: &'static str| {
+            build(
+                &ctx,
+                1,
+                SourceChannel::Transcript,
+                Completeness::Structured,
+                crate::adapters::message_payload(
+                    Id::new("obj").expect("id"),
+                    remuda_protocol::MessageRole::Assistant,
+                    text.into(),
+                ),
+                Knowledge::NotApplicable,
+            )
+            .expect("observation")
+        };
+        {
+            let mut queue = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            queue.push_back(marker_obs("FIRST"));
+            queue.push_back(marker_obs("SECOND"));
+        }
+        let flusher_pending = Arc::clone(&pending);
+        let flusher_ctx = ctx.clone();
+        let handle = tokio::spawn(async move {
+            flush_pending(
+                &flusher_pending,
+                &tx,
+                &AtomicU64::new(0),
+                &flusher_ctx,
+            )
+            .await
+        });
+        // Wait for the flusher to park sending SECOND into the full buffer.
+        // With pop-before-send the queue is empty at that point (the frame is
+        // owned by the in-flight send); the old clone-front/send/pop sequence
+        // parked with SECOND still queued. Best-effort barrier: the ordering
+        // assertions below discriminate the two implementations regardless of
+        // whether this state was observed.
+        let park_deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < park_deadline
+            && !pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // A concurrent REBIND prepends the new epoch's snapshot while the
+        // SECOND send is in flight — the exact r8 item 4 race.
+        pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_front(marker_obs("SNAPSHOT_R"));
+
+        // New code: buffer drains FIRST, the parked send then resolves with
+        // SECOND, and the rebind snapshot is last — none lost or duplicated.
+        // Old code: the post-send pop_front discarded the prepended snapshot.
+        let first = rx.recv().await.expect("first frame");
+        assert!(
+            serde_json::to_string(&first).unwrap_or_default().contains("FIRST"),
+            "FIFO order broken on the first frame"
+        );
+        let second = rx.recv().await.expect("second frame");
+        assert!(
+            serde_json::to_string(&second)
+                .unwrap_or_default()
+                .contains("SECOND"),
+            "in-flight frame must be the one delivered"
+        );
+        let snapshot = rx.recv().await.expect("rebind snapshot not lost");
+        assert!(
+            serde_json::to_string(&snapshot)
+                .unwrap_or_default()
+                .contains("SNAPSHOT_R"),
+            "rebind snapshot delivered after the in-flight frame"
+        );
+        assert!(
+            rx.recv().await.is_none(),
+            "no frame duplicated by the rebind race"
+        );
+        let _ = handle.await;
+    }
+
+    /// c-ctxusage r8 item 4: a new epoch's launch snapshot queues AFTER the
+    /// prior epoch's unsent backlog but BEFORE the new epoch's own replayed
+    /// frames — never moved ahead of the backlog, and the in-flight frame the
+    /// flusher owns can never be popped a second time.
+    #[tokio::test]
+    async fn launch_snapshot_splits_backlog_from_own_replay_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let ctx = ctx_in(&cwd);
+        let transcript =
+            crate::claude_transcript::project_dir(&home, &cwd).join("snap-order.jsonl");
+        let record = serde_json::json!({
+            "type": "assistant",
+            "uuid": "snap-order-record",
+            "timestamp": "2026-10-09T00:03:00.000Z",
+            "isSidechain": false,
+            "message": {
+                "id": "msg_snap_order",
+                "role": "assistant",
+                "type": "message",
+                "model": "claude-opus-5-5",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "REPLAY_A"}],
+                "usage": {
+                    "input_tokens": 11,
+                    "cache_read_input_tokens": 22,
+                    "cache_creation_input_tokens": 1,
+                    "output_tokens": 3
+                }
+            }
+        });
+        write(&transcript, &format!("{record}\n"));
+
+        let marker_obs = |text: &str| {
+            build(
+                &ctx,
+                1,
+                SourceChannel::Transcript,
+                Completeness::Structured,
+                crate::adapters::message_payload(
+                    Id::new("obj").expect("id"),
+                    remuda_protocol::MessageRole::Assistant,
+                    text.into(),
+                ),
+                Knowledge::NotApplicable,
+            )
+            .expect("observation")
+        };
+
+        let mapper = TranscriptMapper::new(
+            remuda_protocol::DriverKind::ShellPty,
+            ctx.instance_id.clone(),
+            ctx.run_id.clone(),
+            ctx.journal_id.clone(),
+            ctx.host_id.clone(),
+            "snap-order".to_owned(),
+            "promoted".to_owned(),
+        );
+        let mut hydrator = Hydrator {
+            tail: crate::claude_transcript::TranscriptTail::new(transcript),
+            mapper,
+            pending: vec![marker_obs("SNAPSHOT_S")],
+            faults: None,
+        };
+        // Prior epoch backlog the flusher has not sent yet.
+        let pending: PendingEmissions =
+            Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(marker_obs("BACKLOG_B"));
+        let notify = Arc::new(Notify::new());
+        hydrator
+            .collect_pump(&pending, &notify)
+            .expect("collect");
+        let queued = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert!(queued >= 3, "backlog + snapshot + replay queued, got {queued}");
+
+        // Drain through the production flusher and capture delivered order.
+        let (tx, mut rx) = mpsc::channel::<Observation>(128);
+        let done = Arc::new(AtomicBool::new(false));
+        let residual_done = Arc::new(AtomicBool::new(true));
+        let seq = Arc::new(AtomicU64::new(0));
+        let handle = tokio::spawn(emission_flusher(
+            Arc::clone(&pending),
+            Arc::clone(&notify),
+            done,
+            residual_done,
+            tx,
+            seq,
+            ctx.clone(),
+        ));
+        // Drain through the flusher, capturing the delivered order.
+        let mut delivered: Vec<String> = Vec::new();
+        while let Ok(obs) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            && let Some(obs) = obs
+        {
+            delivered.push(serde_json::to_string(&obs).unwrap_or_default());
+        }
+        handle.abort();
+        let rendered = delivered.join("|");
+        let pos = |needle: &str| rendered.find(needle);
+        assert!(pos("BACKLOG_B").is_some(), "backlog delivered: {rendered}");
+        assert_eq!(
+            rendered.matches("SNAPSHOT_S").count(),
+            1,
+            "snapshot delivered once: {rendered}"
+        );
+        // The replay produces open/close mutations for one node id — both
+        // carry the text, but the single message node id appears on exactly
+        // those two and the first delivery is what order is asserted on.
+        assert!(
+            rendered.contains("REPLAY_A"),
+            "replayed frame delivered: {rendered}"
+        );
+        assert!(
+            pos("BACKLOG_B") < pos("SNAPSHOT_S"),
+            "snapshot must not overtake the prior backlog: {rendered}"
+        );
+        assert!(
+            pos("SNAPSHOT_S") < pos("REPLAY_A"),
+            "snapshot must precede its own replay: {rendered}"
+        );
     }
 }

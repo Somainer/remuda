@@ -690,6 +690,19 @@ export class Outbox {
    * store runs its single-deliverer flush (the Outbox itself never POSTs).
    */
   onClaimWake: (() => void) | null = null;
+  /**
+   * Store hook fired when a tracked SAME-OWNER wakeup fires (gate 17 item 2)
+   * and its critical section discovers the row is now an inflight claim of a
+   * FOREIGN owner. The wake stops tracking and hands the store the
+   * AUTHORITATIVE row (with the foreign deadline): the store owns foreign
+   * expiry recovery and must arm T2 itself — this wake is being cancelled and
+   * the store schedules foreign leases only from flush/unload rearm, so
+   * without the handoff the (possibly crashed) foreign claim stays inflight
+   * with no recovery clock. Fired only on the timer-discovery path: a refresh
+   * inside a flush reaches the store's own scheduleLeaseExpiryWakeup with the
+   * same durable snapshot.
+   */
+  onForeignLeaseHandoff: ((rec: OutboxRecord) => void) | null = null;
 
   private constructor(storage: OutboxStorage, owner?: Id) {
     this.storage = storage;
@@ -1022,7 +1035,7 @@ export class Outbox {
       | { kind: "failure" }
       | { kind: "stop"; rec: OutboxRecord | null }
       | { kind: "adopt"; lease: { owner: Id; until: number } }
-      | { kind: "handoff"; lease: { owner: Id; until: number } }
+      | { kind: "handoff"; rec: OutboxRecord }
       | { kind: "deliver"; rec: OutboxRecord };
     let outcome: Outcome;
     try {
@@ -1046,10 +1059,13 @@ export class Outbox {
         if (lease.owner !== this.owner) {
           // Gate 16 item 2: ownership changed to a FOREIGN owner. The store's
           // lease-expiry scheduler (scheduleLeaseExpiryWakeup) is the single
-          // owner of foreign-lease recovery; this Outbox wake must HAND OFF —
-          // cancel itself instead of adopting — or both schedulers fire, run
-          // two independent flushes and re-POST a `held` row past its delay.
-          return { kind: "handoff", lease };
+          // owner of foreign-lease recovery; this Outbox wake must HAND OFF
+          // — cancel itself instead of adopting — so two schedulers never
+          // fire for one lease. Gate 17 item 2: carry the AUTHORITATIVE row
+          // (not just the lease) so the outcome handler caches it and hands
+          // the foreign deadline to the store hook — this wake is the only
+          // recovery clock that knew about the row (B may already be dead).
+          return { kind: "handoff", rec: current };
         }
         // Same owner, different deadline: a renewal by this recovery identity.
         // Gate 13 item 1 (a/b): "still inflight" is never terminal — ADOPT
@@ -1079,11 +1095,13 @@ export class Outbox {
         if (reclaimed.state === "pending") return { kind: "deliver", rec: reclaimed };
         // Gate 13 item 1 (b): a concurrent renewal between read and claim
         // makes the conditional return the replacement inflight row. Same
-        // owner -> adopt; foreign owner -> hand off to the store scheduler.
+        // owner -> adopt; foreign owner -> hand off the AUTHORITATIVE row to
+        // the store scheduler (gate 17 item 2: cache the returned row here,
+        // not just the lease).
         if (reclaimed.state === "inflight" && reclaimed.lease) {
           return reclaimed.lease.owner === this.owner
             ? { kind: "adopt", lease: reclaimed.lease }
-            : { kind: "handoff", lease: reclaimed.lease };
+            : { kind: "handoff", rec: reclaimed };
         }
         return { kind: "stop", rec: reclaimed };
       } catch {
@@ -1114,10 +1132,14 @@ export class Outbox {
       return;
     }
     if (outcome.kind === "handoff") {
-      // Foreign owner now: stop tracking it in the Outbox (the cache still
-      // imports the row from the read). The store's foreign-lease scheduler
-      // owns expiry recovery from here (gate 16 item 2).
+      // Foreign owner now. Gate 17 item 2: CACHE the authoritative replacement
+      // row (the conditional reclaim returned it verbatim; keeping the stale
+      // same-owner lease would mislead the pending count), stop tracking it in
+      // the Outbox, and hand the foreign row+deadline to the store's
+      // foreign-lease scheduler — the only thing that schedules T2 from here.
+      this.cache.set(commandId, outcome.rec);
       this.clearClaimWakeup(commandId);
+      this.onForeignLeaseHandoff?.(outcome.rec);
       return;
     }
     if (outcome.rec) this.cache.set(commandId, outcome.rec);
@@ -1145,6 +1167,7 @@ export class Outbox {
     this.claimWakeups.clear();
     this.activeDeliveries.clear();
     this.onClaimWake = null;
+    this.onForeignLeaseHandoff = null;
   }
 
   isFlushing(instanceId: Id): boolean {

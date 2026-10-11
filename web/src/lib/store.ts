@@ -759,6 +759,13 @@ class HubStore {
         box.onClaimWake = () => {
           void this.flushAllOutbox();
         };
+        // Gate 17 item 2: the Outbox's same-owner claim wake can fire and
+        // discover a FOREIGN replacement lease (the other document already
+        // crashed). Its wake is cancelled at that moment; only this hook puts
+        // T2 on the store's foreign-lease scheduler.
+        box.onForeignLeaseHandoff = (rec) => {
+          this.scheduleForeignLeaseHandoff(rec, Date.now());
+        };
         this.emit({ outboxPending: box.pendingCount() });
         if (opened.degraded) this.toast("本机无法可靠保存待发消息（存储不可用）");
         // Rows left inflight by a closed tab are due immediately.
@@ -3920,18 +3927,46 @@ class HubStore {
       if (prev === undefined || r.lease.until < prev) earliest.set(r.instanceId, r.lease.until);
     }
     for (const [instanceId, until] of earliest) {
-      const armed = this.leaseWakeupUntil.get(instanceId);
-      if (armed !== undefined && armed <= until) continue;
-      const old = this.leaseWakeupTimer.get(instanceId);
-      if (old) clearTimeout(old);
-      this.leaseWakeupUntil.set(instanceId, until);
-      const timer = setTimeout(() => {
-        this.leaseWakeupTimer.delete(instanceId);
-        this.leaseWakeupUntil.delete(instanceId);
-        void this.flushAllOutbox();
-      }, Math.max(0, until - Date.now()));
-      this.leaseWakeupTimer.set(instanceId, timer);
+      this.armLeaseWakeup(instanceId, until, now, includeOverdue);
     }
+  }
+
+  /**
+   * Gate 17 item 2: arm the per-instance foreign-lease wakeup from ONE
+   * authoritative row the Outbox's own claim wake just discovered. That wake
+   * is being cancelled on handoff, and the store otherwise schedules foreign
+   * leases only from a flush/unload rearm — with neither in flight the
+   * replacement lease (the other document may already have crashed) would
+   * stay inflight forever. An already-overdue deadline arms an immediate
+   * guarded wake (pagehide and the flush unload flag guard it).
+   */
+  private scheduleForeignLeaseHandoff(rec: OutboxRecord, now: number = Date.now()) {
+    if (this.pageIsUnloading) return;
+    if (rec.state !== "inflight" || !rec.lease) return;
+    if (rec.lease.owner === this.outbox?.ownerId) return;
+    this.armLeaseWakeup(rec.instanceId, rec.lease.until, now, true);
+  }
+
+  /**
+   * Arm (or move EARLIER) the single foreign-lease wakeup for an instance.
+   * A fresh snapshot with a later deadline never pushes an armed wake out.
+   * `allowOverdue` arms a 0 ms guarded wake (used by the read-only unload
+   * re-arm and the gate-17 handoff); the normal flush path skips overdue
+   * leases because that same pass delivers the stealable row itself.
+   */
+  private armLeaseWakeup(instanceId: Id, until: number, now: number, allowOverdue: boolean) {
+    if (!allowOverdue && until <= now) return;
+    const armed = this.leaseWakeupUntil.get(instanceId);
+    if (armed !== undefined && armed <= until) return;
+    const old = this.leaseWakeupTimer.get(instanceId);
+    if (old) clearTimeout(old);
+    this.leaseWakeupUntil.set(instanceId, until);
+    const timer = setTimeout(() => {
+      this.leaseWakeupTimer.delete(instanceId);
+      this.leaseWakeupUntil.delete(instanceId);
+      void this.flushAllOutbox();
+    }, Math.max(0, until - Date.now()));
+    this.leaseWakeupTimer.set(instanceId, timer);
   }
 
   private chainReconcile(instanceId: Id, job: () => Promise<unknown>): Promise<unknown> {

@@ -909,6 +909,118 @@ describe("Outbox", () => {
     } as Storage;
   }
 
+  it("GATE12 item 7: cloned tabs with a REAL held lock and a held POST — B neither requeues nor POSTs; releasing A delivers exactly once", async () => {
+    // Replaces the query-only stub. The lock manager implements BOTH query and
+    // request with real holder bookkeeping (exclusive locks are serialized and
+    // only one holder per name). A holds the instance lock with its POST parked;
+    // B (cloned sessionStorage → same owner) loads and must leave A's claim
+    // entirely alone; after A releases, exactly one POST happened overall.
+    class FakeLockManager {
+      held = new Map<string, { queue: (() => void)[] }>();
+      query = async () => ({
+        held: [...this.held.keys()].map((name) => ({ name, mode: "exclusive" as const })),
+      });
+      async request<T>(name: string, _opts: unknown, cb: () => Promise<T>): Promise<T> {
+        await new Promise<void>((resolve) => {
+          const cur = this.held.get(name);
+          if (!cur) {
+            this.held.set(name, { queue: [] });
+            resolve();
+          } else {
+            cur.queue.push(resolve);
+          }
+        });
+        try {
+          return await cb();
+        } finally {
+          const cur = this.held.get(name)!;
+          const next = cur.queue.shift();
+          if (next) next();
+          else this.held.delete(name);
+        }
+      }
+    }
+    const locks = new FakeLockManager();
+    const originalNavigator = globalThis.navigator;
+    const originalSession = globalThis.sessionStorage;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: { locks },
+    });
+    const instanceId = "ins_clone_real";
+    const owner = "owner_clone_real";
+    const sessionWithOwner = (o: string): Storage => {
+      const m = new Map<string, string>([["remuda-outbox-owner", o]]);
+      return {
+        getItem: (k: string) => m.get(k) ?? null,
+        setItem: (k: string, v: string) => void m.set(k, v),
+        removeItem: (k: string) => void m.delete(k),
+        clear: () => m.clear(),
+        key: () => null,
+        length: m.size,
+      } as Storage;
+    };
+    try {
+      // A owns the row and the durable store.
+      Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: sessionWithOwner(owner) });
+      const store = new MemStorage();
+      const a = await Outbox.load(store, owner);
+      await a.enqueue(rec({ commandId: "cmd_clone_real", instanceId }));
+
+      // A begins delivery under the REAL instance lock; the POST is held.
+      let releasePost: (() => void) | null = null;
+      const postHeld = new Promise<void>((r) => void (releasePost = r));
+      const posts: string[][] = [];
+      const aDelivery = a.withInstanceLock(instanceId, async (_iid, rows) => {
+        posts.push(rows.map((r) => r.commandId));
+        // Claim the durable inflight lease exactly like store.deliverOutboxRecord.
+        await a.patch(rows[0]!.commandId, {
+          state: "inflight",
+          attempts: 1,
+          lease: { owner, until: Date.now() + LEASE_TTL_MS },
+        });
+        await postHeld; // POST in flight
+        await a.patch(rows[0]!.commandId, { state: "sent", gotResponse: true, lease: undefined });
+        return rows.length;
+      });
+      await Promise.resolve();
+      // A has claimed inflight and holds the lock; let the claim write land.
+      await new Promise((r) => setTimeout(r, 5));
+      expect(store.map.get("cmd_clone_real")?.state).toBe("inflight");
+      expect([...locks.held.keys()]).toContain(instanceDeliveryLockName(instanceId));
+
+      // B loads (cloned owner) WHILE A holds the lock with its POST pending.
+      Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: sessionWithOwner(owner) });
+      const b = await Outbox.load(store, owner);
+      expect(b.pendingFor(instanceId)).toEqual([]);
+      expect(store.map.get("cmd_clone_real")?.state).toBe("inflight");
+      // B's own lock turns SERIALIZE behind A (it cannot even enter): no POST
+      // from B, still exactly the one A turn started.
+      expect(posts).toEqual([["cmd_clone_real"]]);
+
+      // Release A's POST; it marks sent and releases the lock. B never wakes a
+      // delivery of its own (its load found the lock held and armed nothing
+      // deliverable).
+      releasePost!();
+      await aDelivery;
+      expect(posts).toEqual([["cmd_clone_real"]]);
+      expect(store.map.get("cmd_clone_real")?.state).toBe("sent");
+
+      // Even a later flush by B sees the sent row and POSTs nothing.
+      const bRows = await b.withInstanceLock(instanceId, (_iid, rows) => {
+        posts.push(rows.map((r) => r.commandId));
+        return Promise.resolve(rows.length);
+      });
+      expect(bRows).toBe(0);
+      expect(posts).toEqual([["cmd_clone_real"], []]);
+      a.dispose();
+      b.dispose();
+    } finally {
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+      Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: originalSession });
+    }
+  });
+
   it("GATE11 item 3: cloned sessionStorage tabs (DEFAULT load) — holder present keeps A's POST claim; absent locks same; gone holder requeues", async () => {
     // Realistic two-tab bookkeeping through Outbox.load with NO explicit owner
     // argument: each tab's tabOwner() reads its own sessionStorage stub;

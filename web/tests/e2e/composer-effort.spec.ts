@@ -390,16 +390,26 @@ test.describe("composer control bar and effort", () => {
     expect(approval).toBeTruthy();
     expect(panel).toBeTruthy();
     expect(trigger).toBeTruthy();
+    const bottom = (box: { y: number; height: number }) => box.y + box.height;
 
-    // c-effortui r5 item 4: compute the card-cleared strip the same way the
-    // popover does (trigger.y − approval.bottom − 8px gap) and assert the
-    // branch the GEOMETRY dictates, rather than accepting any overlap:
+    // c-effortui r5 item 4 / c-effortui r6 item 11: compute the card-cleared
+    // strip the same way the popover does (trigger.y − approval.bottom − 8px
+    // gap; bottom is y + height — a Playwright box has no `.bottom`) and assert
+    // the branch the FINITE geometry dictates, rather than accepting an
+    // always-NaN strip into the permissive else-branch:
     //  - strip >= 120 usable: the panel MUST clear the card entirely;
     //  - strip < 120 (docked, no room to dodge): bounded lesser-evil fallback
     //    (on-screen, bottom edge at/above the trigger).
     const gap = 8;
     const downUsable = 120;
-    const strip = trigger!.y - approval!.bottom - gap;
+    for (const box of [approval!, panel!, trigger!]) {
+      expect(
+        Number.isFinite(box.x) && Number.isFinite(box.y) && box.width > 0 && box.height > 0,
+        `all measured boxes must be finite and non-empty: ${JSON.stringify(box)}`,
+      ).toBeTruthy();
+    }
+    const strip = trigger!.y - bottom(approval!) - gap;
+    expect(Number.isFinite(strip)).toBeTruthy();
     if (strip >= downUsable) {
       expect(
         noOverlap(approval!, panel!),
@@ -412,11 +422,11 @@ test.describe("composer control bar and effort", () => {
     } else {
       // Narrow strip: the documented bounded fallback.
       expect(
-        panel!.y >= 0 && panel!.y + panel!.height <= 900,
+        panel!.y >= 0 && bottom(panel!) <= 900,
         `fallback panel must be on-screen: ${JSON.stringify(panel)}`
       ).toBeTruthy();
       expect(
-        panel!.y + panel!.height <= trigger!.y,
+        bottom(panel!) <= trigger!.y,
         "fallback panel bottom stays above the trigger"
       ).toBeTruthy();
     }

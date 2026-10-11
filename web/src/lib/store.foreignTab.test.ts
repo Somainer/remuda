@@ -116,6 +116,94 @@ it("GATE10 item 7: a lease-less done row committed by another tab skips without 
   hubStore.logout();
 });
 
+it("GATE12 item 6: two aborting load reclaims arm the tracked wakeup that delivers via the REAL store wiring with exactly one POST", async () => {
+  // Unlike the Outbox-only test (which installs its own onClaimWake), this
+  // drives hubStore end to end: Outbox.load -> both reclaim writes abort ->
+  // the tracked wakeup fires at the lease deadline -> the store's registered
+  // onClaimWake runs flushAllOutbox -> one instanceSend. Removing the store
+  // registration (store.ts onClaimWake) leaves the row pending with zero POSTs.
+  vi.useFakeTimers();
+  const OWNER_KEY = "remuda-outbox-owner";
+  const owner = "owner_g12_item6";
+  sessionStorage.setItem(OWNER_KEY, owner);
+  const deadline = Date.now() + 30_000;
+  localStorage.setItem(
+    OUTBOX_LS_KEY,
+    JSON.stringify([
+      row({
+        commandId: "cmd_wake_store",
+        state: "inflight",
+        lease: { owner, until: deadline },
+      }),
+    ]),
+  );
+  // Query says holder gone -> same-owner reclaim attempted at load; no
+  // request() (jsdom): durable lease fallback path.
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { locks: { query: async () => ({ held: [] }) } },
+  });
+  // Fail exactly the first TWO reclaim writes (pending patch); everything
+  // after goes through. Capture the ORIGINAL explicitly — the vi spy's
+  // wrappedMethod is not available on the jsdom Storage prototype here.
+  const originalSetItem = Storage.prototype.setItem;
+  let reclaimWrites = 0;
+  Storage.prototype.setItem = function (this: Storage, key: string, value: string) {
+    if (
+      key === OUTBOX_LS_KEY &&
+      typeof value === "string" &&
+      value.includes("cmd_wake_store") &&
+      value.includes('"state":"pending"')
+    ) {
+      reclaimWrites += 1;
+      if (reclaimWrites <= 2) throw new DOMException("one-shot abort", "QuotaExceededError");
+    }
+    return originalSetItem.call(this, key, value);
+  };
+
+  const { api, hubStore } = await fresh();
+  await bootLive(api, hubStore);
+  // Both load reclaims aborted; the boot-time flush saw a fresh inflight claim
+  // and POSTed nothing.
+  expect(reclaimWrites).toBe(2);
+  const send = vi
+    .spyOn(api, "instanceSend")
+    .mockImplementation((async (_iid, _prompt, _att, _mode, commandId) => ({
+      relatedCommandIds: [],
+      command: {
+        commandId,
+        id: commandId,
+        state: "accepted",
+        revision: "1",
+        dispatch: "native-acknowledged",
+        resolution: "clear",
+      } as Awaited<ReturnType<Api["instanceSend"]>>["command"],
+    })) as Api["instanceSend"]);
+  expect(send).not.toHaveBeenCalled();
+
+  // At the lease deadline, with NO other trigger: the wakeup reclaims and the
+  // store wiring flushes -> exactly one POST and a durable delivered state.
+  await vi.advanceTimersByTimeAsync(31_000);
+  await vi.advanceTimersByTimeAsync(40_000); // let the drained delivery chain settle
+  expect(send).toHaveBeenCalledTimes(1);
+  expect(send.mock.calls[0]?.[4]).toBe("cmd_wake_store");
+  const stored = JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+  const delivered = stored.find((r) => r.commandId === "cmd_wake_store");
+  expect(delivered?.state).toBe("sent");
+  expect(delivered?.lease).toBeUndefined();
+
+  // No duplicate delivery long afterwards.
+  await vi.advanceTimersByTimeAsync(120_000);
+  expect(send).toHaveBeenCalledTimes(1);
+
+  vi.useRealTimers();
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+  Storage.prototype.setItem = originalSetItem;
+  sessionStorage.removeItem(OWNER_KEY);
+  hubStore.logout();
+});
+
 it("discovers and delivers a row another tab persisted after this tab loaded", async () => {
   const { api, hubStore } = await fresh();
   await bootLive(api, hubStore);

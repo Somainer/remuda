@@ -1,22 +1,18 @@
-//! c-ctxusage r6 item 3: when close lands while the promoter's first-bind
-//! pump is still mapping a LARGE backlog past the bounded wait (15 s), the
-//! poller task is aborted. The abort-path FinaliseGuard owns the hydrator
-//! through the loop's shared slot (and the pump/finalise emission queue), so
-//! its Drop still runs the mapper's `finish()` and rescues the LAST buffered
-//! assistant run (usage present, stop_reason null), stamped through the
-//! promoter builder. Before the fix the guard held a separate `None`, so that
-//! usage never reached usage_events.
+//! c-ctxusage r6 item 3 / r8: when close lands while the promoter's first-bind
+//! pump is still working, the poller task is aborted. The abort-path
+//! FinaliseGuard owns the hydrator through the loop's shared slot (and the
+//! pump/finalise emission queue), so its residual thread runs the mapper's
+//! `finish()` and rescues the LAST buffered assistant run (usage present,
+//! stop_reason null), stamped through the promoter builder. Before the fix
+//! the guard held a separate `None`, so that usage never reached
+//! usage_events.
 //!
-//! The backlog is written to the transcript BEFORE the harness launches, so
-//! the first-bind replay pump is the long map close aborts into. The final
-//! record carries no `stop_reason`, so an ordinary poll flush can NEVER
-//! publish it: only `finish()` (cooperative finalise or the guard) can. The
-//! harness is kept alive with one harmless unmatched prompt; nothing ever
-//! supersedes the seeded run.
-//!
-//! No wall-clock is asserted anywhere; the backlog size is content, not a
-//! timing assumption (a fast box takes the cooperative finalise path, which
-//! publishes the same row — the assertion is identical either way).
+//! The abort is forced deterministically with the injected fault seam (r8
+//! items 6/7): a barrier INSIDE the blocking collect/finalise parks it, a
+//! shortened close bound crosses the timeout, and the abort-residual
+//! acknowledgement proves that path ran. The final record carries no
+//! `stop_reason`, so an ordinary poll flush can NEVER publish it: only
+//! `finish()` (cooperative finalise or the guard) can.
 #![cfg(unix)]
 
 use remuda_driver::shell_pty::{AgentLaunch, HookConfig, ShellPtyDriver, ShellPtyOptions};
@@ -164,7 +160,7 @@ fn to_journal_record(observation: &Observation) -> JournalRecord {
     }
 }
 
-// Test-only file-backed collect gate makes this abort deterministic.
+// Deterministic abort via the injected pump barrier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn abort_past_the_finalise_bound_still_rescues_the_last_usage_run() {
     let dir = tempfile::tempdir().expect("tempdir");

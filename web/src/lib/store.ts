@@ -1029,19 +1029,36 @@ class HubStore {
       const id = instance.id;
       const view = effectiveFromRecord(instance.effortEffective);
       const previousPoll = this.polledEffort.get(id);
-      this.polledEffort.set(id, view);
+      // c-effortread r9 item 7: never let a rejected view advance polled
+      // state. A null poll below sets it to null WITHOUT overwriting the
+      // stored T1 projection, and a watermarked view below continues; storing
+      // either first let a later null lower the watermark and let the rejected
+      // view compare against itself.
+      let pollAccepted = true;
       if (!view) {
         // r7 item 4(a): distinguish "the Hub projection went from a level to
         // null" (an explicit withdrawal) from "never projected". The pending
-        // chip shows `?` only for the former. c-effortread r8 item 1: record
-        // the watermark as the previous projection's observedAt (the null
-        // record carries no timestamp) so older poll/load-earlier edges can't
-        // restore it.
+        // chip shows `?` only for the former.
         if (previousPoll) {
+          // c-effortread r8 item 1 / r9 item 7: the watermark is the max of
+          // the previous projection's observedAt and any live edge already
+          // recorded (a readbackAvailable:false can land between polls) —
+          // never lower it. The null record carries no timestamp.
+          const liveWatermark = withdrawnNext[id];
+          const stamp = (() => {
+            const candidates = [previousPoll.observedAt || "", liveWatermark ?? ""].filter(Boolean);
+            return candidates.reduce<string>(
+              (newest, ts) =>
+                newest && Date.parse(newest) > Date.parse(ts) ? newest : ts,
+              "",
+            );
+          })();
+          if (liveWatermark == null) withdrawnNext[id] = stamp || "";
+          else withdrawnNext[id] = stamp || liveWatermark;
           delete next[id];
-          withdrawnNext[id] = previousPoll.observedAt || "";
           effectiveUpdated = true;
         }
+        this.polledEffort.set(id, view);
         continue;
       }
       // c-effortread r8 item 1: a poll carrying a view at or older than the
@@ -1050,6 +1067,7 @@ class HubStore {
       // the marker or move the slider.
       const watermark = withdrawnNext[id];
       if (watermark != null && (!view.observedAt || Date.parse(view.observedAt) <= Date.parse(watermark))) {
+        pollAccepted = false;
         continue;
       }
       // A strictly newer real projection clears the withdrawal watermark.
@@ -1076,6 +1094,10 @@ class HubStore {
           this.clearEffortRefusal(id);
         }
       }
+      // c-effortread r9 item 7: advance polled state only for an ACCEPTED
+      // view, so a rejected watermarked view is never later compared against
+      // itself and a following null still sees the pre-withdrawal projection.
+      if (pollAccepted) this.polledEffort.set(id, view);
     }
     if (effectiveUpdated || pendingChanged) {
       this.emit({

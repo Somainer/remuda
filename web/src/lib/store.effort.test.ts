@@ -513,6 +513,55 @@ it("the model-scoped refusal expires when the model changes", async () => {
   expect(hubStore.effortRefusalOf(ctx.instance.id)).toBeNull();
 });
 
+it("r9 item 7: a null poll never lowers the withdrawal watermark; a stale level stays withdrawn", async () => {
+  const ctx = await startFollowing("null-poll-watermark");
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+
+  // T1: the durable record projects high via a poll.
+  const at = (ms: string | null) =>
+    ({ ...ctx.instance, effortEffective: ms == null ? null : { name: "high", ultracode: false, source: "remuda", observedAt: ms } }) as Instance;
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [at("2026-10-08T00:01:00.000Z")] } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("high");
+
+  // T2: a live read-back-unavailable edge withdraws the projection.
+  ctx.receive({
+    eventId: "evt_eff_null_poll_withdrawn",
+    instanceId: "x",
+    journalId: "x",
+    seq: "3",
+    kind: "effort",
+    observedAt: "2026-10-08T00:02:00.000Z",
+    source: { channel: "transcript" },
+    payload: {
+      effective: {
+        name: null,
+        ultracode: null,
+        source: "remuda",
+        observedAt: "2026-10-08T00:02:00.000Z",
+        readbackAvailable: false,
+      },
+      raw: null,
+    },
+  } as unknown as Observation);
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
+
+  // Null poll: it must record NULL (not the old T1 view as the watermark).
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [at(null)] } as never);
+  await hubStore.refresh();
+
+  // A stale T1.5 level view arrives both via a delayed poll AND replayed
+  // history; each must stay withdrawn (watermark is still T2).
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [at("2026-10-08T00:01:30.000Z")] } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)).toBeNull();
+  ctx.receive(effortEvent(4, "high", false, "slash", "2026-10-08T00:01:45.000Z"));
+  expect(
+    hubStore.effortEffectiveOf(ctx.instance.id),
+    "a replayed T1.5 history level stays withdrawn below the T2 watermark",
+  ).toBeNull();
+});
+
 it("a poll projection settles the push-down without a live event", async () => {
   const ctx = await startFollowing("poll-settle");
   const projected: Instance = {

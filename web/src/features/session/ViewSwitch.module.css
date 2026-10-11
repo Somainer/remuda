@@ -1,8 +1,7 @@
 /* @tokens strict */
 /* The 终端 | 结构 segmented switch (visual-system §8.2): 32px inset track,
-   26px items, selected item raised with a control-border ring. The mobile
-   44px reach stays a width-media ::after (not pointer:coarse): the gate's
-   hit-area probes drive a phone viewport with a fine pointer. */
+   26px items, selected item raised with a control-border ring. The 44px
+   reach follows pointer: coarse (ui-spec §3.4), never viewport width. */
 .viewSwitch {
   display: inline-flex;
   align-items: center;
@@ -46,22 +45,22 @@
   box-shadow: inset 0 0 0 1px var(--border-control);
 }
 
-@media (max-width: 767px) {
+@media (pointer: coarse) {
+  /* The 44px reach past the 32px track is reserved as block margin. */
+  .viewSwitch {
+    margin-block: calc((var(--touch) - 32px) / 2);
+  }
+
   .viewSeg {
     min-width: var(--touch);
     padding: 0 var(--space-2);
   }
 
-  /* Visual height stays 26px; the 44px reach is a centered pseudo that only
-     extends vertically and horizontally to the segment's own box, so
-     adjacent hot zones never overlap (ui-spec §8.2, D-039). */
+  /* Visual height stays 26px; the reach extends vertically only, so the
+     neighbouring segment's zone never overlaps (ui-spec §3.4, D-039). */
   .viewSeg::after {
     content: "";
     position: absolute;
-    top: 50%;
-    left: 50%;
-    width: var(--touch);
-    height: var(--touch);
-    transform: translate(-50%, -50%);
+    inset: calc((var(--seg-item) - var(--touch)) / 2) 0;
   }
 }

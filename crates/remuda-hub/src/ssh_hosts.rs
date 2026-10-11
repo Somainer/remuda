@@ -337,36 +337,110 @@ impl Store {
 
     /// Reconcile observed state without trusting the Node to advance the Hub's
     /// durable journal watermark. Replay is still required for every missing seq.
+    ///
+    /// Returns the [`Settlement`] of pending cards belonging to instances this
+    /// inventory report transitions INTO a terminal lifecycle (c-cardsettle);
+    /// they are invalidated in the same transaction.
     pub(crate) async fn reconcile_daemon_instances(
         &self,
         host_id: String,
         instances: Vec<Value>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<crate::store::Settlement, StoreError> {
         self.run_named("reconcile_daemon_instances", move |conn| {
-            let tx = conn.transaction()?;
+            let tx = crate::store::immediate_tx(conn)?;
+            let now = now_rfc3339();
+            // Instances this report moves INTO a terminal lifecycle; their
+            // pending interactions settle with the UPDATE (c-cardsettle).
+            let mut ended: Vec<String> = Vec::new();
             for instance in instances {
-                if instance["hostId"].as_str() != Some(&host_id) { continue; }
-                let Some(id) = instance["id"].as_str().or_else(|| instance["instanceId"].as_str()) else { continue; };
+                if instance["hostId"].as_str() != Some(&host_id) {
+                    continue;
+                }
+                let Some(id) = instance["id"]
+                    .as_str()
+                    .or_else(|| instance["instanceId"].as_str())
+                else {
+                    continue;
+                };
                 let lifecycle = match instance["lifecycle"].as_str() {
                     Some("ready" | "running") => "running",
-                    Some(value @ ("requested" | "preparing" | "starting" | "closing" | "exited" | "failed" | "unknown" | "reconciling")) => value,
+                    Some(
+                        value @ ("requested" | "preparing" | "starting" | "closing" | "exited"
+                        | "failed" | "unknown" | "reconciling"),
+                    ) => value,
                     _ => continue,
                 };
-                let activity = instance["activity"].as_str().or_else(|| instance["activity"]["value"].as_str());
+                let activity = instance["activity"]
+                    .as_str()
+                    .or_else(|| instance["activity"]["value"].as_str());
                 let activity = match activity {
                     Some("waiting-interaction") => "blocked",
                     Some(value @ ("idle" | "working" | "blocked" | "draining")) => value,
                     _ => "unknown",
                 };
+                // r9 item 2 (OA6): "was this row REALLY terminal?" must use
+                // process-end EVIDENCE, not the lifecycle string alone. The
+                // host-lost sweep marker (`exited` + 'host-lost' + no
+                // ended_at) is only potentially dead; a daemon that now
+                // reports the instance exited authoritatively attests the
+                // process end, so its pending cards must settle.
+                let previous: Option<(String, Option<String>, Option<String>)> = tx
+                    .query_row(
+                        "SELECT lifecycle, last_error, ended_at
+                         FROM instances WHERE id = ?1 AND host_id = ?2",
+                        params![id, &host_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                // r9 item 2 (OA6): "was this row REALLY terminal?" must use
+                // process-end EVIDENCE, not the lifecycle string alone. The
+                // host-lost sweep marker (`exited` + 'host-lost' + no
+                // ended_at) is only potentially dead; a daemon that now
+                // reports the instance exited authoritatively attests the
+                // process end, so its pending cards must settle.
+                let was_terminal = match &previous {
+                    Some((lifecycle, last_error, ended_at)) => {
+                        crate::store::lifecycle_has_process_end_evidence(
+                            lifecycle,
+                            last_error.as_deref(),
+                            ended_at.as_deref(),
+                        )
+                    }
+                    None => true,
+                };
+                let now_terminal = matches!(lifecycle, "exited" | "failed" | "closed");
+                // ma-lineage r5 item 1: a daemon reconcile reporting RUNNING
+                // is authoritative liveness (D-019, same epoch) — it revives a
+                // host-lost/ambiguous terminal row, clearing ended_at (host
+                // loss is contact loss, not a death) and last_error.
+                let reports_running = lifecycle == "running";
                 tx.execute(
                     "UPDATE instances SET lifecycle = ?3, activity = ?4, connectivity = 'connected',
-                     last_error = ?5, updated_at = ?6 WHERE id = ?1 AND host_id = ?2",
-                    params![id, host_id, lifecycle, activity, instance["lastError"].as_str(), now_rfc3339()],
+                     last_error = CASE WHEN ?7 THEN NULL ELSE ?5 END,
+                     ended_at = CASE WHEN ?7 THEN NULL
+                                     WHEN ?8 THEN COALESCE(ended_at, ?6)
+                                     ELSE ended_at END,
+                     updated_at = ?6 WHERE id = ?1 AND host_id = ?2",
+                    params![
+                        id,
+                        &host_id,
+                        lifecycle,
+                        activity,
+                        instance["lastError"].as_str(),
+                        &now,
+                        reports_running,
+                        now_terminal
+                    ],
                 )?;
+                if !was_terminal && now_terminal {
+                    ended.push(id.to_string());
+                }
             }
+            let settlement = crate::store::settle_instance_interactions(&tx, &ended, &now)?;
             tx.commit()?;
-            Ok(())
-        }).await
+            Ok(settlement)
+        })
+        .await
     }
 
     async fn retire_managed_host(&self, id: String) -> Result<(), HubError> {
@@ -540,13 +614,14 @@ async fn bridge_stdio_session<T: NodeTransport>(
     )
     .await?;
     state
-        .store
-        .reconcile_daemon_instances(
-            managed.id.clone(),
-            hello["params"]["instances"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
+        .publish_settlement_unit(
+            state.store.reconcile_daemon_instances(
+                managed.id.clone(),
+                hello["params"]["instances"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
         )
         .await?;
     carrier
@@ -622,17 +697,35 @@ mod tests {
             .await
             .unwrap();
         store.ssh_status(id.clone(), "online", None).await.unwrap();
-        let instance = store
-            .insert_instance(
-                id.clone(),
-                None,
-                "claude".into(),
-                "claude-print".into(),
-                None,
-                json!({}),
-            )
-            .await
-            .unwrap();
+        // ma-lineage r6 item 3(c): host-lost sweeps only chapters that
+        // reached a live lifecycle; acknowledge this instance (ready).
+        let instance = {
+            let inserted = store
+                .insert_instance(
+                    id.clone(),
+                    None,
+                    "claude".into(),
+                    "claude-print".into(),
+                    None,
+                    json!({}),
+                )
+                .await
+                .unwrap();
+            store
+                .append_journal(
+                    id.clone(),
+                    inserted.instance_id.clone(),
+                    Some(1),
+                    json!({"kind":"lifecycle","payload":{"type":"entity","state":"ready"}}),
+                )
+                .await
+                .unwrap();
+            store
+                .get_instance(inserted.instance_id)
+                .await
+                .unwrap()
+                .unwrap()
+        };
         let host_id = id.clone();
         store
             .run_named(
@@ -648,7 +741,7 @@ mod tests {
             .await
             .unwrap();
         store.mark_all_hosts_offline().await.unwrap();
-        assert_eq!(store.expire_lost_hosts(60_000).await.unwrap(), 0);
+        assert_eq!(store.expire_lost_hosts(60_000).await.unwrap().0, 0);
         store
             .run_named(
                 "bridge_loss_grace_begins_only_after_daemon_probe_fails",
@@ -662,13 +755,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(store.expire_lost_hosts(60_000).await.unwrap(), 0);
+        assert_eq!(store.expire_lost_hosts(60_000).await.unwrap().0, 0);
         let id = instance.host_id.clone();
         store
             .ssh_daemon_probe(id.clone(), true, None)
             .await
             .unwrap();
-        assert_eq!(store.expire_lost_hosts(0).await.unwrap(), 0);
+        assert_eq!(store.expire_lost_hosts(0).await.unwrap().0, 0);
         let disconnected_id = id.clone();
         store
             .run_named("bridge_loss_grace_begins_only_after_daemon_probe_fails", move |conn| {
@@ -685,7 +778,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.expire_lost_hosts(60_000).await.unwrap(),
+            store.expire_lost_hosts(60_000).await.unwrap().0,
             0,
             "first failed daemon probe must reset the earlier bridge disconnect timestamp"
         );
@@ -705,7 +798,7 @@ mod tests {
             .unwrap();
         store.ssh_daemon_probe(id, false, None).await.unwrap();
         assert_eq!(
-            store.expire_lost_hosts(60_000).await.unwrap(),
+            store.expire_lost_hosts(60_000).await.unwrap().0,
             1,
             "failed retries must not restart grace"
         );
@@ -715,7 +808,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(instance.lifecycle, "exited");
-        assert_eq!(instance.last_error.as_deref(), Some("host-lost"));
+        assert_eq!(instance.last_error.as_deref(), Some("host-contact-lost"));
         store.close().await;
     }
 
@@ -872,7 +965,23 @@ mod tests {
                 "workspace.unregister".into(),
                 json!({"path": ROOT, "workspaceId": WSP}),
                 None,
+                None,
             )
+            .await
+            .unwrap();
+        // c-dirpicker r11 item 4: the stale intent really was FORWARDED over
+        // the dead previous link, so mark it with THAT link's generation.
+        // A managed host no hello has ever adopted sits at generation 0; the
+        // bridge hello below must bump it to 1. Without this mark the row
+        // relied on the sweep's NULL arm and this test would have passed even
+        // if the SSH hello path never bumped.
+        assert_eq!(
+            store.host_link_generation(host.clone()).await.unwrap(),
+            0,
+            "no hello has adopted a link yet"
+        );
+        store
+            .mark_forward_intent(command.command_id.clone(), 0)
             .await
             .unwrap();
 
@@ -888,12 +997,19 @@ mod tests {
 
         let abort_seen = Arc::new(tokio::sync::Notify::new());
         let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        // The durable unbinding mark the dead previous link prepared: set
+        // until the abort is PROCESSED. The abort answer is parked on the
+        // `release_abort` watch so the test can observe a create colliding
+        // with the mark BEFORE the abort path clears it.
+        let unbinding_mark = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (release_abort_tx, release_abort_rx) = tokio::sync::watch::channel(false);
 
         // The scripted persistent daemon: hello first, then answer the
         // post-hello abort and the follow-up create over the SAME bridge.
         let node = {
             let abort_seen = abort_seen.clone();
             let captured = captured.clone();
+            let unbinding_mark = unbinding_mark.clone();
             let hello = hello.clone();
             tokio::spawn(async move {
                 from_node_tx.send(hello).unwrap();
@@ -904,25 +1020,57 @@ mod tests {
                     match method {
                         "workspace.unregister" if params["phase"] == "abort" => {
                             captured.lock().unwrap().push(params.clone());
+                            // The abort frame has arrived but, like the real
+                            // Node, the mark is only released when the abort
+                            // is processed and acked. Park the answer (the
+                            // recv loop keeps draining, so a create still
+                            // gets its conflict reply) until the test
+                            // releases it.
                             abort_seen.notify_waiters();
-                            from_node_tx
-                                .send(json!({
-                                    "jsonrpc": "2.0", "id": id,
-                                    "result": {
-                                        "commandId": params["commandId"].clone(),
-                                        "workspaceId": params["workspaceId"].clone(),
-                                        "phase": "aborted",
-                                    }
-                                }))
-                                .unwrap();
+                            let mut released = release_abort_rx.clone();
+                            let reply_tx = from_node_tx.clone();
+                            let unbinding_mark = unbinding_mark.clone();
+                            tokio::spawn(async move {
+                                let _ = released.wait_for(|stop| *stop).await;
+                                unbinding_mark.store(false, std::sync::atomic::Ordering::SeqCst);
+                                reply_tx
+                                    .send(json!({
+                                        "jsonrpc": "2.0", "id": id,
+                                        "result": {
+                                            "commandId": params["commandId"].clone(),
+                                            "workspaceId": params["workspaceId"].clone(),
+                                            "phase": "aborted",
+                                        }
+                                    }))
+                                    .unwrap();
+                            });
                         }
                         "instance.create" => {
-                            from_node_tx
-                                .send(json!({
-                                    "jsonrpc": "2.0", "id": id,
-                                    "result": {"ok": true, "instanceId": "it_dp_r9_create"}
-                                }))
-                                .unwrap();
+                            // The real Node's create reservation
+                            // (DevNode::reserve_locked): while the unbinding
+                            // mark is set this is a Conflict, code -32009,
+                            // the message the Hub surfaces as 409.
+                            if unbinding_mark.load(std::sync::atomic::Ordering::SeqCst) {
+                                from_node_tx
+                                    .send(json!({
+                                        "jsonrpc": "2.0", "id": id,
+                                        "error": {
+                                            "code": -32009,
+                                            "message": format!(
+                                                "workspace {ROOT} is being unregistered; \
+                                                 wait for it to settle before starting a session"
+                                            ),
+                                        }
+                                    }))
+                                    .unwrap();
+                            } else {
+                                from_node_tx
+                                    .send(json!({
+                                        "jsonrpc": "2.0", "id": id,
+                                        "result": {"ok": true, "instanceId": "it_dp_r10_create"}
+                                    }))
+                                    .unwrap();
+                            }
                         }
                         // The hello reply (and anything else) needs no answer.
                         _ => {}
@@ -958,6 +1106,58 @@ mod tests {
         assert_eq!(seen[0]["workspaceId"], json!(WSP));
         assert_eq!(seen[0]["commandId"], json!(command.command_id));
 
+        // r11 item 4: the SSH bridge hello runs the SAME adoption bump as the
+        // WSS carrier — exactly once, 0 → 1 — and the abort above proves the
+        // sweep selected the row through its stamped generation (0 < 1), not
+        // the NULL arm.
+        assert_eq!(
+            store.host_link_generation(host.clone()).await.unwrap(),
+            1,
+            "the SSH stdio hello bumps the host link generation"
+        );
+
+        // r10 item 3: the create-after-abort assertion used to be vacuous —
+        // the scripted Node answered every create OK, so it passed even if
+        // the abort never ran. With the abort ANSWER parked and the unbinding
+        // mark still held, the create must now hit the Node's conflict:
+        // JSON-RPC -32009 carrying the 409 "being unregistered" message.
+        let blocked = tokio::time::timeout(
+            Duration::from_secs(10),
+            state.nodes.call(
+                &host,
+                "instance.create",
+                json!({"workspaceId": WSP}),
+                Duration::from_secs(10),
+            ),
+        )
+        .await
+        .expect("pre-abort create timed out")
+        .expect("the pre-abort create reached the node")
+        .expect("the pre-abort create carried an RPC frame");
+        assert_eq!(blocked["error"]["code"], json!(-32009), "{blocked}");
+        let conflict_message = blocked["error"]["message"]
+            .as_str()
+            .expect("the conflict carries a message");
+        assert!(
+            conflict_message.contains("being unregistered"),
+            "{conflict_message}"
+        );
+        assert!(conflict_message.contains(ROOT), "{conflict_message}");
+        // The stuck command is still unsettled: the abort has not been
+        // processed yet, so nothing could have settled it.
+        assert_ne!(
+            store
+                .get_command(command.command_id.clone())
+                .await
+                .expect("command row")
+                .expect("command row")
+                .state,
+            "settled"
+        );
+
+        // Let the Node process the abort: it clears the mark and acks.
+        release_abort_tx.send(true).unwrap();
+
         // The Hub only settles the stuck command after the Node acked.
         let row = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -976,7 +1176,8 @@ mod tests {
         .expect("the stuck unregister never settled");
         assert_eq!(row.settlement_outcome.as_deref(), Some("rejected"));
 
-        // The wedge is gone: a following create succeeds on the same bridge.
+        // The wedge is gone ONLY because the abort ran: the SAME create that
+        // just collided with the mark now succeeds on the same bridge.
         let answer = tokio::time::timeout(
             Duration::from_secs(10),
             crate::http::call_node(
@@ -989,7 +1190,7 @@ mod tests {
         .await
         .expect("create timed out")
         .expect("a following create must succeed after the abort");
-        assert_eq!(answer["instanceId"], json!("it_dp_r9_create"));
+        assert_eq!(answer["instanceId"], json!("it_dp_r10_create"));
 
         // Close the carrier (child exit) and join the bridge and the node.
         shutdown_tx.send(true).unwrap();
@@ -1003,5 +1204,101 @@ mod tests {
             .expect("scripted node join timed out")
             .unwrap();
         hub.shutdown().await;
+    }
+    /// c-cardsettle: a daemon inventory report that moves a live instance to a
+    /// terminal lifecycle invalidates its still-pending interaction in the SAME
+    /// transaction, and returns the pair for broadcast.
+    #[tokio::test]
+    async fn daemon_inventory_terminal_report_settles_pending_interactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let host = new_id("hst").unwrap();
+        store
+            .insert_managed_host(
+                host.clone(),
+                AddSshHost {
+                    target: "cardsettle-daemon".into(),
+                    label: "cardsettle-daemon".into(),
+                    labels: vec![],
+                    remuda_binary_policy: BinaryPolicy::RequireInstalled,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .ssh_status(host.clone(), "online", None)
+            .await
+            .unwrap();
+        let instance = store
+            .insert_instance(
+                host.clone(),
+                None,
+                "codex".into(),
+                "codex-appserver".into(),
+                None,
+                json!({}),
+            )
+            .await
+            .unwrap();
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                Some(1),
+                json!({"kind":"lifecycle","payload":{"type":"entity","state":"ready"}}),
+            )
+            .await
+            .unwrap();
+        let interaction_id = new_id("int").unwrap();
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "interaction.requested",
+                    "payload": {
+                        "interactionKind": "approval",
+                        "interaction": {
+                            "id": interaction_id,
+                            "kind": "approval",
+                            "state": "pending",
+                            "blocking": true,
+                            "answerable": true,
+                            "carrier": "harness-hook",
+                            "deadline": { "state": "unknown" },
+                            "resolution": { "state": "unknown" },
+                            "request": {"kind": "approval", "title": "Bash", "options": []}
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        let settlement = store
+            .reconcile_daemon_instances(
+                host.clone(),
+                vec![json!({
+                    "id": instance.instance_id,
+                    "hostId": host,
+                    "lifecycle": "exited",
+                    "activity": "idle"
+                })],
+            )
+            .await
+            .unwrap();
+        assert_eq!(settlement.interactions.len(), 1);
+        assert_eq!(settlement.interactions[0].instance_id, instance.instance_id);
+        assert_eq!(settlement.interactions[0].interaction_id, interaction_id);
+        assert!(!settlement.interactions[0].updated_at.is_empty());
+        let row = store
+            .get_interaction(interaction_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "invalidated");
+        assert!(!row.blocking);
+        store.close().await;
     }
 }

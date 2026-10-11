@@ -88,7 +88,9 @@ test.describe("workflow tree, task track, events drawer", () => {
   test("raw events drawer filters by kind", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "看 TaskManager spill").click();
-    await page.getByRole("button", { name: "原始事件" }).click();
+    // 原始事件 lives in the header ⋯ at every width (D-053).
+    await page.getByTestId("session-more-open").click();
+    await page.getByRole("menuitemcheckbox", { name: "原始事件" }).click();
     await expect(page).toHaveURL(/\/events$/);
     await expect(page.getByTestId("raw-events")).toBeVisible();
     await page.getByRole("button", { name: "workflow.member" }).click();

@@ -46,9 +46,16 @@
  * band edge and the phone bar carries the safe-area inset itself), so the
  * measured height already spans to the bottom. /m uses PhoneShell, which
  * never stamps data-layout="session", and keeps its anchor.
+ *
+ * r6 item 1: session routes with NO measured chrome — /s/:id/events mounts
+ * neither the dock nor tty chrome, and SessionPage's snapshot-loading state
+ * returns before either mounts — make the publishing hook remove the
+ * property. A 0px fallback then parked the stack 12 px off the band edge,
+ * inside a notched phone's home-indicator zone; fall back to the safe-area
+ * inset the base rule uses instead.
  */
 :global([data-layout="session"]) .stack {
-  bottom: calc(var(--session-dock-h, 0px) + var(--space-3));
+  bottom: calc(var(--session-dock-h, var(--safe-bottom)) + var(--space-3));
 }
 
 /* Transient confirmations, above the errors in the same stack. */

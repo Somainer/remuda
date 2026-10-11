@@ -336,6 +336,23 @@ impl ProcessWriter {
     /// User turns ride the SAME queue as every control command: the oneshot
     /// ack changes how THIS command reports completion, never the ordering.
     pub async fn send_user(&self, content: UserContent) -> Result<(), Error> {
+        let ack = self.enqueue_user_write(content).await?;
+        ack.await.map_err(|_| Error::StdinClosed)?
+    }
+
+    /// Enqueue a user turn and return its write-completion ack receiver the
+    /// moment the single writer task ACCEPTS the command (the FIFO channel
+    /// send resolved).
+    ///
+    /// This is the cancellation boundary (ma-sdk-state r8 item 1): until this
+    /// future resolves `Ok`, the prompt has not been accepted and dropping the
+    /// caller guarantees it is never written. After `Ok`, the writer FIFO owns
+    /// the command — it is written in order even if the returned receiver (and
+    /// its caller) is dropped; awaiting the receiver only observes completion.
+    pub async fn enqueue_user_write(
+        &self,
+        content: UserContent,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), Error>>, Error> {
         let message = Inbound::User(match content {
             UserContent::Text(text) => UserMessage::text(text),
             UserContent::Blocks(blocks) => UserMessage::blocks(blocks),
@@ -343,7 +360,7 @@ impl ProcessWriter {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.enqueue(WriterCmd::UserWrite(Box::new(message), tx))
             .await?;
-        rx.await.map_err(|_| Error::StdinClosed)?
+        Ok(rx)
     }
 
     /// Answer a CLI control request with a success payload (permission camelCase).

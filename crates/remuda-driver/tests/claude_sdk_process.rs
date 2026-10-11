@@ -1525,50 +1525,6 @@ async fn a_successful_turn_then_a_failed_live_write_rolls_back_without_a_b_start
     driver.close().await.expect("close");
 }
 
-/// ma-sdk-state r7 item 2: aborting the CALLER after the prompt is enqueued but
-/// before the writer ack must not cancel the turn — the detached,
-/// write-ordered completion task still drives the writer write to success and
-/// the turn is announced and its result settles.
-#[tokio::test]
-async fn aborting_the_caller_after_enqueue_still_announces_and_settles_the_turn() {
-    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
-    let mut handle = driver.start(spec).await.expect("start");
-    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
-
-    // Park the FIRST write pre-ack (after Reserve enqueue).
-    let barrier = driver.arm_write_commit_barrier();
-    barrier.park_from_write(1);
-    let mut send = Box::pin(driver.send(prompt("aborted after enqueue")));
-    tokio::select! {
-        _ = barrier.wait_until_write_parked(Duration::from_secs(5)) => {}
-        r = &mut send => panic!("send should be parked pre-ack, got {r:?}"),
-    }
-    // The caller gives up while the writer write is still in flight.
-    drop(send);
-
-    // The detached task proceeds: the writer still writes and commits.
-    barrier.release_write_ack();
-    drop(barrier);
-
-    let obs = collect_until(&mut handle, Duration::from_secs(5), |seen| {
-        seen.iter()
-            .any(|o| lifecycle_named(o) == Some("turn_started"))
-            && turn_done_count(seen) >= 1
-    })
-    .await;
-    assert_eq!(
-        turn_started_count(&obs),
-        1,
-        "the written turn is announced once"
-    );
-    assert!(
-        turn_done_count(&obs) >= 1,
-        "its result is still published and settles"
-    );
-
-    driver.close().await.expect("close");
-}
-
 /// ma-sdk-state r7 item 3: a failed write must not leak the driver's Inner
 /// (the old ReservationGuard::fail used std::mem::forget). After the failed
 /// write and close, a Weak to Inner upgrades to None.
@@ -1692,4 +1648,74 @@ fn settled_marker(o: &Observation) -> Option<&str> {
         },
         _ => None,
     }
+}
+
+/// ma-sdk-state r8 item 1 (a): aborting the caller BEFORE the writer accepts
+/// UserWrite (parked pre-accept) must never write the prompt — no `user` frame
+/// reaches the child, no turn_started is emitted, and the reservation is rolled
+/// back so a following turn starts and settles normally.
+#[tokio::test]
+async fn aborting_before_the_writer_accepts_never_writes_the_prompt() {
+    let stdin_file = std::env::temp_dir().join(format!(
+        "remuda-r8-preaccept-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut env = BTreeMap::new();
+    env.insert(
+        "FAKE_CLAUDE_STDIN_FILE".into(),
+        stdin_file.to_string_lossy().into_owned(),
+    );
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Park write #1 at the pre-accept gate (after Reserve, before UserWrite).
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.park_from_write(1);
+    let mut first = Box::pin(driver.send(prompt_id("aborted-before-accept", "msg-cancel")));
+    tokio::select! {
+        _ = barrier.wait_until_write_parked(Duration::from_secs(5)) => {}
+        r = &mut first => panic!("first send should park pre-accept, got {r:?}"),
+    }
+    // Caller gives up BEFORE the writer accepted the command.
+    drop(first);
+    // Opening the gate must not resurrect the cancelled write.
+    barrier.release_write_ack();
+    barrier.release_send();
+    drop(barrier);
+
+    // A second, normal prompt must run: proves the cancelled reservation was
+    // rolled back cleanly (one start, one settle) and the first never wrote.
+    driver
+        .send(prompt_id("the real prompt", "msg-real"))
+        .await
+        .expect("the follow-up send succeeds");
+    let obs = collect_until(&mut handle, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .any(|o| lifecycle_named(o) == Some("turn_started"))
+            && turn_done_count(seen) >= 1
+    })
+    .await;
+    assert_eq!(
+        turn_started_count(&obs),
+        1,
+        "the aborted prompt emitted no turn_started; only the real turn did"
+    );
+    assert!(turn_done_count(&obs) >= 1, "the real turn settles");
+
+    // Give the child a beat to flush its stdin marker, then read it: the
+    // aborted prompt's `user` frame never reached the child.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let recorded = std::fs::read_to_string(&stdin_file).unwrap_or_default();
+    let user_frames = recorded.lines().filter(|l| l.trim() == "user").count();
+    assert_eq!(
+        user_frames, 1,
+        "exactly one user frame (the real prompt) reached the child; aborted one was cancelled"
+    );
+
+    driver.close().await.expect("close");
 }

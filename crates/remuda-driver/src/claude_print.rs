@@ -1037,33 +1037,22 @@ impl Driver for ClaudePrintDriver {
                 // turn book or enqueuing its ticket.
                 let content = prompt_content(&prompt.blocks)?;
                 let client_message_id = prompt.native_client_message_id.clone();
-                // ma-sdk-state r7 items 1+2: drive the reservation/write to
-                // completion in a DETACHED, write_seq-serialized task. The
-                // caller awaiting (or being aborted/timed out) owns only a
-                // result oneshot — dropping it neither cancels a prompt the
-                // writer still commits nor interleaves cleanup with a later
-                // reservation, because the task holds write_seq across the whole
-                // enqueue → writer-outcome → rollback sequence.
-                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-                let inner = self.inner.clone();
                 let writer = {
-                    let live = inner.live.lock().await;
+                    let live = self.inner.live.lock().await;
                     let Some(live) = live.as_ref() else {
                         return Err(DriverError::ControlUnavailable);
                     };
                     live.process.writer()
                 };
-                tokio::spawn(async move {
-                    let result =
-                        drive_prompt_write(&inner, writer, content, client_message_id).await;
-                    let _ = done_tx.send(result);
-                });
-                match done_rx.await {
-                    Ok(ack) => ack,
-                    // Completion task vanished (shutdown/panic); it alone drives
-                    // the guard, so there is nothing left to cancel here.
-                    Err(_) => Err(DriverError::ControlUnavailable),
-                }
+                // Pre-accept phase runs on THIS future: a caller aborted before
+                // the writer accepts UserWrite cancels the write (the prompt
+                // never executes). After acceptance the returned future is a
+                // detached completion that survives the caller (r8 item 1).
+                let completion =
+                    prepare_prompt_write(&self.inner, writer, content, client_message_id).await?;
+                completion
+                    .await
+                    .map_err(|_| DriverError::ControlUnavailable)?
             }
             DriverInput::Steer(_) => Err(DriverError::CapabilityUnknown("steer".into())),
             DriverInput::ModelSwitch(switch) => {
@@ -1378,22 +1367,29 @@ fn signal_child_group(pgid: i32, signal: nix::sys::signal::Signal, carrier: &str
     }
 }
 
-/// Drive one prompt's reservation → write → publication completion (r7 items
-/// 1+2). Runs in a DETACHED task so it survives caller abort/timeout:
-/// reservation completion is tied to the WRITER's definitive outcome (prompt
-/// committed vs. certainly not written), never to the caller's ack waiter.
+/// Result receiver for a prompt whose `UserWrite` the writer has accepted.
+type WriteCompletion = tokio::sync::oneshot::Receiver<DriverResult<DriverAck>>;
+
+/// CANCELLABLE pre-accept phase of a prompt write (ma-sdk-state r8 item 1).
 ///
-/// Holds `write_seq` for the entire sequence, serialising cleanup against the
-/// next send's reservation. The publication ticket is enqueued before the
-/// write; on a definitive write failure the book is rolled back (before the
-/// ticket resolves) and any deferred root settle is published once through the
-/// ordered FIFO.
-async fn drive_prompt_write(
+/// Runs on the CALLER's future and holds `write_seq`, so dropping the caller
+/// (abort/timeout) before the writer ACCEPTS the `UserWrite` command is still
+/// cancellation: the prompt is never written, no `turn_started` is emitted, and
+/// the [`ReservationGuard`]'s `Drop` rolls the reservation back in order (it
+/// re-acquires `write_seq`). The publication ticket is enqueued before the
+/// write.
+///
+/// The instant the writer FIFO accepts the command, ownership transfers to a
+/// DETACHED task that awaits the write ack and commits/fails the reservation;
+/// that task survives the caller being dropped, so a prompt the writer already
+/// owns is always announced and settled. The returned receiver only observes
+/// the result.
+async fn prepare_prompt_write(
     inner: &Arc<Inner>,
     writer: ProcessWriter,
     content: UserContent,
     client_message_id: String,
-) -> DriverResult<DriverAck> {
+) -> DriverResult<WriteCompletion> {
     let _seq = inner.write_seq.lock().await;
 
     let reservation = {
@@ -1401,13 +1397,13 @@ async fn drive_prompt_write(
         let seq = mapper.begin_turn_reservation();
         TurnReservation::shared(seq, client_message_id)
     };
-    let guard = ReservationGuard::new(inner.clone(), reservation.clone());
+    // Armed for the whole pre-accept phase; take() at the accept boundary and
+    // move into the detached completion task.
+    let mut guard = Some(ReservationGuard::new(inner.clone(), reservation.clone()));
 
     let publisher = inner.publish.lock().await.clone();
     let Some(publisher) = publisher.as_ref() else {
-        // Publication worker gone (session closing): roll the empty book back;
-        // nothing can be published.
-        guard.fail().await;
+        guard.take().unwrap().fail().await;
         return Err(DriverError::ControlUnavailable);
     };
     if publisher
@@ -1416,21 +1412,20 @@ async fn drive_prompt_write(
         })
         .is_err()
     {
-        guard.fail().await;
+        guard.take().unwrap().fail().await;
         return Err(DriverError::ControlUnavailable);
     }
-    // test-stub: record that this turn's ticket is in the publication queue.
     #[cfg(feature = "test-stub")]
     test_barrier::note_reserve_enqueued(&inner.barrier);
 
-    // test-stub (r7 item 2): park here, pre-ack, so a test can abort the
-    // CALLER while this detached task (and the writer write) is still in flight.
+    // test-stub: deterministic, NUMBERED park immediately before the writer
+    // accepts UserWrite — a test aborts the caller here to prove the write never
+    // happens (r8 item 1 test a).
     #[cfg(feature = "test-stub")]
-    test_barrier::hold_before_write_ack(&inner.barrier).await;
+    test_barrier::hold_before_user_write_accept(&inner.barrier).await;
 
-    // test-stub (r7 item 5): a numbered forced write fault exercises the
-    // ordered fail() path on a LIVE child without relying on a racy broken pipe
-    // — the reservation is open but the write is definitively not committed.
+    // test-stub: a numbered forced fault fails WITHOUT ever calling the writer
+    // (the live child is untouched). Pre-accept, so it rolls back in order.
     #[cfg(feature = "test-stub")]
     let forced_failure = {
         let n = inner.write_number.fetch_add(1, Ordering::AcqRel) + 1;
@@ -1438,32 +1433,51 @@ async fn drive_prompt_write(
     };
     #[cfg(not(feature = "test-stub"))]
     let forced_failure = false;
-
-    // This await is the WRITER's definitive outcome. The caller cannot abort
-    // it: the task owns the oneshot ack and keeps running, so a prompt the
-    // writer commits is always committed and announced even if the caller gave
-    // up waiting.
-    let write_outcome: Result<(), remuda_claude_wire::Error> = if forced_failure {
-        // Definitively not written: never call the writer so the live child is
-        // untouched and no prompt reaches it.
-        Err(remuda_claude_wire::Error::StdinClosed)
-    } else {
-        writer.send_user(content).await
-    };
-    match write_outcome {
-        Ok(()) => {
-            #[cfg(feature = "test-stub")]
-            test_barrier::hold_write_commit(&inner.barrier).await;
-            guard.commit();
-            Ok(DriverAck::transport_written())
-        }
-        Err(error) => {
-            // Definitively not written: ordered rollback (emits the deferred
-            // settle through the FIFO) and ticket cancel before returning.
-            guard.fail().await;
-            Err(map_wire(error))
-        }
+    if forced_failure {
+        guard.take().unwrap().fail().await;
+        return Err(map_wire(remuda_claude_wire::Error::StdinClosed));
     }
+
+    // >>> CANCELLATION BOUNDARY: this await is the last point at which dropping
+    // the caller can prevent the write. Once it resolves Ok the writer FIFO owns
+    // the command.
+    let ack_rx = match writer.enqueue_user_write(content).await {
+        Ok(ack_rx) => ack_rx,
+        Err(error) => {
+            // Channel send failed before accept: definitively not written.
+            guard.take().unwrap().fail().await;
+            return Err(map_wire(error));
+        }
+    };
+
+    // Writer accepted: disarm the caller-scoped guard and transfer it into a
+    // detached task that owns the ack → commit/fail sequence.
+    let guard = guard.take().unwrap();
+    let task_inner = inner.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = match ack_rx.await {
+            Ok(Ok(())) => {
+                #[cfg(feature = "test-stub")]
+                test_barrier::hold_write_commit(&task_inner.barrier).await;
+                guard.commit();
+                Ok(DriverAck::transport_written())
+            }
+            Ok(Err(error)) => {
+                // The writer definitively failed after accepting the command.
+                guard.fail().await;
+                Err(map_wire(error))
+            }
+            Err(_) => {
+                // Writer task vanished without acking (shutdown mid-write): not
+                // provably written; roll the reservation back.
+                guard.fail().await;
+                Err(DriverError::ControlUnavailable)
+            }
+        };
+        let _ = done_tx.send(result);
+    });
+    Ok(done_rx)
 }
 
 async fn map_loop(
@@ -1679,15 +1693,18 @@ impl Drop for ReservationGuard {
         if self.resolved {
             return;
         }
-        // Panic safety only (the normal completion task always calls commit or
-        // fail): wake the parked worker immediately, then roll the book back
-        // best-effort on a detached task. No deferred settle is emitted here —
-        // the ordered `fail` path owns that exactly once.
+        // Pre-accept cancellation safety (r8 item 1) and panic safety: wake the
+        // parked worker immediately, then roll the book back on a detached task
+        // that RE-ACQUIRES write_seq, so a reservation whose caller was aborted
+        // before the writer accepted UserWrite is undone in order relative to
+        // the next send (which waits on write_seq to begin). No deferred settle
+        // is emitted here — the ordered `fail` path owns that exactly once.
         self.reservation.cancel();
         let inner = self.inner.clone();
         let seq = self.reservation.seq;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
+                let _seq = inner.write_seq.lock().await;
                 let _ = inner.mapper.lock().await.cancel_turn_reservation(seq);
             });
         }
@@ -1781,7 +1798,7 @@ pub mod test_barrier {
     /// r7 item 2 hook: park the DETACHED write task AFTER the Reserve ticket is
     /// enqueued but BEFORE it awaits the writer ack — the precise point where
     /// the caller can be aborted while the prompt is still in flight.
-    pub(super) async fn hold_before_write_ack(slot: &Slot) {
+    pub(super) async fn hold_before_user_write_accept(slot: &Slot) {
         let Some(state) = current(slot) else {
             return;
         };

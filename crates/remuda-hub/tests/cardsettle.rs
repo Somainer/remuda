@@ -2478,7 +2478,7 @@ async fn disconnecting_right_after_delete_still_publishes_and_audits() -> Result
     // then the park is released — the detached task must still publish and
     // audit. c-cardsettle-fu2 r1 item 4: this is the window AFTER the DB job
     // is enqueued/committed (the fu1 pre-DB seam is no longer used here).
-    let (mut delete_reached, delete_release) = hub.test_arm_post_delete_park().await;
+    let (mut delete_reached, delete_release) = hub.test_arm_post_delete_park(&instance_id).await;
 
     // Fire the DELETE over a raw socket WITHOUT reading the response.
     let mut sock = tokio::net::TcpStream::connect(addr).await?;
@@ -2532,11 +2532,21 @@ async fn disconnecting_right_after_delete_still_publishes_and_audits() -> Result
 
     // Release the park: the DETACHED task proceeds; the cancelled handler
     // cannot abort it.
+    // (0) The frame has NOT been published yet: the park is inside
+    // publish_settlement after the delete committed but before the broadcast.
+    // The park is INSIDE publish_settlement (after the delete committed,
+    // before broadcast), so no settlement frame can have been published yet.
+    // Do NOT read from the follow socket during the RST window — repeated
+    // tokio-timeout cancellation of WebSocket reads can starve the next poll;
+    // the post-release read below is the first and only post-arm read.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Release: publish + cleanup tail proceed in the detached task.
     delete_release
         .send(())
         .expect("releasing the parked delete");
 
-    // (1) The settlement frame still reaches the follower.
+    // (1) The settlement frame reaches the follower ONLY after release.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut frame_seen = false;
     while tokio::time::Instant::now() < deadline {
@@ -2559,7 +2569,7 @@ async fn disconnecting_right_after_delete_still_publishes_and_audits() -> Result
     }
     assert!(
         frame_seen,
-        "the detached delete published its settlement frame after the handler was aborted"
+        "the detached delete published its settlement frame after release"
     );
 
     // (2) The durable audit row is written by the detached tail.

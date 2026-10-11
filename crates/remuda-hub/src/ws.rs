@@ -140,9 +140,12 @@ impl FollowParks {
 #[cfg(any(test, feature = "test-faults"))]
 #[derive(Default, Clone)]
 pub(crate) struct OperationParks {
-    slot: Arc<tokio::sync::Mutex<Option<OperationParkSlot>>>,
-    /// One-shot park after the delete transaction committed.
-    post_delete_slot: Arc<tokio::sync::Mutex<Option<OperationParkSlot>>>,
+    /// One-shot post-delete park KEYED BY INSTANCE ID. Background settle
+    /// activity (node hello sweeps, other requests) also calls
+    /// publish_settlement; a global slot would be consumed by the first such
+    /// unrelated settlement. Keying ensures only the delete of the armed
+    /// instance parks.
+    post_delete_slot: Arc<tokio::sync::Mutex<Option<(String, OperationParkSlot)>>>,
 }
 
 #[cfg(any(test, feature = "test-faults"))]
@@ -153,52 +156,44 @@ struct OperationParkSlot {
 
 #[cfg(any(test, feature = "test-faults"))]
 impl OperationParks {
-    pub(crate) async fn arm(
-        &self,
-    ) -> (
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
-        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *self.slot.lock().await = Some(OperationParkSlot {
-            reached: reached_tx,
-            release: release_rx,
-        });
-        (reached_rx, release_tx)
-    }
-
-    /// Park at the operation's start if armed; one-shot.
-    pub(crate) async fn park_if_armed(&self) {
-        if let Some(slot) = self.slot.lock().await.take() {
-            let _ = slot.reached.send(());
-            let _ = slot.release.await;
-        }
-    }
-
-    /// Arm the post-delete park. Fires once the delete transaction has
-    /// committed (c-cardsettle-fu2 r1 item 4).
+    /// Arm the post-delete park for `instance_id`. Fires once that exact
+    /// instance's delete transaction commits (c-cardsettle-fu2 r1 item 4).
     pub(crate) async fn arm_post_delete(
         &self,
+        instance_id: &str,
     ) -> (
         tokio::sync::oneshot::Receiver<()>,
         tokio::sync::oneshot::Sender<()>,
     ) {
         let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *self.post_delete_slot.lock().await = Some(OperationParkSlot {
-            reached: reached_tx,
-            release: release_rx,
-        });
+        *self.post_delete_slot.lock().await = Some((
+            instance_id.to_owned(),
+            OperationParkSlot {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        ));
         (reached_rx, release_tx)
     }
 
-    /// Park after the delete job committed if armed; one-shot.
-    pub(crate) async fn park_after_delete_if_armed(&self) {
-        if let Some(slot) = self.post_delete_slot.lock().await.take() {
-            let _ = slot.reached.send(());
-            let _ = slot.release.await;
+    /// Park after the delete job committed if a park is armed FOR THIS
+    /// instance; unrelated settlements (background sweeps etc.) pass straight
+    /// through without consuming the slot.
+    pub(crate) async fn park_after_delete_if_armed(&self, instance_id: &str) {
+        let mut guard = self.post_delete_slot.lock().await;
+        let matches = guard
+            .as_ref()
+            .is_some_and(|(armed_id, _)| armed_id == instance_id);
+        if !matches {
+            return;
         }
+        let Some((_, slot)) = guard.take() else {
+            return;
+        };
+        drop(guard);
+        let _ = slot.reached.send(());
+        let _ = slot.release.await;
     }
 }
 

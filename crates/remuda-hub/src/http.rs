@@ -679,32 +679,34 @@ pub async fn delete_instance(
         let lifecycle = instance.lifecycle;
         let lineage_id = instance.lineage_id;
 
-        // c-cardsettle-fu r1 item 2: park at the operation start when a test
-        // armed the seam. The park lives INSIDE the detached task, so aborting
-        // the handler future while parked cannot cancel the operation.
-        #[cfg(any(test, feature = "test-faults"))]
-        state.operation_parks.park_if_armed().await;
-
         let deleted = state
             .publish_settlement(async {
+                let deleted = state.store.delete_instance(instance_id.clone()).await?;
+                let exists = deleted.is_some();
+                // Carry the settlement the delete transaction produced so
+                // publish_settlement broadcasts it (the cards it settled
+                // inside the transaction).
+                let settlement = deleted
+                    .as_ref()
+                    .map(|d| d.settlement.clone())
+                    .unwrap_or_default();
+                // c-cardsettle-fu2 r1 item 4: park AFTER the store delete
+                // committed but BEFORE the settlement tuple returns (so the
+                // broadcast has not happened yet), still holding the
+                // publication lock. RST here leaves the deletion durable with
+                // no frame published; after release the detached task
+                // publishes and runs the cleanup tail.
+                #[cfg(any(test, feature = "test-faults"))]
                 state
-                    .store
-                    .delete_instance(instance_id.clone())
-                    .await
-                    .map(|d| (d.is_some(), d.map(|d| d.settlement).unwrap_or_default()))
+                    .operation_parks
+                    .park_after_delete_if_armed(&instance_id)
+                    .await;
+                Ok((exists, settlement))
             })
             .await?;
         if !deleted {
             return Ok::<_, StoreError>(None);
         }
-
-        // c-cardsettle-fu2 r1 item 4: park AFTER the delete transaction
-        // committed but before the settlement frame is published and the
-        // cleanup/audit tail runs. RST here must not cancel the detached
-        // operation: after release the follower still receives the frame and
-        // the audit row is still written.
-        #[cfg(any(test, feature = "test-faults"))]
-        state.operation_parks.park_after_delete_if_armed().await;
 
         let mut lease_returns = Vec::new();
         let mut lease_keys_seen = std::collections::HashSet::new();

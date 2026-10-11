@@ -925,32 +925,21 @@ impl RunningHub {
         self.state.follow_parks.arm(after_seq).await
     }
 
-    /// c-cardsettle-fu r1 item 2: arm a park at the start of the detached
-    /// irreversible delete operation. `reached` fires once the operation task
-    /// reaches the park; dropping/aborting the request while parked and then
-    /// releasing proves the task is detached and still completes.
-    #[cfg(any(test, feature = "test-faults"))]
-    #[doc(hidden)]
-    pub async fn test_arm_delete_park(
-        &self,
-    ) -> (
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
-        self.state.operation_parks.arm().await
-    }
-
     /// c-cardsettle-fu2 r1 item 4: arm the park AFTER the delete DB job
     /// commits (before publication/cleanup).
     #[cfg(any(test, feature = "test-faults"))]
     #[doc(hidden)]
     pub async fn test_arm_post_delete_park(
         &self,
+        instance_id: &str,
     ) -> (
         tokio::sync::oneshot::Receiver<()>,
         tokio::sync::oneshot::Sender<()>,
     ) {
-        self.state.operation_parks.arm_post_delete().await
+        self.state
+            .operation_parks
+            .arm_post_delete(instance_id)
+            .await
     }
 
     /// Mint a scoped device token against this Hub's store (D-018).

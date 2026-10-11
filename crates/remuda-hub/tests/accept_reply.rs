@@ -32,8 +32,9 @@ use support::{
 /// Reply shape under test, paired with the helper variant that produces it.
 #[derive(Clone, Copy)]
 enum ReplyShape {
-    /// The accepted-command envelope the real DevNode returns.
-    AcceptedCommand,
+    /// A real typed `CommandResult` (accepted command + relatedCommandIds),
+    /// with NO top-level accepted/ok — exactly what the DevNode sends.
+    RealCommandResult,
     /// `{accepted:true}` at the result top level.
     TopLevelAccepted,
     /// The pre-fix fake-node reply.
@@ -43,7 +44,7 @@ enum ReplyShape {
 impl ReplyShape {
     fn helper(self) -> InstanceSendReply {
         match self {
-            ReplyShape::AcceptedCommand => InstanceSendReply::AcceptedCommand,
+            ReplyShape::RealCommandResult => InstanceSendReply::RealCommandResult,
             ReplyShape::TopLevelAccepted => InstanceSendReply::TopLevelAccepted,
             ReplyShape::BareOk => InstanceSendReply::BareOk,
         }
@@ -291,20 +292,35 @@ async fn send_and_observe(shape: ReplyShape) -> anyhow::Result<SendObservation> 
     })
 }
 
-/// The shared accepted-command envelope accepts the command directly, and the
-/// result the helper actually sent carries that envelope for THIS command.
+/// A real DevNode `instance.send` result is a typed `CommandResult` —
+/// `{command, relatedCommandIds}` with NO top-level `accepted`/`ok`. The Hub
+/// must mark the row accepted from `/command/state` alone. This guards the
+/// command-state arm of `node_accepted`: dropping it reddens THIS case while
+/// the top-level case below stays green.
 #[tokio::test]
-async fn instance_send_with_the_shared_accepted_envelope_is_accepted() -> anyhow::Result<()> {
-    let obs = send_and_observe(ReplyShape::AcceptedCommand).await?;
+async fn instance_send_with_a_real_command_result_is_accepted() -> anyhow::Result<()> {
+    let obs = send_and_observe(ReplyShape::RealCommandResult).await?;
     assert_eq!(
         obs.state, "accepted",
-        "the shared accepted envelope must mark the command accepted; got {}",
+        "a real CommandResult with command.state=accepted must accept; got {}",
         obs.state
     );
-    assert_eq!(
-        obs.send_result["accepted"],
-        json!(true),
-        "reply: {}",
+    // The real Node never sends either top-level shortcut.
+    assert!(
+        obs.send_result.get("accepted").is_none(),
+        "real CommandResult carries no top-level accepted: {}",
+        obs.send_result
+    );
+    assert!(
+        obs.send_result.get("ok").is_none(),
+        "real CommandResult carries no top-level ok: {}",
+        obs.send_result
+    );
+    // It IS the typed CommandResult shape: the accepted command and its
+    // related commands.
+    assert!(
+        obs.send_result["relatedCommandIds"].is_array(),
+        "reply must be a CommandResult: {}",
         obs.send_result
     );
     assert_eq!(
@@ -316,6 +332,12 @@ async fn instance_send_with_the_shared_accepted_envelope_is_accepted() -> anyhow
     assert_eq!(
         obs.send_result["command"]["commandId"],
         json!(obs.command_id),
+        "reply: {}",
+        obs.send_result
+    );
+    assert_eq!(
+        obs.send_result["command"]["operation"],
+        json!("instance.send"),
         "reply: {}",
         obs.send_result
     );

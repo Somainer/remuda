@@ -2248,7 +2248,7 @@ async fn fake_node(
                     send_instance_send_rpc(
                         &mut ws,
                         id,
-                        InstanceSendReply::AcceptedCommand,
+                        InstanceSendReply::AcceptedEnvelope,
                         command_id.unwrap_or(""),
                     )
                     .await?;

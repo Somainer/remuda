@@ -249,15 +249,106 @@ pub(crate) fn accepted_command_envelope(command_id: &str) -> Value {
     })
 }
 
+/// Serialize the REAL `instance.send` result a DevNode returns: a typed
+/// `CommandResult` = `{command, relatedCommandIds}` for an accepted command —
+/// NO top-level `accepted` or `ok` (the real Node never sends those;
+/// `DevNode::submit_command` in remuda-node builds exactly this shape). The
+/// Hub must therefore accept from `/command/state` alone.
+///
+/// The value is produced by serde from the protocol structs rather than a JSON
+/// literal, so the case tracks the real wire schema (field names, nesting,
+/// enum spellings).
+pub(crate) fn real_command_result(command_id: &str) -> Result<Value> {
+    use remuda_protocol::{
+        Acceptance, AcceptanceScope, ActorRef, ActorType, Command as ProtocolCommand,
+        CommandAuthority, CommandId, CommandOperation, CommandOrigin, CommandResult, CommandState,
+        CommandTarget, DispatchState, EntityMeta, ExpectedState, HostId, Id, InstanceId, Knowledge,
+        NodeReceipt, ResolutionState, Timestamp, U64,
+    };
+
+    /// Fixed, schema-valid RFC3339-ms timestamp for the fixture (the Hub never
+    /// compares the embedded clock).
+    const FIXED_NOW: &str = "2026-01-01T00:00:00.000Z";
+
+    let id = CommandId::try_from(command_id.to_owned())
+        .with_context(|| format!("fixture command id {command_id} must be a branded cmd_ id"))?;
+    let host_id = HostId::try_from(String::from(Id::new("hst")?))?;
+    let instance_id = InstanceId::new();
+    let now: Timestamp = FIXED_NOW.to_owned().try_into()?;
+    let digest = format!("sha256:{}", "0".repeat(64)).try_into()?;
+    let command = ProtocolCommand {
+        meta: EntityMeta {
+            id: id.clone(),
+            revision: U64(2),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        command_id: id,
+        actor: ActorRef {
+            principal_id: Id::new("prn")?,
+            actor_type: ActorType::Human,
+            device_id: None,
+            instance_id: Some(instance_id.clone()),
+        },
+        origin: CommandOrigin::Ui,
+        operation: CommandOperation::InstanceSend,
+        target: CommandTarget {
+            host_id,
+            instance_id: Some(instance_id),
+            run_id: None,
+        },
+        payload_ref: Id::new("obj")?,
+        payload_digest: digest,
+        expected: ExpectedState {
+            instance_revision: None,
+            process_generation: Some(U64(1)),
+            run_generation: None,
+            owner_fence: Some(U64(1)),
+            interaction_version: None,
+        },
+        state: CommandState::Accepted,
+        authority: CommandAuthority::NodeLedger,
+        forward_intent: Knowledge::NotApplicable,
+        dispatch: DispatchState::IntentDurable,
+        resolution: ResolutionState::Clear,
+        acceptance: Knowledge::Known {
+            value: Acceptance {
+                scope: AcceptanceScope::NativeInput,
+                event_ids: Vec::new(),
+            },
+        },
+        settlement: Knowledge::NotApplicable,
+        queued_at: now.clone(),
+        accepted_at: Knowledge::Known { value: now },
+        settled_at: Knowledge::NotApplicable,
+        expires_at: None,
+        node_receipt: Knowledge::Known {
+            value: NodeReceipt {
+                node_epoch: Id::new("epoch")?,
+                ledger_revision: U64(1),
+            },
+        },
+    };
+    let result = CommandResult {
+        command,
+        related_command_ids: Vec::new(),
+    };
+    Ok(serde_json::to_value(result)?)
+}
+
 /// Which `instance.send` result shape a fake Node answers with. The e2e
-/// harness only ever plays [`Self::AcceptedCommand`]; the other shapes exist
+/// harness only ever plays [`Self::AcceptedEnvelope`]; the other shapes exist
 /// for tests/accept_reply.rs, which compiles this module as part of its own
 /// binary — hence the crate-local dead-code allowance.
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 pub(crate) enum InstanceSendReply {
-    /// The accepted-command envelope ([`accepted_command_envelope`]).
-    AcceptedCommand,
+    /// Minimal accepted envelope ([`accepted_command_envelope`]); the e2e
+    /// fake Node's reply.
+    AcceptedEnvelope,
+    /// A real typed `CommandResult` serialization ([`real_command_result`]):
+    /// accepted command plus `relatedCommandIds`, no top-level accepted/ok.
+    RealCommandResult,
     /// `{accepted:true}` at the result top level (no command object).
     TopLevelAccepted,
     /// The pre-fix fake-node reply; never a durable acceptance.
@@ -265,12 +356,13 @@ pub(crate) enum InstanceSendReply {
 }
 
 /// Build the `result` object for one [`InstanceSendReply`] shape.
-pub(crate) fn instance_send_result(shape: InstanceSendReply, command_id: &str) -> Value {
-    match shape {
-        InstanceSendReply::AcceptedCommand => accepted_command_envelope(command_id),
+pub(crate) fn instance_send_result(shape: InstanceSendReply, command_id: &str) -> Result<Value> {
+    Ok(match shape {
+        InstanceSendReply::AcceptedEnvelope => accepted_command_envelope(command_id),
+        InstanceSendReply::RealCommandResult => real_command_result(command_id)?,
         InstanceSendReply::TopLevelAccepted => json!({ "accepted": true }),
         InstanceSendReply::BareOk => json!({ "ok": true }),
-    }
+    })
 }
 
 /// Answer one `instance.send` RPC with the chosen shape; returns the exact
@@ -281,7 +373,7 @@ pub(crate) async fn send_instance_send_rpc(
     shape: InstanceSendReply,
     command_id: &str,
 ) -> Result<Value> {
-    let result = instance_send_result(shape, command_id);
+    let result = instance_send_result(shape, command_id)?;
     send_rpc_ok(ws, id, result.clone()).await?;
     Ok(result)
 }

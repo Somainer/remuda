@@ -374,6 +374,51 @@ describe("ConnectionMachine", () => {
     expect(recoveringEvents).toEqual([]);
   });
 
+  it("GATE11 item 1: a recovering resume's non-rebind followBound() arms NO bind timer and the quiet stale settlement never flashes recovering", async () => {
+    // Timeline (§5.2.1 recovering row → bind cell "—（非 rebind 且
+    // resumeInFlight 时 followBound 跳过）"):
+    // t=0  recovering resume starts; store.openFollowSocket binds via
+    //      followBound() with NO rebind while the attempt is in flight.
+    // t=10 the subscribe snapshot times out → resume rejects → settle probe
+    //      ok → quiet stale at ~10.1.
+    // t=15 the competing `bind` deadline the OLD code armed would fire
+    //      beginResume (wasLive captured recovering=false) → recovering flash.
+    const { clock, machine, resume, onState } = setupTracked();
+    let rejectResume: ((e: Error) => void) | null = null;
+    resume.mockImplementation(() => {
+      machine.followBound(); // openFollowSocket binds before awaiting subscribe
+      return new Promise<void>((_resolve, reject) => void (rejectResume = reject));
+    });
+    const timerNames = () =>
+      [...(machine as unknown as { timers: Map<string, unknown> }).timers.keys()];
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" }); // attempt 1 in flight, t=0
+    expect(machine.state).toBe("recovering");
+    // The in-flight NON-rebind bind must skip arming `bind` (assert BY NAME).
+    expect(timerNames()).not.toContain("bind");
+
+    // Snapshot timeout at t=10, REST settlement probe ok → quiet stale.
+    clock.advance(10_000);
+    rejectResume!(new Error("FOLLOW_SNAPSHOT_TIMEOUT"));
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+    // The stale arm of the settled resume owns no `bind` either.
+    expect(timerNames()).not.toContain("bind");
+
+    // t=15: no recovering banner from a ghost bind deadline.
+    const recoveringAfterSettle: string[] = [];
+    onState.mockImplementation((s: string) => {
+      if (s === "recovering") recoveringAfterSettle.push(s);
+    });
+    clock.advance(5_000);
+    expect(machine.state).toBe("stale");
+    expect(recoveringAfterSettle).toEqual([]);
+    expect(resume).toHaveBeenCalledTimes(1);
+  });
+
   it("GATE10 item 5 (gate9 item 2): rebind after noteBinding retires a REAL quiet reopen re-arms the stale deadline", async () => {
     // Real store sequence: quietReopen for A (resume in flight) → user
     // navigates to mounted B (noteBinding retires A, clears the watchdog and

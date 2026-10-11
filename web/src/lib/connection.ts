@@ -245,12 +245,19 @@ export class ConnectionMachine {
       this.armStaleProbeTimers();
       return;
     }
-    // gate 9 item 3: the REAL reopen path (openFollowSocket → followBound()
-    // with NO rebind) can arrive while the machine is quiet stale — the
-    // resume's own socket is opening. Skip arming a competing `bind` timer
-    // (it would beginResume 15 s later and flash the recovering banner on
-    // every blocked-upgrade cycle); the resume watchdog already owns this
-    // attempt.
+    // gate 11 item 1 (gate 9 item 3 restored — gate 10 deleted this arm): the
+    // REAL reopen path (openFollowSocket → followBound() with NO rebind) arrives
+    // while THIS attempt's resume is in flight; the socket opening is the
+    // attempt's own. Arming `bind` here would leave a competing deadline that
+    // fires into the settled attempt: when a blocked upgrade later settles
+    // quiet stale at ~10 s, the 15 s bind fires beginResume (wasLive was
+    // captured false for recovering) and flashes the recovering banner on
+    // every cycle. The resume watchdog already owns this attempt; a
+    // frame-certified follow takes the frame watchdog.
+    if (!opts.rebind && this.resumeInFlight) {
+      if (this.deps.isFollowLive()) this.armFrameWatchdog();
+      return;
+    }
     // gate 9 item 3: from quiet stale a bind deadline certifies via the SAME
     // quiet probe path (treat stale as wasLive), never beginResume — the
     // upgrade refusal / snapshot timeout must not produce a loud recovering

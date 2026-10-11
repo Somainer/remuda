@@ -1742,8 +1742,34 @@ impl SessionModeTable {
             // instant: an instance.create with an initial prompt writes the
             // transcript before the poller ingests SessionStart, and sizing
             // it here made every such launch a permanent Unverified.
+            //
+            // c-effortread r10 item 7: but when argv established NO launch
+            // session (a hand-typed `claude` — no --resume, no session id on
+            // the detected process) an AUTHENTICATED hook source can still
+            // prove what this first record is: a `resume` source means the
+            // named session carries a prior session's history, so it needs an
+            // unverified EOF boundary (or Fresh when the file is empty),
+            // exactly like a rebound. Ignoring it returned Fresh and replayed
+            // the resumed history as current evidence.
+            let launch_session_established =
+                pre_resume_mode.is_some() || found.session_id.is_some();
+            let hook_provenance = if !launch_session_established {
+                match start_source {
+                    Some("resume") => Some(
+                        transcript_path
+                            .map(ResumeMode::rebound_mode)
+                            .unwrap_or(ResumeMode::Unverified),
+                    ),
+                    Some("clear" | "startup" | "compact") => Some(ResumeMode::Fresh),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             (
-                pre_resume_mode.unwrap_or_else(|| first_session_mode(found, transcript_path)),
+                pre_resume_mode
+                    .or(hook_provenance)
+                    .unwrap_or_else(|| first_session_mode(found, transcript_path)),
                 false,
             )
         } else {
@@ -5241,6 +5267,195 @@ mod tests {
                 .any(|(name, _)| *name == Some(remuda_protocol::EffortName::Max)),
             "an unverified boundary never opens the effort gate: {:?}",
             effort_rows(&later)
+        );
+    }
+
+    /// c-effortread r10 item 7: a HAND-TYPED `claude` (no argv session id, no
+    /// Remuda pre-spawn capture) that `/resume`s into X before the first poll
+    /// must honour the authenticated hook's `resume` source: X opens at an
+    /// unverified EOF boundary and its prior history never publishes Current
+    /// effort evidence. Driven through the production SessionStart ingestion
+    /// + maintain_binding tick (not a hand-built mapper).
+    #[tokio::test]
+    async fn r10_item7_hand_typed_claude_resume_source_on_first_record_is_unverified_eof() {
+        // X already carries a prior session's history.
+        let history = assistant_line(Some("high"), 1);
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(dir.path(), &history);
+        fx.ctx.cwd = dir.path().join("repo");
+        // Hand-typed: the process table knows NO argv session and NO resume
+        // argv — this is exactly what made the old branch call the
+        // argv-provenance Fresh path.
+        let found = detected_claude(7, None);
+
+        let bindings = BindingHandle::empty();
+        bindings.begin_epoch(&fx.ctx.cwd, &fx.ctx.claude_home);
+        // The authenticated hook report, delivered before the first poll.
+        bindings.ingest_session_start(SessionStartReport {
+            session_id: PUMP_SESSION.to_owned(),
+            transcript_path: fx.binding.path.clone(),
+            cwd: Some(fx.binding.cwd.clone()),
+            ppid: Some(7),
+            start_source: Some("resume".into()),
+        });
+        let mut hydrator: Option<Hydrator> = None;
+        let mut announced: Option<String> = None;
+        let mut session_modes = SessionModeTable::default();
+        let mut launch_mode = LaunchModeBinding::Unbound;
+        let mut read_anchors = std::collections::HashMap::new();
+        let mut effort_seeds = std::collections::HashMap::new();
+        let mut withdrawn_sessions = std::collections::HashSet::new();
+        let mut active_session: Option<(i32, String)> = None;
+
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &found,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            None,
+            &mut read_anchors,
+            &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        )
+        .await;
+        let hydrator = hydrator
+            .as_ref()
+            .expect("the resume binds and opens a hydrator");
+        assert!(
+            !hydrator.tail.verified(),
+            "a resume source with no launch-session provenance is unverified"
+        );
+
+        // The prior history hydrates/lands but never as CURRENT evidence.
+        let events = {
+            let mut out = Vec::new();
+            while let Ok(observation) = fx.rx.try_recv() {
+                out.push(observation);
+            }
+            out
+        };
+        assert!(
+            !effort_rows(&events)
+                .iter()
+                .any(|(name, _)| *name == Some(remuda_protocol::EffortName::High)),
+            "resumed history published as current effort: {:?}",
+            effort_rows(&events)
+        );
+
+        // A genuinely new record stays gated too.
+        let mut again: Option<Hydrator> = None;
+        let mut again_announced: Option<String> = None;
+        append_line(&fx.binding.path, &assistant_line(Some("max"), 2));
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &found,
+            &mut again,
+            &mut again_announced,
+            &fx.tx,
+            &fx.seq,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            None,
+            &mut read_anchors,
+            &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        )
+        .await;
+        let later = {
+            let mut out = Vec::new();
+            while let Ok(observation) = fx.rx.try_recv() {
+                out.push(observation);
+            }
+            out
+        };
+        assert!(
+            !effort_rows(&later)
+                .iter()
+                .any(|(name, _)| *name == Some(remuda_protocol::EffortName::Max)),
+            "the unverified boundary never opens the gate: {:?}",
+            effort_rows(&later)
+        );
+    }
+
+    /// c-effortread r10 item 7 control: a hand-typed `claude` with a
+    /// `startup` source stays Fresh and DOES publish the first record.
+    #[tokio::test]
+    async fn r10_item7_hand_typed_claude_startup_source_stays_fresh() {
+        let first_turn = assistant_line(Some("high"), 1);
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(dir.path(), &first_turn);
+        fx.ctx.cwd = dir.path().join("repo");
+        let found = detected_claude(7, None);
+        let bindings = BindingHandle::empty();
+        bindings.begin_epoch(&fx.ctx.cwd, &fx.ctx.claude_home);
+        bindings.ingest_session_start(SessionStartReport {
+            session_id: PUMP_SESSION.to_owned(),
+            transcript_path: fx.binding.path.clone(),
+            cwd: Some(fx.binding.cwd.clone()),
+            ppid: Some(7),
+            start_source: Some("startup".into()),
+        });
+        let mut hydrator: Option<Hydrator> = None;
+        let mut announced: Option<String> = None;
+        let mut session_modes = SessionModeTable::default();
+        let mut launch_mode = LaunchModeBinding::Unbound;
+        let mut read_anchors = std::collections::HashMap::new();
+        let mut effort_seeds = std::collections::HashMap::new();
+        let mut withdrawn_sessions = std::collections::HashSet::new();
+        let mut active_session: Option<(i32, String)> = None;
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &found,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            None,
+            &mut read_anchors,
+            &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        )
+        .await;
+        let events = {
+            let mut out = Vec::new();
+            while let Ok(observation) = fx.rx.try_recv() {
+                out.push(observation);
+            }
+            out
+        };
+        assert!(
+            effort_rows(&events)
+                .iter()
+                .any(|(name, _)| *name == Some(remuda_protocol::EffortName::High)),
+            "a startup source is the fresh current process and its record publishes: {:?}",
+            effort_rows(&events)
         );
     }
 

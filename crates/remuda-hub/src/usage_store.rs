@@ -32,11 +32,14 @@ pub struct UsageEventRow {
     pub model: Option<String>,
     /// Usage scope (`turn` / `session` / …).
     pub scope: String,
-    /// Native scope id (the assistant message id for a turn snapshot). Drives
-    /// durable re-hydration dedupe: the same transcript re-mapped after a
-    /// rebind re-emits the same `(scope, scope_id)`, and INSERT OR IGNORE on
-    /// the partial unique index drops the duplicate projection.
+    /// Native scope id (the assistant message id for a turn snapshot; the
+    /// per-response id for a codex Message row). Drives durable re-hydration
+    /// dedupe and the context basket.
     pub scope_id: Option<String>,
+    /// Native turn id this row belongs to (codex Message rows carry it on the
+    /// stamped observation; r6 item 5). `None` for legacy rows and scope
+    /// kinds that already key on the turn (Claude Turn scope_id).
+    pub turn_id: Option<String>,
     /// Snapshot revision for a given `(scope, scope_id)`. Turn observations
     /// are immutable (always 1); Grok/Codex Session snapshots keep a stable
     /// session id and re-emit with an increasing revision, so a newer
@@ -84,6 +87,7 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             model TEXT,
             scope TEXT NOT NULL,
             scope_id TEXT,
+            turn_id TEXT,
             mode TEXT NOT NULL,
             total_tokens INTEGER,
             input_tokens INTEGER,
@@ -109,6 +113,9 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // Context-window rollup (c-ctxusage RC1): durable per-turn dedupe key.
     // MUST be added before the partial unique index that references it.
     crate::store::ensure_column(conn, "usage_events", "scope_id", "TEXT")?;
+    // c-usagefu r6 item 5: native turn id for codex Message rows, so the
+    // rollup can count distinct turns after the Turn emission was removed.
+    crate::store::ensure_column(conn, "usage_events", "turn_id", "TEXT")?;
     // r2: snapshot revision for revision-aware scoped upserts. Added as a
     // nullable column for upgrade compatibility, then backfilled: rows written
     // at the f890028e schema got NULL here, and a NULL on the right-hand side of
@@ -360,11 +367,11 @@ fn insert_legacy_session_point(conn: &Connection, row: &UsageEventRow) -> rusqli
 fn insert_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO usage_events
-            (instance_id, seq, profile_id, model, scope, scope_id, mode,
+            (instance_id, seq, profile_id, model, scope, scope_id, turn_id, mode,
              metric_revision, total_tokens, input_tokens, output_tokens,
              cache_read_tokens, cache_write_tokens, cost_usd, accounting,
              observed_at, observed_at_source, native_context_window)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             row.instance_id,
             row.seq,
@@ -372,6 +379,7 @@ fn insert_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> 
             row.model,
             row.scope,
             row.scope_id,
+            row.turn_id,
             row.mode,
             row.metric_revision,
             row.total_tokens,
@@ -646,6 +654,15 @@ pub fn project_usage_event(
             .to_string(),
         scope_id: payload
             .get("scopeId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        // r6 item 5: the stamped envelope's native turn id lives under
+        // `source.nativeTurnId` (camelCased ObservationSource).
+        turn_id: record
+            .event
+            .get("source")
+            .and_then(|source| source.get("nativeTurnId"))
+            .and_then(|value| value.get("value"))
             .and_then(Value::as_str)
             .map(str::to_string),
         // c-ctxusage r3 item 2: `metricRevision` is a bare protocol `U64`,
@@ -930,7 +947,7 @@ fn sum_turn_tokens_since(
     conn.query_row(
         "SELECT SUM(input_tokens), SUM(output_tokens)
          FROM usage_events
-         WHERE instance_id = ?1 AND scope = 'turn' AND observed_at >= ?2
+         WHERE instance_id = ?1 AND scope IN ('turn','message') AND observed_at >= ?2
            AND observed_at_source = 'native'",
         params![instance_id, since],
         |row| Ok((row.get(0)?, row.get(1)?)),
@@ -1381,16 +1398,23 @@ pub fn rollup_instance(
     req: &RollupRequest<'_>,
 ) -> rusqlite::Result<Option<InstanceUsageRollup>> {
     let instance_id = req.instance_id;
+    // Flow rows are 'turn' (Claude print/SDK; scope_id is the turn id) or
+    // 'message' (codex per-call, its single billable stream since c-usagefu r6
+    // item 5; scope_id is the RESPONSE id but the row carries turn_id). The
+    // turn count is therefore the number of DISTINCT turns: scope_id for
+    // turn rows, turn_id (stamped on every adapter observation) for messages.
     let totals = conn.query_row(
         "SELECT
-            COUNT(CASE WHEN scope='turn' THEN 1 END) AS turns,
-            SUM(CASE WHEN scope='turn' THEN input_tokens END),
-            SUM(CASE WHEN scope='turn' THEN output_tokens END),
-            SUM(CASE WHEN scope='turn' THEN cache_read_tokens END),
-            SUM(CASE WHEN scope='turn' THEN cache_write_tokens END),
+            COUNT(DISTINCT CASE WHEN scope='turn' THEN scope_id
+                                WHEN scope='message' THEN turn_id
+                                WHEN scope='workflow-member' THEN scope_id END),
+            SUM(CASE WHEN scope IN ('turn','message') THEN input_tokens END),
+            SUM(CASE WHEN scope IN ('turn','message') THEN output_tokens END),
+            SUM(CASE WHEN scope IN ('turn','message') THEN cache_read_tokens END),
+            SUM(CASE WHEN scope IN ('turn','message') THEN cache_write_tokens END),
             COUNT(CASE WHEN scope='session' THEN 1 END),
             COUNT(*),
-            MAX(CASE WHEN scope='turn' AND observed_at_source='native' THEN observed_at END)
+            MAX(CASE WHEN scope IN ('turn','message') AND observed_at_source='native' THEN observed_at END)
          FROM usage_events WHERE instance_id = ?1",
         params![instance_id],
         |row| {
@@ -1407,7 +1431,14 @@ pub fn rollup_instance(
             })
         },
     )?;
-    if !totals.has_turn && !totals.has_session {
+    // A row exists if there is any flow (turn/message with a distinct turn
+    // identity) OR any other row (legacy pre-scopeId turn / session).
+    let total_rows: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM usage_events WHERE instance_id = ?1",
+        params![instance_id],
+        |row| row.get(0),
+    )?;
+    if totals.turns == 0 && !totals.has_session && total_rows == 0 {
         return Ok(None);
     }
 
@@ -1546,8 +1577,10 @@ mod tests {
             event_id: format!("evt_{seq}"),
             event: json!({
                 "kind": "usage",
+                "nativeTurnId": { "state": "known", "value": format!("turn-{seq}") },
                 "payload": {
                     "scope": "turn",
+                    "scopeId": format!("turn-{seq}"),
                     "mode": "snapshot",
                     "totalTokens": { "state": "known", "value": total.to_string() },
                     "inputTokens": { "state": "known", "value": (total / 2).to_string() },
@@ -1626,7 +1659,9 @@ mod tests {
             scope_id.is_none(),
             "old row has no scope_id, so is not deduped"
         );
-        // Rollup still works after upgrade.
+        // Rollup still works after upgrade (legacy turn row has NULL
+        // scope_id/turn_id, but the session-stock/fallback paths still
+        // produce a rollup).
         assert!(
             rollup_fold(&conn, "ins_old", "claude", Some("fake"))
                 .unwrap()
@@ -2347,7 +2382,8 @@ mod tests {
             profile_id: None,
             model: None,
             scope: "turn".into(),
-            scope_id: None,
+            scope_id: Some(format!("turn-{seq}")),
+            turn_id: Some(format!("turn-{seq}")),
             mode: "snapshot".into(),
             metric_revision: 1,
             total_tokens: None,
@@ -2383,6 +2419,7 @@ mod tests {
             model: Some("grok-x".into()),
             scope: "session".into(),
             scope_id: Some("grok-session".into()),
+            turn_id: None,
             mode: "snapshot".into(),
             metric_revision: rev,
             total_tokens: Some(input + output),
@@ -2449,6 +2486,7 @@ mod tests {
             model: Some("codex".to_string()),
             scope: "turn".into(),
             scope_id: Some(format!("turn-{seq}")),
+            turn_id: None,
             mode: "snapshot".into(),
             metric_revision: seq,
             total_tokens: Some(input + output),
@@ -2465,6 +2503,7 @@ mod tests {
         let cumulative = |seq: i64, input: i64, output: i64| UsageEventRow {
             scope: "session".into(),
             scope_id: Some("codex-session".into()),
+            turn_id: None,
             metric_revision: seq,
             ..turn(seq + 10, input, output)
         };
@@ -3961,6 +4000,7 @@ mod tests {
             model: Some("codex".into()),
             scope: "session".into(),
             scope_id: None,
+            turn_id: None,
             mode: "snapshot".into(),
             metric_revision: 1,
             total_tokens: Some(input + output),

@@ -472,10 +472,15 @@ impl CodexAdapter {
                 };
                 let mut totals = crate::usage::UsageTotals::default();
                 totals.add(event);
-                let payload = to_usage_payload(UsageScope::Message, response_id, 1, &totals);
-                vec![AdapterObservation::structured(ObservationPayload::Usage(
-                    Box::new(payload),
-                ))]
+                // Stamp the native turn id so the Hub rollup can count
+                // distinct turns from Message rows (r6 item 5).
+                let mut obs = AdapterObservation::structured(ObservationPayload::Usage(Box::new(
+                    to_usage_payload(UsageScope::Message, response_id, 1, &totals),
+                )));
+                if let Some(turn) = event.turn_id.clone().or_else(|| turn_id(&record)) {
+                    obs = obs.with_turn(turn);
+                }
+                vec![obs]
             }
             // The merged parser types the abort; only an explicit interruption
             // is a turn end here — a future/unknown abort reason must not

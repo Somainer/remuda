@@ -85,10 +85,10 @@ fn codex_0_154_replay_rolls_up_six_turns_and_900_uncached_input() {
     for adapter_obs in usage {
         let number = seq.fetch_add(1, Ordering::SeqCst) + 1;
         let stamped = stamp(&stamp_ctx, number, adapter_obs).expect("stamp usage observation");
+        let event = serde_json::to_value(&stamped).expect("serialize observation");
         if let ObservationPayload::Usage(payload) = &stamped.body {
             *scopes.entry(format!("{:?}", payload.scope)).or_insert(0u32) += 1;
         }
-        let event = serde_json::to_value(&stamped).expect("serialize observation");
         let record = JournalRecord {
             instance_id: INSTANCE.into(),
             seq: number as i64,
@@ -116,9 +116,12 @@ fn codex_0_154_replay_rolls_up_six_turns_and_900_uncached_input() {
     // Per-response Message rows (10 responses) drive the context basket; the 6
     // turn snapshots drive the additive totals; session rows are the stock.
     assert_eq!(scopes.get("Message"), Some(&10));
-    assert_eq!(scopes.get("Turn"), Some(&6));
+    assert_eq!(scopes.get("Turn"), None);
 
-    assert_eq!(rollup.turns, 6, "one turn row per of the 6 completed turns");
+    assert_eq!(
+        rollup.turns, 6,
+        "one distinct message scope id per of the 6 completed turns"
+    );
     assert_eq!(
         rollup.session_input_tokens,
         Some(900),

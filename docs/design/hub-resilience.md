@@ -466,24 +466,33 @@ hello 在单 writer 前排成一串，尾延迟 ≈ N × 单 hello 串行时间�
   REST 已恢复的链路上线即离线、亚秒级重连风暴）。一次真实 frame 重新认证 live
   后该截止清零。
 
-### 5.2.1 定时器归属表（c-reconnfu gate 10 item 0）
+### 5.2.1 定时器归属表（c-reconnfu gate 10 item 0；gate 11 items 1/6/7 校订）
 
 客户端状态机的每个命名定时器只有一个 owner；`setTimer(name, ms, fn)` 在写入
 新 handle 前总是先 `clearTimer(name)`，所以旧 job 绝不会在后来的状态 episode 里
 开火（孤儿 timer 会让上一 episode 的截止在新 episode 误触发，`dispose()` 也
 cancel 不到已被替换的 handle）。
 
-| 状态 | probe | offline | bind | watchdog | reconnect | staleDeadlineAt |
-| --- | --- | --- | --- | --- | --- | --- |
-| **live** | — | — | arm：`followBound` 首次绑定（非 rebind 且非 stale）；clear：`armFrameWatchdog`/`setTimer` 自身/`dispose` | arm：`startLive` 经 `armFrameWatchdog`；clear：frame 超时转 stale、close/offline | —（在线不排程） | 0 |
-| **stale** | arm：`armStaleProbeTimers`；fire：probe ok→`quietReopen`，fail→`goOfflineAndSchedule`；clear：`setTimer` 自身、任何离开 stale | arm：`armStaleProbeTimers`（值=staleDeadlineAt−now）；fire：`goOfflineAndSchedule`；clear：同 probe | （rebind 中若 resumeInFlight 则不 arm；无 attempt 时 rebind 重新 arm stale/probe/offline） | 仅 quiet reopen 在飞时（见下）；fire 后回到 stale | — | arm：首次进 stale（`setState` 离开 stale 即清零）；fire：offline 定时器 |
-| **quiet-reopen-in-stale** | 由 quiet 之前的 stale episode 持有（`armResumeAttemptQuiet` **不**清 offline：gate 10 item 4） | 同一 stale episode 的 offline 截止继续有效 | —（rebind 跳过 bind：resumeInFlight=true） | arm：`armResumeAttemptQuiet`；fire：未 frame→回 stale（re-arm probe/offline），frame-live→live；clear：完成/绑定变更/`setTimer` | — | 沿用当前 episode |
-| **recovering** | — | arm：`goOfflineAndSchedule`→`scheduleReconnect`（经 backoff）；clear：新 attempt 的 `clearTimers` | —（非 rebind 且 resumeInFlight 时 `followBound` 跳过） | arm：`armResumeAttempt`；fire：frame-live→live、REST 可达→stale、不可达→offline；clear：resumeAttempt 完成、`setTimer` | arm：`scheduleReconnect`（仅离线自主路径）；fire：frame-live 则认证 live，否则 `beginResume`；clear：attempt 的 `clearTimers`、frame 认证 | 0（setState 离开 stale 清零） |
-| **offline** | — | —（offline 自身不持有 offline 截止） | arm：`followBound` 非 rebind 且 state=offline 立即 `beginResume`（无延迟 bind） | arm：`beginResume`/`resume`/`online` 事件→`armResumeAttempt` | arm：`setStateOffline` 与每次 `goOfflineAndSchedule`；fire：认证或重开；clear：resume 启动、frame 认证 | 0 |
+六个命名定时器是 `stale`、`probe`、`offline`、`bind`、`watchdog`、`reconnect`；
+注意两个容易混淆的名字（gate 11 item 7 校订）：**`stale` 定时器是 15 s 帧看门
+狗**（`armFrameWatchdog` 安装，fire 只做 live→stale），它在进入 stale 状态后
+不再存在；**`watchdog` 定时器是 20 s resume 看门狗**（只在 recovering /
+quiet-reopen 在飞时安装）。此外 `staleDeadlineAt` 不是定时器，是一次 quiet
+stale episode 的 30 s 墙钟截止，由 `offline` 定时器兑现。
 
-`dispose()` clear 全部六个定时器；浏览器 `offline` 事件只 retire 当前 attempt
-（`retireInFlightForOffline`），不清 offline 截止，它让随后的 `online` 事件启动
-新 attempt。
+| 状态 | `stale`（15 s 帧看门狗） | probe（15 s REST 探测） | offline（episode 30 s 截止） | bind（15 s 首帧） | watchdog（20 s resume） | reconnect（backoff） | staleDeadlineAt |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **live** | arm：`startLive`/`bootstrapLive` 后首帧、每个 `frame`、`followRebindLive` 都经 `armFrameWatchdog`；fire：live→stale 并 `armStaleProbeTimers`；clear：frame 重臂、离开 live（close/offline/进 recovering）、`dispose` | — | — | arm：`followBound` 首次绑定（非 rebind、state 为 live/stale、无在飞 attempt）；fire：frame-live→重臂帧看门狗；wasLive（含 stale）→stale+probe；否则 `beginResume`；clear：`armFrameWatchdog`/settle 回 stale 时显式 clear/`setTimer`/`dispose` | —（无在飞 resume attempt） | —（在线不排程） | 0 |
+| **stale** | —（帧看门狗已在 live→stale 时 fire；stale 内由 probe/offline 接管） | arm：`armStaleProbeTimers`，fire 时**同时 capture `latestBindGen` 与 `resumeAttemptId`**（gate 11 item 6），两者都匹配才 dispatch；ok→`quietReopen`，fail→`goOfflineAndSchedule`；clear：`setTimer` 自身、quiet arm、任何离开 stale | arm：`armStaleProbeTimers`（值=staleDeadlineAt−now）；fire：`goOfflineAndSchedule`；clear：同 probe | —：rebind 遇 `resumeInFlight` 直接 return（仅 isFollowLive 时 armFrameWatchdog）；rebind 在 stale 且无 attempt → 重臂 probe/offline（不 arm bind）；非 rebind 在飞 attempt → **跳过**（gate 11 item 1 恢复）；attempt settle 回 stale 时 clear 既有 `bind` | 仅 quiet-reopen 在飞时（见下一行）；其 fire 落回 stale | — | arm：首次进 stale（`setState` 离开 stale 即清零）；由 `offline` 定时器兑现 |
+| **quiet-reopen-in-stale** | — | clear：`armResumeAttemptQuiet` 清除；attempt settle（未 frame）回 stale 后由 `armStaleProbeTimers` 按**沿用**的 deadline 重臂 | **不清**：同一 stale episode 的 offline 截止继续有效（gate 10 item 4）；fire 时退休在飞 quiet attempt（不带 `resumeRetiredOffline`，其迟到 completion 被 id 丢弃） | —：resumeInFlight=true，rebind 与**非 rebind** 的 `followBound` 都跳过 bind（gate 11 item 1） | arm：`armResumeAttemptQuiet`（arm 时重置 `closedDuringResume`，gate 11 item 2）；fire：未 frame→回 stale（re-arm probe/offline），frame-live→live；clear：completion/绑定变更/`setTimer` | — | 沿用当前 episode |
+| **recovering** | — | —（失败结算用一次性 `settleResumeFailureViaProbe`，capture gen+attemptId，不走 probe 定时器） | arm：`goOfflineAndSchedule`→`scheduleReconnect`（经 backoff）；clear：新 attempt 的 `clearTimers` | —：非 rebind 且 state=offline 的 `followBound` 立即 `beginResume`（无延迟 bind）；resume 在飞的非 rebind bind 由 gate 11 item 1 跳过 | arm：`armResumeAttempt`（`beginResume`/`followAttemptBegin`，arm 时重置 `closedDuringResume`，gate 11 item 2）；fire：frame-live→live+帧看门狗，state=stale→quiet 重臂，否则 REST 可达→stale、不可达→offline；clear：resumeAttempt 完成（latch 在此被消费，gate 11 item 2）、`noteBinding` supersede、`setTimer` | arm：`scheduleReconnect`（仅离线自主路径）；fire：frame-live 则认证 live，否则 `beginResume`；clear：attempt 的 `clearTimers`、frame 认证 | 0（setState 离开 stale 清零） |
+| **offline** | — | — | —（`goOffline` 已 clear；offline 自身不持有 episode 截止） | 非 rebind `followBound` 且 state=offline → 立即 `beginResume`（不 arm 延迟 bind） | arm：`beginResume`/`resume`/`online` 事件→`armResumeAttempt` | arm：`setStateOffline` 与每次 `goOfflineAndSchedule`；fire：认证或重开；clear：resume 启动、frame 认证 | 0 |
+
+`dispose()` clear 全部六个命名定时器（Outbox 自己另有按 commandId 跟踪的租约到期
+wakeup，由 `Outbox.dispose()`/行已送达 cancel，outbox 交付语义见 §5.4 的 D-055）；
+浏览器
+`offline` 事件只 retire 当前 attempt（`retireInFlightForOffline`），不清 offline
+截止，它让随后的 `online` 事件启动新 attempt。
 
 ### 5.3 最高优先级规则：绝不把旧数据当新数据
 

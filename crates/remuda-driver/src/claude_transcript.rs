@@ -788,6 +788,17 @@ impl TailAnchor {
     pub(crate) fn is_live_origin(&self) -> bool {
         self.origin == TailOrigin::Live
     }
+
+    /// c-effortread r10 item 6: stamp an EXPLICIT withdrawal onto a cached
+    /// anchor (the bound session was renamed/resumed away while no hydrator
+    /// was polling, so the file could not be proven to have stayed in place).
+    /// `continued()` then always reopens it displaced/unverified — even if the
+    /// restored file happens to keep the same identity — and the cached
+    /// verified gate can never be restored.
+    pub(crate) fn mark_withdrawn(&mut self) {
+        self.current = false;
+        self.displaced = true;
+    }
 }
 
 #[derive(Debug)]

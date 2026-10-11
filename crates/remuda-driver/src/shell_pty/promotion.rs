@@ -914,6 +914,20 @@ pub(super) fn spawn(
         // demote/re-promotion continues the same transcript where it left
         // off instead of re-emitting it from the sticky anchor.
         let mut read_anchors = std::collections::HashMap::new();
+        // c-effortread r10 item 6: (pid, session) pairs whose bound transcript
+        // was EXPLICITLY withdrawn while no hydrator could prove it stayed in
+        // place (the session was renamed/resumed away, or the bound file
+        // vanished/changed identity). Persisted independently of anchor
+        // capture — a demote with no successful final pump leaves only a
+        // stale verified anchor in `read_anchors`; this set forces an
+        // unverified EOF continuation (and boundary fallback) even after the
+        // session is restored and even when the restored file keeps the same
+        // inode. Sticky for the promotion loop's lifetime (fail closed).
+        let mut withdrawn_sessions: std::collections::HashSet<(i32, String)> =
+            std::collections::HashSet::new();
+        // The (pid, session) the LIVE hydrator is currently reading, so a
+        // rebind/demote arm knows which session an explicit withdrawal marks.
+        let mut active_session: Option<(i32, String)> = None;
         // c-effortread r8 item 5: EffortTracker latch per (pid, session),
         // captured from every pump and re-seeded into the replacement mapper
         // on demote/re-promotion.
@@ -1080,6 +1094,21 @@ pub(super) fn spawn(
                             &report,
                         );
                     if rebound || first_claim {
+                        // c-effortread r10 item 6: switching to a different
+                        // session EXPLICITLY withdraws the transcript the live
+                        // hydrator was reading — it will not be polled while
+                        // absent and its file cannot be proven unchanged, so a
+                        // later restore of the old (pid, session) must reopen
+                        // unverified rather than resume the cached gate.
+                        if let Some(previous) = active_session.take()
+                            && previous.1 != report.session_id
+                        {
+                            mark_session_withdrawn(
+                                previous,
+                                &mut read_anchors,
+                                &mut withdrawn_sessions,
+                            );
+                        }
                         hydrator = None;
                         announced = None;
                     }
@@ -1423,6 +1452,8 @@ pub(super) fn spawn(
                         pre_resume_mode,
                         &mut read_anchors,
                         &mut effort_seeds,
+                        &mut withdrawn_sessions,
+                        &mut active_session,
                     )
                     .await;
                 }
@@ -1897,6 +1928,28 @@ fn shell_resume_mode(found: &Detected) -> ResumeMode {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// c-effortread r10 item 6: record an explicit withdrawal of one
+/// `(pid, session)` transcript. The cached anchor (if any) is downgraded so
+/// `TranscriptTail::continued` cannot restore a verified gate, and the key is
+/// persisted in `withdrawn` even when no anchor was ever captured (a demote
+/// with the file already absent) — the boundary fallback then opens the
+/// restored session at an unverified EOF.
+fn mark_session_withdrawn(
+    key: (i32, String),
+    read_anchors: &mut std::collections::HashMap<(i32, String), TailAnchor>,
+    withdrawn: &mut std::collections::HashSet<(i32, String)>,
+) {
+    tracing::warn!(
+        pid = key.0,
+        session = %key.1,
+        "promoted transcript explicitly withdrawn; later continuation stays unverified"
+    );
+    if let Some(anchor) = read_anchors.get_mut(&key) {
+        anchor.mark_withdrawn();
+    }
+    withdrawn.insert(key);
+}
+
 async fn maintain_binding(
     bindings: &BindingHandle,
     ctx: &PromoteCtx,
@@ -1916,6 +1969,9 @@ async fn maintain_binding(
     read_anchors: &mut std::collections::HashMap<(i32, String), TailAnchor>,
     // c-effortread r8 item 5: tracker latch carried across re-promotion.
     effort_seeds: &mut std::collections::HashMap<(i32, String), EffortTrackerSeed>,
+    // c-effortread r10 item 6: explicitly withdrawn sessions and the live key.
+    withdrawn_sessions: &mut std::collections::HashSet<(i32, String)>,
+    active_session: &mut Option<(i32, String)>,
 ) {
     // Deterministic channels get first crack at an unbound, healthy epoch.
     if bindings.binding().is_none() && !bindings.degraded() {
@@ -2062,15 +2118,28 @@ async fn maintain_binding(
         // c-effortread r8 item 4(c): a CURRENT (Fresh, gate-open) anchor must
         // reopen as a live tail — never forced into a resume tail, which would
         // turn subsequent Fresh edges into Unverified.
-        let continue_anchor = read_anchors
-            .get(&(found.pid, binding.session_id.clone()))
-            .cloned();
+        let session_key = (found.pid, binding.session_id.clone());
+        // c-effortread r10 item 6: an explicitly withdrawn session (renamed
+        // away while absent, or a vanished/displaced tracked file) reopens at
+        // an UNVERIFIED EOF boundary — never from the cached verified anchor,
+        // whose file could not be proven to have stayed put.
+        let session_withdrawn = withdrawn_sessions.contains(&session_key);
+        let continue_anchor = if session_withdrawn {
+            None
+        } else {
+            read_anchors.get(&session_key).cloned()
+        };
         // c-effortread r9 item 3: key on the anchor's ORIGIN, not its
         // gate-open flag — a verified resume currently reading Current must
         // reopen in this session's own mode so a failed continuation (its
         // inode changed while inactive) never falls back to Fresh and replays
         // the resumed history as current.
-        let continue_resume_mode = continuation_resume_mode(continue_anchor.as_ref(), mode);
+        let continue_resume_mode = if session_withdrawn {
+            ResumeMode::Unverified
+        } else {
+            continuation_resume_mode(continue_anchor.as_ref(), mode)
+        };
+        *active_session = Some(session_key.clone());
         *hydrator = Hydrator::open(
             ctx,
             &binding,
@@ -2089,6 +2158,11 @@ async fn maintain_binding(
         );
     }
     if let Some(active) = hydrator.as_mut() {
+        // c-effortread r10 item 6: whether the tail just reported its tracked
+        // file displaced (renamed/replaced/shrink below the cursor) on THIS
+        // pump — an explicit withdrawal that must survive a later demote even
+        // if no further pump captures the downgraded anchor.
+        let displaced_after_pump = active.tail.displaced();
         match pump(active, events, seq, ctx).await {
             Ok(()) => {
                 // Remember where this (pid, session) was read to, so a
@@ -2096,6 +2170,13 @@ async fn maintain_binding(
                 // the whole conversation.
                 if let Some(anchor) = active.tail.anchor() {
                     read_anchors.insert((found.pid, binding.session_id.clone()), anchor);
+                }
+                if displaced_after_pump || active.tail.displaced() {
+                    mark_session_withdrawn(
+                        (found.pid, binding.session_id.clone()),
+                        read_anchors,
+                        withdrawn_sessions,
+                    );
                 }
                 // c-effortread r8 item 5: remember the effort latch so the
                 // replacement mapper after a re-promotion keeps level/flag.
@@ -2107,6 +2188,14 @@ async fn maintain_binding(
                 // The bound file vanished: degrade, never silently rebind.
                 bindings.mark_degraded("bound transcript file vanished");
                 hydrator.take();
+                // r10 item 6: the tracked file is gone with no further pump
+                // to downgrade the cached anchor — persist the withdrawal now
+                // so a restored same-(pid, session) rebind can never reopen
+                // the stale verified anchor.
+                let vanished_key = active_session
+                    .take()
+                    .unwrap_or_else(|| (found.pid, binding.session_id.clone()));
+                mark_session_withdrawn(vanished_key, read_anchors, withdrawn_sessions);
                 let related = BTreeMap::from([
                     ("sessionId".to_owned(), binding.session_id.clone()),
                     ("source".to_owned(), binding.source.as_wire().to_owned()),
@@ -3627,6 +3716,8 @@ mod tests {
         launch_mode: LaunchModeBinding,
         read_anchors: std::collections::HashMap<(i32, String), TailAnchor>,
         effort_seeds: std::collections::HashMap<(i32, String), EffortTrackerSeed>,
+        withdrawn_sessions: std::collections::HashSet<(i32, String)>,
+        active_session: Option<(i32, String)>,
         found: Detected,
     }
 
@@ -3663,6 +3754,8 @@ mod tests {
             launch_mode: LaunchModeBinding::Unbound,
             read_anchors: std::collections::HashMap::new(),
             effort_seeds: std::collections::HashMap::new(),
+            withdrawn_sessions: std::collections::HashSet::new(),
+            active_session: None,
             found,
         }
     }
@@ -3691,6 +3784,8 @@ mod tests {
             pre_resume_mode,
             &mut state.read_anchors,
             &mut state.effort_seeds,
+            &mut state.withdrawn_sessions,
+            &mut state.active_session,
         )
         .await;
     }
@@ -4858,6 +4953,8 @@ mod tests {
         let mut launch_mode = LaunchModeBinding::Unbound;
         let mut read_anchors = std::collections::HashMap::new();
         let mut effort_seeds = std::collections::HashMap::new();
+        let mut withdrawn_sessions = std::collections::HashSet::new();
+        let mut active_session: Option<(i32, String)> = None;
 
         // First promotion tick: maintain_binding opens the Fresh hydrator with
         // the bridge and pumps the ultra-on high turn, capturing the read
@@ -4880,6 +4977,8 @@ mod tests {
             Some(ResumeMode::Fresh),
             &mut read_anchors,
             &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
         )
         .await;
         let first = drain(&mut fx);
@@ -4921,6 +5020,8 @@ mod tests {
             Some(ResumeMode::Fresh),
             &mut read_anchors,
             &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
         )
         .await;
         assert!(hydrator.is_some(), "the re-promote opened a hydrator");
@@ -4931,6 +5032,215 @@ mod tests {
                 && *flag == Some(true)),
             "the attachment-less max record carries the seeded ultracode flag: {:?}",
             effort_rows(&second)
+        );
+    }
+
+    /// c-effortread r10 item 6: an EXPLICIT withdrawal (session X renamed away
+    /// while no hydrator polls it, then restored to a new file) must never
+    /// restore the cached verified anchor. Driven through the production
+    /// rebind + maintain_binding orchestration: X hydrates Fresh (capturing a
+    /// live, gate-open anchor), rebind to Z marks X withdrawn, and the
+    /// restored X rebind opens an UNVERIFIED EOF tail — the restored file's
+    /// history never publishes Current evidence and a later current record
+    /// stays gated.
+    #[tokio::test]
+    async fn r10_item6_withdrawn_session_restored_reopens_unverified_never_cached_verified() {
+        let other_session = "zzzzzzzz-2222-4333-8444-zzzzzzzzzzzz";
+        let x_history = assistant_line(Some("high"), 1);
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(dir.path(), &x_history);
+        fx.ctx.cwd = dir.path().join("repo");
+        let found = detected_claude(7, Some(PUMP_SESSION));
+
+        let bindings = BindingHandle::empty();
+        bindings.begin_epoch(&fx.ctx.cwd, &fx.ctx.claude_home);
+        let x_report = SessionStartReport {
+            session_id: PUMP_SESSION.to_owned(),
+            transcript_path: fx.binding.path.clone(),
+            cwd: Some(fx.binding.cwd.clone()),
+            ppid: Some(7),
+            start_source: Some("startup".into()),
+        };
+        bindings.ingest_session_start(x_report.clone());
+        let mut hydrator: Option<Hydrator> = None;
+        let mut announced: Option<String> = None;
+        let mut session_modes = SessionModeTable::default();
+        let mut launch_mode = LaunchModeBinding::Unbound;
+        let mut read_anchors = std::collections::HashMap::new();
+        let mut effort_seeds = std::collections::HashMap::new();
+        let mut withdrawn_sessions = std::collections::HashSet::new();
+        let mut active_session: Option<(i32, String)> = None;
+
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &found,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            Some(ResumeMode::Fresh),
+            &mut read_anchors,
+            &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        )
+        .await;
+        assert!(hydrator.is_some(), "X hydrates on the first tick");
+        assert!(
+            read_anchors.contains_key(&(7, PUMP_SESSION.to_owned())),
+            "the first pump captures X's gate-open anchor"
+        );
+        // X's fresh history published with the gate open.
+        let first = {
+            let mut out = Vec::new();
+            while let Ok(observation) = fx.rx.try_recv() {
+                out.push(observation);
+            }
+            out
+        };
+        assert!(
+            effort_rows(&first)
+                .iter()
+                .any(|(name, _)| *name == Some(remuda_protocol::EffortName::High))
+        );
+
+        // The user switches to a DIFFERENT session in the same shell pid
+        // (X "renamed away"): production rebind, exactly as the loop does.
+        let z_path = slug_session(
+            dir.path(),
+            &fx.binding.cwd,
+            other_session,
+            &assistant_line(Some("medium"), 1),
+        );
+        let z_report = SessionStartReport {
+            session_id: other_session.to_owned(),
+            transcript_path: z_path,
+            cwd: Some(fx.binding.cwd.clone()),
+            ppid: Some(7),
+            start_source: Some("resume".into()),
+        };
+        assert!(
+            bindings.rebind_authenticated_start(&found, &z_report),
+            "the authenticated start rebinds X -> Z"
+        );
+        // The production loop's rebind arm: demote X while absent and persist
+        // its withdrawal before dropping the hydrator.
+        if let Some(previous) = active_session.take()
+            && previous.1 != z_report.session_id
+        {
+            mark_session_withdrawn(previous, &mut read_anchors, &mut withdrawn_sessions);
+        }
+        hydrator = None;
+        assert!(withdrawn_sessions.contains(&(7, PUMP_SESSION.to_owned())));
+        let cached = read_anchors
+            .get(&(7, PUMP_SESSION.to_owned()))
+            .expect("X still has a cached anchor");
+        assert!(
+            !cached.current,
+            "the cached anchor is downgraded on withdrawal"
+        );
+
+        // X is RESTORED while we were away: its transcript was replaced with a
+        // brand-new file holding fresh history (different inode/head).
+        std::fs::remove_file(&fx.binding.path).expect("remove old X file");
+        let restored_history = assistant_line(Some("max"), 9);
+        std::fs::write(&fx.binding.path, restored_history).expect("restore X file");
+
+        // The user comes back to X: another production rebind, then a tick.
+        assert!(
+            bindings.rebind_authenticated_start(&found, &x_report),
+            "the authenticated start rebinds Z -> X"
+        );
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &found,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            Some(ResumeMode::Fresh),
+            &mut read_anchors,
+            &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        )
+        .await;
+        let reopened = hydrator.as_ref().expect("restored X reopens a hydrator");
+        assert!(
+            !reopened.tail.verified(),
+            "the restored session must NOT restore the cached verified gate"
+        );
+
+        // The restored file's HISTORY can never publish Current evidence.
+        let after_restore = {
+            let mut out = Vec::new();
+            while let Ok(observation) = fx.rx.try_recv() {
+                out.push(observation);
+            }
+            out
+        };
+        assert!(
+            !effort_rows(&after_restore)
+                .iter()
+                .any(|(name, _)| *name == Some(remuda_protocol::EffortName::Max)),
+            "restored history replays as current: {:?}",
+            effort_rows(&after_restore)
+        );
+
+        // Even a genuinely NEW current-process record stays gated while the
+        // boundary is unverified.
+        append_line(&fx.binding.path, &assistant_line(Some("max"), 10));
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &found,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            Some(ResumeMode::Fresh),
+            &mut read_anchors,
+            &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        )
+        .await;
+        let later = {
+            let mut out = Vec::new();
+            while let Ok(observation) = fx.rx.try_recv() {
+                out.push(observation);
+            }
+            out
+        };
+        assert!(
+            !effort_rows(&later)
+                .iter()
+                .any(|(name, _)| *name == Some(remuda_protocol::EffortName::Max)),
+            "an unverified boundary never opens the effort gate: {:?}",
+            effort_rows(&later)
         );
     }
 

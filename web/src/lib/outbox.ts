@@ -180,10 +180,22 @@ export interface OutboxStorage {
    * gate 11 item 4: reclaim via mergeUnlessDown guarded only `done`, so a
    * snapshot patch carrying `pending` downgraded a row already sent). Missing
    * resolves null. A storage failure rejects.
+   *
+   * Options:
+   *  - `requireExpired` (c-reconnfu gate 13 item 2): the WAKE path additionally
+   *    requires `lease.until <= Date.now()` INSIDE the transaction, so a timer
+   *    that fired across a system-clock rollback (Date.now() moved back before
+   *    `until`) cannot reclaim a still-fresh lease. The row is returned
+   *    verbatim inflight in that case. Load-time reclaims do not pass it — load
+   *    applies its own ownership rules (a holder-free fresh context reclaim is
+   *    legitimate regardless of wall time).
+   *  - `signal`: when aborted before the write commits, the transaction is
+   *    aborted and the row stays inflight (c-reconnfu gate 13 item 3).
    */
   reclaimInflight(
     commandId: Id,
     expected: { owner: Id; until: number },
+    opts?: { requireExpired?: boolean; signal?: AbortSignal },
   ): Promise<OutboxRecord | null>;
 }
 
@@ -368,34 +380,68 @@ class IdbOutboxStorage implements OutboxStorage {
   async reclaimInflight(
     commandId: Id,
     expected: { owner: Id; until: number },
+    opts?: { requireExpired?: boolean; signal?: AbortSignal },
   ): Promise<OutboxRecord | null> {
     return await new Promise<OutboxRecord | null>((resolve, reject) => {
       const t = this.db.transaction(IDB_STORE, "readwrite");
       const store = t.objectStore(IDB_STORE);
       let result: OutboxRecord | null = null;
+      let finished = false;
+      // Gate 13 item 3: dispose aborts the reclaim before its put commits.
+      opts?.signal?.addEventListener(
+        "abort",
+        () => {
+          if (finished) return;
+          try {
+            t.abort();
+          } catch {
+            /* already finishing */
+          }
+        },
+        { once: true },
+      );
       const getReq = store.get(commandId);
       getReq.onsuccess = () => {
         const existing = getReq.result as OutboxRecord | undefined;
         if (!existing) return; // missing: null on complete
+        if (opts?.signal?.aborted) {
+          t.abort();
+          return;
+        }
         const lease = existing.lease;
+        // Gate 13 item 2: the expiry test is evaluated INSIDE the
+        // transaction, so a clock rolled back between the timer firing and the
+        // claim cannot reclaim a fresh lease.
+        const expired = !opts?.requireExpired || lease!.until <= Date.now();
         if (
           existing.state === "inflight" &&
           lease &&
           lease.owner === expected.owner &&
-          lease.until === expected.until
+          lease.until === expected.until &&
+          expired
         ) {
+          if (opts?.signal?.aborted) {
+            t.abort();
+            return;
+          }
           const reclaimed: OutboxRecord = { ...existing, state: "pending", lease: undefined };
           result = reclaimed;
           store.put(reclaimed);
         } else {
-          // Moved on (sent/reconciling/held/done) or lease changed: leave the
-          // authoritative row exactly as stored.
+          // Moved on (sent/reconciling/held/done), lease changed or still
+          // fresh after rollback: leave the authoritative row as stored.
           result = existing;
         }
       };
       getReq.onerror = () => reject(getReq.error);
-      t.oncomplete = () => resolve(result);
-      t.onabort = () => reject(t.error ?? getReq.error ?? new Error("IndexedDB reclaim transaction aborted"));
+      t.oncomplete = () => {
+        finished = true;
+        resolve(result);
+      };
+      t.onabort = () => {
+        finished = true;
+        reject(t.error ?? getReq.error ?? new Error("IndexedDB reclaim transaction aborted"));
+      };
       t.onerror = () => reject(t.error ?? getReq.error);
     });
   }
@@ -470,19 +516,28 @@ class LocalStorageOutboxStorage implements OutboxStorage {
   async reclaimInflight(
     commandId: Id,
     expected: { owner: Id; until: number },
+    opts?: { requireExpired?: boolean; signal?: AbortSignal },
   ): Promise<OutboxRecord | null> {
+    // Gate 13 item 3: a dispose must prevent the write even in the synchronous
+    // degraded backend (the caller is suspended at an await boundary).
+    if (opts?.signal?.aborted) throw new DOMException("reclaim aborted", "AbortError");
     const recs = this.read();
     const existing = recs.find((r) => r.commandId === commandId);
     if (!existing) return null;
     const lease = existing.lease;
+    // Gate 13 item 2: the wake path proves expiry AGAIN here (wall clock may
+    // have rolled back since the timer fired).
+    const expired = !opts?.requireExpired || (!!lease && lease.until <= Date.now());
     if (
       existing.state !== "inflight" ||
       !lease ||
       lease.owner !== expected.owner ||
-      lease.until !== expected.until
+      lease.until !== expected.until ||
+      !expired
     ) {
       return existing;
     }
+    if (opts?.signal?.aborted) throw new DOMException("reclaim aborted", "AbortError");
     const reclaimed: OutboxRecord = { ...existing, state: "pending", lease: undefined };
     this.write([...recs.filter((r) => r.commandId !== commandId), reclaimed]);
     return reclaimed;
@@ -888,9 +943,20 @@ export class Outbox {
         // replacement is reclaimed immediately under this lock.
         return { kind: "adopt", lease };
       }
+      // Same exact snapshot. Gate 13 item 2: a timer firing is NOT proof of
+      // absolute expiry — the system clock can roll back after arming, so
+      // Date.now() may be < until even though the delay elapsed. Re-arm the
+      // UNCHANGED snapshot and wait out the remaining wall time instead of
+      // stealing a still-fresh lease.
+      if (Date.now() < snapshot.until) {
+        return { kind: "adopt", lease: snapshot } satisfies Outcome;
+      }
       // Same exact snapshot and its deadline has passed: conditional reclaim.
+      // The transaction re-checks expiry against its own Date.now() inside.
       try {
-        const reclaimed = await this.storage.reclaimInflight(commandId, snapshot);
+        const reclaimed = await this.storage.reclaimInflight(commandId, snapshot, {
+          requireExpired: true,
+        });
         // Gate 12 item 3: dispose while the reclaim was suspended.
         if (this.disposed) return { kind: "stop", rec: null };
         if (!reclaimed) return { kind: "stop", rec: null };

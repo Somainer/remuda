@@ -78,20 +78,25 @@ class MemStorage implements OutboxStorage {
   async reclaimInflight(
     commandId: string,
     expected: { owner: string; until: number },
+    opts?: { requireExpired?: boolean; signal?: AbortSignal },
   ): Promise<OutboxRecord | null> {
     const run = this.writeChain.then(async () => {
       await new Promise((r) => setTimeout(r, 1));
+      if (opts?.signal?.aborted) throw new DOMException("reclaim aborted", "AbortError");
       const existing = this.map.get(commandId);
       if (!existing) return null;
       const lease = existing.lease;
+      const expired = !opts?.requireExpired || (!!lease && lease.until <= Date.now());
       if (
         existing.state !== "inflight" ||
         !lease ||
         lease.owner !== expected.owner ||
-        lease.until !== expected.until
+        lease.until !== expected.until ||
+        !expired
       ) {
         return existing;
       }
+      if (opts?.signal?.aborted) throw new DOMException("reclaim aborted", "AbortError");
       const reclaimed: OutboxRecord = { ...existing, state: "pending", lease: undefined };
       this.map.set(commandId, reclaimed);
       return reclaimed;
@@ -546,6 +551,62 @@ describe("Outbox", () => {
       expect(wakes).toHaveBeenCalledTimes(1);
       expect(store.map.get("cmd_readfail")?.state).toBe("pending");
       expect(box.pendingClaimWakeups()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
+  it("GATE13 item 2: a timer firing across a system-clock ROLLBACK does not reclaim the still-fresh lease — it re-arms and reclaims at the new deadline", async () => {
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000_000);
+      const T = Date.now() + LEASE_TTL_MS;
+      let releaseRead: (() => void) | null = null;
+      const readGate = new Promise<void>((r) => void (releaseRead = r));
+      class RollbackStorage extends MemStorage {
+        reads = 0;
+        override async all() {
+          this.reads += 1;
+          if (this.reads >= 2) await readGate; // the wake's read is suspended
+          return await super.all();
+        }
+      }
+      const store = new RollbackStorage();
+      const putP = store.put(
+        rec({
+          commandId: "cmd_rollback",
+          instanceId: "ins_rb",
+          state: "inflight",
+          lease: { owner: "owner_rb", until: T },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await putP;
+      const box = await Outbox.load(store, "owner_rb");
+      await vi.advanceTimersByTimeAsync(0);
+      const wakes = vi.fn();
+      box.onClaimWake = wakes;
+
+      // The deadline timer fires (clock advanced to T), but its durable read
+      // is suspended WHILE the system clock moves 10 s backwards.
+      await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
+      vi.setSystemTime(T - 10_000);
+      releaseRead!();
+      await vi.advanceTimersByTimeAsync(10);
+      // Still fresh under the rolled-back wall clock: not reclaimed, re-armed.
+      expect(store.map.get("cmd_rollback")?.state).toBe("inflight");
+      expect(wakes).not.toHaveBeenCalled();
+      expect(box.pendingClaimWakeups()).toEqual(["cmd_rollback"]);
+
+      // Wall time catches up with the deadline: now the conditional reclaim
+      // (with its in-transaction expiry check) commits.
+      await vi.advanceTimersByTimeAsync(10_000);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(store.map.get("cmd_rollback")?.state).toBe("pending");
+      expect(wakes).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });

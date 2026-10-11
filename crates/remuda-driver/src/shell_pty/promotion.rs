@@ -1431,6 +1431,16 @@ pub(super) fn spawn(
             faults.as_ref(),
         )
         .await;
+        // c-ctxusage r8 item 1: production is complete (hydrator retired by
+        // the finalise, every final frame parked) BEFORE the flusher is asked
+        // to stop. The flusher exits only on flush_stop && residual_done &&
+        // queue empty; marking residual here is what lets a normal close drain
+        // and return immediately. Previously residual_done was set only by
+        // disarm(), which ran AFTER awaiting the flusher — every close waited
+        // the full 15 s bound and was then aborted. The guard stays ARMED
+        // until the join completes, so an abort landing during the drain keeps
+        // its cancellation safety net.
+        finalise_guard.mark_residual_complete();
         // Every frame (the finalise included) is parked in the shared queue;
         // stop the streaming flusher only once it has drained everything.
         flush_done.store(true, Ordering::SeqCst);
@@ -1551,12 +1561,17 @@ struct FinaliseGuard {
 }
 
 impl FinaliseGuard {
-    /// Happy-path completion: the async finalise already drained the queue and
+    /// Cooperative path: every producer has finished and the final frames are
+    /// parked (c-ctxusage r8 item 1). Lets the flusher drain and exit while
+    /// the guard itself stays armed for cancellation until delivery finishes.
+    fn mark_residual_complete(&self) {
+        self.residual_done.store(true, Ordering::SeqCst);
+    }
+
+    /// Happy-path completion: the async finalise drained the queue and
     /// removed the hydrator from the slot; suppress the Drop finalise.
     fn disarm(mut self) {
         self.done = true;
-        // No residual finish is pending; let the flusher drain and exit.
-        self.residual_done.store(true, Ordering::SeqCst);
     }
 }
 

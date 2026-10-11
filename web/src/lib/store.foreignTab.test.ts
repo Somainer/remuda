@@ -457,6 +457,150 @@ it("GATE16 item 1: follow(B) while bound to A in recovering adopts mounted B —
   hubStore.logout();
 });
 
+it("GATE17 item 1: recovering A -> never-mounted B with a FAILING seed self-drives recovery (timer armed, retry runs)", async () => {
+  // Gate 16 fixed only the MOUNTED branch. On the unmounted path bindConnection
+  // retires A's attempt and clears its watchdog; if B's initial eventsRead then
+  // rejects (or times out) openFollowSocket never runs, so no followBound ever
+  // armed anything and the machine sat in recovering with NO timer. The seed
+  // must run inside a generation-scoped follow attempt whose failure arms the
+  // ordinary probe/reconnect recovery.
+  vi.useFakeTimers();
+  const { api, hubStore } = await fresh();
+  await bootLive(api, hubStore); // lists A = INSTANCE (journal JOURNAL)
+
+  const JOURNAL_B = "obj_journal_b_g17_i1";
+  const INSTANCE_B = "ins_unmounted_b_g17_i1";
+  vi.spyOn(api, "instanceGet").mockImplementation(async (id: string) =>
+    id === INSTANCE_B
+      ? ({
+          id: INSTANCE_B,
+          journalId: JOURNAL_B,
+          lifecycle: "running",
+          revision: "0",
+          durableSeq: "0",
+        } as never as Awaited<ReturnType<Api["instanceGet"]>>)
+      : ({} as Awaited<ReturnType<Api["instanceGet"]>>),
+  );
+  const emptyRead = {
+    events: [],
+    windowFromSeq: "1",
+    durableSeq: "0",
+    reachedAfterSeq: true,
+  } as Awaited<ReturnType<Api["eventsRead"]>>;
+  // B's journal is down for the whole test: seed AND probe reject.
+  const eventsRead = vi.spyOn(api, "eventsRead").mockImplementation(async (args) => {
+    if (args.journalId === JOURNAL_B) throw new Error("B journal unreachable");
+    return emptyRead;
+  });
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    async () =>
+      ({
+        subscriptionId: "sub_g17i1" as never,
+        getReadyState: () => 1,
+        snapshot: { asOfSeq: "0", fromSeq: null },
+        close: () => undefined,
+      }) as never,
+  );
+
+  // Mount A live (a framed socket).
+  await hubStore.follow(INSTANCE);
+  const store = hubStore as unknown as {
+    connection: ConnectionMachine;
+    setFollowLiveForTest: (open: boolean, framed: boolean, journalId?: string) => void;
+  };
+
+  // A goes recovering: a resume whose reopen hangs (blocked upgrade).
+  vi.mocked(api.eventsSubscribe).mockImplementation(() => new Promise<never>(() => {}) as never);
+  store.setFollowLiveForTest(false, false, JOURNAL);
+  store.connection.dispatch({ type: "close" });
+  store.connection.dispatch({ type: "online" });
+  expect(store.connection.state).toBe("recovering");
+
+  // Navigate to B, NEVER mounted before. bind-away retires A; B's seed fails.
+  const bReads = () => eventsRead.mock.calls.filter((c) => c[0].journalId === JOURNAL_B).length;
+  await expect(hubStore.follow(INSTANCE_B)).rejects.toThrow("B journal unreachable");
+  // The failure settled through the real probe (B's probe read rejects too):
+  // loud offline WITH a reconnect clock — never a timer-less recovering.
+  for (let i = 0; i < 5; i += 1) await Promise.resolve();
+  const timerNames = () =>
+    [...(store.connection as unknown as { timers: Map<string, unknown> }).timers.keys()];
+  expect(store.connection.state).toBe("offline");
+  expect(timerNames()).toContain("reconnect");
+  expect(bReads()).toBeGreaterThanOrEqual(2); // seed + probe
+
+  // The backoff fires on its OWN: the real resume action reopens B (via the
+  // resume chain -> reopenFollow -> follow), which seeds B again. No UI event.
+  const readsBeforeRetry = bReads();
+  await vi.advanceTimersByTimeAsync(3_000);
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
+  expect(bReads()).toBeGreaterThan(readsBeforeRetry);
+  // And the machine is still not stranded: after the retried seed fails it
+  // arms another reconnect clock.
+  expect(timerNames()).toContain("reconnect");
+  vi.useRealTimers();
+  hubStore.logout();
+});
+
+it("GATE17 item 5a: repeated live A -> mounted-B navigation opens ZERO additional subscribes and re-seeds nothing", async () => {
+  // The gate-16 live regression test ended still bound to B. Recreate the
+  // live A->B transition on its own and prove adoption reopens nothing: a live
+  // mounted rebind certifies the existing socket and neither the resume action
+  // (no eventsSubscribe) nor a new seed (no eventsRead for either journal)
+  // runs.
+  const { api, hubStore } = await fresh();
+  await bootLive(api, hubStore); // A = INSTANCE / JOURNAL
+
+  const JOURNAL_B = "obj_journal_b_g17_5a";
+  const INSTANCE_B = "ins_mounted_b_g17_5a";
+  vi.spyOn(api, "instanceGet").mockImplementation(async (id: string) =>
+    id === INSTANCE_B
+      ? ({
+          id: INSTANCE_B,
+          journalId: JOURNAL_B,
+          lifecycle: "running",
+          revision: "0",
+          durableSeq: "0",
+        } as never as Awaited<ReturnType<Api["instanceGet"]>>)
+      : ({} as Awaited<ReturnType<Api["instanceGet"]>>),
+  );
+  vi.spyOn(api, "eventsRead").mockResolvedValue({
+    events: [],
+    windowFromSeq: "1",
+    durableSeq: "0",
+    reachedAfterSeq: true,
+  } as Awaited<ReturnType<Api["eventsRead"]>>);
+  const subscribe = vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    async () =>
+      ({
+        subscriptionId: "sub_g17_5a" as never,
+        getReadyState: () => 1,
+        snapshot: { asOfSeq: "0", fromSeq: null },
+        close: () => undefined,
+      }) as never,
+  );
+
+  const store = hubStore as unknown as {
+    connection: ConnectionMachine;
+    setFollowLiveForTest: (open: boolean, framed: boolean, journalId?: string) => void;
+  };
+  // Mount B first, then return to A, so A->B below lands on the MOUNTED branch.
+  await hubStore.follow(INSTANCE_B);
+  await hubStore.follow(INSTANCE);
+  store.setFollowLiveForTest(true, true, JOURNAL);
+  store.setFollowLiveForTest(true, true, JOURNAL_B);
+
+  const reads = vi.mocked(api.eventsRead);
+  for (const to of [INSTANCE_B, INSTANCE, INSTANCE_B, INSTANCE, INSTANCE_B]) {
+    reads.mockClear();
+    subscribe.mockClear();
+    await hubStore.follow(to);
+    expect(store.connection.state).toBe("live");
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(reads).not.toHaveBeenCalled();
+  }
+  hubStore.logout();
+});
+
 it("GATE16 item 4c: an accepted delivery stamped during offline recovery is caught up via the REAL path after navigating away to mounted B", async () => {
   // Replaces the gate-15 version that injected debt through private
   // recordOwed. Here the debt forms the way production forms it: a pending row

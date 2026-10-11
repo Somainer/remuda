@@ -1025,9 +1025,23 @@ async fn a_result_queued_during_the_write_window_starts_then_results() {
 ///   `process_gone()` stays false — the Node must not terminalize on this.
 #[tokio::test]
 async fn a_live_child_that_closed_its_stdin_errors_the_send_without_any_turn_start() {
+    let closed_marker = std::env::temp_dir().join(format!(
+        "remuda-r10-close-stdin-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     let (_tmp, driver, spec) = driver_with_env(
         ScriptKind::Ok,
-        BTreeMap::from([("FAKE_CLAUDE_CLOSE_STDIN".into(), "1".into())]),
+        BTreeMap::from([
+            ("FAKE_CLAUDE_CLOSE_STDIN".into(), "1".into()),
+            (
+                "FAKE_CLAUDE_STDIN_CLOSED_FILE".into(),
+                closed_marker.to_string_lossy().into_owned(),
+            ),
+        ]),
     );
     let mut handle = driver.start(spec).await.expect("start");
     let pid = handle
@@ -1038,8 +1052,13 @@ async fn a_live_child_that_closed_its_stdin_errors_the_send_without_any_turn_sta
         .clone();
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
 
-    // Give the child a beat to run its post-handshake stdin close.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // No post-start sleep (r10 item 5): the fake closes fd 0 and fsyncs this
+    // marker BEFORE it emits the initialize success, so start() returning
+    // already implies the read end is shut.
+    assert!(
+        closed_marker.is_file(),
+        "start() returning implies the child closed stdin and wrote its marker"
+    );
     assert!(
         process_alive(&pid),
         "the child parked alive with stdin closed"

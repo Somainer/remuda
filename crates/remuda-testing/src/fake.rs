@@ -148,7 +148,11 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
             record_stdin_marker(path, &incoming);
         }
         let was_initialized = session.saw_initialize;
-        session.handle_incoming(incoming, &mut lines)?;
+        // A late frame: the handshake response the caller must emit AFTER its
+        // post-frame hooks (CLOSE_STDIN closes fd 0 + writes the marker BEFORE
+        // the driver-visible success, so start() returning implies the read
+        // end is already shut — r10 item 5).
+        let late = session.handle_incoming(incoming, &mut lines)?;
         // ma-sdk-state r6 item 5: after the Nth POST-handshake frame is fully
         // handled (so its turn completed and its frames were emitted), close
         // stdin and park alive — the NEXT prompt's write fails while this child
@@ -164,13 +168,24 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
             if let Some(path) = &stdin_closed_file {
                 let _ = std::fs::write(path, b"closed");
             }
+            if let Some(frame) = late {
+                emit(&frame)?;
+            }
             std::thread::sleep(std::time::Duration::from_secs(300));
+            // Parked; the parent-death watch reaps us. Don't fall through to
+            // the ordinary late-frame emit (the frame was just emitted).
+            continue;
         }
-        // ma-sdk-state r4 item 3: FAKE_CLAUDE_CLOSE_STDIN closes the read end
-        // on the SAME iteration that completes the handshake — the first
-        // prompt must never be consumed, so its write fails while the child
-        // parks alive. Closing on a later iteration would let the first send
-        // through (it is the frame that triggers this loop body).
+        // ma-sdk-state r4 item 3 / r10 item 5: FAKE_CLAUDE_CLOSE_STDIN closes
+        // the read end on the SAME iteration that completes the handshake — the
+        // first prompt must never be consumed, so its write fails while the
+        // child parks alive. Closing on a later iteration would let the first
+        // send through (it is the frame that triggers this loop body).
+        //
+        // fd 0 is closed and the marker file written BEFORE the initialize
+        // success frame is emitted: the parent's start() returns only after it
+        // reads that success, so start() returning already implies the read end
+        // is shut (the test needs no post-start sleep).
         if close_stdin && !was_initialized && session.saw_initialize {
             #[cfg(unix)]
             {
@@ -183,7 +198,16 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
             if let Some(path) = &stdin_closed_file {
                 let _ = std::fs::write(path, b"closed");
             }
+            if let Some(frame) = late {
+                emit(&frame)?;
+            }
             std::thread::sleep(std::time::Duration::from_secs(300));
+            // Parked; the parent-death watch reaps us. The frame was emitted
+            // after the fd was closed; do not emit it again below.
+            continue;
+        }
+        if let Some(frame) = late {
+            emit(&frame)?;
         }
         // c-cardsettle r8 item 1: a test can ask the child to leave on its OWN
         // once the scripted conversation is exhausted — WITHOUT stdin EOF and
@@ -271,31 +295,36 @@ impl Session {
         Ok(())
     }
 
-    /// Returns `true` when the caller should close stdin and park after this
-    /// frame (CLOSE_STDIN handshake mode), so the read end is shut before the
-    /// driver's start() returns from the init response.
+    /// Handle one inbound frame. Returns `Some(frame)` when a response must be
+    /// emitted AFTER the caller's post-frame hooks: the initialize success in
+    /// FAKE_CLAUDE_CLOSE_STDIN mode, where fd 0 and the closure marker have to
+    /// be in place BEFORE the driver-visible handshake response (r10 item 5).
     fn handle_incoming(
         &mut self,
         incoming: Value,
         lines: &mut impl Iterator<Item = io::Result<String>>,
-    ) -> Result<(), FakeClaudeError> {
+    ) -> Result<Option<Value>, FakeClaudeError> {
         let ty = incoming.get("type").and_then(Value::as_str).unwrap_or("");
         match ty {
-            "keep_alive" | "control_cancel_request" => Ok(()),
+            "keep_alive" | "control_cancel_request" => Ok(None),
             "control_request" => self.handle_control_request(&incoming),
-            "control_response" => Ok(()),
+            "control_response" => Ok(None),
             "user" => {
                 if self.flags.replay_user_messages {
                     emit(&incoming)?;
                 }
                 self.append_transcript(&incoming)?;
-                self.play_turn(lines)
+                self.play_turn(lines)?;
+                Ok(None)
             }
-            _ => Ok(()),
+            _ => Ok(None),
         }
     }
 
-    fn handle_control_request(&mut self, incoming: &Value) -> Result<(), FakeClaudeError> {
+    fn handle_control_request(
+        &mut self,
+        incoming: &Value,
+    ) -> Result<Option<Value>, FakeClaudeError> {
         let request_id = incoming
             .get("request_id")
             .and_then(Value::as_str)
@@ -310,20 +339,21 @@ impl Session {
                 self.interrupted = true;
                 emit(&interrupt_ack(&request_id))?;
                 self.emit_interrupt_result()?;
-                Ok(())
+                Ok(None)
             }
             "initialize" => {
                 self.saw_initialize = true;
-                emit(&initialize_success(&request_id))?;
-                Ok(())
+                // Returned late: in CLOSE_STDIN mode the caller closes fd 0
+                // (and writes the marker) before this frame is emitted.
+                Ok(Some(initialize_success(&request_id)))
             }
             "set_permission_mode" | "set_model" => {
                 emit(&control_success(&request_id, json!({})))?;
-                Ok(())
+                Ok(None)
             }
             _ => {
                 emit(&control_success(&request_id, json!({})))?;
-                Ok(())
+                Ok(None)
             }
         }
     }
@@ -409,7 +439,11 @@ impl Session {
                         emit(&interrupt_ack(id))?;
                         return Ok(incoming);
                     }
-                    self.handle_control_request(&incoming)?;
+                    if let Some(late) = self.handle_control_request(&incoming)? {
+                        // Nested inside a control-response wait: no outer late
+                        // frame handling here, emit it directly.
+                        emit(&late)?;
+                    }
                 }
                 "control_response" => {
                     // The response bypasses the main loop's marker; record it

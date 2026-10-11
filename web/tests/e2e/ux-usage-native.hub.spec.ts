@@ -71,8 +71,22 @@ test.beforeAll(async () => {
     });
   }
   // Runs AFTER the build: on a fixture-less host binaries genuinely do not
-  // exist, so this is a real missing-bin skip, not a permanent skip.
-  await Promise.all([access(remuda), access(harness), access(nativeNode)]);
+  // exist, so this is a real missing-prerequisite SKIP rather than a failing
+  // hook (a raw access() rejection failed beforeAll and failed the file).
+  const checks = await Promise.allSettled([
+    access(remuda),
+    access(harness),
+    access(nativeNode),
+  ]);
+  const missing = checks
+    .map((check, index) =>
+      check.status === "rejected" ? ["remuda", "fake-harness", "native node"][index] : null,
+    )
+    .filter(Boolean);
+  test.skip(
+    missing.length > 0,
+    `native usage e2e binaries missing after build: ${missing.join(", ")}`,
+  );
 });
 
 // 3_000 + 94_000 + (2_000 5m + 1_000 1h) = 100_000 of the 200k fallback

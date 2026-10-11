@@ -1619,6 +1619,23 @@ fn spawn_transcript_pump(
                     .await;
                 }
             }
+            // c-ctxusage r8 item 10: no hydrator (unbound this tick) means no
+            // collection — do not pay a spawn_blocking per ~75 ms poll just to
+            // return NotFound. The slot is populated above once a transcript
+            // binds; when present, collect as before.
+            if transcript_slot_lock(&slot).is_none() {
+                tokio::select! {
+                    () = tokio::time::sleep(TRANSCRIPT_POLL) => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            // Cooperative shutdown with no hydrator: nothing to
+                            // finalise; let the guard/flusher wind down below.
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
             // Blocking collection. The hydrator moves out of the shared slot
             // for the closure and is parked back once the map completes; task
             // abort only DETACHES the closure, so it finishes detached and the

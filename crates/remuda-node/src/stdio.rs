@@ -342,10 +342,13 @@ where
     // Node→Hub gate.authorize requests from detached gate runs.
     let (gate_auth_tx, mut gate_auth_rx) = mpsc::channel::<StdioAuthCall>(8);
     let pending_auth: PendingAuth = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
-    // Stable session epoch for this stdio process (host-id + boot).
+    // Session epoch unique to THIS stdio boot (host-id + a fresh UUIDv7): two
+    // boots of the same host never share an epoch, so a frame handed to a
+    // replacement process cannot match the prior session's grant.
     let stdio_epoch = std::sync::Arc::new(std::sync::Mutex::new(format!(
-        "stdio:{}",
-        node.host().meta.id.as_id()
+        "stdio:{}:{}",
+        node.host().meta.id.as_id(),
+        node_epoch
     )));
     node.gate_registry()
         .set_authorizer(std::sync::Arc::new(StdioGateAuthorizer {

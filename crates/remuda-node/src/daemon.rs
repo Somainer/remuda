@@ -804,7 +804,7 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                         "jobId": auth.job_id,
                         "generation": auth.generation,
                         "hostId": node.host().meta.id.as_id().to_string(),
-                        "sessionEpoch": format!("daemon:{generation}"),
+                        "sessionEpoch": format!("daemon:{}:{}", shared.epoch, generation),
                         "mergeSha": auth.merge_sha,
                     },
                 });

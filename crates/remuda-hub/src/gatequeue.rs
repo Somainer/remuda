@@ -90,6 +90,12 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // so a doc-only store would always claim with None and skip the device
     // clause. API responses keep skipping the field.
     crate::store::ensure_column(conn, "gate_jobs", "initiator_device_id", "TEXT")?;
+    // r12 item 2: the authenticated carrier SESSION the dispatch was sent on
+    // (the Hub node-link generation minted at hello). The land grant and the
+    // pre-run authorize fence compare the inbound socket's session against
+    // this, so a paused/old frame riding a replacement session after a
+    // reconnect can neither execute nor land. Hub-only: never on the wire.
+    crate::store::ensure_column(conn, "gate_jobs", "dispatch_session", "INTEGER")?;
     Ok(())
 }
 
@@ -929,6 +935,19 @@ async fn dispatch(
     // only fail that attempt, never a newer Running attempt after a requeue.
     let dispatch_generation = params.generation;
     let host_id = lane.host_id.clone();
+    // r12 item 2: bind THIS dispatch to the authenticated carrier session the
+    // gate.run is about to ride (the Hub node-link generation minted at that
+    // socket's hello). Recorded before the frame is sent, so the Node's
+    // pre-run authorize and the verify→land grant can require the SAME
+    // session; a reconnect that replaces the session makes the old run's
+    // grant fail closed.
+    let dispatch_session = state.nodes.generation_of(host_id.as_id().as_str()).await;
+    if let Some(session) = dispatch_session {
+        let _ = state
+            .store
+            .set_gate_dispatch_session(job_id.as_str(), session)
+            .await;
+    }
     tokio::spawn(async move {
         let reply = state
             .nodes
@@ -2746,25 +2765,34 @@ impl Store {
 
     /// Hub-side fence for the Node's pre-execution `gate.authorize` check.
     /// Authorized only while the row is Running at EXACTLY the requested
-    /// generation and assigned to the asking host.
+    /// generation, assigned to the asking host, AND bound to the same
+    /// authenticated carrier session the dispatch was sent on.
     pub(crate) async fn gate_dispatch_authorized(
         &self,
         job_id: &str,
         host_id: &str,
         generation: u32,
+        session: u64,
     ) -> Result<GateDispatchAuth, crate::store::StoreError> {
         let job_id = job_id.to_owned();
         let host_id = host_id.to_owned();
         self.run_named("gate_dispatch_authorized", move |conn| {
             // Compare against the persisted doc directly: Running at exactly
-            // this generation, assigned to the asking host.
+            // this generation, this host, and the recorded carrier session.
             let authorized: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM gate_jobs
                   WHERE id = ?1
                     AND json_extract(doc_json, '$.state') = 'running'
                     AND json_extract(doc_json, '$.attempts') = ?2
-                    AND json_extract(doc_json, '$.hostId') = ?3",
-                params![job_id, generation, host_id],
+                    AND json_extract(doc_json, '$.hostId') = ?3
+                    AND dispatch_session IS NOT NULL
+                    AND dispatch_session = ?4",
+                params![
+                    job_id,
+                    generation,
+                    host_id,
+                    i64::try_from(session).unwrap_or(0)
+                ],
                 |row| row.get(0),
             )?;
             let state: Option<String> = conn
@@ -2782,11 +2810,31 @@ impl Store {
         .await
     }
 
+    /// r12 item 2: stamp the authenticated carrier session a dispatch rode,
+    /// before the gate.run frame is sent. Hub-only column.
+    pub(crate) async fn set_gate_dispatch_session(
+        &self,
+        job_id: &str,
+        session: u64,
+    ) -> Result<(), crate::store::StoreError> {
+        let job_id = job_id.to_owned();
+        self.run_named("set_gate_dispatch_session", move |conn| {
+            conn.execute(
+                "UPDATE gate_jobs SET dispatch_session = ?2 WHERE id = ?1",
+                params![job_id, i64::try_from(session).unwrap_or(0)],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Running → Landing transition at the verify→land boundary. Serialized
     /// in the same writer path as cancel, so a cancel committing first wins:
     /// the grant is refused when the row is no longer Running at exactly this
-    /// generation/host. Idempotent: a repeat grant for an already-Landing row
-    /// (same generation/host) returns granted=true.
+    /// generation/host/carrier-session. Idempotent: a repeat grant for an
+    /// already-Landing row (same generation/host/session) returns granted=true;
+    /// a regranted attempt riding a replacement session after a reconnect is
+    /// refused even when its generation still matches.
     pub(crate) async fn gate_land_grant(
         &self,
         job_id: &str,
@@ -2794,13 +2842,13 @@ impl Store {
         generation: u32,
         session_epoch: &str,
         merge_sha: &str,
+        session: u64,
     ) -> Result<GateLandGrant, crate::store::StoreError> {
         let job_id = job_id.to_owned();
         let host_id = host_id.to_owned();
         let session_epoch = session_epoch.to_owned();
         let merge_sha = merge_sha.to_owned();
-        let host_id2 = host_id.clone();
-        let session_epoch2 = session_epoch.clone();
+        let session_i64 = i64::try_from(session).unwrap_or(0);
         self.run_named("gate_land_grant", move |conn| {
             let now = now();
             // Current state (JSON-path read, no serde error conversion).
@@ -2818,18 +2866,25 @@ impl Store {
                     landing_in_progress: false,
                 });
             };
-            // Already landing at this generation: idempotent re-answer.
+            // Already landing at this generation: idempotent re-answer, but
+            // ONLY for the same host AND the same authenticated carrier
+            // session the dispatch was bound to. A paused/old frame delivered
+            // to a replacement session (generation still equal) is refused.
             if state == GateJobState::Landing.as_str() {
-                let same_gen: i64 = conn.query_row(
+                let same_tuple: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM gate_jobs
-                      WHERE id = ?1 AND json_extract(doc_json,'$.attempts') = ?2",
-                    params![job_id, generation],
+                      WHERE id = ?1
+                        AND json_extract(doc_json,'$.attempts') = ?2
+                        AND json_extract(doc_json,'$.hostId') = ?3
+                        AND dispatch_session IS NOT NULL
+                        AND dispatch_session = ?4",
+                    params![job_id, generation, host_id, session_i64],
                     |row| row.get(0),
                 )?;
                 return Ok(GateLandGrant {
-                    granted: same_gen > 0,
-                    state: (same_gen == 0).then_some(state),
-                    landing_in_progress: same_gen > 0,
+                    granted: same_tuple > 0,
+                    state: (same_tuple == 0).then_some(state),
+                    landing_in_progress: same_tuple > 0,
                 });
             }
             // Conditional Running → Landing for exactly this tuple. The grant
@@ -2847,8 +2902,18 @@ impl Store {
                   WHERE id = ?1
                     AND json_extract(doc_json,'$.state') = 'running'
                     AND json_extract(doc_json,'$.attempts') = ?4
-                    AND json_extract(doc_json,'$.hostId') = ?5",
-                params![job_id, session_epoch, now, generation, host_id, merge_sha],
+                    AND json_extract(doc_json,'$.hostId') = ?5
+                    AND dispatch_session IS NOT NULL
+                    AND dispatch_session = ?7",
+                params![
+                    job_id,
+                    session_epoch,
+                    now,
+                    generation,
+                    host_id,
+                    merge_sha,
+                    session_i64
+                ],
             )?;
             if updated > 0 {
                 return Ok(GateLandGrant {
@@ -2862,7 +2927,6 @@ impl Store {
                 params![job_id],
                 |row| row.get(0),
             )?;
-            let _ = (host_id2, session_epoch2);
             Ok(GateLandGrant {
                 granted: false,
                 state: Some(state_after),

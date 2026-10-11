@@ -167,7 +167,7 @@ fn node_host_id(runtime: Option<&runtime_wss::RuntimeLink>) -> Value {
 }
 
 /// Node→Hub `gate.authorize` request job, correlation-matched on the session.
-struct GateAuthJob {
+pub(super) struct GateAuthJob {
     method: &'static str,
     job_id: String,
     generation: u32,
@@ -804,6 +804,8 @@ async fn session_task(
         cursors: Arc::new(std::sync::Mutex::new(
             crate::journal_flush::FlushCursor::new(),
         )),
+        gate_auth_tx: auth_tx.clone(),
+        gate_epoch: session_epoch.clone(),
     });
     // Register the Hub-authority hook on the runtime's gate registry. On
     // disconnect the authorize frame fails (send/reply error) so the run
@@ -1466,6 +1468,13 @@ async fn reconnect(
             "hub socket reconnecting",
         );
     }
+    // r12 item 2: the dead socket no longer carries run authority. Revoke the
+    // gate authorizer for the whole reconnect window so a detached run cannot
+    // authorize/grant against a stale link; it is re-bound to the replacement
+    // session only after the new hello succeeds below.
+    if let Some(rt) = runtime {
+        rt.node.gate_registry().clear_authorizer().await;
+    }
     let _ = stream.close(None).await;
     loop {
         let delay = config
@@ -1507,6 +1516,22 @@ async fn reconnect(
                         if let Some(runtime) = runtime {
                             runtime_wss::apply_resume_watermarks(runtime, &hello);
                             runtime_wss::resume_runtime_journals(runtime);
+                            // r12 item 2: adopt the replacement session's epoch
+                            // and re-bind run authority to THIS new carrier.
+                            // An old detached run that now asks for its grant
+                            // rides this new session, which the Hub rejects
+                            // because the dispatch was bound to the old one.
+                            if let Ok(mut epoch) = runtime.gate_epoch.lock() {
+                                *epoch = connection_id.clone();
+                            }
+                            runtime
+                                .node
+                                .gate_registry()
+                                .set_authorizer(std::sync::Arc::new(WssGateAuthorizer {
+                                    tx: runtime.gate_auth_tx.clone(),
+                                    epoch: runtime.gate_epoch.clone(),
+                                }))
+                                .await;
                         }
                         return Ok(());
                     }

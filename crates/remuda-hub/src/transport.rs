@@ -541,6 +541,17 @@ impl ConnectedNodes {
             .map(|slot| slot.link.kind())
     }
 
+    /// The authenticated session generation currently registered for a host
+    /// (minted per hello, incremented on every reconnect). r12 item 2 binds a
+    /// gate dispatch and its land grant to exactly this session.
+    pub async fn generation_of(&self, host_id: &str) -> Option<u64> {
+        self.inner
+            .lock()
+            .await
+            .get(host_id)
+            .map(|slot| slot.generation)
+    }
+
     /// Test support: take the registry lock and hold it until `release`
     /// resolves. This parks a command POST at its `kind_of` lookup — AFTER the
     /// row/merge exist but BEFORE any forward-attempt slot is registered —

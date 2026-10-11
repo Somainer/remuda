@@ -36,6 +36,9 @@ struct RunSpec {
     /// carrier (gate.landGrant), exactly as the real Node does. A refusal
     /// makes the scripted run return `canceled` (the real Node never pushes).
     land_grant: bool,
+    /// When set with `land_grant`, the run parks AFTER verify and BEFORE it
+    /// asks for the grant, while the test reconnects the carrier session.
+    hold_before_grant: bool,
     /// When set with `land_grant`, the run parks AFTER the grant is granted
     /// (the row is Landing) and before it returns the landed verdict, until
     /// `landing_hold` is released — so a test can assert a second job is not
@@ -60,6 +63,7 @@ impl Default for RunSpec {
             run_log: None,
             steps: None,
             land_grant: false,
+            hold_before_grant: false,
             hold_while_landing: false,
         }
     }
@@ -95,6 +99,9 @@ struct ScriptState {
     resolve_landing_reply: Mutex<Option<Value>>,
     /// Observed gate.resolveLanding probes.
     resolve_calls: Mutex<Vec<Value>>,
+    /// Node token returned by the first hello, used to open a reconnected
+    /// session for the SAME host (the enroll token is single-use).
+    node_token: Mutex<Option<String>>,
     /// Node→Hub request counter (ids must be unique).
     seq: Mutex<u64>,
 }
@@ -175,6 +182,9 @@ async fn enroll(
     .await?;
     let hello = recv_json(&mut node).await?;
     assert!(hello["result"]["nodeToken"].is_string(), "{hello}");
+    if let Some(token) = hello["result"]["nodeToken"].as_str() {
+        *script.node_token.lock().unwrap() = Some(token.to_owned());
+    }
 
     let script_for_task = script.clone();
     let task = tokio::spawn(async move {
@@ -265,6 +275,60 @@ async fn enroll(
         _task: task,
         script,
     })
+}
+
+/// Open a SECOND authenticated node socket for an already-enrolled host,
+/// simulating a carrier reconnect: the Hub mints a new session generation for
+/// the same host id. Returns the raw socket so the test can drive Node→Hub
+/// frames (e.g. a detached run's landGrant) on the replacement session.
+async fn open_node_session(
+    hub: &remuda_hub::RunningHub,
+    host_id: &str,
+    workspace_id: &str,
+    node_token: &str,
+) -> Result<LaneSocket> {
+    let mut request = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {node_token}").parse()?);
+    let (mut node, _) = tokio_tungstenite::connect_async(request).await?;
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": "hello-b", "method": "runtime.hello",
+            "params": {"hostId": host_id, "nodeVersion": "0.1.0-test",
+                "label": format!("lane-{host_id}"),
+                "host": {"hostname": format!("{host_id}.local"), "maxInstances": 8,
+                    "labels": {}, "resources": {"cpuCount": 8},
+                    "workspaces": [
+                        {"workspaceId": workspace_id, "hostId": host_id,
+                         "root": format!("/tmp/{workspace_id}")}
+                    ],
+                    "workspaceRevision": 2}}
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let hello = recv_json(&mut node).await?;
+    // A reconnect hello answers with a connectionId/lease (no fresh nodeToken);
+    // either proves the replacement session authenticated.
+    let connected =
+        hello["result"]["connectionId"].is_string() || hello["result"]["nodeToken"].is_string();
+    assert!(connected, "{hello}");
+    Ok(node)
+}
+
+/// Send a raw Node→Hub frame on a socket and await the reply correlated by id.
+async fn node_request(node: &mut LaneSocket, frame: Value) -> Result<Value> {
+    let wanted = frame["id"].as_str().unwrap_or("").to_string();
+    node.send(Message::Text(frame.to_string().into())).await?;
+    for _ in 0..8 {
+        let reply = recv_json(node).await?;
+        if reply.get("id").and_then(Value::as_str) == Some(wanted.as_str()) {
+            return Ok(reply.get("result").cloned().unwrap_or(json!({})));
+        }
+    }
+    anyhow::bail!("no reply for {wanted}")
 }
 
 fn result_json(job_id: &str, spec: &RunSpec, generation: u32) -> Value {
@@ -391,6 +455,36 @@ async fn run_one_inline(script: &Arc<ScriptState>, params: &Value, node: &mut La
         .get("generation")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+
+    // Optional park AFTER verify, BEFORE the land grant — the window in which
+    // the carrier can reconnect to a replacement session. Pumps the carrier so
+    // unrelated RPCs are still answered (the real RPC pump stays free while a
+    // detached run executes).
+    if spec.hold_before_grant {
+        script.landing_started.notify_waiters();
+        let gate = script.landing_hold.lock().unwrap().clone();
+        let parked = async {
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+        };
+        tokio::pin!(parked);
+        loop {
+            tokio::select! {
+                _ = &mut parked => break,
+                frame = node.next() => {
+                    let Some(Ok(Message::Text(text))) = frame else { break };
+                    let frame: Value = serde_json::from_str(&text).unwrap_or(json!({}));
+                    let Some(fid) = frame.get("id").cloned() else { continue };
+                    let _ = node
+                        .send(Message::Text(
+                            json!({"jsonrpc":"2.0","id":fid,"result":{"ok":true}}).to_string().into(),
+                        ))
+                        .await;
+                }
+            }
+        }
+    }
 
     // Production lane-land path: take the Running → Landing grant before the
     // push, exactly as the real Node does at the verify→land boundary.
@@ -1948,6 +2042,91 @@ async fn restart_landing_confirmed_on_remote_settles_landed() -> Result<()> {
         actions.iter().any(|action| action == "gate.landed"),
         "confirmed restart settlement journals gate.landed: {actions:?}"
     );
+    hold.notify_waiters();
+    Ok(())
+}
+
+/// r12 item 2: the land grant is bound to the authenticated carrier SESSION the
+/// dispatch rode. Verification starts on session A; the carrier reconnects as
+/// session B before verification ends; the old run's grant on B is refused and
+/// no Landing/push occurs — even though job/generation/host still match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn land_grant_riding_a_replacement_session_after_reconnect_is_refused() -> Result<()> {
+    let ctx = Ctx::spawn(1).await?;
+    // Latch created BEFORE the run parks, so the notify is never missed.
+    let parked = ctx.scripts[0].landing_started.notified();
+    let hold = Arc::new(Notify::new());
+    *ctx.scripts[0].landing_hold.lock().unwrap() = Some(hold.clone());
+    ctx.scripts[0].script(
+        "wt/land/rebind",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("9999999999999999999999999999999999999999"),
+            merge_ref: Some("refs/remuda/gate/rebind"),
+            land_grant: true,
+            hold_before_grant: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/rebind","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap().to_owned();
+
+    // Wait until the run is parked mid-verify on session A, row still Running.
+    tokio::time::timeout(Duration::from_secs(8), parked)
+        .await
+        .expect("run never parked before the grant");
+    let running = ctx.job(&id).await;
+    assert_eq!(running["state"], "running", "{running}");
+    assert!(
+        running["landingSessionEpoch"].is_null(),
+        "not granted yet: {running}"
+    );
+
+    // Carrier reconnects: a SECOND authenticated socket for the same host
+    // becomes the live session (a new Hub session generation).
+    let token_b = ctx.scripts[0]
+        .node_token
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("enrolled node token");
+    let workspace_b = format!("ws-{}", uuid::Uuid::new_v4().simple());
+    let mut session_b = open_node_session(&ctx.hub, &ctx.hosts[0], &workspace_b, &token_b).await?;
+
+    // The old detached run asks for its grant on the replacement session.
+    let answer = node_request(
+        &mut session_b,
+        json!({
+            "jsonrpc": "2.0", "id": "rebind-grant", "method": "gate.landGrant",
+            "params": {
+                "jobId": id,
+                "generation": 1,
+                "hostId": ctx.hosts[0],
+                "sessionEpoch": "sess-2",
+                "mergeSha": "9999999999999999999999999999999999999999",
+            },
+        }),
+    )
+    .await?;
+    assert_eq!(
+        answer["granted"], false,
+        "grant on session B must be refused: {answer}"
+    );
+    assert_eq!(answer["state"], "running", "{answer}");
+
+    // The row never entered Landing, so the land child never ran and nothing
+    // was pushed.
+    let after = ctx.job(&id).await;
+    assert_eq!(after["state"], "running", "row must stay running: {after}");
+    assert!(after["landingSessionEpoch"].is_null(), "{after}");
+    assert!(
+        ctx.scripts[0].grant_answers.lock().unwrap().is_empty(),
+        "the parked run on A never reached its own grant"
+    );
+
+    // Release the park so teardown is clean (the parked run resumes).
     hold.notify_waiters();
     Ok(())
 }

@@ -854,7 +854,9 @@ pub(crate) async fn handle_node_method(
             // the Hub is the authority on whether this (job, generation) is
             // still the live Running attempt. Any non-Running or mismatched
             // generation is refused; force-with-lease only guards the git
-            // ref, not cancel authority.
+            // ref, not cancel authority. The socket's OWN authenticated
+            // session (r12 item 2), not a client-claimed epoch, must match
+            // the session the dispatch was sent on.
             let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
             let typed: remuda_protocol::GateAuthorizeParams = serde_json::from_value(params)
                 .map_err(|error| {
@@ -862,7 +864,12 @@ pub(crate) async fn handle_node_method(
                 })?;
             let auth = state
                 .store
-                .gate_dispatch_authorized(&typed.job_id, host_id.as_str(), typed.generation)
+                .gate_dispatch_authorized(
+                    &typed.job_id,
+                    host_id.as_str(),
+                    typed.generation,
+                    session_generation.unwrap_or(0),
+                )
                 .await
                 .map_err(crate::http::map_store)?;
             let result = serde_json::to_value(remuda_protocol::GateAuthorizeResult {
@@ -876,7 +883,10 @@ pub(crate) async fn handle_node_method(
         "gate.landGrant" => {
             // Node→Hub fence at the verify→land boundary: serializes with
             // cancel so a cancel first wins; a granted Landing then runs to
-            // completion.
+            // completion. Bound to the socket's OWN authenticated carrier
+            // session (r12 item 2): a paused/old frame that reaches a
+            // replacement session after a reconnect is refused even when the
+            // job/generation/host still match.
             let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
             let typed: remuda_protocol::GateLandGrantParams = serde_json::from_value(params)
                 .map_err(|error| {
@@ -890,6 +900,7 @@ pub(crate) async fn handle_node_method(
                     typed.generation,
                     &typed.session_epoch,
                     &typed.merge_sha,
+                    session_generation.unwrap_or(0),
                 )
                 .await
                 .map_err(crate::http::map_store)?;

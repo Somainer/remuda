@@ -388,18 +388,18 @@ class IdbOutboxStorage implements OutboxStorage {
       let result: OutboxRecord | null = null;
       let finished = false;
       // Gate 13 item 3: dispose aborts the reclaim before its put commits.
-      opts?.signal?.addEventListener(
-        "abort",
-        () => {
-          if (finished) return;
-          try {
-            t.abort();
-          } catch {
-            /* already finishing */
-          }
-        },
-        { once: true },
-      );
+      // Gate 14 item 3: a NAMED handler removed on EVERY terminal path so
+      // listeners/closures do not accumulate over the Outbox's lifetime.
+      const onSignalAbort = () => {
+        if (finished) return;
+        try {
+          t.abort();
+        } catch {
+          /* already finishing */
+        }
+      };
+      opts?.signal?.addEventListener("abort", onSignalAbort, { once: true });
+      const detach = () => opts?.signal?.removeEventListener("abort", onSignalAbort);
       const getReq = store.get(commandId);
       getReq.onsuccess = () => {
         const existing = getReq.result as OutboxRecord | undefined;
@@ -439,16 +439,24 @@ class IdbOutboxStorage implements OutboxStorage {
           result = existing;
         }
       };
-      getReq.onerror = () => reject(getReq.error);
+      getReq.onerror = () => {
+        detach();
+        reject(getReq.error);
+      };
       t.oncomplete = () => {
         finished = true;
+        detach();
         resolve(result);
       };
       t.onabort = () => {
         finished = true;
+        detach();
         reject(t.error ?? getReq.error ?? new Error("IndexedDB reclaim transaction aborted"));
       };
-      t.onerror = () => reject(t.error ?? getReq.error);
+      t.onerror = () => {
+        detach();
+        reject(t.error ?? getReq.error);
+      };
     });
   }
 }

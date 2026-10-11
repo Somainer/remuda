@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { openOutboxStorage, Outbox, type OutboxRecord, type OutboxStorage } from "./outbox";
 
 /**
@@ -212,6 +212,61 @@ it("a write whose request succeeds but whose transaction aborts afterwards is no
   // A follow-up transaction in a new attempt commits normally.
   await storage.put(probeRecord("cmd_retry_ok"));
   expect((await storage.all()).map((r) => r.commandId)).toContain("cmd_retry_ok");
+});
+
+it("GATE14 item 3: every reclaim removes its lifetime abort listener on every terminal path (no listener accumulation)", async () => {
+  const db = installFakeIndexedDB();
+  const opened = await openOutboxStorage();
+  const storage = opened.storage;
+  const controller = new AbortController();
+  const adds = vi.spyOn(controller.signal, "addEventListener");
+  const removes = vi.spyOn(controller.signal, "removeEventListener");
+
+  // Several SUCCESSFUL reclaim transactions (expired matching leases).
+  const expiredLease = { owner: "owner_l", until: Date.now() - 60_000 };
+  for (let i = 0; i < 5; i += 1) {
+    const id = `cmd_listener_ok_${i}`;
+    await storage.put({ ...probeRecord(id), state: "inflight", lease: expiredLease });
+    const got = await storage.reclaimInflight(id, expiredLease, {
+      requireExpired: true,
+      signal: controller.signal,
+    });
+    expect(got?.state).toBe("pending");
+  }
+  // A non-matching terminal row: resolves on complete, listener must detach.
+  await storage.put({ ...probeRecord("cmd_listener_sent"), state: "sent", gotResponse: true });
+  const sent = await storage.reclaimInflight("cmd_listener_sent", expiredLease, {
+    requireExpired: true,
+    signal: controller.signal,
+  });
+  expect(sent?.state).toBe("sent");
+
+  // An ABORTED reclaim (commit held open until the signal fires): listener
+  // must detach on the abort terminal path too.
+  await storage.put({
+    ...probeRecord("cmd_listener_abort"),
+    state: "inflight",
+    lease: expiredLease,
+  });
+  db.commitGate = true; // hold only the reclaim transaction open
+  const abortP = storage.reclaimInflight("cmd_listener_abort", expiredLease, {
+    requireExpired: true,
+    signal: controller.signal,
+  });
+  await Promise.resolve(); // get onsuccess -> put issued, commits held open
+  await Promise.resolve(); // put onsuccess fired
+  expect(db.requestsIssued.filter((m) => m === "put").length).toBeGreaterThan(0);
+  controller.abort();
+  await expect(abortP).rejects.toThrow(/abort/);
+  db.commitGate = false;
+
+  // Every registered abort handler reference was removed (detach is
+  // idempotent — the fake fires oncomplete once per request, real IDB once
+  // per tx — so compare handler identities, not raw call counts).
+  const added = adds.mock.calls.filter((c) => c[0] === "abort").map((c) => c[1]);
+  const removed = new Set(removes.mock.calls.filter((c) => c[0] === "abort").map((c) => c[1]));
+  expect(added).toHaveLength(7);
+  for (const fn of added) expect(removed.has(fn)).toBe(true);
 });
 
 it("GATE14 item 2: a requireExpired reclaim whose row completed to sent (lease undefined) returns the terminal row instead of throwing", async () => {

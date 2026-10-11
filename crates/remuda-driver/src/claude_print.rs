@@ -591,6 +591,15 @@ pub struct ClaudePrintDriver {
     carrier: DriverKind,
 }
 
+/// Test-only (`test-stub`): held publication-mutex guard (r10 item 1).
+/// The field exists solely to keep the lock held until this handle drops.
+#[cfg(feature = "test-stub")]
+#[must_use = "holding the guard is the point; drop it to release the mutex"]
+#[allow(dead_code)]
+pub struct PublishMutexHold<'a>(
+    tokio::sync::MutexGuard<'a, Option<mpsc::UnboundedSender<PublishJob>>>,
+);
+
 impl ClaudePrintDriver {
     /// Test-only (`test-stub`): true when the bounded observation channel is
     /// full and the publication worker is parked — the close-under-pressure
@@ -638,6 +647,14 @@ impl ClaudePrintDriver {
             let _ = publisher.send(PublishJob::Fence(tx));
         }
         rx
+    }
+
+    /// Test-only (`test-stub`, r10 item 1): hold the publication mutex so a
+    /// concurrent send parks on it BEFORE opening its book entry. Drop the
+    /// returned hold to release.
+    #[cfg(feature = "test-stub")]
+    pub async fn hold_publish_mutex_for_test(&self) -> PublishMutexHold<'_> {
+        PublishMutexHold(self.inner.publish.lock().await)
     }
 
     /// Test-only (`test-stub`): make the terminal exit observation build fail
@@ -1415,8 +1432,31 @@ async fn prepare_prompt_write(
     content: UserContent,
     client_message_id: String,
 ) -> DriverResult<WriteCompletion> {
+    // test-stub: note a caller reaching the write_seq lock (r10 item 3: a test
+    // acknowledges the NEXT caller queued behind a suspended one).
+    #[cfg(feature = "test-stub")]
+    test_barrier::note_write_seq_wait(&inner.barrier);
     let _seq = inner.write_seq.lock().await;
 
+    // ma-sdk-state r10 item 1: acquire the publisher BEFORE opening a book
+    // entry. The publish mutex can be held for a while (close, a publication
+    // fence); a caller aborted while parked on it used to leave a reservation
+    // no PublishJob owned — Drop only signalled the never-queued ticket, so a
+    // later result popped the phantom in result_settles_root and a deferred
+    // settle it blocked was never released. Parked here, no book entry exists
+    // yet, so an abort leaves nothing behind.
+    #[cfg(feature = "test-stub")]
+    test_barrier::note_publish_lock_wait(&inner.barrier);
+    let publisher = inner.publish.lock().await.clone();
+    let Some(publisher) = publisher.as_ref() else {
+        return Err(DriverError::ControlUnavailable);
+    };
+
+    // Open the book entry and enqueue its Reserve ticket with NO await between
+    // the two: the mapper await is fully before the entry exists, and the
+    // unbounded send is synchronous, so once the entry exists the ticket that
+    // owns it is already queued (or the send failed and the entry is rolled
+    // back inline below).
     let reservation = {
         let mut mapper = inner.mapper.lock().await;
         let seq = mapper.begin_turn_reservation();
@@ -1426,20 +1466,19 @@ async fn prepare_prompt_write(
     // move into the detached completion task.
     let mut guard = Some(ReservationGuard::new(inner.clone(), reservation.clone()));
 
-    let publisher = inner.publish.lock().await.clone();
-    let Some(publisher) = publisher.as_ref() else {
-        guard.take().unwrap().fail().await;
-        return Err(DriverError::ControlUnavailable);
-    };
     if publisher
         .send(PublishJob::Reserve {
             reservation: reservation.clone(),
         })
         .is_err()
     {
-        guard.take().unwrap().fail().await;
+        // The publisher is closed (close in progress): no worker will ever
+        // visit this ticket. Roll the just-opened entry back directly.
+        guard.take().unwrap().fail_without_ticket().await;
         return Err(DriverError::ControlUnavailable);
     }
+    // The ticket is queued; Drop from here on only has to wake the worker.
+    guard.as_mut().expect("guard before accept").mark_ticket_queued();
     #[cfg(feature = "test-stub")]
     test_barrier::note_reserve_enqueued(&inner.barrier);
 
@@ -1671,6 +1710,31 @@ impl TurnReservation {
 ///
 /// Does NOT take `write_seq`: the caller holds it (`fail`, which runs under
 /// `prepare_prompt_write`) or a spawned cleanup task has already acquired it.
+/// Roll back a reservation whose ticket NO worker will ever visit: the Reserve
+/// send failed because the publisher is closed (close in progress), or
+/// panic-safety Drop fired between opening the book and enqueuing the ticket
+/// (r10 item 1). Any deferred settle this releases cannot be published in
+/// order — the launch is shutting down and close seals the events channel — so
+/// it is dropped.
+///
+/// Does NOT take `write_seq`: a caller can drop the guard while still parked
+/// on `write_seq` itself, so re-acquiring it here could deadlock.
+async fn rollback_without_ticket(inner: &Arc<Inner>, seq: u64) {
+    let released = {
+        let mut mapper = inner.mapper.lock().await;
+        match mapper.cancel_turn_reservation(seq) {
+            Ok(released) => released,
+            Err(error) => {
+                warn!(%error, "turn rollback failed during reservation cleanup");
+                None
+            }
+        }
+    };
+    if released.is_some() {
+        debug!("publication gone; released deferred settle dropped on close");
+    }
+}
+
 async fn rollback_and_publish(inner: &Arc<Inner>, seq: u64) {
     let deferred = {
         let mut mapper = inner.mapper.lock().await;
@@ -1701,6 +1765,11 @@ struct ReservationGuard {
     inner: Arc<Inner>,
     reservation: Arc<TurnReservation>,
     resolved: bool,
+    /// Whether the Reserve ticket was actually enqueued. Between the book
+    /// entry opening and the (synchronous) send there is no await, so this is
+    /// false only when the send failed (handled explicitly) or a panic fired
+    /// in that gap (r10 item 1).
+    ticket_queued: bool,
 }
 
 impl ReservationGuard {
@@ -1709,7 +1778,13 @@ impl ReservationGuard {
             inner,
             reservation,
             resolved: false,
+            ticket_queued: false,
         }
+    }
+
+    /// The Reserve send succeeded; this guard's ticket owns the book entry.
+    fn mark_ticket_queued(&mut self) {
+        self.ticket_queued = true;
     }
 
     /// The writer committed the prompt: keep the reservation so the worker emits
@@ -1733,6 +1808,15 @@ impl ReservationGuard {
         self.resolved = true;
         self.reservation.cancel();
     }
+
+    /// The Reserve send failed (publisher closed) — no ticket exists for the
+    /// just-opened book entry, so roll it back directly and discard any
+    /// released settle. Consumes the guard.
+    async fn fail_without_ticket(mut self) {
+        self.resolved = true;
+        rollback_without_ticket(&self.inner, self.reservation.seq).await;
+        self.reservation.cancel();
+    }
 }
 
 impl Drop for ReservationGuard {
@@ -1740,14 +1824,30 @@ impl Drop for ReservationGuard {
         if self.resolved {
             return;
         }
-        // Pre-accept cancellation (r8 item 1) / panic safety. The Reserve ticket
-        // was already enqueued in publication order, so all this does is wake
-        // the parked worker: the WORKER consumes the cancelled ticket at its FIFO
-        // position and performs the ordered rollback + deferred-settle publish
-        // (see the Reserve arm). Keeping the rollback off a detached task here
-        // prevents a cancelled B from lingering in the book while a later C
-        // result is mapped (r9 item 2). If no worker exists (publisher gone),
-        // the launch is shutting down and the reservation is discarded with it.
+        // Pre-accept cancellation (r8 item 1) / panic safety.
+        if self.ticket_queued {
+            // The Reserve ticket is already in the publication queue, so all
+            // this does is wake the parked worker: the WORKER consumes the
+            // cancelled ticket at its FIFO position and performs the ordered
+            // rollback + deferred-settle publish (see the Reserve arm).
+            // Keeping the rollback off a detached task here prevents a
+            // cancelled B from lingering in the book while a later C result is
+            // mapped (r9 item 2).
+            self.reservation.cancel();
+            return;
+        }
+        // No ticket owns this open book entry (aborted while parked BEFORE the
+        // Reserve send — on the publish mutex — r10 item 1; or panic safety in
+        // the open→enqueue gap). The worker cannot roll it back from a queue
+        // position, so roll it back directly on a detached task. Do NOT take
+        // write_seq: the dropping caller may itself be parked on it.
+        let inner = self.inner.clone();
+        let seq = self.reservation.seq;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let _ = handle.spawn(async move {
+                rollback_without_ticket(&inner, seq).await;
+            });
+        }
         self.reservation.cancel();
     }
 }
@@ -1807,6 +1907,14 @@ pub mod test_barrier {
         /// Result frame (after the mapper lock released). A test waits for the
         /// specific count (A's result) before releasing B's failure.
         result_mapped_count: AtomicUsize,
+        /// r10 item 1: number of send callers that reached the `write_seq`
+        /// lock await. With the previous caller still holding it, count `n`
+        /// ACKNOWLEDGES the nth caller parked behind (the lock is held).
+        write_seq_wait_count: AtomicUsize,
+        /// r10 item 1: number of send callers that reached the publish-mutex
+        /// lock await. With the mutex externally held, count `n` acknowledges
+        /// the nth caller parked there BEFORE its book entry was opened.
+        publish_lock_wait_count: AtomicUsize,
     }
 
     /// An armed write-commit barrier. Releases on drop.
@@ -1832,6 +1940,8 @@ pub mod test_barrier {
             write_number: AtomicUsize::new(0),
             park_from_write: AtomicUsize::new(usize::MAX),
             result_mapped_count: AtomicUsize::new(0),
+            write_seq_wait_count: AtomicUsize::new(0),
+            publish_lock_wait_count: AtomicUsize::new(0),
         });
         *slot.lock().expect("barrier lock") = Some(state.clone());
         WriteCommitBarrier { state }
@@ -1931,7 +2041,65 @@ pub mod test_barrier {
         }
     }
 
+    /// r10 item 1 send hook: a caller is about to await the `write_seq` lock.
+    /// With the lock held by a previous caller, the count acknowledges this
+    /// caller parked behind it.
+    pub(super) fn note_write_seq_wait(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state.write_seq_wait_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// r10 item 1 send hook: a caller is about to await the publish-mutex lock
+    /// (taken BEFORE the book entry is opened). With the mutex externally
+    /// held, the count acknowledges this caller parked there with no book
+    /// entry opened yet.
+    pub(super) fn note_publish_lock_wait(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state.publish_lock_wait_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
     impl WriteCommitBarrier {
+        /// r10 item 1: wait until `n` send callers have reached the `write_seq`
+        /// lock await (the nth is parked behind the holder when the previous
+        /// caller is suspended holding it).
+        pub async fn wait_until_write_seq_waits(&self, n: usize, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.write_seq_wait_count.load(Ordering::Acquire) >= n {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "write_commit barrier: timed out waiting for {n} write_seq waiters \
+                         (reached={})",
+                        self.state.write_seq_wait_count.load(Ordering::Acquire)
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// r10 item 1: wait until `n` send callers have reached the
+        /// publish-mutex lock await.
+        pub async fn wait_until_publish_lock_waits(&self, n: usize, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.publish_lock_wait_count.load(Ordering::Acquire) >= n {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "write_commit barrier: timed out waiting for {n} publish-lock waiters \
+                         (reached={})",
+                        self.state.publish_lock_wait_count.load(Ordering::Acquire)
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
         /// r8 item 3: wait until `n` Result frames have been MAPPED by the
         /// publication worker (after the mapper lock, before/with emit).
         pub async fn wait_until_results_mapped(&self, n: usize, timeout: Duration) {

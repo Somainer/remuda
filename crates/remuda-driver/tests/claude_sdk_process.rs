@@ -1840,6 +1840,106 @@ async fn aborting_a_suspended_b_does_not_let_c_result_pop_a_phantom_b() {
     let _ = driver.close().await;
 }
 
+/// ma-sdk-state r10 item 1: with the publish mutex held, B parks on it (BEFORE
+/// opening its book entry now) and is aborted there. No reservation may be
+/// left without a ticket owning it: A's result (mapped while B is parked)
+/// settles A, and a later C completes and settles C itself. Pre-fix, B opened
+/// the book before parking; the abort left a phantom entry, A's settle was
+/// deferred forever, and C's result popped the phantom so C stayed
+/// outstanding.
+#[tokio::test]
+async fn aborting_while_parked_on_the_publish_mutex_leaves_no_phantom_reservation() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = driver.arm_write_commit_barrier();
+
+    // A writes; the send task parks post-ack, the worker parks at A's ticket,
+    // A's result is queued behind it.
+    let da = driver.clone();
+    let send_a = tokio::spawn(async move { da.send(prompt_id("first", "msg-a")).await });
+    barrier
+        .wait_until_result_parked(Duration::from_secs(5))
+        .await;
+    barrier.release_send();
+    tokio::time::timeout(Duration::from_secs(5), send_a)
+        .await
+        .expect("send_a task within 5s")
+        .expect("send_a joined")
+        .expect("A acked");
+
+    // Hold the publish mutex (a concurrent fence/close does the same), then
+    // send B. Under the fix B parks on the mutex BEFORE its book entry opens.
+    let publish_hold = driver.hold_publish_mutex_for_test().await;
+    let db = driver.clone();
+    let send_b = tokio::spawn(async move { db.send(prompt_id("second", "msg-b")).await });
+    barrier
+        .wait_until_publish_lock_waits(2, Duration::from_secs(5))
+        .await;
+
+    // Map A's result WHILE B is parked: with no phantom B book outstanding, A
+    // settles its root turn ordinarily (result index 0, settledRootTurn).
+    barrier.resume_worker();
+    barrier
+        .wait_until_results_mapped(1, Duration::from_secs(5))
+        .await;
+
+    // Abort B parked on the mutex, then release the mutex. B opened nothing and
+    // enqueued no ticket, so no cleanup is owed and write_seq is free again.
+    send_b.abort();
+    drop(publish_hold);
+
+    // C completes normally; its result (second user frame the child sees)
+    // settles C itself at result index 1.
+    let dc = driver.clone();
+    tokio::time::timeout(Duration::from_secs(5), dc.send(prompt_id("second", "msg-c")))
+        .await
+        .expect("C send within 5s")
+        .expect("C sends after B aborted");
+    // The send ack means WRITTEN, not answered: acknowledge C's result is
+    // mapped before fencing so the fence cannot overtake C's live frames.
+    barrier
+        .wait_until_results_mapped(2, Duration::from_secs(5))
+        .await;
+
+    // One acknowledged fence, one overall timeout, then drain what is buffered.
+    let fence = driver.publication_fence().await;
+    tokio::time::timeout(Duration::from_secs(5), fence)
+        .await
+        .expect("publication fence within 5s")
+        .expect("fence sender alive");
+    let mut all = Vec::new();
+    while let Some(obs) = handle.try_recv() {
+        all.push(obs);
+    }
+
+    assert_eq!(
+        turn_started_count(&all),
+        2,
+        "only A and C start; the aborted B emits no start: {all:?}"
+    );
+    let results: Vec<(&str, bool)> = all.iter().filter_map(result_attrs).collect();
+    assert_eq!(
+        results,
+        vec![("0", true), ("1", true)],
+        "A settles while B parks pre-book, and C settles C (no phantom B pop): {all:?}"
+    );
+    let corrections: Vec<Option<&str>> = all
+        .iter()
+        .filter_map(settled_marker)
+        .filter(|marker| *marker == Some("true"))
+        .collect();
+    assert!(
+        corrections.is_empty(),
+        "no deferred correction is owed when B never opened a book: {all:?}"
+    );
+
+    drop(barrier);
+    let _ = driver.close().await;
+}
+
 /// deferredSettle marker (None = ordinary settlement, Some("true") = deferred
 /// correction); returns None for non-settled results. Use this to count ALL
 /// settledRootTurn observations and inspect the deferred flag.

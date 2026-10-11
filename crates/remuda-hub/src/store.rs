@@ -314,6 +314,11 @@ pub struct Store {
     #[cfg(any(test, feature = "test-faults"))]
     test_finish_before_gate_mutate:
         Arc<std::sync::Mutex<Option<(String, crate::gatequeue::TestGateFinishBeforeWrite)>>>,
+    /// Test-only one-shot: the NEXT `insert_gate_log` writer deletes the old
+    /// row and then fails its insert (ma-initiator r9 item 3), proving the
+    /// atomic transaction rolls the delete back.
+    #[cfg(any(test, feature = "test-faults"))]
+    gate_log_insert_fault: Arc<std::sync::atomic::AtomicBool>,
     /// Per-Store test fault flags (`test-faults` feature only). Shared via
     /// [`Arc`] so every clone of the store arms the SAME flags.
     #[cfg(any(test, feature = "test-faults"))]
@@ -2407,6 +2412,8 @@ impl Store {
             #[cfg(any(test, feature = "test-faults"))]
             test_finish_before_gate_mutate: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-faults"))]
+            gate_log_insert_fault: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(any(test, feature = "test-faults"))]
             faults: Arc::new(test_faults::FaultFlags::default()),
         })
     }
@@ -2625,6 +2632,22 @@ impl Store {
             .lock()
             .expect("gate mutate finish seam lock")
             .take()
+    }
+
+    /// Test-only: arm the one-shot `insert_gate_log` post-delete insert
+    /// failure (ma-initiator r9 item 3).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_arm_gate_log_insert_fault(&self) {
+        self.gate_log_insert_fault
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only: consume (and clear) the armed insert fault.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn take_gate_log_insert_fault(&self) -> bool {
+        self.gate_log_insert_fault
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Test-only: drain (at most) the armed project-patch fence.

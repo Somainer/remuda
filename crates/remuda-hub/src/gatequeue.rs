@@ -2184,7 +2184,16 @@ impl Store {
     }
 
     /// Replace and persist the log object for one job run; returns the
-    /// stable per-job `obj_…` id ([`Store::gate_log_object_id`]).
+    /// object id the JOB references — its existing `logObjectId` when it
+    /// already has one (legacy pre-upgrade random id or the stable per-job
+    /// id), or the deterministic per-job id when none exists. Reusing the
+    /// referenced id means even a writer that persists and then stops at the
+    /// terminal guard never leaves the job pointing at a deleted object.
+    ///
+    /// The lookup, delete and insert run in ONE immediate transaction, so a
+    /// concurrent GET can never observe the post-delete/pre-insert gap and a
+    /// failed insert rolls the delete back (the previous object stays
+    /// served).
     pub(crate) async fn insert_gate_log(
         &self,
         project_id: &str,
@@ -2196,29 +2205,55 @@ impl Store {
         let project_id = project_id.to_owned();
         let job_id = job_id.to_owned();
         let created_by = created_by.to_owned();
+        // Drain the one-shot insert fault before the 'static writer closure.
+        #[cfg(any(test, feature = "test-faults"))]
+        let insert_fault = self.take_gate_log_insert_fault();
         self.run_named("insert_gate_log", move |conn| {
+            let tx = crate::store::immediate_tx(conn)?;
             let now = now();
             let expires_at = gate_log_expiry(&now);
-            let object_id = Self::gate_log_object_id(&job_id);
+            // The id this job already references, read under the same
+            // transaction before any delete. Covers legacy random ids; only
+            // a row with no reference at all gets the deterministic id.
+            let referenced: Option<String> = tx
+                .query_row(
+                    "SELECT json_extract(doc_json, '$.logObjectId')
+                       FROM gate_jobs WHERE id = ?1",
+                    params![job_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+            let object_id = referenced
+                .filter(|id| id.starts_with("obj_"))
+                .unwrap_or_else(|| Self::gate_log_object_id(&job_id));
             // The Node delivers one verdict twice (finished event + RPC
             // reply), and both handlers persist the same bytes. If the
-            // per-job row already stores that exact digest, touch nothing:
-            // no DELETE window at all, so the first writer's referenced
-            // object can never disappear underneath the job. A genuinely
-            // different run (a re-verify attempt) replaces the row under
-            // the SAME stable id, keeping every stored logObjectId valid.
-            let same: i64 = conn.query_row(
+            // referenced row already stores that exact digest, touch nothing.
+            let same: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM gate_log_objects
                   WHERE id = ?1 AND digest = ?2",
                 params![object_id, digest],
                 |row| row.get(0),
             )?;
             if same == 0 {
-                conn.execute(
+                tx.execute(
                     "DELETE FROM gate_log_objects WHERE job_id = ?1",
                     params![job_id],
                 )?;
-                conn.execute(
+                // Test-only fault: fail the write AFTER the delete, inside
+                // the transaction. Must roll the delete back so the prior
+                // object is still served.
+                #[cfg(any(test, feature = "test-faults"))]
+                if insert_fault {
+                    // Missing the NOT NULL job_id/project_id columns: a
+                    // deterministic constraint failure.
+                    tx.execute(
+                        "INSERT INTO gate_log_objects (id) VALUES (?1)",
+                        params![object_id],
+                    )?;
+                }
+                tx.execute(
                     "INSERT INTO gate_log_objects
                         (id, job_id, project_id, bytes, byte_len, digest,
                          created_by, created_at, expires_at)
@@ -2236,6 +2271,7 @@ impl Store {
                     ],
                 )?;
             }
+            tx.commit()?;
             Ok(object_id)
         })
         .await

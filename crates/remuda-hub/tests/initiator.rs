@@ -1946,6 +1946,205 @@ async fn a_duplicate_failed_verdict_keeps_the_referenced_gate_log_object() {
     );
 }
 
+/// Plant a claimed Running gate job that references a LEGACY random log
+/// object id A (the pre-r8 shape) and the A row itself. Returns (job id,
+/// object id, original log bytes).
+async fn running_job_with_legacy_log(ctx: &Ctx) -> (String, String, Vec<u8>) {
+    let (status, body) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":"wt/gate/legacy-log","mode":"verify"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let job_id = body["id"].as_str().unwrap().to_owned();
+    let claimed = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claim");
+    assert_eq!(claimed["state"], json!("running"), "{claimed}");
+
+    // A pre-upgrade random object id (NOT the deterministic obj_<job>).
+    let legacy_id = "obj_00112233445566778899aabbccddeeff00";
+    let legacy_log = json!({
+        "step": "cargo-test",
+        "kind": "failed",
+        "attempts": 1,
+        "headline": "the OLD evidence",
+        "summary": ["old failure"],
+        "tail": ["old tail"],
+        "linesSeen": 1
+    });
+    let legacy_bytes = serde_json::to_vec(&legacy_log).unwrap();
+    // Digest only keys the same-bytes short-circuit; a distinct fixed value
+    // is enough (the new result carries different bytes).
+    let digest = "legacy-log-digest-v1";
+    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+    db.execute(
+        "INSERT INTO gate_log_objects
+            (id, job_id, project_id, bytes, byte_len, digest,
+             created_by, created_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'dev', '2020-01-01T00:00:00.000Z',
+                 '2099-01-01T00:00:00.000Z')",
+        rusqlite::params![
+            legacy_id,
+            job_id,
+            ctx.project,
+            legacy_bytes,
+            legacy_bytes.len() as i64,
+            digest as &str,
+        ],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE gate_jobs
+            SET doc_json = json_set(doc_json, '$.logObjectId', ?2)
+          WHERE id = ?1",
+        rusqlite::params![job_id, legacy_id],
+    )
+    .unwrap();
+    drop(db);
+    (job_id, legacy_id.to_owned(), legacy_bytes)
+}
+
+fn failed_result_with_log(job_id: &str, headline: &str) -> Value {
+    json!({
+        "jobId": job_id,
+        "status": "failed",
+        "failedStep": "cargo-test",
+        "error": "cargo-test failed: 1 test",
+        "reason": "1 test failed",
+        "runLog": {
+            "step": "cargo-test",
+            "kind": "failed",
+            "attempts": 1,
+            "headline": headline,
+            "summary": ["test it_new ... FAILED"],
+            "tail": ["failures:", "    it_new"],
+            "linesSeen": 2
+        }
+    })
+}
+
+/// A pre-upgrade job references a LEGACY random object id A. A later runLog
+/// result must reuse that id (not derive a new deterministic B and delete
+/// A), including when a competing terminal write (the duplicate's first
+/// arrival / grace finisher) makes THIS writer stop at the guard after
+/// persisting. The job's stored logObjectId resolves by object id and by
+/// job id.
+#[tokio::test]
+async fn a_late_runlog_reuses_the_jobs_legacy_log_object_id_through_a_terminal_interleave() {
+    use remuda_hub::store_test_support::TestGateFinishBeforeWrite;
+
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    let (job_id, legacy_id, _old_bytes) = running_job_with_legacy_log(&ctx).await;
+
+    // The second handler's perspective: its pre-read saw Running and the
+    // first duplicate arrival's Failed write lands inside its writer after
+    // the persist. The persist must replace bytes UNDER THE LEGACY ID.
+    ctx.store().test_arm_finish_before_gate_mutate(
+        job_id.clone(),
+        TestGateFinishBeforeWrite::DuplicateFailed,
+    );
+    ctx.hub
+        .test_apply_gate_result(&job_id, failed_result_with_log(&job_id, "the NEW evidence"))
+        .await
+        .unwrap();
+
+    // The job still references the legacy id, which now holds the new bytes.
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("failed"), "{doc}");
+    assert_eq!(
+        doc["logObjectId"],
+        json!(legacy_id),
+        "the legacy reference must be reused, not orphaned: {doc}"
+    );
+
+    let (status, by_object) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{legacy_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "legacy object 404: {by_object}");
+    assert_eq!(by_object["objectId"], json!(legacy_id), "{by_object}");
+    assert_eq!(
+        by_object["log"]["headline"],
+        json!("the NEW evidence"),
+        "the reused object should carry the new bytes: {by_object}"
+    );
+    let (status, by_job) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{job_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "by-job lookup 404: {by_job}");
+    assert_eq!(
+        by_job["objectId"],
+        json!(legacy_id),
+        "by-job lookup resolves elsewhere: {by_job}"
+    );
+}
+
+/// A failed INSERT inside the log writer must roll the prior DELETE back:
+/// the previously referenced object stays served. The select/delete/insert
+/// are one immediate transaction.
+#[tokio::test]
+async fn a_failed_log_insert_keeps_the_previous_object_served() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    let (job_id, legacy_id, old_bytes) = running_job_with_legacy_log(&ctx).await;
+
+    // Make the writer fail its insert AFTER the delete (one-shot).
+    ctx.store().test_arm_gate_log_insert_fault();
+    ctx.hub
+        .test_apply_gate_result(&job_id, failed_result_with_log(&job_id, "never stored"))
+        .await
+        .unwrap();
+
+    // The transaction rolled back: the OLD object is still served, by object
+    // id and by job id.
+    let (status, by_object) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{legacy_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "previous object lost after failed insert: {by_object}"
+    );
+    assert_eq!(
+        by_object["log"]["headline"],
+        json!("the OLD evidence"),
+        "the rollback did not preserve the old bytes: {by_object}"
+    );
+    let (status, by_job) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{job_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "by-job lookup lost: {by_job}");
+    assert_eq!(by_job["objectId"], json!(legacy_id), "{by_job}");
+    // The old headline already proves the original bytes survived.
+    let _ = old_bytes;
+}
+
 // ── 6c. A narrowed Bot token acts for the live chapter (CLI path) ─────────
 
 #[tokio::test]

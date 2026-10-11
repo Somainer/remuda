@@ -146,6 +146,13 @@ struct MemberState {
     agent_id: String,
     key: Option<String>,
     attempt: u64,
+    /// c-cardsettle-fu2 r1 item 2: whether this member has already consumed
+    /// a journal `started` record. Hook-created placeholders (SubagentStart
+    /// failure-before-start, agent_started) are false until their own first
+    /// journal start folds; a journal-folded started on a shared key whose
+    /// counter was already bumped by ANOTHER agent must only resurrect when
+    /// THIS member previously consumed a start.
+    consumed_journal_start: bool,
     state: WorkflowState,
     label: Option<String>,
     phase: Option<String>,
@@ -1291,18 +1298,19 @@ impl RunState {
                         WorkflowState::Failed | WorkflowState::Completed | WorkflowState::Cancelled
                     );
                 // A strictly newer attempt number relative to the recorded
-                // member; combined with the member having consumed a start
-                // before (attempt > 0) this identifies a genuine retry.
+                // member identifies a candidate retry.
                 let is_newer_attempt = attempt > member.attempt;
-                // A strictly newer attempt (a real retry of an agent id that
-                // already consumed a start) is authoritative: it resurrects
-                // an earlier terminal member — set Running/stopped=false and
-                // tie the terminal evidence to the OLD attempt. A same-attempt
-                // started never downgrades a terminal outcome regardless of
-                // fold order; a failure placeholder (attempt 0) that sees its
-                // OWN first start (attempt 1) is also not a retry and stays
-                // Failed (see agent_failed).
-                let genuine_retry = is_newer_attempt && member.attempt > 0;
+                // c-cardsettle-fu2 r1 item 2: it is a GENUINE retry only when
+                // the member already consumed a journal start. This excludes:
+                // - a hook placeholder (SubagentStart/StopFailure beat the
+                //   catch-up fold) seeing its OWN first start;
+                // - a member created on a SHARED key whose per-key counter a
+                //   different agent id already bumped (started(k,a0) then
+                //   started(k,a1) counts the key to 2, but a1 never consumed
+                //   a start).
+                // Same-attempt folds and the placeholder's own first start
+                // never downgrade a terminal outcome.
+                let genuine_retry = is_newer_attempt && member.consumed_journal_start;
                 member.key = Some(key.clone());
                 member.attempt = attempt;
                 if !terminal || genuine_retry {
@@ -1313,6 +1321,10 @@ impl RunState {
                     // force one file-catch-up convergence emission.
                     self.force_member_refresh.insert(agent_id.clone());
                 }
+                // This journal `started` has now been consumed by THIS member,
+                // regardless of whether it resurrected it or was held terminal;
+                // a subsequent newer attempt is then eligible as a real retry.
+                member.consumed_journal_start = true;
                 if member.label.is_none()
                     && let Some(label) = value.get("label").and_then(Value::as_str)
                 {
@@ -1396,7 +1408,10 @@ impl RunState {
         {
             return Ok(());
         }
-        let mut member = MemberState::new(agent_id.to_owned(), None, 1);
+        // Hook SubagentStart: the member has NOT yet consumed a journal start
+        // (the live transcript hook beats the catch-up fold); attempt 0 so
+        // its own first folded started is not mistaken for a retry.
+        let mut member = MemberState::new_placeholder(agent_id.to_owned());
         if let Some(path) = transcript_path {
             member.jsonl = Some(FileTail::new(path)?);
         }
@@ -1410,14 +1425,10 @@ impl RunState {
     /// SubagentStart. The root instance is untouched; only the member row.
     fn agent_failed(&mut self, agent_id: &str, transcript_path: Option<&Path>) {
         if !self.members.iter().any(|m| m.agent_id == agent_id) {
-            // c-cardsettle-fu2 r1 item 1: the placeholder for a StopFailure
-            // that beat its SubagentStart carries NO key and attempt 0 (not 1).
-            // A `started` record that lands AFTER this failure is then attempt
-            // 1 > 0, but it is the failure's OWN first start (the agent id had
-            // consumed no start yet), so it must NOT be treated as a genuine
-            // retry and must NOT resurrect the member. Only a started whose
-            // agent id already consumed a start (attempt recorded) resurrects.
-            let mut member = MemberState::new(agent_id.to_owned(), None, 0);
+            // c-cardsettle-fu2 r1 items 1+2: a StopFailure that beat its
+            // SubagentStart creates a no-key placeholder that consumed no
+            // journal start (attempt 0, consumed_journal_start false).
+            let mut member = MemberState::new_placeholder(agent_id.to_owned());
             if let Some(path) = transcript_path
                 && let Ok(tail) = FileTail::new(path)
             {
@@ -1657,11 +1668,26 @@ impl RunState {
 }
 
 impl MemberState {
+    /// A hook-created member that has NOT consumed a journal start yet:
+    /// no key, attempt 0, and [`MemberState::consumed_journal_start`] false.
+    /// Used by SubagentStart (before the catch-up fold sees its first start)
+    /// and by a StopFailure that beat its SubagentStart.
+    fn new_placeholder(agent_id: String) -> Self {
+        let mut member = Self::new(agent_id, None, 0);
+        member.consumed_journal_start = false;
+        member
+    }
+
     fn new(agent_id: String, key: Option<String>, attempt: u64) -> Self {
         Self {
             agent_id,
             key,
             attempt,
+            // Only the journal fold constructs members that have already
+            // consumed a start (it is created from the `started` record
+            // currently being folded). Hook-created members use
+            // new_placeholder (attempt 0, flag false).
+            consumed_journal_start: true,
             state: WorkflowState::Running,
             label: None,
             phase: None,

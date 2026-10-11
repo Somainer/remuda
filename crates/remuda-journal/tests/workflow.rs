@@ -606,3 +606,69 @@ fn a_failure_placeholder_own_first_start_does_not_resurrect() {
         "no Running observation for the placeholder's own first start: {states:?}"
     );
 }
+
+/// c-cardsettle-fu2 r1 item 2: TWO agents sharing key k. The journal folds
+/// started(k,a0) → failed(a0) → started(k,a1); a1 is a member that NEVER
+/// consumed a journal start before (its placeholder is created by the failed
+/// fold with consumed_journal_start=false), and the shared key's counter is
+/// already 1 from a0, so a1's start counts as attempt 2. Without the
+/// consumed-journal-start flag a1's failed member would be resurrected and
+/// the OLDER journal format (only started/result records) never repairs it.
+#[test]
+fn a_shared_key_second_agent_without_a_start_stays_failed() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_shared";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a0.jsonl"), "{}\n").unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    // a0 started (key counter 1), a0 failed, then a1's first start (key
+    // counter 2) — but a1's member already exists as Failed from a prior
+    // StopFailure (created out-of-band with no key/attempt 0).
+    std::fs::write(
+        run_dir.join("journal.jsonl"),
+        "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a0\"}\n\
+         {\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a0\"}\n\
+         {\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n",
+    )
+    .unwrap();
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    // a1 failed BEFORE any start for it (StopFailure beat the fold): create
+    // the attempt-0 placeholder.
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    // Now poll: the catch-up folds all three journal lines.
+    let bodies = bodies(tailer.poll().unwrap());
+    let a1_states: Vec<_> = bodies
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        a1_states.contains(&WorkflowState::Failed),
+        "a1 must be observed Failed: {a1_states:?}"
+    );
+    assert!(
+        !a1_states.contains(&WorkflowState::Running),
+        "a1 never consumed a start; the shared-key attempt-2 must not resurrect it: {a1_states:?}"
+    );
+}

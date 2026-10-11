@@ -197,6 +197,7 @@ impl DiscoveryWindow {
         }
         self.released = true;
         let mut map = OPEN_WINDOWS.lock().expect("codex discovery windows");
+        let mut last_window = false;
         if let Some(entry) = map.get_mut(&self.key) {
             entry.count = entry.count.saturating_sub(1);
             if entry.count <= 1 {
@@ -206,6 +207,7 @@ impl DiscoveryWindow {
             }
             if entry.count == 0 {
                 map.remove(&self.key);
+                last_window = true;
             }
         }
         // Remove this owner from the live-discoverer set regardless of
@@ -216,6 +218,19 @@ impl DiscoveryWindow {
             .get_mut(&self.key)
         {
             set.remove(&self.owner);
+        }
+        // r7 item 10: when this is the LAST open window for the cwd, no
+        // discovery lifecycle remains — discard all recorded prompts so they
+        // cannot authorize a future unrelated rollout and do not accumulate.
+        // (A specific owner's prompts are also harmless once no window is
+        // open; the next launch records fresh inputs.)
+        if last_window
+            && let Some(by_instance) = SENT_INPUTS
+                .lock()
+                .expect("codex sent inputs")
+                .get_mut(&self.key)
+        {
+            by_instance.clear();
         }
     }
 }
@@ -237,6 +252,27 @@ pub(crate) const INPUT_MATCH_WINDOW: time::Duration = time::Duration::seconds(30
 /// Small pre-keystroke slack (the session row can precede the recorded send by
 /// a scheduler tick).
 const INPUT_MATCH_SLACK: time::Duration = time::Duration::seconds(5);
+
+/// How long a recorded prompt stays eligible for attribution after its LATEST
+/// dispatch (r7 item 10). Beyond this an input is aged out on write, so a
+/// long-lived Node's registry does not grow without bound and an old prompt
+/// cannot authorize a much-later rollout.
+const INPUT_MAX_AGE: time::Duration = time::Duration::hours(1);
+
+/// Evict all recorded inputs older than `now - INPUT_MAX_AGE` (r7 item 10).
+/// Called on every record_input so stale per-instance prompts disappear
+/// without a background task.
+pub(crate) fn evict_expired_inputs(now: OffsetDateTime) {
+    let cutoff = now - INPUT_MAX_AGE;
+    let mut map = SENT_INPUTS.lock().expect("codex sent inputs");
+    map.retain(|_, by_instance| {
+        by_instance.retain(|_, inputs| {
+            inputs.retain(|input| input.at >= cutoff);
+            !inputs.is_empty()
+        });
+        !by_instance.is_empty()
+    });
+}
 
 #[derive(Clone)]
 struct SentInput {
@@ -288,12 +324,15 @@ fn put_input(cwd: &Path, owner: &str, text: &str, at: OffsetDateTime) {
 
 /// Record that instance `owner` dispatched `text` in `cwd` at `now`.
 pub(crate) fn record_input(cwd: &Path, owner: &str, text: &str) {
+    evict_expired_inputs(OffsetDateTime::now_utc());
     put_input(cwd, owner, text, OffsetDateTime::now_utc());
 }
 
-/// Test seam: record an input with an explicit timestamp.
+/// Test seam: record an input with an explicit timestamp; also runs eviction
+/// against that clock so age-out is deterministic.
 #[cfg(test)]
 pub(crate) fn record_input_at(cwd: &Path, owner: &str, text: &str, at: OffsetDateTime) {
+    evict_expired_inputs(at);
     put_input(cwd, owner, text, at);
 }
 

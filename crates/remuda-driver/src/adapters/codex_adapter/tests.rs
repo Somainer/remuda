@@ -1545,3 +1545,73 @@ fn stable_instance_key_reclaims_after_close_and_resume() {
         Some("resume-s")
     );
 }
+
+// c-usagefu r7 item 10: age + lifecycle eviction of sent inputs ----------
+
+#[test]
+fn a_prompt_older_than_max_age_is_evicted_and_cannot_authorize() {
+    use time::Duration;
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r7-aged";
+    let now = OffsetDateTime::now_utc();
+
+    // Record a prompt 2 hours ago (older than INPUT_MAX_AGE=1h): the act of
+    // recording a newer prompt triggers eviction of the old one.
+    send_fixture_prompt(
+        Path::new(cwd),
+        INST_A,
+        "old prompt",
+        now - Duration::hours(2),
+    );
+    send_fixture_prompt(Path::new(cwd), INST_A, "fresh prompt", now);
+
+    // A rollout matching the OLD text at the old time must not bind.
+    let mut adapter = launch_adapter_keyed(
+        home.path(),
+        cwd,
+        now - Duration::hours(2) - Duration::seconds(5),
+        INST_A,
+    );
+    write_rollout_prompt_at(
+        home.path(),
+        "old-file",
+        cwd,
+        &(now - Duration::hours(2)).format(&Rfc3339).unwrap(),
+        "old prompt",
+    );
+    assert!(
+        !adapter.discover().unwrap(),
+        "aged-out prompt cannot authorize a rollout"
+    );
+    drop(adapter);
+}
+
+#[test]
+fn closing_the_last_discovery_window_clears_recorded_prompts() {
+    // After all discovery windows in a cwd close (every instance bound or
+    // gave up), the recorded prompts are discarded: a later fresh adapter
+    // with no sent prompt must not match a rollout left behind.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r7-lifecycle";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+
+    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
+    send_fixture_prompt(Path::new(cwd), INST_A, "bound words", now);
+    write_rollout_prompt_at(
+        home.path(),
+        "bound",
+        cwd,
+        &now.format(&Rfc3339).unwrap(),
+        "bound words",
+    );
+    assert!(a.discover().unwrap()); // binds → releases the window (last one)
+
+    // A brand new adapter after the lifecycle ended has no prompts recorded.
+    let mut late = launch_adapter_keyed(home.path(), cwd, floor, "late-key");
+    assert!(
+        !late.discover().unwrap(),
+        "prompts from the closed lifecycle are gone"
+    );
+    assert!(late.binding().is_none());
+}

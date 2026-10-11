@@ -258,3 +258,171 @@ async fn claude_pty_close_finalises_no_stop_usage_and_projects_to_hub_row() {
         "context = input + cache read + cache creation"
     );
 }
+
+/// c-ctxusage r8 item 2: when close's 2 s deadline aborts the pump WHILE the
+/// cooperative finish is running, the finish must be part of the shared
+/// in-flight state — the abort guard waits for it and the single flusher
+/// drains the FINAL frames exactly once. Before the fix the cooperative
+/// finish ran with map_in_flight clear and the hydrator already out of the
+/// slot: the guard saw "nothing in flight, empty slot", stopped the flusher,
+/// and the frames the detached finish parked were never delivered.
+///
+/// The barrier is INSIDE the cooperative finish: the test holds it past
+/// close's (shortened) deadline, proves the timeout-driven abort happened and
+/// no FINAL leaked early, releases, and asserts the FINAL arrives once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claude_pty_abort_mid_cooperative_finish_still_delivers_final_usage_once() {
+    use remuda_driver::test_faults::TranscriptFaults;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.as_ref().join("herdr");
+    fs::create_dir_all(&socket_dir).unwrap();
+    let socket = socket_dir.join("herdr.sock");
+    let fake_bin = ensure_workspace_bin("fake-herdr");
+    let _fake = FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap();
+
+    let cwd = tmp.path().join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let claude = install_executable(
+        tmp.path(),
+        "claude",
+        "#!/bin/sh\necho '2.1.268 (Claude Code)'\n",
+    );
+    fs::create_dir_all(&launch).unwrap();
+    let transcript = launch.join("transcript.jsonl");
+    seed_transcript(&transcript, 30);
+
+    // Barrier inside the cooperative finish + a 500 ms close bound so the
+    // timeout-driven abort is deterministic and fast.
+    let faults = TranscriptFaults::new();
+    faults.arm_finish_gate();
+    faults.arm_close_timeout(Duration::from_millis(500));
+
+    let driver = ClaudePtyDriver::new(ClaudePtyOptions {
+        instance_id: None,
+        media_stager: None,
+        profile: profile(),
+        launch_dir: launch.clone(),
+        native_home: home,
+        binary: BinarySource::Pinned(pin_binary(&claude).unwrap()),
+        origin: LaunchOrigin::Human,
+        session_name: "remuda-cp-abort-finish".into(),
+        socket_dir: Some(socket_dir),
+        herdr_binary: Some(fake_bin),
+        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker::env_only()),
+        extra_env: Default::default(),
+        agent_mcp: None,
+        setting_sources: None,
+        agent_start_timeout_ms: 5_000,
+        inherit_default_config: false,
+        settings_overlay_path: None,
+        auto_trust_registered_workspace: false,
+        seed_onboarding: true,
+        host_claude_config: None,
+    });
+    driver.set_test_faults(faults.clone());
+
+    let handle = driver.start(spec(&cwd)).await.expect("start");
+    let mut events_rx = handle.into_events();
+    fs::write(
+        launch.join("session-meta.json"),
+        serde_json::json!({
+            "session_id": "fixture-session",
+            "transcript_path": transcript,
+            "hook_event_name": "SessionStart",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Background drainer keeps the 64-slot event channel empty at all times,
+    // so a (buggy) flusher really can drain and exit — and counts FINAL
+    // deliveries exactly. Barriers: a bind oneshot, a FINAL oneshot, and the
+    // channel close after the pump/flusher wind down.
+    let final_count = Arc::new(AtomicU32::new(0));
+    let bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (final_tx, final_rx) = tokio::sync::oneshot::channel();
+    let final_tx = std::sync::Mutex::new(Some(final_tx));
+    let drainer_count = Arc::clone(&final_count);
+    let drainer_bound = Arc::clone(&bound);
+    let drainer = tokio::spawn(async move {
+        while let Some(obs) = events_rx.recv().await {
+            if let ObservationPayload::Lifecycle(payload) = &obs.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = payload.as_ref()
+                && native.native_name == "transcript_bound"
+            {
+                drainer_bound.store(true, AtomicOrdering::SeqCst);
+            }
+            if let ObservationPayload::Usage(payload) = &obs.body
+                && payload.scope_id == FINAL_MSG_ID
+            {
+                drainer_count.fetch_add(1, AtomicOrdering::SeqCst);
+                if let Some(tx) = final_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+    });
+
+    // Event barrier: wait for the bind, not an idle gap.
+    let bind_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !bound.load(AtomicOrdering::SeqCst) && std::time::Instant::now() < bind_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(bound.load(AtomicOrdering::SeqCst), "transcript never bound");
+    assert_eq!(
+        final_count.load(AtomicOrdering::SeqCst),
+        0,
+        "the no-stop FINAL usage must not publish before close"
+    );
+
+    // Close crosses its shortened bound while the cooperative finish is
+    // parked INSIDE the blocking operation.
+    driver.close().await.expect("close");
+    assert!(
+        faults.wait_finish_entered(),
+        "the cooperative finish never entered its barrier"
+    );
+    assert!(
+        faults.wait_abort_residual(),
+        "close returned but no timeout-driven abort happened"
+    );
+
+    // The abort guard must NOT have stopped the flusher while the cooperative
+    // finish still owns the hydrator behind the shared in-flight flag. The
+    // drainer keeps the channel empty, so a buggy guard that set stop here
+    // lets the flusher drain and exit within the window; the fixed flusher
+    // stays alive because stop is never set until the parked finish parks.
+    assert!(
+        !faults.wait_flusher_exit_for(Duration::from_millis(500)),
+        "the flusher exited while the cooperative finish was still in flight"
+    );
+    assert_eq!(
+        final_count.load(AtomicOrdering::SeqCst),
+        0,
+        "FINAL usage delivered before the parked finish was released"
+    );
+
+    // Release the detached cooperative finish: it parks the FINAL frames,
+    // clears in-flight, the abort guard then retires and releases the single
+    // flusher, which delivers them.
+    faults.release();
+    tokio::time::timeout(Duration::from_secs(30), final_rx)
+        .await
+        .expect("the aborted cooperative finish never delivered the FINAL usage")
+        .expect("final oneshot closed without a frame");
+    // Let the flusher wind down after delivery, then it must have delivered
+    // exactly once even though two producers (finish + guard) both ran.
+    drainer.abort();
+    assert_eq!(
+        final_count.load(AtomicOrdering::SeqCst),
+        1,
+        "the aborted cooperative finish must deliver the FINAL usage exactly once"
+    );
+}

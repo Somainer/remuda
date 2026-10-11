@@ -43,6 +43,8 @@ pub(crate) struct FaultState {
     gate_cv: Condvar,
     abort_residual: Mutex<bool>,
     abort_residual_cv: Condvar,
+    flusher_exited: Mutex<bool>,
+    flusher_exited_cv: Condvar,
     skip_cooperative_finalise: AtomicBool,
     /// Overrides the driver's bounded cooperative-close wait so an abort test
     /// crosses the bound deterministically without the production 15 s / 2 s
@@ -68,6 +70,8 @@ impl FaultState {
             gate_cv: Condvar::new(),
             abort_residual: Mutex::new(false),
             abort_residual_cv: Condvar::new(),
+            flusher_exited: Mutex::new(false),
+            flusher_exited_cv: Condvar::new(),
             skip_cooperative_finalise: AtomicBool::new(false),
             close_timeout_ms: AtomicU64::new(0),
         })
@@ -78,11 +82,7 @@ impl FaultState {
     /// the gate. Never touches an async runtime.
     fn enter(&self, phase: Phase) {
         let (armed, entered, cv) = match phase {
-            Phase::Pump => (
-                &self.pump_armed,
-                &self.pump_entered,
-                &self.pump_entered_cv,
-            ),
+            Phase::Pump => (&self.pump_armed, &self.pump_entered, &self.pump_entered_cv),
             Phase::Finish => (
                 &self.finish_armed,
                 &self.finish_entered,
@@ -92,7 +92,9 @@ impl FaultState {
         if !armed.load(Ordering::SeqCst) {
             return;
         }
-        *entered.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        *entered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         cv.notify_all();
         let mut open = self
             .gate_open
@@ -146,6 +148,26 @@ impl FaultState {
             millis => Some(Duration::from_millis(millis)),
         }
     }
+
+    /// Acknowledge that the streaming flusher exited. A test holding a
+    /// producer past close uses this to prove the flusher did not quit while
+    /// final frames were still pending.
+    pub(crate) fn note_flusher_exit(&self) {
+        *self
+            .flusher_exited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.flusher_exited_cv.notify_all();
+    }
+
+    /// Whether the flusher has already exited.
+    #[cfg(feature = "test-faults")]
+    fn flusher_exited_now(&self) -> bool {
+        *self
+            .flusher_exited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// Test-only handle used to drive the injected faults. Constructible only
@@ -186,9 +208,10 @@ impl TranscriptFaults {
     /// Shorten the driver's bounded cooperative-close wait so a parked pump
     /// crosses the abort bound quickly (production timeout is used otherwise).
     pub fn arm_close_timeout(&self, timeout: Duration) {
-        self.inner
-            .close_timeout_ms
-            .store(timeout.as_millis().min(u128::from(u64::MAX)) as u64, Ordering::SeqCst);
+        self.inner.close_timeout_ms.store(
+            timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            Ordering::SeqCst,
+        );
     }
 
     /// Open the gate and let every parked blocking phase proceed.
@@ -203,7 +226,11 @@ impl TranscriptFaults {
 
     /// Block until the pump-collect phase signals it entered (bounded).
     pub fn wait_pump_entered(&self) -> bool {
-        Self::wait_true(&self.inner.pump_entered, &self.inner.pump_entered_cv)
+        Self::wait_true(
+            &self.inner.pump_entered,
+            &self.inner.pump_entered_cv,
+            Duration::from_secs(60),
+        )
     }
 
     /// Block until the cooperative-finish phase signals it entered (bounded).
@@ -211,6 +238,7 @@ impl TranscriptFaults {
         Self::wait_true(
             &self.inner.finish_entered,
             &self.inner.finish_entered_cv,
+            Duration::from_secs(60),
         )
     }
 
@@ -220,14 +248,31 @@ impl TranscriptFaults {
         Self::wait_true(
             &self.inner.abort_residual,
             &self.inner.abort_residual_cv,
+            Duration::from_secs(60),
         )
     }
 
-    fn wait_true(flag: &Mutex<bool>, cv: &Condvar) -> bool {
+    /// Non-blocking check whether the streaming flusher has exited.
+    #[must_use]
+    pub fn flusher_exited(&self) -> bool {
+        self.inner.flusher_exited_now()
+    }
+
+    /// Wait up to `timeout` for the streaming flusher to exit; returns
+    /// whether it exited within the window.
+    pub fn wait_flusher_exit_for(&self, timeout: Duration) -> bool {
+        Self::wait_true(
+            &self.inner.flusher_exited,
+            &self.inner.flusher_exited_cv,
+            timeout,
+        )
+    }
+
+    fn wait_true(flag: &Mutex<bool>, cv: &Condvar, timeout: Duration) -> bool {
         let mut guard = flag
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + timeout;
         while !*guard {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {

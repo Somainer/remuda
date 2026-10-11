@@ -1474,7 +1474,12 @@ fn spawn_transcript_pump(
     let flusher_pending = Arc::clone(&pending);
     let flusher_notify = Arc::clone(&flush_notify);
     let flusher_stop = Arc::clone(&flush_stop);
+    let flusher_faults = faults.clone();
     let flusher_handle = tokio::spawn(async move {
+        // Dropped on every flusher exit (including cancellation): tests use
+        // the acknowledgement to prove the flusher did not quit while final
+        // frames were still pending.
+        let _exit_ack = FlusherExitAck(flusher_faults);
         loop {
             if flusher_stop.load(Ordering::SeqCst)
                 && transcript_pending_lock(&flusher_pending).is_empty()
@@ -1633,10 +1638,14 @@ fn spawn_transcript_pump(
                 let in_flight = Arc::clone(&map_in_flight);
                 let collect_faults = faults.clone();
                 move || {
-                    let Some(mut hydrated) = transcript_slot_lock(&slot).take() else {
+                    // Take the hydrator and mark a producer in flight inside
+                    // the SAME critical section (c-ctxusage r8 item 2): the
+                    // abort guard waits on this flag and then takes the slot,
+                    // so it must never observe "not in flight" while the
+                    // hydrator is already out of the slot.
+                    let Some(mut hydrated) = claim_transcript_hydrator(&slot, &in_flight) else {
                         return;
                     };
-                    in_flight.store(true, Ordering::SeqCst);
                     // Test-only seam (c-ctxusage r8 item 6): park the first
                     // collect INSIDE the blocking operation; inert in prod.
                     if let Some(faults) = &collect_faults {
@@ -1663,8 +1672,7 @@ fn spawn_transcript_pump(
                         chunk.extend(batch);
                     }
                     park(&mut chunk);
-                    *transcript_slot_lock(&slot) = Some(hydrated);
-                    in_flight.store(false, Ordering::SeqCst);
+                    restore_transcript_hydrator(&slot, &in_flight, hydrated);
                 }
             });
             // Normal path awaits the poll map; on abort the JoinHandle future
@@ -1754,7 +1762,13 @@ async fn final_finish_blocking(
         while in_flight.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let Some(mut hydrated) = transcript_slot_lock(&slot).take() else {
+        // c-ctxusage r8 item 2: the cooperative finish is part of the SAME
+        // shared in-flight state as a collect. Claim the hydrator and mark the
+        // flag atomically, and only clear the flag AFTER its final frames are
+        // parked — an abort landing while this closure is detached (close's
+        // deadline fired) leaves the guard correctly waiting on the flag, and
+        // once the frames are queued the single flusher drains them.
+        let Some(mut hydrated) = claim_transcript_hydrator(&slot, &in_flight) else {
             return;
         };
         // Test-only seam (c-ctxusage r8 item 6 / item 2): park the cooperative
@@ -1772,12 +1786,51 @@ async fn final_finish_blocking(
         if let Ok(batch) = hydrated.mapper.finish() {
             frames.extend(batch);
         }
+        // Park before clearing the flag: the guard reads "no producer" only
+        // after the final frames are safely in the flusher's queue. The
+        // hydrator stays retired (slot stays None) on the close path.
         if !frames.is_empty() {
             transcript_pending_lock(&pending).append(&mut frames.into());
             notify.notify_one();
         }
+        in_flight.store(false, Ordering::SeqCst);
     });
     let _ = join.await;
+}
+
+/// Take the hydrator out of its slot and mark a producer in flight in the
+/// SAME critical section. An abort-path waiter can therefore never observe a
+/// clear flag while the hydrator is already gone (c-ctxusage r8 item 2).
+fn claim_transcript_hydrator(
+    slot: &TranscriptSlot,
+    in_flight: &Arc<AtomicBool>,
+) -> Option<TranscriptHydrator> {
+    let mut guard = transcript_slot_lock(slot);
+    let hydrated = guard.take()?;
+    in_flight.store(true, Ordering::SeqCst);
+    Some(hydrated)
+}
+
+/// Return a hydrator after a collect and clear the in-flight flag together.
+fn restore_transcript_hydrator(
+    slot: &TranscriptSlot,
+    in_flight: &Arc<AtomicBool>,
+    hydrated: TranscriptHydrator,
+) {
+    *transcript_slot_lock(slot) = Some(hydrated);
+    in_flight.store(false, Ordering::SeqCst);
+}
+
+/// Acknowledges flusher termination on any exit path, including cancellation
+/// (c-ctxusage r8 item 2 tests).
+struct FlusherExitAck(Option<Arc<crate::test_faults::FaultState>>);
+
+impl Drop for FlusherExitAck {
+    fn drop(&mut self) {
+        if let Some(faults) = &self.0 {
+            faults.note_flusher_exit();
+        }
+    }
 }
 
 /// Abort-path safety net for the claude-pty transcript pump. Held inside the

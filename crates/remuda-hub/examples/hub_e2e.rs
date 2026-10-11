@@ -23,8 +23,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 #[path = "../tests/support/mod.rs"]
 mod fake_node;
 use fake_node::{
-    FrameQueue, InstanceSendReply, NodeWs, PENDING_FRAME_QUEUE_CAP, append_command_user,
-    append_user_message, command_user_node, send_instance_send_rpc, send_rpc_ok,
+    FrameQueue, NodeWs, PENDING_FRAME_QUEUE_CAP, accept_instance_send, append_command_user,
+    append_user_message, command_user_node, send_command_result_reply, send_rpc_ok,
     send_user_message_frame, wait_frame_ack,
 };
 
@@ -1767,8 +1767,9 @@ async fn fake_node(
                     // followed by `__ackbarrier__:next`): the hold command parks
                     // its append-ack wait until a FURTHER Hub RPC is buffered,
                     // forcing the swallowed-frame race structurally; both reply
-                    // `accepted:true` so the Hub marks the row accepted from the
-                    // RPC reply itself (not via later journal reconcile).
+                    // with the shared real CommandResult so the Hub marks the row
+                    // accepted from the RPC reply itself (not via later journal
+                    // reconcile).
                     if prompt.starts_with("__ackbarrier__:") {
                         if prompt.contains(":hold") {
                             append_n = append_command_user_barrier(
@@ -1803,16 +1804,14 @@ async fn fake_node(
                         .await?;
                         append_n =
                             append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
-                        send_rpc_ok(
+                        // Same shared accepted reply the normal arm sends (real
+                        // typed CommandResult); only the append half differs
+                        // (the determinism barrier parked behind its ack).
+                        send_command_result_reply(
                             &mut ws,
                             id,
-                            json!({
-                                "accepted": true,
-                                "command": {
-                                    "state": "accepted",
-                                    "commandId": command_id.unwrap_or(""),
-                                }
-                            }),
+                            command_id.context("instance.send requires commandId")?,
+                            &instance_id,
                         )
                         .await?;
                         continue;
@@ -2104,15 +2103,29 @@ async fn fake_node(
                     // C2: the journal user node for a composer send carries the
                     // exact commandId the HTTP response returned, so the web folds
                     // optimistic bubble and transcript node into one.
-                    append_n = append_command_user(
+                    //
+                    // ONE shared acceptance contract (tests/support/mod.rs),
+                    // identical to the one accept_reply drives: durably append
+                    // the user message, await its MATCHING ack (an RPC error is
+                    // fatal), and answer the send with the REAL typed
+                    // CommandResult — all before the fake turn journals its
+                    // output, exactly as DevNode accepts at enqueue time and the
+                    // worker runs afterwards. The previous hand-written
+                    // `{ok:true}` / `{accepted:true,command:{…}}` envelopes are
+                    // gone; reverting the shared builder or the ack wait
+                    // reddens the accept_reply regression.
+                    let accepted = accept_instance_send(
                         &mut ws,
                         &mut frame_queue,
+                        id,
                         &instance_id,
                         append_n,
                         prompt,
-                        command_id,
+                        command_id.context("instance.send requires commandId")?,
+                        None,
                     )
                     .await?;
+                    append_n = accepted.append_seq;
                     // D-027: echo the attachment metadata the Hub resolved, so the
                     // e2e can prove staging reached the Node without a real agent.
                     // 2026-09-15: also echo the [Image #n] manifest (index +
@@ -2233,25 +2246,9 @@ async fn fake_node(
                         };
                     append_n =
                         append_native_status(&mut ws, &instance_id, append_n, next_status).await?;
-                    // The user message + status were just journal.append'd and
-                    // each frame's durable ack awaited, so the command is
-                    // durably enqueued. A real Node (DevNode::enqueue_existing)
-                    // calls accept_command and replies with the accepted-command
-                    // envelope — the hub marks the row accepted from the RPC
-                    // itself. The envelope builder is shared with the
-                    // accept_reply regression (tests/support/mod.rs), so
-                    // reverting it reddens that test too. The previous bare
-                    // `{ok:true}` left node_accepted() false and relied solely
-                    // on the mirrored journal to converge the row, which raced
-                    // the client's immediate post-reconnect read under load
-                    // (offline-outbox reload flake).
-                    send_instance_send_rpc(
-                        &mut ws,
-                        id,
-                        InstanceSendReply::AcceptedEnvelope,
-                        command_id.unwrap_or(""),
-                    )
-                    .await?;
+                    // The acceptance RPC was already sent by accept_instance_send
+                    // above (durable user append → real CommandResult), before
+                    // the turn output streamed — matching DevNode enqueue/accept.
                 }
                 "instance.cancel" => {
                     // §5.3: the turn ends but the instance keeps running.

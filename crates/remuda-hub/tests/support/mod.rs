@@ -1,14 +1,13 @@
 //! Shared fake-Node machinery for the `hub_e2e` example harness and the
 //! `accept_reply` regression test.
 //!
-//! c-acceptrace round 3: the `instance.send` acceptance sequence the fake Node
-//! runs — durably `journal.append` the user message, await the MATCHING append
-//! ack (queuing unrelated frames instead of swallowing them), then answer the
-//! Hub RPC with the accepted-command envelope — used to exist as TWO copies:
-//! one in `examples/hub_e2e.rs` and a second, divergent one in
-//! `tests/accept_reply.rs`. The regression test only ever exercised its own
-//! copy, so reverting the harness arm left the test green. Both call sites now
-//! build the reply and wait for the ack through this one module.
+//! The fake Node's `instance.send` acceptance lives in ONE place here —
+//! [`accept_instance_send`]: durably `journal.append` the user message, await
+//! the MATCHING append ack (queuing unrelated frames instead of swallowing
+//! them, failing on an RPC error), and answer the Hub RPC with the REAL typed
+//! `CommandResult` ([`real_command_result`]). Both the e2e harness and the
+//! regression call that exact function, so neither copy can drift back to the
+//! old hand-written envelope or the discarded ack without reddening the test.
 
 // This file is compiled as part of TWO binaries (the hub_e2e example and the
 // accept_reply integration test), each of which uses a different subset of
@@ -369,25 +368,6 @@ pub(crate) async fn durable_command_append(
     Ok((seq, ack))
 }
 
-/// The accepted-command envelope the fake Node returns for `instance.send`
-/// AFTER the user message is durable. A real Node (`DevNode::submit_command`
-/// → `accept_command`) replies `{accepted:true, command:{state:"accepted",
-/// commandId}}`; the Hub marks the row accepted from the RPC itself rather
-/// than waiting for the mirrored journal to converge it.
-///
-/// Single construction point shared by the e2e harness and the regression
-/// test: "reverting the fix" means reverting THIS builder.
-pub(crate) fn accepted_command_envelope(command_id: &str) -> Value {
-    json!({
-        "ok": true,
-        "accepted": true,
-        "command": {
-            "state": "accepted",
-            "commandId": command_id,
-        }
-    })
-}
-
 /// Serialize the REAL `instance.send` result a DevNode returns: a typed
 /// `CommandResult` = `{command, relatedCommandIds}` for an accepted command —
 /// NO top-level `accepted` or `ok` (the real Node never sends those;
@@ -396,8 +376,10 @@ pub(crate) fn accepted_command_envelope(command_id: &str) -> Value {
 ///
 /// The value is produced by serde from the protocol structs rather than a JSON
 /// literal, so the case tracks the real wire schema (field names, nesting,
-/// enum spellings).
-pub(crate) fn real_command_result(command_id: &str) -> Result<Value> {
+/// enum spellings). This is the SINGLE accepted-reply builder shared by the
+/// e2e harness and the regression: reverting it to a bare `{ok:true}` reddens
+/// the accepting test while leaving every other path untouched.
+pub(crate) fn real_command_result(command_id: &str, instance_id: &str) -> Result<Value> {
     use remuda_protocol::{
         Acceptance, AcceptanceScope, ActorRef, ActorType, Command as ProtocolCommand,
         CommandAuthority, CommandId, CommandOperation, CommandOrigin, CommandResult, CommandState,
@@ -411,8 +393,9 @@ pub(crate) fn real_command_result(command_id: &str) -> Result<Value> {
 
     let id = CommandId::try_from(command_id.to_owned())
         .with_context(|| format!("fixture command id {command_id} must be a branded cmd_ id"))?;
+    let instance_id = InstanceId::try_from(instance_id.to_owned())
+        .with_context(|| format!("fixture instance id {instance_id} must be a branded ins_ id"))?;
     let host_id = HostId::try_from(String::from(Id::new("hst")?))?;
-    let instance_id = InstanceId::new();
     let now: Timestamp = FIXED_NOW.to_owned().try_into()?;
     let digest = format!("sha256:{}", "0".repeat(64)).try_into()?;
     let command = ProtocolCommand {
@@ -475,44 +458,86 @@ pub(crate) fn real_command_result(command_id: &str) -> Result<Value> {
     Ok(serde_json::to_value(result)?)
 }
 
-/// Which `instance.send` result shape a fake Node answers with. The e2e
-/// harness only ever plays [`Self::AcceptedEnvelope`]; the other shapes exist
-/// for tests/accept_reply.rs, which compiles this module as part of its own
-/// binary — hence the crate-local dead-code allowance.
+/// Send the REAL accepted `CommandResult` for one `instance.send` RPC;
+/// returns the exact result object sent so a caller can correlate it.
+pub(crate) async fn send_command_result_reply(
+    ws: &mut NodeWs,
+    rpc_id: Value,
+    command_id: &str,
+    instance_id: &str,
+) -> Result<Value> {
+    let result = real_command_result(command_id, instance_id)?;
+    send_rpc_ok(ws, rpc_id, result.clone()).await?;
+    Ok(result)
+}
+
+/// Everything [`accept_instance_send`] produced, so a caller (the regression)
+/// can assert every half of the acceptance contract.
+pub(crate) struct DurableSendAcceptance {
+    /// Append seq after the durable user message (`append_n` for the next
+    /// append).
+    pub append_seq: u64,
+    /// The validated journal.append success ack.
+    pub append_ack: Value,
+    /// The exact `CommandResult` object the RPC was answered with.
+    pub send_result: Value,
+}
+
+/// THE fake-Node `instance.send` acceptance contract, in ONE function shared
+/// by the e2e harness and the accept_reply regression:
+/// 1. durably `journal.append` the command's user message;
+/// 2. await the MATCHING append ack — an RPC error returns `Err` and NO send
+///    reply is written (the caller maps it to the send RPC error);
+/// 3. answer the Hub RPC with the REAL typed `CommandResult`.
+///
+/// `seq_hint` is `None` for the harness and the accepting cases; the
+/// rejected-append regression pins a hint past the durable cursor so step 2
+/// deterministically fails over the SAME code. The real DevNode accepts at
+/// enqueue time and the turn journals afterwards, so the harness calls this
+/// BEFORE appending assistant/status events.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn accept_instance_send(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    rpc_id: Value,
+    instance_id: &str,
+    n: u64,
+    text: &str,
+    command_id: &str,
+    seq_hint: Option<i64>,
+) -> Result<DurableSendAcceptance> {
+    let (append_seq, append_ack) =
+        durable_command_append(ws, queue, instance_id, n, text, Some(command_id), seq_hint).await?;
+    let send_result = send_command_result_reply(ws, rpc_id, command_id, instance_id).await?;
+    Ok(DurableSendAcceptance {
+        append_seq,
+        append_ack,
+        send_result,
+    })
+}
+
+/// Non-acceptance `instance.send` result shapes kept ONLY as predicate
+/// regression cases in accept_reply.rs. The real acceptance path is
+/// [`accept_instance_send`] and never uses these.
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) enum InstanceSendReply {
-    /// Minimal accepted envelope ([`accepted_command_envelope`]); the e2e
-    /// fake Node's reply.
-    AcceptedEnvelope,
-    /// A real typed `CommandResult` serialization ([`real_command_result`]):
-    /// accepted command plus `relatedCommandIds`, no top-level accepted/ok.
-    RealCommandResult,
     /// `{accepted:true}` at the result top level (no command object).
     TopLevelAccepted,
     /// The pre-fix fake-node reply; never a durable acceptance.
     BareOk,
 }
 
-/// Build the `result` object for one [`InstanceSendReply`] shape.
-pub(crate) fn instance_send_result(shape: InstanceSendReply, command_id: &str) -> Result<Value> {
-    Ok(match shape {
-        InstanceSendReply::AcceptedEnvelope => accepted_command_envelope(command_id),
-        InstanceSendReply::RealCommandResult => real_command_result(command_id)?,
-        InstanceSendReply::TopLevelAccepted => json!({ "accepted": true }),
-        InstanceSendReply::BareOk => json!({ "ok": true }),
-    })
-}
-
-/// Answer one `instance.send` RPC with the chosen shape; returns the exact
-/// result object sent, so a test can assert the reply the Hub accepted from.
+/// Answer one `instance.send` RPC with an alternative shape (after the shared
+/// durable append already succeeded); returns the exact result object sent.
 pub(crate) async fn send_instance_send_rpc(
     ws: &mut NodeWs,
     id: Value,
     shape: InstanceSendReply,
-    command_id: &str,
 ) -> Result<Value> {
-    let result = instance_send_result(shape, command_id)?;
+    let result = match shape {
+        InstanceSendReply::TopLevelAccepted => json!({ "accepted": true }),
+        InstanceSendReply::BareOk => json!({ "ok": true }),
+    };
     send_rpc_ok(ws, id, result.clone()).await?;
     Ok(result)
 }

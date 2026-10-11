@@ -1,17 +1,18 @@
-//! c-acceptrace round 3: the fake Node acceptance sequence for
-//! `instance.send` is shared with the e2e harness (`tests/support/mod.rs`).
+//! c-acceptrace round 4: the accepting `instance.send` case and the e2e
+//! harness run the SAME function — [`support::accept_instance_send`]:
+//! durable `journal.append` of the user message, await the MATCHING ack
+//! (failing on an RPC error), and answer the Hub RPC with the REAL typed
+//! `CommandResult` (no hand-written envelope exists anywhere).
 //!
-//! * item 1 — the accepted reply comes from the SAME arm the harness runs
-//!   (`durable_command_append` + the shared envelope builders), so reverting
-//!   that arm reddens this file.
-//! * item 2 — the primary acceptance case is a REAL typed `CommandResult`
-//!   (`{command, relatedCommandIds}`, no top-level accepted/ok); a bare
-//!   top-level `accepted:true` is kept as a separate case.
-//! * item 3 — the fake Node waits for the MATCHING `jappend` response id: an
-//!   RPC error (journal seq gap) makes it answer `instance.send` with an RPC
-//!   error instead of a fake acceptance; the success ack's durable fields and
-//!   the durable journal message are both asserted. Unrelated frames arriving
-//!   while waiting for the ack are queued, never swallowed.
+//! * accepting case — goes through the shared function, which is also the
+//!   harness's only send-accept path; reverting its reply builder to
+//!   `{ok:true}` (or splitting the append so the ack is skipped) reddens this
+//!   file;
+//! * top-level `accepted:true` and bare `{ok:true}` stay as separate
+//!   predicate-regression cases (durable append, alternative reply);
+//! * seq-gap case — a rejected append is carried to the send RPC as an error,
+//!   the row settles rejected, and no message is durable;
+//! * two loopback unit tests prove ack matching by id and error surfacing.
 
 mod support;
 
@@ -27,8 +28,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::client::IntoClientRequest};
 
 use support::{
-    AckFrame, FrameQueue, InstanceSendReply, NodeWs, await_ack_frame, durable_command_append,
-    send_instance_send_rpc, send_rpc_error, send_rpc_ok,
+    AckFrame, FrameQueue, InstanceSendReply, NodeWs, accept_instance_send, await_ack_frame,
+    durable_command_append, send_instance_send_rpc, send_rpc_error, send_rpc_ok,
 };
 
 const PROMPT: &str = "acceptrace prompt";
@@ -39,30 +40,17 @@ const GAP_SEQ: i64 = 50;
 /// How the fake Node plays the one `instance.send` in a scenario.
 #[derive(Clone, Copy)]
 enum FakeBehavior {
-    /// Durable append succeeds; answer with this result shape.
+    /// The ONE shared acceptance contract the e2e harness runs:
+    /// [`accept_instance_send`] — durable append, matched ack, REAL typed
+    /// `CommandResult` reply.
+    AcceptShared,
+    /// Durable append succeeds; answer with this non-acceptance result shape
+    /// (predicate-alternative regression cases).
     Reply(InstanceSendReply),
     /// Force a seq-gap append error. A contract-correct Node maps that to an
     /// RPC error for the send; one that ignores the append error would instead
     /// answer accepted — the false acceptance this scenario guards.
     GapRejectsSend,
-}
-
-impl FakeBehavior {
-    /// Seq hint carried on the append frame.
-    fn seq_hint(self) -> Option<i64> {
-        match self {
-            FakeBehavior::Reply(_) => None,
-            FakeBehavior::GapRejectsSend => Some(GAP_SEQ),
-        }
-    }
-
-    /// Envelope used for the send reply when the durable append SUCCEEDS.
-    fn accepted_shape(self) -> InstanceSendReply {
-        match self {
-            FakeBehavior::Reply(shape) => shape,
-            FakeBehavior::GapRejectsSend => InstanceSendReply::RealCommandResult,
-        }
-    }
 }
 
 /// Everything the test inspects after the POST.
@@ -177,45 +165,81 @@ async fn spawn_fake_node(
                                 .as_str()
                                 .map(str::to_string)
                                 .unwrap_or_default();
-                            // Shared durable contract: append the user message,
-                            // wait for the MATCHING ack and validate it. A
-                            // rejected append (seq gap) is carried to the send
-                            // RPC as an error — the Node never claims
-                            // acceptance after a failed durable write.
-                            match durable_command_append(
-                                &mut ws,
-                                &mut queue,
-                                &iid,
-                                append_n,
-                                PROMPT,
-                                Some(&command_id),
-                                behavior.seq_hint(),
-                            )
-                            .await
-                            {
-                                Ok((new_n, ack)) => {
-                                    append_n = new_n;
-                                    let result = send_instance_send_rpc(
+                            match behavior {
+                                FakeBehavior::AcceptShared => {
+                                    // The EXACT function the e2e harness calls:
+                                    // durable append + matched ack + the real
+                                    // CommandResult reply.
+                                    let accepted = accept_instance_send(
                                         &mut ws,
+                                        &mut queue,
                                         id,
-                                        behavior.accepted_shape(),
+                                        &iid,
+                                        append_n,
+                                        PROMPT,
                                         &command_id,
+                                        None,
                                     )
                                     .await?;
+                                    append_n = accepted.append_seq;
+                                    let mut rec = record.lock().await;
+                                    rec.append_ack = Some(accepted.append_ack);
+                                    rec.send_result = Some(accepted.send_result);
+                                }
+                                FakeBehavior::Reply(shape) => {
+                                    // Same durable append half; only the RPC
+                                    // result shape differs (predicate cases).
+                                    let (new_n, ack) = durable_command_append(
+                                        &mut ws,
+                                        &mut queue,
+                                        &iid,
+                                        append_n,
+                                        PROMPT,
+                                        Some(&command_id),
+                                        None,
+                                    )
+                                    .await?;
+                                    append_n = new_n;
+                                    let result = send_instance_send_rpc(&mut ws, id, shape).await?;
                                     let mut rec = record.lock().await;
                                     rec.append_ack = Some(ack);
                                     rec.send_result = Some(result);
                                 }
-                                Err(error) => {
-                                    let message = error.to_string();
-                                    send_rpc_error(
+                                FakeBehavior::GapRejectsSend => {
+                                    // The SAME shared function, with a seq hint
+                                    // past the durable cursor: the append must
+                                    // fail, no accepted reply is sent, and the
+                                    // Node carries the error to the send RPC.
+                                    match accept_instance_send(
                                         &mut ws,
-                                        id,
-                                        -32000,
-                                        &format!("node did not accept instance.send: {message}"),
+                                        &mut queue,
+                                        id.clone(),
+                                        &iid,
+                                        append_n,
+                                        PROMPT,
+                                        &command_id,
+                                        Some(GAP_SEQ),
                                     )
-                                    .await?;
-                                    record.lock().await.append_error = Some(message);
+                                    .await
+                                    {
+                                        Ok(accepted) => anyhow::bail!(
+                                            "fixture: expected a journal-gap error, got {}",
+                                            accepted.send_result
+                                        ),
+                                        Err(error) => {
+                                            let message = error.to_string();
+                                            send_rpc_error(
+                                                &mut ws,
+                                                id,
+                                                -32000,
+                                                &format!(
+                                                    "node did not accept instance.send: {message}"
+                                                ),
+                                            )
+                                            .await?;
+                                            record.lock().await.append_error = Some(message);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -409,7 +433,7 @@ fn assert_durable_message(obs: &SendObservation) {
 /// this case), and the user message is durable with the acked event id.
 #[tokio::test]
 async fn instance_send_with_a_real_command_result_is_accepted() -> anyhow::Result<()> {
-    let obs = run_scenario(FakeBehavior::Reply(InstanceSendReply::RealCommandResult)).await?;
+    let obs = run_scenario(FakeBehavior::AcceptShared).await?;
     assert_eq!(
         obs.state, "accepted",
         "a real CommandResult with command.state=accepted must accept; got {}",

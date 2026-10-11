@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  instanceDeliveryLockName,
   LEASE_TTL_MS,
   newCommandId,
   Outbox,
@@ -149,27 +150,44 @@ describe("Outbox", () => {
     expect(reloaded.pending().map((r) => r.commandId)).toEqual(["cmd_a"]);
   });
 
-  it("GATE7: a reload by the SAME profile reclaims its own stale inflight claim immediately", async () => {
-    const owner = "owner_reload_same_profile";
-    const first = await Outbox.load(storage, owner);
-    await first.enqueue(rec({ commandId: "cmd_inflight", instanceId: "ins_1" }));
-    // Claim the durable inflight lease the way a flush does right before its
-    // POST — then the page context is destroyed (no rollback, no finish()).
-    await first.patch("cmd_inflight", {
-      state: "inflight",
-      attempts: 1,
-      lease: { owner, until: Date.now() + LEASE_TTL_MS },
+  it("GATE11 item 3: same-owner fresh lease with NO Web Locks API is UNKNOWN — kept until TTL, reclaimed once expired", async () => {
+    // Gate 7 used to reclaim a same-owner claim immediately; gate 11 item 3
+    // changes the no-Web-Locks outcome to UNKNOWN: a cloned live tab cannot be
+    // distinguished from a dead context without locks.query, so the fresh
+    // lease stands until its deadline and only an expired claim is requeued.
+    const originalLocks = (globalThis.navigator as { locks?: LockManager }).locks;
+    Object.defineProperty(globalThis.navigator, "locks", {
+      value: undefined,
+      configurable: true,
     });
-    expect(storage.map.get("cmd_inflight")?.state).toBe("inflight");
+    try {
+      const owner = "owner_reload_no_locks";
+      const first = await Outbox.load(storage, owner);
+      await first.enqueue(rec({ commandId: "cmd_inflight", instanceId: "ins_1" }));
+      await first.patch("cmd_inflight", {
+        state: "inflight",
+        attempts: 1,
+        lease: { owner, until: Date.now() + LEASE_TTL_MS },
+      });
 
-    // New context, same browser profile (stable owner id): the claim cannot
-    // have a POST in flight any more, so it is requeued immediately, both in
-    // the cache and durably — no waiting out the 30 s lease TTL.
-    const reloaded = await Outbox.load(storage, owner);
-    expect(reloaded.pendingFor("ins_1").map((r) => r.commandId)).toEqual(["cmd_inflight"]);
-    // A durable re-read must not resurrect the stale claim.
-    expect(storage.map.get("cmd_inflight")?.state).toBe("pending");
-    expect(storage.map.get("cmd_inflight")?.lease).toBeUndefined();
+      const reloaded = await Outbox.load(storage, owner);
+      expect(reloaded.pendingFor("ins_1")).toEqual([]);
+      expect(storage.map.get("cmd_inflight")?.state).toBe("inflight");
+
+      // Once the lease has expired the claim is reclaimed.
+      await first.patch("cmd_inflight", {
+        state: "inflight",
+        lease: { owner, until: Date.now() - 1 },
+      });
+      const reloadedExpired = await Outbox.load(storage, owner);
+      expect(reloadedExpired.pendingFor("ins_1").map((r) => r.commandId)).toEqual(["cmd_inflight"]);
+      expect(storage.map.get("cmd_inflight")?.state).toBe("pending");
+    } finally {
+      Object.defineProperty(globalThis.navigator, "locks", {
+        value: originalLocks,
+        configurable: true,
+      });
+    }
   });
 
   it("GATE7: another owner's FRESH inflight lease is never stolen on load", async () => {
@@ -233,41 +251,126 @@ describe("Outbox", () => {
     }
   });
 
-  it("GATE10 item 6: a same-owner fresh lease is NOT reclaimed when a live context holds the instance lock", async () => {
+  it("GATE11 item 3: a same-owner fresh lease is NOT reclaimed when the REAL instance Web Lock is held", async () => {
     // Duplicated tab (cloned sessionStorage → same tabOwner): tab A is
-    // delivering and holds the durable Web Lock. Tab B loads with a stubbed
-    // navigator.locks.query reporting the holder → it must leave A's fresh
-    // inflight row untouched and not deliver it.
+    // delivering and holds the durable Web Lock under its REAL name
+    // (instanceDeliveryLockName — the exact string acquireLock requests).
+    // Gate 10 queried the wrong name ("__lock__:<instance>" is only the
+    // no-Web-Locks lease row key), never saw the holder, and requeued anyway.
+    const instanceId = "ins_same";
     const originalQuery = (globalThis as { navigator?: Navigator }).navigator?.locks?.query;
     const originalNavigator = globalThis.navigator;
-    const heldNames = new Set<string>(["__lock__:ins_same"]);
+    const heldName = instanceDeliveryLockName(instanceId);
     Object.defineProperty(globalThis, "navigator", {
       configurable: true,
       value: {
         locks: {
-          query: async () => ({ held: [...heldNames].map((name) => ({ name, mode: "exclusive" as const })) }),
+          query: async () => ({ held: [{ name: heldName, mode: "exclusive" as const }] }),
         },
       },
     });
     try {
       const store = new MemStorage();
       const a = await Outbox.load(store, "owner_dup");
-      await a.enqueue(rec({ commandId: "cmd_dup", instanceId: "ins_same" }));
+      await a.enqueue(rec({ commandId: "cmd_dup", instanceId }));
       await a.patch("cmd_dup", {
         state: "inflight",
         lease: { owner: "owner_dup", until: Date.now() + LEASE_TTL_MS },
       });
       // B has the same owner (cloned sessionStorage) and sees the lock held.
       const b = await Outbox.load(store, "owner_dup");
-      expect(b.pendingFor("ins_same")).toEqual([]);
+      expect(b.pendingFor(instanceId)).toEqual([]);
       const row = store.map.get("cmd_dup")!;
       expect(row.state).toBe("inflight");
       expect(row.lease?.owner).toBe("owner_dup");
       // A (the real holder) can still see/deliver it via its cache.
-      expect(a.pendingFor("ins_same")).toEqual([]);
+      expect(a.pendingFor(instanceId)).toEqual([]);
     } finally {
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
       void originalQuery;
+    }
+  });
+
+  /** Install an isolated per-tab sessionStorage stub seeded with an owner id. */
+  function sessionWithOwner(owner: string): Storage {
+    const m = new Map<string, string>([["remuda-outbox-owner", owner]]);
+    return {
+      getItem: (k: string) => m.get(k) ?? null,
+      setItem: (k: string, v: string) => void m.set(k, v),
+      removeItem: (k: string) => void m.delete(k),
+      clear: () => m.clear(),
+      key: () => null,
+      length: m.size,
+    } as Storage;
+  }
+
+  it("GATE11 item 3: cloned sessionStorage tabs (DEFAULT load) — holder present keeps A's POST claim; absent locks same; gone holder requeues", async () => {
+    // Realistic two-tab bookkeeping through Outbox.load with NO explicit owner
+    // argument: each tab's tabOwner() reads its own sessionStorage stub;
+    // "duplicate tab" clones sessionStorage, so both stubs carry the SAME
+    // owner id.
+    const instanceId = "ins_clone";
+    const clonedOwner = "owner_cloned_session";
+    const originalNavigator = globalThis.navigator;
+    const originalSession = globalThis.sessionStorage;
+    const shared = new MemStorage();
+    try {
+      // Tab A loads, enqueues and claims inflight (POST pending).
+      Object.defineProperty(globalThis, "sessionStorage", {
+        configurable: true,
+        value: sessionWithOwner(clonedOwner),
+      });
+      const a = await Outbox.load(shared);
+      expect(a.ownerId).toBe(clonedOwner);
+      await a.enqueue(rec({ commandId: "cmd_clone", instanceId }));
+      await a.patch("cmd_clone", {
+        state: "inflight",
+        lease: { owner: clonedOwner, until: Date.now() + LEASE_TTL_MS },
+      });
+
+      // Tab B: cloned sessionStorage (same owner), its own stub object.
+      Object.defineProperty(globalThis, "sessionStorage", {
+        configurable: true,
+        value: sessionWithOwner(clonedOwner),
+      });
+      const heldName = instanceDeliveryLockName(instanceId);
+      Object.defineProperty(globalThis, "navigator", {
+        configurable: true,
+        value: {
+          locks: { query: async () => ({ held: [{ name: heldName, mode: "exclusive" as const }] }) },
+        },
+      });
+      const bHeld = await Outbox.load(shared);
+      expect(bHeld.ownerId).toBe(clonedOwner);
+      // B neither requeues nor can deliver: claim stays fresh inflight.
+      expect(bHeld.pendingFor(instanceId)).toEqual([]);
+      expect(shared.map.get("cmd_clone")?.state).toBe("inflight");
+
+      // Same tab loading with Web Locks ABSENT: unknown ownership, same result.
+      Object.defineProperty(globalThis, "navigator", {
+        configurable: true,
+        value: { locks: undefined },
+      });
+      const bNoLocks = await Outbox.load(shared);
+      expect(bNoLocks.pendingFor(instanceId)).toEqual([]);
+      expect(shared.map.get("cmd_clone")?.state).toBe("inflight");
+
+      // A is gone (locks.query reports no holder): the dead context's claim is
+      // requeued immediately.
+      Object.defineProperty(globalThis, "navigator", {
+        configurable: true,
+        value: { locks: { query: async () => ({ held: [] }) } },
+      });
+      const bFree = await Outbox.load(shared);
+      expect(bFree.pendingFor(instanceId).map((r) => r.commandId)).toEqual(["cmd_clone"]);
+      expect(shared.map.get("cmd_clone")?.state).toBe("pending");
+      expect(shared.map.get("cmd_clone")?.lease).toBeUndefined();
+    } finally {
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+      Object.defineProperty(globalThis, "sessionStorage", {
+        configurable: true,
+        value: originalSession,
+      });
     }
   });
 

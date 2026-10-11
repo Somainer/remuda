@@ -175,6 +175,20 @@ export interface OutboxStorage {
 /** Lease lifetime for a delivery; a crashed owner's lease steals after this. */
 export const LEASE_TTL_MS = 30_000;
 
+/**
+ * The Web Lock name guarding delivery for ONE instance. This is the ONLY place
+ * that computes it — acquireLock() requests exactly this name and Outbox.load
+ * asks the LockManager whether exactly this name is held (c-reconnfu gate 11
+ * item 3: the holder query used a different string than the request, so a live
+ * same-owner cloned tab's lock was never recognised and the fresh claim was
+ * requeued under the POSTing tab). Distinct from the durable lease row key
+ * (`__lock__:<instance>`, see leaseKey), which exists only in the no-Web-Locks
+ * fallback.
+ */
+export function instanceDeliveryLockName(instanceId: Id): string {
+  return `remuda-outbox-${instanceId}`;
+}
+
 const IDB_NAME = "remuda-outbox";
 const IDB_STORE = "commands";
 const LS_KEY = "remuda-outbox-v1";
@@ -457,14 +471,20 @@ export class Outbox {
       box.cache.set(rec.commandId, rec);
     }
     const now = Date.now();
-    // c-reconnfu gate 10 item 6: a same-owner FRESH lease may belong to a
-    // LIVE sibling tab/duplicated window that cloned sessionStorage (it has
-    // the same owner id). Before reclaiming it immediately, ask the Web Locks
-    // manager whether the instance delivery lock is held in THIS browser
-    // context. Held → the other tab is delivering; wait for the lease TTL like
-    // a foreign lease. No Web Locks API (private mode/no SW fallback) → also
-    // treat as foreign (safe; the durable Web Lock is unavailable there
-    // anyway). A prior CONTEXT (reload/SW restore) holds nothing.
+    // c-reconnfu gate 11 item 3 (gate 10 item 6 corrected): a same-owner
+    // FRESH lease may belong to a LIVE sibling tab/duplicated window that
+    // cloned sessionStorage (same owner id). Before reclaiming it, ask the Web
+    // Locks manager whether the instance delivery lock — the SAME name
+    // acquireLock requests (instanceDeliveryLockName) — is held in THIS
+    // browser context. Three outcomes:
+    //  - held:    a live same-owner cloned tab is delivering; keep the fresh
+    //             claim until its lease expires, never requeue under it;
+    //  - free:    no holder → this profile's PREVIOUS context left the claim
+    //             (a fresh context owns the fetch lifecycle) → reclaim now;
+    //  - unknown: the Web Locks API is absent OR locks.query threw. We cannot
+    //             tell a live cloned tab from a dead context → fail safe and
+    //             keep the fresh lease until it expires (no immediate reclaim).
+    let locksQueryOk = false;
     const locksHeld = new Set<string>();
     if (typeof navigator !== "undefined" && typeof navigator.locks?.query === "function") {
       try {
@@ -472,31 +492,27 @@ export class Outbox {
         for (const lock of snapshot.held ?? []) {
           if (typeof lock.name === "string") locksHeld.add(lock.name);
         }
+        locksQueryOk = true;
       } catch {
-        // If the query itself fails, do NOT reclaim same-owner fresh leases:
-        // leave them to the TTL (fail safe).
-        locksHeld.add("__locks_unavailable__");
+        // Query failure is UNKNOWN ownership, not proof the context is dead.
+        locksQueryOk = false;
       }
-    } else {
-      locksHeld.add("__locks_unavailable__");
     }
     const requeue: Id[] = [];
     for (const [id, rec] of box.cache) {
       if (rec.state !== "inflight") continue;
       if (rec.lease?.owner === box.owner) {
-        const lockName = `__lock__:${rec.instanceId}`;
-        if (locksHeld.has(lockName)) {
-          // A live same-owner context (duplicated tab/opener window) holds
-          // the instance lock: it is delivering this command. Wait for TTL.
-          if (rec.lease.until > now) continue;
-          requeue.push(id);
-        } else {
-          // This browser profile's PREVIOUS context left the claim: no POST
-          // can still be in flight here (a fresh context owns the fetch
-          // lifecycle), so requeue immediately instead of waiting out the
-          // lease TTL.
-          requeue.push(id);
+        const ownership: "held" | "free" | "unknown" = !locksQueryOk
+          ? "unknown"
+          : locksHeld.has(instanceDeliveryLockName(rec.instanceId))
+            ? "held"
+            : "free";
+        if (ownership !== "free" && rec.lease.until > now) {
+          // Held by a live cloned tab, or ownership unknowable: the fresh
+          // same-owner lease stands until its deadline.
+          continue;
         }
+        requeue.push(id);
       } else if (!rec.lease || rec.lease.until <= now) {
         // A row left inflight by another (possibly crashed) process is
         // returned to a deliverable state once its lease expires; the durable
@@ -680,7 +696,7 @@ export class Outbox {
   ): Promise<T | null> {
     const locks = (globalThis as { navigator?: Navigator & { locks?: LockManager } }).navigator?.locks;
     if (locks?.request) {
-      return await locks.request(`remuda-outbox-${instanceId}`, { mode: "exclusive" }, () =>
+      return await locks.request(instanceDeliveryLockName(instanceId), { mode: "exclusive" }, () =>
         this.runDeliverer(instanceId, fn),
       );
     }

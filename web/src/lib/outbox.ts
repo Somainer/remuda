@@ -519,12 +519,17 @@ export class Outbox {
    * context is not itself POSTing): same-owner claims kept until their
    * deadline (held/unknown, gate 11 item 3) and claims whose load-time
    * reclaim failed (gate 10 item 8). One handle per commandId; a row leaving
-   * inflight (or {@link dispose}) cancels it (c-reconnfu gate 11 item 5: the
-   * old load fallback armed an UNTRACKED setTimeout that only refreshed the
-   * cache — no requeue, no flush — so the row stranded until an unrelated UI
-   * event and could never be cancelled).
+   * inflight (or {@link dispose}) cancels it (c-reconnfu gate 11 item 5).
+   *
+   * Gate 12 item 1: the entry carries the EXACT lease snapshot observed when
+   * it was armed. The deadline callback may reclaim that snapshot only after
+   * its own deadline; a live retry that renewed the lease to a later until
+   * re-arms instead of forcing the renewed live claim back to pending.
    */
-  private claimWakeups = new Map<Id, ReturnType<typeof setTimeout>>();
+  private claimWakeups = new Map<
+    Id,
+    { instanceId: Id; snapshot: { owner: Id; until: number }; handle: ReturnType<typeof setTimeout> }
+  >();
 
   /**
    * Store hook fired exactly once when a tracked wakeup reclaims a row: the
@@ -611,7 +616,7 @@ export class Outbox {
           // same-owner lease stands until its deadline. A TRACKED wakeup
           // reclaims it at expiry (item 5) — the cloned tab may be gone by
           // then; until then this context neither requeues nor delivers.
-          box.scheduleClaimWakeup(id, rec.lease.until);
+          box.scheduleClaimWakeup(id, rec.instanceId, rec.lease);
           continue;
         }
         requeue.push({ id, instanceId: rec.instanceId, expected: rec.lease });
@@ -668,7 +673,7 @@ export class Outbox {
           // Persist failed twice: the row is still (durable) inflight with its
           // lease. The TRACKED expiry wakeup (item 5) reclaims and triggers
           // delivery at the deadline instead of merely refreshing the cache.
-          box.scheduleClaimWakeup(id, expected.until);
+          box.scheduleClaimWakeup(id, instanceId, expected);
         }
       }),
     );
@@ -766,28 +771,29 @@ export class Outbox {
 
   /**
    * Arm (or replace) the tracked lease-expiry wakeup for one inactive claim.
-   * At the deadline it re-reads the durable row and, only if the row is STILL
-   * the inflight claim with the expected lease, atomically reclaims it to
-   * pending and fires {@link onClaimWake} exactly once (the store's
-   * flushAllOutbox then performs exactly one delivery under the single
-   * deliverer lock). A lease renewed past the deadline re-arms the wakeup; a
-   * terminal/changed row or a missing row cancels silently.
+   * The entry remembers the observed lease SNAPSHOT (gate 12 item 1): at the
+   * deadline fireClaimWakeup may reclaim exactly that lease and only after it
+   * is due; a row carrying a later renewed lease re-arms for that deadline.
    */
-  private scheduleClaimWakeup(commandId: Id, until: number) {
+  private scheduleClaimWakeup(
+    commandId: Id,
+    instanceId: Id,
+    snapshot: { owner: Id; until: number },
+  ) {
     const old = this.claimWakeups.get(commandId);
-    if (old) clearTimeout(old);
-    const delay = Math.max(0, until - Date.now());
+    if (old) clearTimeout(old.handle);
+    const delay = Math.max(0, snapshot.until - Date.now());
     const handle = setTimeout(() => {
       this.claimWakeups.delete(commandId);
-      void this.fireClaimWakeup(commandId);
+      void this.fireClaimWakeup(commandId, instanceId, snapshot);
     }, delay);
-    this.claimWakeups.set(commandId, handle);
+    this.claimWakeups.set(commandId, { instanceId, snapshot, handle });
   }
 
   private clearClaimWakeup(commandId: Id) {
-    const handle = this.claimWakeups.get(commandId);
-    if (handle) {
-      clearTimeout(handle);
+    const entry = this.claimWakeups.get(commandId);
+    if (entry) {
+      clearTimeout(entry.handle);
       this.claimWakeups.delete(commandId);
     }
   }
@@ -797,35 +803,58 @@ export class Outbox {
     return [...this.claimWakeups.keys()];
   }
 
-  private async fireClaimWakeup(commandId: Id) {
-    const durable = await this.refreshFromStorage().catch(() => null);
-    const rec = durable?.find((r) => r.commandId === commandId);
-    // Delivered, deleted or no longer a claim: nothing to wake.
-    if (!rec || rec.state !== "inflight" || !rec.lease) return;
-    const reclaimed = await this.storage.reclaimInflight(commandId, rec.lease).catch(() => null);
-    if (!reclaimed) {
-      // Storage still failing: retry the reclaim at a bounded short poll
-      // instead of losing the row; the lease is already expired.
-      this.scheduleClaimWakeup(commandId, Date.now() + 250);
-      return;
+  /**
+   * Run `fn` under the per-instance Web Lock whenever the API exists —
+   * independent of whether locks.query was usable at load (gate 12 item 5 for
+   * the load path; the deadline path uses it regardless). With no Web Locks
+   * the durable IDB/localStorage lease remains the serialization boundary.
+   */
+  private async runUnderInstanceLock<T>(instanceId: Id, fn: () => Promise<T>): Promise<T> {
+    const locks = (globalThis as { navigator?: Navigator & { locks?: LockManager } }).navigator?.locks;
+    if (locks?.request) {
+      return await locks.request(instanceDeliveryLockName(instanceId), { mode: "exclusive" }, fn);
     }
-    if (reclaimed.state !== "pending") {
-      // The live owner moved the lease/row: follow a renewed fresh lease,
-      // otherwise the row is terminal and the wakeup is done.
-      const until = reclaimed.state === "inflight" ? reclaimed.lease?.until : undefined;
-      if (typeof until === "number" && until > Date.now()) this.scheduleClaimWakeup(commandId, until);
-      this.cache.set(commandId, reclaimed);
-      return;
-    }
+    return await fn();
+  }
+
+  private async fireClaimWakeup(
+    commandId: Id,
+    instanceId: Id,
+    snapshot: { owner: Id; until: number },
+  ) {
+    // Read + conditional reclaim as ONE critical section under the instance
+    // lock (gate 12 item 1): a live deliverer renewing/releasing its lease
+    // concurrently cannot interleave with this reclaim.
+    const reclaimed = await this.runUnderInstanceLock(instanceId, async () => {
+      const durable = await this.refreshFromStorage();
+      const current = durable.find((r) => r.commandId === commandId);
+      // Missing or terminal by the time the lock was acquired: stop.
+      if (!current || current.state !== "inflight" || !current.lease) return current ?? null;
+      const lease = current.lease;
+      if (lease.owner !== snapshot.owner || lease.until !== snapshot.until) {
+        // The live owner renewed/replaced the lease. Follow it ONLY while it
+        // is still in the future; an expired different lease is not ours to
+        // reclaim here (the ordinary foreign-lease flush owns that).
+        if (lease.until > Date.now()) {
+          this.scheduleClaimWakeup(commandId, instanceId, lease);
+        }
+        return current;
+      }
+      // Same exact snapshot and its deadline has passed: conditional reclaim.
+      return await this.storage.reclaimInflight(commandId, snapshot);
+    });
+    if (!reclaimed) return; // missing row: nothing to do
     this.cache.set(commandId, reclaimed);
-    this.emit();
-    // Exactly one delivery trigger for this wakeup.
-    this.onClaimWake?.();
+    if (reclaimed.state === "pending") {
+      this.emit();
+      // Exactly one delivery trigger for this wakeup.
+      this.onClaimWake?.();
+    }
   }
 
   /** Cancel every tracked claim wakeup (page teardown / test disposal). */
   dispose() {
-    for (const handle of this.claimWakeups.values()) clearTimeout(handle);
+    for (const entry of this.claimWakeups.values()) clearTimeout(entry.handle);
     this.claimWakeups.clear();
   }
 

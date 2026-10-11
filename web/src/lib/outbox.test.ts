@@ -274,6 +274,90 @@ describe("Outbox", () => {
     }
   });
 
+  it("GATE12 item 1: a wakeup reclaims ONLY its lease snapshot after it is due — a renewed later lease re-arms for T2, then reclaims", async () => {
+    // T  = lease deadline observed at load (fresh same-owner claim, Web Locks
+    //      absent -> UNKNOWN ownership -> kept, wakeup armed at T).
+    // T2 = a live delivery RETRY renews the lease to T2 > T.
+    // At T the wakeup must NOT force the live renewed claim to pending (that
+    // let a concurrent POST race in cloned-tab no-locks mode); it re-arms for
+    // T2 and only reclaims there if the claim is still inactive. The read +
+    // conditional reclaim run under the real per-instance lock when present.
+    const originalNavigator = globalThis.navigator;
+    const lockNames: string[] = [];
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: {
+        // No query (unknown ownership at load) but request EXISTS: the wakeup
+        // still serializes its read+reclaim under the lock.
+        locks: {
+          request: (name: string, _opts: unknown, cb: () => Promise<unknown>) => {
+            lockNames.push(name);
+            return cb();
+          },
+        },
+      },
+    });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(100_000);
+      const store = new MemStorage();
+      const owner = "owner_renew";
+      const instanceId = "ins_renew";
+      const T = Date.now() + LEASE_TTL_MS;
+      const putP = store.put(
+        rec({
+          commandId: "cmd_renew",
+          instanceId,
+          state: "inflight",
+          lease: { owner, until: T },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await putP;
+      const box = await Outbox.load(store, owner);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(box.pendingClaimWakeups()).toEqual(["cmd_renew"]);
+      const wakes = vi.fn();
+      box.onClaimWake = wakes;
+
+      // A live delivery retry RENEWS the lease (new until T2 > T) before T.
+      const T2 = T + LEASE_TTL_MS;
+      const renewP = store.put(
+        rec({
+          commandId: "cmd_renew",
+          instanceId,
+          state: "inflight",
+          attempts: 1,
+          lease: { owner, until: T2 },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await renewP;
+
+      // At T: still the live renewed claim — no reclaim, no delivery trigger,
+      // wakeup moved to T2.
+      await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
+      expect(store.map.get("cmd_renew")?.state).toBe("inflight");
+      expect(store.map.get("cmd_renew")?.lease?.until).toBe(T2);
+      expect(wakes).not.toHaveBeenCalled();
+      expect(box.pendingClaimWakeups()).toEqual(["cmd_renew"]);
+
+      // The row goes inactive and stays on the renewed lease up to T2: then
+      // the wakeup reclaims its snapshot and triggers exactly one delivery.
+      await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
+      expect(store.map.get("cmd_renew")?.state).toBe("pending");
+      expect(store.map.get("cmd_renew")?.lease).toBeUndefined();
+      expect(wakes).toHaveBeenCalledTimes(1);
+      expect(box.pendingClaimWakeups()).toEqual([]);
+
+      // The deadline read+reclaim took the real per-instance lock.
+      expect(lockNames).toContain(instanceDeliveryLockName(instanceId));
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
   it("GATE11 item 5: a failed load-time reclaim arms a TRACKED expiry wakeup that requeues and triggers exactly one delivery", async () => {
     const originalNavigator = globalThis.navigator;
     Object.defineProperty(globalThis, "navigator", {

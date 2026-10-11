@@ -607,15 +607,21 @@ fn a_failure_placeholder_own_first_start_does_not_resurrect() {
     );
 }
 
-/// c-cardsettle-fu2 r1 item 2: TWO agents sharing key k. The journal folds
-/// started(k,a0) → failed(a0) → started(k,a1); a1 is a member that NEVER
-/// consumed a journal start before (its placeholder is created by the failed
-/// fold with consumed_journal_start=false), and the shared key's counter is
-/// already 1 from a0, so a1's start counts as attempt 2. Without the
-/// consumed-journal-start flag a1's failed member would be resurrected and
-/// the OLDER journal format (only started/result records) never repairs it.
+/// c-cardsettle-fu2 r1 item 2 / r4 item 2: TWO agents sharing key k. The
+/// regression MUST run through the path the bug was in — a member created by
+/// the live SubagentStart hook (`agent_started`), not one synthesized by
+/// `agent_failed`:
+/// 1. the journal counts started(k,a0) (a0 then fails);
+/// 2. a1's member is created by `agent_event(started=true)` — a hook
+///    placeholder with no key, attempt 0, no journal start consumed;
+/// 3. a1 then fails out-of-band (StopFailure);
+/// 4. the catch-up poll folds a1's OWN first started(k,a1): the shared key's
+///    counter is already 1 from a0, so this is attempt 2 — but a1 consumed no
+///    start itself, so it must stay Failed;
+/// 5. a subsequent started(k,a1) (attempt 3) IS a genuine same-agent retry
+///    and resurrects a1 to Running.
 #[test]
-fn a_shared_key_second_agent_without_a_start_stays_failed() {
+fn a_shared_key_second_agent_created_by_start_hook_stays_failed_then_retries() {
     let tmp = TempDir::new().unwrap();
     let session = tmp.path().join("session");
     let run_id = "wf_fu2_shared";
@@ -624,8 +630,7 @@ fn a_shared_key_second_agent_without_a_start_stays_failed() {
     std::fs::write(run_dir.join("agent-a0.jsonl"), "{}\n").unwrap();
     std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
     // a0 started (key counter 1), a0 failed, then a1's first start (key
-    // counter 2) — but a1's member already exists as Failed from a prior
-    // StopFailure (created out-of-band with no key/attempt 0).
+    // counter 2 when it folds).
     std::fs::write(
         run_dir.join("journal.jsonl"),
         "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a0\"}\n\
@@ -645,16 +650,61 @@ fn a_shared_key_second_agent_without_a_start_stays_failed() {
             script_source: None,
         })
         .unwrap();
-    // a1 failed BEFORE any start for it (StopFailure beat the fold): create
-    // the attempt-0 placeholder.
+    // The live SubagentStart hook beats the catch-up fold: a1 is created by
+    // agent_started (attempt 0, consumed_journal_start=false)…
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    // …and then a StopFailure marks it Failed before the journal catches up.
     tailer
         .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
         .unwrap();
-    // Now poll: the catch-up folds all three journal lines.
-    let bodies = bodies(tailer.poll().unwrap());
-    let a1_states: Vec<_> = bodies
+
+    // First poll: the catch-up folds all three journal lines. a1's own first
+    // started bumps the shared key to 2 but resurrects nothing.
+    let a1_states = |bodies: &[ObservationPayload]| {
+        bodies
+            .iter()
+            .filter_map(|body| match body {
+                ObservationPayload::WorkflowMember(m)
+                    if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+                {
+                    Some(m.state)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = bodies(tailer.poll().unwrap());
+    let first_states = a1_states(&first);
+    assert!(
+        first_states.contains(&WorkflowState::Failed),
+        "a1 must be observed Failed after its own first shared-key start: {first_states:?}"
+    );
+    assert!(
+        !first_states.contains(&WorkflowState::Running),
+        "a1 never consumed a journal start; the shared-key attempt-2 must not resurrect it: {first_states:?}"
+    );
+
+    // A GENUINE same-agent retry: another started(k,a1) after the member
+    // already consumed its first journal start (attempt 3) resurrects it.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}}"
+        )
+        .unwrap();
+    }
+    let second = bodies(tailer.poll().unwrap());
+    let final_state = second
         .iter()
-        .filter_map(|body| match body {
+        .rev()
+        .find_map(|body| match body {
             ObservationPayload::WorkflowMember(m)
                 if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
             {
@@ -662,13 +712,10 @@ fn a_shared_key_second_agent_without_a_start_stays_failed() {
             }
             _ => None,
         })
-        .collect();
-    assert!(
-        a1_states.contains(&WorkflowState::Failed),
-        "a1 must be observed Failed: {a1_states:?}"
-    );
-    assert!(
-        !a1_states.contains(&WorkflowState::Running),
-        "a1 never consumed a start; the shared-key attempt-2 must not resurrect it: {a1_states:?}"
+        .expect("a1 observed after the real retry");
+    assert_eq!(
+        final_state,
+        WorkflowState::Running,
+        "a genuine same-agent retry (attempt 3, after a1 consumed a start) must resurrect it"
     );
 }

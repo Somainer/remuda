@@ -151,7 +151,13 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         "DROP INDEX IF EXISTS usage_events_scope_dedupe;
          CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
              ON usage_events(instance_id, scope, scope_id)
-             WHERE scope = 'turn' AND scope_id IS NOT NULL;",
+             WHERE scope = 'turn' AND scope_id IS NOT NULL;
+         -- c-usagefu r7 item 5: codex Message rows are keyed on the durable
+         -- per-response id; re-promoting/replaying a rollout byte-0 re-emits
+         -- the same response and must not double the Message totals.
+         CREATE UNIQUE INDEX IF NOT EXISTS usage_events_message_dedupe
+             ON usage_events(instance_id, scope, scope_id)
+             WHERE scope = 'message' AND scope_id IS NOT NULL;",
     )?;
     Ok(())
 }
@@ -2051,6 +2057,65 @@ mod tests {
             None => json!({ "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] }),
         };
         rec
+    }
+
+    #[test]
+    fn duplicate_message_replay_does_not_double_totals() {
+        // c-usagefu r7 item 5: re-promoting Codex replays the rollout from
+        // byte 0 and two fresh adapters emit the SAME Message response ids.
+        // The durable unique index (instance, scope, scope_id) for Message
+        // rows must collapse the replay; totals stay at one set.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        let message_row = |seq: i64, response_id: &str, output: i64| {
+            let rec = JournalRecord {
+                instance_id: "ins_replay".into(),
+                seq,
+                event_id: format!("evt_replay_{seq}"),
+                event: json!({
+                    "kind": "usage",
+                    "source": { "nativeTurnId": { "state": "known", "value": "t1" } },
+                    "payload": {
+                        "scope": "message",
+                        "scopeId": response_id,
+                        "mode": "snapshot",
+                        "metricRevision": "1",
+                        "inputTokens": { "state": "known", "value": "0" },
+                        "outputTokens": { "state": "known", "value": output.to_string() },
+                        "cost": { "state": "known",
+                                   "value": { "amount": "0.10", "currency": "USD" } },
+                        "accounting": "estimated",
+                    }
+                }),
+                observed_at: "2026-09-15T00:00:00.000Z".into(),
+            };
+            project_usage_event(&rec, None, None).unwrap()
+        };
+
+        // First adapter: two message responses (r1=100 out, r2=200 out).
+        let first = insert_row(&conn, &message_row(1, "r1", 100)).unwrap();
+        assert!(first, "first r1 inserted");
+        assert!(insert_row(&conn, &message_row(2, "r2", 200)).unwrap());
+
+        // Second adapter replays the same rollout (different journal seqs but
+        // identical response ids): both must be ignored.
+        assert!(
+            !insert_row(&conn, &message_row(3, "r1", 100)).unwrap(),
+            "replayed r1 is deduped by response id"
+        );
+        assert!(
+            !insert_row(&conn, &message_row(4, "r2", 200)).unwrap(),
+            "replayed r2 is deduped by response id"
+        );
+
+        let agg = aggregate_instance(&conn, "ins_replay").unwrap();
+        assert_eq!(agg.output_tokens, 300, "100 + 200, not doubled");
+        assert!(
+            (agg.cost_usd - 0.20).abs() < 1e-9,
+            "two responses at 0.10, replay not billed: {}",
+            agg.cost_usd
+        );
     }
 
     #[test]

@@ -698,6 +698,14 @@ pub async fn delete_instance(
             return Ok::<_, StoreError>(None);
         }
 
+        // c-cardsettle-fu2 r1 item 4: park AFTER the delete transaction
+        // committed but before the settlement frame is published and the
+        // cleanup/audit tail runs. RST here must not cancel the detached
+        // operation: after release the follower still receives the frame and
+        // the audit row is still written.
+        #[cfg(any(test, feature = "test-faults"))]
+        state.operation_parks.park_after_delete_if_armed().await;
+
         let mut lease_returns = Vec::new();
         let mut lease_keys_seen = std::collections::HashSet::new();
         let mut purge_outcomes = serde_json::Map::new();

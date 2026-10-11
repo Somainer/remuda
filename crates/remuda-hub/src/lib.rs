@@ -940,6 +940,19 @@ impl RunningHub {
         self.state.operation_parks.arm().await
     }
 
+    /// c-cardsettle-fu2 r1 item 4: arm the park AFTER the delete DB job
+    /// commits (before publication/cleanup).
+    #[cfg(any(test, feature = "test-faults"))]
+    #[doc(hidden)]
+    pub async fn test_arm_post_delete_park(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.state.operation_parks.arm_post_delete().await
+    }
+
     /// Mint a scoped device token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/login`, for components composed into

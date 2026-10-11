@@ -2473,11 +2473,12 @@ async fn disconnecting_right_after_delete_still_publishes_and_audits() -> Result
     let (mut follow, _sentinel) =
         connect_follower_proven_seeded(addr, &cookie, "r12fu-disconnect").await?;
 
-    // Arm the delete operation park BEFORE the request. The detached task
-    // reaches the park (before any DB work), the request future is aborted,
-    // then the park is released; the detached task must still commit, publish
-    // and audit.
-    let (mut delete_reached, delete_release) = hub.test_arm_delete_park().await;
+    // Arm the POST-delete park BEFORE the request. The detached task commits
+    // the delete, then parks; the request future is RST-aborted while parked,
+    // then the park is released — the detached task must still publish and
+    // audit. c-cardsettle-fu2 r1 item 4: this is the window AFTER the DB job
+    // is enqueued/committed (the fu1 pre-DB seam is no longer used here).
+    let (mut delete_reached, delete_release) = hub.test_arm_post_delete_park().await;
 
     // Fire the DELETE over a raw socket WITHOUT reading the response.
     let mut sock = tokio::net::TcpStream::connect(addr).await?;
@@ -2495,17 +2496,17 @@ async fn disconnecting_right_after_delete_still_publishes_and_audits() -> Result
         sock.flush().await?;
     }
 
-    // Wait until the detached task reaches its park (the handler accepted the
-    // request and spawned the operation, which has not done DB work yet).
+    // Wait until the detached task reaches its post-delete park: the delete
+    // transaction is committed but publication/cleanup have not run.
     tokio::time::timeout(Duration::from_secs(10), &mut delete_reached)
         .await
-        .expect("the delete operation never reached its park")
-        .expect("park reached channel closed");
+        .expect("the delete operation never reached its post-delete park")
+        .expect("post-delete park channel closed");
 
-    // The instance is still present: the park is BEFORE the delete job.
+    // The deletion is durable at this park.
     assert!(
-        store.get_instance(instance_id.clone()).await?.is_some(),
-        "the park must be reached before the DB delete runs"
+        store.get_instance(instance_id.clone()).await?.is_none(),
+        "the post-delete park must be reached after the DB delete committed"
     );
 
     // Abort the request connection with RST while the operation is parked:

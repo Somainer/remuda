@@ -2157,6 +2157,107 @@ async fn cancelling_b_emits_a_settlement_at_its_ticket_position_before_c_starts(
     );
 }
 
+/// ma-sdk-state r11 item 1: A commits, B commits (still active), A's result is
+/// mapped DEFERRED behind B; a NEWER turn C then reserves and its write fails.
+/// C is newer than the outstanding blocker B, so its cancellation must NOT
+/// release A's deferred settle — no settledRootTurn may be emitted while B is
+/// mid-turn (Node/Hub would otherwise read the session idle mid-turn). B's own
+/// result settles the root ordinarily. Pre-fix, C's cancel released the
+/// deferral purely because one existed, emitting a bogus correction.
+#[tokio::test]
+async fn cancelling_a_newer_c_while_older_b_is_active_does_not_release_a_deferred_settle() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // A (#1) runs the pre-ack gate; B (#2) and C (#3) park pre-accept.
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.park_from_write(2);
+
+    let da = driver.clone();
+    let send_a = tokio::spawn(async move { da.send(prompt_id("first", "msg-a")).await });
+    barrier
+        .wait_until_result_parked(Duration::from_secs(5))
+        .await;
+    barrier.release_send();
+    tokio::time::timeout(Duration::from_secs(5), send_a)
+        .await
+        .expect("send_a task within 5s")
+        .expect("send_a joined")
+        .expect("A acked");
+
+    // B reserves; its book is open when the worker maps A's result -> deferred.
+    let db = driver.clone();
+    let send_b = tokio::spawn(async move { db.send(prompt_id("second", "msg-b")).await });
+    barrier
+        .wait_until_reserves_enqueued(2, Duration::from_secs(5))
+        .await;
+    barrier.resume_worker();
+    barrier
+        .wait_until_results_mapped(1, Duration::from_secs(5))
+        .await;
+
+    // C queues behind B on write_seq; its write will take the forced fault.
+    driver.force_write_failure_from(3);
+    let dc = driver.clone();
+    let send_c = tokio::spawn(async move { dc.send(prompt_id("never-written-c", "msg-c")).await });
+
+    // Open the pre-ack gate: B proceeds to its writer and commits, releasing
+    // write_seq to C; C enqueues its ticket (count 3) and takes the forced
+    // fault before the writer accepts it.
+    barrier.release_write_ack();
+    barrier
+        .wait_until_reserves_enqueued(3, Duration::from_secs(5))
+        .await;
+
+    let b = tokio::time::timeout(Duration::from_secs(5), send_b)
+        .await
+        .expect("send_b task within 5s")
+        .expect("send_b joined");
+    assert!(b.is_ok(), "B writes and commits: {b:?}");
+    let c = tokio::time::timeout(Duration::from_secs(5), send_c)
+        .await
+        .expect("send_c task within 5s")
+        .expect("send_c joined");
+    assert!(c.is_err(), "C's forced-fault write fails: {c:?}");
+
+    // ACKNOWLEDGED FENCE: B's result (the ordinary settle) is mapped before the
+    // fence, so every start/settlement in publication order is counted.
+    barrier
+        .wait_until_results_mapped(2, Duration::from_secs(5))
+        .await;
+    let fence = driver.publication_fence().await;
+    let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
+
+    assert_eq!(
+        turn_started_count(&all),
+        2,
+        "A and B start; the failed C emits no start: {all:?}"
+    );
+    let results: Vec<(&str, bool)> = all.iter().filter_map(result_attrs).collect();
+    assert_eq!(
+        results,
+        vec![("0", false), ("1", true)],
+        "A's result is deferred (no settledRootTurn) and B's OWN result settles \
+         the root — C's cancel emits no idle while B is active: {all:?}"
+    );
+    let corrections: Vec<Option<&str>> = all
+        .iter()
+        .filter_map(settled_marker)
+        // B's own ordinary settle carries settledRootTurn=true but NO
+        // deferredSettle marker; only the correction carries "true".
+        .filter(|marker| *marker == Some("true"))
+        .collect();
+    assert!(
+        corrections.is_empty(),
+        "no deferred-settle correction is released by a newer C: {all:?}"
+    );
+
+    drop(barrier);
+    let _ = driver.close().await;
+}
+
 /// deferredSettle marker (None = ordinary settlement, Some("true") = deferred
 /// correction); returns None for non-settled results. Use this to count ALL
 /// settledRootTurn observations and inspect the deferred flag.

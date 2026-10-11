@@ -236,6 +236,15 @@ impl TurnBook {
     /// is already in the book (its start will follow the correction). The
     /// stashed result is `take`n by the first release, so it is published
     /// exactly once; later cancellations release nothing.
+    ///
+    /// ma-sdk-state r11 item 1: the release additionally requires that NO
+    /// outstanding turn OLDER than the cancelled one remains. The deferral is
+    /// owed while a turn that was outstanding when the result was deferred is
+    /// still active; cancelling a turn NEWER than that active blocker (reserve
+    /// order A committed, B committed, A's result deferred behind B, then C
+    /// cancelled) must not emit the idle while B is still mid-turn. Newer
+    /// reservations queued behind the cancelled ticket may proceed — their
+    /// starts follow this ticket's position in publication order.
     fn cancel_turn(&mut self, seq: u64) -> bool {
         let removed = if let Some(pos) = self.outstanding.iter().position(|turn| turn.seq == seq) {
             let turn = self.outstanding.remove(pos).expect("positioned turn");
@@ -250,6 +259,12 @@ impl TurnBook {
             self.reserved = None;
         }
         if removed.is_some() && self.deferred_settle {
+            // An older turn still outstanding keeps the root working: the
+            // cancelled turn was NOT the deferral's blocker. Keep the deferral
+            // for that older turn's completion or its own later rollback.
+            if self.outstanding.iter().any(|turn| turn.seq < seq) {
+                return false;
+            }
             self.deferred_settle = false;
             true
         } else {
@@ -6151,5 +6166,66 @@ mod turn_book_reserved_seq_tests {
         assert!(!book.deferred_settle, "a queued result is not deferred");
         let back = book.outstanding.back().expect("D is the back").seq;
         assert!(!book.cancel_turn(back), "no deferred settle to release");
+    }
+
+    /// ma-sdk-state r11 item 1: A completes while B is outstanding (deferred);
+    /// a NEWER turn C is then cancelled while B (older than C) is still active.
+    /// C's cancellation must NOT release the deferred settle — B still owns the
+    /// root's working state. Releasing it here emitted settledRootTurn in the
+    /// middle of B's turn (Node/Hub read the session as idle mid-turn).
+    #[test]
+    fn cancelling_a_newer_c_keeps_the_deferral_while_older_b_is_active() {
+        let mut book = TurnBook::default();
+        book.begin_turn(); // A (committed)
+        book.begin_turn(); // B (committed, still active)
+
+        // A's result pops A; B keeps the root working: deferred.
+        assert_eq!(book.result_settles_root(0), RootSettle::Deferred);
+        assert!(book.deferred_settle);
+
+        // C reserves behind B and is cancelled. B is OLDER than C and still
+        // outstanding, so the deferral survives C's removal.
+        let c = book.begin_turn();
+        assert!(!book.cancel_turn(c), "C is newer than the active blocker B");
+        assert!(
+            book.deferred_settle,
+            "the owed settle stays deferred while B is active"
+        );
+        assert_eq!(
+            book.outstanding
+                .iter()
+                .map(|turn| turn.seq)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "C removed, B intact"
+        );
+
+        // B's own result then settles the root the ordinary way (the stashed
+        // deferral is superseded by that real settle).
+        assert_eq!(book.result_settles_root(0), RootSettle::Settled);
+        assert!(!book.deferred_settle);
+        assert!(book.outstanding.is_empty());
+
+        // The mirror ordering: with A2 deferred behind B2, cancelling B2
+        // (the active blocker) releases the deferral even while a newer D2 is
+        // already booked behind it — D2's start is queued behind B2's ticket
+        // and therefore behind the correction.
+        book.begin_turn(); // A2
+        let b2 = book.begin_turn(); // B2 (the blocker)
+        assert_eq!(book.result_settles_root(0), RootSettle::Deferred);
+        let d2 = book.begin_turn(); // D2 (newer reservation behind B2)
+        assert!(
+            book.cancel_turn(b2),
+            "cancelling the blocker B2 releases A2"
+        );
+        assert!(!book.deferred_settle);
+        assert_eq!(
+            book.outstanding
+                .iter()
+                .map(|turn| turn.seq)
+                .collect::<Vec<_>>(),
+            vec![d2],
+            "only D2 remains; the correction precedes its start"
+        );
     }
 }

@@ -47,6 +47,12 @@ pub(crate) struct MergeArgs {
     #[arg(long, requires = "onto", conflicts_with_all = ["dry_run", "list", "queue"])]
     #[serde(default)]
     pub land: bool,
+    /// Internal: land the immutable verified report keyed by this merge sha
+    /// (the exact base/head/merged tuple the gate captured). Prevents a second
+    /// verification on the same base from substituting the report landed.
+    #[arg(long, hide = true, requires = "land")]
+    #[serde(default)]
+    pub report: Option<String>,
     /// Verify the listed branches as an optimistic queue across --lanes lanes.
     #[arg(long, num_args = 1.., value_name = "BRANCH", conflicts_with_all = ["dry_run", "list", "land", "onto", "message", "branch"])]
     #[serde(default)]
@@ -863,7 +869,25 @@ fn execute_land(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
     let onto = args.onto.as_deref().context("--land requires --onto")?;
     let (base, verified) = record(report, "preflight", || {
         let base = resolve_onto(&repo, onto)?;
-        let verified = reports::load(&repo, &reference, &base)?;
+        // When the caller pins the captured merge (the Node always does for a
+        // granted land), load the IMMUTABLE report for that exact tuple rather
+        // than the `<base>.json` latest pointer, so a second verification of
+        // the same branch/base cannot substitute what gets landed.
+        let verified = match args.report.as_deref() {
+            Some(pinned) => {
+                let loaded = reports::load_by_merged(&repo, &reference, pinned)?;
+                ensure!(
+                    loaded.merged.as_deref() == Some(pinned),
+                    "immutable report for {pinned} does not name that merge"
+                );
+                ensure!(
+                    loaded.base.as_deref() == Some(base.as_str()),
+                    "pinned report was verified on a different base; re-verify before landing"
+                );
+                loaded
+            }
+            None => reports::load(&repo, &reference, &base)?,
+        };
         ensure!(
             verified.exit_code == 0 && verified.merged.is_some(),
             "verification report for {} on {base} is not a passing gate",

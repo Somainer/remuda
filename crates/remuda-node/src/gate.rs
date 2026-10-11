@@ -1584,6 +1584,13 @@ impl DevNode {
                 "--target-dir".to_owned(),
                 request.target_dir.clone(),
             ];
+            // Pin the exact verified tuple (r12 item 6): the land child reads
+            // the immutable report for THIS merge sha, not the latest report
+            // on the same base, so a second verification cannot substitute it.
+            if let Some(merge_sha) = result.merge_sha.as_deref().filter(|sha| !sha.is_empty()) {
+                land_args.push("--report".to_owned());
+                land_args.push(merge_sha.to_owned());
+            }
             if !request.push {
                 land_args.push("--no-push".into());
             }

@@ -50,6 +50,27 @@ pub(super) fn report_path(repo: &Path, reference: &str, base: &str) -> Result<Pa
     Ok(report_dir(repo, reference)?.join(format!("{base}.json")))
 }
 
+/// Immutable, content-addressed report path keyed by the constructed merge
+/// sha. Unlike the `<base>.json` "latest verified onto this base" pointer —
+/// which a second verification legitimately overwrites — this file names one
+/// exact (base, head, merged) tuple and is never replaced. A pinned land reads
+/// THIS, so a newer same-base report cannot be substituted for an older one.
+fn immutable_report_path(repo: &Path, reference: &str, merged: &str) -> Result<PathBuf> {
+    Ok(report_dir(repo, reference)?.join(format!("{merged}.json")))
+}
+
+/// Load the immutable report for one captured merge sha.
+pub(super) fn load_by_merged(repo: &Path, reference: &str, merged: &str) -> Result<MergeReport> {
+    let path = immutable_report_path(repo, reference, merged)?;
+    let contents = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "no immutable verification report for merge {merged} on {}; re-run the gate",
+            reference.trim_start_matches("refs/heads/")
+        )
+    })?;
+    serde_json::from_str(&contents).context("parse immutable verification report")
+}
+
 /// Ref pinning the constructed merge commit so it stays reachable for
 /// `--land` after the temporary worktree is removed.
 pub(super) fn verified_ref(reference: &str, base: &str) -> String {
@@ -118,14 +139,22 @@ pub(super) fn preparing(repo: &Path, reference: &str, base: &str) -> Result<Opti
     }))
 }
 
-/// Persist the final report and remove the preparing sidecar.
+/// Persist the final report and remove the preparing sidecar. Also publishes
+/// the immutable `<merged>.json` copy a pinned `--land --report` reads.
 pub(super) fn save(repo: &Path, reference: &str, report: &MergeReport) -> Result<()> {
     let base = report
         .base
         .as_deref()
         .context("verification report has no base")?;
     let path = report_path(repo, reference, base)?;
-    write_atomic(&path, &serde_json::to_string(report)?)?;
+    let serialized = serde_json::to_string(report)?;
+    write_atomic(&path, &serialized)?;
+    if let Some(merged) = report.merged.as_deref() {
+        let immutable = immutable_report_path(repo, reference, merged)?;
+        if immutable != path {
+            write_atomic(&immutable, &serialized)?;
+        }
+    }
     let sidecar = preparing_path(repo, reference, base)?;
     if sidecar.exists() {
         let _ = fs::remove_file(sidecar);
@@ -271,6 +300,75 @@ mod tests {
         assert_eq!(
             load(repo, reference, "0123456789abcdef").unwrap().exit_code,
             1
+        );
+    }
+
+    #[test]
+    fn a_pinned_report_survives_a_second_verification_on_the_same_base() {
+        // r12 item 6: verify A then verify B for the SAME branch/base. The
+        // `<base>.json` latest pointer is B, but the immutable report keyed by
+        // A's merge sha must still resolve to A — exactly what a pinned
+        // `--land --report <mergeA>` reads, so B cannot substitute A's land.
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = temporary.path();
+        super::super::git(repo, &["init", "-b", "main"]).unwrap();
+        let reference = "refs/heads/wt/a/work";
+        let base = "0123456789abcdef0123456789abcdef01234567";
+        let make = |merged: &str, head: &str| MergeReport {
+            merged: Some(merged.into()),
+            head: Some(head.into()),
+            ..serde_json::from_value(serde_json::json!({
+                "exitCode": 0,
+                "status": "verified",
+                "branch": "wt/a/work",
+                "dryRun": false,
+                "affected": true,
+                "base": base,
+                "tree": "deadbeef",
+                "gateOverride": false,
+                "web": false,
+                "webE2e": false,
+                "mainUpdated": false,
+                "pushed": false,
+                "conflicts": [],
+                "steps": []
+            }))
+            .unwrap()
+        };
+        let report_a = make(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "1111111111111111111111111111111111111111",
+        );
+        let report_b = make(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "2222222222222222222222222222222222222222",
+        );
+        save(repo, reference, &report_a).unwrap();
+        save(repo, reference, &report_b).unwrap();
+
+        // The latest-by-base pointer was overwritten by the second verify.
+        let latest = load(repo, reference, base).unwrap();
+        assert_eq!(
+            latest.merged.as_deref(),
+            Some(report_b.merged.as_deref().unwrap())
+        );
+
+        // The pinned immutable reports still select each exact tuple.
+        let pinned_a =
+            load_by_merged(repo, reference, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        assert_eq!(
+            pinned_a.merged.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            pinned_a.head.as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
+        let pinned_b =
+            load_by_merged(repo, reference, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        assert_eq!(
+            pinned_b.merged.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         );
     }
 }

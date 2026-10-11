@@ -48,17 +48,69 @@ impl ReplyHold {
     }
 }
 
+/// Deterministic control over the fake Node's handling of ONE `gate.run`
+/// RPC: the canned result is withheld until `release()` (so the job stays
+/// Running on the Hub while the test drives the `gate.event` finished
+/// notification), and `arrived` fires when the frame reaches the Node.
+#[derive(Clone)]
+struct GateRunHook {
+    arrived: Arc<Notify>,
+    released: Arc<AtomicBool>,
+    release: Arc<Notify>,
+    result: Arc<std::sync::Mutex<Value>>,
+}
+
+impl GateRunHook {
+    fn new(result: Value) -> Self {
+        Self {
+            arrived: Arc::new(Notify::new()),
+            released: Arc::new(AtomicBool::new(false)),
+            release: Arc::new(Notify::new()),
+            result: Arc::new(std::sync::Mutex::new(result)),
+        }
+    }
+
+    async fn wait_arrived(&self) {
+        self.arrived.notified().await;
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+
+    fn result(&self) -> Value {
+        self.result.lock().expect("gate result").clone()
+    }
+
+    fn set_result(&self, result: Value) {
+        *self.result.lock().expect("gate result") = result;
+    }
+}
+
+/// A verbatim node→Hub JSON-RPC frame (e.g. a `gate.event` notification).
+type RawFrame = Value;
+
 /// Service one inbound Hub RPC frame: track answer state, record the frame
 /// for assertions, honor a reply hold, then answer with a canned result.
-async fn service_inbound<S>(
-    node: &mut WebSocketStream<S>,
+type FakeWs = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type FakeOut = std::sync::Arc<tokio::sync::Mutex<futures::stream::SplitSink<FakeWs, Message>>>;
+
+async fn service_inbound(
+    out: &FakeOut,
     frames: &mpsc::UnboundedSender<AppendFrame>,
     pending: &tokio::sync::Mutex<HashSet<String>>,
     holds: &std::sync::Mutex<HashMap<String, ReplyHold>>,
+    gate_run: &tokio::sync::Mutex<Option<Arc<GateRunHook>>>,
     frame: Value,
-) where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
+) {
+    /// Send one JSON frame through the shared sink.
+    macro_rules! send_frame {
+        ($value:expr) => {{
+            let mut sink = out.lock().await;
+            sink.send(Message::Text($value.to_string().into())).await
+        }};
+    }
     // journal.append is node→hub: the Hub never sends it as an RPC request.
     let Some(method) = frame.get("method").and_then(Value::as_str) else {
         return;
@@ -91,6 +143,27 @@ async fn service_inbound<S>(
     if frame.get("id").is_none() {
         return;
     }
+    // A scripted, parkable gate.run: answer with the hook's canned verdict
+    // (and withhold it until released) instead of the generic ack.
+    if method == "gate.run"
+        && let Some(hook) = gate_run.lock().await.clone()
+    {
+        hook.arrived.notify_waiters();
+        // Background reply so the read loop keeps servicing other
+        // frames (a node->Hub gate.event) while this RPC is held.
+        let out = out.clone();
+        let rpc_id = frame["id"].clone();
+        tokio::spawn(async move {
+            while !hook.released.load(Ordering::SeqCst) {
+                hook.release.notified().await;
+            }
+            let result = hook.result();
+            let value = json!({"jsonrpc":"2.0","id":rpc_id,"result":result});
+            let mut sink = out.lock().await;
+            let _ = sink.send(Message::Text(value.to_string().into())).await;
+        });
+        return;
+    }
     let result = match method {
         "worker.provision" => json!({
             "name": frame["params"]["name"].clone(),
@@ -105,13 +178,7 @@ async fn service_inbound<S>(
         "interaction.answer" => json!({"accepted": true}),
         _ => json!({"accepted": true}),
     };
-    let _ = node
-        .send(Message::Text(
-            json!({"jsonrpc":"2.0","id":frame["id"],"result":result})
-                .to_string()
-                .into(),
-        ))
-        .await;
+    let _ = send_frame!(json!({"jsonrpc":"2.0","id":frame["id"],"result":result}));
 }
 
 /// Fake Node: accepts every Hub RPC, records `(method, params)`, and lets the
@@ -126,6 +193,10 @@ struct FakeNode {
     pending: Arc<tokio::sync::Mutex<HashSet<String>>>,
     /// opId -> held reply (deterministic in-flight seam).
     holds: Arc<std::sync::Mutex<HashMap<String, ReplyHold>>>,
+    /// Scripted parkable gate.run reply (one job at a time).
+    gate_run: Arc<tokio::sync::Mutex<Option<Arc<GateRunHook>>>>,
+    /// Verbatim node→Hub frames (e.g. a `gate.event` finished notification).
+    raw: mpsc::UnboundedSender<RawFrame>,
 }
 
 /// Node credentials returned on first hello (D-018: re-enrollment of the same
@@ -193,9 +264,33 @@ impl FakeNode {
         let holds: Arc<std::sync::Mutex<HashMap<String, ReplyHold>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
         let holds_task = holds.clone();
+        let gate_run: Arc<tokio::sync::Mutex<Option<Arc<GateRunHook>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let gate_run_task = gate_run.clone();
+        let (raw_tx, mut raw_rx): (
+            mpsc::UnboundedSender<RawFrame>,
+            mpsc::UnboundedReceiver<RawFrame>,
+        ) = mpsc::unbounded_channel();
+        // Split the socket: a shared sink lets a parked gate.run reply wait
+        // in a background task while the read loop keeps handling frames
+        // (notably a node→Hub gate.event), like the real carrier.
+        let (sink, mut node) = node.split();
+        let out: FakeOut = std::sync::Arc::new(tokio::sync::Mutex::new(sink));
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    Some(raw) = raw_rx.recv() => {
+                        // A verbatim node→Hub frame (e.g. gate.event).
+                        if out
+                            .lock()
+                            .await
+                            .send(Message::Text(raw.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Some((instance_id, event)) = append_rx.recv() => {
                         // Tracked on the append feed BEFORE the frame is
                         // sent: feed local to the test driver, so the Hub's
@@ -219,7 +314,15 @@ impl FakeNode {
                             "jsonrpc":"2.0","id":"append","method":"journal.append",
                             "params":{"instanceId":instance_id,"event":event}
                         });
-                        if node.send(Message::Text(frame.to_string().into())).await.is_err() { break; }
+                        if out
+                            .lock()
+                            .await
+                            .send(Message::Text(frame.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                         // Wait for the append ack matched BY ID. A Hub RPC
                         // that lands on the socket here is a REAL frame — it
                         // is recorded and answered, never swallowed as if it
@@ -237,10 +340,11 @@ impl FakeNode {
                                         break 'ack;
                                     }
                                     service_inbound(
-                                        &mut node,
+                                        &out,
                                         &frame_tx,
                                         &answered_task,
                                         &holds_task,
+                                        &gate_run_task,
                                         fr,
                                     )
                                     .await;
@@ -255,10 +359,11 @@ impl FakeNode {
                             Some(Ok(Message::Text(text))) => {
                                 let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
                                 service_inbound(
-                                    &mut node,
+                                    &out,
                                     &frame_tx,
                                     &answered_task,
                                     &holds_task,
+                                    &gate_run_task,
                                     frame,
                                 )
                                 .await;
@@ -277,6 +382,8 @@ impl FakeNode {
                 appends: append_tx,
                 pending: pending.clone(),
                 holds,
+                gate_run,
+                raw: raw_tx,
             },
             hello["result"]["nodeToken"]
                 .as_str()
@@ -395,6 +502,25 @@ impl FakeNode {
     /// frame has arrived).
     async fn is_pending(&self, interaction_id: &str) -> bool {
         self.pending.lock().await.contains(interaction_id)
+    }
+
+    /// Script the NEXT `gate.run` RPC: park it at the Node with the given
+    /// verdict until the hook is released. Returns the hook.
+    async fn arm_gate_run(&self, result: Value) -> Arc<GateRunHook> {
+        let hook = Arc::new(GateRunHook::new(result));
+        *self.gate_run.lock().await = Some(hook.clone());
+        hook
+    }
+
+    /// Send a verbatim node→Hub JSON-RPC frame (a `gate.event`
+    /// notification).
+    fn send_raw(&self, frame: Value) {
+        self.raw.send(frame).expect("raw frame channel");
+    }
+
+    /// Pop the next inbound `(method, params)` the Hub asked the Node to run.
+    async fn next_frame(&mut self) -> AppendFrame {
+        self.frames.recv().await.expect("frame channel")
     }
 
     /// Drop the Node connection abruptly; the Hub marks its host offline.
@@ -2028,6 +2154,28 @@ fn failed_result_with_log(job_id: &str, headline: &str) -> Value {
     })
 }
 
+/// A failed gate verdict carrying bounded evidence, for the real two-path
+/// (finished event + gate.run reply) test. Same bytes on both paths so the
+/// second persist is a digest no-op.
+fn failed_gate_result(job_id: &str, _branch: &str) -> Value {
+    json!({
+        "jobId": job_id,
+        "status": "failed",
+        "failedStep": "cargo-test",
+        "error": "cargo-test failed: 1 test",
+        "reason": "1 test failed",
+        "runLog": {
+            "step": "cargo-test",
+            "kind": "failed",
+            "attempts": 1,
+            "headline": "the two-path evidence",
+            "summary": ["test it_two_paths ... FAILED"],
+            "tail": ["failures:", "    it_two_paths"],
+            "linesSeen": 2
+        }
+    })
+}
+
 /// A pre-upgrade job references a LEGACY random object id A. A later runLog
 /// result must reuse that id (not derive a new deterministic B and delete
 /// A), including when a competing terminal write (the duplicate's first
@@ -2143,6 +2291,132 @@ async fn a_failed_log_insert_keeps_the_previous_object_served() {
     assert_eq!(by_job["objectId"], json!(legacy_id), "{by_job}");
     // The old headline already proves the original bytes survived.
     let _ = old_bytes;
+}
+
+/// The Node delivers a FAILED verdict with runLog through BOTH real Hub
+/// entry points — the `gate.event` finished NOTIFICATION and the gate.run
+/// RPC REPLY — not a shared in-process helper. The event lands while the
+/// job is Running (the RPC reply is parked at the Node), settles it and
+/// stores the log; the released reply is then the terminal duplicate. The
+/// stored logObjectId resolves by object id AND by job id. No SQL writes
+/// to job state.
+#[tokio::test]
+async fn the_finished_event_and_the_gate_run_reply_both_feed_the_real_log_path() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+
+    // Eligible lane BEFORE enqueue so the POST's schedule_once dispatches
+    // gate.run for real to the fake Node.
+    ctx.configure_gate_lane().await;
+
+    // Park the gate.run RPC at the Node (the canned verdict is set once the
+    // job id is known); the event is driven first while the row stays
+    // Running.
+    let job_seed = "wt/gate/two-arrival-paths";
+    let hook = node
+        .arm_gate_run(json!({ "jobId": "placeholder", "status": "failed" }))
+        .await;
+    let (status, enqueued) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":job_seed,"mode":"verify"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{enqueued}");
+    let job_id = enqueued["id"].as_str().unwrap().to_owned();
+    // Now that the id is known, set the real verdict (identical runLog on
+    // both paths) before the reply is released.
+    hook.set_result(failed_gate_result(&job_id, job_seed));
+
+    // The scheduler really sent gate.run to the Node; the hook parks it so
+    // the Hub row is still Running.
+    hook.wait_arrived().await;
+    let running = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(running["state"], json!("running"), "{running}");
+
+    // ENTRY POINT 1: the Node's `gate.event` finished notification (the
+    // wire shape the real Node's gate pump emits).
+    let result = failed_gate_result(&job_id, job_seed);
+    node.send_raw(json!({
+        "jsonrpc": "2.0",
+        "method": "gate.event",
+        "params": { "jobId": job_id, "kind": "finished", "result": result }
+    }));
+
+    // The event applies and settles the job Failed with the stored log.
+    let mut settled = None;
+    for _ in 0..100 {
+        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+        if doc["state"] == json!("failed") {
+            settled = Some(doc);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let settled = settled.expect("the finished event never settled the job");
+    let object_id = settled["logObjectId"]
+        .as_str()
+        .expect("event stored no logObjectId")
+        .to_owned();
+    assert!(object_id.starts_with("obj_"), "{object_id}");
+
+    // ENTRY POINT 2: release the parked gate.run — the RPC reply carries the
+    // same failed verdict. It arrives after the row is terminal and must not
+    // disturb the stored object (stable id, identical digest).
+    hook.release();
+
+    // The inbound gate.run frame is observable on the Node.
+    let mut saw_gate_run = false;
+    while let Ok((method, _params)) =
+        tokio::time::timeout(Duration::from_millis(200), node.next_frame()).await
+    {
+        if method == "gate.run" {
+            saw_gate_run = true;
+        }
+    }
+    assert!(
+        saw_gate_run,
+        "the Hub never dispatched gate.run over the link"
+    );
+
+    // After BOTH arrivals the log resolves by object id and by job id.
+    let (status, by_object) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{object_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "log by object id: {by_object}");
+    assert_eq!(by_object["objectId"], json!(object_id), "{by_object}");
+    assert_eq!(
+        by_object["log"]["headline"],
+        json!("the two-path evidence"),
+        "{by_object}"
+    );
+    let (status, by_job) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{job_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "log by job id: {by_job}");
+    assert_eq!(
+        by_job["objectId"],
+        json!(object_id),
+        "by-job lookup resolves elsewhere: {by_job}"
+    );
+    let final_doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(final_doc["state"], json!("failed"), "{final_doc}");
+    assert_eq!(
+        final_doc["logObjectId"],
+        json!(object_id),
+        "the gate.run reply disturbed the reference: {final_doc}"
+    );
 }
 
 // ── 6c. A narrowed Bot token acts for the live chapter (CLI path) ─────────

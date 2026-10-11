@@ -150,6 +150,9 @@ struct PtyLive {
     matcher_task: Option<JoinHandle<()>>,
     /// codex/grok file-tail adapters (c-usagefu (d)); aborted on close.
     adapter_handle: Option<crate::adapters::supervisor::AdapterHandle>,
+    /// Per-launch identity shared with the codex file adapter's discovery
+    /// (c-usagefu r6 item 1).
+    instance_key: String,
     closed: bool,
     failed: Arc<AtomicBool>,
 }
@@ -508,7 +511,11 @@ impl GenericPtyDriver {
         // c-usagefu (d): tail the codex/grok session files from the pinned
         // native home so generic-pty dispatch gets usage/live observations the
         // way shell-pty launches do.
-        let adapter_handle = self.spawn_file_tail_adapters(&spec, &recipe, &ctx, &tx, launched_at);
+        // Per-launch identity shared with the codex adapter discovery (r6
+        // item 1).
+        let instance_key = uuid::Uuid::new_v4().to_string();
+        let adapter_handle =
+            self.spawn_file_tail_adapters(&spec, &recipe, &ctx, &tx, launched_at, &instance_key);
         *self.inner.lock().await = Some(PtyLive {
             ctx,
             client,
@@ -522,6 +529,7 @@ impl GenericPtyDriver {
             interaction_task,
             matcher_task,
             adapter_handle,
+            instance_key,
             closed: false,
             failed,
         });
@@ -560,6 +568,7 @@ impl GenericPtyDriver {
         ctx: &crate::claude_pty::ObsCtx,
         events: &mpsc::Sender<Observation>,
         launched_at: time::OffsetDateTime,
+        instance_key: &str,
     ) -> Option<crate::adapters::supervisor::AdapterHandle> {
         let kind = match spec.kind {
             AgentKind::Codex | AgentKind::Grok => spec.kind,
@@ -597,6 +606,7 @@ impl GenericPtyDriver {
                 .filter(|model| !model.is_empty()),
             hooks: None,
             agent_pid: None,
+            instance_key: Some(instance_key.to_owned()),
         };
         match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {
             Ok(Some(handle)) => Some(handle),
@@ -676,13 +686,17 @@ impl Driver for GenericPtyDriver {
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
         // Record the sent prompt for the codex file adapter: discovery may
-        // bind only a rollout whose first user message is an input THIS driver
-        // dispatched, so an idle Remuda pane can never bind a codex the
-        // operator ran by hand in the same cwd (c-usagefu r5 item 5).
-        crate::adapters::codex_discovery::record_input(
-            &std::path::PathBuf::from(&live.recipe.cwd),
-            &text,
-        );
+        // bind only a rollout whose first user message is an input THIS
+        // driver dispatched to THIS instance (c-usagefu r5 item 5). Codex
+        // only: prompts sent to a grok/claude pane must never authorize a
+        // codex bind, and the registry is per-instance (r6 item 1).
+        if live.preset_id.eq_ignore_ascii_case("codex") {
+            crate::adapters::codex_discovery::record_input(
+                &std::path::PathBuf::from(&live.recipe.cwd),
+                &live.instance_key,
+                &text,
+            );
+        }
         // D-027: grok has no remote image input at all — not a flag, not a
         // content block, not a path its tooling will open as an image. The
         // prompt still carries the path, but say plainly that this agent will

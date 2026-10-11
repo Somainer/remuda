@@ -53,8 +53,17 @@ use crate::usage::{UsageAggregator, to_usage_payload};
 /// File-tail adapter for one codex TUI session.
 pub struct CodexAdapter {
     home: AdapterHome,
-    /// Hook-confirmed session id, when the hook channel reached us first.
+    /// Stable identity of the driver launch owning this adapter. Every prompt
+    /// it may bind to was dispatched under this exact key (c-usagefu r6 item
+    /// 1); `None` for promoted/hook-attached adapters (whose claim is
+    /// released on close).
+    instance_key: Option<String>,
+    /// Session id established by the HOOK channel (channel A). It stays
+    /// distinct from a tentative cwd-discovery guess (r6 item 2).
     confirmed: Option<String>,
+    /// Session id established by cwd discovery, recorded ONLY after a claim
+    /// succeeded — a claim loser must never shortcut on the id it scanned.
+    discovered: Option<String>,
     /// Bound session + its rollout tail.
     binding: Option<AdapterBinding>,
     tail: Option<RolloutTail>,
@@ -101,7 +110,9 @@ impl CodexAdapter {
             .then(|| crate::adapters::codex_discovery::DiscoveryWindow::open(&home.cwd));
         Self {
             home,
+            instance_key: None,
             confirmed: None,
+            discovered: None,
             binding: None,
             tail: None,
             nodes: HashMap::new(),
@@ -117,6 +128,14 @@ impl CodexAdapter {
             discovery_gave_up: false,
             window,
         }
+    }
+
+    /// Attach the stable per-launch identity used for prompt matching and
+    /// rollout claims (c-usagefu r6 item 1).
+    #[must_use]
+    pub fn with_instance_key(mut self, key: Option<String>) -> Self {
+        self.instance_key = key;
+        self
     }
 
     /// Seed a model used to price usage when `turn_context` never reported one.
@@ -159,9 +178,21 @@ impl CodexAdapter {
     /// driver launch, releases the same-cwd discovery window so a later
     /// launch is not tainted by this instance (c-usagefu r5 item 1).
     fn bind(&mut self, session_id: String, path: PathBuf, strict_launch: bool) -> bool {
+        // Owner of the claim: the driver launch's instance key; promoted
+        // attaches use an ephemeral hook-scoped owner and release on close.
+        let owner = self
+            .instance_key
+            .clone()
+            .unwrap_or_else(|| format!("hook:{session_id}"));
         // Two adapters polling in parallel can race for the same file; a lost
-        // claim means the candidate is someone else's — don't bind.
-        if !crate::adapters::codex_discovery::claim(&path) {
+        // claim means the candidate is someone else's — don't bind and don't
+        // remember the id (r6 item 2).
+        let cwd_for_claim = self.home.cwd.clone();
+        if !crate::adapters::codex_discovery::claim_session(
+            &path,
+            &owner,
+            Some((&cwd_for_claim, &session_id)),
+        ) {
             return false;
         }
         // Tail position:
@@ -182,7 +213,7 @@ impl CodexAdapter {
         self.tail = Some(tail);
         self.binding = Some(AdapterBinding {
             session_id: session_id.clone(),
-            directory: path.parent().map(|parent| parent.to_path_buf()),
+            directory: path.parent().map(std::path::Path::to_path_buf),
             main_file: Some(path),
         });
         // Bound: stop counting against later launches in this cwd.
@@ -199,6 +230,18 @@ impl CodexAdapter {
         if let Some(mut window) = self.window.take() {
             window.release();
         }
+    }
+
+    /// Test-only access to the private bind decision (r6 item 2 claim-race
+    /// test): returns whether the claim succeeded.
+    #[cfg(test)]
+    pub(crate) fn bind_for_test(
+        &mut self,
+        session_id: String,
+        path: PathBuf,
+        strict_launch: bool,
+    ) -> bool {
+        self.bind(session_id, path, strict_launch)
     }
 
     /// Find the session's rollout.
@@ -228,17 +271,33 @@ impl CodexAdapter {
         if self.discovery_gave_up {
             return Ok(false);
         }
+        // Tier 1: a HOOK-confirmed id (channel A) — distinct from a cwd guess.
         if let Some(id) = self.confirmed.clone() {
-            if let Some(path) = locate_rollout_in(&self.home.home, &id) {
-                return Ok(self.bind(id, path, true));
+            if let Some(path) = locate_rollout_in(&self.home.home, &id)
+                && self.bind(id, path, true)
+            {
+                return Ok(true);
             }
             return Ok(false);
+        }
+        // A cwd discovery id is remembered only after its claim succeeded
+        // (set below); a claim loser reaches here every poll and keeps
+        // scanning, never shortcutting on an id it failed to claim.
+        if let Some(id) = self.discovered.clone() {
+            if let Some(path) = locate_rollout_in(&self.home.home, &id)
+                && self.bind(id, path, true)
+            {
+                return Ok(true);
+            }
+            // The claimed file vanished before bind; forget the guess.
+            self.discovered = None;
         }
         let Some(launched_at) = self.home.launched_at else {
             if let Some(id) = newest_indexed(&self.home.home)
                 && let Some(path) = locate_rollout_in(&self.home.home, &id)
+                && self.bind(id, path, true)
             {
-                return Ok(self.bind(id, path, true));
+                return Ok(true);
             }
             return Ok(false);
         };
@@ -249,30 +308,46 @@ impl CodexAdapter {
             .window
             .as_ref()
             .is_some_and(|window| window.overlapping());
+        // Prompts are authorized per INSTANCE, and files already owned by a
+        // different instance are excluded: both together make an idle
+        // adapter unable to bind another pane's or a hand-run session.
+        let owner = self.instance_key.clone().unwrap_or_default();
+        let cwd = self.home.cwd.clone();
         match locate_rollout_by_cwd(
             &self.home.home,
-            &self.home.cwd,
+            &cwd,
             launched_at,
-            &|path: &Path| crate::adapters::codex_discovery::is_claimed(path),
-            &|_path, started, first_prompt| {
+            &|path: &Path| crate::adapters::codex_discovery::is_claimed_by_other(path, &owner),
+            &|_path, started, first_prompt, metadata| {
+                // Exact own prompt, or a duplicate own prompt (the harness can
+                // re-run identical text) whose session id is already claimed
+                // by THIS owner from an earlier poll.
                 crate::adapters::codex_discovery::matches_sent_input(
-                    &self.home.cwd,
+                    &cwd,
+                    &owner,
                     first_prompt,
                     started,
-                )
+                ) || metadata["id"]
+                    .as_str()
+                    .is_some_and(|id| crate::adapters::codex_discovery::owned_by(&cwd, &owner, id))
             },
         ) {
-            // A unique UNCLAIMED match is ours even while another window is
-            // open: files the other adapter bound are excluded above, so the
-            // "A bound first" race resolves cleanly (a parallel claim race
-            // returns false here and we keep discovering).
+            // A unique match authorized by THIS instance's prompts binds,
+            // even while another window is open (the other instance's files
+            // are excluded above and cannot match its prompts).
             CwdRollout::Found { id, path, strict } => {
-                self.confirmed = Some(id.clone());
-                Ok(self.bind(id, path, strict))
+                if self.bind(id.clone(), path, strict) {
+                    // Remember the discovery id only NOW (post-claim).
+                    self.discovered = Some(id);
+                    Ok(true)
+                } else {
+                    // Lost a claim race: stay in discovery and scan again.
+                    Ok(false)
+                }
             }
-            // Two UNCLAIMED same-cwd sessions exist at once. While a partner
-            // window is still open one of them may be theirs — wait (never
-            // latch). After the overlap ends the two are genuinely
+            // Two rollouts match THIS instance's own prompts. While a partner
+            // window is still open one may still be theirs — wait (never
+            // latch); after the overlap ends they are genuinely
             // indistinguishable: fail closed.
             CwdRollout::Ambiguous => {
                 if overlapping {
@@ -587,15 +662,18 @@ impl CodexAdapter {
 
 impl Drop for CodexAdapter {
     fn drop(&mut self) {
-        // Release the claimed rollout when the instance closes, so a relaunch
-        // may bind the same physical file again.
-        if let Some(binding) = self.binding.take()
+        // Driver-launch claims (instance_key present) OUTLIVE the adapter: a
+        // rollout a closed Remuda instance owned must never be re-bound by a
+        // different idle instance (r6 item 1). A PROMOTED attach
+        // (instance_key None) owns nothing durable — release its claim so the
+        // process-wide set does not grow forever (r6 item 7, exact key).
+        if self.instance_key.is_none()
+            && let Some(binding) = self.binding.take()
             && let Some(path) = binding.main_file
         {
-            crate::adapters::codex_discovery::release_claim(&path);
+            let owner = format!("hook:{}", binding.session_id);
+            crate::adapters::codex_discovery::release_claim(&path, &owner);
         }
-        // The window's own Drop covers the unbound case (and the bound case if
-        // bind() was bypassed in tests).
     }
 }
 

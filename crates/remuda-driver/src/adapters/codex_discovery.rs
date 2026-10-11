@@ -1,21 +1,24 @@
 //! Process-wide registry for codex generic-pty discovery.
 //!
-//! Two mechanisms close the cross-instance same-cwd binding holes:
+//! Identity model (c-usagefu r6 item 1): every driver launch gets its OWN
+//! opaque instance key, shared by the [`crate::generic_pty::GenericPtyDriver`]
+//! and the file adapter it spawned. All ownership evidence is scoped to
+//! `(cwd, instance key)`:
 //!
-//! - **Launch windows** ([`DiscoveryWindow`]) count the adapters in this Node
-//!   process that are still discovering in one canonical cwd. While two
-//!   windows overlap, a file matched by launch-time alone could belong to
-//!   either adapter, so discovery waits for stronger evidence (c-usagefu r5
-//!   item 1). A window is released as soon as its adapter BINDS or gives up,
-//!   not only when the instance closes: an instance that bound at 10:01 must
-//!   not taint a second launch in the same cwd at 11:00.
-//! - **Claimed rollouts** ([`claim`]): once an adapter binds a rollout file,
-//!   no other adapter in this process may bind it — the file-level locator
-//!   excludes claimed paths. This closes the "A binds first" race: B's scan
-//!   sees A's rollout as already owned and waits for B's own file. Claims are
-//!   released when the owning adapter drops (instance close).
+//! - **Sent inputs** ([`record_input`]) hold the prompts THIS instance
+//!   dispatched in THIS cwd. A prompt sent to another pane (a second codex
+//!   instance, a grok/claude pane) can never authorize a bind here.
+//! - **Claims** ([`claim`]) remember the owning instance key per rollout
+//!   path. A path released by a closed owner is never re-bound by a
+//!   different instance; the same instance relaunching may reclaim it.
+//! - **Launch windows** ([`DiscoveryWindow`]) count the adapters still
+//!   discovering in one cwd while they have no evidence yet.
+//!
+//! The registry lives for the Node process lifetime, which is exactly the
+//! scope within which two Remuda launches could race for one file; separate
+//! processes/hosts have separate homes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use time::OffsetDateTime;
@@ -31,8 +34,15 @@ struct WindowEntry {
 static OPEN_WINDOWS: LazyLock<Mutex<HashMap<PathBuf, WindowEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-static CLAIMED_ROLLOUTS: LazyLock<Mutex<HashSet<PathBuf>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+/// rollout path -> owning instance key.
+static CLAIMED_ROLLOUTS: LazyLock<Mutex<HashMap<PathBuf, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// (canonical cwd, native session id) -> owning instance key. Lets a
+/// poll re-recognize a session it ALREADY claimed (e.g. identical prompt
+/// text re-run) without re-scanning the whole file.
+static CLAIMED_SESSIONS: LazyLock<Mutex<HashMap<(PathBuf, String), String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Canonical key for one rollout path / cwd (best effort: a non-existent or
 /// unreadable path keeps its lexical form).
@@ -40,28 +50,68 @@ fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Whether a rollout file is already claimed by another live adapter.
-pub(crate) fn is_claimed(path: &Path) -> bool {
+/// Whether the rollout is currently claimed by a DIFFERENT instance.
+pub(crate) fn is_claimed_by_other(path: &Path, owner: &str) -> bool {
     let map = CLAIMED_ROLLOUTS.lock().expect("claimed codex rollouts");
-    map.contains(&canonical(path))
+    matches!(map.get(&canonical(path)), Some(existing) if existing != owner)
 }
 
-/// Claim a rollout file for this adapter. Returns false when another adapter
-/// claimed it first (a poll race — the caller must treat the candidate as
-/// someone else's and keep discovering).
-pub(crate) fn claim(path: &Path) -> bool {
-    CLAIMED_ROLLOUTS
-        .lock()
-        .expect("claimed codex rollouts")
-        .insert(canonical(path))
+/// Claim a rollout for `owner`. Returns false when another instance owns it;
+/// the same owner (a relaunch) may always reclaim. The inserted key is
+/// remembered verbatim for exact removal (a moved/deleted/symlinked path
+/// must not leave a canonical-key ghost behind).
+/// Claim a rollout path, optionally also remembering the native session id
+/// scoped to `cwd` (so a later poll re-recognizes the session by id even if
+/// its path is identical to another launch's file).
+pub(crate) fn claim_session(path: &Path, owner: &str, cwd_session: Option<(&Path, &str)>) -> bool {
+    let key = canonical(path);
+    let mut map = CLAIMED_ROLLOUTS.lock().expect("claimed codex rollouts");
+    match map.get(&key) {
+        Some(existing) if existing != owner => false,
+        _ => {
+            map.insert(key, owner.to_owned());
+            drop(map);
+            if let Some((cwd, session_id)) = cwd_session {
+                CLAIMED_SESSIONS
+                    .lock()
+                    .expect("claimed codex sessions")
+                    .insert((canonical(cwd), session_id.to_owned()), owner.to_owned());
+            }
+            true
+        }
+    }
 }
 
-/// Release a claim (adapter drop). A double release is a no-op.
-pub(crate) fn release_claim(path: &Path) {
-    CLAIMED_ROLLOUTS
+/// Whether native session `session_id` in `cwd` is already claimed by THIS
+/// owner (lets an adapter re-bind its own session after a tail restart).
+pub(crate) fn owned_by(cwd: &Path, owner: &str, session_id: &str) -> bool {
+    CLAIMED_SESSIONS
         .lock()
-        .expect("claimed codex rollouts")
-        .remove(&canonical(path));
+        .expect("claimed codex sessions")
+        .get(&(canonical(cwd), session_id.to_owned()))
+        .is_some_and(|existing| existing == owner)
+}
+
+/// Whether native session `session_id` in `cwd` is claimed by a DIFFERENT
+/// owner.
+#[allow(dead_code)]
+pub(crate) fn session_claimed_by_other(cwd: &Path, owner: &str, session_id: &str) -> bool {
+    CLAIMED_SESSIONS
+        .lock()
+        .expect("claimed codex sessions")
+        .get(&(canonical(cwd), session_id.to_owned()))
+        .is_some_and(|existing| existing != owner)
+}
+
+/// Remove exactly the key `claim` inserted (r6 item 7): callers pass the
+/// returned key rather than re-canonicalizing a path that may have moved or
+/// disappeared. A foreign/unowned key is untouched.
+pub(crate) fn release_claim(path_key: &Path, owner: &str) {
+    let key = canonical(path_key);
+    let mut map = CLAIMED_ROLLOUTS.lock().expect("claimed codex rollouts");
+    if map.get(&key).is_some_and(|existing| existing == owner) {
+        map.remove(&key);
+    }
 }
 
 /// RAII window for one launch still discovering in a cwd. Explicit
@@ -113,8 +163,8 @@ impl DiscoveryWindow {
         if let Some(entry) = map.get_mut(&self.key) {
             entry.count = entry.count.saturating_sub(1);
             if entry.count <= 1 {
-                // At most one seeker left: the file-level locator (with the
-                // claimed-rollout set) is authoritative again.
+                // At most one seeker left: the file-level locator (with
+                // per-instance claims and prompts) is authoritative again.
                 entry.tainted = false;
             }
             if entry.count == 0 {
@@ -131,25 +181,31 @@ impl Drop for DiscoveryWindow {
 }
 
 // ---------------------------------------------------------------------------
-// Sent-input evidence (c-usagefu r5 item 5)
+// Sent-input evidence (c-usagefu r5 item 5; r6 items 1/3)
 // ---------------------------------------------------------------------------
 
-/// How close to a driver-sent prompt a lazily-created rollout may appear and
-/// still count as that prompt's session. The first turn writes session_meta,
-/// the user item and usage within well under a second of the keystroke in
-/// practice; this is the generous outer bound.
+/// How long after a keystroke a lazily-created rollout may appear and still
+/// count as that prompt's session.
 pub(crate) const INPUT_MATCH_WINDOW: time::Duration = time::Duration::seconds(300);
+
+/// Small pre-keystroke slack (the session row can precede the recorded send by
+/// a scheduler tick).
+const INPUT_MATCH_SLACK: time::Duration = time::Duration::seconds(5);
 
 #[derive(Clone)]
 struct SentInput {
     /// Whitespace-trimmed prompt text as the driver sent it.
     text: String,
-    /// When the driver sent it.
-    at: time::OffsetDateTime,
+    /// Latest time the instance dispatched this text.
+    at: OffsetDateTime,
 }
 
-static SENT_INPUTS: LazyLock<Mutex<HashMap<PathBuf, Vec<SentInput>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// cwd -> (instance key -> prompts). A HashMap (not a global dedupe list):
+/// every instance authorizes only its OWN prompts, and re-sending identical
+/// text ("continue") refreshes that instance's timestamp instead of being
+/// dropped (r6 item 3).
+type SentInputs = HashMap<PathBuf, HashMap<String, Vec<SentInput>>>;
+static SENT_INPUTS: LazyLock<Mutex<SentInputs>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Whitespace-trimmed comparison form (codex stores the prompt verbatim in
 /// the `input_text` item).
@@ -157,44 +213,51 @@ fn normalize_input(text: &str) -> String {
     text.trim().to_owned()
 }
 
-/// Record that THIS driver process sent `text` in `cwd` (generic-pty prompt
-/// dispatched). Only inputs recorded here may bind a rollout: a codex the
-/// OPERATOR ran by hand in the same cwd never appears in the registry and can
-/// never be claimed by an idle Remuda pane.
-pub(crate) fn record_input(cwd: &Path, text: &str) {
-    put_input(cwd, text, OffsetDateTime::now_utc());
-}
-
-/// Test seam: record an input with an explicit timestamp.
-#[cfg(test)]
-pub(crate) fn record_input_at(cwd: &Path, text: &str, at: OffsetDateTime) {
-    put_input(cwd, text, at);
-}
-
-fn put_input(cwd: &Path, text: &str, at: OffsetDateTime) {
-    let key = canonical(cwd);
-    let entry = SentInput {
-        text: normalize_input(text),
-        at,
-    };
+fn put_input(cwd: &Path, owner: &str, text: &str, at: OffsetDateTime) {
+    let cwd_key = canonical(cwd);
+    let text = normalize_input(text);
+    if text.is_empty() {
+        return;
+    }
     let mut map = SENT_INPUTS.lock().expect("codex sent inputs");
-    let inputs = map.entry(key).or_default();
-    if !inputs.iter().any(|existing| existing.text == entry.text) {
-        inputs.push(entry);
-        // Bound the retained history per cwd.
-        if inputs.len() > 32 {
-            let excess = inputs.len() - 32;
-            inputs.drain(0..excess);
+    let inputs = map
+        .entry(cwd_key)
+        .or_default()
+        .entry(owner.to_owned())
+        .or_default();
+    match inputs.iter_mut().find(|existing| existing.text == text) {
+        // Identical prompt sent again: refresh the time so a later turn
+        // ("continue" minutes/hours later) can still match (r6 item 3).
+        Some(existing) => existing.at = at,
+        None => {
+            inputs.push(SentInput { text, at });
+            // Bound retained history per (cwd, instance).
+            if inputs.len() > 32 {
+                let excess = inputs.len() - 32;
+                inputs.drain(0..excess);
+            }
         }
     }
 }
 
-/// Whether a rollout created at `session_started` carrying first-user-message
-/// text `rollout_text` is evidence of an input this driver sent in `cwd`:
-/// exact trimmed-text match and creation within [`INPUT_MATCH_EPSILON`] before
-/// / [`INPUT_MATCH_WINDOW`] after the keystroke.
+/// Record that instance `owner` dispatched `text` in `cwd` at `now`.
+pub(crate) fn record_input(cwd: &Path, owner: &str, text: &str) {
+    put_input(cwd, owner, text, OffsetDateTime::now_utc());
+}
+
+/// Test seam: record an input with an explicit timestamp.
+#[cfg(test)]
+pub(crate) fn record_input_at(cwd: &Path, owner: &str, text: &str, at: OffsetDateTime) {
+    put_input(cwd, owner, text, at);
+}
+
+/// Whether a rollout created at `session_started` whose first real user
+/// message is `rollout_text` is evidence of a prompt instance `owner` sent in
+/// `cwd`: exact trimmed-text match and creation within the slack/window
+/// bounds of the LATEST dispatch of that text.
 pub(crate) fn matches_sent_input(
     cwd: &Path,
+    owner: &str,
     rollout_text: &str,
     session_started: OffsetDateTime,
 ) -> bool {
@@ -203,16 +266,27 @@ pub(crate) fn matches_sent_input(
         return false;
     }
     let map = SENT_INPUTS.lock().expect("codex sent inputs");
-    let Some(inputs) = map.get(&canonical(cwd)) else {
+    let Some(by_instance) = map.get(&canonical(cwd)) else {
+        return false;
+    };
+    let Some(inputs) = by_instance.get(owner) else {
+        // Another instance's prompts do not authorize this adapter.
         return false;
     };
     inputs.iter().any(|input| {
         input.text == wanted
-            && session_started >= input.at - LAUNCH_TIME_SLACK_SENT
+            && session_started >= input.at - INPUT_MATCH_SLACK
             && session_started <= input.at + INPUT_MATCH_WINDOW
     })
 }
 
-/// Small pre-keystroke slack (the session row can precede the recorded send by
-/// a scheduler tick).
-const LAUNCH_TIME_SLACK_SENT: time::Duration = time::Duration::seconds(5);
+// Test-only visibility so unit tests in other modules of this crate can
+// build deterministic identities without touching process globals elsewhere.
+#[cfg(test)]
+pub(crate) fn claimed_owner_of(path: &Path) -> Option<String> {
+    CLAIMED_ROLLOUTS
+        .lock()
+        .expect("claimed codex rollouts")
+        .get(&canonical(path))
+        .cloned()
+}

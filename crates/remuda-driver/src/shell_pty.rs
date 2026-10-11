@@ -1431,6 +1431,7 @@ impl ShellPtyDriver {
                 .filter(|model| !model.is_empty()),
             hooks: Some(Arc::clone(hooks)),
             agent_pid: pid,
+            instance_key: Some(uuid::Uuid::new_v4().to_string()),
         };
         crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx)
     }
@@ -1496,6 +1497,7 @@ impl ShellPtyDriver {
                         fallback_model: None,
                         hooks: None,
                         agent_pid: Some(found.pid),
+                        instance_key: None,
                     };
                     match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {
                         Ok(Some(started)) => handle = Some(started),

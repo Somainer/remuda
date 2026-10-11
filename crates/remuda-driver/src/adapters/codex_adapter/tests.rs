@@ -410,7 +410,8 @@ fn a_driver_launch_binds_only_its_own_post_launch_same_cwd_rollout() {
         cwd: cwd.to_path_buf(),
         pid: None,
         launched_at: Some(floor),
-    });
+    })
+    .with_instance_key(Some(INST_A.to_owned()));
 
     assert!(adapter.poll().unwrap().is_empty());
     let bound = adapter.binding().map(|binding| binding.session_id.clone());
@@ -421,7 +422,7 @@ fn a_driver_launch_binds_only_its_own_post_launch_same_cwd_rollout() {
 
     // The pane's own session registers shortly after launch; the driver
     // dispatched its prompt just before that.
-    send_fixture_prompt(cwd, "fixture driver prompt", now);
+    send_fixture_prompt(cwd, INST_A, "fixture driver prompt", now);
     write_rollout(
         home.path(),
         "2026/09/14",
@@ -448,7 +449,7 @@ fn two_post_launch_same_cwd_rollouts_fail_closed_for_the_launch_lifetime() {
     let now = OffsetDateTime::now_utc();
     let floor = now - time::Duration::seconds(10);
     let rfc = |at: OffsetDateTime| at.format(&Rfc3339).unwrap();
-    send_fixture_prompt(cwd, "fixture driver prompt", now);
+    send_fixture_prompt(cwd, INST_A, "fixture driver prompt", now);
     write_rollout(
         home.path(),
         "2026/09/14",
@@ -469,7 +470,8 @@ fn two_post_launch_same_cwd_rollouts_fail_closed_for_the_launch_lifetime() {
         cwd: cwd.to_path_buf(),
         pid: None,
         launched_at: Some(floor),
-    });
+    })
+    .with_instance_key(Some(INST_A.to_owned()));
     assert!(!adapter.discover().unwrap(), "ambiguous binds nothing");
     assert!(adapter.binding().is_none());
 
@@ -500,7 +502,8 @@ fn a_rollout_appearing_long_after_launch_binds_when_the_first_prompt_is_late() {
         cwd: cwd.to_path_buf(),
         pid: None,
         launched_at: Some(floor),
-    });
+    })
+    .with_instance_key(Some(INST_A.to_owned()));
     assert!(!adapter.discover().unwrap());
     assert!(adapter.binding().is_none());
     assert!(
@@ -511,7 +514,7 @@ fn a_rollout_appearing_long_after_launch_binds_when_the_first_prompt_is_late() {
     // First prompt at t+200 s: the driver dispatches it and the rollout's
     // session starts just now.
     let now = OffsetDateTime::now_utc();
-    send_fixture_prompt(cwd, "fixture driver prompt", now);
+    send_fixture_prompt(cwd, INST_A, "fixture driver prompt", now);
     let started = now.format(&Rfc3339).unwrap();
     write_rollout(
         home.path(),
@@ -580,20 +583,31 @@ fn write_rollout_with_prompt(
     .unwrap();
 }
 
+/// Per-instance keys used by the driver-launch unit tests.
+const INST_A: &str = "inst-a-key";
+const INST_B: &str = "inst-b-key";
+const INST_C: &str = "inst-c-key";
+
 /// Record a driver-sent prompt (as generic_pty.send does) for unit tests.
 /// `cwd` must be the same path given to the adapter's `AdapterHome`.
-fn send_fixture_prompt(cwd: &Path, prompt: &str, at: OffsetDateTime) {
-    crate::adapters::codex_discovery::record_input_at(cwd, prompt, at);
+fn send_fixture_prompt(cwd: &Path, owner: &str, prompt: &str, at: OffsetDateTime) {
+    crate::adapters::codex_discovery::record_input_at(cwd, owner, prompt, at);
 }
 
 /// Build an unbound driver-launch adapter (with an open discovery window).
 fn launch_adapter(home: &Path, cwd: &str, floor: OffsetDateTime) -> CodexAdapter {
+    launch_adapter_keyed(home, cwd, floor, INST_A)
+}
+
+/// Build a driver-launch adapter with an explicit per-instance identity.
+fn launch_adapter_keyed(home: &Path, cwd: &str, floor: OffsetDateTime, key: &str) -> CodexAdapter {
     CodexAdapter::new(AdapterHome {
         home: home.to_path_buf(),
         cwd: Path::new(cwd).to_path_buf(),
         pid: None,
         launched_at: Some(floor),
     })
+    .with_instance_key(Some(key.to_owned()))
 }
 
 #[test]
@@ -614,10 +628,11 @@ fn a_bound_first_instance_releases_its_window_and_a_later_instance_binds_its_own
 
     send_fixture_prompt(
         Path::new(cwd),
+        INST_A,
         "fixture driver prompt",
         now - time::Duration::seconds(50),
     );
-    let mut a = launch_adapter(home.path(), cwd, floor_a);
+    let mut a = launch_adapter_keyed(home.path(), cwd, floor_a, INST_A);
     write_rollout(home.path(), "2026/09/14", "A-thread", cwd, &a_started);
     assert!(a.discover().unwrap(), "A binds its unique rollout");
     assert!(
@@ -627,7 +642,7 @@ fn a_bound_first_instance_releases_its_window_and_a_later_instance_binds_its_own
 
     // B launches later with a fresh floor after A's session started.
     let floor_b = now - time::Duration::seconds(10);
-    let mut b = launch_adapter(home.path(), cwd, floor_b);
+    let mut b = launch_adapter_keyed(home.path(), cwd, floor_b, INST_B);
     assert!(
         !b.window.as_ref().is_some_and(|window| window.overlapping()),
         "A is no longer discovering: B opens clean"
@@ -642,6 +657,7 @@ fn a_bound_first_instance_releases_its_window_and_a_later_instance_binds_its_own
     // unclaimed -> binds.
     send_fixture_prompt(
         Path::new(cwd),
+        INST_B,
         "fixture driver prompt",
         now - time::Duration::seconds(2),
     );
@@ -670,9 +686,9 @@ fn three_overlapping_windows_do_not_latch_give_up_and_clear_as_they_close() {
     let floor = OffsetDateTime::now_utc() - time::Duration::seconds(5);
     let now = OffsetDateTime::now_utc();
 
-    let mut a = launch_adapter(home.path(), cwd, floor);
-    let mut b = launch_adapter(home.path(), cwd, floor);
-    let mut c = launch_adapter(home.path(), cwd, floor);
+    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
+    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+    let mut c = launch_adapter_keyed(home.path(), cwd, floor, INST_C);
     for adapter in [&a, &b, &c] {
         assert!(
             adapter
@@ -685,7 +701,9 @@ fn three_overlapping_windows_do_not_latch_give_up_and_clear_as_they_close() {
 
     // A's rollout appears and A wins it; B and C must not latch give-up and
     // must not touch A's file.
-    send_fixture_prompt(Path::new(cwd), "fixture driver prompt", now);
+    send_fixture_prompt(Path::new(cwd), INST_A, "fixture driver prompt", now);
+    send_fixture_prompt(Path::new(cwd), INST_B, "fixture driver prompt", now);
+    send_fixture_prompt(Path::new(cwd), INST_C, "fixture driver prompt", now);
     write_rollout(
         home.path(),
         "2026/09/14",
@@ -732,10 +750,10 @@ fn an_idle_unbound_instance_does_not_block_a_later_second_instance() {
     let home = tempfile::tempdir().unwrap();
     let cwd = "/projects/r5-idle";
     let floor = OffsetDateTime::now_utc() - time::Duration::seconds(5);
-    let mut a = launch_adapter(home.path(), cwd, floor);
+    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
     assert!(!a.discover().unwrap(), "A has no rollout yet");
 
-    let mut b = launch_adapter(home.path(), cwd, floor);
+    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
     assert!(
         b.window.as_ref().is_some_and(|window| window.overlapping()),
         "B overlaps the still-idle A"
@@ -746,7 +764,7 @@ fn an_idle_unbound_instance_does_not_block_a_later_second_instance() {
 
     let now = OffsetDateTime::now_utc();
     // B dispatched its own prompt before the rollout was created.
-    send_fixture_prompt(Path::new(cwd), "fixture driver prompt", now);
+    send_fixture_prompt(Path::new(cwd), INST_B, "fixture driver prompt", now);
     write_rollout(
         home.path(),
         "2026/09/14",
@@ -802,7 +820,7 @@ fn a_strictly_post_launch_match_hydrates_its_own_first_turn_from_byte_zero() {
     }
 
     let mut adapter = launch_adapter(home.path(), cwd, floor);
-    send_fixture_prompt(Path::new(cwd), "fixture driver prompt", now);
+    send_fixture_prompt(Path::new(cwd), INST_A, "fixture driver prompt", now);
     assert!(
         adapter.discover().unwrap(),
         "the strict post-floor file matches"
@@ -869,7 +887,7 @@ fn an_in_slack_match_tails_from_end_and_skips_pre_bind_records() {
     }
 
     let mut adapter = launch_adapter(home.path(), cwd, floor);
-    send_fixture_prompt(Path::new(cwd), "fixture driver prompt", now);
+    send_fixture_prompt(Path::new(cwd), INST_A, "fixture driver prompt", now);
     assert!(
         adapter.discover().unwrap(),
         "the in-slack file still matches"
@@ -947,9 +965,9 @@ fn a_rollout_whose_first_prompt_matches_a_driver_sent_input_binds() {
     let floor = now - time::Duration::seconds(5);
     let prompt = "remuda dispatched this";
 
-    let mut adapter = launch_adapter(home.path(), cwd, floor);
+    let mut adapter = launch_adapter_keyed(home.path(), cwd, floor, "sent-key");
     // The driver sent the prompt slightly before the rollout was created.
-    record_input_at(&cwd_dir, prompt, now);
+    record_input_at(&cwd_dir, "sent-key", prompt, now);
     let started = (now - time::Duration::seconds(1)).format(&Rfc3339).unwrap();
     write_rollout_with_prompt(home.path(), "2026/09/14", "sent-one", cwd, &started, prompt);
     assert!(
@@ -959,5 +977,277 @@ fn a_rollout_whose_first_prompt_matches_a_driver_sent_input_binds() {
     assert_eq!(
         adapter.binding().map(|binding| binding.session_id.as_str()),
         Some("sent-one")
+    );
+}
+
+// c-usagefu r6 item 1 ---------------------------------------------------------
+
+fn write_rollout_prompt_at(home: &Path, id: &str, cwd: &str, started: &str, prompt: &str) {
+    write_rollout_with_prompt(home, "2026/09/14", id, cwd, started, prompt);
+}
+
+/// Reverse tick order: B polls BEFORE A has polled. Even though B sees A's
+/// prompt file first, the prompt text is A's — B's gate rejects it, and B
+/// then binds its own distinct rollout.
+#[test]
+fn a_prompt_file_is_never_bound_by_the_instance_that_polls_first() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r6-pollorder";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+    let rfc = now.format(&Rfc3339).unwrap();
+
+    send_fixture_prompt(Path::new(cwd), INST_A, "A prompt words", now);
+    send_fixture_prompt(Path::new(cwd), INST_B, "B prompt words", now);
+    write_rollout_prompt_at(home.path(), "A-first", cwd, &rfc, "A prompt words");
+
+    // B scans first (supervisor tick order is arbitrary).
+    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+    assert!(!b.discover().unwrap(), "B must not bind A's prompt file");
+    assert!(b.binding().is_none());
+
+    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
+    assert!(
+        a.discover().unwrap(),
+        "A binds its own file despite B's early poll"
+    );
+    assert_eq!(a.binding().map(|b| b.session_id.as_str()), Some("A-first"));
+
+    // B's own rollout then appears and binds, with A still alive.
+    let later = now.format(&Rfc3339).unwrap();
+    write_rollout_prompt_at(home.path(), "B-second", cwd, &later, "B prompt words");
+    assert!(b.discover().unwrap());
+    assert_eq!(b.binding().map(|b| b.session_id.as_str()), Some("B-second"));
+}
+
+/// A binds and STAYS OPEN; B must still bind its own rollout (A's window was
+/// released on bind; A's prompt authorizes only A).
+#[test]
+fn a_still_open_idle_while_b_binds_its_own_rollout() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r6-open";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+
+    send_fixture_prompt(Path::new(cwd), INST_A, "fixture driver prompt", now);
+    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
+    write_rollout_prompt_at(
+        home.path(),
+        "A-open",
+        cwd,
+        &now.format(&Rfc3339).unwrap(),
+        "fixture driver prompt",
+    );
+    assert!(a.discover().unwrap());
+
+    // B launches and binds while A is still live (no drop).
+    send_fixture_prompt(Path::new(cwd), INST_B, "fixture driver prompt", now);
+    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+    assert!(!b.discover().unwrap(), "B cannot touch A's bound file");
+    write_rollout_prompt_at(
+        home.path(),
+        "B-open",
+        cwd,
+        &now.format(&Rfc3339).unwrap(),
+        "fixture driver prompt",
+    );
+    assert!(b.discover().unwrap(), "B binds with A's window still open");
+    assert_eq!(b.binding().map(|b| b.session_id.as_str()), Some("B-open"));
+}
+
+/// After A closes, an idle B must not rebind A's file even though A's prompt
+/// remains in the per-cwd history.
+#[test]
+fn a_closed_owner_file_is_never_rebound_by_idle_b() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r6-close";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+
+    send_fixture_prompt(Path::new(cwd), INST_A, "fixture driver prompt", now);
+    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
+    write_rollout_prompt_at(
+        home.path(),
+        "A-closed",
+        cwd,
+        &now.format(&Rfc3339).unwrap(),
+        "fixture driver prompt",
+    );
+    assert!(a.discover().unwrap());
+    let path = a.binding().unwrap().main_file.clone().unwrap();
+    assert!(crate::adapters::codex_discovery::claimed_owner_of(&path).is_some());
+    drop(a);
+    // Claim survives the close, keyed to A.
+    assert_eq!(
+        crate::adapters::codex_discovery::claimed_owner_of(&path).as_deref(),
+        Some(INST_A)
+    );
+
+    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+    send_fixture_prompt(Path::new(cwd), INST_B, "fixture driver prompt", now);
+    for _ in 0..3 {
+        assert!(
+            !b.discover().unwrap(),
+            "B never re-binds the closed owner's file"
+        );
+        assert!(b.binding().is_none());
+    }
+}
+
+/// A prompt sent to a GROK pane must not authorize a codex bind with the
+/// same first user message.
+#[test]
+fn a_grok_pane_prompt_does_not_authorize_a_codex_bind() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r6-grok";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+
+    // A codex-like adapter, but the only recorded prompt in the cwd belongs
+    // to a DIFFERENT (grok) instance key (as generic_pty records codex-only:
+    // a grok pane records nothing on the codex registry at all).
+    let mut codex = launch_adapter_keyed(home.path(), cwd, floor, "codex-key");
+    write_rollout_prompt_at(
+        home.path(),
+        "grok-shaped",
+        cwd,
+        &now.format(&Rfc3339).unwrap(),
+        "same words",
+    );
+    // Simulate "a prompt exists in the cwd under some other identity" — it
+    // must not authorize this codex adapter.
+    send_fixture_prompt(Path::new(cwd), "grok-key", "same words", now);
+    assert!(!codex.discover().unwrap());
+    assert!(codex.binding().is_none());
+}
+
+/// Two prompted panes racing for their own files each bind exactly theirs
+/// (deterministic interleaving: both scan both files; claims decide).
+#[test]
+fn two_prompted_panes_each_bind_their_own_file() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r6-two";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+    let rfc = now.format(&Rfc3339).unwrap();
+
+    send_fixture_prompt(Path::new(cwd), INST_A, "A words", now);
+    send_fixture_prompt(Path::new(cwd), INST_B, "B words", now);
+    write_rollout_prompt_at(home.path(), "A-file", cwd, &rfc, "A words");
+    write_rollout_prompt_at(home.path(), "B-file", cwd, &rfc, "B words");
+
+    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
+    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+    assert!(a.discover().unwrap());
+    assert!(b.discover().unwrap());
+    let bound = |adapter: &CodexAdapter| adapter.binding().unwrap().session_id.clone();
+    let (ab, bb) = (bound(&a), bound(&b));
+    assert!(
+        ab != bb && (ab == "A-file" || ab == "B-file"),
+        "each instance binds a distinct file, got {ab} {bb}"
+    );
+    assert!(
+        (ab == "A-file" && bb == "B-file") || (ab == "B-file" && bb == "A-file"),
+        "only A-file/B-file are bindable, got {ab} {bb}"
+    );
+}
+
+// c-usagefu r6 item 2 ---------------------------------------------------------
+
+#[test]
+fn a_claim_loser_keeps_discovering_and_never_takes_the_winners_file() {
+    // Two adapters scanning the same candidate: A wins the claim, B's bind
+    // returns false. B must NOT remember the id (which would shortcut tier 1
+    // with strict=true) and must later bind its OWN rollout — never A's file
+    // even after A drops.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r6-loser";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+    let rfc = now.format(&Rfc3339).unwrap();
+
+    send_fixture_prompt(Path::new(cwd), INST_A, "winner words", now);
+    send_fixture_prompt(Path::new(cwd), INST_B, "loser words", now);
+    write_rollout_prompt_at(home.path(), "W", cwd, &rfc, "winner words");
+
+    // A claims first.
+    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
+    assert!(a.discover().unwrap());
+    assert_eq!(a.binding().unwrap().session_id, "W");
+
+    // B sees the SAME file in a scan; the locator's exclude check actually
+    // removes it (owned by A), so verify the residual loser path directly:
+    // hand the winner's path to bind with B's identity -> claim refused.
+    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+    let winner_path = home
+        .path()
+        .join("sessions/2026/09/14")
+        .join("rollout-W.jsonl");
+    let tier1_snapshot = b.confirmed.is_none() && b.binding().is_none();
+    assert!(tier1_snapshot, "fresh B has no remembered identity");
+    // Direct bind call: B must lose the claim and stay unbound.
+    let bound = b.bind_for_test("W".into(), winner_path.clone(), false);
+    assert!(!bound, "B loses the claim");
+    assert!(b.binding().is_none(), "lost claim must not bind");
+
+    // After A closes B still cannot take A's file (claim outlives A).
+    drop(a);
+    assert!(!b.discover().unwrap());
+    assert!(b.binding().is_none());
+
+    // B's own rollout appears and binds.
+    write_rollout_prompt_at(home.path(), "L", cwd, &rfc, "loser words");
+    assert!(b.discover().unwrap());
+    assert_eq!(
+        b.binding().map(|b| b.session_id.as_str()),
+        Some("L"),
+        "the loser binds its own rollout, never W"
+    );
+}
+
+// c-usagefu r6 item 3 ---------------------------------------------------------
+
+#[test]
+fn an_identical_prompt_sent_minutes_apart_refreshes_and_each_turn_binds() {
+    // "continue" dispatched twice with a large gap must refresh the recorded
+    // send time per instance (r5 dropped duplicate text globally). Both the
+    // first session and the later one bind, even though their first prompt
+    // text is byte-identical.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r6-refresh";
+
+    // Turn 1 at t0.
+    let t0 = OffsetDateTime::now_utc() - time::Duration::seconds(600);
+    let floor = t0 - time::Duration::seconds(5);
+    send_fixture_prompt(Path::new(cwd), INST_A, "continue", t0);
+    let mut a1 = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
+    write_rollout_prompt_at(
+        home.path(),
+        "continue-1",
+        cwd,
+        &t0.format(&Rfc3339).unwrap(),
+        "continue",
+    );
+    assert!(a1.discover().unwrap());
+    drop(a1);
+
+    // Turn 2, 600 s later (outside INPUT_MATCH_WINDOW of t0), same text.
+    let t1 = OffsetDateTime::now_utc();
+    send_fixture_prompt(Path::new(cwd), INST_A, "continue", t1);
+    let mut a2 = launch_adapter_keyed(home.path(), cwd, t1 - time::Duration::seconds(5), INST_A);
+    write_rollout_prompt_at(
+        home.path(),
+        "continue-2",
+        cwd,
+        &t1.format(&Rfc3339).unwrap(),
+        "continue",
+    );
+    assert!(
+        a2.discover().unwrap(),
+        "the refreshed send time lets the second identical prompt bind"
+    );
+    assert_eq!(
+        a2.binding().map(|b| b.session_id.as_str()),
+        Some("continue-2")
     );
 }

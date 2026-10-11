@@ -508,7 +508,7 @@ pub fn locate_rollout_by_cwd(
     // Ownership gate beyond cwd + timestamp: a candidate is accepted only
     // when this returns true for (file, session start, first user message).
     // The driver passes the sent-input match (r5 item 5); tests pass accept-all.
-    input_gate: &dyn Fn(&Path, time::OffsetDateTime, &str) -> bool,
+    input_gate: &dyn Fn(&Path, time::OffsetDateTime, &str, &Value) -> bool,
 ) -> CwdRollout {
     let floor = launched_at - LAUNCH_TIME_SLACK;
     // Wall-clock form of the floor for mtime comparisons.
@@ -612,13 +612,12 @@ pub fn locate_rollout_by_cwd(
                 // and is left alone. A header-only file (lazy 0.154 creation
                 // before the prompt lands) yields None and simply waits: it
                 // can match later once its real prompt appears.
-                match first_user_text(entry.path().as_path()) {
-                    Some(first_prompt) => {
-                        if !input_gate(entry.path().as_path(), started, &first_prompt) {
-                            continue;
-                        }
-                    }
-                    None => continue,
+                let Some(first_prompt) = first_user_text(entry.path().as_path()) else {
+                    // Header-only lazy file — wait for its real prompt.
+                    continue;
+                };
+                if !input_gate(entry.path().as_path(), started, &first_prompt, &metadata) {
+                    continue;
                 }
                 // Distinguish a strictly post-launch session (safe to
                 // hydrate from byte zero) from an in-slack candidate (a

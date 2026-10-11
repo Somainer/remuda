@@ -56,6 +56,11 @@ pub struct AdapterCtx {
     /// different process sharing this home (same rule as
     /// `remuda_node::signal::binds_instance`).
     pub agent_pid: Option<i32>,
+    /// Stable per-launch identity for process-wide codex discovery
+    /// (prompt registry + rollout claims, c-usagefu r6 item 1). `None` for a
+    /// promoted attach to a process this Node did not launch: its claim is
+    /// released when the adapter closes.
+    pub instance_key: Option<String>,
 }
 
 /// Handle to a running adapter task. Dropping/aborting it stops the poll loop.
@@ -108,7 +113,8 @@ pub fn spawn_file_adapters(
 ) -> DriverResult<Option<AdapterHandle>> {
     match kind {
         AgentKind::Codex => {
-            let mut adapter = CodexAdapter::new(ctx.home.clone());
+            let mut adapter =
+                CodexAdapter::new(ctx.home.clone()).with_instance_key(ctx.instance_key.clone());
             if let Some(model) = &ctx.fallback_model {
                 adapter = adapter.with_fallback_model(model.clone());
             }

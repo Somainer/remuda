@@ -654,13 +654,8 @@ pub(crate) struct GateRegistry {
     /// Live runs plus canceled-dispatch records (one lock).
     runs: Mutex<GateRunTable>,
     /// Live-carrier hook the run calls to ask the Hub for authority before
-    /// executing. Replaced per session.
+    /// executing. Replaced per session; absence always refuses (r12 item 5).
     authorizer: tokio::sync::RwLock<Option<std::sync::Arc<dyn GateAuthorizer>>>,
-    /// True once ANY carrier session attached. Distinguishes a carrier-less
-    /// direct/dev caller (never attached → Node-local floor is the only
-    /// available authority) from a carrier that ATTACHED and then went away
-    /// (must fail closed: no stale/replacement-session authorization).
-    carrier_attached: std::sync::atomic::AtomicBool,
     /// Test-only holds that park the NEXT gate.run handler at its entry (the
     /// cancel-beats-run race needs the run frame to be in flight, before the
     /// registry and lane are touched, when gate.cancel arrives). One-shot:
@@ -682,7 +677,6 @@ impl GateRegistry {
             lanes: Mutex::new(BTreeMap::new()),
             runs: Mutex::new(GateRunTable::new()),
             authorizer: tokio::sync::RwLock::new(None),
-            carrier_attached: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-faults"))]
             run_holds: Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-faults"))]
@@ -711,8 +705,6 @@ impl GateRegistry {
 
     /// Register the live session's Hub-authority hook (called on connect).
     pub(crate) async fn set_authorizer(&self, authorizer: std::sync::Arc<dyn GateAuthorizer>) {
-        self.carrier_attached
-            .store(true, std::sync::atomic::Ordering::SeqCst);
         *self.authorizer.write().await = Some(authorizer);
     }
 
@@ -722,10 +714,12 @@ impl GateRegistry {
         *self.authorizer.write().await = None;
     }
 
-    /// Ask the Hub whether the dispatch may execute. A live session that lost
-    /// its link, a transport error or a bounded timeout all mean NO. A node
-    /// that NEVER had a carrier (direct/dev caller) falls back to the
-    /// Node-local floor.
+    /// Ask the Hub whether the dispatch may execute. The ONLY way to get a
+    /// yes is a live, registered carrier authorizer returning true within the
+    /// bound. No authorizer (a Node that never attached a carrier, or one
+    /// whose session dropped), a transport error or a timeout all mean NO —
+    /// missing authority is permission, never an allow (r12 item 5). Tests
+    /// that need a yes install a test-only authorizer explicitly.
     async fn hub_authorizes(&self, job_id: &str, generation: u32) -> bool {
         let authorizer = self.authorizer.read().await.clone();
         match authorizer {
@@ -735,16 +729,14 @@ impl GateRegistry {
             )
             .await
             .unwrap_or(false),
-            None => !self
-                .carrier_attached
-                .load(std::sync::atomic::Ordering::Acquire),
+            None => false,
         }
     }
 
-    /// Request the Running → Landing grant at the verify→land boundary. On a
-    /// never-attached direct/dev caller the local floor grants (tests); on a
-    /// live/attached carrier any non-grant/refusal/timeout is a refusal and
-    /// the push must not happen.
+    /// Request the Running → Landing grant at the verify→land boundary. With
+    /// no registered carrier the answer is always a refusal (r12 item 5): a
+    /// production DevNode that never attached must not fabricate a grant and
+    /// push. Tests that need a grant install a test-only authorizer.
     async fn hub_land_grant(
         &self,
         job_id: &str,
@@ -762,22 +754,10 @@ impl GateRegistry {
                 granted: false,
                 landing_in_progress: false,
             }),
-            None => {
-                if self
-                    .carrier_attached
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    LandGrantAnswer {
-                        granted: false,
-                        landing_in_progress: false,
-                    }
-                } else {
-                    LandGrantAnswer {
-                        granted: true,
-                        landing_in_progress: false,
-                    }
-                }
-            }
+            None => LandGrantAnswer {
+                granted: false,
+                landing_in_progress: false,
+            },
         }
     }
 

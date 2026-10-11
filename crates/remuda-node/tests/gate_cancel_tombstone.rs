@@ -81,6 +81,8 @@ async fn gate_run_is_refused_canceled_when_its_cancel_was_acked_first() {
 async fn the_cancel_tombstone_does_not_touch_other_jobs() {
     let dir = tempfile::tempdir().expect("tmp");
     let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+    node.gate_test_set_authorizer(std::sync::Arc::new(StubAuthorizer(true)))
+        .await;
     let repo = dir.path().join("never-checked-out");
 
     gate_rpc(
@@ -110,6 +112,8 @@ async fn the_cancel_tombstone_does_not_touch_other_jobs() {
 async fn the_tombstone_is_consumed_by_the_first_run() {
     let dir = tempfile::tempdir().expect("tmp");
     let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+    node.gate_test_set_authorizer(std::sync::Arc::new(StubAuthorizer(true)))
+        .await;
     let repo = dir.path().join("never-checked-out");
     let job_id = "gjb_tombstone_consumed";
 
@@ -156,6 +160,8 @@ async fn the_tombstone_is_consumed_by_the_first_run() {
 async fn a_delayed_old_generation_is_refused_however_late_it_arrives() {
     let dir = tempfile::tempdir().expect("tmp");
     let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+    node.gate_test_set_authorizer(std::sync::Arc::new(StubAuthorizer(true)))
+        .await;
     let repo = dir.path().join("never-checked-out-late");
     let job_id = "gjb_tombstone_late";
 
@@ -407,6 +413,10 @@ async fn after_local_state_is_lost_the_hub_fence_still_refuses() {
 async fn at_capacity_a_refused_cancel_does_not_block_a_later_dispatch() {
     let dir = tempfile::tempdir().expect("tmp");
     let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+    // A live carrier authorizes executions; the tombstone (not the Hub) is
+    // what must still refuse the tracked job below.
+    node.gate_test_set_authorizer(std::sync::Arc::new(StubAuthorizer(true)))
+        .await;
     for i in 0..4096u32 {
         gate_rpc(
             &node,
@@ -459,4 +469,29 @@ async fn at_capacity_a_refused_cancel_does_not_block_a_later_dispatch() {
         json!("canceled"),
         "the refused cancel must not block the overflow dispatch: {overflow}"
     );
+}
+
+/// r12 item 5: a FRESH production DevNode that has never had a carrier attach
+/// has no authorizer at all. A valid land dispatch must be refused (never
+/// silently allowed by a "direct/dev" local floor) and so can never push.
+#[tokio::test]
+async fn a_land_run_with_no_carrier_attached_is_refused_and_pushes_nothing() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+    let repo = dir.path().join("fresh-no-carrier");
+    let job_id = "gjb_fresh_no_carrier_land";
+
+    // Deliberately do NOT call gate_test_set_authorizer: no carrier attached.
+    let mut params = run_params(job_id, "lane-fresh", &repo, 1);
+    params["mode"] = json!("land");
+    params["push"] = json!(true);
+
+    let result = gate_rpc(&node, "gate.run", params).await;
+    assert_eq!(
+        result["status"],
+        json!("canceled"),
+        "missing authority must refuse, not allow a land: {result}"
+    );
+    // Refused before execute_gate, so no checkout/push was attempted.
+    assert!(!repo.exists(), "the refused run must not touch a checkout");
 }

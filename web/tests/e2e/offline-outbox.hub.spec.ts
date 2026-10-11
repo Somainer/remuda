@@ -182,9 +182,18 @@ async function keepHubBlockedByRoutes(context: import('@playwright/test').Browse
   await context.setOffline(false);
 }
 
-async function unblockHub(context: import('@playwright/test').BrowserContext) {
+async function unblockHub(page: import('@playwright/test').Page) {
+  const context = page.context();
   await context.setOffline(false);
   await context.unroute(V1);
+  // Playwright unrouting the /v1/ abort does not, by itself, deliver the
+  // `online` window event the app's connection machine waits for (blockHub
+  // used BOTH setOffline(true) and a route abort; recovery here is route-only
+  // because the document must keep loading). A real browser reconnect fires
+  // `online`, which drives resume -> live -> outbox flush; synthesise that
+  // event so the re-send is deterministic instead of racing the reconnect
+  // timer against the 30 s delivery poll.
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
 }
 
 test.beforeEach(async ({ page }) => {
@@ -307,7 +316,7 @@ test("offline sends are queued and delivered exactly once after reconnect", asyn
   ).length;
   expect(seedSends).toBe(0);
 
-  await unblockHub(page.context());
+  await unblockHub(page);
   await expect(banner).toHaveCount(0, { timeout: 20_000 });
 
   // Exactly one Hub command row per id …
@@ -361,7 +370,7 @@ test("an offline-queued message survives a reload while the Hub is still off and
   expect((await hubCommands(api, instanceId)).filter((c) => c.operation === "instance.send")).toHaveLength(0);
 
   // Reconnect: the restored row delivers exactly once under the same id.
-  await unblockHub(page.context());
+  await unblockHub(page);
   await expect(page.getByTestId("journal-banner")).toHaveCount(0, { timeout: 20_000 });
   await expect
     .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })

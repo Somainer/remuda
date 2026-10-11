@@ -290,7 +290,10 @@ async fn run_one_inline(script: &Arc<ScriptState>, params: &Value, node: &mut La
             *seq += 1;
             format!("evt-{seq}")
         };
-        let mut event_params = json!({ "jobId": job_id });
+        let mut event_params = json!({
+            "jobId": job_id,
+            "generation": params["generation"].clone(),
+        });
         if let Some(object) = event.as_object() {
             for (key, value) in object {
                 event_params[key] = value.clone();

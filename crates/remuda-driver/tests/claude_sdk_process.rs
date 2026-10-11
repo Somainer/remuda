@@ -1525,16 +1525,17 @@ async fn a_successful_turn_then_a_failed_live_write_rolls_back_without_a_b_start
     driver.close().await.expect("close");
 }
 
-/// ma-sdk-state r7 item 3: a failed write must not leak the driver's Inner
+/// ma-sdk-state r7/r8 item 3: a failed write must not leak the driver's Inner
 /// (the old ReservationGuard::fail used std::mem::forget). After the failed
 /// write and close, a Weak to Inner upgrades to None.
+///
+/// Uses the deterministic NUMBERED driver write fault (the write fails before
+/// the writer is called, exercising ReservationGuard::fail) rather than a live
+/// broken pipe, so the test cannot race the fake child's stdin-closure timing
+/// (ma-sdk-state r8 item 4).
 #[tokio::test]
 async fn a_failed_write_and_close_release_the_driver_inner() {
-    let mut env = BTreeMap::new();
-    // Close stdin right after the handshake: the first prompt write fails on a
-    // live child deterministically (no fixed sleep).
-    env.insert("FAKE_CLAUDE_CLOSE_STDIN".into(), "1".into());
-    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
     let handle = driver.start(spec).await.expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
     let weak = driver.weak_inner();
@@ -1543,11 +1544,10 @@ async fn a_failed_write_and_close_release_the_driver_inner() {
         "Inner is alive while the driver is"
     );
 
+    // The very next write fails deterministically WITHOUT touching the child.
+    driver.force_write_failure_from(1);
     let failed = driver.send(prompt("never written")).await;
-    assert!(
-        failed.is_err(),
-        "write against closed stdin must fail: {failed:?}"
-    );
+    assert!(failed.is_err(), "the forced write must fail: {failed:?}");
 
     driver.close().await.expect("close");
     drop(handle);

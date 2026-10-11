@@ -274,6 +274,82 @@ describe("Outbox", () => {
     }
   });
 
+  it("GATE12 item 4: refreshDurable reconciles claim wakeups — cancel terminal/missing, re-arm a changed lease", async () => {
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(500_000);
+      const store = new MemStorage();
+      const owner = "owner_reconcile";
+      const T = Date.now() + LEASE_TTL_MS;
+      for (const id of ["cmd_sent", "cmd_renewed", "cmd_deleted"]) {
+        const p = store.put(
+          rec({
+            commandId: id,
+            instanceId: `ins_${id}`,
+            state: "inflight",
+            lease: { owner, until: T },
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(2);
+        await p;
+      }
+      const box = await Outbox.load(store, owner);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(box.pendingClaimWakeups().sort()).toEqual(["cmd_deleted", "cmd_renewed", "cmd_sent"]);
+      const wakes = vi.fn();
+      box.onClaimWake = wakes;
+
+      // Another tab delivers one, renews a second, deletes the third.
+      const T2 = T + LEASE_TTL_MS;
+      const writes = [
+        store.put(
+          rec({
+            commandId: "cmd_sent",
+            instanceId: "ins_cmd_sent",
+            state: "sent",
+            gotResponse: true,
+            lease: undefined,
+          }),
+        ),
+        store.put(
+          rec({
+            commandId: "cmd_renewed",
+            instanceId: "ins_cmd_renewed",
+            state: "inflight",
+            lease: { owner, until: T2 },
+          }),
+        ),
+        store.delete("cmd_deleted"),
+      ];
+      await vi.advanceTimersByTimeAsync(5);
+      await Promise.all(writes);
+
+      await box.refreshDurable();
+
+      // Terminal and missing claims lost their wakeups; the renewed one kept
+      // its wakeup for the LATER deadline.
+      expect(box.pendingClaimWakeups()).toEqual(["cmd_renewed"]);
+      expect(box.get("cmd_sent")?.state).toBe("sent");
+
+      // At the OLD deadline nothing fires (sent would re-trigger wrongly; the
+      // renewed claim is still live).
+      await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
+      expect(wakes).not.toHaveBeenCalled();
+      expect(box.pendingClaimWakeups()).toEqual(["cmd_renewed"]);
+      expect(store.map.get("cmd_renewed")?.state).toBe("inflight");
+
+      // The renewed claim goes inactive and reclaims only at T2.
+      await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
+      expect(wakes).toHaveBeenCalledTimes(1);
+      expect(store.map.get("cmd_renewed")?.state).toBe("pending");
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
   it("GATE12 item 3: dispose during a deferred deadline READ makes the wakeup return with no reclaim, no flush, zero timers", async () => {
     const originalNavigator = globalThis.navigator;
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });

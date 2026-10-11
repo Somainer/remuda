@@ -1020,7 +1020,36 @@ export class Outbox {
   private async refreshFromStorage(): Promise<OutboxRecord[]> {
     const durable = (await this.storage.all()).filter((r) => commandIdFromKey(r.commandId));
     for (const rec of durable) this.cache.set(rec.commandId, rec);
+    this.reconcileClaimWakeups(durable);
     return durable;
+  }
+
+  /**
+   * Reconcile tracked claim wakeups against a FRESH durable set (gate 12
+   * item 4): another tab may have delivered/deleted the row a wakeup is
+   * waiting on, or renewed its lease. Cancel when the row is missing or no
+   * longer inflight; re-arm for the new FUTURE lease when the observed lease
+   * changed; drop an expired different lease (the ordinary foreign-lease
+   * flush owns that delivery). The command whose own wakeup is firing is not
+   * in the map yet, so this never disturbs the in-flight critical section.
+   */
+  private reconcileClaimWakeups(durable: OutboxRecord[]) {
+    if (this.disposed || this.claimWakeups.size === 0) return;
+    const byId = new Map(durable.map((r) => [r.commandId, r]));
+    for (const [id, entry] of [...this.claimWakeups]) {
+      const fresh = byId.get(id);
+      if (!fresh || fresh.state !== "inflight" || !fresh.lease) {
+        this.clearClaimWakeup(id);
+        continue;
+      }
+      const lease = fresh.lease;
+      if (lease.owner === entry.snapshot.owner && lease.until === entry.snapshot.until) continue;
+      if (lease.until > Date.now()) {
+        this.scheduleClaimWakeup(id, entry.instanceId, lease);
+      } else {
+        this.clearClaimWakeup(id);
+      }
+    }
   }
 
   /**

@@ -178,7 +178,54 @@ fn read_persisted_token(path: &Path) -> Result<Option<String>, HubError> {
 ///            adopted at a no-source start) and rotation is allowed.
 const BOOTSTRAP_EXPLICIT_MARKER: &str = "bootstrap-token-source-explicit";
 
+// Test-only: when armed ON THE TEST THREAD, `write_private` fails for a file
+// whose name contains the needle. Thread-local so parallel auth tests each
+// call resolve_bootstrap on their own thread and never see another test's
+// fault (production write_private runs synchronously on the caller thread).
+// c-bootstrap-dev r8 item 3.
+#[cfg(test)]
+thread_local! {
+    static WRITE_FAULT_NEEDLE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn arm_write_fault(needle: &str) {
+    WRITE_FAULT_NEEDLE.with(|n| *n.borrow_mut() = Some(needle.to_owned()));
+}
+
+#[cfg(test)]
+fn clear_write_fault() {
+    WRITE_FAULT_NEEDLE.with(|n| *n.borrow_mut() = None);
+}
+
+/// Test-only RAII guard clearing the thread-local fault at scope end.
+#[cfg(test)]
+struct WriteFaultGuard;
+
+#[cfg(test)]
+impl Drop for WriteFaultGuard {
+    fn drop(&mut self) {
+        clear_write_fault();
+    }
+}
+
 fn write_private(path: &Path, contents: &str) -> Result<(), HubError> {
+    #[cfg(test)]
+    {
+        let faulted = WRITE_FAULT_NEEDLE.with(|needle| {
+            let n = needle.borrow();
+            n.as_deref().is_some_and(|needle| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(needle))
+            })
+        });
+        if faulted {
+            return Err(HubError::Internal(
+                "bootstrap: injected write fault".to_owned(),
+            ));
+        }
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -397,7 +444,16 @@ fn file_mtime_newer_than_stamp(file: &Path, stamp: &Path) -> Result<bool, HubErr
     let Ok(modified) = meta.modified() else {
         return Ok(false);
     };
-    Ok(time::OffsetDateTime::from(modified) > parsed)
+    let modified = time::OffsetDateTime::from(modified);
+    // c-bootstrap-dev r7 item 4: a FUTURE mtime is clock skew / a restored
+    // tree, not evidence of a redeploy. Clamping it to "now" is not enough on
+    // its own (now is always newer than the stored stamp, so that would
+    // re-stamp on EVERY restart): a touch only counts when it lies in the
+    // observable interval (stamp, now]. A future-dated file therefore keeps the
+    // stored issued-at until real time actually passes its mtime; the code
+    // change check still re-stamps a changed content independently.
+    let now = time::OffsetDateTime::now_utc();
+    Ok(modified <= now && modified > parsed)
 }
 
 /// Commit the post-bind adoption of provenance. Called only when
@@ -943,6 +999,78 @@ mod tests {
         assert!(bootstrap_within_ttl(dir.path(), 24));
     }
 
+    /// Round 7 item 4: a FUTURE-dated access-file mtime (clock skew, a
+    /// `cp -r`/restore carrying a timestamp ahead of the hub clock) must not
+    /// re-stamp the bootstrap on every restart. The touch rule only accepts an
+    /// mtime in the interval (stamp, now]; a future value is ignored, so the
+    /// expired stamp stays expired and a fresh stamp stays byte-identical
+    /// across restarts.
+    #[cfg(unix)]
+    #[test]
+    fn future_dated_access_file_mtime_never_restamps() {
+        let dir = tempfile::tempdir().expect("data dir");
+        // (1) An EXPIRED stamp plus a future file: the code stays expired
+        //     instead of being revived.
+        let expired_bytes = expired_token_setup(dir.path(), "same-code");
+        let code_file = dir.path().join("access-code");
+        write_private(&code_file, "same-code").expect("code file");
+        let future = time::OffsetDateTime::now_utc().unix_timestamp() + 86_400;
+        set_mtime(&code_file, future, 0);
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "same-code".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitFile(code_file.clone());
+        resolve_bootstrap(&mut config).expect("resolve restart 1");
+        let stamp_path = dir.path().join("bootstrap-issued-at");
+        assert_eq!(
+            std::fs::read(&stamp_path).unwrap(),
+            expired_bytes,
+            "a future mtime must not revive an expired stamp"
+        );
+        assert!(!bootstrap_within_ttl(dir.path(), 24));
+
+        // Restart 2 leaves the exact same bytes — no perpetual re-stamp.
+        resolve_bootstrap(&mut config).expect("resolve restart 2");
+        assert_eq!(
+            std::fs::read(&stamp_path).unwrap(),
+            expired_bytes,
+            "the future-dated file must not re-stamp on any restart"
+        );
+
+        // (2) A genuine touch in the observable past (now, second resolution)
+        // still re-stamps once and then settles.
+        set_mtime(
+            &code_file,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+            0,
+        );
+        resolve_bootstrap(&mut config).expect("resolve after real touch");
+        let stamped = std::fs::read(&stamp_path).unwrap();
+        assert_ne!(stamped, expired_bytes, "a real touch re-stamps");
+        assert!(bootstrap_within_ttl(dir.path(), 24));
+        // c-bootstrap-dev r8 item 2: the deferred touch is consumed ONCE —
+        // another restart with the same (now current) mtime does not reissue.
+        let mtime_after = std::fs::metadata(&code_file)
+            .and_then(|m| m.modified())
+            .expect("code file mtime");
+        resolve_bootstrap(&mut config).expect("resolve after consumed touch");
+        assert_eq!(
+            std::fs::read(&stamp_path).unwrap(),
+            stamped,
+            "the (stamp, now] touch reissues exactly once"
+        );
+        let _ = mtime_after;
+        // Future-date it again after the fresh stamp: the fresh stamp must
+        // survive the next restart byte-for-byte.
+        set_mtime(&code_file, future + 10, 0);
+        resolve_bootstrap(&mut config).expect("resolve restart 3");
+        assert_eq!(
+            std::fs::read(&stamp_path).unwrap(),
+            stamped,
+            "a future mtime never overwrites a freshly issued stamp"
+        );
+    }
+
     /// Item 2: a no-source start that finds the explicit marker defers marker
     /// removal until after a successful bind. `resolve_bootstrap` itself must
     /// leave the marker (and rotation refusal) intact and report the deferred
@@ -1079,6 +1207,44 @@ mod tests {
             assert!(!dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
             assert!(!dir.path().join("bootstrap-token").is_file());
             assert!(!dir.path().join("bootstrap-issued-at").is_file());
+        }
+    }
+
+    /// Round 7 item 3: an EMPTY access-code FILE (or a whitespace-only one)
+    /// configured as an ExplicitFile is refused exactly like an empty env
+    /// value — before any marker/token/stamp write — and does not silently
+    /// mint. The CLI rejects the empty SecretRef before spawning; this pins
+    /// the library refusal the spawn path relies on.
+    #[test]
+    fn empty_explicit_file_is_rejected_before_writes() {
+        for contents in ["", "   ", "\n\t "] {
+            let dir = tempfile::tempdir().expect("data dir");
+            let code_file = dir.path().join("access-code");
+            write_private(&code_file, contents).expect("empty code file");
+            // Pre-existing hub-owned code the refusal must leave untouched.
+            persist_bootstrap(dir.path(), "real-code").expect("persist");
+            let token_bytes = std::fs::read(dir.path().join("bootstrap-token")).unwrap();
+            let stamp_bytes = std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap();
+
+            let mut config = HubConfig::for_test(dir.path().to_path_buf());
+            config.bootstrap_token = String::new();
+            config.bootstrap_source = BootstrapSource::ExplicitFile(code_file);
+            let err = resolve_bootstrap(&mut config).expect_err("empty file refused");
+            assert!(format!("{err}").contains("empty"), "got: {err}");
+
+            assert!(!dir.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file());
+            assert_eq!(
+                std::fs::read(dir.path().join("bootstrap-token")).unwrap(),
+                token_bytes
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("bootstrap-issued-at")).unwrap(),
+                stamp_bytes
+            );
+            assert!(
+                rotate_bootstrap(dir.path()).is_ok(),
+                "the dir stays hub-owned"
+            );
         }
     }
 
@@ -1580,27 +1746,279 @@ mod tests {
         );
     }
 
-    /// Round 6 item 3: rotation is TOKEN-first. The residue of an interrupted
-    /// rotate (new token committed atomically, stamp write never happened —
-    /// represented by the old expired stamp still on disk) pairs NEITHER code
-    /// with a valid fresh stamp, so the TTL stays closed instead of granting
-    /// the old code another 24 h. A follow-up rotate completes the repair.
+    /// Round 7 item 1 (replaces the round-6 assertion that checked neither
+    /// order): rotation/mint persist order is TOKEN → STAMP, asserted through
+    /// the observable directory state at EVERY crash point.
     #[test]
-    fn interrupted_token_first_rotate_fails_closed() {
+    fn mint_persist_order_is_token_then_stamp_at_each_crash_point() {
         let dir = tempfile::tempdir().expect("data dir");
-        write_private(&dir.path().join("bootstrap-token"), "old-code").expect("old token");
-        replace_private(&dir.path().join("bootstrap-token"), "new-minted-code")
-            .expect("new token landed first");
-        write_private(&dir.path().join("bootstrap-issued-at"), EXPIRED_STAMP)
-            .expect("stamp write never happened; old expired stamp remains");
+        let token_path = dir.path().join("bootstrap-token");
+        let stamp_path = dir.path().join("bootstrap-issued-at");
+        write_private(&token_path, "old-code").expect("pre-rotate token");
+        write_private(&stamp_path, EXPIRED_STAMP).expect("pre-rotate stamp");
 
+        // Crash point 1: the atomic token rename landed, the stamp write never
+        // ran. The OLD expired stamp bytes are still on disk — this is the
+        // exact residue persist_minted_bootstrap's ordering produces, and it
+        // must fail closed for BOTH codes.
+        replace_private(&token_path, "new-minted-code").expect("new token landed first");
+        assert_eq!(
+            std::fs::read(&stamp_path).unwrap(),
+            EXPIRED_STAMP.as_bytes(),
+            "at crash point 1 the new token pairs with the OLD stamp"
+        );
+        assert_eq!(
+            read_persisted_token(&token_path).unwrap().as_deref(),
+            Some("new-minted-code")
+        );
         assert!(
             !bootstrap_within_ttl(dir.path(), 24),
-            "neither old nor new code pairs with a valid fresh stamp"
+            "a new token with the old expired stamp grants no TTL to either code"
         );
-        let fixed = rotate_bootstrap(dir.path()).expect("rotate repairs the residue");
-        assert_ne!(fixed, "old-code");
-        assert_ne!(fixed, "new-minted-code");
+
+        // Crash point 2: the fresh stamp lands and the pair is usable.
+        write_private(&stamp_path, &now_rfc3339()).expect("stamp lands second");
         assert!(bootstrap_within_ttl(dir.path(), 24));
+        assert_eq!(
+            read_persisted_token(&token_path).unwrap().as_deref(),
+            Some("new-minted-code"),
+            "the stamp write never touches the token"
+        );
+
+        // A fresh rotate on the completed pair is the same order end to end
+        // and repairs nothing it did not break.
+        let rotated = rotate_bootstrap(dir.path()).expect("rotate");
+        assert_ne!(rotated, "old-code");
+        assert_ne!(rotated, "new-minted-code");
+        assert!(bootstrap_within_ttl(dir.path(), 24));
+    }
+
+    /// Round 7 item 1: an injected fault at the SECOND write pins the real
+    /// persist_minted_bootstrap order rather than a hand-staged file layout.
+    /// With the stamp path made unwritable (a directory), the function errors
+    /// at the stamp write AFTER the atomic token rename: the NEW token is
+    /// already on disk. A stamp-first implementation would fail on the FIRST
+    /// write and leave the OLD token, so this assertion fails if the order is
+    /// reverted.
+    #[cfg(unix)]
+    #[test]
+    fn mint_persist_order_pinned_by_a_fault_at_the_second_write() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let token_path = dir.path().join("bootstrap-token");
+        let stamp_path = dir.path().join("bootstrap-issued-at");
+        write_private(&token_path, "old-code").expect("pre-mint token");
+        write_private(&stamp_path, EXPIRED_STAMP).expect("pre-mint stamp");
+
+        // The stamp write cannot succeed: the path is now a directory.
+        std::fs::remove_file(&stamp_path).expect("remove stamp file");
+        std::fs::create_dir(&stamp_path).expect("stamp path is a directory");
+
+        let err = persist_minted_bootstrap(dir.path(), "new-minted-code")
+            .expect_err("the second (stamp) write must fail");
+        assert!(format!("{err}").contains("bootstrap"), "got: {err}");
+        assert_eq!(
+            read_persisted_token(&token_path).unwrap().as_deref(),
+            Some("new-minted-code"),
+            "token-first: the new token is committed before the stamp write fails"
+        );
+
+        // Clean up the directory so the tempdir can be removed, and confirm a
+        // follow-up call on the healthy dir completes the pair.
+        std::fs::remove_dir(&stamp_path).expect("remove blocking directory");
+        persist_minted_bootstrap(dir.path(), "new-minted-code").expect("retry completes");
+        assert_eq!(
+            read_persisted_token(&token_path).unwrap().as_deref(),
+            Some("new-minted-code")
+        );
+        assert!(bootstrap_within_ttl(dir.path(), 24));
+    }
+
+    /// Round 7 item 1: the EXPLICIT-source persist order is MARKER (fsync'd)
+    /// → STAMP → TOKEN. The residue each crash point leaves is asserted
+    /// directly, and the point-A residue (marker durable, token never
+    /// persisted) is fed to the REAL no-source recovery path.
+    #[test]
+    fn explicit_persist_order_is_marker_then_stamp_then_token() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let marker_path = dir.path().join(BOOTSTRAP_EXPLICIT_MARKER);
+        let token_path = dir.path().join("bootstrap-token");
+        let stamp_path = dir.path().join("bootstrap-issued-at");
+        std::fs::create_dir_all(dir.path()).expect("data dir");
+
+        // Crash point A: the explicit start was killed between the marker
+        // fsync and persist_bootstrap. The marker is durable; NOTHING else may
+        // exist yet — no token, no stamp.
+        write_private(&marker_path, "").expect("marker");
+        fsync_dir(dir.path()).expect("marker fsync");
+        assert!(marker_path.is_file(), "point A: marker durable");
+        assert!(!token_path.is_file(), "point A: no token");
+        assert!(!stamp_path.is_file(), "point A: no stamp");
+
+        // A no-source start at point A must mint ONLY in memory and defer
+        // every write to post-bind (the round-6 fix): the marker and the
+        // absence of a token are both preserved.
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = String::new();
+        config.bootstrap_source = BootstrapSource::Generated;
+        assert_eq!(
+            resolve_bootstrap(&mut config).expect("resolve"),
+            BootstrapResolution::AdoptAfterBind
+        );
+        assert!(marker_path.is_file(), "pre-bind: marker not unlinked");
+        assert!(!token_path.is_file(), "pre-bind: no token minted to disk");
+        assert!(!stamp_path.is_file(), "pre-bind: no stamp minted to disk");
+        assert!(
+            !config.bootstrap_token.is_empty(),
+            "the running hub holds an in-memory code"
+        );
+        assert!(
+            rotate_bootstrap(dir.path()).is_err(),
+            "pre-bind: rotation still refuses the marker-guarded, token-less dir"
+        );
+
+        // A FAILED bind (no adopt) followed by a second start reaches the same
+        // state — still no on-disk token, marker intact.
+        let mut retry = HubConfig::for_test(dir.path().to_path_buf());
+        retry.bootstrap_token = String::new();
+        retry.bootstrap_source = BootstrapSource::Generated;
+        assert_eq!(
+            resolve_bootstrap(&mut retry).expect("retry resolve"),
+            BootstrapResolution::AdoptAfterBind
+        );
+        assert!(marker_path.is_file());
+        assert!(!token_path.is_file());
+        assert!(!stamp_path.is_file());
+
+        // Bind succeeds: the minted token+stamp land and the marker is removed
+        // TOGETHER.
+        adopt_bootstrap_after_bind(dir.path(), &retry.bootstrap_token).expect("adopt");
+        assert!(
+            !marker_path.is_file(),
+            "post-bind: marker removed with the commit"
+        );
+        assert_eq!(
+            read_persisted_token(&token_path).unwrap().as_deref(),
+            Some(retry.bootstrap_token.as_str())
+        );
+        assert!(bootstrap_issued_at(dir.path()).is_some());
+        assert!(bootstrap_within_ttl(dir.path(), 24));
+        assert!(
+            rotate_bootstrap(dir.path()).is_ok(),
+            "the adopted token is hub-owned now"
+        );
+
+        // Crash point B (separate dir): on a code CHANGE persist wrote the new
+        // stamp but was killed before the atomic token rename. New stamp,
+        // token still the OLD code — code_changed repairs on the next start.
+        let dir2 = tempfile::tempdir().expect("data dir 2");
+        expired_token_setup(dir2.path(), "previous-code");
+        write_private(&dir2.path().join("bootstrap-issued-at"), &now_rfc3339())
+            .expect("new stamp landed");
+        assert_eq!(
+            std::fs::read_to_string(dir2.path().join("bootstrap-token"))
+                .unwrap()
+                .trim(),
+            "previous-code",
+            "point B: stamp-first leaves the OLD token paired with the new stamp"
+        );
+        let code_file = dir2.path().join("access-code");
+        write_private(&code_file, "replaced-code").expect("code file");
+        backdate_mtime(&code_file, MTIME_1999);
+        let mut cfg = HubConfig::for_test(dir2.path().to_path_buf());
+        cfg.bootstrap_token = "replaced-code".to_owned();
+        cfg.bootstrap_source = BootstrapSource::ExplicitFile(code_file);
+        resolve_bootstrap(&mut cfg).expect("restart self-heals point B");
+        assert_eq!(
+            std::fs::read_to_string(dir2.path().join("bootstrap-token"))
+                .unwrap()
+                .trim(),
+            "replaced-code"
+        );
+        assert!(bootstrap_within_ttl(dir2.path(), 24));
+    }
+
+    /// c-bootstrap-dev r8 item 3: a REAL-FUNCTION fault (not a hand-staged
+    /// residue) pins the explicit-path durable order — marker BEFORE the
+    /// token/stamp. If resolve_bootstrap were reordered to persist first, the
+    /// marker-fault test below would instead find a written token, and the
+    /// stamp-fault test would find a written stamp before the marker.
+    #[test]
+    fn explicit_order_pinned_by_real_write_faults() {
+        // Fault 1: marker write fails → nothing else may be written.
+        let _fault = WriteFaultGuard;
+        let dir = tempfile::tempdir().expect("data dir");
+        let code_file = dir.path().join("access-code");
+        write_private(&code_file, "real-fault-code-at-least-16-xx").expect("code file");
+        arm_write_fault(BOOTSTRAP_EXPLICIT_MARKER);
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = "real-fault-code-at-least-16-xx".to_owned();
+        config.bootstrap_source = BootstrapSource::ExplicitFile(code_file.clone());
+        assert!(
+            resolve_bootstrap(&mut config).is_err(),
+            "marker fault aborts"
+        );
+        assert!(
+            !dir.path().join("bootstrap-token").is_file(),
+            "marker-before-token: a marker fault writes no token"
+        );
+        assert!(
+            !dir.path().join("bootstrap-issued-at").is_file(),
+            "marker-before-stamp: a marker fault writes no stamp"
+        );
+        // Fault 2: stamp write fails → the marker IS durable, token is NOT.
+        let dir2 = tempfile::tempdir().expect("data dir 2");
+        let code_file2 = dir2.path().join("access-code");
+        write_private(&code_file2, "real-fault-code-two-at-least-16-x").expect("code file 2");
+        arm_write_fault("bootstrap-issued-at");
+        let mut cfg2 = HubConfig::for_test(dir2.path().to_path_buf());
+        cfg2.bootstrap_token = "real-fault-code-two-at-least-16-x".to_owned();
+        cfg2.bootstrap_source = BootstrapSource::ExplicitFile(code_file2);
+        assert!(resolve_bootstrap(&mut cfg2).is_err(), "stamp fault aborts");
+        assert!(
+            dir2.path().join(BOOTSTRAP_EXPLICIT_MARKER).is_file(),
+            "marker committed before the stamp fault"
+        );
+        assert!(
+            !dir2.path().join("bootstrap-token").is_file(),
+            "stamp-before-token: a stamp fault writes no token"
+        );
+    }
+
+    /// Round 7 item 1, negative contract: an explicit start that died in the
+    /// marker→persist window must not be turned into a hub-owned, rotateable
+    /// directory by a no-source mint that unlinks the marker (or writes the
+    /// token) BEFORE the listener binds. This test fails against the pre-r6
+    /// order (mint, persist, unlink marker, then bind).
+    #[test]
+    fn pre_bind_mint_never_unlinks_marker_or_publishes_token() {
+        let dir = tempfile::tempdir().expect("data dir");
+        std::fs::create_dir_all(dir.path()).expect("data dir");
+        write_private(&dir.path().join(BOOTSTRAP_EXPLICIT_MARKER), "").expect("crashed marker");
+        let marker_path = dir.path().join(BOOTSTRAP_EXPLICIT_MARKER);
+        let token_path = dir.path().join("bootstrap-token");
+
+        let mut config = HubConfig::for_test(dir.path().to_path_buf());
+        config.bootstrap_token = String::new();
+        config.bootstrap_source = BootstrapSource::Generated;
+        let resolution = resolve_bootstrap(&mut config).expect("resolve");
+        assert_eq!(resolution, BootstrapResolution::AdoptAfterBind);
+
+        // The observable pre-bind state must be byte-identical to the crash
+        // residue: marker present, no token (and the no-source mint path must
+        // never have called set_bootstrap_explicit_marker(false)).
+        assert!(
+            marker_path.is_file(),
+            "the marker must survive until a successful bind — unlinking it \
+             pre-bind would hand rotation authority to a Hub that never started"
+        );
+        assert!(
+            !token_path.is_file(),
+            "publishing the minted token pre-bind would leave a hub-owned code \
+             with no marker guarding it if the bind then fails"
+        );
+        assert!(
+            rotate_bootstrap(dir.path()).is_err(),
+            "authority over the directory stays with the explicit marker"
+        );
     }
 }

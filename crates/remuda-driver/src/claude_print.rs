@@ -1778,6 +1778,10 @@ pub mod test_barrier {
         /// (`MAX` = never).
         accept_ack_from: AtomicUsize,
         accept_ack_number: AtomicUsize,
+        /// r8 item 3: incremented each time the publication worker has MAPPED a
+        /// Result frame (after the mapper lock released). A test waits for the
+        /// specific count (A's result) before releasing B's failure.
+        result_mapped_count: AtomicUsize,
     }
 
     /// An armed write-commit barrier. Releases on drop.
@@ -1807,6 +1811,7 @@ pub mod test_barrier {
             accept_ack_gate: tokio::sync::Notify::new(),
             accept_ack_from: AtomicUsize::new(usize::MAX),
             accept_ack_number: AtomicUsize::new(0),
+            result_mapped_count: AtomicUsize::new(0),
         });
         *slot.lock().expect("barrier lock") = Some(state.clone());
         WriteCommitBarrier { state }
@@ -1922,7 +1927,33 @@ pub mod test_barrier {
         }
     }
 
+    /// r8 item 3 worker hook: a Result frame has been mapped by the worker.
+    pub(super) fn note_result_mapped(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state.result_mapped_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
     impl WriteCommitBarrier {
+        /// r8 item 3: wait until `n` Result frames have been MAPPED by the
+        /// publication worker (after the mapper lock, before/with emit).
+        pub async fn wait_until_results_mapped(&self, n: usize, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.result_mapped_count.load(Ordering::Acquire) >= n {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "write_commit barrier: timed out waiting for {n} mapped results \
+                         (mapped={})",
+                        self.state.result_mapped_count.load(Ordering::Acquire)
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
         /// Block until the send has parked post-write, the worker is parked at
         /// the turn's Reserve ticket, AND the reader's result frame is queued
         /// behind it — i.e. the race window is provably occupied.
@@ -2115,6 +2146,14 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                         let mut mapper = inner.mapper.lock().await;
                         map_outbound(&mut mapper, &frame)?
                     };
+                    // r8 item 3: signal once a RESULT frame has actually been
+                    // mapped (after the mapper lock), so a deferred-settle test
+                    // can wait for A's result to be consumed before releasing
+                    // B's failure — ordering without a sleep.
+                    #[cfg(feature = "test-stub")]
+                    if matches!(&*frame, Outbound::Result(_)) {
+                        test_barrier::note_result_mapped(&inner.barrier);
+                    }
                     emit_all(&inner, observations).await
                 }
                 .await

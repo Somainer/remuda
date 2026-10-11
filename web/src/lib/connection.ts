@@ -367,6 +367,16 @@ export class ConnectionMachine {
         }
         return;
       case "resumeAttempt": {
+        // Gate 17 item 4: reject a completion whose BINDING GENERATION differs
+        // BEFORE touching any state. The retired-offline acceptance below used
+        // to let an attempt for a navigated-away session through: its close
+        // latch then overrode the NEW binding's healthy live socket (state was
+        // flipped to recovering before the gen check at the end ran). A
+        // same-binding offline retirement (resumeBindGen === latestBindGen) is
+        // still accepted — gate 8's offline→online chain depends on it.
+        if (this.resumeBindGen !== this.latestBindGen) {
+          return;
+        }
         // Accept a completion only for the CURRENT attempt. A late resolution
         // from an attempt the watchdog already timed out (B is now running)
         // must not certify live nor consume B's outcome. The browser
@@ -705,6 +715,16 @@ export class ConnectionMachine {
   noteBinding(gen: number) {
     if (gen === this.latestBindGen) return;
     this.latestBindGen = gen;
+    // Gate 17 item 4: a binding change invalidates the OLD attempt's
+    // retired-offline bookkeeping AND its close latch. A browser `offline`
+    // event while A's attempt was dying left resumeRetiredOffline set with
+    // resumeInFlight=false; after navigating to mounted B (adopted live) A's
+    // delayed rejection then PASSED the acceptance guard, and its stale close
+    // latch flipped B's healthy-socket state to recovering. The gen guard in
+    // the resumeAttempt arm drops the completion; clearing the latch here keeps
+    // every other path (frame/settle) clean as well.
+    this.resumeRetiredOffline = false;
+    this.closedDuringResume = false;
     if (this.resumeInFlight && this.resumeBindGen !== gen) {
       this.resumeInFlight = false;
       this.clearTimer("watchdog");

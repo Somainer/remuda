@@ -1332,4 +1332,77 @@ describe("ConnectionMachine", () => {
     machine.followAttemptEnd(false, idA, 1);
     expect(onAttemptFinish).not.toHaveBeenCalled();
   });
+
+  it("GATE17 item 4: an offline-retired attempt's delayed rejection and close latch never cross a binding onto mounted live B", async () => {
+    // The gate-17 regression: A's resume socket closes mid-attempt
+    // (closedDuringResume latched), a browser offline event retires the
+    // attempt with resumeRetiredOffline (resumeInFlight=false), the user
+    // navigates to mounted B adopted live, and A's delayed catch-up rejects —
+    // the stale completion passed the acceptance guard and its latch flipped
+    // B to recovering. The binding change must retire ALL of A's bookkeeping
+    // and its completion must be dropped before any state mutation.
+    const { machine, resume, probe, isFollowLive, onAttemptFinish, onState } = setupTracked();
+    machine.bootstrapLive();
+    machine.noteBinding(1);
+
+    // A's resume stays pending; its follow socket closes while A owns it.
+    let rejectA!: (err: Error) => void;
+    resume.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectA = reject;
+        }),
+    );
+    machine.dispatch({ type: "resume" });
+    expect(machine.state).toBe("recovering");
+    machine.dispatch({ type: "close" });
+    // Browser offline: the attempt is retired WITH the offline flag.
+    machine.dispatch({ type: "offline" });
+    expect(machine.state).toBe("offline");
+
+    // Navigate to mounted B: the store binds gen 2 then adopts B's live
+    // socket (adoptMountedFollow -> followRebindLive).
+    machine.noteBinding(2);
+    isFollowLive.mockReturnValue(true);
+    machine.followRebindLive();
+    expect(machine.state).toBe("live");
+    const statesAfterAdopt = onState.mock.calls.length;
+
+    // A's delayed catch-up rejects. B must stay live: no recovery transition,
+    // no settlement probe (which could demote B later), no finish callback.
+    rejectA(new Error("A catch-up lost the race"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("live");
+    expect(onState.mock.calls.slice(statesAfterAdopt).map((c) => c[0])).toEqual([]);
+    expect(probe).not.toHaveBeenCalled();
+    expect(onAttemptFinish).not.toHaveBeenCalled();
+  });
+
+  it("GATE17 item 4: a same-binding offline retirement still accepts the rejection (gate 8 chain preserved)", async () => {
+    // Defence for the fix: clearing retired-offline on BINDING changes must not
+    // retire the flag within one binding — the gate-8 offline→online chain
+    // settles the old rejection via that flag.
+    const { machine, resume, probe } = setupTracked();
+    probe.mockResolvedValue(false);
+    machine.bootstrapLive();
+    machine.noteBinding(1);
+
+    let rejectA!: (err: Error) => void;
+    resume.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectA = reject;
+        }),
+    );
+    machine.dispatch({ type: "resume" });
+    machine.dispatch({ type: "offline" });
+    expect(machine.state).toBe("offline");
+    // No binding change: the late rejection is still consumed and REST being
+    // down keeps the loud offline reconnect clock.
+    rejectA(new Error("lost"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("offline");
+  });
 });

@@ -667,6 +667,11 @@ pub(crate) struct GateRegistry {
     /// parked at the entry and consumed by the first run.
     #[cfg(any(test, feature = "test-faults"))]
     run_holds: Mutex<Vec<Arc<GateRunHold>>>,
+    /// Test-only override for the granted land child's wall-clock budget, so
+    /// the kill-on-timeout path (r12 item 4) can be exercised without waiting
+    /// the production 10 minutes.
+    #[cfg(any(test, feature = "test-faults"))]
+    land_timeout: Mutex<Option<Duration>>,
     events: tokio::sync::broadcast::Sender<GateEventParams>,
 }
 
@@ -680,8 +685,28 @@ impl GateRegistry {
             carrier_attached: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-faults"))]
             run_holds: Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "test-faults"))]
+            land_timeout: Mutex::new(None),
             events,
         }
+    }
+
+    /// Test-only: override the granted land child timeout (r12 item 4).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) async fn set_land_timeout(&self, timeout: Duration) {
+        *self.land_timeout.lock().await = Some(timeout);
+    }
+
+    /// The granted land child budget: the test override or the production cap.
+    async fn land_timeout(&self) -> Duration {
+        #[cfg(any(test, feature = "test-faults"))]
+        {
+            if let Some(timeout) = *self.land_timeout.lock().await {
+                return timeout;
+            }
+        }
+        #[allow(unreachable_code)]
+        Duration::from_secs(DEFAULT_LAND_TIMEOUT_SECS)
     }
 
     /// Register the live session's Hub-authority hook (called on connect).
@@ -912,6 +937,14 @@ impl DevNode {
     #[cfg(any(test, feature = "test-faults"))]
     pub async fn gate_test_arm_run_hold(&self, hold: std::sync::Arc<GateRunHold>) {
         self.gate_registry().arm_run_hold(hold).await;
+    }
+
+    /// Test-only: shorten the granted land child budget to exercise its
+    /// kill-the-process-group timeout path (r12 item 4).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_set_land_timeout(&self, timeout: std::time::Duration) {
+        self.gate_registry().set_land_timeout(timeout).await;
     }
 
     /// Dispatch one Hub→Node gate RPC by method name.
@@ -1587,7 +1620,7 @@ impl DevNode {
                 .kill_on_drop(false);
             #[cfg(unix)]
             land_command.process_group(0);
-            let land_child = match land_command.spawn() {
+            let mut land_child = match land_command.spawn() {
                 Ok(child) => child,
                 Err(error) => {
                     result.status = "failed".into();
@@ -1596,33 +1629,67 @@ impl DevNode {
                     return finalize(result);
                 }
             };
+            // Record the land child's OWN process group so a timeout can kill
+            // the whole push (the child plus any git it spawned) and reap it.
+            // Without this the child was dropped with kill_on_drop(false) and
+            // kept pushing after we reported failed.
+            #[cfg(unix)]
+            let land_pgid = land_child.id().and_then(|pid| i32::try_from(pid).ok());
+            let land_stdout = land_child.stdout.take();
             // Land runs to completion even if cancel fires (grant already
-            // held); just await it bounded by the land timeout.
-            let land_output = tokio::time::timeout(
-                Duration::from_secs(DEFAULT_LAND_TIMEOUT_SECS),
-                land_child.wait_with_output(),
-            )
-            .await;
-            match land_output {
-                Ok(Ok(land_output)) if land_output.status.success() => {
+            // held); await it bounded by the (test-overridable) land budget.
+            // wait_with_output_piped BORROWS the child (unlike the consuming
+            // wait_with_output), so on timeout the child is still owned here
+            // and can be killed and reaped.
+            let land_budget = registry.land_timeout().await;
+            // Scope the waiting future so its borrow of `land_child` is
+            // released before the timeout arm kills and reaps the child.
+            let land_outcome: Result<Option<std::process::Output>, ()> = {
+                let wait = land_child.wait_with_output_piped(land_stdout);
+                tokio::pin!(wait);
+                tokio::select! {
+                    output = &mut wait => Ok(output),
+                    _ = tokio::time::sleep(land_budget) => Err(()),
+                }
+            };
+            match land_outcome {
+                Err(()) => {
+                    // The budget expired: kill the whole land process group so
+                    // the CAS push cannot complete after this verdict, then
+                    // reap the child. Reporting failed is now honest — the
+                    // force-with-lease push is a single atomic ref update that
+                    // cannot have landed from a killed group.
+                    #[cfg(unix)]
+                    if let Some(pgid) = land_pgid {
+                        kill_group(pgid);
+                    }
+                    let _ = land_child.kill().await;
+                    let _ = land_child.wait().await;
+                    result.status = "failed".into();
+                    result.error = Some(format!(
+                        "land exceeded {}s; killed land process group",
+                        land_budget.as_secs()
+                    ));
+                    result.reason = Some(format!(
+                        "land timed out after {}s and was killed",
+                        land_budget.as_secs()
+                    ));
+                }
+                Ok(Some(land_output)) if land_output.status.success() => {
                     let land_report: Value =
                         serde_json::from_slice(&land_output.stdout).unwrap_or_else(|_| json!({}));
                     result.status = "landed".into();
                     result.current_main_sha = string_field(&land_report, "currentMain");
                     result.merge_sha = string_field(&land_report, "merged").or(result.merge_sha);
                 }
-                Ok(Ok(land_output)) => {
-                    let stderr = String::from_utf8_lossy(&land_output.stderr);
+                Ok(land_output) => {
                     result.status = "failed".into();
-                    result.error = Some(format!("land failed after grant: {}", stderr.trim()));
-                }
-                Ok(Err(error)) => {
-                    result.status = "failed".into();
-                    result.error = Some(format!("land child failed: {error}"));
-                }
-                Err(_elapsed) => {
-                    result.status = "failed".into();
-                    result.error = Some(format!("land exceeded {DEFAULT_LAND_TIMEOUT_SECS}s"));
+                    result.error = Some(match land_output {
+                        Some(output) => {
+                            format!("land failed after grant (exit {:?})", output.status.code())
+                        }
+                        None => "land child produced no result".into(),
+                    });
                 }
             }
         }

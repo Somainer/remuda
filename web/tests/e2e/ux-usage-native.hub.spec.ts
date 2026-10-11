@@ -106,9 +106,25 @@ async function sendTtyKeys(page: import("@playwright/test").Page, id: string, te
   expect(response.status(), `tty.write ${response.status()}`).toBe(200);
 }
 
-test("native transcript usage drives the context chip through the real rollup", async ({ page }) => {
-  test.skip((await access(nativeNode).then(() => false).catch(() => true)), "native_hub_e2e not built");
-  test.setTimeout(180_000);
+for (const geometry of [
+  { label: "1440 desktop", width: 1440, height: 900, touch: false as const },
+  { label: "390 touch sheet", width: 390, height: 844, touch: true as const },
+]) {
+  test(`native transcript usage drives the context chip (${geometry.label})`, async ({ browser }) => {
+    // c-usagefu r7 item 11: one verified-missing-binary skip; enrollment and
+    // turn failures are real failures. Covers desktop popover and the mobile
+    // 390 options sheet.
+    if (await access(nativeNode).then(() => false).catch(() => true)) {
+      test.skip(true, "native_hub_e2e not built (beforeAll builds it)");
+      return;
+    }
+    test.setTimeout(180_000);
+    const context = await browser.newContext({
+      viewport: { width: geometry.width, height: geometry.height },
+      hasTouch: geometry.touch,
+      isMobile: geometry.touch,
+    });
+    const page = await context.newPage();
   const scratch = path.join(target, "hub-e2e");
   await mkdir(scratch, { recursive: true });
   const dir = await realpath(await mkdtemp(path.join(scratch, "usage-native-")));
@@ -195,11 +211,14 @@ test("native transcript usage drives the context chip through the real rollup", 
         )
         .not.toBe("");
     } catch (error) {
-      // The native_hub_e2e Node needs a functional PTY/herdr environment.
-      // The same production path (NativeDriverConfig -> Hub HTTP -> rollup)
-      // is covered in Rust by usage_native_rollup.rs; skip rather than fail
-      // on hosts without the PTY capabilities the example requires.
-      test.skip(true, `native_hub_e2e Node did not enroll: ${String(error).slice(0, 200)}; log: ${nodeLog.slice(-300)}`);
+      // c-usagefu r7 item 11: enrollment failure after a successful binary
+      // build is a REAL failure (missing PTY capability or the example
+      // crashed), not a skip. The only legitimate skip is the missing-binary
+      // check at test start (beforeAll builds it when absent). Throw so the
+      // gated run surfaces the environment defect.
+      throw new Error(
+        `native_hub_e2e Node did not enroll: ${String(error).slice(0, 200)}; log: ${nodeLog.slice(-500)}`,
+      );
     }
 
     const workspaces = await (await page.request.get(`/v1/hosts/${hostId}/workspaces`)).json();
@@ -257,18 +276,31 @@ test("native transcript usage drives the context chip through the real rollup", 
     await sendTtyKeys(page, id, "\n");
 
     // Successful launch above -> a missing turn is a FAILURE, not a skip.
+    if (geometry.touch) {
+      // r7 item 11: on mobile the context chip rides INSIDE the composer
+      // options sheet (not the collapsed bar), exactly as the sentinel 390
+      // test handles it — open the sheet first.
+      await expect(page.getByTestId("context-chip")).toHaveCount(0);
+      await page.getByTestId("model-effort-chip").click();
+      await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
+    }
     await expect(page.getByTestId("context-chip")).toHaveText("50%", { timeout: 60_000 });
     const chip = page.getByTestId("context-chip");
     await chip.click();
-    const popover = page.getByTestId("context-usage-popover");
-    await expect(popover).toBeVisible();
-    await expect(popover).toContainText("97,000");
-    await expect(popover).toContainText("3,000");
+    // Touch (390): the same component renders as the fixed bottom sheet;
+    // desktop (1440): the hover popover card. Both carry the data-testid
+    // context-usage-popover and the rollup numbers.
+    const detail = page.getByTestId("context-usage-popover");
+    await expect(detail).toBeVisible();
+    await expect(detail).toContainText("97,000");
+    await expect(detail).toContainText("3,000");
   } finally {
     if (instanceId) {
       await page.request.delete(`/v1/instances/${instanceId}?force=1`).catch(() => {});
     }
     if (node) await stopNode(node);
     await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await context.close().catch(() => {});
   }
-});
+  });
+}

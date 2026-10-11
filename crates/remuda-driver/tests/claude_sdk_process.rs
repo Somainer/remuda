@@ -1721,7 +1721,70 @@ async fn cancelling_a_pre_accept_b_publishes_a_deferred_a_settle() {
     let _ = driver.close().await;
 }
 
-/// For a `result` carrying settledRootTurn=true, returns Some with its
+/// ma-sdk-state r9 item 2: B reserves and SUSPENDS pre-accept (holding
+/// write_seq); C is already waiting on write_seq behind it. Abort B: B's book
+/// entry must be removed at its cancelled ticket's FIFO position BEFORE C's
+/// frames map, so C's real result settles C itself — result_settles_root never
+/// pops a phantom B for C's turn and attribution stays correct from then on.
+#[tokio::test]
+async fn aborting_a_suspended_b_does_not_let_c_result_pop_a_phantom_b() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Park write #1 (B) pre-accept. (The turn naming: B is the suspended one;
+    // the prior turn A has already completed, so B begins a fresh reservation.)
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.park_from_write(1);
+
+    // B starts and parks pre-accept, holding write_seq with an open book.
+    let db = driver.clone();
+    let send_b = tokio::spawn(async move { db.send(prompt_id("suspended-b", "msg-b")).await });
+    barrier
+        .wait_until_reserves_enqueued(1, Duration::from_secs(5))
+        .await;
+    // The pre-ack gate is also shut, so B is fully suspended before accept.
+
+    // C queues behind B for write_seq; it cannot begin until B is aborted.
+    let dc = driver.clone();
+    let send_c = tokio::spawn(async move { dc.send(prompt_id("first", "msg-c")).await });
+
+    // Abort B: write_seq releases and C proceeds. B's reservation must be
+    // consumed (rolled back) at its ticket position before C's frames map.
+    send_b.abort();
+    barrier.release_write_ack();
+    barrier.release_send();
+    drop(barrier);
+
+    send_c
+        .await
+        .expect("send_c task")
+        .expect("C sends after B aborted");
+
+    // C's single turn starts and settles as C (index 0, settledRootTurn) — its
+    // result did not pop a phantom B leaving C outstanding.
+    let obs = collect_until(&mut handle, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .any(|o| lifecycle_named(o) == Some("turn_started"))
+            && turn_done_count(seen) >= 1
+    })
+    .await;
+    assert_eq!(
+        turn_started_count(&obs),
+        1,
+        "B never started; only C did: {obs:?}"
+    );
+    let result = obs.iter().find_map(result_attrs).expect("C result");
+    assert_eq!(
+        result,
+        ("0", true),
+        "C's result settles C (no phantom B pop)"
+    );
+
+    let _ = driver.close().await;
+}
+
 /// deferredSettle marker (None = ordinary settlement, Some("true") = deferred
 /// correction); returns None for non-settled results. Use this to count ALL
 /// settledRootTurn observations and inspect the deferred flag.

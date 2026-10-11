@@ -1711,20 +1711,15 @@ impl Drop for ReservationGuard {
         if self.resolved {
             return;
         }
-        // Pre-accept cancellation (r8 item 1) / panic safety: wake the parked
-        // worker immediately, then run the SAME ordered rollback-and-publish
-        // `fail` uses on a detached task that holds write_seq, so the
-        // reservation is undone in order relative to the next send AND a
-        // deferred settle it blocked is still published (r9 item 1).
+        // Pre-accept cancellation (r8 item 1) / panic safety. The Reserve ticket
+        // was already enqueued in publication order, so all this does is wake
+        // the parked worker: the WORKER consumes the cancelled ticket at its FIFO
+        // position and performs the ordered rollback + deferred-settle publish
+        // (see the Reserve arm). Keeping the rollback off a detached task here
+        // prevents a cancelled B from lingering in the book while a later C
+        // result is mapped (r9 item 2). If no worker exists (publisher gone),
+        // the launch is shutting down and the reservation is discarded with it.
         self.reservation.cancel();
-        let inner = self.inner.clone();
-        let seq = self.reservation.seq;
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let _seq = inner.write_seq.lock().await;
-                rollback_and_publish(&inner, seq).await;
-            });
-        }
     }
 }
 
@@ -2195,6 +2190,15 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                         test_barrier::hold_worker_after_start(&inner.barrier).await;
                         Ok(())
                     } else {
+                        // The ticket was cancelled. Roll the book back HERE, at
+                        // the ticket's FIFO position — before any frame queued
+                        // behind it is mapped — and release the deferred settle
+                        // the cancelled turn blocked. Doing this on the worker
+                        // (rather than in a detached Drop task that can run
+                        // after a later turn's result is mapped) guarantees a
+                        // cancelled reservation is gone before a later turn
+                        // pops it as a phantom (ma-sdk-state r9 item 2).
+                        rollback_and_publish(&inner, reservation.seq).await;
                         Ok(())
                     }
                 }

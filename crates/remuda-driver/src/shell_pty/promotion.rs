@@ -3607,6 +3607,86 @@ mod tests {
             .expect("the production promotion pump");
     }
 
+    /// c-effortread r9 item 9d: the per-tick state the production promotion
+    /// loop owns, so tests can run maintain_binding (the real bind/open/pump
+    /// entry point) across demote/re-promotion instead of calling
+    /// epoch_mode/open_hydrator directly.
+    struct MaintainState {
+        bindings: BindingHandle,
+        hydrator: Option<Hydrator>,
+        announced: Option<String>,
+        session_modes: SessionModeTable,
+        launch_mode: LaunchModeBinding,
+        read_anchors: std::collections::HashMap<(i32, String), TailAnchor>,
+        effort_seeds: std::collections::HashMap<(i32, String), EffortTrackerSeed>,
+        found: Detected,
+    }
+
+    /// Build MaintainState bound to the fixture's (pid 7, PUMP_SESSION) with
+    /// the hook source and argv the production loop would see. `resume` picks
+    /// the `--resume` argv (and a "resume" source) vs a fresh startup.
+    fn maintain_state(fx: &PumpFixture, resume: bool) -> MaintainState {
+        let args = if resume {
+            format!("claude --resume {PUMP_SESSION}")
+        } else {
+            format!("claude --session-id {PUMP_SESSION}")
+        };
+        let found =
+            crate::promote::detect(std::slice::from_ref(&ProcessRow { pid: 7, args }), None)
+                .expect("detects as claude");
+        let bindings = BindingHandle::empty();
+        bindings.begin_epoch(&fx.ctx.cwd, &fx.ctx.claude_home);
+        bindings.ingest_session_start(SessionStartReport {
+            session_id: PUMP_SESSION.to_owned(),
+            transcript_path: fx.binding.path.clone(),
+            cwd: Some(fx.binding.cwd.clone()),
+            ppid: Some(7),
+            start_source: Some(if resume {
+                "resume".into()
+            } else {
+                "startup".into()
+            }),
+        });
+        MaintainState {
+            bindings,
+            hydrator: None,
+            announced: None,
+            session_modes: SessionModeTable::default(),
+            launch_mode: LaunchModeBinding::Unbound,
+            read_anchors: std::collections::HashMap::new(),
+            effort_seeds: std::collections::HashMap::new(),
+            found,
+        }
+    }
+
+    /// Run one production maintain_binding tick against `state`.
+    async fn maintain_tick(
+        state: &mut MaintainState,
+        fx: &PumpFixture,
+        pre_resume_mode: Option<ResumeMode>,
+    ) {
+        maintain_binding(
+            &state.bindings,
+            &fx.ctx,
+            &state.found,
+            &mut state.hydrator,
+            &mut state.announced,
+            &fx.tx,
+            &fx.seq,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut state.session_modes,
+            &mut state.launch_mode,
+            pre_resume_mode,
+            &mut state.read_anchors,
+            &mut state.effort_seeds,
+        )
+        .await;
+    }
+
     fn drain(fx: &mut PumpFixture) -> Vec<Observation> {
         let mut out = Vec::new();
         while let Ok(observation) = fx.rx.try_recv() {
@@ -3825,33 +3905,31 @@ mod tests {
 
     #[tokio::test]
     async fn item2_an_exec_resume_keeping_the_shell_pid_is_never_time_verified() {
-        // r7 item 3 (R6-7): the mode is derived exactly as the poller does it
-        // — detect() over the real ProcessRow -> epoch_mode with the detected
-        // provenance -> Hydrator::open — rather than hard-coded into the pump
-        // helper. `exec claude --resume <id>` keeps the shell's pid/start time,
-        // so the uuid resume is still Unverified end to end.
+        // r7 item 3 (R6-7), c-effortread r9 item 9d: derive the mode the way
+        // the poller does by running maintain_binding with the real argv
+        // detector (no direct epoch_mode/open_hydrator). `exec claude --resume`
+        // keeps the shell's pid/start time, so the uuid resume is Unverified
+        // end to end: history never replays as current and post-anchor records
+        // hydrate conversation only, never opening the effort gate.
         let history = assistant_line(Some("high"), 1);
         let tmp = tempfile::tempdir().expect("tmp");
         let mut fx = pump_fixture(tmp.path(), &history);
-        let row = ProcessRow {
-            pid: 7,
-            args: format!("claude --resume {PUMP_SESSION}"),
-        };
-        let found = crate::promote::detect(std::slice::from_ref(&row), None)
-            .expect("the exec argv detects as claude");
-        assert_eq!(found.session_id.as_deref(), Some(PUMP_SESSION));
-        assert!(found.resume, "--resume is resume provenance");
-        let mut launch = LaunchModeBinding::Unbound;
-        let mode = epoch_mode(&mut launch, None, None, &found);
-        assert_eq!(mode, ResumeMode::Unverified, "never time-verified");
-        let mut hydrator = open_hydrator(&fx, mode, None);
-        pump_once(&mut hydrator, &fx).await;
+        fx.ctx.cwd = tmp.path().join("repo");
+        let mut state = maintain_state(&fx, true);
+        assert!(state.found.resume, "--resume is resume provenance");
+
+        maintain_tick(&mut state, &fx, None).await;
+        let first9d = drain(&mut fx);
         assert!(
-            drain(&mut fx).is_empty(),
-            "history never replays as current"
+            first9d
+                .iter()
+                .all(|observation| matches!(observation.body, ObservationPayload::Lifecycle(_))),
+            "the resume bind may announce a lifecycle, but history never replays: {first9d:?}"
         );
+        assert!(effort_rows(&first9d).is_empty());
+
         append_line(&fx.binding.path, &assistant_line(Some("max"), 2));
-        pump_once(&mut hydrator, &fx).await;
+        maintain_tick(&mut state, &fx, None).await;
         let observations = drain(&mut fx);
         assert!(
             effort_rows(&observations).is_empty(),
@@ -5045,8 +5123,12 @@ mod tests {
     /// edge) and only bytes appended after the demote hydrate.
     #[tokio::test]
     async fn item4c_repromotion_continues_at_the_last_read_offset() {
-        // First epoch: a Fresh session already holds one turn, including a
-        // high read-back.
+        // r7 item 4(c), c-effortread r9 item 9d: the demote/re-promotion now
+        // runs through maintain_binding (production bind/open/pump), not a
+        // direct Hydrator::open. A Fresh session publishes one turn (incl. its
+        // high read-back); after the demote only bytes appended following the
+        // re-promote hydrate, and the pre-demote effort/conversation is not
+        // re-emitted.
         let first_turn = format!(
             "{}{}",
             user_line(1, "first question"),
@@ -5054,8 +5136,11 @@ mod tests {
         );
         let dir = tempfile::tempdir().expect("tmp");
         let mut fx = pump_fixture(dir.path(), &first_turn);
-        let mut hydrator = open_hydrator(&fx, ResumeMode::Fresh, None);
-        pump_once(&mut hydrator, &fx).await;
+        fx.ctx.cwd = dir.path().join("repo");
+        let mut state = maintain_state(&fx, false);
+
+        // First promotion tick reads the turn as current.
+        maintain_tick(&mut state, &fx, Some(ResumeMode::Fresh)).await;
         let first = drain(&mut fx);
         assert_eq!(
             effort_rows(&first),
@@ -5063,28 +5148,19 @@ mod tests {
             "first epoch reads the turn as current"
         );
         assert!(conversation_hydrated(&first, "first question"));
-        // The poller captures this from the running hydrator on every pump.
-        let anchor = hydrator.tail.anchor().expect("a live anchor");
+        assert!(
+            state
+                .read_anchors
+                .contains_key(&(7, PUMP_SESSION.to_owned())),
+            "the poll loop captured a read anchor for the re-promotion"
+        );
 
-        // The agent demotes, then comes back (re-promotion). Meanwhile a new
-        // record is appended.
+        // The agent demotes: the loop drops the hydrator but keeps the anchor.
+        state.hydrator = None;
         append_line(&fx.binding.path, &user_line(3, "after re-promotion"));
-        // The reopen goes through Hydrator::open with the captured anchor,
-        // exactly as maintain_binding does it.
-        let mut reopened = Hydrator::open(
-            &fx.ctx,
-            &fx.binding,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ResumeMode::Fresh,
-            Some(anchor.clone()),
-            None,
-        )
-        .expect("the anchored tail reopens");
-        pump_once(&mut reopened, &fx).await;
+
+        // Re-promotion reopens through the SAME production entry point.
+        maintain_tick(&mut state, &fx, Some(ResumeMode::Fresh)).await;
         let second = drain(&mut fx);
         assert!(
             effort_rows(&second).is_empty(),
@@ -5101,6 +5177,11 @@ mod tests {
 
         // An anchor against a DIFFERENT identity (the file was replaced) does
         // not continue; the caller falls back to the mode's own open.
+        let anchor = state
+            .read_anchors
+            .get(&(7, PUMP_SESSION.to_owned()))
+            .cloned()
+            .expect("anchor held across the demote");
         std::fs::remove_file(&fx.binding.path).unwrap();
         std::fs::write(
             &fx.binding.path,

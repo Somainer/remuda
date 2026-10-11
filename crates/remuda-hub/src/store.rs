@@ -779,6 +779,15 @@ pub struct InstanceRecord {
         rename = "usageRollup"
     )]
     pub usage_rollup: Option<crate::usage_store::InstanceUsageRollup>,
+    /// D-057 OA6: additive marker for the most recent SETTLED root-turn
+    /// failure (e.g. an API 429) while the process stays running. Never a
+    /// lifecycle; the next turn start clears it. Serialized as `lastTurnError`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "lastTurnError"
+    )]
+    pub last_turn_error: Option<TurnErrorMarker>,
     /// D-057 §5: lineage this chapter belongs to (its own id for a plain
     /// instance); serialized as `lineageId`.
     #[serde(rename = "lineageId")]
@@ -799,6 +808,18 @@ pub struct InstanceRecord {
     /// C1 restart policy copied to every chapter of a continuity lineage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart: Option<Value>,
+}
+
+/// Additive marker for a root turn that ended in failure while the process
+/// kept running (D-057 OA6). Not a lifecycle: the instance stays `running`
+/// with every grant; the composer shows the text and the owner can retry.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnErrorMarker {
+    /// RFC3339 timestamp of the turn's `result` observation.
+    pub at: String,
+    /// Native error text, truncated to 200 characters.
+    pub text: String,
 }
 
 /// C1 restart policy chosen at create time (D-057 §6.1).
@@ -6767,7 +6788,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             last_error TEXT,
-            configure_seq INTEGER NOT NULL DEFAULT 0
+            configure_seq INTEGER NOT NULL DEFAULT 0,
+            turn_error_json TEXT
         );
         CREATE TABLE IF NOT EXISTS commands (
             id TEXT PRIMARY KEY,
@@ -7041,6 +7063,9 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "configure_seq",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    // D-057 OA6 (ma-sdk-state): additive last root-turn-error marker, kept
+    // separate from `last_error` (which belongs to terminal/failed rows).
+    ensure_column(&conn, "instances", "turn_error_json", "TEXT")?;
     // D-057 (ma-lineage): every instance belongs to a lineage (its own id by
     // default); a continuity lineage's chapters carry a generation and cause.
     // `fenced_at` marks a chapter whose authority moved to its successor, and
@@ -14324,7 +14349,8 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 title, journal_id, durable_seq, created_at, updated_at, spec_json, last_error,
                 mode, promoted_at, launched_by,
                 role, scope_json, grants_json, task_id, api_route_json, configure_seq,
-                lineage_id, generation, chapter_cause, fenced_at, restart_json
+                lineage_id, generation, chapter_cause, fenced_at, restart_json,
+                turn_error_json
          FROM instances WHERE id = ?1",
         params![id],
         |row| {
@@ -14527,6 +14553,10 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 fenced_at: row.get(27)?,
                 restart: row
                     .get::<_, Option<String>>(28)?
+                    .and_then(|raw| serde_json::from_str(&raw).ok()),
+                last_turn_error: row
+                    .get::<_, Option<String>>(29)?
+                    .filter(|raw| !raw.is_empty())
                     .and_then(|raw| serde_json::from_str(&raw).ok()),
             })
         },
@@ -15656,9 +15686,14 @@ fn apply_instance_lifecycle(
     } else {
         next_act.unwrap_or(current.activity.as_str())
     };
+    // D-057 OA6: maintain the additive last-turn-error marker alongside the
+    // state change. `Some("")` clears it (next turn start), `Some(json)` sets
+    // it (a SETTLED turn error), `None` leaves it untouched.
+    let turn_error = turn_error_projection(event, &now);
     conn.execute(
-        "UPDATE instances SET lifecycle = ?1, activity = ?2, updated_at = ?3 WHERE id = ?4",
-        params![lifecycle, activity, now, instance_id],
+        "UPDATE instances SET lifecycle = ?1, activity = ?2, updated_at = ?3,
+             turn_error_json = COALESCE(?4, turn_error_json) WHERE id = ?5",
+        params![lifecycle, activity, now, turn_error, instance_id],
     )?;
     // ma-lineage r4: the derived write settles pending cards through the SAME
     // transition guard the projection write uses. ended_at is stamped by the
@@ -15691,6 +15726,61 @@ fn apply_instance_lifecycle(
         settlement,
     )?;
     Ok(())
+}
+
+const TURN_ERROR_TEXT_MAX_CHARS: usize = 200;
+
+/// Build the `turn_error_json` write value for one journal event.
+///
+/// A `turn/turn_started` (working) clears the marker (`Some("")`); a
+/// `turn/result` status `error` that SETTLED the root turn
+/// (`relatedIds.settledRootTurn=true`) sets it; every other event returns
+/// `None` and the UPDATE coalesces the column away. An intermediate/queued
+/// unsettled error sets no marker.
+fn turn_error_projection(event: &Value, now: &str) -> Option<String> {
+    let payload = event.get("payload").unwrap_or(event);
+    if payload.get("type").and_then(Value::as_str) != Some("native")
+        || payload.get("topic").and_then(Value::as_str) != Some("turn")
+    {
+        return None;
+    }
+    let name = payload
+        .get("nativeName")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let status = knowledge_value(payload.get("status"));
+    if name == "turn_started" && status == Some("working") {
+        return Some(String::new());
+    }
+    if name != "result" || status != Some("error") {
+        return None;
+    }
+    if payload
+        .pointer("/relatedIds/settledRootTurn")
+        .and_then(Value::as_str)
+        != Some("true")
+    {
+        return None;
+    }
+    let text = payload
+        .pointer("/relatedIds/lastError")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| {
+            if text.chars().count() <= TURN_ERROR_TEXT_MAX_CHARS {
+                text.to_owned()
+            } else {
+                text.chars().take(TURN_ERROR_TEXT_MAX_CHARS).collect()
+            }
+        })
+        .unwrap_or_else(|| "turn error".to_owned());
+    let at = event
+        .get("observedAt")
+        .and_then(Value::as_str)
+        .filter(|at| !at.is_empty())
+        .unwrap_or(now);
+    Some(json!({ "at": at, "text": text }).to_string())
 }
 
 fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> {

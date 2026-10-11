@@ -847,7 +847,12 @@ impl ShellPtyDriver {
 
     /// §9.1: queue `/effort <level>` for the composer, ready-ladder gated, and
     /// wait for transcript read-back while the composer is idle.
-    async fn switch_effort(&self, level: &str, ultracode: Option<bool>) -> DriverResult<DriverAck> {
+    async fn switch_effort(
+        &self,
+        level: &str,
+        ultracode: Option<bool>,
+        request_id: Option<String>,
+    ) -> DriverResult<DriverAck> {
         // The promoted-shell carrier does not hold the agent's reported binary
         // version, so the version-gated ultracode axis fails closed here (the
         // Herdr `claude_pty` carrier is the version-aware one and types
@@ -859,7 +864,9 @@ impl ShellPtyDriver {
                     .to_owned(),
             ));
         }
-        let Some(request) = crate::effort::EffortRequest::from_level(level) else {
+        let Some(request) = crate::effort::EffortRequest::from_level(level)
+            .map(|request| request.with_request_id(request_id.as_deref()))
+        else {
             return Err(DriverError::CapabilityUnsupported(format!(
                 "claude /effort does not accept {level:?} in-session; \
                  valid: low, medium, high, xhigh, max, ultracode, ultracode on, ultracode off"
@@ -903,9 +910,10 @@ impl ShellPtyDriver {
         } else {
             // The agent is working (or the screen is not provably idle). Hold
             // for the next idle and let the worker journal the terminal state.
-            io.journal(
+            io.journal_effort(
                 crate::effort::SwitchOutcome::Queued.journal_status(request.command_word(), ""),
                 remuda_protocol::Severity::Info,
+                request.request_id.clone(),
             )
             .await;
             queue.enqueue(request, None);
@@ -954,9 +962,10 @@ impl ShellPtyDriver {
                 // Never claim applied without a terminal outcome.
             }
         } else {
-            io.journal(
+            io.journal_effort(
                 crate::model::ModelSwitchOutcome::Queued.journal_status(&request.id, ""),
                 remuda_protocol::Severity::Info,
+                None,
             )
             .await;
             queue.enqueue(request, None);
@@ -2592,7 +2601,13 @@ impl Driver for ShellPtyDriver {
             && !level.is_empty()
             && switch.model_id.is_empty()
         {
-            return self.switch_effort(level, switch.effort_ultracode).await;
+            return self
+                .switch_effort(
+                    level,
+                    switch.effort_ultracode,
+                    switch.effort_request_id.clone(),
+                )
+                .await;
         }
         // §9.1: a model switch is `/model <id>` proven by the verdict.
         if self.session_kind() == Some(AgentKind::Claude)
@@ -3478,8 +3493,23 @@ impl crate::effort::EffortSwitchIo for ShellEffortIo {
         Ok(self.state.screen_grid().text())
     }
 
-    async fn journal(&self, status: String, severity: remuda_protocol::Severity) {
-        let payload = promotion::effort_lifecycle(&status, severity);
+    async fn journal_effort(
+        &self,
+        status: String,
+        severity: remuda_protocol::Severity,
+        request_id: Option<String>,
+    ) {
+        // c-effortread r10: echo the configure's per-request id so the web
+        // binds the lifecycle edge to the exact in-flight switch.
+        let related_ids = request_id
+            .map(|id| {
+                std::collections::BTreeMap::from([(
+                    remuda_protocol::EFFORT_REQUEST_ID_KEY.to_owned(),
+                    id,
+                )])
+            })
+            .unwrap_or_default();
+        let payload = promotion::effort_lifecycle(&status, severity, related_ids);
         if promotion::emit_payload(
             &self.events,
             &self.seq,

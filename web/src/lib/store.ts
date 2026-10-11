@@ -121,6 +121,17 @@ import {
 export type EffortPending = {
   /** Per-instance nonce identifying one switch; stale lifecycles are dropped. */
   nonce: number;
+  /**
+   * Per-request id (c-effortread r10 items 1–4) minted for THIS switch and
+   * carried web → Hub → Node → driver. Lifecycle edges and the requested echo
+   * settle/clear this pending ONLY when they carry the same id. The id-less
+   * fallback (older drivers, durable poll records) may settle only from a
+   * read-back newer than BOTH {@link baselineObservedAt} and
+   * {@link queuedObservedAt} whose value matches the requested axis.
+   */
+  requestId: string;
+  /** Axis this switch moves ("flag" = orthogonal toggle, "tier" = level). */
+  axis: EffortAxis;
   /** Requested native level word. */
   name: string;
   /** Requested switch state. */
@@ -130,12 +141,17 @@ export type EffortPending = {
   /** Wall-clock ms the pending state was entered (stale-state safety net). */
   at: number;
   /**
-   * Effective `observedAt` of the newest projection when THIS request was
-   * made/queued. A projection settles an axis only when strictly newer — an
-   * observation belonging to the replaced request (an A→B race) is kept for
-   * history but can neither settle B nor clear its indicator.
+   * Effective `observedAt` of the newest projection BEFORE this request. The
+   * id-less fallback must be strictly newer than BOTH this baseline and the
+   * request's own queued time (c-effortread r10 item 1): an unchanged older
+   * poll at T0 must not settle a request queued at T1.
    */
-  thresholdObservedAt: string | null;
+  baselineObservedAt: string | null;
+  /**
+   * `observedAt` of THIS request's own `effort-queued` lifecycle; null until
+   * that edge arrives. Kept separately from the pre-request baseline.
+   */
+  queuedObservedAt: string | null;
   /** Level axis confirmed by a newer projection. */
   levelSettled: boolean;
   /** Switch axis confirmed by a newer projection. */
@@ -184,6 +200,13 @@ type EffortLifecycleRequest = {
 /** Stable reason codes that keep the switch disabled (D-056 §5). */
 const ULTRA_MODEL_REASON = "ultracode-unavailable-for-model";
 const ULTRA_WORKFLOWS_REASON = "ultracode-workflows-disabled";
+
+/**
+ * Native-lifecycle `relatedIds` key carrying the effort configure's
+ * per-request id (c-effortread r10 items 1–4); mirrors
+ * `remuda_protocol::EFFORT_REQUEST_ID_KEY`.
+ */
+const EFFORT_REQUEST_ID_KEY = "effortRequestId";
 
 /** Pending entries older than this without a verdict are dropped. */
 const EFFORT_PENDING_MAX_AGE_MS = 30 * 60_000;
@@ -1009,70 +1032,87 @@ class HubStore {
    * reads). Returns the updated pending entry, or null when BOTH axes have
    * settled and the indicator must be cleared.
    *
-   * Request identity (c-effortui r3 item 3) — a replaced request A's read-back
-   * must never settle request B:
-   * - `requestedEcho` is the driver's own `requested` payload (the axes ITS
-   *   command carried). When present it is the nonce: a verdict that echoes a
-   *   different level/flag is A's outcome even if source is `remuda` and the
-   *   clock says newer. An echoed request whose EFFECTIVE clamped to another
-   *   level still names this request (`requested.max` → `effective.xhigh`).
-   * - without an echo (older driver / durable poll record), identity falls
-   *   back to name agreement or a post-threshold `remuda` read-back — the
-   *   threshold being THIS request's own queued lifecycle observedAt.
-   * - the flag axis likewise trusts an opposite value only from a verdict
-   *   that echoes this request; an unreported flag (null) never settles.
+   * Request identity (c-effortread r10 items 1–4) — a pending request is
+   * settled ONLY by:
+   *  1. a requested echo carrying THIS request's id (the driver echoed the
+   *     configure nonce). An echo that carries ANOTHER id names a replaced
+   *     request and is rejected outright — matching tier or a newer clock can
+   *     never promote it; or
+   *  2. an id-less legacy echo whose axes exactly match this request; or
+   *  3. no echo at all (older driver / durable poll record): a `remuda`
+   *     read-back strictly newer than BOTH the pre-request baseline and the
+   *     request's own queued time, whose value matches the requested axis.
+   *     An unchanged older poll (`{high,false}@T0`) can therefore never settle
+   *     an ON request queued at T1 (item 1), and a mismatching OFF verdict can
+   *     never settle a queued ON (item 2).
    */
   private settleEffortAxes(
     instanceId: Id,
     pending: EffortPending,
     view: EffortEffectiveView,
-    requestedEcho?: { name?: string; ultracode?: boolean },
+    requestedEcho?: { name?: string; ultracode?: boolean; requestId?: string },
   ): EffortPending | null {
-    const threshold = pending.thresholdObservedAt;
-    const namesLevel = view.name === pending.name;
-    const remuda = view.source === "remuda";
-    // The driver echoed which axes ITS command carried: the reliable nonce.
-    const echoesRequest =
-      requestedEcho?.name !== undefined &&
-      requestedEcho.name === pending.name &&
-      (requestedEcho.ultracode === undefined || requestedEcho.ultracode === pending.ultracode);
-    const postThreshold =
-      threshold != null && Date.parse(view.observedAt) > Date.parse(threshold);
-    // A verdict is this request's when it echoes it, names its level, or (no
-    // echo available) is a post-threshold/cold-start remuda read-back. An
-    // echoed-but-mismatched remuda edge is the replaced request's verdict.
-    const identifiesRequest = echoesRequest || namesLevel;
-    const ours =
-      identifiesRequest ||
-      (remuda && requestedEcho === undefined && (threshold == null || postThreshold));
-    // Merge of c-perffu r7: a read-back at the SAME parsed instant as the
-    // queued request (millisecond-truncated spellings differ) still settles
-    // WHEN it identifies THIS request — the level name or echo matches. The
-    // echo-less remuda fallback stays strictly post-threshold, so request A's
-    // equal-instant verdict (which names A's level) can never settle request
-    // B's pending.
-    const newer = threshold != null ? postThreshold || identifiesRequest : ours;
+    const echoId =
+      typeof requestedEcho?.requestId === "string" && requestedEcho.requestId.trim()
+        ? requestedEcho.requestId
+        : null;
+    // Rule 1: a verdict that explicitly names ANOTHER request is never ours.
+    const namesOtherRequest = echoId !== null && echoId !== pending.requestId;
+    const echoNamesThisRequest = echoId !== null && echoId === pending.requestId;
+    // (r10 item 2 later tightens this: an explicit mismatch on a moved axis
+    // vetoes settlement even when the tier name happens to match.)
+    const movesBothEcho = pending.commandWord === "ultracode";
+    const echoMovesLevel = movesBothEcho || pending.axis !== "flag";
+    const echoMovesFlag = movesBothEcho || pending.axis === "flag";
+    const echoLevelMatch =
+      !echoMovesLevel ||
+      (requestedEcho?.name !== undefined && requestedEcho.name === pending.name);
+    const echoFlagMatch = !echoMovesFlag || requestedEcho?.ultracode !== undefined;
+    const legacyEchoMatches =
+      echoId === null && requestedEcho !== undefined && echoLevelMatch && echoFlagMatch;
+
+    // Rule 3: no id and no echo — the read-back must be STRICTLY newer than
+    // the pre-request baseline (the pre-switch state itself can never confirm
+    // the switch) and at or after the request's own queued time (equal parsed
+    // instant settles — the durable record truncates milliseconds, c-perffu
+    // r7), and the observed VALUE must match the requested axis. A cold start
+    // with no stamps makes the time checks vacuous; value match still rules.
+    const postBaseline =
+      pending.baselineObservedAt == null ||
+      Date.parse(view.observedAt) > Date.parse(pending.baselineObservedAt);
+    const atOrAfterQueued =
+      pending.queuedObservedAt == null ||
+      Date.parse(view.observedAt) >= Date.parse(pending.queuedObservedAt);
+    const inWindow = postBaseline && atOrAfterQueued;
+
+    const movesLevel = echoMovesLevel;
+    const movesFlag = echoMovesFlag;
+
+    const authoritativeEcho = echoNamesThisRequest || legacyEchoMatches;
+    // The value fallback is attribution-agnostic: a read-back in the
+    // post-request window that shows the requested axis value is the goal
+    // state holding, however it got there. An opposite value is A's state (or
+    // the refusal lifecycle's job), never B's confirmation.
+    const valueFallback =
+      !namesOtherRequest && requestedEcho === undefined && inWindow;
+    const ours = !namesOtherRequest && (authoritativeEcho || valueFallback);
+
     let { levelSettled, flagSettled } = pending;
-    if (newer && !levelSettled && ours) {
-      levelSettled = true;
+    if (ours && !levelSettled) {
+      // An echo that names this request settles the level even on a clamped
+      // value (it is rendered as the delivered mismatch). The value fallback
+      // settles only an exact level match.
+      if (movesLevel && (authoritativeEcho || view.name === pending.name)) {
+        levelSettled = true;
+      }
     }
-    // The flag axis needs process-local evidence.
-    //  - non-null threshold: any definitive value newer than the request
-    //    settles (an opposite value is the delivered refusal, rendered as a
-    //    mismatch);
-    //  - null baseline: a remuda read-back that echoes THIS request (or comes
-    //    from an echo-less driver) is our verdict even on an opposite flag; a
-    //    terminal-origin flag settles only when it equals the requested one —
-    //    otherwise it could be request A's flag proving nothing for B.
-    const trustedRemuda = remuda && (requestedEcho === undefined || echoesRequest);
-    const flagEvidence =
-      threshold != null
-        ? effortFlagSettles(view.ultracode)
-        : trustedRemuda
-          ? effortFlagSettles(view.ultracode)
-          : view.ultracode === pending.ultracode;
-    if (newer && !flagSettled && flagEvidence) {
-      flagSettled = true;
+    if (ours && !flagSettled) {
+      // A definitive flag value from our own verdict settles (an opposite
+      // value is the delivered refusal); the fallback needs an exact match.
+      const definitive = effortFlagSettles(view.ultracode);
+      if (movesFlag && definitive && (authoritativeEcho || inWindow)) {
+        flagSettled = true;
+      }
     }
     if (ours && (levelSettled || flagSettled)) {
       this.settledEffortPushdown.set(instanceId, view.observedAt);
@@ -1482,7 +1522,14 @@ class HubStore {
     const ours = Boolean(pending) || (hydratedAt != null && view.observedAt <= hydratedAt);
     if (ours) {
       if (pending) {
-        const updated = this.settleEffortAxes(instanceId, pending, view, parsed.requested);
+        const updated = this.settleEffortAxes(
+          instanceId,
+          pending,
+          view,
+          parsed.requested || parsed.requestId
+            ? { ...parsed.requested, requestId: parsed.requestId }
+            : undefined,
+        );
         if (updated) {
           patch.effortPending = { ...this.state.effortPending, [instanceId]: updated };
         } else {
@@ -1530,7 +1577,12 @@ class HubStore {
   private noteEffortLifecycle(instanceId: Id, observation: Observation, live = true) {
     if (!live) return;
     const payload = observation.payload as
-      | { type?: string; nativeName?: string; status?: unknown }
+      | {
+          type?: string;
+          nativeName?: string;
+          status?: unknown;
+          relatedIds?: Record<string, unknown> | null;
+        }
       | undefined;
     if (payload?.type !== "native" || payload.nativeName !== "instance.configure") return;
     // The journal persists status as a bare string; newer runs may wrap it.
@@ -1542,9 +1594,25 @@ class HubStore {
           : undefined;
     const parsed = effortLifecycleStatus(value);
     if (!parsed) return;
+    // c-effortread r10: the driver echoes the configure's per-request id in
+    // the lifecycle's related-ids map. An edge carrying an id settles only the
+    // pending with the SAME id; an id-less edge falls back to the strict
+    // command-word/value matcher (older drivers, the e2e fake node).
+    const edgeRequestId =
+      payload.relatedIds && typeof payload.relatedIds === "object"
+        ? payload.relatedIds[EFFORT_REQUEST_ID_KEY]
+        : undefined;
+    const edgeId =
+      typeof edgeRequestId === "string" && edgeRequestId.trim() ? edgeRequestId : null;
     const current = this.state.effortPending[instanceId];
-    // THIS request's queued edge timestamp — the request threshold. Parsed as
-    // an instant like every other observedAt comparison (r6 same-second fix).
+    // Whether an edge belongs to the current pending: an id is authoritative;
+    // without one the strict word matcher decides (never a bare tier match).
+    const edgeBelongsTo = (pending: EffortPending, kind: EffortLifecycleKind): boolean =>
+      edgeId !== null
+        ? edgeId === pending.requestId
+        : effortLifecycleMatches(pending, parsed.word, kind);
+    // THIS request's queued edge timestamp. Parsed as an instant like every
+    // other observedAt comparison (r6 same-second fix).
     const queuedThreshold =
       typeof observation.observedAt === "string" && Number.isFinite(Date.parse(observation.observedAt))
         ? observation.observedAt
@@ -1553,10 +1621,10 @@ class HubStore {
       let current = this.state.effortPending[instanceId];
       if (current) {
         // A queued lifecycle belongs to the REQUEST in flight only. A late
-        // `effort-queued` for request A after the user replaced it with B names
-        // different axes and is dropped — it must never overwrite B's pending
-        // indicator nor stamp B's threshold (c-effortui A→B race).
-        if (!effortLifecycleMatches(current, parsed.word, parsed.kind)) return;
+        // `effort-queued` for request A after the user replaced it with B
+        // carries a different id/axes and is dropped — it must never overwrite
+        // B's pending indicator nor stamp B's queued time (A→B race).
+        if (!edgeBelongsTo(current, "queued")) return;
       } else {
         // No client-side pending (the configure was posted outside the UI):
         // still surface 排队中 from the lifecycle's own axes.
@@ -1566,43 +1634,57 @@ class HubStore {
         const fallbackSelection =
           effortFromRecord(kind, request.name ?? null, null, request.ultracode === true)
           ?? effortAt(kind, DEFAULT_EFFORT_INDEX, request.ultracode === true);
+        const nonce = (this.state.effortNonces[instanceId] ?? 0) + 1;
+        const lowerWord = parsed.word.trim().toLowerCase();
+        const wireAxis: EffortAxis =
+          lifecycleNamesUltraWord(parsed.word) && lowerWord !== "ultracode" ? "flag" : "tier";
+        const wireMovesBoth = lowerWord === "ultracode";
+        const wireMovesLevel = wireMovesBoth || wireAxis !== "flag";
+        const wireMovesFlag = wireMovesBoth || wireAxis === "flag";
+        const existingView = this.state.effortEffective[instanceId];
         current = {
-          nonce: (this.state.effortNonces[instanceId] ?? 0) + 1,
+          nonce,
+          requestId: edgeId ?? `lifecycle:${nonce}`,
+          // A decoupled toggle word moves the flag; a level word (and the
+          // coupled bare `ultracode`, which is the xhigh level command) moves
+          // the tier.
+          axis: wireAxis,
           name: fallbackSelection.name,
           ultracode: fallbackSelection.ultracode === true,
           queued: true,
           at: Date.now(),
-          thresholdObservedAt: queuedThreshold ?? this.state.effortEffective[instanceId]?.observedAt ?? null,
-          levelSettled: false,
-          flagSettled: false,
+          baselineObservedAt: existingView?.observedAt ?? null,
+          queuedObservedAt: queuedThreshold,
+          // Axes the queued command does not move need no proof; moved axes
+          // already agreeing with a current projection start settled.
+          levelSettled: !wireMovesLevel || existingView?.name === fallbackSelection.name,
+          flagSettled:
+            !wireMovesFlag ||
+            (fallbackSelection.ultracode !== true && existingView?.ultracode !== true),
           source: "lifecycle",
           // Synthesized from the driver's own queued word; it is its own
           // command-word identity, so leave the client prediction null and
           // match via the two-axis fallback.
           commandWord: null,
         };
-        this.emit({ effortNonces: { ...this.state.effortNonces, [instanceId]: current.nonce } });
+        this.emit({ effortNonces: { ...this.state.effortNonces, [instanceId]: nonce } });
       }
-      // Provenance (c-effortui r3 item 3): the threshold is THIS request's
-      // own queued-lifecycle observedAt, so a replaced request A's read-back
-      // (journaled before B was queued) can never be "newer than the request"
-      // and settle B. Only an unparseable queued timestamp falls back to the
-      // previous stamp; a duplicate queued edge simply carries the same time.
-      const stamped =
-        queuedThreshold ??
-        this.state.effortEffective[instanceId]?.observedAt ??
-        current.thresholdObservedAt;
+      // Provenance (c-effortui r3 item 3 / r10 item 1): the queued stamp is
+      // THIS request's own queued-lifecycle observedAt, kept SEPARATE from the
+      // pre-request baseline. A duplicate queued edge keeps the same time; an
+      // unparseable timestamp leaves a previous stamp untouched.
+      const stamped = queuedThreshold ?? current.queuedObservedAt;
       this.emit({
         effortPending: {
           ...this.state.effortPending,
-          [instanceId]: { ...current, queued: true, thresholdObservedAt: stamped },
+          [instanceId]: { ...current, queued: true, queuedObservedAt: stamped },
         },
       });
       return;
     }
     if (parsed.kind === "applied") {
       if (!current) return;
-      if (!effortLifecycleMatches(current, parsed.word, parsed.kind)) return;
+      if (!edgeBelongsTo(current, "applied")) return;
       // The driver reported acceptance: the projected read-back is the source
       // of truth, but clear the indicator now rather than leaving it on 切换中
       // when the observation is delayed. The slider stays where requested.
@@ -1615,22 +1697,23 @@ class HubStore {
     // degraded
     const isUltraRefusal =
       parsed.reason === ULTRA_MODEL_REASON || parsed.reason === ULTRA_WORKFLOWS_REASON;
-    // Request identity (c-effortui r2 item 2): does this verdict name the
-    // CURRENT request's axes?
-    //  - no pending at all: an unsolicited refusal from a configure posted
+    // Request identity (c-effortui r2 item 2, r10 item 3): does this verdict
+    // name the CURRENT request?
+    //  - no pending at all: an unsolicited verdict from a configure posted
     //    outside the UI — it applies (refusal recorded, tier untouched).
-    //  - wire-owned pending (synthesized from effort-queued): the driver owns
-    //    the request; its terminal verdict is trusted even when the rejected
-    //    word differs from the queued one (the e2e driver queues one word and
-    //    rejects another).
-    //  - client-owned pending: a mismatched verdict belongs to a REPLACED
-    //    request A. It must not clear B's indicator nor revert B's optimistic
-    //    axes. Only refusal EVIDENCE is process-local and still recorded (an
-    //    ultra refusal describes the environment, not the level request).
+    //  - an edge carrying a request id: it mutates the pending ONLY when the
+    //    id is the current one. Request A's timeout/cancellation can never
+    //    delete or roll back newer request B.
+    //  - id-less edge (older driver): the strict word matcher decides, except
+    //    a wire-owned pending whose driver journals a different rejected word.
+    //  - genuine ultracode refusals (model/workflow) are environment evidence:
+    //    they are recorded and disable the switch regardless, but mutate the
+    //    pending ONLY when they are this request's verdict.
     const namesCurrent = current
-      ? effortLifecycleMatches(current, parsed.word, "degraded")
+      ? current.source === "lifecycle" ||
+        effortLifecycleMatches(current, parsed.word, "degraded")
       : false;
-    const mutatesRequest = !current || current.source === "lifecycle" || namesCurrent;
+    const mutatesRequest = !current || namesCurrent;
     if (!mutatesRequest && !isUltraRefusal) return;
 
     const pendingNext = { ...this.state.effortPending };
@@ -4109,12 +4192,15 @@ class HubStore {
       effort?: EffortSelection;
       /** c-effortread r9 item 6: explicit axis intent carried on effort.axis. */
       effortAxis?: EffortAxis;
+      /** c-effortread r10: per-request id echoed on lifecycle/echo edges. */
+      effortRequestId?: string;
     },
     freshness?: { effortNonce?: number },
   ) {
-    // D-056 wire: `{name, ultracode, index, axis}` — a native level word plus
-    // the orthogonal boolean and the explicit axis the driver executes; the
-    // web never sends the legacy "ultracode" name.
+    // D-056 wire: `{name, ultracode, index, axis, requestId}` — a native level
+    // word plus the orthogonal boolean, the explicit axis the driver executes
+    // and the per-request id the driver echoes on its edges; the web never
+    // sends the legacy "ultracode" name.
     const wireExtras = extras?.effort
       ? {
           ...extras,
@@ -4126,6 +4212,8 @@ class HubStore {
             // the toggle the driver types ("ultracode on"), never a substituted
             // tier command.
             ...(extras.effortAxis ? { axis: extras.effortAxis } : {}),
+            // c-effortread r10: carry the per-request id to the driver.
+            ...(extras.effortRequestId ? { requestId: extras.effortRequestId } : {}),
           },
         }
       : extras;
@@ -4216,23 +4304,42 @@ class HubStore {
     // nonce and its OWN threshold stamped from the current projection. A
     // replaced request's late events cannot settle this indicator.
     const nonce = (this.state.effortNonces[instanceId] ?? 0) + 1;
+    // c-effortread r10 items 1–4: the per-request id that rides the configure
+    // to the driver and returns on lifecycle edges and the requested echo.
+    const requestId = id("effreq_") as unknown as string;
     const currentView = this.state.effortEffective[instanceId] ?? null;
     // c-effortui r4 item 3: predict the exact word the driver will type so the
     // queued/applied/degraded lifecycle (which echoes the typed command word)
     // can be matched even when a decoupled TIER move carries the flag — the
     // driver then types the plain level word with flag=true in the payload.
     const commandWord = predictDriverCommandWord(effort, axis, instance, this.state, instanceId);
+    // The coupled bare `ultracode` word moves BOTH axes. The decoupled toggle
+    // moves only the flag and a plain tier word only the level (r10 item 4:
+    // the other axis is driven by its OWN configure, so axes this request
+    // does not move start settled rather than waiting for another request's
+    // read-back).
+    const movesBoth = commandWord === "ultracode";
+    const movesLevel = movesBoth || axis !== "flag";
+    const movesFlag = movesBoth || axis === "flag";
     const pending: EffortPending = {
       nonce,
+      requestId,
+      axis,
       name: effort.name,
       ultracode: effort.ultracode === true,
       queued: busy,
       at: Date.now(),
-      thresholdObservedAt: currentView?.observedAt ?? null,
-      // Axes that already agree with the projection need no further proof;
-      // an unobserved flag (null) is "not proven" only when switching it ON.
-      levelSettled: currentView?.name === effort.name,
-      flagSettled: effort.ultracode !== true && currentView?.ultracode !== true,
+      // The pre-request baseline is kept SEPARATE from the queued lifecycle
+      // time (r10 item 1): an id-less read-back settles only when newer than
+      // BOTH and matching the requested axis.
+      baselineObservedAt: currentView?.observedAt ?? null,
+      queuedObservedAt: null,
+      // Axes this request does not move need no proof; among the moved axes,
+      // ones already agreeing with the projection start settled — except an
+      // unobserved flag (null) switched ON, which is never pre-proven.
+      levelSettled: !movesLevel || currentView?.name === effort.name,
+      flagSettled:
+        !movesFlag || (effort.ultracode !== true && currentView?.ultracode !== true),
       source: "client",
       commandWord,
     };
@@ -4250,7 +4357,7 @@ class HubStore {
       await this.configure(
         instanceId,
         this.permissionModeOf(instanceId),
-        { effort, effortAxis: axis },
+        { effort, effortAxis: axis, effortRequestId: requestId },
         { effortNonce: nonce },
       );
       // Re-request authoritative state once the command is accepted. The

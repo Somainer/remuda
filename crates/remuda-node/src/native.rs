@@ -947,6 +947,7 @@ impl Driver for NativeAdapter {
                     effort_index,
                     effort_ultracode,
                     effort_axis,
+                    effort_request_id,
                     permission_mode,
                 } => {
                     let effort = effort.filter(|value| !value.is_empty());
@@ -965,6 +966,7 @@ impl Driver for NativeAdapter {
                         effort: effort.clone(),
                         effort_ultracode,
                         effort_axis,
+                        effort_request_id,
                         permission_mode: permission_mode.clone(),
                     };
                     // §9.1: an effort/permission switch with no model id reports

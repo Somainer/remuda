@@ -752,6 +752,7 @@ impl ClaudePtyDriver {
         level: &str,
         ultracode: Option<bool>,
         axis: Option<remuda_protocol::EffortAxis>,
+        request_id: Option<String>,
     ) -> DriverResult<DriverAck> {
         let (pane_id, session_id, queue, ready, io, request) = {
             let inner = self.inner.lock().await;
@@ -783,7 +784,13 @@ impl ClaudePtyDriver {
                         ultracode: request.ultracode,
                     });
             let Some(request) = crate::effort::EffortRequest::for_configure(
-                level, ultracode, axis, semantics, proven, requested,
+                level,
+                ultracode,
+                axis,
+                semantics,
+                proven,
+                requested,
+                request_id.as_deref(),
             ) else {
                 // An honest refusal: a word the command does not take, or a
                 // flag-on a legacy/ambiguous request cannot disambiguate
@@ -830,9 +837,10 @@ impl ClaudePtyDriver {
         } else {
             // Ready ladder: a turn is running. Journal `queued` and hand off;
             // the worker types it at the next idle and journals the result.
-            io.journal(
+            io.journal_effort(
                 crate::effort::SwitchOutcome::Queued.journal_status(request.command_word(), ""),
                 Severity::Info,
+                request.request_id.clone(),
             )
             .await;
             queue.enqueue(request, None);
@@ -888,9 +896,10 @@ impl ClaudePtyDriver {
                 // claim applied from this command.
             }
         } else {
-            io.journal(
+            io.journal_effort(
                 crate::model::ModelSwitchOutcome::Queued.journal_status(&request.id, ""),
                 Severity::Info,
+                None,
             )
             .await;
             queue.enqueue(request, None);
@@ -1080,7 +1089,12 @@ impl Driver for ClaudePtyDriver {
             && switch.model_id.is_empty()
         {
             return self
-                .switch_effort(level, switch.effort_ultracode, switch.effort_axis)
+                .switch_effort(
+                    level,
+                    switch.effort_ultracode,
+                    switch.effort_axis,
+                    switch.effort_request_id.clone(),
+                )
                 .await;
         }
         // §9.1: a model switch is `/model <id>` typed into the composer and
@@ -1872,14 +1886,19 @@ impl crate::effort::EffortSwitchIo for HerdrEffortIo {
         Ok(read.text().to_owned())
     }
 
-    async fn journal(&self, status: String, severity: Severity) {
+    async fn journal_effort(&self, status: String, severity: Severity, request_id: Option<String>) {
+        // c-effortread r10: echo the configure's per-request id so the web
+        // binds the lifecycle edge to the exact in-flight switch.
+        let related_ids = request_id
+            .map(|id| BTreeMap::from([(remuda_protocol::EFFORT_REQUEST_ID_KEY.to_owned(), id)]))
+            .unwrap_or_default();
         let payload = ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
             NativeLifecycle {
                 topic: LifecycleTopic::Configuration,
                 native_name: "instance.configure".into(),
                 native_id: Knowledge::NotApplicable,
                 status: Knowledge::Known { value: status },
-                related_ids: BTreeMap::new(),
+                related_ids,
                 data_ref: None,
                 severity,
                 affects_completion: false,

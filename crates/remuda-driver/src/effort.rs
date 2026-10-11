@@ -225,7 +225,7 @@ pub(crate) const IN_SESSION_LEVELS: &[&str] =
     &["low", "medium", "high", "xhigh", "max", "ultracode", "auto"];
 
 /// What the switch was asked to change to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EffortRequest {
     /// Level to type. For a decoupled flag-only switch this is unused on the
     /// wire (the toggle keeps the current level); the configure writer is
@@ -236,35 +236,55 @@ pub(crate) struct EffortRequest {
     /// Exact argument word(s) after `/effort `: a level word, the bare
     /// `ultracode`, or `ultracode on` / `ultracode off`.
     pub(crate) word: &'static str,
+    /// c-effortread r10 items 1–4: per-request id minted by the web and
+    /// carried on the configure. Every lifecycle edge this switch journals
+    /// (`effort-queued|applied|degraded`) and the transcript mapper's
+    /// requested echo carry it back, so the client settles only its own
+    /// request. `None` for a launch-argv request or an id-less legacy client.
+    pub(crate) request_id: Option<String>,
 }
 
 impl EffortRequest {
+    /// Attach the configure's per-request id (builder).
+    pub(crate) fn with_request_id(mut self, request_id: Option<&str>) -> Self {
+        self.request_id = request_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        self
+    }
+
     pub(crate) fn from_level(level: &str) -> Option<Self> {
         match level.trim().to_ascii_lowercase().as_str() {
             "low" => Some(Self {
                 name: EffortName::Low,
                 ultracode: false,
                 word: "low",
+                request_id: None,
             }),
             "medium" => Some(Self {
                 name: EffortName::Medium,
                 ultracode: false,
                 word: "medium",
+                request_id: None,
             }),
             "high" => Some(Self {
                 name: EffortName::High,
                 ultracode: false,
                 word: "high",
+                request_id: None,
             }),
             "xhigh" => Some(Self {
                 name: EffortName::Xhigh,
                 ultracode: false,
                 word: "xhigh",
+                request_id: None,
             }),
             "max" => Some(Self {
                 name: EffortName::Max,
                 ultracode: false,
                 word: "max",
+                request_id: None,
             }),
             // Coupled input alias AND the decoupled bare toggle. The version
             // gate decides what the word means (see `awaits_level`).
@@ -272,16 +292,19 @@ impl EffortRequest {
                 name: EffortName::Xhigh,
                 ultracode: true,
                 word: "ultracode",
+                request_id: None,
             }),
             "ultracode on" => Some(Self {
                 name: EffortName::Xhigh,
                 ultracode: true,
                 word: "ultracode on",
+                request_id: None,
             }),
             "ultracode off" => Some(Self {
                 name: EffortName::Xhigh,
                 ultracode: false,
                 word: "ultracode off",
+                request_id: None,
             }),
             _ => None,
         }
@@ -310,6 +333,7 @@ impl EffortRequest {
             name: selection.name,
             ultracode: selection.ultracode,
             word: selection.flag_value(),
+            request_id: None,
         }
     }
 
@@ -363,10 +387,11 @@ impl EffortRequest {
         semantics: remuda_protocol::EffortSemantics,
         observed: Option<ObservedSelection>,
         requested: Option<EffortSelection>,
+        request_id: Option<&str>,
     ) -> Option<Self> {
         let normalized = level.trim().to_ascii_lowercase();
         if semantics == remuda_protocol::EffortSemantics::Coupled && ultracode == Some(true) {
-            return Self::from_level("ultracode");
+            return Self::from_level("ultracode").map(|req| req.with_request_id(request_id));
         }
         if semantics == remuda_protocol::EffortSemantics::Decoupled {
             let target_name = parse_plain_effort_name(&normalized);
@@ -375,27 +400,8 @@ impl EffortRequest {
                 // tier, no provenance guess needed (the sender disambiguated).
                 Some(remuda_protocol::EffortAxis::Flag) => {
                     let name = target_name?;
-                    return Some(Self {
-                        name,
-                        ultracode: ultracode == Some(true),
-                        word: if ultracode == Some(true) {
-                            "ultracode on"
-                        } else {
-                            "ultracode off"
-                        },
-                    });
-                }
-                // Explicit tier intent: a plain level move; the orthogonal flag
-                // stays where the running session had it.
-                Some(remuda_protocol::EffortAxis::Tier) => return Self::from_level(&normalized),
-                None => {
-                    // Legacy client: a same-tier proven selection lets either
-                    // flag direction mean the toggle.
-                    let proven = Self::classify_provenance(observed, requested);
-                    if let Some(name) = target_name
-                        .filter(|name| proven.as_ref().is_some_and(|obs| obs.name == *name))
-                    {
-                        return Some(Self {
+                    return Some(
+                        Self {
                             name,
                             ultracode: ultracode == Some(true),
                             word: if ultracode == Some(true) {
@@ -403,7 +409,37 @@ impl EffortRequest {
                             } else {
                                 "ultracode off"
                             },
-                        });
+                            request_id: None,
+                        }
+                        .with_request_id(request_id),
+                    );
+                }
+                // Explicit tier intent: a plain level move; the orthogonal flag
+                // stays where the running session had it.
+                Some(remuda_protocol::EffortAxis::Tier) => {
+                    return Self::from_level(&normalized)
+                        .map(|req| req.with_request_id(request_id));
+                }
+                None => {
+                    // Legacy client: a same-tier proven selection lets either
+                    // flag direction mean the toggle.
+                    let proven = Self::classify_provenance(observed, requested);
+                    if let Some(name) = target_name
+                        .filter(|name| proven.as_ref().is_some_and(|obs| obs.name == *name))
+                    {
+                        return Some(
+                            Self {
+                                name,
+                                ultracode: ultracode == Some(true),
+                                word: if ultracode == Some(true) {
+                                    "ultracode on"
+                                } else {
+                                    "ultracode off"
+                                },
+                                request_id: None,
+                            }
+                            .with_request_id(request_id),
+                        );
                     }
                     // A cold flag-ON with no axis is ambiguous: do not execute
                     // a different (tier) operation — refuse. A flag-off or a
@@ -418,7 +454,7 @@ impl EffortRequest {
             // rather than typing a bare level and claiming the flag.
             return None;
         }
-        Self::from_level(&normalized)
+        Self::from_level(&normalized).map(|req| req.with_request_id(request_id))
     }
 
     /// The native spelling to type after `/effort ` — a level word,
@@ -581,7 +617,7 @@ impl EffortBridge {
         let mut state = self.lock();
         state.generation += 1;
         let generation = state.generation;
-        state.pending = Some((generation, request));
+        state.pending = Some((generation, request.clone()));
         state.requested = Some(request);
         generation
     }
@@ -593,12 +629,15 @@ impl EffortBridge {
 
     /// The pending switch the mapper should arm its tracker with, if any.
     pub(crate) fn pending(&self) -> Option<EffortRequest> {
-        self.lock().pending.map(|(_, request)| request)
+        self.lock()
+            .pending
+            .as_ref()
+            .map(|(_, request)| request.clone())
     }
 
     /// Pending switch together with its generation, for the mapper to arm once.
     pub(crate) fn pending_with_gen(&self) -> Option<(u64, EffortRequest)> {
-        self.lock().pending
+        self.lock().pending.clone()
     }
 
     /// Whether a switch is currently awaiting read-back.
@@ -608,7 +647,7 @@ impl EffortBridge {
 
     /// Latest requested selection, for the emitted payload.
     pub(crate) fn requested(&self) -> Option<EffortRequest> {
-        self.lock().requested
+        self.lock().requested.clone()
     }
 
     /// c-effortui r5 item 1: the proven selection for classifying a live
@@ -619,7 +658,7 @@ impl EffortBridge {
         let state = self.lock();
         EffortRequest::classify_provenance(
             state.observed,
-            state.requested.map(|request| EffortSelection {
+            state.requested.as_ref().map(|request| EffortSelection {
                 name: request.name,
                 ultracode: request.ultracode,
             }),
@@ -731,7 +770,14 @@ pub(crate) trait EffortSwitchIo: Send + Sync {
     async fn screen_text(&self) -> crate::DriverResult<String>;
 
     /// Journal an `instance.configure` effort lifecycle from the worker.
-    async fn journal(&self, status: String, severity: Severity);
+    ///
+    /// Distinctly named (not `journal`) because the same IO adapters also
+    /// implement the model/permission switch traits' `journal`.
+    ///
+    /// `request_id` is the configure's per-request id (c-effortread r10): it
+    /// is echoed on the lifecycle's related-ids so the web can bind the edge
+    /// to the exact switch; `None` for an id-less legacy configure.
+    async fn journal_effort(&self, status: String, severity: Severity, request_id: Option<String>);
 }
 
 /// Type the slash command, clear the confirmation dialog Claude opens for a
@@ -769,9 +815,10 @@ pub(crate) async fn perform_switch(
 ) -> SwitchOutcome {
     let word = request.command_word();
     let target = request.dialog_target_word();
+    let request_id = request.request_id.clone();
     // Arm before typing so the mapper correlates the slash record the command
     // produces with this generation.
-    let generation = bridge.arm(request);
+    let generation = bridge.arm(request.clone());
 
     // Snapshot before typing: a dialog the previous switch left rendered is
     // stale and must not receive this switch's Enter.
@@ -781,9 +828,10 @@ pub(crate) async fn perform_switch(
     if let Err(error) = io.type_body(&request.command_body()).await {
         tracing::warn!(%error, "effort switch: body write failed");
         bridge.fail(generation);
-        io.journal(
+        io.journal_effort(
             SwitchOutcome::ControlUnavailable.journal_status(word, &error.to_string()),
             Severity::Error,
+            request_id.clone(),
         )
         .await;
         return SwitchOutcome::ControlUnavailable;
@@ -792,9 +840,10 @@ pub(crate) async fn perform_switch(
     if let Err(error) = io.press_enter().await {
         tracing::warn!(%error, "effort switch: submit write failed");
         bridge.fail(generation);
-        io.journal(
+        io.journal_effort(
             SwitchOutcome::ControlUnavailable.journal_status(word, &error.to_string()),
             Severity::Error,
+            request_id.clone(),
         )
         .await;
         return SwitchOutcome::ControlUnavailable;
@@ -912,9 +961,10 @@ pub(crate) async fn perform_switch(
             // The dialog was dismissed (Esc) or the argument rejected. The
             // effective level never changed; the UI reverts on this lifecycle.
             bridge.fail(generation);
-            io.journal(
+            io.journal_effort(
                 SwitchOutcome::Degraded.journal_status(word, &reason),
                 Severity::Warning,
+                request_id.clone(),
             )
             .await;
             SwitchOutcome::Degraded
@@ -923,9 +973,10 @@ pub(crate) async fn perform_switch(
             // Never claim applied without a verdict. A switch the user does
             // nothing after simply has no command record to read.
             bridge.fail(generation);
-            io.journal(
+            io.journal_effort(
                 SwitchOutcome::Degraded.journal_status(word, "no-readback-within-window"),
                 Severity::Warning,
+                request_id.clone(),
             )
             .await;
             SwitchOutcome::Degraded
@@ -1018,6 +1069,7 @@ pub(crate) fn spawn_worker(
             match queued {
                 Some(QueuedSwitch { request, done }) => {
                     let word = request.command_word();
+                    let request_id = request.request_id.clone();
                     // Wait out a running turn on the ready ladder. A newer
                     // switch arriving meanwhile replaces this one, which never
                     // goes out and is reported back as still `queued`.
@@ -1056,7 +1108,12 @@ pub(crate) fn spawn_worker(
                                 SwitchOutcome::Degraded => Severity::Warning,
                                 SwitchOutcome::ControlUnavailable => Severity::Error,
                             };
-                            io.journal(outcome.journal_status(word, ""), severity).await;
+                            io.journal_effort(
+                                outcome.journal_status(word, ""),
+                                severity,
+                                request_id,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1311,12 +1368,14 @@ mod sync_tests {
 
         // Coupled: {xhigh,true} is the single bare word regardless of axis.
         let coupled_on =
-            EffortRequest::for_configure("xhigh", Some(true), None, Coupled, None, None).unwrap();
+            EffortRequest::for_configure("xhigh", Some(true), None, Coupled, None, None, None)
+                .unwrap();
         assert_eq!(coupled_on.command_word(), "ultracode");
         assert_eq!(coupled_on.name, EffortName::Xhigh);
         // Coupled: a plain level never gains the flag, even with a stale true.
         let coupled_level =
-            EffortRequest::for_configure("max", Some(false), None, Coupled, None, None).unwrap();
+            EffortRequest::for_configure("max", Some(false), None, Coupled, None, None, None)
+                .unwrap();
         assert_eq!(coupled_level.command_word(), "max");
 
         // Decoupled, no provenance, LEGACY client (no axis): flag-off posts the
@@ -1324,23 +1383,39 @@ mod sync_tests {
         // than substituted to a different (tier) command (c-effortread r9
         // item 6).
         let cold =
-            EffortRequest::for_configure("high", Some(false), None, Decoupled, None, None).unwrap();
+            EffortRequest::for_configure("high", Some(false), None, Decoupled, None, None, None)
+                .unwrap();
         assert_eq!(cold.command_word(), "high");
         assert!(
-            EffortRequest::for_configure("high", Some(true), None, Decoupled, None, None).is_none(),
+            EffortRequest::for_configure("high", Some(true), None, Decoupled, None, None, None)
+                .is_none(),
             "a cold legacy flag-on is ambiguous and is refused, never a level word"
         );
 
         // Decoupled, explicit FLAG axis at a cold start: execute EXACTLY the
         // toggle — no provenance needed because the client stated the intent.
-        let cold_flag_on =
-            EffortRequest::for_configure("high", Some(true), Some(Flag), Decoupled, None, None)
-                .unwrap();
+        let cold_flag_on = EffortRequest::for_configure(
+            "high",
+            Some(true),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(cold_flag_on.command_word(), "ultracode on");
         assert_eq!(cold_flag_on.name, EffortName::High);
-        let cold_flag_off =
-            EffortRequest::for_configure("high", Some(false), Some(Flag), Decoupled, None, None)
-                .unwrap();
+        let cold_flag_off = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(cold_flag_off.command_word(), "ultracode off");
         assert_eq!(cold_flag_off.name, EffortName::High);
 
@@ -1356,6 +1431,7 @@ mod sync_tests {
             Some(Tier),
             Decoupled,
             Some(obs_high_on),
+            None,
             None,
         )
         .unwrap();
@@ -1374,6 +1450,7 @@ mod sync_tests {
             None,
             Decoupled,
             Some(obs_high_off),
+            None,
             None,
         )
         .unwrap();
@@ -1394,6 +1471,7 @@ mod sync_tests {
             Decoupled,
             Some(obs_high_on),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(off.command_word(), "ultracode off");
@@ -1401,17 +1479,19 @@ mod sync_tests {
 
         // Unknown gate: only levels are produced; a flag-on is refused.
         assert_eq!(
-            EffortRequest::for_configure("xhigh", Some(false), None, Unknown, None, None)
+            EffortRequest::for_configure("xhigh", Some(false), None, Unknown, None, None, None)
                 .unwrap()
                 .command_word(),
             "xhigh"
         );
         assert!(
-            EffortRequest::for_configure("high", Some(true), Some(Flag), Unknown, None, None)
+            EffortRequest::for_configure("high", Some(true), Some(Flag), Unknown, None, None, None)
                 .is_none(),
             "an unsupported build refuses the flag even with explicit intent"
         );
-        assert!(EffortRequest::for_configure("bogus", None, None, Coupled, None, None).is_none());
+        assert!(
+            EffortRequest::for_configure("bogus", None, None, Coupled, None, None, None).is_none()
+        );
     }
 
     /// c-effortui r4 item 2 trigger A: Remuda drags high→max; the USER then
@@ -1433,6 +1513,7 @@ mod sync_tests {
             None,
             Decoupled,
             Some(observed),
+            None,
             None,
         )
         .unwrap();
@@ -1462,6 +1543,7 @@ mod sync_tests {
             Decoupled,
             None,
             Some(requested),
+            None,
         )
         .unwrap();
         assert_eq!(req.command_word(), "max");
@@ -1488,6 +1570,7 @@ mod sync_tests {
             Some(remuda_protocol::EffortAxis::Tier),
             Decoupled,
             Some(observed),
+            None,
             None,
         )
         .unwrap();
@@ -1520,6 +1603,7 @@ mod sync_tests {
             None,
             Decoupled,
             Some(observed),
+            None,
             None,
         )
         .unwrap();
@@ -1591,6 +1675,7 @@ mod sync_tests {
                 name: EffortName::High,
                 ultracode: false,
             }),
+            None,
         )
         .unwrap();
         assert_eq!(on.command_word(), "ultracode on");
@@ -1606,16 +1691,18 @@ mod sync_tests {
                 Decoupled,
                 None,
                 None,
+                None,
             )
             .unwrap()
             .command_word(),
             "ultracode on"
         );
         assert!(
-            EffortRequest::for_configure("high", Some(true), None, Decoupled, None, None).is_none()
+            EffortRequest::for_configure("high", Some(true), None, Decoupled, None, None, None)
+                .is_none()
         );
         assert_eq!(
-            EffortRequest::for_configure("high", Some(false), None, Decoupled, None, None)
+            EffortRequest::for_configure("high", Some(false), None, Decoupled, None, None, None)
                 .unwrap()
                 .command_word(),
             "high"
@@ -1784,7 +1871,12 @@ mod switch_tests {
             self.maybe_reject_invalid(&screen.to_ascii_lowercase());
             Ok(screen)
         }
-        async fn journal(&self, status: String, severity: Severity) {
+        async fn journal_effort(
+            &self,
+            status: String,
+            severity: Severity,
+            _request_id: Option<String>,
+        ) {
             self.journals.lock().unwrap().push((status, severity));
         }
     }
@@ -2024,9 +2116,10 @@ mod switch_tests {
             Arc::clone(&io) as Arc<dyn EffortSwitchIo>,
         );
         let request = EffortRequest::from_level("xhigh").unwrap();
-        io.journal(
+        io.journal_effort(
             SwitchOutcome::Queued.journal_status("xhigh", ""),
             Severity::Info,
+            None,
         )
         .await;
         queue.enqueue(request, None);

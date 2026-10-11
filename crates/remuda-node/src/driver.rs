@@ -89,6 +89,8 @@ pub enum DriverRequest {
         effort_ultracode: Option<bool>,
         /// c-effortread r9 item 6: explicit axis intent ("flag" | "tier").
         effort_axis: Option<String>,
+        /// c-effortread r10: per-request id of the web's switch.
+        effort_request_id: Option<String>,
         /// Native permission-mode word.
         permission_mode: Option<String>,
     },
@@ -416,6 +418,7 @@ impl Driver for FakeDriver {
                     effort_index,
                     effort_ultracode,
                     effort_axis,
+                    effort_request_id: _,
                     permission_mode,
                 } => Ok(vec![DriverEmission::NativeLifecycle {
                     name: "instance.configure".to_owned(),

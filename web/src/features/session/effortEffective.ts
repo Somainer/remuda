@@ -30,6 +30,13 @@ export type EffortObservationPayload = {
   kind: "effort";
   payload: {
     requested?: { name?: string; ultracode?: boolean } | null;
+    /**
+     * c-effortread r10 items 1–4: per-request id this `requested` echo
+     * belongs to. It identifies WHICH switch the driver answered; an echo
+     * naming another request can never settle the in-flight one even when the
+     * tier happens to match.
+     */
+    requestId?: string | null;
     effective: {
       name?: string | null;
       ultracode?: boolean | null;
@@ -81,6 +88,8 @@ export type EffortObservationResult = {
   /** Timestamp carried by a withdrawn edge, for stale/ordering checks. */
   observedAt?: string;
   requested?: { name?: string; ultracode?: boolean };
+  /** c-effortread r10: id of the switch this echo belongs to. */
+  requestId?: string;
 };
 
 /** Extract effective effort from an observation. Accepts the wire envelope
@@ -116,6 +125,10 @@ export function effectiveFromObservation(observation: unknown): EffortObservatio
       candidate.requested && typeof candidate.requested === "object"
         ? (candidate.requested as { name?: string; ultracode?: boolean })
         : undefined;
+    const requestId =
+      typeof candidate.requestId === "string" && candidate.requestId.trim()
+        ? candidate.requestId
+        : undefined;
     if (readbackWithdrawn(eff)) {
       const observedAt = typeof eff.observedAt === "string" ? eff.observedAt : undefined;
       return {
@@ -123,11 +136,17 @@ export function effectiveFromObservation(observation: unknown): EffortObservatio
         withdrawn: true,
         ...(observedAt ? { observedAt } : {}),
         ...(requested ? { requested } : {}),
+        ...(requestId ? { requestId } : {}),
       };
     }
     const view = effectiveFromRecord(eff);
     if (view) {
-      return { effective: view, withdrawn: false, ...(requested ? { requested } : {}) };
+      return {
+        effective: view,
+        withdrawn: false,
+        ...(requested ? { requested } : {}),
+        ...(requestId ? { requestId } : {}),
+      };
     }
   }
   return null;

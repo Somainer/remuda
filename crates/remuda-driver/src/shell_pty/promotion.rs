@@ -2178,13 +2178,21 @@ fn agent_status(status: ScreenStatus) -> ObservationPayload {
 
 /// §9.1 `instance.configure` effort lifecycle (`effort-queued`,
 /// `effort-applied`, `effort-degraded`, …) emitted by the switch worker.
-pub(super) fn effort_lifecycle(status: &str, severity: Severity) -> ObservationPayload {
+///
+/// `related_ids` carries the configure's per-request id under
+/// [`remuda_protocol::EFFORT_REQUEST_ID_KEY`] when the client minted one
+/// (c-effortread r10).
+pub(super) fn effort_lifecycle(
+    status: &str,
+    severity: Severity,
+    related_ids: BTreeMap<String, String>,
+) -> ObservationPayload {
     native(
         LifecycleTopic::Configuration,
         "instance.configure",
         Knowledge::NotApplicable,
         status,
-        BTreeMap::new(),
+        related_ids,
         severity,
     )
     .1

@@ -1098,6 +1098,8 @@ async fn dispatch_rpc(
                         effort_index: None,
                         effort_ultracode: None,
                         effort_axis: None,
+
+                        effort_request_id: None,
                         permission_mode: None,
                     },
                 )
@@ -1170,6 +1172,8 @@ async fn submit_rpc_command(
                 effort_index: None,
                 effort_ultracode: None,
                 effort_axis: None,
+
+                effort_request_id: None,
                 permission_mode: None,
             },
         )

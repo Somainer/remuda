@@ -575,6 +575,14 @@ pub struct ModelSwitchInput {
     /// than typing a different operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_axis: Option<crate::effort::EffortAxis>,
+    /// c-effortread r10 items 1–4: per-request id the web mints for one
+    /// switch. The driver echoes it on every effort lifecycle edge
+    /// (`effort-queued|applied|degraded`, via the lifecycle `relatedIds` map)
+    /// and on the `effort` observation's requested echo, so a late edge for a
+    /// replaced request can never settle the newer in-flight one. Absent on
+    /// older clients, which keep the axis/value + timestamp fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_request_id: Option<String>,
     /// Native permission-mode spelling when the driver supports a runtime
     /// switch (Claude PTY: shift+tab cycling). Launch-only modes the carrier
     /// cannot cycle into are rejected by the driver.

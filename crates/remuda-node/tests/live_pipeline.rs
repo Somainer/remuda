@@ -378,6 +378,8 @@ impl LiveRun {
                     effort_index: None,
                     effort_ultracode: None,
                     effort_axis: None,
+
+                    effort_request_id: None,
                     permission_mode: None,
                 },
             )

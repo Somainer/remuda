@@ -3454,6 +3454,13 @@
             "null"
           ]
         },
+        "requestId": {
+          "description": "Per-request id of the in-session switch THIS edge's `requested` echo\nbelongs to (c-effortread r10, items 1–4). The driver mints nothing: it\nechoes the id the configure carried (web → Hub → Node → driver). An\nolder driver/journal omits it; consumers then fall back to the\nnewer-than-baseline-and-queue axis/value rule.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "requested": {
           "anyOf": [
             {
@@ -11914,6 +11921,13 @@
             }
           ],
           "description": "c-effortread r9 item 6: the axis this switch intends to move.\n`\"flag\"` = the orthogonal ultracode switch at the current tier;\n`\"tier\"` = a level move. Absent on a legacy client, in which case the\ndriver disambiguates from provenance and refuses a cold flag-on rather\nthan typing a different operation."
+        },
+        "effortRequestId": {
+          "description": "c-effortread r10 items 1–4: per-request id the web mints for one\nswitch. The driver echoes it on every effort lifecycle edge\n(`effort-queued|applied|degraded`, via the lifecycle `relatedIds` map)\nand on the `effort` observation's requested echo, so a late edge for a\nreplaced request can never settle the newer in-flight one. Absent on\nolder clients, which keep the axis/value + timestamp fallback.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "effortUltracode": {
           "description": "D-056 orthogonal ultracode flag accompanying [`Self::effort`]. The\ndriver picks the exact in-session spelling (a bare `/effort ultracode`\non coupled builds, `/effort ultracode on|off` on decoupled ones) from\nthis boolean plus the tier and the reported binary version.",

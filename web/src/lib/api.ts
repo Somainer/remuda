@@ -501,6 +501,14 @@ export type EffortRef = {
    * refuses an ambiguous legacy flag-on rather than substituting a tier move.
    */
   axis?: "flag" | "tier";
+  /**
+   * c-effortread r10 items 1–4: per-request id minted in the tab. It rides to
+   * the driver and comes back on every effort lifecycle edge and the
+   * requested echo, so a stale edge for a replaced request can never settle
+   * the newer one. Absent on old drivers, which keep the timestamp/value
+   * fallback.
+   */
+  requestId?: string;
 };
 
 export type InstanceCreateSpec = {

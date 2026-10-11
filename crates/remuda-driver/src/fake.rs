@@ -504,6 +504,7 @@ mod tests {
                     effort: Some("xhigh".into()),
                     effort_ultracode: Some(true),
                     effort_axis: Some(remuda_protocol::EffortAxis::Flag),
+                    effort_request_id: None,
                     permission_mode: None,
                 },
             )))

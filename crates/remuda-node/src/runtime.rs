@@ -2909,6 +2909,7 @@ fn command_parts(
                 effort_index: request.effort_index,
                 effort_ultracode: request.effort_ultracode,
                 effort_axis: request.effort_axis.clone(),
+                effort_request_id: request.effort_request_id.clone(),
                 permission_mode: request.permission_mode.clone(),
             },
             false,

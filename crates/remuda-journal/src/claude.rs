@@ -601,6 +601,7 @@ fn effort_envelope(
         native_uuid(value).as_deref(),
         ObservationPayload::Effort(Box::new(EffortPayload {
             requested: None,
+            request_id: None,
             effective: EffortEffective {
                 name: Some(observed.name),
                 ultracode: observed.ultracode,

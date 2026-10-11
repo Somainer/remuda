@@ -45,6 +45,18 @@
 
 use crate::{EffortName, EffortSource, EventId, Id};
 
+/// `NativeLifecycle.related_ids` key carrying the per-request id of an effort
+/// `instance.configure` (c-effortread r10, items 1–4).
+///
+/// The web mints one id per switch; it rides web → Hub → Node → driver on the
+/// configure, and every `effort-queued` / `effort-applied` /
+/// `effort-degraded` lifecycle the switch worker journals echoes it under this
+/// key. A client settles, rolls back or clears a pending switch ONLY on an
+/// edge carrying ITS id (or, on the id-less read-back fallback, on evidence
+/// newer than both the pre-request baseline and the queued time). A timeout,
+/// cancellation or refusal of request A therefore can never touch request B.
+pub const EFFORT_REQUEST_ID_KEY: &str = "effortRequestId";
+
 /// Deterministic observation id for an effort edge read from one native
 /// assistant record.
 ///

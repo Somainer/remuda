@@ -420,6 +420,9 @@ pub struct InstanceCommandRequest {
     /// c-effortread r9 item 6: explicit axis intent (`"flag"` | `"tier"`).
     #[serde(default)]
     pub effort_axis: Option<String>,
+    /// c-effortread r10: per-request id minted by the web for one switch.
+    #[serde(default)]
+    pub effort_request_id: Option<String>,
     /// Native permission-mode word for `instance.configure`.
     #[serde(default)]
     pub permission_mode: Option<String>,
@@ -451,6 +454,13 @@ impl InstanceCommandRequest {
                 .get("axis")
                 .and_then(serde_json::Value::as_str)
                 .filter(|value| matches!(*value, "flag" | "tier"))
+                .map(str::to_owned);
+            // c-effortread r10: the per-request id echoed on lifecycle edges.
+            self.effort_request_id = effort
+                .get("requestId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
                 .map(str::to_owned);
         }
         self.permission_mode = params

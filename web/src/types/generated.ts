@@ -733,6 +733,7 @@ export type EffortName = ("minimal" | "low" | "medium" | "high" | "xhigh" | "max
 export type EffortPayload = ({
   "effective": EffortEffective;
   "raw"?: (string | null);
+  "requestId"?: (string | null);
   "requested"?: (EffortSelection | (null));
   [key: string]: unknown;
 });
@@ -2601,6 +2602,7 @@ export type ModelSwitchInput = ({
   "effective": ModelEffective;
   "effort"?: (string | null);
   "effortAxis"?: (EffortAxis | (null));
+  "effortRequestId"?: (string | null);
   "effortUltracode"?: (boolean | null);
   "modelId": (string);
   "permissionMode"?: (string | null);

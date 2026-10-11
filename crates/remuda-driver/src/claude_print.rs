@@ -2765,6 +2765,7 @@ impl TranscriptMapper {
             remuda_protocol::NativeRequestKey::None,
             ObservationPayload::Effort(Box::new(EffortPayload {
                 requested,
+                request_id: None,
                 effective: EffortEffective {
                     name: None,
                     ultracode: None,
@@ -3178,16 +3179,23 @@ impl TranscriptMapper {
         raw: Option<String>,
         native_label: &str,
     ) -> DriverResult<Vec<Observation>> {
-        let requested = self
+        let (requested, request_id) = self
             .effort_bridge
             .as_ref()
             .and_then(|bridge| bridge.requested())
-            .map(|request| remuda_protocol::EffortSelection {
-                name: request.name,
-                ultracode: request.ultracode,
-            });
+            .map(|request| {
+                (
+                    Some(remuda_protocol::EffortSelection {
+                        name: request.name,
+                        ultracode: request.ultracode,
+                    }),
+                    request.request_id,
+                )
+            })
+            .unwrap_or((None, None));
         let payload = ObservationPayload::Effort(Box::new(EffortPayload {
             requested,
+            request_id,
             effective: EffortEffective {
                 name: Some(observed.name),
                 ultracode: observed.ultracode,

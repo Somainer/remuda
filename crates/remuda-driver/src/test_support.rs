@@ -105,6 +105,7 @@ pub fn configure_word(
         semantics,
         observed.map(|(name, ultracode)| crate::effort::ObservedSelection { name, ultracode }),
         requested.map(|(name, ultracode)| remuda_protocol::EffortSelection { name, ultracode }),
+        None,
     )
     .map(|request| request.command_word())
 }

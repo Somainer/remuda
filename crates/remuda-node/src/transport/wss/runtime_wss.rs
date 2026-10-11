@@ -510,6 +510,8 @@ async fn send_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
                 effort_index: None,
                 effort_ultracode: None,
                 effort_axis: None,
+
+                effort_request_id: None,
                 permission_mode: None,
             },
         )
@@ -555,6 +557,8 @@ async fn cancel_from_params(
                 effort_index: None,
                 effort_ultracode: None,
                 effort_axis: None,
+
+                effort_request_id: None,
                 permission_mode: None,
             },
         )
@@ -596,6 +600,8 @@ async fn close_from_params(
                 effort_index: None,
                 effort_ultracode: None,
                 effort_axis: None,
+
+                effort_request_id: None,
                 permission_mode: None,
             },
         )
@@ -662,6 +668,8 @@ async fn keys_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
                 effort_index: None,
                 effort_ultracode: None,
                 effort_axis: None,
+
+                effort_request_id: None,
                 permission_mode: None,
             },
         )
@@ -715,6 +723,8 @@ async fn respond_from_params(
                 effort_index: None,
                 effort_ultracode: None,
                 effort_axis: None,
+
+                effort_request_id: None,
                 permission_mode: None,
             },
         )

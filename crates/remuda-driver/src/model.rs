@@ -292,9 +292,10 @@ pub(crate) async fn perform_model_switch(
     if let Err(error) = io.type_body(&body).await {
         tracing::warn!(%error, "model switch: body write failed");
         bridge.fail(generation);
-        io.journal(
+        io.journal_effort(
             ModelSwitchOutcome::ControlUnavailable.journal_status(&id, &error.to_string()),
             Severity::Error,
+            None,
         )
         .await;
         return ModelSwitchOutcome::ControlUnavailable;
@@ -303,9 +304,10 @@ pub(crate) async fn perform_model_switch(
     if let Err(error) = io.press_enter().await {
         tracing::warn!(%error, "model switch: submit write failed");
         bridge.fail(generation);
-        io.journal(
+        io.journal_effort(
             ModelSwitchOutcome::ControlUnavailable.journal_status(&id, &error.to_string()),
             Severity::Error,
+            None,
         )
         .await;
         return ModelSwitchOutcome::ControlUnavailable;
@@ -355,18 +357,20 @@ pub(crate) async fn perform_model_switch(
         Some(ModelReadback::Applied(_)) => ModelSwitchOutcome::Applied,
         Some(ModelReadback::Rejected { reason }) => {
             bridge.fail(generation);
-            io.journal(
+            io.journal_effort(
                 ModelSwitchOutcome::Degraded.journal_status(&id, &reason),
                 Severity::Warning,
+                None,
             )
             .await;
             ModelSwitchOutcome::Degraded
         }
         None => {
             bridge.fail(generation);
-            io.journal(
+            io.journal_effort(
                 ModelSwitchOutcome::Degraded.journal_status(&id, "no-readback-within-window"),
                 Severity::Warning,
+                None,
             )
             .await;
             ModelSwitchOutcome::Degraded
@@ -466,7 +470,8 @@ pub(crate) fn spawn_model_worker(
                                 ModelSwitchOutcome::Degraded => Severity::Warning,
                                 ModelSwitchOutcome::ControlUnavailable => Severity::Error,
                             };
-                            io.journal(outcome.journal_status(&id, ""), severity).await;
+                            io.journal_effort(outcome.journal_status(&id, ""), severity, None)
+                                .await;
                         }
                     }
                 }
@@ -575,7 +580,12 @@ mod tests {
         async fn screen_text(&self) -> DriverResult<String> {
             Ok(self.screen.lock().unwrap().clone())
         }
-        async fn journal(&self, status: String, severity: Severity) {
+        async fn journal_effort(
+            &self,
+            status: String,
+            severity: Severity,
+            _request_id: Option<String>,
+        ) {
             self.journals.lock().unwrap().push((status, severity));
         }
     }

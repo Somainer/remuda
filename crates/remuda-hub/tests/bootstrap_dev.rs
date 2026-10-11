@@ -93,10 +93,37 @@ fn backdate_mtime(path: &Path) {
         .expect("utimensat backdates the access-code file");
 }
 
+/// Set a path's atime+mtime one day in the FUTURE (Unix only), modelling clock
+/// skew or a restored tree carrying a timestamp ahead of the hub clock.
+#[cfg(unix)]
+fn future_mtime(path: &Path) {
+    use nix::sys::stat::{UtimensatFlags, utimensat};
+    use nix::sys::time::TimeSpec;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+        + 86_400;
+    let ts = TimeSpec::new(secs, 0);
+    utimensat(None, path, &ts, &ts, UtimensatFlags::FollowSymlink)
+        .expect("utimensat postdates the access-code file");
+}
+
 fn explicit_file_config(hub_data: PathBuf, code_file: PathBuf, code: &str) -> HubConfig {
     HubConfig {
         bootstrap_token: code.to_owned(),
         bootstrap_source: BootstrapSource::ExplicitFile(code_file),
+        ..HubConfig::for_test(hub_data)
+    }
+}
+
+/// A config with NO explicit source: the hub owns/mints the code and writes
+/// it to `data_dir/bootstrap-token` on first start.
+fn minted_config(hub_data: PathBuf) -> HubConfig {
+    HubConfig {
+        bootstrap_token: String::new(),
+        bootstrap_source: BootstrapSource::Generated,
         ..HubConfig::for_test(hub_data)
     }
 }
@@ -494,5 +521,210 @@ async fn rotate_bootstrap_honours_dev_hub_layout() -> Result<()> {
     assert_eq!(stored.trim(), new);
     // The OUTER dir must NOT have received a token.
     assert!(!outer.path().join("bootstrap-token").exists());
+    Ok(())
+}
+
+/// Round 7 item 4: an access file with a FUTURE mtime (clock skew / restored
+/// tree) must not re-stamp an expired bootstrap on restart — neither the first
+/// restart nor the second. The expired login stays refused and the stamp bytes
+/// never move; a genuine same-time touch is what re-issues.
+#[cfg(unix)]
+#[tokio::test]
+async fn future_dated_access_file_does_not_restamp_across_restarts() -> Result<()> {
+    let outer = tempfile::tempdir()?;
+    let hub_data = outer.path().join("dev-hub");
+    let code_file = outer.path().join("access-code");
+    const CODE: &str = "explicit-file-code-at-least-sixteen";
+    write_code_file(&code_file, CODE)?;
+
+    // First start: the explicit file persists the code and a fresh stamp.
+    {
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            code_file.clone(),
+            CODE,
+        ))
+        .await?;
+        login(hub.addr, CODE).await?;
+        hub.shutdown().await;
+    }
+
+    // Expire the stamp and give the file a future mtime WITHOUT changing its
+    // content (no code change).
+    std::fs::write(hub_data.join("bootstrap-issued-at"), EXPIRED_STAMP)?;
+    future_mtime(&code_file);
+    let expired_bytes = std::fs::read(hub_data.join("bootstrap-issued-at"))?;
+
+    for restart in 1..=2 {
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            code_file.clone(),
+            CODE,
+        ))
+        .await?;
+        let status = login_status(hub.addr, CODE).await?;
+        assert_eq!(
+            status, 401,
+            "restart {restart}: the future mtime must not revive the code"
+        );
+        let stamp = std::fs::read(hub_data.join("bootstrap-issued-at"))?;
+        assert_eq!(
+            stamp, expired_bytes,
+            "restart {restart}: a future-dated file must never re-stamp"
+        );
+        hub.shutdown().await;
+    }
+
+    // A genuine redeploy touch (mtime = now) re-issues the stamp once.
+    write_code_file(&code_file, CODE)?;
+    let hub = spawn(explicit_file_config(
+        hub_data.clone(),
+        code_file.clone(),
+        CODE,
+    ))
+    .await?;
+    login(hub.addr, CODE).await?;
+    let stamp = std::fs::read(hub_data.join("bootstrap-issued-at"))?;
+    assert_ne!(stamp, expired_bytes, "a real touch re-stamps");
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// Round 7 item 5 (chosen contract: EXPLICIT precedence, documented): pointing
+/// `bootstrapToken = "file:…"` at the Hub's OWN regenerated bootstrap-token
+/// file (e.g. an operator passing a previously minted token back in) does NOT
+/// let a later hub regen override it. The explicit source wins on every
+/// restart — the file content is the sole code, it is not silently reminted,
+/// rotation is refused, and the explicit marker is present. This pins the
+/// existing r6 `self_token_file` behaviour so it cannot silently change to
+/// "the hub's own file wins".
+#[tokio::test]
+async fn explicit_file_at_the_hub_token_path_pins_and_blocks_regen() -> Result<()> {
+    let outer = tempfile::tempdir()?;
+    let hub_data = outer.path().join("dev-hub");
+    std::fs::create_dir_all(&hub_data)?;
+    let token_path = hub_data.join("bootstrap-token");
+    const OPERATOR_CODE: &str = "operator-pinned-code-at-least-16-chars";
+
+    // Start 1: no explicit source. The hub mints a token into its own file.
+    {
+        let hub = spawn(minted_config(hub_data.clone())).await?;
+        let minted = std::fs::read_to_string(&token_path)?;
+        assert!(!minted.trim().is_empty(), "first start mints a token");
+        assert_ne!(minted.trim(), OPERATOR_CODE);
+        // The hub-minted code logs in; it stays rotateable below until the
+        // operator pins an explicit source.
+        login(hub.addr, minted.trim()).await?;
+        hub.shutdown().await;
+    }
+
+    // The operator pins an explicit code by replacing the hub's own file and
+    // pointing the source right back AT it.
+    write_code_file(&token_path, OPERATOR_CODE)?;
+    let marker_path = hub_data.join("bootstrap-token-source-explicit");
+
+    for restart in 1..=2 {
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            token_path.clone(),
+            OPERATOR_CODE,
+        ))
+        .await?;
+        // The file's content logs in; a hub-minted code does not exist.
+        login(hub.addr, OPERATOR_CODE).await?;
+        assert_eq!(
+            std::fs::read_to_string(&token_path)?.trim(),
+            OPERATOR_CODE,
+            "restart {restart}: the explicit file is never silently reminted"
+        );
+        assert!(
+            marker_path.is_file(),
+            "restart {restart}: pointing at the hub's own file still marks it explicit"
+        );
+        // Rotation is refused even though the path is the hub's mint path.
+        let rotated = remuda_hub::rotate_bootstrap(&hub_data);
+        assert!(
+            rotated.is_err(),
+            "restart {restart}: rotate-bootstrap must refuse the explicit precedence"
+        );
+        hub.shutdown().await;
+    }
+
+    // c-bootstrap-dev r8 item 1 (pinning freezes issued-at): age the stamp
+    // past the TTL while the source still points at the Hub's own token file.
+    // An unchanged code is NOT revived (no mtime rule for the self file,
+    // content identical), and re-writing the SAME code doesn't help either.
+    let stamp_path = hub_data.join("bootstrap-issued-at");
+    std::fs::write(&stamp_path, EXPIRED_STAMP)?;
+    {
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            token_path.clone(),
+            OPERATOR_CODE,
+        ))
+        .await?;
+        assert_eq!(login_status(hub.addr, OPERATOR_CODE).await?, 401);
+        // The stamp is left exactly as the operator set it.
+        assert_eq!(std::fs::read_to_string(&stamp_path)?.trim(), EXPIRED_STAMP);
+        hub.shutdown().await;
+    }
+
+    // Recovery (1) documented in remuda-cli.md: write a DIFFERENT code to a
+    // SEPARATE access file (outside the data dir, as the doc requires — a
+    // self-referential source can never show a content change). Point the
+    // explicit source at it; a genuine content change re-stamps.
+    const NEW_PINNED_CODE: &str = "operator-pinned-code-two-at-least-16-xx";
+    let new_code_file = {
+        let mut p = token_path.clone();
+        p.set_file_name("access-code-recovered");
+        p
+    };
+    write_code_file(&new_code_file, NEW_PINNED_CODE)?;
+    {
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            new_code_file.clone(),
+            NEW_PINNED_CODE,
+        ))
+        .await?;
+        login(hub.addr, NEW_PINNED_CODE).await?;
+        assert_ne!(std::fs::read_to_string(&stamp_path)?.trim(), EXPIRED_STAMP);
+        hub.shutdown().await;
+    }
+
+    // Recovery (2): deleting the stamp with the code unchanged backfills it.
+    // Recovery (2): deleting the stamp with the code unchanged backfills it —
+    // still pointing at the separate access file from recovery (1).
+    std::fs::write(&stamp_path, EXPIRED_STAMP)?;
+    std::fs::remove_file(&stamp_path)?;
+    {
+        let hub = spawn(explicit_file_config(
+            hub_data.clone(),
+            new_code_file.clone(),
+            NEW_PINNED_CODE,
+        ))
+        .await?;
+        login(hub.addr, NEW_PINNED_CODE).await?;
+        assert!(stamp_path.is_file());
+        hub.shutdown().await;
+    }
+
+    // A no-source restart does not "regain" rotation until the operator starts
+    // once without the explicit file (the documented adoption path). The
+    // persisted token now holds NEW_PINNED_CODE.
+    {
+        let hub = spawn(minted_config(hub_data.clone())).await?;
+        login(hub.addr, NEW_PINNED_CODE).await?;
+        assert!(
+            !marker_path.is_file(),
+            "a no-source start adopts and clears the marker"
+        );
+        let rotated = remuda_hub::rotate_bootstrap(&hub_data)?;
+        assert_ne!(
+            rotated, NEW_PINNED_CODE,
+            "rotation is hub-owned again after adoption"
+        );
+        hub.shutdown().await;
+    }
     Ok(())
 }

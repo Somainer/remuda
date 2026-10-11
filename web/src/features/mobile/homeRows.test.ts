@@ -298,6 +298,35 @@ describe("buildHomeGroups body text", () => {
     }
   });
 
+  it("(r7 item 6) reads a SERIALIZED Hub instance's lastTurnError after a settled API error", () => {
+    // The exact JSON the Hub serializes for InstanceRecord (camelCase
+    // lastTurnError from the turn_error_json column). Parsing this raw shape
+    // (not a hand-built mock) proves the mobile consumer agrees with the real
+    // backend contract end to end.
+    const hubJson = JSON.parse(`{
+      "id": "ins-hub-turn-error",
+      "hostId": "host-alpha",
+      "workspaceId": "wsp-alpha",
+      "kind": "claude",
+      "driver": "claude-sdk",
+      "lifecycle": "running",
+      "activity": { "state": "known", "value": "idle" },
+      "connectivity": "connected",
+      "createdAt": "2026-10-11T00:00:00.000Z",
+      "updatedAt": "2026-10-11T00:00:01.000Z",
+      "lastError": null,
+      "lineageId": "ins-hub-turn-error",
+      "generation": 1,
+      "lastTurnError": { "at": "2026-10-11T00:00:01.000Z", "text": "API Error: 429 no eligible upstream" }
+    }`) as Instance;
+
+    const groups = build(named([hubJson]));
+    const row = groups[0].rows[0];
+    expect(row.status).toBe("idle");
+    expect(row.body).toBe("API Error: 429 no eligible upstream");
+    expect(row.bodyIsError, "durable turn error on a live process is not red").toBe(false);
+  });
+
   it("(r3 item 8) unknown connectivity wins over a durable lastTurnError: disconnect and reconcile", () => {
     // An instance that carries a settled turn error disconnects: the row must
     // show the unknown-connectivity sentence, not the turn error text.

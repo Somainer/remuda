@@ -21,7 +21,10 @@ services:
       # Separate read-only secrets mount for an operator-pinned access code
       # (bootstrapToken = "file:/secrets/access-code"). Kept OUTSIDE the
       # writable data dir so a cp -r restore cannot carry a newer-mtime access
-      # file over the restored stamp. Create the host dir 0700 (see m1 README).
+      # file over the restored stamp. The Hub runs as 65532:65532 (user:
+      # above), so create the host dir owned by 65532:65532, mode 0700, and
+      # the access-code file 0600 owned by 65532:65532 — a root-owned 0700
+      # dir is EACCES for the nonroot process. See m1/README.md A2.
       - /data00/remuda/secrets:/secrets:ro
       - ./hub.toml:/etc/remuda/hub.toml:ro
     environment:

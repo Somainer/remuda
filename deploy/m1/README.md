@@ -73,10 +73,33 @@ Expect `linux/amd64`. Do not `docker run` yet.
 
 ```bash
 ssh -o BatchMode=yes devbox-sg-host 'sudo mkdir -p /data00/remuda/hub /data00/remuda/secrets ~/astergate/deploy/Caddyfile.d
-sudo chown 65532:65532 /data00/remuda/hub
+# The container runs as uid/gid 65532 (distroless nonroot, compose user:).
+# BOTH dirs must be owned by it: a 0700 dir owned by root is not merely
+# "private", it is unreadable by 65532 — the /secrets bind mount would then
+# give the Hub EACCES on /secrets/access-code.
+sudo chown 65532:65532 /data00/remuda/hub /data00/remuda/secrets
 sudo chmod 0700 /data00/remuda/hub /data00/remuda/secrets'
 scp -o BatchMode=yes deploy/compose.hub.yml devbox-sg-host:~/astergate/deploy/compose.hub.yml
 scp -o BatchMode=yes deploy/m1/hub.toml.example devbox-sg-host:~/astergate/deploy/hub.toml
+```
+
+Expected permissions (verified against `compose.hub.yml` `user: "65532:65532"`,
+the read-only `/secrets:ro` mount, and `deploy/Dockerfile` `USER
+nonroot:nonroot` = distroless uid/gid 65532):
+
+| Host path | Mounted at | Owner uid:gid | Mode | Why |
+| --- | --- | --- | --- | --- |
+| `/data00/remuda/hub` | `/data` (rw) | `65532:65532` | `0700` | Hub writes its DB and minted `bootstrap-token` (0600); only the hub user reads it. |
+| `/data00/remuda/secrets` | `/secrets` (**ro**) | `65532:65532` | `0700` | The Hub must be able to TRAVERSE and read the pinned access code, but no other host user may. Root-owned `0700` blocks the container entirely. |
+| `/data00/remuda/secrets/access-code` | `/secrets/access-code` | `65532:65532` | `0600` | The operator-pinned code read by `bootstrapToken = "file:/secrets/access-code"`. |
+
+Place an operator-pinned access code with matching ownership:
+
+```bash
+ssh -o BatchMode=yes devbox-sg-host \
+  'sudo install -o 65532 -g 65532 -m 0600 /dev/stdin /data00/remuda/secrets/access-code' <<'CODE'
+replace-with-a-long-random-code
+CODE
 ```
 
 Edit `hub.toml` `allowedOrigins` to `https://remuda.example.com`.

@@ -60,22 +60,50 @@ When the Hub starts under `remuda dev --access-code-file F` (or with
 Hub data directory (`<data-dir>/dev-hub/bootstrap-token`) together with an
 issue timestamp, and a provenance marker
 (`bootstrap-token-source-explicit`) records that the code's source of truth is
-the file/env. `F` must be a separate operator-managed file: pointing
+the file/env. `F` SHOULD be a separate operator-managed file. Pointing
 `bootstrapToken = "file:…/bootstrap-token"` back at the Hub's own minted file
-marks it explicit and blocks `rotate-bootstrap` on the normal
-stop → rotate → start flow. It must also live **outside the Hub data
-directory** (a separate read-only secrets mount): a `cp -r`/`scp -r` restore
-of the data dir copies the access file with a fresh mtime newer than the
-restored issued stamp, which would revive an expired code once on the next
-start. In the m1 image the mount is `/data00/remuda/secrets` → `/secrets`,
-so the reference is `bootstrapToken = "file:/secrets/access-code"`.
+**pins** that code: it marks it explicit, blocks `rotate-bootstrap` on the
+normal stop → rotate → start flow, and — because the source IS the persisted
+token — a redeploy touch can never be read as a new issue (see "Pinning
+freezes issued-at" below). Keep the file **outside the Hub data directory**
+(a separate read-only secrets mount): a `cp -r`/`scp -r` restore of the data
+dir copies the access file with a fresh mtime newer than the restored issued
+stamp, which would revive an expired code once on the next start. In the m1
+image the mount is `/data00/remuda/secrets` → `/secrets`, so the reference is
+`bootstrapToken = "file:/secrets/access-code"`.
+
+**Precedence:** a configured explicit file/env always wins over the Hub's own
+token, even when the path *is* `<data-dir>/bootstrap-token` (an operator
+pasting a previously minted code back in). The explicit source is the sole
+code — it is never silently reminted, the marker is written, and
+`rotate-bootstrap` refuses on every restart with that config. We deliberately
+do NOT reject the self-reference: the operator may intentionally pin the file
+the Hub itself manages, and an error would block the adoption/restart flow. To
+hand the code back to the Hub (regain rotation), remove the explicit source
+and start once without it; that start adopts the persisted token as
+hub-generated and clears the marker.
 
 An explicit code does **not** skip the TTL. The code is trimmed of
 surrounding whitespace/newlines before use; an empty or whitespace-only value
-is refused before anything is written. On disk the issue stamp is written
-**before** the token (so a crash between the two leaves the old token with the
-new stamp and is repaired on retry). On a restart the stamp is re-written as
-follows:
+is refused before anything is written. The durable write ORDER differs by
+path — there is no single "stamp-first" rule:
+
+| Path | Durable order |
+| --- | --- |
+| Explicit file/env, code **changed** | provenance marker (fsync'd) → stamp → atomic token (before bind) |
+| Explicit file/env, code unchanged | marker (fsync'd); stamp re-written only when touched/backfilled (below) |
+| Hub mint, explicit marker present (crash recovery) | mint in memory → **bind** → atomic token → stamp → marker removed |
+| Hub mint, fresh unmarked data dir | atomic token → stamp (before bind) |
+| `rotate-bootstrap` | atomic token → stamp |
+
+The explicit path is stamp-before-token so a crash between the two leaves the
+old token paired with the new stamp and the next start self-heals via the
+code-change check. Mints and rotates are token-before-stamp so an interrupted
+write fails CLOSED (a new token with the old/missing stamp pairs neither
+code), never granting the old code another TTL. A crash between the explicit
+marker fsync and the token write leaves marker + no-token: a no-source start
+then mints only in memory and commits token, stamp and marker-removal together
+only AFTER a successful bind. On a restart the stamp is re-written as follows:
 
 - **Fresh stamp (code considered newly issued)** only when the supplied code
   differs from the persisted token, or — for a file source — the access-code
@@ -94,6 +122,29 @@ follows:
   `bootstrap_ttl_hours` (default **24**; set to `0` to disable expiry
   entirely). Expiry is enforced at `/v1/login`; an expired code returns 401
   until the operator replaces the source or rotates.
+- **Future mtime is deferred, never ignored.** The mtime rule is the
+  half-open interval **(stamp, now]**: a file whose mtime is in the future
+  (clock skew, a restored tree) keeps the stored issued-at while real time is
+  behind that mtime. On the FIRST restart after wall clock passes the mtime,
+  the touch is counted and the stamp is reissued once (a fresh 24 h window);
+  the observed future mtime is not persisted, so an operator cannot extend the
+  TTL indefinitely by back-dating files.
+- **Pinning freezes `issued-at` (self-referential source).** When the explicit
+  file path IS `<data-dir>/dev-hub/bootstrap-token`, the persisted token and
+  the configured code are the SAME file, so its content can never differ and
+  its own mtime (always fractionally newer than the stamp after a healthy
+  persist) is deliberately not read as a touch — the only thing that advances
+  the stamp on an unchanged code, a redeploy mtime, therefore never fires.
+  Consequences the operator must know: after `bootstrap_ttl_hours` the code
+  expires exactly like any other; `rotate-bootstrap` refuses; and simply
+  re-writing the file with the SAME code does not revive it. Recovery (any
+  one): (1) write a DIFFERENT code to the source and restart — a genuine
+  content change persists a fresh stamp; (2) stop the Hub, delete
+  `bootstrap-issued-at`, and restart — the missing stamp is backfilled once
+  from the unchanged code; (3) start once without the explicit source (no
+  `--access-code-file`/env), which adopts the persisted token as
+  hub-generated and clears the marker, then `rotate-bootstrap`. The supported
+  non-freezing setup is a separate secrets file outside the data dir (above).
 
 `remuda hub rotate-bootstrap --data-dir D` detects the dev layout and writes
 to `D/dev-hub/` unless `--standalone` names `D` directly. If both

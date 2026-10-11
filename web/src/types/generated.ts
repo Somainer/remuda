@@ -1043,6 +1043,7 @@ export type GateEventParams = (({
   "result": GateRunResult;
   [key: string]: unknown;
 })) & ({
+  "generation": (number);
   "jobId": (string);
   [key: string]: unknown;
 });

@@ -1015,13 +1015,19 @@ pub(crate) async fn on_event(
         return Err(HubError::Forbidden);
     }
     use remuda_protocol::GateEventKind as Kind;
+    let event_generation = event.generation;
     match event.kind {
         Kind::Phase { .. } | Kind::Log { .. } => {}
         Kind::Step { step } => {
             let _ = state
                 .store
-                .mutate_gate_job(&job_id, |row| {
+                .mutate_gate_job(&job_id, move |row| {
                     if row.state != GateJobState::Running && row.state != GateJobState::Canceling {
+                        return None;
+                    }
+                    // r11 item 5: ignore step evidence from a stale attempt so
+                    // attempt-1 steps cannot overwrite attempt-2 evidence.
+                    if row.attempts != event_generation {
                         return None;
                     }
                     match row

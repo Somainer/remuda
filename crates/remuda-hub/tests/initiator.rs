@@ -3349,3 +3349,72 @@ async fn an_rpc_failure_for_attempt_one_does_not_fail_running_attempt_two() {
         "current-attempt failure must fail: {doc}"
     );
 }
+
+/// r11 item 5: a step event from the OLD attempt must not overwrite step
+/// evidence on the current attempt after a requeue.
+#[tokio::test]
+async fn a_stale_attempts_step_event_does_not_overwrite_the_current_steps() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    let job_id = queued_job(&ctx).await;
+    // claim 1, requeue, claim 2.
+    let _ = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap();
+    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+    db.execute(
+        "UPDATE gate_jobs SET state='queued',
+            doc_json = json_set(json_set(doc_json,'$.state','queued'),'$.startedAt',NULL)
+          WHERE id = ?1",
+        rusqlite::params![job_id],
+    )
+    .unwrap();
+    drop(db);
+    let _ = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap();
+
+    // A current-attempt (2) step lands.
+    node.send_raw(json!({
+        "jsonrpc": "2.0",
+        "method": "gate.event",
+        "params": {
+            "jobId": job_id,
+            "generation": 2,
+            "kind": "step",
+            "step": { "name": "cargo-test", "status": "running", "durationMs": 0 },
+        },
+    }));
+    for _ in 0..100 {
+        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+        if doc["steps"].as_array().map(|a| a.len()).unwrap_or(0) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // A stale attempt-1 step for the SAME step name must be ignored.
+    node.send_raw(json!({
+        "jsonrpc": "2.0",
+        "method": "gate.event",
+        "params": {
+            "jobId": job_id,
+            "generation": 1,
+            "kind": "step",
+            "step": { "name": "cargo-test", "status": "ok", "durationMs": 9999 },
+        },
+    }));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    let step = &doc["steps"][0];
+    assert_eq!(step["name"], json!("cargo-test"));
+    assert_eq!(
+        step["status"],
+        json!("running"),
+        "stale attempt-1 step must not overwrite attempt-2 step: {doc}"
+    );
+    assert_eq!(step["durationMs"], json!(0), "{doc}");
+}

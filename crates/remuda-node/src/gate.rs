@@ -637,6 +637,7 @@ fn canceled_before_run(registry: &GateRegistry, job_id: &str, generation: u32) -
     };
     let _ = registry.events.send(GateEventParams {
         job_id: job_id.to_owned(),
+        generation,
         kind: GateEventKind::Finished {
             result: Box::new(result.clone()),
         },
@@ -1159,6 +1160,7 @@ impl DevNode {
         // The finished event is authoritative even if the RPC reply is lost.
         let _ = registry.events.send(GateEventParams {
             job_id: request.job_id.clone(),
+            generation: request.generation,
             kind: GateEventKind::Finished {
                 result: Box::new(outcome.clone()),
             },
@@ -1183,6 +1185,7 @@ impl DevNode {
         let emit = |kind: GateEventKind| {
             let _ = self.gate_registry().events.send(GateEventParams {
                 job_id: request.job_id.clone(),
+                generation: request.generation,
                 kind,
             });
         };
@@ -1306,6 +1309,7 @@ impl DevNode {
         let step_task = tokio::spawn(stream_gate_report(
             self.clone(),
             request.job_id.clone(),
+            request.generation,
             run_started,
             child_pid,
         ));
@@ -1313,6 +1317,7 @@ impl DevNode {
         if let Some(stderr) = child.stderr.take() {
             let node = self.clone();
             let job_id = request.job_id.clone();
+            let generation = request.generation;
             let trace = trace.clone();
             stderr_task = Some(tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
@@ -1324,6 +1329,7 @@ impl DevNode {
                     }
                     let _ = node.gate_registry().events.send(GateEventParams {
                         job_id: job_id.clone(),
+                        generation,
                         kind: GateEventKind::Log { message: line },
                     });
                 }
@@ -1508,6 +1514,7 @@ impl DevNode {
                 result.reason = Some(why.into());
                 let _ = registry.events.send(GateEventParams {
                     job_id: request.job_id.clone(),
+                    generation: request.generation,
                     kind: GateEventKind::Finished {
                         result: Box::new(result.clone()),
                     },
@@ -1675,6 +1682,7 @@ impl WaitWithOutputPiped for tokio::process::Child {
 async fn stream_gate_report(
     node: DevNode,
     job_id: String,
+    generation: u32,
     run_started: std::time::SystemTime,
     child_pid: u32,
 ) {
@@ -1720,6 +1728,7 @@ async fn stream_gate_report(
                         }
                         let _ = node.gate_registry().events.send(GateEventParams {
                             job_id: job_id.clone(),
+                            generation,
                             kind: GateEventKind::Step { step },
                         });
                     }

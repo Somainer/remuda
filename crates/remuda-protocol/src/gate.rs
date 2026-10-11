@@ -429,6 +429,11 @@ pub enum GateEventKind {
 pub struct GateEventParams {
     /// The job this event belongs to.
     pub job_id: String,
+    /// Attempt generation this event was produced by. The Hub ignores events
+    /// whose generation is not the persisted row's attempts, so a delayed
+    /// attempt-1 step cannot overwrite attempt-2 evidence.
+    #[serde(default)]
+    pub generation: u32,
     /// Event payload.
     #[serde(flatten)]
     pub kind: GateEventKind,

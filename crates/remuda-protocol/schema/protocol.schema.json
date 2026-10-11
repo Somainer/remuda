@@ -4938,13 +4938,21 @@
         }
       ],
       "properties": {
+        "generation": {
+          "default": 0,
+          "description": "Attempt generation this event was produced by. The Hub ignores events\nwhose generation is not the persisted row's attempts, so a delayed\nattempt-1 step cannot overwrite attempt-2 evidence.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "jobId": {
           "description": "The job this event belongs to.",
           "type": "string"
         }
       },
       "required": [
-        "jobId"
+        "jobId",
+        "generation"
       ],
       "type": "object"
     },

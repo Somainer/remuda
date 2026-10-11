@@ -135,6 +135,13 @@ pub struct Detected {
     /// opposed to starting a new one with `--session-id`. A hand-typed resume
     /// inside a login shell is gated the same way as a Remuda-launched one.
     pub resume: bool,
+    /// c-effortread r11 item 6: whether [`Self::session_id`] was learned from
+    /// an authenticated SessionStart HOOK rather than argv/pre-spawn
+    /// provenance. A hook-only identity must never count as launch
+    /// provenance: a hand-typed `claude` (no argv session/resume) that
+    /// `/resume`s X before the first poll is a hook-named resume and opens at
+    /// an unverified EOF boundary, not Fresh.
+    pub session_id_from_hook: bool,
 }
 
 /// Reads the foreground process group of a live PTY.
@@ -233,6 +240,7 @@ pub fn detect(rows: &[ProcessRow], alias: Option<&LaunchAlias>) -> Option<Detect
                 session_id,
                 hydrates_transcript: hydrates_transcript(alias.kind),
                 resume,
+                session_id_from_hook: false,
             });
         }
         let base = basename(program);
@@ -248,6 +256,7 @@ pub fn detect(rows: &[ProcessRow], alias: Option<&LaunchAlias>) -> Option<Detect
                     session_id,
                     hydrates_transcript: entry.hydrates_transcript,
                     resume,
+                    session_id_from_hook: false,
                 });
             }
         }

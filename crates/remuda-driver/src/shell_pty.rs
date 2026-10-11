@@ -5032,6 +5032,7 @@ mod tests {
             session_id: None,
             hydrates_transcript: true,
             resume: false,
+            session_id_from_hook: false,
         });
         let hooks = driver.hooks.lock().await.clone().unwrap();
         assert!(
@@ -5170,6 +5171,7 @@ mod tests {
                 session_id: None,
                 hydrates_transcript: true,
                 resume: false,
+                session_id_from_hook: false,
             });
         }
         driver
@@ -5241,6 +5243,7 @@ mod tests {
             session_id: None,
             hydrates_transcript: true,
             resume: false,
+            session_id_from_hook: false,
         });
         *driver.status.lock().unwrap() = Some(ScreenStatus::Idle);
 

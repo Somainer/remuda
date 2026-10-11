@@ -1722,15 +1722,20 @@ impl SessionModeTable {
         // recorded, the argv session is stale (an in-TUI switch already
         // happened, e.g. a hook delivery racing the first poll) — record this
         // as a rebound, never as the launch's own first session.
-        let argv_names_other_session = found
-            .session_id
-            .as_deref()
-            .is_some_and(|argv_id| argv_id != session_id);
         // c-effortread r9 item 4: only CLAIM the pid's launch slot here; do
         // not `insert` a record that loses on argv (a hook-raced switch). The
         // old insert-then-discard consumed the slot, so the real launch-id the
         // argv named landed later as a rebound and lost pre_resume_mode.
         let slot_unclaimed = !self.first_pid.contains(&pid);
+        // c-effortread r11 item 6: the hook fallback populates
+        // `found.session_id` from the authenticated SessionStart, not argv.
+        // That identity is NOT the launch's own established session, so a
+        // hand-typed `claude` (no argv session/resume) whose user /resume'd X
+        // before the first poll cannot win Fresh launch provenance here.
+        let argv_names_other_session = found
+            .session_id
+            .as_deref()
+            .is_some_and(|argv_id| !found.session_id_from_hook && argv_id != session_id);
         let first_for_pid = slot_unclaimed && !argv_names_other_session;
         if first_for_pid {
             self.first_pid.insert(pid);
@@ -1751,8 +1756,13 @@ impl SessionModeTable {
             // unverified EOF boundary (or Fresh when the file is empty),
             // exactly like a rebound. Ignoring it returned Fresh and replayed
             // the resumed history as current evidence.
-            let launch_session_established =
-                pre_resume_mode.is_some() || found.session_id.is_some();
+            //
+            // c-effortread r11 item 6: a session id learned from the HOOK
+            // (found.session_id_from_hook) establishes launch provenance no
+            // more than no id at all — only a pre-spawn capture or an argv
+            // session/resume does.
+            let launch_session_established = pre_resume_mode.is_some()
+                || (found.session_id.is_some() && !found.session_id_from_hook);
             let hook_provenance = if !launch_session_established {
                 match start_source {
                     Some("resume") => Some(
@@ -2364,6 +2374,7 @@ async fn sample(state: &PtyState, table: &dyn ProcessTable, alias: Option<&Launc
             session_id: None,
             hydrates_transcript: kind == AgentKind::Claude,
             resume: false,
+            session_id_from_hook: false,
         }),
     }
 }
@@ -2402,6 +2413,10 @@ fn promote_from_hook_binding(
             .iter()
             .any(|entry| entry.kind == kind && entry.hydrates_transcript),
         resume,
+        // r11 item 6: this identity came from the authenticated hook, not from
+        // argv/pre-spawn provenance; the caller must not treat it as the
+        // launch's own established session.
+        session_id_from_hook: true,
     })
 }
 
@@ -2810,6 +2825,7 @@ mod tests {
             session_id: session_id.map(str::to_owned),
             hydrates_transcript: true,
             resume: false,
+            session_id_from_hook: false,
         }
     }
 
@@ -3018,6 +3034,7 @@ mod tests {
             session_id: None,
             hydrates_transcript: false,
             resume: false,
+            session_id_from_hook: false,
         };
         let events = transition(&mut state, Some(&codex), &now);
         assert_eq!(names(&events), vec![DEMOTED, DETECTED, PROMOTED]);
@@ -5590,6 +5607,150 @@ mod tests {
             "a startup source is the fresh current process and its record publishes: {:?}",
             effort_rows(&events)
         );
+    }
+
+    /// c-effortread r11 item 6: a hook-derived session id is SESSION IDENTITY,
+    /// not launch provenance. A hand-typed `claude` (plain argv, no
+    /// session/resume) that the poller detects ONLY through the SessionStart
+    /// hook fallback, whose user `/resume`d X before the first poll (source
+    /// resume), must open X at an unverified EOF boundary: X's historical
+    /// effort/verdict records neither publish as current nor settle an armed
+    /// switch. Driven native bus → promote_from_hook_binding → production
+    /// SessionModeTable classification → maintain_binding/promotion.
+    #[tokio::test]
+    async fn r11_item6_hook_only_identity_with_resume_source_uses_unverified_boundary() {
+        use crate::effort::EffortRequest;
+        use remuda_protocol::EffortAxis::Tier;
+        use remuda_protocol::EffortSemantics::Decoupled;
+
+        // X's prior history: a high read-back, then a /effort max slash and
+        // its accepted verdict — the exact pair that settles an armed max
+        // request when the boundary is wrongly Fresh.
+        let history = format!(
+            "{}{}{}",
+            assistant_line(Some("high"), 1),
+            slash_line("max", 2),
+            stdout_verdict(
+                "Set effort level to max (this session only): Maximum capability",
+                3,
+            ),
+        );
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(dir.path(), &history);
+        fx.ctx.cwd = dir.path().join("repo");
+
+        // Native hook bus: exactly the relay payload, source folded to resume.
+        let (tx, _rx) = mpsc::channel(256);
+        let bus = remuda_signal::SignalBus::new(
+            remuda_signal::BusContext {
+                instance_id: InstanceId::new(),
+                host_id: HostId::new(),
+                journal_id: Id::new("obj").expect("journal id"),
+                run_id: RunId::new(),
+                driver_kind: remuda_protocol::DriverKind::ShellPty,
+                adapter_version: "test".into(),
+            },
+            tx,
+            Arc::new(AtomicU64::new(0)),
+        );
+        bus.handle(remuda_signal::HookEnvelope {
+            credential: "cred".into(),
+            event: "SessionStart".into(),
+            ppid: 7,
+            payload: serde_json::json!({
+                "session_id": PUMP_SESSION,
+                "transcript_path": fx.binding.path.to_string_lossy(),
+                "cwd": fx.binding.cwd.to_string_lossy(),
+                "source": "resume",
+            }),
+        })
+        .await;
+        let binding = bus.binding().expect("the native bus folded a binding");
+        assert_eq!(binding.source.as_deref(), Some("resume"));
+
+        // Fallback detection (the production seam): the foreground group shows
+        // a plain hand-typed `claude` — no argv session/resume — so the
+        // identity comes ONLY from the authenticated hook binding.
+        let rows = vec![ProcessRow {
+            pid: 7,
+            args: "claude".into(),
+        }];
+        let found = promote_from_hook_binding(&rows, &binding, AgentKind::Claude)
+            .expect("the hook pid in the foreground group promotes");
+        assert_eq!(found.session_id.as_deref(), Some(PUMP_SESSION));
+        assert!(!found.resume, "plain argv carries no resume flag");
+        assert!(
+            found.session_id_from_hook,
+            "the session identity is learned from the hook, not argv"
+        );
+        let report =
+            SessionStartReport::from_bus_binding(&binding).expect("a named path yields a report");
+
+        // A live configure request is already armed when the mapper replays X.
+        let bridge = Arc::new(crate::effort::EffortBridge::new());
+        let armed = EffortRequest::for_configure(
+            "max",
+            Some(false),
+            Some(Tier),
+            Decoupled,
+            None,
+            None,
+            Some("req-armed"),
+        )
+        .expect("max tier request");
+        bridge.arm(armed);
+        assert!(bridge.has_pending());
+
+        let bindings = BindingHandle::empty();
+        bindings.begin_epoch(&fx.ctx.cwd, &fx.ctx.claude_home);
+        bindings.ingest_session_start(report);
+        let mut hydrator: Option<Hydrator> = None;
+        let mut announced: Option<String> = None;
+        let mut session_modes = SessionModeTable::default();
+        let mut launch_mode = LaunchModeBinding::Unbound;
+        let mut read_anchors = std::collections::HashMap::new();
+        let mut effort_seeds = std::collections::HashMap::new();
+        let mut withdrawn_sessions = std::collections::HashSet::new();
+        let mut active_session: Option<(i32, String)> = None;
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &found,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
+            Some(&bridge),
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            None,
+            &mut read_anchors,
+            &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        )
+        .await;
+        let hydrator = hydrator.expect("the hook identity binds and opens a hydrator");
+        assert!(
+            !hydrator.tail.verified(),
+            "a hook-only resume identity opens an unverified EOF boundary, not Fresh"
+        );
+
+        let events = drain(&mut fx);
+        assert!(
+            effort_rows(&events).is_empty(),
+            "X's historical high/max records never publish current effort: {:?}",
+            effort_rows(&events)
+        );
+        let pending = bridge
+            .pending()
+            .expect("the historical slash/verdict cannot settle the armed request");
+        assert_eq!(pending.request_id.as_deref(), Some("req-armed"));
+        assert_eq!(pending.name, remuda_protocol::EffortName::Max);
     }
 
     /// r6 item 3 (the lazy-create case): a fresh launch has no transcript and

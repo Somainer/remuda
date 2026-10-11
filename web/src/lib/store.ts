@@ -1495,12 +1495,12 @@ class HubStore {
   }
 
   /** Test-only: force the follow-live verdict (simulates open + fresh frame). */
-  setFollowLiveForTest(open: boolean, framed: boolean) {
-    const journalId = this.connectionBoundJournal ?? "test_journal";
-    if (open) this.followReadyState.set(journalId, () => 1);
-    else this.followReadyState.delete(journalId);
-    if (framed) this.followFrameAt.set(journalId, Date.now());
-    else this.followFrameAt.delete(journalId);
+  setFollowLiveForTest(open: boolean, framed: boolean, journalId?: Id) {
+    const j = journalId ?? this.connectionBoundJournal ?? "test_journal";
+    if (open) this.followReadyState.set(j, () => 1);
+    else this.followReadyState.delete(j);
+    if (framed) this.followFrameAt.set(j, Date.now());
+    else this.followFrameAt.delete(j);
   }
 
   /** Test-only: drive the machine live the way a fresh follow frame would. */
@@ -1790,6 +1790,23 @@ class HubStore {
         this.settleFromJournal(instanceId, this.state.events[instanceId] ?? []);
       }
     });
+  }
+
+  /**
+   * Adopt an ALREADY-MOUNTED follow's socket after bindConnection rebound the
+   * connection machine to it (c-reconnfu gate 16 item 1). bindConnection's
+   * noteBinding retires any in-flight resume and clears the watchdog, so the
+   * machine would otherwise sit in `recovering` with NO timers (banner stuck,
+   * create refused) because the mounted branch returns before
+   * openFollowSocket. A live socket certifies live; a dead socket takes the
+   * rebind path (re-arms stale timers or a bind deadline -> beginResume).
+   */
+  private adoptMountedFollow() {
+    if (this.followSocketLive()) {
+      this.connection?.followRebindLive();
+    } else {
+      this.connection?.followBound({ rebind: true });
+    }
   }
 
   /** Foreground trigger used by Shell/PhoneShell (replaces raw catchup). */
@@ -2886,8 +2903,10 @@ class HubStore {
     this.hydrateModels([instance]);
     // Already mounted (SessionPage re-render): the bind above rebound the
     // connection machine to this active follow (and serviced any abandoned
-    // instance); a dead socket is reopened by the machine.
+    // instance); adopt THIS journal's socket so the rebound machine is not
+    // left timer-less in recovering (gate 16 item 1).
     if (this.journals.has(instance.journalId)) {
+      this.adoptMountedFollow();
       return;
     }
     this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: "live" } });
@@ -2897,7 +2916,11 @@ class HubStore {
     // demand via JournalClient.loadEarlier.
     const seed = await api.eventsRead({ journalId: instance.journalId, limit: 2000 });
     // Another mount may finish loading this journal while this read is pending.
-    if (this.journals.has(instance.journalId)) return;
+    if (this.journals.has(instance.journalId)) {
+      // Same adoption as the top mounted branch (gate 16 item 1).
+      this.adoptMountedFollow();
+      return;
+    }
     const history = seed.events;
     const historyPhrase = liveSummary(history);
     this.emit({

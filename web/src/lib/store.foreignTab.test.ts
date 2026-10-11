@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
+import type { ConnectionMachine } from "./connection";
 import { OUTBOX_LS_KEY, type OutboxRecord } from "./outbox";
 
 const INSTANCE = "ins_foreign_tab";
@@ -206,6 +207,90 @@ it("GATE12 item 6: two aborting load reclaims arm the tracked wakeup that delive
   Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
   Storage.prototype.setItem = originalSetItem;
   sessionStorage.removeItem(OWNER_KEY);
+  hubStore.logout();
+});
+
+it("GATE16 item 1: follow(B) while bound to A in recovering adopts mounted B — dead socket arms a deadline that resumes; live socket certifies live", async () => {
+  // Gate 15 item 3 routed follow() through bindConnection, whose noteBinding
+  // retires A's in-flight resume and clears the watchdog; the mounted branch
+  // then returned without adopting B's socket, so the machine was stuck in
+  // recovering with ZERO timers. follow() must adopt the mounted follow.
+  vi.useFakeTimers();
+  const { api, hubStore } = await fresh();
+  await bootLive(api, hubStore); // mounts A = INSTANCE (journal JOURNAL)
+  const store = hubStore as unknown as {
+    connection: ConnectionMachine;
+    setFollowLiveForTest: (open: boolean, framed: boolean, journalId?: string) => void;
+  };
+
+  const JOURNAL_B = "obj_journal_b_g16";
+  const INSTANCE_B = "ins_mounted_b_g16";
+  const instanceB = {
+    id: INSTANCE_B,
+    journalId: JOURNAL_B,
+    lifecycle: "running",
+    revision: "0",
+    durableSeq: "0",
+  } as never as Awaited<ReturnType<Api["instanceGet"]>>;
+  vi.spyOn(api, "instanceGet").mockImplementation(async (id: string) =>
+    id === INSTANCE_B ? instanceB : ({} as Awaited<ReturnType<Api["instanceGet"]>>),
+  );
+  vi.spyOn(api, "eventsRead").mockResolvedValue({
+    events: [],
+    windowFromSeq: "1",
+    durableSeq: "0",
+    reachedAfterSeq: true,
+  } as Awaited<ReturnType<Api["eventsRead"]>>);
+  // B mounts with an OPEN live socket the first time.
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(async () =>
+    ({
+      subscriptionId: "sub_g16" as never,
+      getReadyState: () => 1,
+      snapshot: { asOfSeq: "0", fromSeq: null },
+      close: () => undefined,
+    }) as never,
+  );
+  // Both A and B are mounted while subscribes resolve live.
+  await hubStore.follow(INSTANCE_B);
+  await hubStore.follow(INSTANCE);
+  const timerNames = () =>
+    [...(store.connection as unknown as { timers: Map<string, unknown> }).timers.keys()];
+
+  // --- scenario 1: rebind into recovering with B's socket DEAD ---
+  // New subscribes hang (blocked upgrades), so resume reopen attempts stay in
+  // flight in recovering rather than certifying live off a fresh socket.
+  vi.mocked(api.eventsSubscribe).mockImplementation(
+    () => new Promise<never>(() => {}) as never,
+  );
+  store.setFollowLiveForTest(false, false, JOURNAL);
+  store.setFollowLiveForTest(false, false, JOURNAL_B);
+  store.connection.dispatch({ type: "close" });
+  store.connection.dispatch({ type: "online" }); // beginResume hangs -> recovering
+  expect(store.connection.state).toBe("recovering");
+
+  await hubStore.follow(INSTANCE_B); // bind-away retires A's attempt; B dead
+  expect(store.connection.state).toBe("recovering");
+  // Machine not stuck: the rebind armed a pending bind deadline (zero timers
+  // was the gate-16 regression).
+  expect(timerNames()).toContain("bind");
+  // The bind deadline starts a resume attempt (its reopen hangs); its 20 s
+  // watchdog settles quiet stale with armed probe timers — the machine
+  // self-drives out of recovering instead of hanging forever.
+  await vi.advanceTimersByTimeAsync(15_000); // bind fires -> new recovering attempt
+  await Promise.resolve();
+  await vi.advanceTimersByTimeAsync(20_001); // watchdog -> quiet stale
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(store.connection.state).toBe("stale");
+  expect(timerNames()).toContain("probe");
+
+  // --- scenario 2: rebind into recovering with B's socket LIVE -> live ---
+  store.setFollowLiveForTest(true, true, JOURNAL_B);
+  store.connection.dispatch({ type: "close" });
+  store.connection.dispatch({ type: "online" }); // resume attempt armed
+  expect(store.connection.state).toBe("recovering");
+  await hubStore.follow(INSTANCE_B); // adopt the live mounted socket
+  expect(store.connection.state).toBe("live");
   hubStore.logout();
 });
 

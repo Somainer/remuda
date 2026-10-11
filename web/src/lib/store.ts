@@ -1038,13 +1038,17 @@ class HubStore {
    *     configure nonce). An echo that carries ANOTHER id names a replaced
    *     request and is rejected outright — matching tier or a newer clock can
    *     never promote it; or
-   *  2. an id-less legacy echo whose axes exactly match this request; or
+   *  2. an id-less legacy echo (older driver) whose REQUESTED values name
+   *     this request, whose effective VALUES exactly match every moved axis,
+   *     and whose read-back is strictly newer than both bounds (r11 item 4:
+   *     it can never authorize a clamped or opposite outcome); or
    *  3. no echo at all (older driver / durable poll record): a `remuda`
    *     read-back strictly newer than BOTH the pre-request baseline and the
    *     request's own queued time, whose value matches the requested axis.
    *     An unchanged older poll (`{high,false}@T0`) can therefore never settle
-   *     an ON request queued at T1 (item 1), and a mismatching OFF verdict can
-   *     never settle a queued ON (item 2).
+   *     an ON request queued at T1 (item 1), a mismatching OFF verdict can
+   *     never settle a queued ON (item 2), and an instant EQUAL to the queued
+   *     time settles nothing (item 4).
    */
   private settleEffortAxes(
     instanceId: Id,
@@ -1079,50 +1083,55 @@ class HubStore {
       !echoMovesFlag ||
       (requestedEcho?.ultracode !== undefined &&
         requestedEcho.ultracode === pending.ultracode);
-    const legacyEchoMatches =
+    const legacyEchoNamesRequest =
       echoId === null && requestedEcho !== undefined && echoLevelMatch && echoFlagMatch;
 
     // Rule 3: no id and no echo — the read-back must be STRICTLY newer than
-    // the pre-request baseline (the pre-switch state itself can never confirm
-    // the switch) and at or after the request's own queued time (equal parsed
-    // instant settles — the durable record truncates milliseconds, c-perffu
-    // r7), and the observed VALUE must match the requested axis. A cold start
-    // with no stamps makes the time checks vacuous; value match still rules.
+    // BOTH the pre-request baseline AND the request's own queued time. An
+    // instant EQUAL to the queued time settles nothing (c-effortread r11 item
+    // 4): it can be the state A left behind, same-second on a clock that
+    // truncates milliseconds. The observed VALUE must also match the moved
+    // axes exactly. A cold start with no stamps makes the time checks vacuous.
     const postBaseline =
       pending.baselineObservedAt == null ||
       Date.parse(view.observedAt) > Date.parse(pending.baselineObservedAt);
-    const atOrAfterQueued =
+    const strictlyAfterQueued =
       pending.queuedObservedAt == null ||
-      Date.parse(view.observedAt) >= Date.parse(pending.queuedObservedAt);
-    const inWindow = postBaseline && atOrAfterQueued;
+      Date.parse(view.observedAt) > Date.parse(pending.queuedObservedAt);
+    const inWindow = postBaseline && strictlyAfterQueued;
 
     const movesLevel = echoMovesLevel;
     const movesFlag = echoMovesFlag;
+    const viewLevelMatches = !movesLevel || view.name === pending.name;
+    const viewFlagMatches =
+      !movesFlag ||
+      (effortFlagSettles(view.ultracode) && view.ultracode === pending.ultracode);
 
-    const authoritativeEcho = echoNamesThisRequest || legacyEchoMatches;
-    // The value fallback is attribution-agnostic: a read-back in the
-    // post-request window that shows the requested axis value is the goal
-    // state holding, however it got there. An opposite value is A's state (or
-    // the refusal lifecycle's job), never B's confirmation.
-    const valueFallback =
-      !namesOtherRequest && requestedEcho === undefined && inWindow;
-    const ours = !namesOtherRequest && (authoritativeEcho || valueFallback);
+    // Only an echo carrying THIS request's id may authorize a clamped or
+    // opposite outcome (it is rendered as the delivered mismatch). An id-less
+    // legacy echo settles only when its requested values name the request,
+    // its effective VALUES exactly match every moved axis, and BOTH time
+    // bounds hold; any other id-less echo stays a veto (the no-echo fallback
+    // requires NO echo at all, so a stale/non-matching echo cannot ride it).
+    const ownEcho = echoNamesThisRequest;
+    const legacyEchoSettles =
+      legacyEchoNamesRequest && inWindow && viewLevelMatches && viewFlagMatches;
+    const valueFallback = requestedEcho === undefined && inWindow;
+    const ours = ownEcho || legacyEchoSettles || valueFallback;
 
     let { levelSettled, flagSettled } = pending;
-    if (ours && !levelSettled) {
+    if (ours && !levelSettled && movesLevel) {
       // An echo that names this request settles the level even on a clamped
-      // value (it is rendered as the delivered mismatch). The value fallback
-      // settles only an exact level match.
-      if (movesLevel && (authoritativeEcho || view.name === pending.name)) {
+      // value; a legacy echo and the value fallback need an exact level match.
+      if (ownEcho || view.name === pending.name) {
         levelSettled = true;
       }
     }
-    if (ours && !flagSettled) {
-      // A definitive flag value from our own verdict settles (an opposite
-      // value is the delivered refusal); the fallback needs an exact match.
+    if (ours && !flagSettled && movesFlag) {
       const definitive = effortFlagSettles(view.ultracode);
-      const flagMatches = view.ultracode === pending.ultracode;
-      if (movesFlag && definitive && (authoritativeEcho || flagMatches)) {
+      // A definitive flag value from our own verdict settles (an opposite
+      // value is the delivered refusal); legacy/fallback need an exact match.
+      if (definitive && (ownEcho || view.ultracode === pending.ultracode)) {
         flagSettled = true;
       }
     }

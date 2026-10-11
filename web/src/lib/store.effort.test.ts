@@ -281,23 +281,39 @@ it("a cold switch flip states the flag axis and predicts the decoupled toggle wo
 
 it("a clamped level named by THIS request's echo settles the tier request; an unnamed clamp does not", async () => {
   const ctx = await startFollowing("clamp-flag");
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
   // Decoupled tier request to max: only the level moves, the flag is left to a
   // separate toggle (its axis starts settled).
   await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false)); // max
+  const id = posts[0]?.requestId!;
   const pending = hubStore.effortPendingOf(ctx.instance.id);
   expect(pending?.levelSettled).toBe(false);
 
   // The org cap clamps max to high. In PRODUCTION the verdict edge carries
-  // the driver's requested echo naming the request's max (r10): the clamp is
+  // the driver's requested echo naming the request's id (r10): the clamp is
   // this request's delivered outcome (rendered as a mismatch) and settles.
   ctx.receive(
     effortEvent(2, "high", null, "remuda", undefined, {
       requested: { name: "max", ultracode: false },
+      requestId: id,
     }),
   );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
+
+  // An ID-LESS clamped echo (older driver) can no longer authorize the
+  // opposite level: it must leave a fresh max request pending (r11 item 4).
+  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false)); // max again
+  ctx.receive(
+    effortEvent(3, "high", null, "remuda", undefined, {
+      requested: { name: "max", ultracode: false },
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
 });
 
 it("a clamped level with NO echo and a non-matching value never settles a request", async () => {
@@ -1777,8 +1793,10 @@ it("a load-earlier replay hydrates observations but never queues; a live queued 
   // frames — a historical queued configure in the older page cannot surface a
   // 切换中 indicator. This still drives the REAL load-earlier path (floor
   // descriptor, beforeSeq paging, monotonic effective guard) and then proves
-  // poll settlement (stale t00:05 below the request; equal-instant t00:14 with
-  // the matching level name settles) for a genuinely live queued switch.
+  // poll settlement (stale t00:05 below the request; an equal-instant t00:14
+  // must NOT settle — r11 item 4 requires a STRICTLY newer read-back — and a
+  // later t00:15 with the matching level settles) for a genuinely live queued
+  // switch.
   const id = "ins_effort_prepend";
   const journalId = "obj_effort_prepend";
   const instance: Instance = {
@@ -1884,7 +1902,8 @@ it("a load-earlier replay hydrates observations but never queues; a live queued 
   expect(hubStore.effortPendingOf(id)?.queued).toBe(true);
 
   // A read-back at the SAME parsed instant as the queued request (the durable
-  // record truncates milliseconds) names the requested level and settles it.
+  // record truncates milliseconds) could be the state the previous command
+  // left behind: r11 item 4 requires STRICTLY newer, so it stays pending.
   vi.spyOn(api, "instanceList").mockResolvedValue({
     items: [
       {
@@ -1894,6 +1913,23 @@ it("a load-earlier replay hydrates observations but never queues; a live queued 
           ultracode: false,
           source: "remuda",
           observedAt: "2026-09-16T00:14:00Z",
+        },
+      },
+    ],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortPendingOf(id)).not.toBeNull();
+
+  // A STRICTLY later read-back naming the requested level settles it.
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      {
+        ...instance,
+        effortEffective: {
+          name: "max",
+          ultracode: false,
+          source: "remuda",
+          observedAt: "2026-09-16T00:15:00Z",
         },
       },
     ],
@@ -1946,9 +1982,18 @@ it("a stale effort poll older than the queued configure leaves the queued switch
   await hubStore.refresh();
   expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
 
-  // A current read-back (t2) settles.
+  // An equal-instant read-back (t2, same parsed second as the queued edge)
+  // stays pending under r11 item 4's strictly-newer bound.
   list.mockResolvedValue({
     items: [{ ...ctx.instance, effortEffective: { name: "max", ultracode: false, source: "remuda", observedAt: t2 } }],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
+
+  // A STRICTLY later read-back settles.
+  const t230 = "2026-09-16T00:11:30Z";
+  list.mockResolvedValue({
+    items: [{ ...ctx.instance, effortEffective: { name: "max", ultracode: false, source: "remuda", observedAt: t230 } }],
   } as never);
   await hubStore.refresh();
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
@@ -2356,4 +2401,61 @@ it("r11 item 3: an id-less genuine model/workflow refusal is recorded as environ
   expect(hubStore.effortRefusalOf(ctx.instance.id)).not.toBeNull();
   expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idB);
   expect(hubStore.effortOf(ctx.instance.id, "claude").ultracode).toBe(true);
+});
+
+it("r11 item 4: an older driver's clamped max echo (id-less) never settles queued C=max past the timestamp and effective-value bounds", async () => {
+  const ctx = await startFollowing("r11-item4-clamp", { state: "known", value: "working" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+
+  // Observed low.
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-10-11T00:00:00.000Z"));
+
+  // A drags to max and executes; before it reads back the user picks low (B)
+  // and then max again (C). The older driver (no request ids) has clamped A
+  // to high; its verdict is outstanding.
+  const aPost = hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+  await hubStore.setEffort(ctx.instance.id, { index: 2, name: "low", kind: "claude", ultracode: false });
+  await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+  const idC = posts[2]?.requestId!;
+  await aPost;
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idC);
+
+  // C's own queued edge at t2.
+  ctx.receive(configureLifecycleFor(3, "effort-queued:max", idC, ctx.instance.id, "2026-10-11T00:02:00.000Z"));
+
+  // A's delayed verdict: an ID-LESS max echo but the EFFECTIVE value is high
+  // (clamped) at t1, BEFORE C queued. It must not settle C even though its
+  // requested word names max.
+  ctx.receive(
+    effortEvent(4, "high", false, "remuda", "2026-10-11T00:01:00.000Z", {
+      requested: { name: "max", ultracode: false },
+    }),
+  );
+  const c = hubStore.effortPendingOf(ctx.instance.id);
+  expect(c, "the clamped id-less echo never authorizes C").not.toBeNull();
+  expect(c?.requestId).toBe(idC);
+  expect(c?.levelSettled).toBe(false);
+
+  // An id-less max echo at a time EQUAL to the queued instant still cannot
+  // settle (must be strictly newer), even with the matching value.
+  ctx.receive(
+    effortEvent(5, "max", false, "remuda", "2026-10-11T00:02:00.000Z", {
+      requested: { name: "max", ultracode: false },
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idC);
+
+  // C's own id-bearing read-back settles it.
+  ctx.receive(
+    effortEvent(6, "max", false, "remuda", "2026-10-11T00:03:00.000Z", {
+      requested: { name: "max", ultracode: false },
+      requestId: idC,
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });

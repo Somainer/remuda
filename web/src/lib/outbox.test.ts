@@ -57,7 +57,7 @@ class MemStorage implements OutboxStorage {
       this.map.set(key, rec);
       return true;
     });
-    this.writeChain = run.then(() => undefined);
+    this.writeChain = run.then(() => undefined, () => undefined);
     return await run;
   }
   /** Atomic read-check-write on the same chain as the lease claim. */
@@ -71,7 +71,7 @@ class MemStorage implements OutboxStorage {
       this.map.set(commandId, merged);
       return merged;
     });
-    this.writeChain = run.then(() => undefined);
+    this.writeChain = run.then(() => undefined, () => undefined);
     return await run;
   }
   /** Conditional reclaim on the same serialized critical section. */
@@ -101,7 +101,7 @@ class MemStorage implements OutboxStorage {
       this.map.set(commandId, reclaimed);
       return reclaimed;
     });
-    this.writeChain = run.then(() => undefined);
+    this.writeChain = run.then(() => undefined, () => undefined);
     return await run;
   }
 }

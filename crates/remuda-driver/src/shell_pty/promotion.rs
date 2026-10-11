@@ -1953,7 +1953,6 @@ fn shell_resume_mode(found: &Detected) -> ResumeMode {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// c-effortread r10 item 6: record an explicit withdrawal of one
 /// `(pid, session)` transcript. The cached anchor (if any) is downgraded so
 /// `TranscriptTail::continued` cannot restore a verified gate, and the key is
@@ -1976,6 +1975,7 @@ fn mark_session_withdrawn(
     withdrawn.insert(key);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn maintain_binding(
     bindings: &BindingHandle,
     ctx: &PromoteCtx,
@@ -2517,7 +2517,6 @@ impl Hydrator {
         // the last offset the previous hydrator read instead of replaying the
         // sticky anchor. A changed identity/shrink invalidates the captured
         // anchor, so fall back to the mode's own boundary/EOF open.
-        let had_anchor = continue_anchor.is_some();
         let tail = continue_anchor
             .and_then(|anchor| TranscriptTail::continued(binding.path.clone(), anchor))
             .or_else(|| mode.open_tail(&binding.path))?;
@@ -4822,7 +4821,6 @@ mod tests {
         )
         .await;
         let reopened = hydrator.as_ref().expect("X reopens after the rebind");
-        let dbg8 = drain(&mut fx);
         assert!(
             !reopened.tail.verified(),
             "returning to X reuses its Unverified boundary, not Z's Fresh: {:?}",

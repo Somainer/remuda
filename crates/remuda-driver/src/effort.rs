@@ -1086,15 +1086,14 @@ impl EffortQueue {
         done: Option<oneshot::Sender<SwitchOutcome>>,
     ) {
         let seq = self.enqueue_seq.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-        if let Ok(mut slot) = self.slot(request.queued_axis()).lock() {
-            if let Some(previous) = slot.replace(QueuedSwitch { request, seq, done })
-                && let Some(previous_done) = previous.done
-            {
-                // The replaced operation never goes out; report it still
-                // queued so its idle fast-path caller never awaits a verdict
-                // that belongs to a dead generation.
-                let _ = previous_done.send(SwitchOutcome::Queued);
-            }
+        if let Ok(mut slot) = self.slot(request.queued_axis()).lock()
+            && let Some(previous) = slot.replace(QueuedSwitch { request, seq, done })
+            && let Some(previous_done) = previous.done
+        {
+            // The replaced operation never goes out; report it still
+            // queued so its idle fast-path caller never awaits a verdict
+            // that belongs to a dead generation.
+            let _ = previous_done.send(SwitchOutcome::Queued);
         }
         self.notify.notify_one();
     }

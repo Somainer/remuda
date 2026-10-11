@@ -876,6 +876,9 @@ async fn dispatch(
     journal(state, &job.requested_by, "gate.running", &job).await;
     let state = state.clone();
     let job_id = job.id.as_id().to_string();
+    // r11 item 4: the generation THIS dispatch claimed; its error/timeout must
+    // only fail that attempt, never a newer Running attempt after a requeue.
+    let dispatch_generation = params.generation;
     let host_id = lane.host_id.clone();
     tokio::spawn(async move {
         let reply = state
@@ -896,24 +899,63 @@ async fn dispatch(
                         apply_result(&state, &job_id, result).await;
                     }
                 } else if let Some(error) = frame.get("error") {
-                    fail_rpc(&state, &job_id, error).await;
+                    fail_rpc(&state, &job_id, dispatch_generation, error).await;
                 }
             }
             Ok(None) => {
                 fail_rpc(
                     &state,
                     &job_id,
+                    dispatch_generation,
                     &json!({"message": "lane host is not connected"}),
                 )
                 .await;
             }
-            Err(error) => fail_rpc(&state, &job_id, &json!({"message": error.to_string()})).await,
+            Err(error) => {
+                fail_rpc(
+                    &state,
+                    &job_id,
+                    dispatch_generation,
+                    &json!({"message": error.to_string()}),
+                )
+                .await
+            }
         }
         schedule_once(&state);
     });
 }
 
-async fn fail_rpc(state: &AppState, job_id: &str, error: &Value) {
+async fn fail_rpc(state: &AppState, job_id: &str, expected_generation: u32, error: &Value) {
+    fail_rpc_inner(state, job_id, expected_generation, error).await
+}
+
+/// Test-only direct entry for fail_rpc's state write (item 4 regression).
+/// Drives the same mutation a failed gate.run RPC would, scoped to the
+/// dispatch generation.
+#[cfg(any(test, feature = "test-faults"))]
+pub async fn test_fail_gate_rpc(store: &crate::store::Store, job_id: &str, generation: u32) {
+    let message = "test RPC failure".to_owned();
+    let _ = store
+        .mutate_gate_job(job_id, move |row| {
+            if row.state != GateJobState::Running && row.state != GateJobState::Canceling {
+                return None;
+            }
+            if row.attempts != generation {
+                return None;
+            }
+            if row.home_land_in_flight {
+                return None;
+            }
+            row.state = GateJobState::Failed;
+            row.finished_at = Some(now_ts());
+            row.reason = Some(message.lines().next().unwrap_or(&message).to_owned());
+            row.error = Some(message.clone());
+            Some(())
+        })
+        .await;
+}
+
+async fn fail_rpc_inner(state: &AppState, job_id: &str, expected_generation: u32, error: &Value) {
     let message = error
         .get("message")
         .and_then(Value::as_str)
@@ -923,6 +965,17 @@ async fn fail_rpc(state: &AppState, job_id: &str, error: &Value) {
         .store
         .mutate_gate_job(job_id, move |row| {
             if row.state != GateJobState::Running && row.state != GateJobState::Canceling {
+                return None;
+            }
+            // r11 item 4: an RPC error/timeout belongs to the dispatch that
+            // made the call; after a base-moved requeue the row is a newer
+            // Running attempt and must not be failed.
+            if row.attempts != expected_generation {
+                tracing::info!(
+                    expected_generation,
+                    writer_attempt = row.attempts,
+                    "dropping gate.run RPC failure for a non-current attempt"
+                );
                 return None;
             }
             // The lane's `gate.run` RPC stays outstanding across a `pushFrom:

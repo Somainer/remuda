@@ -3297,3 +3297,55 @@ async fn a_stale_attempts_verdict_is_dropped_after_a_requeue() {
         "the stale verdict must not have applied: {final_doc}"
     );
 }
+
+/// r11 item 4: attempt 1's RPC error/timeout must not fail the running
+/// attempt 2 after a genuine base-moved requeue.
+#[tokio::test]
+async fn an_rpc_failure_for_attempt_one_does_not_fail_running_attempt_two() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    let job_id = queued_job(&ctx).await;
+    // claim attempt 1, requeue (base-moved), claim attempt 2 (running).
+    let _ = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap();
+    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+    db.execute(
+        "UPDATE gate_jobs SET state='queued',
+            doc_json = json_set(json_set(doc_json,'$.state','queued'),'$.startedAt',NULL)
+          WHERE id = ?1",
+        rusqlite::params![job_id],
+    )
+    .unwrap();
+    drop(db);
+    let _ = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap()["attempts"],
+        json!(2)
+    );
+
+    // Attempt 1's RPC error arrives (as the stale dispatch's call failed).
+    remuda_hub::test_fail_gate_rpc(ctx.store(), &job_id, 1).await;
+
+    // Attempt 2 stays running; the stale failure did not fail it.
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("running"),
+        "stale attempt-1 RPC failure must not fail attempt 2: {doc}"
+    );
+
+    // The CURRENT (attempt 2) failure does fail it.
+    remuda_hub::test_fail_gate_rpc(ctx.store(), &job_id, 2).await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("failed"),
+        "current-attempt failure must fail: {doc}"
+    );
+}

@@ -290,27 +290,68 @@ pub struct RolloutTail {
 /// in real 0.154 sessions and carries metadata
 /// `content_item_kinds: ["environments.environment_context"]`. Scans at most
 /// the first megabyte of the file (the prompt is in the opening turn).
+/// Read the rollout's first REAL user message (the operator's prompt),
+/// skipping codex's injected `environment_context` block. Injected context is
+/// identified structurally by
+/// `internal_chat_message_metadata_passthrough.content_item_kinds` containing
+/// `environments.environment_context` (c-usagefu r6 item 4): a genuine prompt
+/// that merely LITERALLY contains the text `<environment_context>` is kept.
+/// Scans at most the first megabyte (the prompt is in the opening turn).
 pub fn first_user_text(path: &Path) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = std::io::BufReader::new(file).take(1024 * 1024);
     let mut buf = String::new();
     std::io::Read::read_to_string(&mut reader, &mut buf).ok()?;
     for line in buf.lines() {
-        let Ok(CodexRolloutRecord {
-            event: CodexRolloutEvent::Message { role, text, .. },
-            ..
-        }) = parse_rollout_line(line)
-        else {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if role == "user" && !text.trim().is_empty() && !text.contains("<environment_context>") {
+        let payload = &value["payload"];
+        if value["type"].as_str() != Some("response_item")
+            || payload["type"].as_str() != Some("message")
+            || payload["role"].as_str() != Some("user")
+        {
+            continue;
+        }
+        if is_environment_context_item(payload) {
+            continue;
+        }
+        let text = message_item_text(payload);
+        if !text.trim().is_empty() {
             return Some(text);
         }
-        // Parser fallback shape: Message events only carry the first text
-        // block, so the environment item (input_text only) arrives here too;
-        // the marker check above covers both real sessions and fixtures.
     }
     None
+}
+
+/// Whether a `response_item/message` user payload is codex's injected
+/// environment-context item (identified by its metadata kinds, r6 item 4).
+fn is_environment_context_item(payload: &Value) -> bool {
+    payload
+        .get("internal_chat_message_metadata_passthrough")
+        .and_then(|meta| meta.get("content_item_kinds"))
+        .and_then(Value::as_array)
+        .is_some_and(|kinds| {
+            kinds
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|kind| kind.contains("environment_context"))
+        })
+}
+
+/// Concatenated text of a message item's `input_text`/`text` blocks.
+fn message_item_text(payload: &Value) -> String {
+    payload["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| {
+            (block["type"].as_str() == Some("input_text") || block["type"].as_str() == Some("text"))
+                .then(|| block["text"].as_str())
+                .flatten()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl RolloutTail {

@@ -615,3 +615,47 @@ fn locate_by_cwd_skips_an_old_file_even_under_a_fresh_non_date_directory() {
         "past floor binds"
     );
 }
+
+#[test]
+fn first_user_text_keeps_literal_environment_marker_in_a_genuine_prompt() {
+    // r6 item 4: a real operator prompt can contain the literal
+    // "<environment_context>" string. It is the injected item only when the
+    // record carries the environments.environment_context content-item kind;
+    // text-content sniffing wrongly rejected the genuine prompt.
+    use remuda_driver::codex_rollout::first_user_text;
+    use std::io::Write;
+
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("sessions/2026/09/14");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rollout-literal-marker.jsonl");
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let mut file = std::fs::File::create(&path).unwrap();
+    // session_meta
+    writeln!(
+        file,
+        "{{\"timestamp\":\"{now}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"lit\",\"session_id\":\"lit\",\"cwd\":\"/x\",\"timestamp\":\"{now}\"}}}}"
+    )
+    .unwrap();
+    // injected context (metadata-marked)
+    writeln!(
+        file,
+        "{{\"timestamp\":\"{now}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_env\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"<environment_context>real injected block</environment_context>\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"environments.environment_context\"]}}}}}}"
+    )
+    .unwrap();
+    // genuine user prompt whose text mentions the marker but has NO env kind
+    writeln!(
+        file,
+        "{{\"timestamp\":\"{now}\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"why does my <environment_context> tag fail?\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}"
+    )
+    .unwrap();
+    drop(file);
+
+    assert_eq!(
+        first_user_text(&path).as_deref(),
+        Some("why does my <environment_context> tag fail?"),
+        "literal marker text in a genuine user.text item must be kept"
+    );
+}

@@ -218,27 +218,39 @@ impl TurnBook {
     }
 
     /// Roll back the reservation for turn `seq` when its prompt write failed
-    /// (ma-sdk-state r6 item 1; r7 item 1). The prompt never reached the child,
-    /// so that turn is still empty. Remove the entry carrying `seq` WHEREVER it
-    /// sits in the FIFO (not only the back): a write-failed turn has produced no
-    /// frames and owns no workflows, so it is always safe to pull it out, and
-    /// cancelling only a matching back entry could leave a phantom turn ahead of
-    /// a later reservation. Clear `reserved` only when it names `seq`.
+    /// (ma-sdk-state r6 item 1; r7 item 1; r10 item 2). The prompt never
+    /// reached the child, so that turn is still empty. Remove the entry
+    /// carrying `seq` WHEREVER it sits in the FIFO (not only the back): a
+    /// write-failed turn has produced no frames and owns no workflows, so it is
+    /// always safe to pull it out, and cancelling only a matching back entry
+    /// could leave a phantom turn ahead of a later reservation. Clear
+    /// `reserved` only when it names `seq`.
     ///
-    /// Returns true when removing this turn drained the last outstanding local
-    /// turn and thereby RELEASED a deferred root settle (r6 item 5): an earlier
-    /// completed turn's result is now owed an idle.
+    /// Returns true when this cancellation RELEASED a deferred root settle
+    /// (r6 item 5; r10 item 2): an earlier completed turn's result is owed an
+    /// idle. The release fires whenever a recorded deferral exists and the
+    /// removed turn was outstanding — NOT only when the book drains. This runs
+    /// on the publication worker AT THE CANCELLED TICKET'S POSITION: every
+    /// NEWER turn's ticket (and therefore its turn_started) is still queued
+    /// behind it, so the older turn's idle belongs here even when a newer turn
+    /// is already in the book (its start will follow the correction). The
+    /// stashed result is `take`n by the first release, so it is published
+    /// exactly once; later cancellations release nothing.
     fn cancel_turn(&mut self, seq: u64) -> bool {
-        if let Some(pos) = self.outstanding.iter().position(|turn| turn.seq == seq) {
+        let removed = if let Some(pos) = self.outstanding.iter().position(|turn| turn.seq == seq)
+        {
             let turn = self.outstanding.remove(pos).expect("positioned turn");
             for id in turn.open_workflows {
                 self.workflow_owner.remove(&id);
             }
-        }
+            Some(())
+        } else {
+            None
+        };
         if self.reserved == Some(seq) {
             self.reserved = None;
         }
-        if self.deferred_settle && self.outstanding.is_empty() {
+        if removed.is_some() && self.deferred_settle {
             self.deferred_settle = false;
             true
         } else {
@@ -1498,7 +1510,7 @@ async fn prepare_prompt_write(
     #[cfg(not(feature = "test-stub"))]
     let forced_failure = false;
     if forced_failure {
-        guard.take().unwrap().fail().await;
+        guard.take().unwrap().fail();
         return Err(map_wire(remuda_claude_wire::Error::StdinClosed));
     }
 
@@ -1509,7 +1521,7 @@ async fn prepare_prompt_write(
         Ok(ack_rx) => ack_rx,
         Err(error) => {
             // Channel send failed before accept: definitively not written.
-            guard.take().unwrap().fail().await;
+            guard.take().unwrap().fail();
             return Err(map_wire(error));
         }
     };
@@ -1532,13 +1544,13 @@ async fn prepare_prompt_write(
             }
             Ok(Err(error)) => {
                 // The writer definitively failed after accepting the command.
-                guard.fail().await;
+                guard.fail();
                 Err(map_wire(error))
             }
             Err(_) => {
                 // Writer task vanished without acking (shutdown mid-write): not
                 // provably written; roll the reservation back.
-                guard.fail().await;
+                guard.fail();
                 Err(DriverError::ControlUnavailable)
             }
         };
@@ -1605,11 +1617,6 @@ enum PublishJob {
     Reserve { reservation: Arc<TurnReservation> },
     /// The child's stdout closed; emit exactly one `exited` (deduped).
     StdoutEof,
-    /// Emit already-built observations through the SAME FIFO path as mapped
-    /// frames. Used for the deferred root settle published when a newer turn's
-    /// write fails (r7 item 1), so the correction is ordered with the frames
-    /// around it rather than sent on a side channel.
-    Emit(Vec<Observation>),
     /// Ordered publication fence (ma-sdk-state r9 item 4): when the single worker
     /// drains this job (i.e. every job enqueued before it has been published),
     /// it signals the oneshot. A test enqueues it after a rollback and awaits
@@ -1701,15 +1708,35 @@ impl TurnReservation {
     }
 }
 
-/// Roll a cancelled turn's book back and publish any root settle it released
-/// (ma-sdk-state r9 item 1). One ordered operation shared by the write-failure
-/// path (`ReservationGuard::fail`) and caller-cancellation (`Drop`), so an A
-/// result mapped DEFERRED behind a cancelled B can never have its correction
-/// silently discarded: it is released through the same ordered publication
-/// path (`PublishJob::Emit`, drained in FIFO by the single publication worker).
+/// Roll a cancelled reservation's book back AT ITS TICKET POSITION on the
+/// single publication worker and emit the root settle it releases right there
+/// (ma-sdk-state r9 item 1; r10 item 2). Both cancellation paths — the
+/// detached write-completion task (`ReservationGuard::fail`) and caller
+/// cancellation pre-accept (`Drop`) — only RESOLVE THE TICKET; the worker runs
+/// this when it reaches that ticket, so:
 ///
-/// Does NOT take `write_seq`: the caller holds it (`fail`, which runs under
-/// `prepare_prompt_write`) or a spawned cleanup task has already acquired it.
+/// * the rollback happens before ANY frame/job queued behind the ticket is
+///   processed (a later turn C's turn_started can no longer precede the
+///   released settle of A);
+/// * the correction can never be appended at the queue tail, where a queued
+///   `StdoutEof` could overtake it;
+/// * there is exactly one rollback path per reservation.
+///
+/// Does NOT take `write_seq`: the worker never holds it.
+async fn rollback_reservation_at_ticket(inner: &Arc<Inner>, seq: u64) -> DriverResult<()> {
+    let released = {
+        let mut mapper = inner.mapper.lock().await;
+        mapper.cancel_turn_reservation(seq)?
+    };
+    if let Some(observation) = released {
+        // Emit HERE, at the cancelled ticket's position — before the worker
+        // takes the next job (C's start, a frame, StdoutEof).
+        emit_all(&inner, vec![observation]).await
+    } else {
+        Ok(())
+    }
+}
+
 /// Roll back a reservation whose ticket NO worker will ever visit: the Reserve
 /// send failed because the publisher is closed (close in progress), or
 /// panic-safety Drop fired between opening the book and enqueuing the ticket
@@ -1732,27 +1759,6 @@ async fn rollback_without_ticket(inner: &Arc<Inner>, seq: u64) {
     };
     if released.is_some() {
         debug!("publication gone; released deferred settle dropped on close");
-    }
-}
-
-async fn rollback_and_publish(inner: &Arc<Inner>, seq: u64) {
-    let deferred = {
-        let mut mapper = inner.mapper.lock().await;
-        match mapper.cancel_turn_reservation(seq) {
-            Ok(deferred) => deferred,
-            Err(error) => {
-                warn!(%error, "turn rollback failed during reservation cleanup");
-                None
-            }
-        }
-    };
-    if let Some(observation) = deferred
-        && let Some(publisher) = inner.publish.lock().await.clone()
-        // Enqueue behind the cancelled ticket (and any frames already queued);
-        // the single worker drains them in order after the ticket resolves.
-        && publisher.send(PublishJob::Emit(vec![observation])).is_err()
-    {
-        debug!("publication gone; deferred settle dropped on close");
     }
 }
 
@@ -1794,17 +1800,13 @@ impl ReservationGuard {
         self.reservation.commit();
     }
 
-    /// The writer definitively did NOT write the prompt. Roll the book back
-    /// BEFORE resolving the ticket, and publish the deferred root settle the
-    /// cancelled turn blocked through the ORDERED publication FIFO (a queued
-    /// [`PublishJob::Emit`] behind this ticket, so it lands after the frames
-    /// already queued and before any later turn), then unblock the worker.
-    /// Consumes the guard and lets it DROP normally (r7 item 3: no
-    /// `mem::forget`, no Arc leak).
-    async fn fail(mut self) {
-        // Runs under prepare_prompt_write's write_seq guard; release the
-        // deferred settle through the ordered publication path (r9 item 1).
-        rollback_and_publish(&self.inner, self.reservation.seq).await;
+    /// The writer definitively did NOT write the prompt (pre-accept abort,
+    /// post-accept write failure). ONLY resolve the ticket: the publication
+    /// worker rolls the book back at this ticket's FIFO position and emits the
+    /// released settle there (r10 item 2), so the correction can never land
+    /// behind a later turn's start or a queued StdoutEof. Consumes the guard
+    /// and lets it DROP normally (r7 item 3: no `mem::forget`, no Arc leak).
+    fn fail(mut self) {
         self.resolved = true;
         self.reservation.cancel();
     }
@@ -1828,11 +1830,12 @@ impl Drop for ReservationGuard {
         if self.ticket_queued {
             // The Reserve ticket is already in the publication queue, so all
             // this does is wake the parked worker: the WORKER consumes the
-            // cancelled ticket at its FIFO position and performs the ordered
-            // rollback + deferred-settle publish (see the Reserve arm).
+            // cancelled ticket at its FIFO position, rolling the book back and
+            // emitting the released settle THERE (see the Reserve arm).
             // Keeping the rollback off a detached task here prevents a
             // cancelled B from lingering in the book while a later C result is
-            // mapped (r9 item 2).
+            // mapped (r9 item 2), and emitting at the ticket position keeps
+            // the correction ahead of C's start/StdoutEof (r10 item 2).
             self.reservation.cancel();
             return;
         }
@@ -1915,6 +1918,13 @@ pub mod test_barrier {
         /// lock await. With the mutex externally held, count `n` acknowledges
         /// the nth caller parked there BEFORE its book entry was opened.
         publish_lock_wait_count: AtomicUsize,
+        /// r10 item 2: the worker dequeued a ticket that was already cancelled
+        /// and is parked just before the at-position rollback, so a test can
+        /// queue a later reservation behind it before the correction is
+        /// emitted.
+        cancelled_ticket_reached: AtomicBool,
+        cancelled_gate_open: AtomicBool,
+        cancelled_gate: tokio::sync::Notify,
     }
 
     /// An armed write-commit barrier. Releases on drop.
@@ -1942,6 +1952,12 @@ pub mod test_barrier {
             result_mapped_count: AtomicUsize::new(0),
             write_seq_wait_count: AtomicUsize::new(0),
             publish_lock_wait_count: AtomicUsize::new(0),
+            cancelled_ticket_reached: AtomicBool::new(false),
+            // Open by default: cancellations roll back at the ticket without a
+            // hold. A test that must enqueue a later reservation between the
+            // cancelled ticket and its rollback shuts this explicitly.
+            cancelled_gate_open: AtomicBool::new(true),
+            cancelled_gate: tokio::sync::Notify::new(),
         });
         *slot.lock().expect("barrier lock") = Some(state.clone());
         WriteCommitBarrier { state }
@@ -2060,6 +2076,25 @@ pub mod test_barrier {
         }
     }
 
+    /// r10 item 2 worker hook: reached a cancelled ticket's position. Park
+    /// before the at-position rollback while the cancel gate is shut, so a
+    /// test can enqueue a later reservation behind the cancelled ticket and
+    /// prove the correction is emitted ahead of it.
+    pub(super) async fn hold_cancelled_ticket(slot: &Slot) {
+        let Some(state) = current(slot) else {
+            return;
+        };
+        state.cancelled_ticket_reached.store(true, Ordering::Release);
+        if state.cancelled_gate_open.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = state.cancelled_gate.notified();
+        if state.cancelled_gate_open.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+
     impl WriteCommitBarrier {
         /// r10 item 1: wait until `n` send callers have reached the `write_seq`
         /// lock await (the nth is parked behind the holder when the previous
@@ -2097,6 +2132,39 @@ pub mod test_barrier {
                     );
                 }
                 tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// r10 item 2: wait until the worker reaches a cancelled ticket's
+        /// position and parks before the at-position rollback.
+        pub async fn wait_until_cancelled_ticket_reached(&self, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.cancelled_ticket_reached.load(Ordering::Acquire) {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "write_commit barrier: timed out waiting for the cancelled ticket"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// r10 item 2: SHUT the cancelled-ticket rollback gate so the worker
+        /// parks at the cancelled ticket before the rollback. Opt-in (the gate
+        /// is open by default): lets a test enqueue a later reservation behind
+        /// the cancelled ticket deterministically.
+        pub fn hold_cancelled_rollback(&self) {
+            self.state.cancelled_gate_open.store(false, Ordering::Release);
+        }
+
+        /// r10 item 2: release the worker from a cancelled ticket so the
+        /// at-position rollback (and correction) runs.
+        pub fn release_cancelled_ticket(&self) {
+            if !self.state.cancelled_gate_open.swap(true, Ordering::AcqRel) {
+                self.state.cancelled_gate.notify_waiters();
             }
         }
 
@@ -2245,6 +2313,7 @@ pub mod test_barrier {
             self.release_write_ack();
             self.release_send();
             self.resume_worker();
+            self.release_cancelled_ticket();
         }
     }
 
@@ -2316,15 +2385,25 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                         Ok(())
                     } else {
                         // The ticket was cancelled. Roll the book back HERE, at
-                        // the ticket's FIFO position — before any frame queued
-                        // behind it is mapped — and release the deferred settle
-                        // the cancelled turn blocked. Doing this on the worker
-                        // (rather than in a detached Drop task that can run
-                        // after a later turn's result is mapped) guarantees a
-                        // cancelled reservation is gone before a later turn
-                        // pops it as a phantom (ma-sdk-state r9 item 2).
-                        rollback_and_publish(&inner, reservation.seq).await;
-                        Ok(())
+                        // the ticket's FIFO position — before the next job
+                        // (a later turn's start, a queued frame, StdoutEof) —
+                        // and emit the released deferred settle THERE. Doing
+                        // this on the worker (rather than in a detached Drop
+                        // task that can run after a later turn's result is
+                        // mapped, or by appending the correction to the queue
+                        // tail where C's start/StdoutEof could overtake it)
+                        // guarantees a cancelled reservation is gone before a
+                        // later turn pops it as a phantom and its correction
+                        // stays at its ticket's position
+                        // (ma-sdk-state r9 item 2; r10 item 2).
+                        //
+                        // test-stub: a test may hold the worker HERE (ticket
+                        // known-cancelled, rollback not yet run) so another
+                        // reservation can provably queue behind it before the
+                        // ordered rollback fires.
+                        #[cfg(feature = "test-stub")]
+                        test_barrier::hold_cancelled_ticket(&inner.barrier).await;
+                        rollback_reservation_at_ticket(&inner, reservation.seq).await
                     }
                 }
                 .await
@@ -2336,7 +2415,6 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                 let _ = signal.send(());
                 Ok(())
             }
-            PublishJob::Emit(observations) => emit_all(&inner, observations).await,
         };
         if let Err(error) = result {
             warn!("ordered publication failed: {error}");

@@ -150,6 +150,43 @@ async fn collect_until(
     out
 }
 
+/// ACKNOWLEDGED fence drain (ma-sdk-state r10 item 2/4): collect until the
+/// ordered publication fence resolves — every job enqueued before it,
+/// INCLUDING a rollback-generated correction emitted at a cancelled ticket's
+/// position, has then been published into the channel — then drain the
+/// observations already buffered behind it. One overall timeout bounds the
+/// whole collect; there is no quiet-period polling, so a correction emitted
+/// late (or delayed at a barrier) cannot be silently missed.
+async fn drain_fence(
+    handle: &mut remuda_driver::RunHandle,
+    fence: tokio::sync::oneshot::Receiver<()>,
+    timeout: Duration,
+) -> Vec<Observation> {
+    let mut out = Vec::new();
+    let mut fence = fence;
+    let drain = async {
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut fence => {
+                    while let Some(obs) = handle.try_recv() {
+                        out.push(obs);
+                    }
+                    break;
+                }
+                maybe = handle.recv() => match maybe {
+                    Some(obs) => out.push(obs),
+                    None => break,
+                },
+            }
+        }
+    };
+    tokio::time::timeout(timeout, drain)
+        .await
+        .expect("publication fence drains within timeout");
+    out
+}
+
 fn lifecycle_status(obs: &Observation) -> Option<&str> {
     match &obs.body {
         ObservationPayload::Lifecycle(payload) => match payload.as_ref() {
@@ -1939,6 +1976,148 @@ async fn aborting_while_parked_on_the_publish_mutex_leaves_no_phantom_reservatio
     drop(barrier);
     let _ = driver.close().await;
 }
+
+/// ma-sdk-state r10 item 2: A's result is mapped DEFERRED behind B's reserved
+/// turn; B is cancelled pre-accept while C reserves CONCURRENTLY. A's
+/// settlement must be emitted at B's cancelled TICKET POSITION — ahead of C's
+/// turn_started (and never after the child's StdoutEof). Pre-fix the
+/// correction was appended to the publication queue tail, so C's start (and a
+/// queued StdoutEof) could overtake it.
+#[tokio::test]
+async fn cancelling_b_emits_a_settlement_at_its_ticket_position_before_c_starts() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = driver.arm_write_commit_barrier();
+    // A (#1) runs the pre-ack gate; B (#2) parks pre-accept.
+    barrier.park_from_write(2);
+    // Hold the worker at B's cancelled ticket (before the rollback) so C can
+    // enqueue its ticket BEHIND B before the correction is emitted.
+    barrier.hold_cancelled_rollback();
+
+    let da = driver.clone();
+    let send_a = tokio::spawn(async move { da.send(prompt_id("first", "msg-a")).await });
+    barrier
+        .wait_until_result_parked(Duration::from_secs(5))
+        .await;
+    barrier.release_send();
+    tokio::time::timeout(Duration::from_secs(5), send_a)
+        .await
+        .expect("send_a task within 5s")
+        .expect("send_a joined")
+        .expect("A acked");
+
+    // B reserves and parks pre-accept (writer never accepts its prompt).
+    let db = driver.clone();
+    let send_b = tokio::spawn(async move { db.send(prompt_id("second", "msg-b")).await });
+    barrier
+        .wait_until_reserves_enqueued(2, Duration::from_secs(5))
+        .await;
+
+    // Map A's result against B's open book -> deferred; acknowledge the map.
+    barrier.resume_worker();
+    barrier
+        .wait_until_results_mapped(1, Duration::from_secs(5))
+        .await;
+
+    // Cancel B; the worker reaches the cancelled ticket and parks at the
+    // r10-item-2 gate just before the ordered rollback.
+    send_b.abort();
+    barrier
+        .wait_until_cancelled_ticket_reached(Duration::from_secs(5))
+        .await;
+
+    // C reserves CONCURRENTLY: its ticket is enqueued BEHIND B's cancelled
+    // ticket while the rollback is held at the gate (count 3: A, B, C).
+    let dc = driver.clone();
+    let send_c = tokio::spawn(async move { dc.send(prompt_id("second", "msg-c")).await });
+    barrier
+        .wait_until_reserves_enqueued(3, Duration::from_secs(5))
+        .await;
+    // C parked at the pre-ack gate; open it so C writes after the rollback gate
+    // is released.
+    barrier.release_write_ack();
+
+    // Release the rollback: fixed code emits A's correction at B's position,
+    // i.e. before the worker visits C's ticket and emits start_C.
+    barrier.release_cancelled_ticket();
+    tokio::time::timeout(Duration::from_secs(5), send_c)
+        .await
+        .expect("send_c task within 5s")
+        .expect("send_c joined")
+        .expect("C sends after B cancelled");
+    // Acknowledge C's result is mapped (A's was count 1) before fencing so the
+    // fence cannot overtake C's live frames.
+    barrier
+        .wait_until_results_mapped(2, Duration::from_secs(5))
+        .await;
+
+    let fence = driver.publication_fence().await;
+    let mut all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
+
+    assert_eq!(
+        turn_started_count(&all),
+        2,
+        "A and C start; cancelled B emits no start: {all:?}"
+    );
+    let corrections: Vec<usize> = all
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| match settled_marker(o) {
+            Some(Some("true")) => Some(i),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        corrections.len(),
+        1,
+        "exactly one deferred correction (A's released settle): {all:?}"
+    );
+    let correction = corrections[0];
+    // Two starts in publication order: A then C. C's start is the second.
+    let mut starts = all
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| (lifecycle_named(o) == Some("turn_started")).then_some(i));
+    let _start_a = starts.next().expect("start_A");
+    let start_c = starts.next().expect("start_C");
+    assert!(
+        correction < start_c,
+        "A's settlement is emitted at B's ticket position, BEFORE C's start \
+         (correction={correction}, start_c={start_c}): {all:?}"
+    );
+
+    // Close and drain to EOF: no settlement/correction may follow the
+    // session/exited observation (a tail-appended correction could).
+    drop(barrier);
+    let _ = driver.close().await;
+    while let Some(obs) = tokio::time::timeout(Duration::from_secs(5), handle.recv()).await
+        .ok()
+        .flatten()
+    {
+        all.push(obs);
+    }
+    let exited = first_where(
+        &all,
+        |o| lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("exited"),
+    );
+    assert!(
+        correction < exited,
+        "A's correction precedes the session exit: {all:?}"
+    );
+    assert!(
+        all[exited + 1..]
+            .iter()
+            .all(|o| lifecycle_named(o) != Some("result")),
+        "no result/settlement is published after StdoutEof: {all:?}"
+    );
+}
+
+/// deferredSettle marker (None = ordinary settlement, Some("true") = deferred
+/// correction); returns None for non-settled results. Use this to count ALL
+/// settledRootTurn observations and inspect the deferred flag.
 
 /// deferredSettle marker (None = ordinary settlement, Some("true") = deferred
 /// correction); returns None for non-settled results. Use this to count ALL

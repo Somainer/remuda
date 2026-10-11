@@ -3896,6 +3896,284 @@ mod tests {
         );
     }
 
+    /// c-effortread r9 item 9a: the REAL driver, launching the fake-harness
+    /// `claude` with `--resume <id>`, must snapshot the pre-spawn resume
+    /// boundary through the CHILD config dir for BOTH native-home pin values,
+    /// under a PARENT driver CLAUDE_CONFIG_DIR that names a different dir.
+    /// Pre-anchor history never publishes; an effort record appended after
+    /// spawn publishes. Goes red if spawn_at resolves the boundary through the
+    /// parent dir (the decoy xhigh history leaks).
+    #[test]
+    fn r9_item9a_real_resume_spawn_uses_child_config_dir_for_both_pins() {
+        if std::env::var_os(R7_CONFIG_CHILD_MARKER).is_some() {
+            return;
+        }
+        for pin in ["true", "false"] {
+            let parent_dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "shell_pty::tests::r9_item9a_real_resume_child_body",
+                    "--nocapture",
+                ])
+                .env(R7_CONFIG_CHILD_MARKER, pin)
+                .env("CLAUDE_CONFIG_DIR", parent_dir.path())
+                .output()
+                .expect("spawn child");
+            assert!(
+                output.status.success(),
+                "pin={pin} child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// Child body for [`r9_item9a_real_resume_spawn_uses_child_config_dir_for_both_pins`].
+    #[tokio::test]
+    async fn r9_item9a_real_resume_child_body() {
+        use remuda_testing::fake_harness::artifacts::{SessionMeta, claude_assistant_block};
+        use remuda_testing::fake_harness::clock::FakeClock;
+        use remuda_testing::fake_harness::script::UsageSpec;
+
+        let pin_native_home = match std::env::var(R7_CONFIG_CHILD_MARKER).as_deref() {
+            Ok("true") => true,
+            Ok("false") => false,
+            _ => return,
+        };
+        let parent_home = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("the parent CLAUDE_CONFIG_DIR is set by the re-exec");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = std::fs::canonicalize(&workspace).unwrap();
+        let child_home = root.join("child-home");
+        let native_home = root.join("managed-native-home");
+        std::fs::create_dir_all(&child_home).unwrap();
+        std::fs::create_dir_all(&native_home).unwrap();
+        let instance_dir = root.join("instance");
+
+        // Install the deterministic fake-harness as the child `claude`.
+        let install = root.join("opt/bin");
+        std::fs::create_dir_all(&install).unwrap();
+        let harness = remuda_testing::ensure_workspace_bin("fake-harness");
+        let claude_bin = install.join("claude");
+        std::fs::copy(&harness, &claude_bin).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&claude_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Locate the real relay binary the hook overlay invokes.
+        let deps_dir = std::env::current_exe().unwrap();
+        let deps_dir = deps_dir.parent().unwrap();
+        let relay_binary = [deps_dir.join("remuda"), deps_dir.join("../remuda")]
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| remuda_testing::workspace_root().join("target/debug/remuda"));
+
+        let session_id = "aaaaaaaa-r9a0-4333-8444-aaaaaaaaaaaa";
+        let child_config = if pin_native_home {
+            native_home.clone()
+        } else {
+            child_home.join(".claude")
+        };
+        let meta = SessionMeta {
+            session_id: session_id.to_owned(),
+            cwd: workspace.clone(),
+            model: "claude".into(),
+            version: "2.1.270".into(),
+        };
+        let session_path = crate::claude_transcript::ResumeBoundary::session_path(
+            &child_config,
+            &workspace,
+            session_id,
+        );
+        std::fs::create_dir_all(session_path.parent().unwrap()).unwrap();
+        let history_clock = FakeClock::new(1_700_000_000_000);
+        let history = serde_json::to_string(&claude_assistant_block(
+            &meta,
+            &history_clock,
+            "msg-history",
+            0,
+            serde_json::json!({"type": "text", "text": "HISTORY-PRE-ANCHOR-MARKER"}),
+            "end_turn",
+            &UsageSpec::default(),
+            Some("high"),
+        ))
+        .unwrap();
+        std::fs::write(&session_path, history + "\n").unwrap();
+
+        // The parent driver CLAUDE_CONFIG_DIR carries a same-id DECOY
+        // transcript. If spawn_at wrongly resolves the boundary through it,
+        // this xhigh read-back leaks as current.
+        let parent_path = crate::claude_transcript::ResumeBoundary::session_path(
+            &parent_home,
+            &workspace,
+            session_id,
+        );
+        std::fs::create_dir_all(parent_path.parent().unwrap()).unwrap();
+        let decoy = serde_json::to_string(&claude_assistant_block(
+            &meta,
+            &history_clock,
+            "msg-parent",
+            0,
+            serde_json::json!({"type": "text", "text": "PARENT-DECOY-MARKER"}),
+            "end_turn",
+            &UsageSpec::default(),
+            Some("xhigh"),
+        ))
+        .unwrap();
+        std::fs::write(&parent_path, decoy + "\n").unwrap();
+
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.kind = AgentKind::Claude;
+        spec.cwd = workspace.to_string_lossy().into_owned();
+        spec.effort = None;
+
+        let launch = ShellPtyOptions::agent(
+            workspace.clone(),
+            AgentKind::Claude,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::Anthropic,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["claude".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: instance_dir.join("launch"),
+                native_home: native_home.clone(),
+                binary: Some(claude_bin),
+                origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: pin_native_home,
+                settings_overlay: None,
+            },
+        );
+        let mut options = launch.resuming(session_id);
+        options.pin_native_home = pin_native_home;
+        // Deliberately no options.claude_home: the child env resolves it.
+        options.claude_home = None;
+        options
+            .extra_env
+            .insert("HOME".to_owned(), child_home.to_string_lossy().into_owned());
+        options
+            .extra_env
+            .insert("FAKE_HARNESS_DIALECT_VERSION".into(), "modern".into());
+        options.hooks = Some(HookConfig {
+            instance_dir: instance_dir.clone(),
+            relay_binary,
+            tui: crate::launch::TuiMode::Default,
+        });
+
+        let driver = ShellPtyDriver::new(options);
+        let mut events = driver
+            .start(spec)
+            .await
+            .expect("real resume launch")
+            .into_events();
+
+        // The boundary was snapped at spawn: the pre-anchor history must not
+        // publish while promotion binds and starts pumping.
+        let settle = std::time::Duration::from_secs(6);
+        let early = r9a_collect(&mut events, settle).await;
+        assert!(
+            !r9a_blob_contains(&early, "HISTORY-PRE-ANCHOR-MARKER"),
+            "pin={pin_native_home}: pre-anchor history must never hydrate as current"
+        );
+        assert!(
+            !r9a_blob_contains(&early, "PARENT-DECOY-MARKER"),
+            "pin={pin_native_home}: the parent CLAUDE_CONFIG_DIR transcript must never be read"
+        );
+        assert!(
+            !r9a_effort_names(&early).contains(&Some(remuda_protocol::EffortName::High)),
+            "pin={pin_native_home}: the pre-anchor high read-back must not publish"
+        );
+        assert!(
+            !r9a_effort_names(&early).contains(&Some(remuda_protocol::EffortName::Xhigh)),
+            "pin={pin_native_home}: the parent-decoy xhigh read-back must not publish"
+        );
+
+        // After spawn the agent appends a NEW effort record past the boundary.
+        let post_clock = FakeClock::new(1_700_000_100_000);
+        let post = serde_json::to_string(&claude_assistant_block(
+            &meta,
+            &post_clock,
+            "msg-post-anchor",
+            0,
+            serde_json::json!({"type": "text", "text": "POST-ANCHOR-MAX-MARKER"}),
+            "end_turn",
+            &UsageSpec::default(),
+            Some("max"),
+        ))
+        .unwrap();
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&session_path)
+            .unwrap();
+        writeln!(file, "{post}").unwrap();
+        drop(file);
+
+        let later = r9a_collect(&mut events, std::time::Duration::from_secs(20)).await;
+        assert!(
+            r9a_effort_names(&later).contains(&Some(remuda_protocol::EffortName::Max)),
+            "pin={pin_native_home}: the post-spawn max verdict publishes past the resume boundary"
+        );
+        assert!(
+            r9a_blob_contains(&later, "POST-ANCHOR-MAX-MARKER"),
+            "pin={pin_native_home}: post-anchor conversation hydrates"
+        );
+        // Even after pumping the post-boundary record, neither history source
+        // has leaked.
+        let all: Vec<remuda_protocol::Observation> = early.into_iter().chain(later).collect();
+        assert!(!r9a_blob_contains(&all, "HISTORY-PRE-ANCHOR-MARKER"));
+        assert!(!r9a_blob_contains(&all, "PARENT-DECOY-MARKER"));
+
+        Driver::close(&driver).await.expect("clean close");
+    }
+
+    async fn r9a_collect(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+        dur: std::time::Duration,
+    ) -> Vec<remuda_protocol::Observation> {
+        let mut out = Vec::new();
+        let until = std::time::Instant::now() + dur;
+        while std::time::Instant::now() < until {
+            // Stop early once the budget is over or a max edge has landed
+            // (callers that need the full budget pass a fresh receiver).
+            if let Ok(Some(observation)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), events.recv()).await
+            {
+                out.push(observation);
+            }
+        }
+        out
+    }
+
+    fn r9a_blob_contains(observations: &[remuda_protocol::Observation], needle: &str) -> bool {
+        observations.iter().any(|observation| {
+            serde_json::to_string(&observation.body).is_ok_and(|body| body.contains(needle))
+        })
+    }
+
+    fn r9a_effort_names(
+        observations: &[remuda_protocol::Observation],
+    ) -> Vec<Option<remuda_protocol::EffortName>> {
+        observations
+            .iter()
+            .filter_map(|observation| match &observation.body {
+                remuda_protocol::ObservationPayload::Effort(payload) => {
+                    Some(payload.effective.name)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     const R7_CONFIG_CHILD_MARKER: &str = "REMUDA_TEST_R7_CONFIG_CHILD";
 
     /// c-wfdrill2 C. `promote_ctx` minted `InstanceId::new()`, so every id the

@@ -1259,11 +1259,12 @@ fn two_prompted_panes_each_bind_their_own_file() {
 
 #[test]
 fn a_claim_loser_keeps_discovering_and_never_takes_the_winners_file() {
-    // r8 item 9: BOTH adapters run their REAL discover() scan of the same
-    // candidates before either binds (no bind_for_test). The winner's file is
-    // process-held by the winner's pid; the loser stays identity-empty, never
-    // takes the winner's file (even after the winner closes), then binds its
-    // own process-held rollout.
+    // r8 item 8: BOTH adapters run their REAL discover() scan of the same
+    // candidates before either binds (no bind_for_test). The loser scans the
+    // winner's file while it is still unclaimed and rejects it on the
+    // process-ownership tier; the winner then binds its own pid-held file. The
+    // loser stays identity-empty, never takes the winner's file (even after
+    // the winner closes), then binds its own process-held rollout.
     let home = tempfile::tempdir().unwrap();
     let cwd = "/projects/r8-loser";
     let now = OffsetDateTime::now_utc();
@@ -1284,8 +1285,28 @@ fn a_claim_loser_keeps_discovering_and_never_takes_the_winners_file() {
     assert!(a.confirmed.is_none() && a.discovered.is_none() && a.binding().is_none());
     assert!(b.confirmed.is_none() && b.discovered.is_none() && b.binding().is_none());
 
-    // The winner's process holds W open; the loser's does not. Both scan.
+    // The winner's process holds W open; the loser's does not.
     probe_a.hold(&winner_path, 6001);
+
+    // r8 item 8: the LOSER scans first, through its REAL discover() path,
+    // while W is still UNCLAIMED — no bind_for_test pre-binding the winner.
+    // B's process tree does not hold W, so B must reject the candidate on
+    // the ownership tier itself rather than on a claim it found there.
+    assert!(
+        !b.discover().unwrap(),
+        "loser does not bind a file its process never held, though unclaimed"
+    );
+    assert!(b.confirmed.is_none(), "loser confirmed stays empty");
+    assert!(b.discovered.is_none(), "loser discovered stays empty");
+    assert!(b.binding().is_none(), "loser never bound W");
+    assert!(
+        !crate::adapters::codex_discovery::claim_is_present_any_owner(
+            &crate::adapters::codex_discovery::canonical_claim_key(&winner_path)
+        ),
+        "the loser's rejected scan left no claim on W"
+    );
+
+    // Only now does the winner scan and claim its own process-held file.
     assert!(
         a.discover().unwrap(),
         "winner binds its own process-held file"
@@ -1301,6 +1322,10 @@ fn a_claim_loser_keeps_discovering_and_never_takes_the_winners_file() {
     // process never held it).
     drop(a);
     assert!(!b.discover().unwrap());
+    assert!(
+        b.binding().is_none(),
+        "closing the winner transfers nothing"
+    );
 
     // B's own rollout appears and is held by B's pid → binds.
     write_rollout_prompt_at(home.path(), "L", cwd, &rfc, "loser words");

@@ -656,14 +656,16 @@ impl Drop for CodexAdapter {
         // Driver-launch claims (instance_key present) OUTLIVE the adapter: a
         // rollout a closed Remuda instance owned must never be re-bound by a
         // different idle instance (r6 item 1). A PROMOTED attach
-        // (instance_key None) owns nothing durable — release its claim so the
-        // process-wide set does not grow forever (r6 item 7, exact key).
+        // (instance_key None) owns nothing durable — release its claim with
+        // the exact key recorded at claim time (r6 item 7), so a deleted or
+        // symlinked file leaves no ghost.
         if self.instance_key.is_none()
             && let Some(binding) = self.binding.take()
             && let Some(path) = binding.main_file
         {
+            let key = crate::adapters::codex_discovery::claim_key_for(&path);
             let owner = format!("hook:{}", binding.session_id);
-            crate::adapters::codex_discovery::release_claim(&path, &owner);
+            crate::adapters::codex_discovery::release_claim_key(&key, &owner);
         }
     }
 }

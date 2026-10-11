@@ -734,10 +734,11 @@ fn three_overlapping_windows_do_not_latch_give_up_and_clear_as_they_close() {
 }
 
 #[test]
-fn an_idle_unbound_instance_does_not_block_a_later_second_instance() {
-    // A launched but never prompted (idle, window still open). B launches in
-    // the same cwd; while both overlap B waits, but when A is closed B binds
-    // its own rollout — A's lingering window cannot poison B for its life.
+fn an_idle_unbound_instance_with_a_live_window_does_not_block_b() {
+    // r6 item 8: A launched but never prompted stays ALIVE the whole time. B
+    // launches in the same cwd (so B's window overlaps A's) and binds its own
+    // prompt-authorized rollout without A ever being dropped: per-instance
+    // claims and prompts mean an idle live window no longer forces B to wait.
     let home = tempfile::tempdir().unwrap();
     let cwd = "/projects/r5-idle";
     let floor = OffsetDateTime::now_utc() - time::Duration::seconds(5);
@@ -747,14 +748,12 @@ fn an_idle_unbound_instance_does_not_block_a_later_second_instance() {
     let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
     assert!(
         b.window.as_ref().is_some_and(|window| window.overlapping()),
-        "B overlaps the still-idle A"
+        "B overlaps the still-idle, still-LIVE A"
     );
 
-    // A is closed (instance torn down without ever being prompted).
-    drop(a);
-
+    // B dispatched its own prompt and its rollout appears while A is still
+    // open (no drop).
     let now = OffsetDateTime::now_utc();
-    // B dispatched its own prompt before the rollout was created.
     send_fixture_prompt(Path::new(cwd), INST_B, "fixture driver prompt", now);
     write_rollout(
         home.path(),
@@ -763,11 +762,14 @@ fn an_idle_unbound_instance_does_not_block_a_later_second_instance() {
         cwd,
         &now.format(&Rfc3339).unwrap(),
     );
-    assert!(b.discover().unwrap());
+    assert!(b.discover().unwrap(), "B binds with A's window still live");
     assert_eq!(
         b.binding().map(|binding| binding.session_id.as_str()),
         Some("B-only")
     );
+    // A remains idle and unbound throughout.
+    assert!(!a.discover().unwrap());
+    assert!(a.binding().is_none());
 }
 
 #[test]
@@ -1240,5 +1242,57 @@ fn an_identical_prompt_sent_minutes_apart_refreshes_and_each_turn_binds() {
     assert_eq!(
         a2.binding().map(|b| b.session_id.as_str()),
         Some("continue-2")
+    );
+}
+
+// c-usagefu r6 item 7 ---------------------------------------------------------
+
+#[test]
+fn claim_release_uses_the_exact_key_not_a_re_canonicalized_path() {
+    // r6 item 7: a promoted adapter releases with the exact key recorded at
+    // claim time. A release call using any OTHER path string — e.g. the
+    // original symlink path after the claim key was canonicalized, or a path
+    // that no longer resolves the same way after a move — must not touch the
+    // stored entry. Also covers symlinked CODEX_HOME and file deletion: the
+    // release happens after the file is gone and still clears the entry.
+    use std::os::unix::fs::symlink;
+
+    let real_home = tempfile::tempdir().unwrap();
+    let link_dir = tempfile::tempdir().unwrap();
+    let link = link_dir.path().join("codex-link");
+    symlink(real_home.path(), &link).unwrap();
+    let rollout_dir = link.join("sessions/2026/09/14");
+    std::fs::create_dir_all(&rollout_dir).unwrap();
+    let rollout = rollout_dir.join("rollout-sym.jsonl");
+    std::fs::write(&rollout, "header\n").unwrap();
+
+    let owner = "promoted-owner";
+    assert!(crate::adapters::codex_discovery::claim_session(
+        &rollout, owner, None
+    ));
+    let key = crate::adapters::codex_discovery::claim_key_for(&rollout);
+    assert_ne!(key, rollout, "the claim key is the canonical real path");
+    assert!(
+        crate::adapters::codex_discovery::is_claimed_by_other(&rollout, "someone-else"),
+        "visible through the symlink before release"
+    );
+
+    // A release with the symlink path (the caller's original path) must not
+    // remove the canonical-key entry — this is the ghost the review calls out
+    // (the wrong key must never match, whether or not the FS still resolves).
+    crate::adapters::codex_discovery::release_claim_key(&rollout, owner);
+    assert!(
+        crate::adapters::codex_discovery::is_claim_present_exact(&key, owner),
+        "a non-canonical key must not release the claim"
+    );
+
+    // Delete the file and the symlink, then release with the RECORDED key:
+    // it clears without touching the filesystem.
+    std::fs::remove_file(&rollout).unwrap();
+    std::fs::remove_file(&link).unwrap();
+    crate::adapters::codex_discovery::release_claim_key(&key, owner);
+    assert!(
+        !crate::adapters::codex_discovery::is_claim_present_exact(&key, owner),
+        "exact recorded key releases after the path and symlink are gone"
     );
 }

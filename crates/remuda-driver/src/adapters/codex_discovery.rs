@@ -56,10 +56,6 @@ pub(crate) fn is_claimed_by_other(path: &Path, owner: &str) -> bool {
     matches!(map.get(&canonical(path)), Some(existing) if existing != owner)
 }
 
-/// Claim a rollout for `owner`. Returns false when another instance owns it;
-/// the same owner (a relaunch) may always reclaim. The inserted key is
-/// remembered verbatim for exact removal (a moved/deleted/symlinked path
-/// must not leave a canonical-key ghost behind).
 /// Claim a rollout path, optionally also remembering the native session id
 /// scoped to `cwd` (so a later poll re-recognizes the session by id even if
 /// its path is identical to another launch's file).
@@ -103,15 +99,31 @@ pub(crate) fn session_claimed_by_other(cwd: &Path, owner: &str, session_id: &str
         .is_some_and(|existing| existing != owner)
 }
 
-/// Remove exactly the key `claim` inserted (r6 item 7): callers pass the
-/// returned key rather than re-canonicalizing a path that may have moved or
-/// disappeared. A foreign/unowned key is untouched.
-pub(crate) fn release_claim(path_key: &Path, owner: &str) {
-    let key = canonical(path_key);
+/// Release a claim using the EXACT key [`claim_session`] inserted (r6 item 7).
+/// Callers hold that canonical key (not a path that may have moved or
+/// disappeared, nor a symlink whose target canonicalization changes). A
+/// foreign/unowned key is untouched.
+pub(crate) fn release_claim_key(key: &Path, owner: &str) {
     let mut map = CLAIMED_ROLLOUTS.lock().expect("claimed codex rollouts");
-    if map.get(&key).is_some_and(|existing| existing == owner) {
-        map.remove(&key);
+    if map.get(key).is_some_and(|existing| existing == owner) {
+        map.remove(key);
     }
+}
+
+/// Canonical claim key for a path (test seam + adapter Drop).
+pub(crate) fn claim_key_for(path: &Path) -> PathBuf {
+    canonical(path)
+}
+
+/// Test-only: whether the claim map still contains an entry owned by
+/// `owner` for the exact key (no re-canonicalization).
+#[cfg(test)]
+pub(crate) fn is_claim_present_exact(key: &Path, owner: &str) -> bool {
+    CLAIMED_ROLLOUTS
+        .lock()
+        .expect("claimed codex rollouts")
+        .get(key)
+        .is_some_and(|existing| existing == owner)
 }
 
 /// RAII window for one launch still discovering in a cwd. Explicit

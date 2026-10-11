@@ -501,9 +501,17 @@ export class ConnectionMachine {
       // Gate 10 item 3: capture the binding the probe answers FOR. A late
       // probe (the user navigated to a framed session B while it was in
       // flight) must not demote B.
+      // Gate 11 item 6: capture the RESUME ATTEMPT too, and require BOTH to
+      // match. Same binding is not enough: a stale probe P in flight before a
+      // foreground resume fails after it — the failed attempt settles quiet
+      // stale via its own settle probe Q, and P answering false afterwards
+      // must not take Q's stale offline (attempt id moved on).
       const gen = this.latestBindGen;
+      const probeAttemptId = this.resumeAttemptId;
       void this.deps.probe().then((ok) => {
-        if (gen === this.latestBindGen) this.dispatch({ type: "probe", ok });
+        if (gen !== this.latestBindGen) return;
+        if (probeAttemptId !== this.resumeAttemptId) return;
+        this.dispatch({ type: "probe", ok });
       });
     });
     this.setTimer("offline", offlineMs, () => {

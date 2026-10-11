@@ -419,6 +419,55 @@ describe("ConnectionMachine", () => {
     expect(resume).toHaveBeenCalledTimes(1);
   });
 
+  it("GATE11 item 6: a stale probe answering for an OLD attempt id cannot take the newer attempt's Q-settled stale offline", async () => {
+    // Same binding, no navigation:
+    //  t=30 stale probe P starts (no attempt in flight; captures attempt id 0)
+    //  t=31 foreground resume starts attempt 1 and fails; its settle probe Q
+    //       starts
+    //  t=32 Q answers ok -> quiet stale
+    //  t=35 P answers FALSE. P's generation matches, so the gen-only gate
+    //       accepted it and goOfflineAndSchedule flipped the link offline —
+    //       even though Q (for attempt 1) had already decided stale. The probe
+    //       must capture resumeAttemptId too and require BOTH to match.
+    const { clock, machine, probe, resume, isFollowLive, onState } = setupTracked();
+    isFollowLive.mockReturnValue(false);
+    const resolvers: ((ok: boolean) => void)[] = [];
+    probe.mockImplementation(
+      () => new Promise<boolean>((resolve) => resolvers.push(resolve)),
+    );
+    resume.mockRejectedValueOnce(new Error("foreground resume failed"));
+    machine.startLive();
+    clock.advance(LIVE_FRAME_MS); // t=15 stale
+    clock.advance(REST_PROBE_MS); // t=30: stale probe P in flight
+    expect(resolvers).toHaveLength(1);
+
+    // t=31: foreground resume (attempt 1) fails; its settle probe Q starts.
+    clock.advance(1_000);
+    machine.dispatch({ type: "resume" });
+    expect(machine.state).toBe("recovering");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resolvers).toHaveLength(2);
+
+    // t=32: Q wins — quiet stale.
+    resolvers[1]!(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+
+    // t=35: the stale P answers false for an attempt that is no longer
+    // current: dropped, state stays stale — no offline banner, no reconnect.
+    const offlineEvents: string[] = [];
+    onState.mockImplementation((s: string) => {
+      if (s === "offline") offlineEvents.push(s);
+    });
+    resolvers[0]!(false);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+    expect(offlineEvents).toEqual([]);
+  });
+
   it("GATE11 item 2: the close latch is CONSUMED by attempt A's completion; quiet attempt B's own frame survives B's rejection", async () => {
     // §5.2.1 recovering row -> watchdog cell: EVERY attempt arm starts with a
     // clean latch and a completion consumes it. A (loud) closes while active

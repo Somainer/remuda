@@ -498,7 +498,11 @@ impl CodexAdapter {
                 // distinct turns from Message rows (r6 item 5).
                 let mut obs = AdapterObservation::structured(ObservationPayload::Usage(Box::new(
                     to_usage_payload(UsageScope::Message, response_id, 1, &totals),
-                )));
+                )))
+                // r7 item 7: stamp the record's own timestamp so the Hub
+                // native-time rate SQL (60 s / 5 min TPM) and lastTurnAt use
+                // the real model-call time instead of ingest time.
+                .with_native_at(native_timestamp(record.timestamp.as_deref()));
                 if let Some(turn) = event.turn_id.clone().or_else(|| turn_id(&record)) {
                     obs = obs.with_turn(turn);
                 }

@@ -2060,6 +2060,119 @@ mod tests {
     }
 
     #[test]
+    fn message_rows_carry_native_time_for_rates_and_last_turn_at() {
+        // c-usagefu r7 item 7: a real CodexAdapter Message observation carries
+        // the token_usage_record's native timestamp; after stamping →
+        // projection → insertion the rollup must report non-NULL 60 s / 5 min
+        // rates and an advanced lastTurnAt (not ingest time).
+        use remuda_driver::adapters::{
+            AdapterHome, AdapterObservation, CodexAdapter, FileSignalAdapter, StampCtx, stamp,
+        };
+        use remuda_protocol::ObservationPayload;
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let session_dir = home_dir.path().join(".codex/sessions/2026/09/15");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let rollout = session_dir.join("rollout-native-time.jsonl");
+        let native_at = "2026-09-15T01:00:00.000Z";
+        std::fs::write(
+            &rollout,
+            format!(
+                "{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"nt\",\"session_id\":\"nt\",\"cwd\":\"/w\",\"timestamp\":\"{native_at}\"}}}}\n\
+                 {{\"ordinal\":1,\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"t1\",\"model\":\"gpt-5.4\"}}}}\n\
+                 {{\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"t1\"}}}}\n\
+                 {{\"ordinal\":3,\"timestamp\":\"{native_at}\",\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"t1\",\"response_id\":\"r1\",\"usage\":{{\"input_tokens\":0,\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":10000,\"reasoning_output_tokens\":0,\"total_tokens\":10000}}}}}}\n\
+                 {{\"ordinal\":4,\"timestamp\":\"{native_at}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut adapter = CodexAdapter::new(AdapterHome {
+            home: home_dir.path().join(".codex"),
+            cwd: "/w".into(),
+            pid: None,
+            launched_at: None,
+        });
+        adapter.bind_rollout("nt", rollout.clone());
+        let observed = adapter.poll().unwrap();
+        let messages: Vec<&AdapterObservation> = observed
+            .iter()
+            .filter(|o| {
+                matches!(&o.payload, ObservationPayload::Usage(u) if u.scope == remuda_protocol::UsageScope::Message)
+            })
+            .collect();
+        assert!(!messages.is_empty(), "a Message usage was emitted");
+        assert!(
+            messages[0].native_at.is_some(),
+            "Message observation carries native_at directly"
+        );
+
+        // Stamp and project.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let stamp_ctx = StampCtx {
+            instance_id: remuda_protocol::InstanceId::new(),
+            host_id: remuda_protocol::HostId::new(),
+            journal_id: remuda_protocol::Id::new("obj").unwrap(),
+            run_id: remuda_protocol::RunId::new(),
+            session_id: "nt".into(),
+        };
+        for (i, obs) in observed.iter().enumerate() {
+            let stamped = stamp(&stamp_ctx, i as u64 + 1, obs).unwrap();
+            if let ObservationPayload::Usage(_) = &stamped.body {
+                let event = serde_json::to_value(&stamped).unwrap();
+                let rec = JournalRecord {
+                    instance_id: "ins_nt".into(),
+                    seq: i as i64 + 1,
+                    event_id: stamped.event_id.as_id().as_str().to_owned(),
+                    event,
+                    observed_at: "2030-01-01T00:00:00.000Z".into(), // far future ingest
+                };
+                let row = project_usage_event(&rec, None, None).unwrap();
+                insert_row(&conn, &row).unwrap();
+            }
+        }
+
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_nt",
+                kind: "codex",
+                spec_model: None,
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        // Rates use NATIVE time (the row is recent relative to the native
+        // timestamp only when run near 2026 — instead assert the row projected
+        // with observed_at_source=native and lastTurnAt equals the native time).
+        assert_eq!(
+            rollup.last_turn_at.as_deref(),
+            Some(native_at),
+            "lastTurnAt advances to the Message's native time, not ingest time"
+        );
+        let source: String = conn
+            .query_row(
+                "SELECT observed_at_source FROM usage_events WHERE scope='message' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source, "native", "Message row projected as native-sourced");
+        // And the observed_at itself is the native timestamp.
+        let at: String = conn
+            .query_row(
+                "SELECT observed_at FROM usage_events WHERE scope='message' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(at, native_at);
+    }
+
+    #[test]
     fn duplicate_message_replay_does_not_double_totals() {
         // c-usagefu r7 item 5: re-promoting Codex replays the rollout from
         // byte 0 and two fresh adapters emit the SAME Message response ids.

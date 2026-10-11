@@ -50,8 +50,8 @@ use serde_json::Value;
 
 use crate::adapters::{
     AdapterBinding, AdapterHome, AdapterObservation, FileSignalAdapter, first_mutation,
-    message_chunk, message_close, message_payload, node_id, not_emitted, thought_chunk,
-    turn_lifecycle,
+    message_chunk, message_close, message_payload, native_timestamp, node_id, not_emitted,
+    thought_chunk, turn_lifecycle,
 };
 use crate::error::DriverResult;
 use crate::grok_session::{
@@ -596,6 +596,11 @@ impl GrokAdapter {
         };
         let mut out = Vec::new();
         let mut ended_turn = false;
+        // Native turn-end timestamp of the last turn_ended in this batch:
+        // Grok usage observations otherwise carry no native time, so the
+        // Hub's native-only rate/freshness queries dropped every Grok row
+        // (c-ctxusage r9 item 4).
+        let mut ended_at: Option<String> = None;
         for line in tail.poll()? {
             let Ok(record) = parse_event_line(&line) else {
                 continue;
@@ -647,6 +652,7 @@ impl GrokAdapter {
                         }
                         out.push(observed);
                         ended_turn = true;
+                        ended_at = record.timestamp.clone();
                     }
                     // Post-hoc permission bookkeeping (§A5): journaled, never
                     // an answer channel. The wait_ms=0 case is not "no prompt".
@@ -670,13 +676,14 @@ impl GrokAdapter {
             }
         }
         if ended_turn {
-            self.emit_session_usage(&mut out);
+            self.emit_session_usage(&mut out, ended_at);
         }
         Ok(out)
     }
 
-    /// Read `usage.json` once per new content and emit a session snapshot.
-    fn emit_session_usage(&mut self, out: &mut Vec<AdapterObservation>) {
+    /// Read `usage.json` once per new content and emit a session snapshot,
+    /// stamped with the native turn-end timestamp (c-ctxusage r9 item 4).
+    fn emit_session_usage(&mut self, out: &mut Vec<AdapterObservation>, ended_at: Option<String>) {
         let Ok(text) = std::fs::read_to_string(
             self.binding
                 .as_ref()
@@ -703,9 +710,10 @@ impl GrokAdapter {
             self.session_usage_revision,
             self.usage_totals.session(),
         );
-        out.push(AdapterObservation::structured(ObservationPayload::Usage(
-            Box::new(payload),
-        )));
+        out.push(
+            AdapterObservation::structured(ObservationPayload::Usage(Box::new(payload)))
+                .with_native_at(native_timestamp(ended_at.as_deref())),
+        );
     }
 }
 

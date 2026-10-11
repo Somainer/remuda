@@ -503,6 +503,7 @@ mod tests {
                     effective: remuda_protocol::ModelEffective::NextTurn,
                     effort: Some("xhigh".into()),
                     effort_ultracode: Some(true),
+                    effort_axis: Some(remuda_protocol::EffortAxis::Flag),
                     permission_mode: None,
                 },
             )))

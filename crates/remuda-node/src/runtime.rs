@@ -2781,6 +2781,7 @@ fn command_parts(
                 effort: request.effort_name.clone(),
                 effort_index: request.effort_index,
                 effort_ultracode: request.effort_ultracode,
+                effort_axis: request.effort_axis.clone(),
                 permission_mode: request.permission_mode.clone(),
             },
             false,
@@ -4144,7 +4145,10 @@ mod tests {
                                 // D-056: the orthogonal boolean reaches the
                                 // driver alongside the level (xhigh), never as
                                 // the legacy "ultracode" level name.
-                                value: "applied model=opus effort=xhigh index=3 ultracode=true permission=-"
+                                // c-effortread r9 item 6: the explicit axis
+                                // reaches the driver too; this legacy request
+                                // omits it ("-").
+                                value: "applied model=opus effort=xhigh index=3 ultracode=true axis=- permission=-"
                                     .into(),
                             }
                 });

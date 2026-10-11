@@ -222,6 +222,30 @@ it("a rapid level→switch flip reads the freshest requested tier (D-056 race)",
   });
 });
 
+it("a cold switch flip states the flag axis and predicts the decoupled toggle word (r9 item 6)", async () => {
+  const ctx = await startFollowing("cold-axis");
+  // No local state, no read-back, null durable record (startFollowing clears
+  // effortName/effortUltracode): a true cold start on a 2.1.289 session.
+  const posts: { name?: string; ultracode?: boolean; axis?: string }[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+
+  await hubStore.setUltracode(ctx.instance.id, true);
+
+  // The configure carries the EXPLICIT flag axis at the current displayed tier.
+  const flagPost = posts.find((p) => p.ultracode === true);
+  expect(flagPost?.axis).toBe("flag");
+  expect(flagPost?.name).toBe("high");
+
+  // The pending indicator predicts the exact orthogonal toggle word even with
+  // no proven selection, so the queued/applied matcher can settle it (it never
+  // sticks on a stale "切换中" from a guessed level word).
+  const pending = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pending?.commandWord).toBe("ultracode on");
+});
+
 it("a level clamp settles the level axis while the unobserved switch stays pending", async () => {
   const ctx = await startFollowing("clamp-flag");
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);

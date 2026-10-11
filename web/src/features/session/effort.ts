@@ -40,6 +40,13 @@ export type EffortSelection = {
 };
 
 /**
+ * c-effortread r9 item 6: which axis a live configure moves. The web states
+ * this explicitly so the driver executes exactly that operation — a cold
+ * flag-on click is the `ultracode on` toggle, never a substituted tier move.
+ */
+export type EffortAxis = "flag" | "tier";
+
+/**
  * The three visual treatments of the one slider (composer-slider-5):
  *
  * - `plain` — ordinary tiers: the cold brand fill, no amber.

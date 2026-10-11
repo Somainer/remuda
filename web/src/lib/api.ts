@@ -488,7 +488,18 @@ export type HelloResult = {
 };
 
 /** D-056 configure payload: native level word + orthogonal ultracode boolean. */
-export type EffortRef = { index: number; name: string; ultracode?: boolean };
+export type EffortRef = {
+  index: number;
+  name: string;
+  ultracode?: boolean;
+  /**
+   * c-effortread r9 item 6: the axis this configure intends to move.
+   * "flag" = the orthogonal ultracode switch at the current tier;
+   * "tier" = a level move. The driver executes exactly that operation and
+   * refuses an ambiguous legacy flag-on rather than substituting a tier move.
+   */
+  axis?: "flag" | "tier";
+};
 
 export type InstanceCreateSpec = {
   hostId: Id;

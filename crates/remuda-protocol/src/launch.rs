@@ -567,6 +567,13 @@ pub struct ModelSwitchInput {
     /// this boolean plus the tier and the reported binary version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_ultracode: Option<bool>,
+    /// c-effortread r9 item 6: the axis this switch intends to move.
+    /// `"flag"` = the orthogonal ultracode switch at the current tier;
+    /// `"tier"` = a level move. Absent on a legacy client, in which case the
+    /// driver disambiguates from provenance and refuses a cold flag-on rather
+    /// than typing a different operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_axis: Option<crate::effort::EffortAxis>,
     /// Native permission-mode spelling when the driver supports a runtime
     /// switch (Claude PTY: shift+tab cycling). Launch-only modes the carrier
     /// cannot cycle into are rejected by the driver.

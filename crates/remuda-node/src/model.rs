@@ -417,6 +417,9 @@ pub struct InstanceCommandRequest {
     /// D-056 orthogonal ultracode flag for `instance.configure`.
     #[serde(default)]
     pub effort_ultracode: Option<bool>,
+    /// c-effortread r9 item 6: explicit axis intent (`"flag"` | `"tier"`).
+    #[serde(default)]
+    pub effort_axis: Option<String>,
     /// Native permission-mode word for `instance.configure`.
     #[serde(default)]
     pub permission_mode: Option<String>,
@@ -443,6 +446,12 @@ impl InstanceCommandRequest {
             // D-056: the orthogonal flag rides with the level; the driver picks
             // the exact in-session word from the reported Claude version.
             self.effort_ultracode = effort.get("ultracode").and_then(serde_json::Value::as_bool);
+            // c-effortread r9 item 6: the explicit axis the client intends.
+            self.effort_axis = effort
+                .get("axis")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| matches!(*value, "flag" | "tier"))
+                .map(str::to_owned);
         }
         self.permission_mode = params
             .get("permissionMode")

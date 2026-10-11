@@ -41,6 +41,7 @@ import {
   effortWireName,
   mapEffort,
   type ClaudeVersionGate,
+  type EffortAxis,
   type EffortKind,
   type EffortSelection,
   type ModelEffortCatalogRow,
@@ -277,6 +278,7 @@ const PERMISSION_PENDING_MAX_AGE_MS = 30 * 60_000;
  */
 function predictDriverCommandWord(
   effort: EffortSelection,
+  axis: EffortAxis,
   instance: Instance | undefined,
   state: HubState,
   instanceId: Id,
@@ -297,6 +299,14 @@ function predictDriverCommandWord(
   const gate = claudeVersionGate(reported ?? hostClaudeVersion(host) ?? "");
   if (gate === "coupled" && effort.ultracode) return "ultracode";
   if (gate === "decoupled") {
+    // c-effortread r9 item 6: an explicit FLAG axis is the orthogonal toggle
+    // even at a cold start (no proven tier needed) — the driver executes
+    // exactly that word. An explicit TIER axis is the plain level. Only a
+    // legacy request (no axis) falls back to same-tier provenance.
+    if (axis === "flag") {
+      return effort.ultracode ? "ultracode on" : "ultracode off";
+    }
+    if (axis === "tier") return effort.name;
     // c-effortui r5 item 2: mirror the driver's provenance fallback —
     // observed effective, optimistic selection, then the durable instance
     // record (effortName/effortUltracode) — so a session opened on another
@@ -3845,11 +3855,17 @@ class HubStore {
   async configure(
     instanceId: Id,
     permissionMode: string,
-    extras?: { model?: string; effort?: EffortSelection },
+    extras?: {
+      model?: string;
+      effort?: EffortSelection;
+      /** c-effortread r9 item 6: explicit axis intent carried on effort.axis. */
+      effortAxis?: EffortAxis;
+    },
     freshness?: { effortNonce?: number },
   ) {
-    // D-056 wire: `{name, ultracode, index}` — a native level word plus the
-    // orthogonal boolean; the web never sends the legacy "ultracode" name.
+    // D-056 wire: `{name, ultracode, index, axis}` — a native level word plus
+    // the orthogonal boolean and the explicit axis the driver executes; the
+    // web never sends the legacy "ultracode" name.
     const wireExtras = extras?.effort
       ? {
           ...extras,
@@ -3857,6 +3873,10 @@ class HubStore {
             name: effortWireName(extras.effort),
             ultracode: extras.effort.ultracode === true,
             index: extras.effort.index,
+            // c-effortread r9 item 6: state the axis so a cold flag click is
+            // the toggle the driver types ("ultracode on"), never a substituted
+            // tier command.
+            ...(extras.effortAxis ? { axis: extras.effortAxis } : {}),
           },
         }
       : extras;
@@ -3938,7 +3958,7 @@ class HubStore {
     return requested;
   }
 
-  async setEffort(instanceId: Id, effortIn: EffortSelection) {
+  async setEffort(instanceId: Id, effortIn: EffortSelection, axis: EffortAxis = "tier") {
     const effort = this.gateLiveEffort(instanceId, effortIn);
     const instance = this.state.instances.find((row) => row.id === instanceId);
     const busy =
@@ -3952,7 +3972,7 @@ class HubStore {
     // queued/applied/degraded lifecycle (which echoes the typed command word)
     // can be matched even when a decoupled TIER move carries the flag — the
     // driver then types the plain level word with flag=true in the payload.
-    const commandWord = predictDriverCommandWord(effort, instance, this.state, instanceId);
+    const commandWord = predictDriverCommandWord(effort, axis, instance, this.state, instanceId);
     const pending: EffortPending = {
       nonce,
       name: effort.name,
@@ -3981,7 +4001,7 @@ class HubStore {
       await this.configure(
         instanceId,
         this.permissionModeOf(instanceId),
-        { effort },
+        { effort, effortAxis: axis },
         { effortNonce: nonce },
       );
       // Re-request authoritative state once the command is accepted. The
@@ -4044,7 +4064,8 @@ class HubStore {
    */
   async setUltracode(instanceId: Id, ultracode: boolean) {
     const current = this.effortOf(instanceId);
-    await this.setEffort(instanceId, { ...current, ultracode });
+    // c-effortread r9 item 6: the switch moves ONLY the flag axis.
+    await this.setEffort(instanceId, { ...current, ultracode }, "flag");
   }
 
   /** Claude Code version gate for a session.

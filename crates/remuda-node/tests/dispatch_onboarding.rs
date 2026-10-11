@@ -283,6 +283,7 @@ fn run_child() {
                     effort_name: None,
                     effort_index: None,
                     effort_ultracode: None,
+                    effort_axis: None,
                     permission_mode: None,
                 },
             )

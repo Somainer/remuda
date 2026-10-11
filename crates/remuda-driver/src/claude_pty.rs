@@ -747,7 +747,12 @@ impl ClaudePtyDriver {
 impl ClaudePtyDriver {
     /// §9.1: type `/effort <level>` (plus the D-056 ultracode axis) and let
     /// the transcript pump prove it.
-    async fn switch_effort(&self, level: &str, ultracode: Option<bool>) -> DriverResult<DriverAck> {
+    async fn switch_effort(
+        &self,
+        level: &str,
+        ultracode: Option<bool>,
+        axis: Option<remuda_protocol::EffortAxis>,
+    ) -> DriverResult<DriverAck> {
         let (pane_id, session_id, queue, ready, io, request) = {
             let inner = self.inner.lock().await;
             let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
@@ -778,14 +783,15 @@ impl ClaudePtyDriver {
                         ultracode: request.ultracode,
                     });
             let Some(request) = crate::effort::EffortRequest::for_configure(
-                level, ultracode, semantics, proven, requested,
+                level, ultracode, axis, semantics, proven, requested,
             ) else {
-                // An honest refusal for a word the in-session command does not
-                // take (`auto` is a mode, and an unknown future name must not
-                // be typed and hoped about). The Node surfaces the rejection in
-                // the UI.
+                // An honest refusal: a word the command does not take, or a
+                // flag-on a legacy/ambiguous request cannot disambiguate
+                // (c-effortread r9 item 6: execute exactly the stated axis,
+                // never a substituted tier command). The Node surfaces the
+                // rejection in the UI.
                 return Err(DriverError::CapabilityUnsupported(format!(
-                    "claude /effort does not accept {level:?} in-session; \
+                    "claude /effort cannot apply {ultracode:?} at {level:?} on this build/request; \
                      valid: low, medium, high, xhigh, max, ultracode, ultracode on, ultracode off"
                 )));
             };
@@ -1073,7 +1079,9 @@ impl Driver for ClaudePtyDriver {
             && !level.is_empty()
             && switch.model_id.is_empty()
         {
-            return self.switch_effort(level, switch.effort_ultracode).await;
+            return self
+                .switch_effort(level, switch.effort_ultracode, switch.effort_axis)
+                .await;
         }
         // §9.1: a model switch is `/model <id>` typed into the composer and
         // proven by the transcript verdict. (A combined model+effort configure

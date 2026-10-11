@@ -333,30 +333,33 @@ impl EffortRequest {
     }
 
     /// Build the in-session request for a LIVE configure from the two D-056
-    /// axes (`{name, ultracode}`) and the reported build semantics.
+    /// axes (`{name, ultracode}`), the explicit intent `axis`, and the
+    /// reported build semantics.
     ///
-    /// Classification (c-effortui r4 item 2, tightened in r5 item 1) is
-    /// against the driver's latest OBSERVED effective selection, falling back
-    /// to the launch REQUESTED selection — never a guessed toggle with no
-    /// provenance:
+    /// Classification (c-effortui r4 item 2, tightened in r5 item 1, intent
+    /// made explicit in c-effortread r9 item 6) is against the driver's latest
+    /// OBSERVED effective selection, falling back to the launch REQUESTED
+    /// selection — never a guessed toggle with no provenance:
     ///
     /// - Coupled (2.1.203–2.1.283): a flag-on request is the single bare
     ///   `/effort ultracode` — on those builds that word IS the xhigh-tier
     ///   command; anything else is a plain level word. The UI guarantees it
     ///   never asks for `{non-xhigh, true}`.
-    /// - Decoupled (≥2.1.284): same tier as the proven selection → the
-    ///   orthogonal toggle (`/effort ultracode on|off`); a different tier is
-    ///   a level move and a plain `/effort <level>` (the ortho flag stays
-    ///   where read-back puts it). With NO observed AND NO requested state,
-    ///   a flag-on request is typed as the plain LEVEL word (no cold guess):
-    ///   the first proven selection always comes from launch argv or
-    ///   read-back, and a toggle with no same-tier provenance cannot be known
-    ///   to target this session's flag.
-    /// - Legacy/unknown: a flag-on request is rejected by the caller's version
-    ///   gate; here only plain level words are produced.
+    /// - Decoupled (≥2.1.284):
+    ///   * explicit `axis = Flag` → the orthogonal toggle
+    ///     (`/effort ultracode on|off`) at the given tier, executed exactly —
+    ///     even with no proven selection, because the client disambiguated it;
+    ///   * explicit `axis = Tier` → a plain `/effort <level>`;
+    ///   * `axis = None` (legacy client) → same-tier provenance is required to
+    ///     read a flag-on as a toggle; a flag-on with no same-tier provenance
+    ///     is AMBIGUOUS and returns `None` (the caller refuses it) rather than
+    ///     typing a different, tier-changing command.
+    /// - Legacy/unknown: a flag-on request is rejected (the caller's version
+    ///   gate already blocks it); here only plain level words are produced.
     pub(crate) fn for_configure(
         level: &str,
         ultracode: Option<bool>,
+        axis: Option<remuda_protocol::EffortAxis>,
         semantics: remuda_protocol::EffortSemantics,
         observed: Option<ObservedSelection>,
         requested: Option<EffortSelection>,
@@ -367,22 +370,53 @@ impl EffortRequest {
         }
         if semantics == remuda_protocol::EffortSemantics::Decoupled {
             let target_name = parse_plain_effort_name(&normalized);
-            // The proven selection (observed, else requested). None = true
-            // cold start — no toggle guess.
-            let proven = Self::classify_provenance(observed, requested);
-            if let Some(name) =
-                target_name.filter(|name| proven.as_ref().is_some_and(|obs| obs.name == *name))
-            {
-                return Some(Self {
-                    name,
-                    ultracode: ultracode == Some(true),
-                    word: if ultracode == Some(true) {
-                        "ultracode on"
-                    } else {
-                        "ultracode off"
-                    },
-                });
+            match axis {
+                // Explicit flag intent: execute exactly the toggle at this
+                // tier, no provenance guess needed (the sender disambiguated).
+                Some(remuda_protocol::EffortAxis::Flag) => {
+                    let name = target_name?;
+                    return Some(Self {
+                        name,
+                        ultracode: ultracode == Some(true),
+                        word: if ultracode == Some(true) {
+                            "ultracode on"
+                        } else {
+                            "ultracode off"
+                        },
+                    });
+                }
+                // Explicit tier intent: a plain level move; the orthogonal flag
+                // stays where the running session had it.
+                Some(remuda_protocol::EffortAxis::Tier) => return Self::from_level(&normalized),
+                None => {
+                    // Legacy client: a same-tier proven selection lets either
+                    // flag direction mean the toggle.
+                    let proven = Self::classify_provenance(observed, requested);
+                    if let Some(name) = target_name
+                        .filter(|name| proven.as_ref().is_some_and(|obs| obs.name == *name))
+                    {
+                        return Some(Self {
+                            name,
+                            ultracode: ultracode == Some(true),
+                            word: if ultracode == Some(true) {
+                                "ultracode on"
+                            } else {
+                                "ultracode off"
+                            },
+                        });
+                    }
+                    // A cold flag-ON with no axis is ambiguous: do not execute
+                    // a different (tier) operation — refuse. A flag-off or a
+                    // plain level is still just the level word.
+                    if ultracode == Some(true) {
+                        return None;
+                    }
+                }
             }
+        } else if ultracode == Some(true) {
+            // Legacy/unknown build: the flag cannot be expressed; refuse
+            // rather than typing a bare level and claiming the flag.
+            return None;
         }
         Self::from_level(&normalized)
     }
@@ -1272,41 +1306,77 @@ mod sync_tests {
 
     #[test]
     fn live_configure_picks_the_command_word_for_each_gate() {
+        use remuda_protocol::EffortAxis::{Flag, Tier};
         use remuda_protocol::EffortSemantics::{Coupled, Decoupled, Unknown};
 
-        // Coupled: {xhigh,true} is the single bare word.
+        // Coupled: {xhigh,true} is the single bare word regardless of axis.
         let coupled_on =
-            EffortRequest::for_configure("xhigh", Some(true), Coupled, None, None).unwrap();
+            EffortRequest::for_configure("xhigh", Some(true), None, Coupled, None, None).unwrap();
         assert_eq!(coupled_on.command_word(), "ultracode");
         assert_eq!(coupled_on.name, EffortName::Xhigh);
         // Coupled: a plain level never gains the flag, even with a stale true.
         let coupled_level =
-            EffortRequest::for_configure("max", Some(false), Coupled, None, None).unwrap();
+            EffortRequest::for_configure("max", Some(false), None, Coupled, None, None).unwrap();
         assert_eq!(coupled_level.command_word(), "max");
 
-        // Decoupled, no provenance: neither flag direction can be a toggle —
-        // the driver has no same-tier evidence (c-effortui r5 item 1 drops the
-        // cold-start guess). Both post the plain level word; the first proven
-        // selection comes from launch argv or read-back.
+        // Decoupled, no provenance, LEGACY client (no axis): flag-off posts the
+        // plain level word; a cold flag-ON is ambiguous and is REFUSED rather
+        // than substituted to a different (tier) command (c-effortread r9
+        // item 6).
         let cold =
-            EffortRequest::for_configure("high", Some(false), Decoupled, None, None).unwrap();
+            EffortRequest::for_configure("high", Some(false), None, Decoupled, None, None).unwrap();
         assert_eq!(cold.command_word(), "high");
-        let cold_on =
-            EffortRequest::for_configure("high", Some(true), Decoupled, None, None).unwrap();
-        assert_eq!(
-            cold_on.command_word(),
-            "high",
-            "no cold toggle guess — plain level"
+        assert!(
+            EffortRequest::for_configure("high", Some(true), None, Decoupled, None, None).is_none(),
+            "a cold legacy flag-on is ambiguous and is refused, never a level word"
         );
 
-        // Decoupled, same tier as the OBSERVED selection: the flag toggle words.
+        // Decoupled, explicit FLAG axis at a cold start: execute EXACTLY the
+        // toggle — no provenance needed because the client stated the intent.
+        let cold_flag_on =
+            EffortRequest::for_configure("high", Some(true), Some(Flag), Decoupled, None, None)
+                .unwrap();
+        assert_eq!(cold_flag_on.command_word(), "ultracode on");
+        assert_eq!(cold_flag_on.name, EffortName::High);
+        let cold_flag_off =
+            EffortRequest::for_configure("high", Some(false), Some(Flag), Decoupled, None, None)
+                .unwrap();
+        assert_eq!(cold_flag_off.command_word(), "ultracode off");
+        assert_eq!(cold_flag_off.name, EffortName::High);
+
+        // Explicit TIER axis is a plain level move even with the flag riding
+        // along from a different observed tier.
+        let obs_high_on = ObservedSelection {
+            name: EffortName::High,
+            ultracode: Some(true),
+        };
+        let drag = EffortRequest::for_configure(
+            "max",
+            Some(true),
+            Some(Tier),
+            Decoupled,
+            Some(obs_high_on),
+            None,
+        )
+        .unwrap();
+        assert_eq!(drag.command_word(), "max");
+        assert_eq!(drag.name, EffortName::Max);
+
+        // Decoupled, same tier as the OBSERVED selection, LEGACY client: the
+        // flag toggles on the proven word for either direction.
         let obs_high_off = ObservedSelection {
             name: EffortName::High,
             ultracode: Some(false),
         };
-        let on =
-            EffortRequest::for_configure("high", Some(true), Decoupled, Some(obs_high_off), None)
-                .unwrap();
+        let on = EffortRequest::for_configure(
+            "high",
+            Some(true),
+            None,
+            Decoupled,
+            Some(obs_high_off),
+            None,
+        )
+        .unwrap();
         assert_eq!(on.command_word(), "ultracode on");
         assert_eq!(
             on.name,
@@ -1317,32 +1387,31 @@ mod sync_tests {
             name: EffortName::High,
             ultracode: Some(true),
         };
-        let off =
-            EffortRequest::for_configure("high", Some(false), Decoupled, Some(obs_high_on), None)
-                .unwrap();
+        let off = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            None,
+            Decoupled,
+            Some(obs_high_on),
+            None,
+        )
+        .unwrap();
         assert_eq!(off.command_word(), "ultracode off");
         assert_eq!(off.name, EffortName::High);
 
-        // Decoupled, tier moves while the flag rides along: plain level word,
-        // flag stays where it was on an orthogonal build.
-        let obs_high_on = ObservedSelection {
-            name: EffortName::High,
-            ultracode: Some(true),
-        };
-        let drag =
-            EffortRequest::for_configure("max", Some(true), Decoupled, Some(obs_high_on), None)
-                .unwrap();
-        assert_eq!(drag.command_word(), "max");
-        assert_eq!(drag.name, EffortName::Max);
-
-        // Unknown gate: only levels are produced.
+        // Unknown gate: only levels are produced; a flag-on is refused.
         assert_eq!(
-            EffortRequest::for_configure("xhigh", Some(false), Unknown, None, None)
+            EffortRequest::for_configure("xhigh", Some(false), None, Unknown, None, None)
                 .unwrap()
                 .command_word(),
             "xhigh"
         );
-        assert!(EffortRequest::for_configure("bogus", None, Coupled, None, None).is_none());
+        assert!(
+            EffortRequest::for_configure("high", Some(true), Some(Flag), Unknown, None, None)
+                .is_none(),
+            "an unsupported build refuses the flag even with explicit intent"
+        );
+        assert!(EffortRequest::for_configure("bogus", None, None, Coupled, None, None).is_none());
     }
 
     /// c-effortui r4 item 2 trigger A: Remuda drags high→max; the USER then
@@ -1358,9 +1427,15 @@ mod sync_tests {
             name: EffortName::Max,
             ultracode: Some(false),
         };
-        let req =
-            EffortRequest::for_configure("high", Some(false), Decoupled, Some(observed), None)
-                .unwrap();
+        let req = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            None,
+            Decoupled,
+            Some(observed),
+            None,
+        )
+        .unwrap();
         assert_eq!(req.command_word(), "high");
         assert_eq!(req.name, EffortName::High);
         assert!(!req.ultracode);
@@ -1380,8 +1455,15 @@ mod sync_tests {
             name: EffortName::High,
             ultracode: true,
         };
-        let req = EffortRequest::for_configure("max", Some(true), Decoupled, None, Some(requested))
-            .unwrap();
+        let req = EffortRequest::for_configure(
+            "max",
+            Some(true),
+            Some(remuda_protocol::EffortAxis::Tier),
+            Decoupled,
+            None,
+            Some(requested),
+        )
+        .unwrap();
         assert_eq!(req.command_word(), "max");
         assert_eq!(req.name, EffortName::Max);
     }
@@ -1400,8 +1482,15 @@ mod sync_tests {
             name: EffortName::High,
             ultracode: Some(false),
         };
-        let req = EffortRequest::for_configure("max", Some(true), Decoupled, Some(observed), None)
-            .unwrap();
+        let req = EffortRequest::for_configure(
+            "max",
+            Some(true),
+            Some(remuda_protocol::EffortAxis::Tier),
+            Decoupled,
+            Some(observed),
+            None,
+        )
+        .unwrap();
         assert_eq!(req.command_word(), "max");
         assert_eq!(req.name, EffortName::Max);
     }
@@ -1425,9 +1514,15 @@ mod sync_tests {
         assert_eq!(observed.name, EffortName::Max);
         // A subsequent {high,false} configure is a tier move vs the observed
         // max even though the launch requested was high.
-        let req =
-            EffortRequest::for_configure("high", Some(false), Decoupled, Some(observed), None)
-                .unwrap();
+        let req = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            None,
+            Decoupled,
+            Some(observed),
+            None,
+        )
+        .unwrap();
         assert_eq!(req.command_word(), "high");
     }
 
@@ -1484,10 +1579,12 @@ mod sync_tests {
             Some(EffortName::Max),
             "observed replaces requested"
         );
-        // A same-tier flag flip with REQUESTED high,false types the toggle.
+        // A same-tier flag flip with REQUESTED high,false (LEGACY client, no
+        // axis) types the toggle because the provenance matches.
         let on = EffortRequest::for_configure(
             "high",
             Some(true),
+            None,
             Decoupled,
             None,
             Some(EffortSelection {
@@ -1497,16 +1594,28 @@ mod sync_tests {
         )
         .unwrap();
         assert_eq!(on.command_word(), "ultracode on");
-        // True cold start (no observed, no requested): plain level, never a
-        // guessed toggle — for BOTH flag directions.
+        // True cold start (no observed, no requested): an explicit FLAG axis
+        // executes the toggle exactly, while a LEGACY client's cold flag-ON is
+        // ambiguous and REFUSED (never substituted to the level word); flag-off
+        // and a plain level still type the level word.
         assert_eq!(
-            EffortRequest::for_configure("high", Some(true), Decoupled, None, None)
-                .unwrap()
-                .command_word(),
-            "high"
+            EffortRequest::for_configure(
+                "high",
+                Some(true),
+                Some(remuda_protocol::EffortAxis::Flag),
+                Decoupled,
+                None,
+                None,
+            )
+            .unwrap()
+            .command_word(),
+            "ultracode on"
+        );
+        assert!(
+            EffortRequest::for_configure("high", Some(true), None, Decoupled, None, None).is_none()
         );
         assert_eq!(
-            EffortRequest::for_configure("high", Some(false), Decoupled, None, None)
+            EffortRequest::for_configure("high", Some(false), None, Decoupled, None, None)
                 .unwrap()
                 .command_word(),
             "high"

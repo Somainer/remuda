@@ -713,6 +713,9 @@ export type EffectiveModel = ({
   [key: string]: unknown;
 });
 
+/** Which axis a live `instance.configure` effort switch intends to move.  c-effortread r9 item 6: without this the pair `{name, ultracode}` is ambiguous — a cold flag-on click `{high, true}` cannot be told apart from a tier move. The web now states the intent explicitly so the driver executes exactly that operation instead of substituting a different one:  - [`EffortAxis::Flag`] — the orthogonal ultracode switch only (`/effort   ultracode on|off` on decoupled builds; the tier is unchanged). - [`EffortAxis::Tier`] — a level move only (`/effort <level>`).  `None` is a legacy client that omits the axis; the driver then disambiguates from provenance and REJECTS a cold flag-on it cannot prove rather than guessing. */
+export type EffortAxis = ("flag" | "tier");
+
 /** Effective effort, read back from a Claude assistant transcript record (`effort` / `perTurnEffort`); D-028 §9.1 / D-056.  This is the *observed* tier, never the requested one. Claude never repeats the ultracode workflow flag on assistant records: it is read from the `/effort` verdicts and the `ultra_effort_enter` / `ultra_effort_exit` attachments instead. On coupled builds (2.1.203–2.1.283) the flag implies xhigh; on decoupled builds (≥ 2.1.284) it is an orthogonal toggle that latches at every level. `ultracode` is `None` until this process has positive evidence either way. */
 export type EffortEffective = ({
   "name"?: (EffortName | (null));
@@ -2597,6 +2600,7 @@ export type ModelSelectionPath = ("listed" | "typed");
 export type ModelSwitchInput = ({
   "effective": ModelEffective;
   "effort"?: (string | null);
+  "effortAxis"?: (EffortAxis | (null));
   "effortUltracode"?: (boolean | null);
   "modelId": (string);
   "permissionMode"?: (string | null);

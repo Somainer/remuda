@@ -179,6 +179,31 @@ pub fn parse_plain_level(word: &str) -> Option<EffortName> {
     }
 }
 
+/// Which axis a live `instance.configure` effort switch intends to move.
+///
+/// c-effortread r9 item 6: without this the pair `{name, ultracode}` is
+/// ambiguous — a cold flag-on click `{high, true}` cannot be told apart from
+/// a tier move. The web now states the intent explicitly so the driver
+/// executes exactly that operation instead of substituting a different one:
+///
+/// - [`EffortAxis::Flag`] — the orthogonal ultracode switch only (`/effort
+///   ultracode on|off` on decoupled builds; the tier is unchanged).
+/// - [`EffortAxis::Tier`] — a level move only (`/effort <level>`).
+///
+/// `None` is a legacy client that omits the axis; the driver then
+/// disambiguates from provenance and REJECTS a cold flag-on it cannot prove
+/// rather than guessing.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum EffortAxis {
+    /// Move the ultracode workflow flag, leaving the tier where it is.
+    Flag,
+    /// Move the effort tier.
+    Tier,
+}
+
 /// An effort level as read off an assistant transcript record.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,

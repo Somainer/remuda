@@ -87,6 +87,8 @@ pub enum DriverRequest {
         effort_index: Option<u32>,
         /// D-056 orthogonal ultracode flag.
         effort_ultracode: Option<bool>,
+        /// c-effortread r9 item 6: explicit axis intent ("flag" | "tier").
+        effort_axis: Option<String>,
         /// Native permission-mode word.
         permission_mode: Option<String>,
     },
@@ -368,11 +370,12 @@ impl Driver for FakeDriver {
                     effort,
                     effort_index,
                     effort_ultracode,
+                    effort_axis,
                     permission_mode,
                 } => Ok(vec![DriverEmission::NativeLifecycle {
                     name: "instance.configure".to_owned(),
                     status: format!(
-                        "applied model={} effort={} index={} ultracode={} permission={}",
+                        "applied model={} effort={} index={} ultracode={} axis={} permission={}",
                         model.as_deref().unwrap_or("-"),
                         effort.as_deref().unwrap_or("-"),
                         effort_index
@@ -381,6 +384,7 @@ impl Driver for FakeDriver {
                         effort_ultracode
                             .map(|on| if on { "true" } else { "false" })
                             .unwrap_or("-"),
+                        effort_axis.as_deref().unwrap_or("-"),
                         permission_mode.as_deref().unwrap_or("-")
                     ),
                     severity: Severity::Info,

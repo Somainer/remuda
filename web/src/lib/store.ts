@@ -370,6 +370,14 @@ function effortLifecycleRequest(word: string): EffortLifecycleRequest {
   return { name: normalized };
 }
 
+/**
+ * Deduplicate an emitted lifecycle edge by request nonce when the wire
+ * carries one (c-effortread r9 item 8). The driver/fake-node may echo the
+ * client nonce on configure statuses; until one is plumbed through this
+ * matcher is axis-value based.
+ */
+type EffortLifecycleKind = "queued" | "applied" | "degraded";
+
 /** Whether a lifecycle word is an ultracode switch word (bare or toggle).
  *  c-effortui r5 item 2: accept any separator the driver journals — the
  *  actual command space form (`ultracode on`), plus `:`/`_`/`-`. */
@@ -378,28 +386,42 @@ function lifecycleNamesUltraWord(word: string): boolean {
   return n === "ultracode" || /^ultracode[\s:_-]+(on|off)$/.test(n);
 }
 
-/** Whether a parsed lifecycle word refers to the in-flight request.
- *  Prefer the pending's predicted COMMAND word (c-effortui r4 item 3): a
- *  decoupled tier move with the flag on is typed as a plain level word. Only
- *  when the pending carries no predicted word (older wire-owned pending) fall
- *  back to comparing the two axes. A flag REFUSAL/verdict word also names any
- *  flag-CARRYING pending: a configure that posted `{tier,true}` typed the
- *  plain `/effort <tier>` can still come back as an ultracode refusal. */
-function effortLifecycleMatches(pending: EffortPending, word: string): boolean {
-  if (pending.commandWord !== null) {
-    const normalized = word.trim().toLowerCase();
-    // Exact predicted word (level word, bare coupled word, decoupled toggle).
-    if (normalized === pending.commandWord) return true;
-    // "ultracode on|off" prediction also accepts the bare switch word used by
-    // journal/fake-node refusal and degradation statuses.
-    if (pending.commandWord.startsWith("ultracode ") && normalized === "ultracode") {
+/**
+ * Whether a parsed lifecycle word refers to the in-flight request.
+ *
+ * c-effortread r9 item 8: queued/applied must match the request's EXACT
+ * identity — comparing the parsed ON/OFF flag value and tier against the
+ * pending request. A delayed `ultracode off` applied for a replaced request A
+ * must never delete newer request B's `ultracode on` indicator (the old
+ * matcher accepted it because B carried ultracode:true). Only genuine
+ * ultracode REFUSALS/degradations get the looser carrying-word matching,
+ * since refusal evidence is process-local, not request-scoped.
+ */
+function effortLifecycleMatches(
+  pending: EffortPending,
+  word: string,
+  kind: EffortLifecycleKind,
+): boolean {
+  const normalized = word.trim().toLowerCase();
+  // A REFUSAL/DEGRADATION names the ultracode SWITCH and may concern a flag
+  // carried on a plain tier command: keep the looser carrying-word rule for
+  // it only. The outer handler additionally treats refusal evidence as
+  // process-local and must not clear a non-matching pending via this result.
+  if (kind === "degraded") {
+    if (
+      pending.commandWord !== null &&
+      (normalized === pending.commandWord ||
+        (pending.commandWord.startsWith("ultracode ") && normalized === "ultracode") ||
+        (pending.ultracode && lifecycleNamesUltraWord(normalized)))
+    ) {
       return true;
     }
-    // A flag CARRYING request (typed as a plain tier move on decoupled) can
-    // still be refused/degraded via the ultracode switch word.
-    if (pending.ultracode && lifecycleNamesUltraWord(normalized)) return true;
-    return false;
+  } else if (pending.commandWord !== null) {
+    // Exact predicted command word only — no flag-carries cross-matching.
+    return normalized === pending.commandWord;
   }
+  // Wire-owned / synthesized pending (no client predicted word): compare the
+  // parsed ON/OFF VALUE and tier against the request identity.
   const request = effortLifecycleRequest(word);
   const bareCoupled = normalizedWordIsBareUltracode(word);
   if (request.name !== undefined) {
@@ -1460,7 +1482,7 @@ class HubStore {
         // `effort-queued` for request A after the user replaced it with B names
         // different axes and is dropped — it must never overwrite B's pending
         // indicator nor stamp B's threshold (c-effortui A→B race).
-        if (!effortLifecycleMatches(current, parsed.word)) return;
+        if (!effortLifecycleMatches(current, parsed.word, parsed.kind)) return;
       } else {
         // No client-side pending (the configure was posted outside the UI):
         // still surface 排队中 from the lifecycle's own axes.
@@ -1506,7 +1528,7 @@ class HubStore {
     }
     if (parsed.kind === "applied") {
       if (!current) return;
-      if (!effortLifecycleMatches(current, parsed.word)) return;
+      if (!effortLifecycleMatches(current, parsed.word, parsed.kind)) return;
       // The driver reported acceptance: the projected read-back is the source
       // of truth, but clear the indicator now rather than leaving it on 切换中
       // when the observation is delayed. The slider stays where requested.
@@ -1531,7 +1553,9 @@ class HubStore {
     //    request A. It must not clear B's indicator nor revert B's optimistic
     //    axes. Only refusal EVIDENCE is process-local and still recorded (an
     //    ultra refusal describes the environment, not the level request).
-    const namesCurrent = current ? effortLifecycleMatches(current, parsed.word) : false;
+    const namesCurrent = current
+      ? effortLifecycleMatches(current, parsed.word, "degraded")
+      : false;
     const mutatesRequest = !current || current.source === "lifecycle" || namesCurrent;
     if (!mutatesRequest && !isUltraRefusal) return;
 

@@ -284,6 +284,41 @@ it("while queued the entry shows queued until a strictly newer read-back", async
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
+it("r9 item 8: a delayed OFF lifecycle after a newer ON request leaves B's pending untouched", async () => {
+  const ctx = await startFollowing("off-after-on", { state: "known", value: "idle" });
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+
+  // A flips the switch OFF at the current high tier...
+  await hubStore.setUltracode(ctx.instance.id, false);
+  const pendingA = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pendingA).toMatchObject({ name: "high", ultracode: false });
+  // ...then B flips it ON before A's lifecycle lands.
+  await hubStore.setUltracode(ctx.instance.id, true);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toMatchObject({ name: "high", ultracode: true });
+
+  // A's delayed OFF (both the space command form and the legacy separator
+  // form) must not clear B's pending/threshold nor select B off.
+  for (const word of ["ultracode off", "ultracode:off"]) {
+    ctx.receive(configureLifecycle(9, `effort-applied:${word}`));
+    const pending = hubStore.effortPendingOf(ctx.instance.id);
+    expect(pending, `B's ON pending survives a delayed ${word} applied`).toMatchObject({
+      name: "high",
+      ultracode: true,
+    });
+  }
+
+  // A delayed OFF QUEUED edge must not stamp B's threshold or flip it queued.
+  const beforeThreshold = hubStore.effortPendingOf(ctx.instance.id)?.thresholdObservedAt;
+  ctx.receive(configureLifecycle(10, "effort-queued:ultracode off", "x", "2026-10-08T12:09:00.000Z"));
+  const after = hubStore.effortPendingOf(ctx.instance.id);
+  expect(after?.ultracode).toBe(true);
+  expect(after?.thresholdObservedAt).toBe(beforeThreshold);
+
+  // B's own ON applied clears it.
+  ctx.receive(configureLifecycle(11, "effort-applied:ultracode on"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
 it("a stale queued lifecycle for a replaced request is dropped (A→B race)", async () => {
   const ctx = await startFollowing("ab-queued", { state: "known", value: "idle" });
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);

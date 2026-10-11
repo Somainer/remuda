@@ -4725,17 +4725,18 @@ mod tests {
         );
     }
 
-    /// c-effortread r8 item 5 (Opus): the EffortTracker latch survives a
-    /// demote/re-promotion. On a decoupled build with ultracode ON at high,
-    /// after a re-promotion an assistant record WITHOUT a new ultra_effort
-    /// attachment must still report the flag true (chip "ultracode"), not drop
-    /// to None (chip "high") — the replacement mapper is seeded from the last
-    /// published observation.
+    /// c-effortread r9 item 9b: the EffortTracker latch survives a
+    /// demote/re-promotion driven through the PRODUCTION maintain_binding
+    /// path (not a hand-built mapper). After an ultracode-on high epoch, a
+    /// demote drops the hydrator while keeping the per-(pid,session) anchor and
+    /// effort seed; the re-promote's Hydrator::open re-latches from that seed,
+    /// so an attachment-less assistant at a NEW level publishes
+    /// {Max, ultracode:true}. Goes red if the seed stops reaching
+    /// Hydrator::open (the edge comes out {Max, None}).
     #[tokio::test]
-    async fn r8_item5_effort_tracker_latch_survives_repromotion() {
-        // Native 2.1.289 shape: a top-level attachment record with
-        // ultra_effort_enter, then the assistant high record rides the
-        // latched flag onto its edge.
+    async fn r9_item9b_tracker_latch_rides_a_maintain_binding_repromotion() {
+        // Native 2.1.289 shape: an ultra_effort_enter attachment, then the
+        // assistant high record rides the latched flag.
         let first_turn = format!(
             "{}{}",
             serde_json::json!({
@@ -4748,9 +4749,53 @@ mod tests {
         );
         let dir = tempfile::tempdir().expect("tmp");
         let mut fx = pump_fixture(dir.path(), &first_turn);
-        let bridge = std::sync::Arc::new(crate::effort::EffortBridge::new());
-        let mut hydrator = open_hydrator(&fx, ResumeMode::Fresh, Some(&bridge));
-        pump_once(&mut hydrator, &fx).await;
+        // pump_fixture's default ctx cwd is the tmp root; the binding slug is
+        // under tmp/repo, so give the production ctx the same cwd the hydrator
+        // content-membership check enforces.
+        fx.ctx.cwd = dir.path().join("repo");
+        let bridge = Arc::new(crate::effort::EffortBridge::new());
+        let found = detected_claude(7, Some(PUMP_SESSION));
+
+        // The exact per-tick state the promotion loop owns.
+        let bindings = BindingHandle::empty();
+        bindings.begin_epoch(&fx.ctx.cwd, &fx.ctx.claude_home);
+        bindings.ingest_session_start(SessionStartReport {
+            session_id: PUMP_SESSION.to_owned(),
+            transcript_path: fx.binding.path.clone(),
+            cwd: Some(fx.binding.cwd.clone()),
+            ppid: Some(7),
+            start_source: Some("startup".into()),
+        });
+        let mut hydrator: Option<Hydrator> = None;
+        let mut announced: Option<String> = None;
+        let mut session_modes = SessionModeTable::default();
+        let mut launch_mode = LaunchModeBinding::Unbound;
+        let mut read_anchors = std::collections::HashMap::new();
+        let mut effort_seeds = std::collections::HashMap::new();
+
+        // First promotion tick: maintain_binding opens the Fresh hydrator with
+        // the bridge and pumps the ultra-on high turn, capturing the read
+        // anchor and effort seed exactly as the production loop does.
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &found,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
+            Some(&bridge),
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            Some(ResumeMode::Fresh),
+            &mut read_anchors,
+            &mut effort_seeds,
+        )
+        .await;
         let first = drain(&mut fx);
         assert!(
             effort_rows(&first).iter().any(|(name, flag)| *name
@@ -4759,104 +4804,47 @@ mod tests {
             "the first epoch publishes high + ultracode on: {:?}",
             effort_rows(&first)
         );
-
-        // Capture the seed exactly as the production pump does.
-        let seed = EffortTrackerSeed::from_mapper(&hydrator.mapper).expect("seed captured");
-
-        // A FRESH replacement mapper (what a new Hydrator builds after
-        // demote/re-promotion) seeded with the latch: an attachment-less
-        // assistant record keeps the flag.
-        let mut seeded_mapper = TranscriptMapper::new(
-            remuda_protocol::DriverKind::ShellPty,
-            fx.ctx.instance_id.clone(),
-            fx.ctx.run_id.clone(),
-            fx.ctx.journal_id.clone(),
-            fx.ctx.host_id.clone(),
-            PUMP_SESSION.to_owned(),
-            "promoted".to_owned(),
-        );
-        seeded_mapper = seeded_mapper.with_effort_seed(seed.last.expect("seed has last"));
-        // An attachment-less assistant record at the SAME level after
-        // re-promotion: the seeded tracker's latch is still {High, on}, so it
-        // emits NO effort edge (no spurious {High, None} regression) and
-        // last_observed keeps the flag true.
-        let no_attachment = assistant_line(Some("high"), 9);
-        let mut mapped: Vec<_> = seeded_mapper.map_line(&no_attachment).expect("line maps");
-        mapped.extend(seeded_mapper.flush().expect("flush"));
-        let seeded_rows: Vec<(Option<remuda_protocol::EffortName>, Option<bool>)> = mapped
-            .iter()
-            .filter_map(|observation| match &observation.body {
-                ObservationPayload::Effort(payload) => {
-                    Some((payload.effective.name, payload.effective.ultracode))
-                }
-                _ => None,
-            })
-            .collect();
         assert!(
-            seeded_rows.iter().all(|(_, flag)| *flag != Some(false)),
-            "the seeded mapper never emits a flag-off regression: {seeded_rows:?}"
-        );
-        assert_eq!(
-            seeded_mapper.effort_seed(),
-            Some((
-                remuda_protocol::EffortName::High,
-                Some(true),
-                remuda_protocol::EffortSemantics::Decoupled
-            )),
-            "the latch stays {{High, ultracode on}} after the attachment-less record"
+            effort_seeds.contains_key(&(7, PUMP_SESSION.to_owned())),
+            "the production pump stored an effort seed for (pid, session)"
         );
 
-        // A CHANGE to a different level (max) rides the latched flag onto the
-        // new edge — this is the chip the review scenario actually reads.
-        let mut at_max = seeded_mapper;
-        let mut mapped_max: Vec<_> = at_max
-            .map_line(&assistant_line(Some("max"), 10))
-            .expect("line maps");
-        mapped_max.extend(at_max.flush().expect("flush"));
-        let max_rows: Vec<(Option<remuda_protocol::EffortName>, Option<bool>)> = mapped_max
-            .iter()
-            .filter_map(|observation| match &observation.body {
-                ObservationPayload::Effort(payload) => {
-                    Some((payload.effective.name, payload.effective.ultracode))
-                }
-                _ => None,
-            })
-            .collect();
-        assert!(
-            max_rows.iter().any(
-                |(name, flag)| *name == Some(remuda_protocol::EffortName::Max)
-                    && *flag == Some(true)
-            ),
-            "a level change carries the seeded ultracode flag onto the new edge: {max_rows:?}"
-        );
+        // Demote: the hydrator is dropped; the loop keeps the anchor + seed.
+        hydrator = None;
 
-        // The same high record on an UNSEEDED fresh mapper has no flag latch
-        // (regression baseline: pre-fix behaviour the seed replaces).
-        let mut unseeded = TranscriptMapper::new(
-            remuda_protocol::DriverKind::ShellPty,
-            fx.ctx.instance_id.clone(),
-            fx.ctx.run_id.clone(),
-            fx.ctx.journal_id.clone(),
-            fx.ctx.host_id.clone(),
-            PUMP_SESSION.to_owned(),
-            "promoted".to_owned(),
-        );
-        let mut mapped2: Vec<_> = unseeded
-            .map_line(&assistant_line(Some("high"), 9))
-            .expect("line maps");
-        mapped2.extend(unseeded.flush().expect("flush"));
-        let rows2: Vec<(Option<remuda_protocol::EffortName>, Option<bool>)> = mapped2
-            .iter()
-            .filter_map(|observation| match &observation.body {
-                ObservationPayload::Effort(payload) => {
-                    Some((payload.effective.name, payload.effective.ultracode))
-                }
-                _ => None,
-            })
-            .collect();
+        // After re-promotion the agent appends an attachment-less assistant at
+        // a NEW level. The reopened hydrator must carry the latched flag.
+        append_line(&fx.binding.path, &assistant_line(Some("max"), 10));
+
+        // Re-promote through the SAME production entry point.
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &found,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
+            Some(&bridge),
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            Some(ResumeMode::Fresh),
+            &mut read_anchors,
+            &mut effort_seeds,
+        )
+        .await;
+        assert!(hydrator.is_some(), "the re-promote opened a hydrator");
+        let second = drain(&mut fx);
         assert!(
-            rows2.iter().all(|(_, flag)| *flag != Some(true)),
-            "without the seed the latch is gone (regression baseline): {rows2:?}"
+            effort_rows(&second).iter().any(|(name, flag)| *name
+                == Some(remuda_protocol::EffortName::Max)
+                && *flag == Some(true)),
+            "the attachment-less max record carries the seeded ultracode flag: {:?}",
+            effort_rows(&second)
         );
     }
 

@@ -219,6 +219,7 @@ impl remuda_node::GateAuthorizer for StubAuthorizer {
         &'a self,
         _job_id: &'a str,
         _generation: u32,
+        _merge_sha: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = remuda_node::GateLandGrantAnswer> + Send + 'a>,
     > {

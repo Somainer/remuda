@@ -425,7 +425,12 @@ async fn list_all_jobs(
     let mut jobs = state.store.list_gate_jobs(None).await.map_err(map_store)?;
     jobs.retain(|job| scope.allows_project(job.project_id.as_id().as_str()));
     if query.active == Some(true) {
-        jobs.retain(|job| matches!(job.state, GateJobState::Queued | GateJobState::Running));
+        jobs.retain(|job| {
+            matches!(
+                job.state,
+                GateJobState::Queued | GateJobState::Running | GateJobState::Landing
+            )
+        });
     }
     if let Some(state_name) = query.state.as_deref() {
         jobs.retain(|job| job.state.as_str() == state_name);
@@ -706,11 +711,15 @@ async fn schedule(state: &AppState) -> Result<(), HubError> {
     if !jobs.iter().any(|job| job.state == GateJobState::Queued) {
         return Ok(());
     }
-    // Lane usage from running jobs.
+    // Lane usage from in-flight jobs. Landing is in-flight too: the granted
+    // push still owns the lane checkout, and a land still holds the project's
+    // single land slot until it reaches a terminal state. Counting only
+    // Running let the scheduler dispatch a second job onto the same checkout
+    // and start a second land while the first push was unresolved.
     let mut busy_lanes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut land_active: std::collections::HashSet<String> = std::collections::HashSet::new();
     for job in &jobs {
-        if job.state == GateJobState::Running {
+        if matches!(job.state, GateJobState::Running | GateJobState::Landing) {
             if let Some(lane) = &job.lane_id {
                 busy_lanes.insert(format!("{}:{lane}", job.project_id.as_id()));
             }
@@ -1004,6 +1013,18 @@ async fn fail_rpc_inner(state: &AppState, job_id: &str, expected_generation: u32
     let updated = state
         .store
         .mutate_gate_job(job_id, move |row| {
+            // Landing is an in-flight state: the grant already authorized the
+            // push and the lane child may be mid-push. A gate.run RPC error or
+            // timeout here cannot say the push failed (it may still complete),
+            // so the row stays Landing and is settled by the land verdict / a
+            // finished event / restart reconcile — never failed optimistically.
+            if row.state == GateJobState::Landing {
+                tracing::info!(
+                    expected_generation,
+                    "gate.run RPC failure during Landing; leaving the push to settle"
+                );
+                return None;
+            }
             if row.state != GateJobState::Running && row.state != GateJobState::Canceling {
                 return None;
             }
@@ -1119,8 +1140,23 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
     }
     if !matches!(
         existing.state,
-        GateJobState::Running | GateJobState::Canceling
+        GateJobState::Running | GateJobState::Canceling | GateJobState::Landing
     ) {
+        #[cfg(any(test, feature = "test-faults"))]
+        barrier.note_completed();
+        return;
+    }
+    // A Landing verdict settles the GRANTED attempt. It is accepted only when
+    // the row actually carries a grant marker (the session the grant was
+    // fenced to): a verdict that finds Landing but no `landingSessionEpoch`
+    // did not come through a real Running → Landing grant and is dropped.
+    // Host binding is enforced by `on_event` for finished events; the gate.run
+    // reply is structurally the dispatched host's call.
+    if existing.state == GateJobState::Landing && existing.landing_session_epoch.is_none() {
+        tracing::warn!(
+            job_id,
+            "dropping verdict for a Landing row with no granted session marker"
+        );
         #[cfg(any(test, feature = "test-faults"))]
         barrier.note_completed();
         return;
@@ -1194,18 +1230,14 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
     let outcome = state
         .store
         .mutate_gate_job(job_id, move |row| {
-            // The LIVE row is the authority. A land job in Canceling receives
-            // its base-moved verdict twice — the Node broadcasts `finished`
-            // AND returns it as the gate.run reply, and those travel through
-            // independent queues. Both calls pre-read Canceling; the first
-            // writer commits Canceled. Without this guard the second writer
-            // (whose loaded row is now terminal) would fall through to the
-            // base-moved branch below and requeue the Canceled land job — the
-            // next tick would dispatch gate.run again and a pushFrom-lane land
-            // could move main after the caller already held 200 canceling. The
-            // cancel-grace finisher can commit the same terminal write in this
-            // window. A terminal row never moves again; just stand down.
-            if !matches!(row.state, GateJobState::Running | GateJobState::Canceling) {
+            // The LIVE row is the authority. Running and Canceling are the
+            // pre-grant states; Landing is the granted in-flight push whose
+            // verdict (landed / failed / base-moved) settles the row below.
+            // Other (terminal) rows never move again.
+            if !matches!(
+                row.state,
+                GateJobState::Running | GateJobState::Canceling | GateJobState::Landing
+            ) {
                 return None;
             }
             // r11 item 3: the pre-read generation check can be stale after a
@@ -1218,6 +1250,66 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
                     "dropping gate verdict in writer for a non-current attempt"
                 );
                 return None;
+            }
+            // Landing: settle the GRANTED attempt's land verdict. Cancel is not
+            // grantable once Landing (the grant writer only takes Running), so
+            // there is no Canceling sub-case here. Idempotent on the dual
+            // finished-event/RPC-reply: the first arrival moves the row to a
+            // terminal state, after which the top guard stands the second down.
+            if row.state == GateJobState::Landing {
+                for step in &result.steps {
+                    match row
+                        .steps
+                        .iter()
+                        .position(|existing| existing.name == step.name)
+                    {
+                        Some(index) => row.steps[index] = step.clone(),
+                        None => row.steps.push(step.clone()),
+                    }
+                }
+                row.base_sha = result.base_sha.clone().or(row.base_sha.clone());
+                row.head_sha = result.head_sha.clone().or(row.head_sha.clone());
+                row.merge_sha = result.merge_sha.clone().or(row.merge_sha.clone());
+                row.merge_ref = result.merge_ref.clone().or(row.merge_ref.clone());
+                row.current_main_sha = result.current_main_sha.clone();
+                row.failed_step = result.failed_step.clone();
+                row.reason = result.reason.clone();
+                if let Some(object_id) = &log_object_id {
+                    row.log_object_id = Some(object_id.clone());
+                }
+                row.finished_at = Some(now_ts());
+                match result.status.as_str() {
+                    "landed" => {
+                        row.state = GateJobState::Landed;
+                        row.error = None;
+                    }
+                    "base-moved" if row.attempts < MAX_LAND_ATTEMPTS => {
+                        // The CAS lost: nothing was pushed. Re-queue a fresh
+                        // verify onto the new base under the same attempt cap.
+                        row.state = GateJobState::Queued;
+                        row.started_at = None;
+                        row.host_id = None;
+                        row.lane_id = None;
+                        row.landing_session_epoch = None;
+                        row.finished_at = None;
+                        row.current_main_sha = result.current_main_sha.clone();
+                        row.merge_ref = None;
+                        row.merge_sha = None;
+                        row.failed_step = None;
+                        row.reason = None;
+                        row.log_object_id = None;
+                    }
+                    other => {
+                        row.state = GateJobState::Failed;
+                        let error = result
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| format!("land ended after grant: {other}"));
+                        row.reason = Some(error.lines().next().unwrap_or(&error).to_owned());
+                        row.error = Some(error);
+                    }
+                }
+                return Some(());
             }
             // Re-read the live state inside the writer job: the pre-read
             // above can be stale by one cancel commit. Without this, a land
@@ -1920,6 +2012,109 @@ pub(crate) async fn reconcile(state: &AppState) {
             })
             .await;
     }
+    // A Landing row's granted push cannot be blindly re-run (a second push is
+    // the hazard the grant exists to prevent). Resolve it deterministically:
+    // confirm via the lane host that the granted merge is already on the remote
+    // base → landed; otherwise (host gone, fetch failed, non-ancestor) settle
+    // failed with an explicit indeterminate reason rather than leave the job
+    // landing forever.
+    let jobs = state.store.list_gate_jobs(None).await;
+    if let Ok(jobs) = jobs {
+        for job in jobs
+            .into_iter()
+            .filter(|job| job.state == GateJobState::Landing)
+        {
+            settle_landing_after_restart(state, &job).await;
+        }
+    }
+}
+
+/// Resolve one Landing row left by a restart. Best-effort read-only probe to
+/// the lane host, then a single terminal write.
+async fn settle_landing_after_restart(state: &AppState, job: &GateJob) {
+    let confirmed_landed = probe_landing_contained(state, job).await;
+    let job_id = job.id.as_id().to_string();
+    let outcome = state
+        .store
+        .mutate_gate_job(&job_id, move |row| {
+            if row.state != GateJobState::Landing {
+                return None;
+            }
+            row.home_land_in_flight = false;
+            row.landing_session_epoch = None;
+            row.finished_at = Some(now_ts());
+            if confirmed_landed {
+                row.state = GateJobState::Landed;
+                row.error = None;
+                if row.reason.is_none() {
+                    row.reason = Some("landed; confirmed on remote main after hub restart".into());
+                }
+            } else {
+                row.state = GateJobState::Failed;
+                let error =
+                    "landing outcome unknown after hub restart; the granted push was not confirmed \
+                     on the remote base (the job is not re-run automatically)";
+                row.error = Some(error.into());
+                row.reason = Some("failed; landing outcome unknown after hub restart".into());
+            }
+            Some(())
+        })
+        .await;
+    if let Ok(Some(settled)) = outcome {
+        if settled.state == GateJobState::Landed {
+            journal(state, &settled.requested_by, "gate.landed", &settled).await;
+            drop_job_refs(state, &settled).await;
+            run_then_hook(state, &settled).await;
+        } else {
+            journal(state, &settled.requested_by, "gate.failed", &settled).await;
+            drop_job_refs(state, &settled).await;
+        }
+    }
+}
+
+/// Ask the lane host (read-only) whether the granted merge is already on the
+/// remote base. False for host gone / probe error / non-ancestry.
+async fn probe_landing_contained(state: &AppState, job: &GateJob) -> bool {
+    let Some(merge_sha) = job.merge_sha.clone() else {
+        return false;
+    };
+    let Some(lane_id) = job.lane_id.clone() else {
+        return false;
+    };
+    let Ok(Some(project)) = state
+        .store
+        .get_project(job.project_id.as_id().to_string())
+        .await
+    else {
+        return false;
+    };
+    let Some(lane) = project.gate.lanes.iter().find(|lane| lane.id == lane_id) else {
+        return false;
+    };
+    let params = serde_json::to_value(remuda_protocol::GateResolveLandingParams {
+        job_id: job.id.as_id().to_string(),
+        repo_path: lane.repo_path.clone(),
+        base_branch: project.default_base_branch.clone(),
+        merge_sha,
+    })
+    .unwrap_or(Value::Null);
+    let reply = state
+        .nodes
+        .call(
+            lane.host_id.as_id().as_str(),
+            remuda_protocol::METHOD_GATE_RESOLVE_LANDING,
+            params,
+            Duration::from_secs(30),
+        )
+        .await;
+    matches!(
+        reply,
+        Ok(Some(frame)) if frame
+            .get("result")
+            .and_then(|result| result.get("status"))
+            .and_then(Value::as_str)
+            == Some("landed")
+    )
 }
 
 // ── store CRUD ─────────────────────────────────────────────────────────────
@@ -2598,10 +2793,12 @@ impl Store {
         host_id: &str,
         generation: u32,
         session_epoch: &str,
+        merge_sha: &str,
     ) -> Result<GateLandGrant, crate::store::StoreError> {
         let job_id = job_id.to_owned();
         let host_id = host_id.to_owned();
         let session_epoch = session_epoch.to_owned();
+        let merge_sha = merge_sha.to_owned();
         let host_id2 = host_id.clone();
         let session_epoch2 = session_epoch.clone();
         self.run_named("gate_land_grant", move |conn| {
@@ -2635,12 +2832,15 @@ impl Store {
                     landing_in_progress: same_gen > 0,
                 });
             }
-            // Conditional Running → Landing for exactly this tuple.
+            // Conditional Running → Landing for exactly this tuple. The grant
+            // also records the verified merge it authorizes, so a restart
+            // during the push can later confirm that exact commit on remote.
             let updated = conn.execute(
                 "UPDATE gate_jobs
-                    SET doc_json = json_set(json_set(doc_json,
+                    SET doc_json = json_set(json_set(json_set(doc_json,
                             '$.state', 'landing'),
                             '$.landingSessionEpoch', ?2),
+                            '$.mergeSha', ?6),
                         state = 'landing',
                         revision = revision + 1,
                         updated_at = ?3
@@ -2648,7 +2848,7 @@ impl Store {
                     AND json_extract(doc_json,'$.state') = 'running'
                     AND json_extract(doc_json,'$.attempts') = ?4
                     AND json_extract(doc_json,'$.hostId') = ?5",
-                params![job_id, session_epoch, now, generation, host_id],
+                params![job_id, session_epoch, now, generation, host_id, merge_sha],
             )?;
             if updated > 0 {
                 return Ok(GateLandGrant {

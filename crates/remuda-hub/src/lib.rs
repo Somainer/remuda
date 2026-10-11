@@ -683,6 +683,26 @@ impl RunningHub {
         Ok(job.map(|job| serde_json::to_value(job).expect("gate job serializes")))
     }
 
+    /// Test-only: the ordered audit-log actions recorded for one gate job id
+    /// (e.g. `gate.running`, `gate.landed`).
+    #[doc(hidden)]
+    pub async fn test_gate_audit_actions(&self, job_id: &str) -> anyhow::Result<Vec<String>> {
+        let rows = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .audit_for(job_id.to_owned())
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                row.get("action")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
+            .collect())
+    }
+
     /// Test-only: run the §7.5 direct-op admission (check + `admitted` row)
     /// without a live Node, for worker.provision/remove coverage while the
     /// worker routes themselves stay Agent-403 (ma-admission opens them).

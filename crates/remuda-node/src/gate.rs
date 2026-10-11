@@ -20,9 +20,9 @@
 use crate::DevNode;
 use crate::NodeError;
 use remuda_protocol::{
-    GateCancelParams, GateEventKind, GateEventParams, GateLandParams, GateLandResult, GateRunLog,
-    GateRunParams, GateRunResult, GateStep, GateThenParams, GateThenResult, GateUnpinParams,
-    GateUnpinResult,
+    GateCancelParams, GateEventKind, GateEventParams, GateLandParams, GateLandResult,
+    GateResolveLandingParams, GateResolveLandingResult, GateRunLog, GateRunParams, GateRunResult,
+    GateStep, GateThenParams, GateThenResult, GateUnpinParams, GateUnpinResult,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -613,11 +613,13 @@ pub trait GateAuthorizer: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
 
     /// Ask the Hub to transition Running → Landing before the push. Any
-    /// error/timeout/refusal must be treated as not granted.
+    /// error/timeout/refusal must be treated as not granted. `merge_sha` is
+    /// the verified merge this grant authorizes (recorded on the Landing row).
     fn request_land_grant<'a>(
         &'a self,
         job_id: &'a str,
         generation: u32,
+        merge_sha: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = LandGrantAnswer> + Send + 'a>>;
 }
 
@@ -718,12 +720,17 @@ impl GateRegistry {
     /// never-attached direct/dev caller the local floor grants (tests); on a
     /// live/attached carrier any non-grant/refusal/timeout is a refusal and
     /// the push must not happen.
-    async fn hub_land_grant(&self, job_id: &str, generation: u32) -> LandGrantAnswer {
+    async fn hub_land_grant(
+        &self,
+        job_id: &str,
+        generation: u32,
+        merge_sha: &str,
+    ) -> LandGrantAnswer {
         let authorizer = self.authorizer.read().await.clone();
         match authorizer {
             Some(authorizer) => tokio::time::timeout(
                 Duration::from_secs(5),
-                authorizer.request_land_grant(job_id, generation),
+                authorizer.request_land_grant(job_id, generation, merge_sha),
             )
             .await
             .unwrap_or(LandGrantAnswer {
@@ -923,6 +930,9 @@ impl DevNode {
             remuda_protocol::METHOD_GATE_THEN => self.run_gate_then(params).await,
             remuda_protocol::METHOD_GATE_LAND => self.run_gate_land(params).await,
             remuda_protocol::METHOD_GATE_UNPIN => self.run_gate_unpin(params).await,
+            remuda_protocol::METHOD_GATE_RESOLVE_LANDING => {
+                self.run_gate_resolve_landing(params).await
+            }
             other => Err(NodeError::InvalidRequest(format!(
                 "not a gate method: {other}"
             ))),
@@ -1009,6 +1019,23 @@ impl DevNode {
             removed,
         })
         .map_err(NodeError::from)
+    }
+
+    /// Handle `gate.resolveLanding` — read-only post-restart probe: is the
+    /// granted merge already an ancestor of the remote base branch? Never
+    /// pushes; `unknown` is the honest answer when it cannot confirm.
+    pub(crate) async fn run_gate_resolve_landing(
+        &self,
+        params: &Value,
+    ) -> Result<Value, NodeError> {
+        let request: GateResolveLandingParams =
+            serde_json::from_value(params.clone()).map_err(|error| {
+                NodeError::InvalidRequest(format!("invalid gate.resolveLanding params: {error}"))
+            })?;
+        let result = tokio::task::spawn_blocking(move || resolve_landing_after_restart(&request))
+            .await
+            .map_err(|error| NodeError::InvalidRequest(format!("resolveLanding join: {error}")))?;
+        serde_json::to_value(result).map_err(NodeError::from)
     }
 
     /// The `pushFrom: home` land: obtain the verified merge commit from the
@@ -1509,7 +1536,11 @@ impl DevNode {
                 }
             }
             let grant = registry
-                .hub_land_grant(&request.job_id, request.generation)
+                .hub_land_grant(
+                    &request.job_id,
+                    request.generation,
+                    result.merge_sha.as_deref().unwrap_or(""),
+                )
                 .await;
             if !grant.granted {
                 let why = "land not granted (canceled/stale/session changed); not pushed";
@@ -2157,6 +2188,56 @@ fn block_git(repo: &Path, args: &[&str]) -> Result<String, String> {
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<(), String> {
     block_git(repo, args).map(|_| ())
+}
+
+/// Read-only post-restart landing resolution. Fetches the remote base branch
+/// and reports `landed` only when the granted merge is already an ancestor of
+/// `origin/<base>`. Any fetch/parse failure or non-ancestry is `unknown` — it
+/// never pushes and never asserts a push that cannot be proven.
+fn resolve_landing_after_restart(request: &GateResolveLandingParams) -> GateResolveLandingResult {
+    let repo = PathBuf::from(&request.repo_path);
+    let unknown = |error: String| GateResolveLandingResult {
+        job_id: request.job_id.clone(),
+        status: "unknown".into(),
+        base_sha: None,
+        error: Some(error),
+    };
+    if request.merge_sha.trim().is_empty() {
+        return unknown("no granted merge sha recorded".into());
+    }
+    if let Err(error) = block_git(&repo, &["fetch", "-q", "origin"]) {
+        return unknown(format!("fetch origin: {error}"));
+    }
+    let remote_base = format!("origin/{}", request.base_branch);
+    let base_sha = match block_git(&repo, &["rev-parse", &remote_base]) {
+        Ok(sha) => sha,
+        Err(error) => return unknown(format!("resolve {remote_base}: {error}")),
+    };
+    // merge-base --is-ancestor exits 0 iff merge_sha is reachable from the
+    // remote base — i.e. the granted push actually landed there.
+    match std::process::Command::new("git")
+        .current_dir(&repo)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            &request.merge_sha,
+            &remote_base,
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .status()
+    {
+        Ok(status) if status.success() => GateResolveLandingResult {
+            job_id: request.job_id.clone(),
+            status: "landed".into(),
+            base_sha: Some(base_sha),
+            error: None,
+        },
+        Ok(_) => unknown(format!(
+            "{} is not an ancestor of {remote_base}; push outcome unknown",
+            request.merge_sha
+        )),
+        Err(error) => unknown(format!("merge-base: {error}")),
+    }
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> Result<String, String> {

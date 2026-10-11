@@ -31,6 +31,16 @@ struct RunSpec {
     reason: Option<&'static str>,
     run_log: Option<Value>,
     steps: Option<Value>,
+    /// Production lane-land path: before returning a `landed` verdict the
+    /// scripted Node asks the Hub for the Running → Landing grant over the
+    /// carrier (gate.landGrant), exactly as the real Node does. A refusal
+    /// makes the scripted run return `canceled` (the real Node never pushes).
+    land_grant: bool,
+    /// When set with `land_grant`, the run parks AFTER the grant is granted
+    /// (the row is Landing) and before it returns the landed verdict, until
+    /// `landing_hold` is released — so a test can assert a second job is not
+    /// dispatched while the first still owns the lane/push.
+    hold_while_landing: bool,
 }
 
 impl Default for RunSpec {
@@ -49,6 +59,8 @@ impl Default for RunSpec {
             reason: None,
             run_log: None,
             steps: None,
+            land_grant: false,
+            hold_while_landing: false,
         }
     }
 }
@@ -72,6 +84,17 @@ struct ScriptState {
     land_started: Arc<Notify>,
     /// Observed gate.unpin params (ref cleanup).
     unpin_calls: Mutex<Vec<Value>>,
+    /// Observed gate.landGrant answers (the production Running → Landing fence).
+    grant_answers: Mutex<Vec<Value>>,
+    /// When set, a run that took the land grant parks here while Landing until
+    /// released; `landing_started` fires once it has parked.
+    landing_hold: Mutex<Option<Arc<Notify>>>,
+    landing_started: Arc<Notify>,
+    /// Configured answer to gate.resolveLanding (post-restart probe). Absent
+    /// → the scripted lane answers `unknown` (cannot confirm without a repo).
+    resolve_landing_reply: Mutex<Option<Value>>,
+    /// Observed gate.resolveLanding probes.
+    resolve_calls: Mutex<Vec<Value>>,
     /// Node→Hub request counter (ids must be unique).
     seq: Mutex<u64>,
 }
@@ -216,6 +239,16 @@ async fn enroll(
                         format!("refs/remuda/gate/{job}.branch"),
                     ]})
                 }
+                "gate.resolveLanding" => {
+                    let job = params["jobId"].as_str().unwrap_or("").to_string();
+                    script.resolve_calls.lock().unwrap().push(params);
+                    script
+                        .resolve_landing_reply
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| json!({"jobId": job, "status": "unknown"}))
+                }
                 _ => json!({"ok": true}),
             };
             let response = json!({"jsonrpc":"2.0","id":id,"result":result});
@@ -354,14 +387,112 @@ async fn run_one_inline(script: &Arc<ScriptState>, params: &Value, node: &mut La
             }
         }
     }
-    result_json(
-        &job_id,
-        &spec,
-        params
-            .get("generation")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32,
-    )
+    let generation = params
+        .get("generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    // Production lane-land path: take the Running → Landing grant before the
+    // push, exactly as the real Node does at the verify→land boundary.
+    let mut status = spec.status;
+    if spec.land_grant {
+        let grant_id = {
+            let mut seq = script.seq.lock().unwrap();
+            *seq += 1;
+            format!("grant-{seq}")
+        };
+        let grant_frame = json!({
+            "jsonrpc": "2.0", "id": grant_id, "method": "gate.landGrant",
+            "params": {
+                "jobId": job_id,
+                "generation": generation,
+                "hostId": "scripted-lane",
+                "sessionEpoch": "sess-1",
+                "mergeSha": spec.merge_sha.unwrap_or(""),
+            },
+        });
+        node.send(Message::Text(grant_frame.to_string().into()))
+            .await
+            .unwrap();
+        // Bounded wait for the grant answer on this same socket, acks for any
+        // interleaved frame notwithstanding.
+        let answer = async {
+            loop {
+                let frame = tokio::time::timeout(Duration::from_secs(8), node.next())
+                    .await
+                    .expect("grant answer timed out")
+                    .expect("socket closed")
+                    .expect("text frame");
+                let frame: Value = match frame {
+                    Message::Text(text) => serde_json::from_str(&text).unwrap_or(json!({})),
+                    other => panic!("unexpected frame {other:?}"),
+                };
+                if frame.get("id").and_then(Value::as_str) == Some(grant_id.as_str()) {
+                    break frame.get("result").cloned().unwrap_or(json!({}));
+                }
+            }
+        }
+        .await;
+        script.grant_answers.lock().unwrap().push(answer.clone());
+        if answer.get("granted").and_then(Value::as_bool) != Some(true) {
+            // A refused grant means the real Node never pushes.
+            status = "canceled";
+        } else if spec.hold_while_landing {
+            // The row is now Landing; park before the landed verdict. Keep
+            // pumping the carrier while parked: a real Node's land child runs
+            // while its RPC pump is free, so a post-restart resolveLanding (or
+            // any other Hub RPC) must still be answered here.
+            script.landing_started.notify_waiters();
+            let gate = script.landing_hold.lock().unwrap().clone();
+            let parked = async {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+            };
+            tokio::pin!(parked);
+            loop {
+                tokio::select! {
+                    _ = &mut parked => break,
+                    frame = node.next() => {
+                        let Some(Ok(Message::Text(text))) = frame else { break };
+                        let frame: Value = serde_json::from_str(&text).unwrap_or(json!({}));
+                        let Some(fid) = frame.get("id").cloned() else { continue };
+                        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+                        let in_params = frame.get("params").cloned().unwrap_or(json!({}));
+                        let result = match method {
+                            "gate.resolveLanding" => {
+                                let job = in_params["jobId"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string();
+                                script.resolve_calls.lock().unwrap().push(in_params);
+                                script
+                                    .resolve_landing_reply
+                                    .lock()
+                                    .unwrap()
+                                    .clone()
+                                    .unwrap_or_else(|| {
+                                        json!({"jobId": job, "status": "unknown"})
+                                    })
+                            }
+                            _ => json!({"ok": true}),
+                        };
+                        let reply =
+                            json!({"jsonrpc":"2.0","id":fid,"result":result});
+                        if node.send(Message::Text(reply.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut result = result_json(&job_id, &spec, generation as u32);
+    if status != spec.status {
+        result["status"] = json!(status);
+    }
+    result
 }
 
 // ── test harness ───────────────────────────────────────────────────────────
@@ -1604,5 +1735,219 @@ async fn unknown_lane_and_bad_inputs_are_rejected() -> Result<()> {
         )
         .await;
     assert_eq!(status, 400);
+    Ok(())
+}
+
+/// r12 item 1: a real pushFrom-lane land takes the Running → Landing GRANT
+/// over the carrier before it pushes, then settles `landed` with a
+/// `gate.landed` journal and drops its pinned refs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lane_land_takes_the_grant_and_settles_landed() -> Result<()> {
+    let ctx = Ctx::spawn(1).await?;
+    ctx.scripts[0].script(
+        "wt/land/grant",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("4444444444444444444444444444444444444444"),
+            merge_ref: Some("refs/remuda/gate/grant"),
+            land_grant: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/grant","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap();
+    let landed = ctx.wait_state(id, &["landed", "failed", "canceled"]).await;
+    assert_eq!(landed["state"], "landed", "{landed}");
+
+    let answers = ctx.scripts[0].grant_answers.lock().unwrap().clone();
+    assert_eq!(answers.len(), 1, "one land grant request: {answers:?}");
+    assert_eq!(answers[0]["granted"], true, "{answers:?}");
+
+    let actions = ctx.hub.test_gate_audit_actions(id).await?;
+    assert!(
+        actions.iter().any(|action| action == "gate.landed"),
+        "gate.landed journaled: {actions:?}"
+    );
+    assert!(
+        !ctx.scripts[0].unpin_calls.lock().unwrap().is_empty(),
+        "pinned refs dropped after landing"
+    );
+    Ok(())
+}
+
+/// r12 item 1: while one land is Landing it still owns its lane and the
+/// project's single land slot — a second queued land is not dispatched onto
+/// the same checkout, and runs exactly once after the first lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_second_dispatch_while_the_first_is_landing() -> Result<()> {
+    let ctx = Ctx::spawn(1).await?;
+    let hold = Arc::new(Notify::new());
+    *ctx.scripts[0].landing_hold.lock().unwrap() = Some(hold.clone());
+    ctx.scripts[0].script(
+        "wt/land/first",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("5555555555555555555555555555555555555555"),
+            merge_ref: Some("refs/remuda/gate/first"),
+            land_grant: true,
+            hold_while_landing: true,
+            ..RunSpec::default()
+        },
+    );
+    ctx.scripts[0].script(
+        "wt/land/second",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("6666666666666666666666666666666666666666"),
+            merge_ref: Some("refs/remuda/gate/second"),
+            land_grant: true,
+            ..RunSpec::default()
+        },
+    );
+    let job1 = ctx
+        .enqueue(json!({"branch":"wt/land/first","mode":"land"}))
+        .await;
+    let id1 = job1["id"].as_str().unwrap().to_owned();
+    // Wait until job1 is genuinely Landing (grant held).
+    let landing = ctx.wait_state(&id1, &["landing"]).await;
+    assert_eq!(landing["state"], "landing", "{landing}");
+
+    let job2 = ctx
+        .enqueue(json!({"branch":"wt/land/second","mode":"land"}))
+        .await;
+    let id2 = job2["id"].as_str().unwrap().to_owned();
+
+    // Bounded negative window: job2 must not be dispatched while job1 is
+    // Landing, and job1 must have been dispatched exactly once.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    {
+        let arrivals = ctx.scripts[0].arrivals.lock().unwrap();
+        let count_for = |wanted: &str| {
+            arrivals
+                .iter()
+                .filter(|a| a["jobId"].as_str() == Some(wanted))
+                .count()
+        };
+        assert_eq!(
+            count_for(&id2),
+            0,
+            "job2 dispatched during Landing: {arrivals:?}"
+        );
+        assert_eq!(
+            count_for(&id1),
+            1,
+            "job1 dispatched more than once: {arrivals:?}"
+        );
+    }
+
+    // Release the granted push; job1 lands, then job2 is dispatched and lands.
+    hold.notify_waiters();
+    let l1 = ctx.wait_state(&id1, &["landed", "failed"]).await;
+    assert_eq!(l1["state"], "landed", "{l1}");
+    let l2 = ctx.wait_state(&id2, &["landed", "failed"]).await;
+    assert_eq!(l2["state"], "landed", "{l2}");
+
+    let arrivals = ctx.scripts[0].arrivals.lock().unwrap();
+    let count_for = |wanted: &str| {
+        arrivals
+            .iter()
+            .filter(|a| a["jobId"].as_str() == Some(wanted))
+            .count()
+    };
+    assert_eq!(count_for(&id1), 1);
+    assert_eq!(
+        count_for(&id2),
+        1,
+        "job2 ran exactly once after Landing cleared"
+    );
+    Ok(())
+}
+
+/// r12 item 1: a Hub restart with a Landing row it CANNOT confirm settles the
+/// job failed with an explicit indeterminate reason (never re-run, never
+/// landing forever); a later `landed` verdict is ignored against the terminal
+/// row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_landing_unconfirmed_settles_failed_indeterminate() -> Result<()> {
+    let ctx = Ctx::spawn(1).await?;
+    let hold = Arc::new(Notify::new());
+    *ctx.scripts[0].landing_hold.lock().unwrap() = Some(hold.clone());
+    ctx.scripts[0].script(
+        "wt/land/restart-unknown",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("7777777777777777777777777777777777777777"),
+            land_grant: true,
+            hold_while_landing: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/restart-unknown","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap().to_owned();
+    ctx.wait_state(&id, &["landing"]).await;
+
+    ctx.hub.test_reconcile().await;
+    let settled = ctx.wait_state(&id, &["failed", "landed"]).await;
+    assert_eq!(settled["state"], "failed", "{settled}");
+    let reason = settled["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("outcome unknown"),
+        "indeterminate reason: {reason}"
+    );
+    assert_eq!(ctx.scripts[0].resolve_calls.lock().unwrap().len(), 1);
+
+    // The granted child now reports landed, but the row is terminal and must
+    // not flip.
+    hold.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after = ctx.job(&id).await;
+    assert_eq!(
+        after["state"], "failed",
+        "late landed verdict changed the row: {after}"
+    );
+    Ok(())
+}
+
+/// r12 item 1: a Hub restart with a Landing row whose granted merge the lane
+/// confirms is already on the remote base settles `landed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_landing_confirmed_on_remote_settles_landed() -> Result<()> {
+    let ctx = Ctx::spawn(1).await?;
+    let hold = Arc::new(Notify::new());
+    *ctx.scripts[0].landing_hold.lock().unwrap() = Some(hold.clone());
+    *ctx.scripts[0].resolve_landing_reply.lock().unwrap() = Some(json!({
+        "jobId": "ignored",
+        "status": "landed",
+        "baseSha": "8888888888888888888888888888888888888888"
+    }));
+    ctx.scripts[0].script(
+        "wt/land/restart-landed",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("8888888888888888888888888888888888888888"),
+            land_grant: true,
+            hold_while_landing: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/restart-landed","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap().to_owned();
+    ctx.wait_state(&id, &["landing"]).await;
+
+    ctx.hub.test_reconcile().await;
+    let settled = ctx.wait_state(&id, &["landed", "failed"]).await;
+    assert_eq!(settled["state"], "landed", "{settled}");
+    let actions = ctx.hub.test_gate_audit_actions(&id).await?;
+    assert!(
+        actions.iter().any(|action| action == "gate.landed"),
+        "confirmed restart settlement journals gate.landed: {actions:?}"
+    );
+    hold.notify_waiters();
     Ok(())
 }

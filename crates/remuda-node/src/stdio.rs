@@ -76,6 +76,7 @@ impl StdioGateAuthorizer {
         method: &'static str,
         job_id: &str,
         generation: u32,
+        merge_sha: &str,
     ) -> Result<Value, NodeError> {
         let (tx, rx) = oneshot::channel();
         let id = format!(
@@ -92,6 +93,7 @@ impl StdioGateAuthorizer {
                 "generation": generation,
                 "hostId": Value::Null,
                 "sessionEpoch": epoch,
+                "mergeSha": merge_sha,
             },
         });
         self.tx
@@ -117,7 +119,12 @@ impl crate::gate::GateAuthorizer for StdioGateAuthorizer {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
             match self
-                .call(remuda_protocol::METHOD_GATE_AUTHORIZE, job_id, generation)
+                .call(
+                    remuda_protocol::METHOD_GATE_AUTHORIZE,
+                    job_id,
+                    generation,
+                    "",
+                )
                 .await
             {
                 Ok(value) => value.get("authorized").and_then(Value::as_bool) == Some(true),
@@ -130,12 +137,18 @@ impl crate::gate::GateAuthorizer for StdioGateAuthorizer {
         &'a self,
         job_id: &'a str,
         generation: u32,
+        merge_sha: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = crate::gate::LandGrantAnswer> + Send + 'a>,
     > {
         Box::pin(async move {
             match self
-                .call(remuda_protocol::METHOD_GATE_LAND_GRANT, job_id, generation)
+                .call(
+                    remuda_protocol::METHOD_GATE_LAND_GRANT,
+                    job_id,
+                    generation,
+                    merge_sha,
+                )
                 .await
             {
                 Ok(value) => crate::gate::LandGrantAnswer {

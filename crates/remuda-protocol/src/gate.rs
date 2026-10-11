@@ -32,6 +32,11 @@ pub const METHOD_GATE_THEN: &str = "gate.then";
 pub const METHOD_GATE_LAND: &str = "gate.land";
 /// Hub→Node (lane host): drop a job's persisted merge refs.
 pub const METHOD_GATE_UNPIN: &str = "gate.unpin";
+/// Hub→Node (lane host): after a Hub restart with a job left `landing`, ask
+/// the lane whether the granted merge is already an ancestor of the remote
+/// base branch (so the push in fact landed) or whether the outcome is unknown.
+/// Read-only: it never pushes.
+pub const METHOD_GATE_RESOLVE_LANDING: &str = "gate.resolveLanding";
 
 /// Every Hub→Node gate RPC (stdio allowlist predicate helper).
 #[must_use]
@@ -43,6 +48,7 @@ pub fn is_gate_call(method: &str) -> bool {
             | METHOD_GATE_THEN
             | METHOD_GATE_LAND
             | METHOD_GATE_UNPIN
+            | METHOD_GATE_RESOLVE_LANDING
     )
 }
 
@@ -618,6 +624,11 @@ pub struct GateLandGrantParams {
     /// delivered to a replacement session must not match.
     #[serde(default)]
     pub session_epoch: String,
+    /// The verified merge commit this grant authorizes to push. Recorded on
+    /// the Landing row so a Hub restart during the push can later confirm
+    /// whether that exact merge reached the remote base.
+    #[serde(default)]
+    pub merge_sha: String,
 }
 
 /// Result of a land-grant request.
@@ -760,6 +771,42 @@ pub struct GateUnpinResult {
     /// Refs actually deleted.
     #[serde(default)]
     pub removed: Vec<String>,
+}
+
+/// `gate.resolveLanding` params: a read-only probe after a Hub restart left a
+/// job `landing`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateResolveLandingParams {
+    /// Job whose granted push is being resolved.
+    pub job_id: String,
+    /// Lane checkout the merge was pushed from.
+    pub repo_path: String,
+    /// Base branch the CAS advanced (`main`).
+    #[serde(default = "default_base_branch")]
+    pub base_branch: String,
+    /// The merge commit the grant was for; the remote base must contain it for
+    /// the outcome to count as landed.
+    pub merge_sha: String,
+}
+
+/// `gate.resolveLanding` verdict. `landed` means the remote base already
+/// contains the granted merge; `unknown` means it could not be confirmed
+/// (host unreachable, fetch failed, or the merge is not an ancestor), so the
+/// Hub must not claim the push succeeded.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateResolveLandingResult {
+    /// Job id echoed back.
+    pub job_id: String,
+    /// `landed` | `unknown`.
+    pub status: String,
+    /// Base-branch sha observed (when known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sha: Option<String>,
+    /// Why the outcome could not be confirmed (status `unknown`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[cfg(test)]

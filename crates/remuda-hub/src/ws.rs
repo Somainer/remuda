@@ -889,6 +889,7 @@ pub(crate) async fn handle_node_method(
                     host_id.as_str(),
                     typed.generation,
                     &typed.session_epoch,
+                    &typed.merge_sha,
                 )
                 .await
                 .map_err(crate::http::map_store)?;

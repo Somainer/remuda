@@ -32,6 +32,7 @@ struct DaemonGateAuth {
     method: &'static str,
     job_id: String,
     generation: u32,
+    merge_sha: String,
     reply: oneshot::Sender<Result<Value, NodeError>>,
 }
 
@@ -52,6 +53,7 @@ impl DaemonGateAuthorizer {
         method: &'static str,
         job_id: &str,
         generation: u32,
+        merge_sha: &str,
     ) -> Result<Value, NodeError> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -59,6 +61,7 @@ impl DaemonGateAuthorizer {
                 method,
                 job_id: job_id.to_owned(),
                 generation,
+                merge_sha: merge_sha.to_owned(),
                 reply: tx,
             })
             .await
@@ -78,7 +81,7 @@ impl crate::GateAuthorizer for DaemonGateAuthorizer {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
             matches!(
-                self.call(remuda_protocol::METHOD_GATE_AUTHORIZE, job_id, generation)
+                self.call(remuda_protocol::METHOD_GATE_AUTHORIZE, job_id, generation, "")
                     .await,
                 Ok(value) if value.get("authorized").and_then(Value::as_bool) == Some(true)
             )
@@ -89,11 +92,17 @@ impl crate::GateAuthorizer for DaemonGateAuthorizer {
         &'a self,
         job_id: &'a str,
         generation: u32,
+        merge_sha: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::GateLandGrantAnswer> + Send + 'a>>
     {
         Box::pin(async move {
             match self
-                .call(remuda_protocol::METHOD_GATE_LAND_GRANT, job_id, generation)
+                .call(
+                    remuda_protocol::METHOD_GATE_LAND_GRANT,
+                    job_id,
+                    generation,
+                    merge_sha,
+                )
                 .await
             {
                 Ok(value) => crate::GateLandGrantAnswer {
@@ -796,6 +805,7 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                         "generation": auth.generation,
                         "hostId": node.host().meta.id.as_id().to_string(),
                         "sessionEpoch": format!("daemon:{generation}"),
+                        "mergeSha": auth.merge_sha,
                     },
                 });
                 tokio::select! {

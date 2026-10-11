@@ -171,6 +171,7 @@ struct GateAuthJob {
     method: &'static str,
     job_id: String,
     generation: u32,
+    merge_sha: String,
     session_epoch: Option<String>,
     reply: oneshot::Sender<Result<Value, NodeError>>,
 }
@@ -192,6 +193,7 @@ impl WssGateAuthorizer {
         method: &'static str,
         job_id: &str,
         generation: u32,
+        merge_sha: &str,
     ) -> Result<Value, NodeError> {
         let session_epoch = self.epoch.lock().ok().and_then(|e| e.clone());
         let (tx, rx) = oneshot::channel();
@@ -200,6 +202,7 @@ impl WssGateAuthorizer {
                 method,
                 job_id: job_id.to_owned(),
                 generation,
+                merge_sha: merge_sha.to_owned(),
                 session_epoch,
                 reply: tx,
             })
@@ -220,7 +223,12 @@ impl crate::gate::GateAuthorizer for WssGateAuthorizer {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
             match self
-                .call(remuda_protocol::METHOD_GATE_AUTHORIZE, job_id, generation)
+                .call(
+                    remuda_protocol::METHOD_GATE_AUTHORIZE,
+                    job_id,
+                    generation,
+                    "",
+                )
                 .await
             {
                 Ok(value) => value.get("authorized").and_then(Value::as_bool) == Some(true),
@@ -233,12 +241,18 @@ impl crate::gate::GateAuthorizer for WssGateAuthorizer {
         &'a self,
         job_id: &'a str,
         generation: u32,
+        merge_sha: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = crate::gate::LandGrantAnswer> + Send + 'a>,
     > {
         Box::pin(async move {
             match self
-                .call(remuda_protocol::METHOD_GATE_LAND_GRANT, job_id, generation)
+                .call(
+                    remuda_protocol::METHOD_GATE_LAND_GRANT,
+                    job_id,
+                    generation,
+                    merge_sha,
+                )
                 .await
             {
                 Ok(value) => crate::gate::LandGrantAnswer {
@@ -984,6 +998,7 @@ async fn session_task(
                         "generation": auth.generation,
                         "hostId": node_host_id(runtime.as_ref()),
                         "sessionEpoch": auth.session_epoch,
+                        "mergeSha": auth.merge_sha,
                     }),
                 );
                 match send_ws(&mut stream, &frame).await {

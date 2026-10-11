@@ -2221,7 +2221,29 @@ async fn fake_node(
                         };
                     append_n =
                         append_native_status(&mut ws, &instance_id, append_n, next_status).await?;
-                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                    // The user message + status were just journal.append'd and
+                    // each frame's durable ack awaited, so the command is
+                    // durably enqueued. A real Node (DevNode::enqueue_existing)
+                    // calls accept_command and replies with
+                    // `{accepted:true, command:{state:"accepted", commandId}}`
+                    // — the hub marks the row accepted from the RPC itself.
+                    // The previous bare `{ok:true}` left node_accepted() false
+                    // and relied solely on the mirrored journal to converge the
+                    // row, which raced the client's immediate post-reconnect
+                    // read under load (offline-outbox reload flake).
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({
+                            "ok": true,
+                            "accepted": true,
+                            "command": {
+                                "state": "accepted",
+                                "commandId": command_id.unwrap_or(""),
+                            }
+                        }),
+                    )
+                    .await?;
                 }
                 "instance.cancel" => {
                     // §5.3: the turn ends but the instance keeps running.

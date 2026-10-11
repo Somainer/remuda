@@ -1494,18 +1494,33 @@ async fn prepare_prompt_write(
     // later result popped the phantom in result_settles_root and a deferred
     // settle it blocked was never released. Parked here, no book entry exists
     // yet, so an abort leaves nothing behind.
+    //
+    // ma-sdk-state r11 item 2: this mutex is the ADMISSION GATE. It is held
+    // continuously until the book entry is opened AND the Reserve ticket has
+    // been inserted — one atomic admission relative to natural-stdout-EOF
+    // sealing (which sets `closed` and enqueues StdoutEof from this same
+    // critical section in map_loop). A reservation either inserts its ticket
+    // BEFORE sealing (everything it emits, including a write failure's
+    // rollback correction, is ordered ahead of StdoutEof) or loses the race
+    // and is rejected here having opened nothing — including a caller that
+    // cloned the sender earlier, since the sender is no longer used outside
+    // this section.
     #[cfg(feature = "test-stub")]
     test_barrier::note_publish_lock_wait(&inner.barrier);
-    let publisher = inner.publish.lock().await.clone();
-    let Some(publisher) = publisher.as_ref() else {
+    let mut admission = inner.publish.lock().await;
+    if inner.closed.load(Ordering::SeqCst) {
         return Err(DriverError::ControlUnavailable);
-    };
+    }
+    if admission.is_none() {
+        return Err(DriverError::ControlUnavailable);
+    }
 
     // Open the book entry and enqueue its Reserve ticket with NO await between
-    // the two: the mapper await is fully before the entry exists, and the
-    // unbounded send is synchronous, so once the entry exists the ticket that
-    // owns it is already queued (or the send failed and the entry is rolled
-    // back inline below).
+    // opening and insertion WHILE holding admission: the mapper await is the
+    // only await, and EOF sealing cannot enter until this section releases the
+    // gate, so once the entry exists the ticket that owns it is already queued
+    // ahead of any StdoutEof (or the send failed and the entry is rolled back
+    // below before the gate is released).
     let reservation = {
         let mut mapper = inner.mapper.lock().await;
         let seq = mapper.begin_turn_reservation();
@@ -1515,12 +1530,19 @@ async fn prepare_prompt_write(
     // move into the detached completion task.
     let mut guard = Some(ReservationGuard::new(inner.clone(), reservation.clone()));
 
-    if publisher
+    let send_failed = admission
+        .as_ref()
+        .expect("admission checked above")
         .send(PublishJob::Reserve {
             reservation: reservation.clone(),
         })
-        .is_err()
-    {
+        .is_err();
+    // Admission is decided: release the gate before the (mapper-locked)
+    // rollback so a sealed/closed channel never parks the EOF sealer or close
+    // behind this caller's cleanup. The ticket was never inserted, so ordering
+    // owes nothing.
+    drop(admission);
+    if send_failed {
         // The publisher is closed (close in progress): no worker will ever
         // visit this ticket. Roll the just-opened entry back directly.
         guard.take().unwrap().fail_without_ticket().await;
@@ -1636,10 +1658,23 @@ async fn map_loop(
             test_barrier::note_frame_enqueued(&inner.barrier);
         }
     }
-    // Child stdout reached EOF. Enqueue the exit BEHIND every already-queued
-    // frame so `exited` is always the last published observation; the worker
-    // drains the queue and reaches this even while close is reaping.
-    let _ = publisher.send(PublishJob::StdoutEof);
+    // Child stdout reached EOF. Seal reservation admission and enqueue the
+    // exit as ONE critical section under the publication mutex (ma-sdk-state
+    // r11 item 2): prepare_prompt_write holds that same mutex from its seal
+    // check through book creation and ticket insertion, so a reservation can
+    // never queue a Reserve ticket BEHIND this StdoutEof. Either the ticket
+    // (and therefore its start/write-failure rollback) is fully ahead of the
+    // EOF in publication order, or the reservation is rejected having opened
+    // nothing. `closed` is set here, not only by explicit close: a prompt sent
+    // after the child's natural exit can never start a turn.
+    let mut gate = inner.publish.lock().await;
+    inner.closed.store(true, Ordering::SeqCst);
+    if let Some(publisher) = gate.as_ref() {
+        let _ = publisher.send(PublishJob::StdoutEof);
+    }
+    drop(gate);
+    #[cfg(feature = "test-stub")]
+    test_barrier::note_stdout_eof_queued(&inner.barrier);
 }
 
 /// One ordered unit of publication work. See [`Inner::publish`].
@@ -1768,13 +1803,22 @@ async fn rollback_reservation_at_ticket(inner: &Arc<Inner>, seq: u64) -> DriverR
         let mut mapper = inner.mapper.lock().await;
         mapper.cancel_turn_reservation(seq)?
     };
-    if let Some(observation) = released {
-        // Emit HERE, at the cancelled ticket's position — before the worker
-        // takes the next job (C's start, a frame, StdoutEof).
-        emit_all(inner, vec![observation]).await
-    } else {
-        Ok(())
+    let Some(observation) = released else {
+        return Ok(());
+    };
+    // Emit HERE, at the cancelled ticket's position — before the worker takes
+    // the next job (C's start, a frame, StdoutEof).
+    //
+    // Defense in depth (ma-sdk-state r11 item 2): the EOF admission seal makes
+    // a cancelled ticket behind StdoutEof unreachable, but never publish after
+    // the terminal observation regardless of how the ticket got there. The
+    // book is still rolled back above; the launch is ending, so the owed
+    // correction is dropped the same way rollback_without_ticket drops one.
+    if inner.exit_emitted.load(Ordering::Acquire) {
+        debug!("ordered publication: deferred settle released after exit; dropped");
+        return Ok(());
     }
+    emit_all(inner, vec![observation]).await
 }
 
 /// Roll back a reservation whose ticket NO worker will ever visit: the Reserve
@@ -1968,6 +2012,11 @@ pub mod test_barrier {
         cancelled_ticket_reached: AtomicBool,
         cancelled_gate_open: AtomicBool,
         cancelled_gate: tokio::sync::Notify,
+        /// r11 item 2: the reader observed natural stdout EOF, sealed
+        /// reservation admission, and queued StdoutEof from the seal critical
+        /// section. A send attempted only after this is set must lose the
+        /// admission race deterministically.
+        stdout_eof_queued: AtomicBool,
     }
 
     /// An armed write-commit barrier. Releases on drop.
@@ -2001,6 +2050,7 @@ pub mod test_barrier {
             // cancelled ticket and its rollback shuts this explicitly.
             cancelled_gate_open: AtomicBool::new(true),
             cancelled_gate: tokio::sync::Notify::new(),
+            stdout_eof_queued: AtomicBool::new(false),
         });
         *slot.lock().expect("barrier lock") = Some(state.clone());
         WriteCommitBarrier { state }
@@ -2090,6 +2140,14 @@ pub mod test_barrier {
     pub(super) fn note_frame_enqueued(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.result_queued.store(true, Ordering::Release);
+        }
+    }
+
+    /// Reader hook (r11 item 2): natural stdout EOF was sealed and the
+    /// StdoutEof job queued from the same publish-mutex critical section.
+    pub(super) fn note_stdout_eof_queued(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state.stdout_eof_queued.store(true, Ordering::Release);
         }
     }
 
@@ -2231,6 +2289,21 @@ pub mod test_barrier {
         pub fn release_cancelled_ticket(&self) {
             if !self.state.cancelled_gate_open.swap(true, Ordering::AcqRel) {
                 self.state.cancelled_gate.notify_waiters();
+            }
+        }
+
+        /// r11 item 2: wait until the reader observed natural stdout EOF and
+        /// queued StdoutEof under the admission seal.
+        pub async fn wait_until_stdout_eof_queued(&self, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.stdout_eof_queued.load(Ordering::Acquire) {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("write_commit barrier: timed out waiting for stdout EOF to be queued");
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }
 

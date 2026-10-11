@@ -2258,6 +2258,93 @@ async fn cancelling_a_newer_c_while_older_b_is_active_does_not_release_a_deferre
     let _ = driver.close().await;
 }
 
+/// ma-sdk-state r11 item 2: natural stdout EOF seals reservation admission.
+/// The worker is held after start_A with result_A still queued; the one-turn
+/// fake then exits ON ITS OWN (FAKE_CLAUDE_EXIT_WHEN_SCRIPT_DONE), so the
+/// reader seals admission and queues StdoutEof behind result_A. A send B
+/// attempted only AFTER that EOF is acknowledged must be REFUSED at admission
+/// (no book entry, no ticket behind the terminal job), and when the worker
+/// drains, `exited` is the LAST observation — no deferred correction after it.
+/// Pre-fix, B booked and queued its ticket behind EOF, its dead-child write
+/// failed, A's result was deferred, and the rollback correction was emitted
+/// AFTER exited.
+#[tokio::test]
+async fn natural_stdout_eof_seals_reservation_admission_and_emits_nothing_after_exit() {
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_EXIT_WHEN_SCRIPT_DONE".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = driver.arm_write_commit_barrier();
+
+    // A: send parks post-ack, the worker parks at A's ticket, result_A queued.
+    let da = driver.clone();
+    let send_a = tokio::spawn(async move { da.send(prompt("only turn")).await });
+    barrier
+        .wait_until_result_parked(Duration::from_secs(5))
+        .await;
+    barrier.release_send();
+    // A commits: start_A is published and the worker parks post-start (worker
+    // gate shut by default) BEFORE mapping result_A.
+    tokio::time::timeout(Duration::from_secs(5), send_a)
+        .await
+        .expect("send_a task within 5s")
+        .expect("send_a joined")
+        .expect("A acked");
+
+    // The one-turn fake finishes its script and exits naturally: the reader
+    // seals admission and queues StdoutEof BEHIND result_A. ACKNOWLEDGE the
+    // sealed EOF before attempting B, so B deterministically loses the race
+    // (this is not a timing hope: sealing completes under the publish mutex
+    // before the barrier note is set).
+    barrier
+        .wait_until_stdout_eof_queued(Duration::from_secs(5))
+        .await;
+
+    let b = tokio::time::timeout(Duration::from_secs(5), driver.send(prompt("late b")))
+        .await
+        .expect("B admission attempt resolves within 5s");
+    assert!(
+        matches!(&b, Err(DriverError::ControlUnavailable)),
+        "B loses the race to the EOF seal and is refused: {b:?}"
+    );
+
+    // An acknowledged fence queued after the EOF: the worker maps result_A,
+    // emits exited, then signals. Open the worker gate first (drop the
+    // barrier), then drain in one overall timeout.
+    let fence = driver.publication_fence().await;
+    drop(barrier);
+    let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
+
+    let exited = first_where(&all, |o| {
+        lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("exited")
+    });
+    assert_eq!(
+        exited + 1,
+        all.len(),
+        "nothing is published after the terminal exited observation: {all:?}"
+    );
+    let results: Vec<(&str, bool)> = all.iter().filter_map(result_attrs).collect();
+    assert_eq!(
+        results,
+        vec![("0", true)],
+        "A settles ordinarily — B never opened a book: {all:?}"
+    );
+    let corrections = all
+        .iter()
+        .filter_map(settled_marker)
+        .filter(|marker| *marker == Some("true"))
+        .count();
+    assert_eq!(
+        corrections, 0,
+        "no deferred-settle correction is emitted, before or after exit"
+    );
+
+    let _ = driver.close().await;
+}
+
 /// deferredSettle marker (None = ordinary settlement, Some("true") = deferred
 /// correction); returns None for non-settled results. Use this to count ALL
 /// settledRootTurn observations and inspect the deferred flag.

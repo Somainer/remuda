@@ -122,9 +122,16 @@ pub(crate) fn release_claim_key(key: &Path, owner: &str) {
     }
 }
 
-/// Canonical claim key for a path (test seam + adapter Drop).
-pub(crate) fn claim_key_for(path: &Path) -> PathBuf {
+/// Canonical claim key for a path: the exact PathBuf `claim_session` inserts
+/// (r8 item 6). `claim_key_for` is kept as a test alias.
+pub(crate) fn canonical_claim_key(path: &Path) -> PathBuf {
     canonical(path)
+}
+
+/// Test-only alias for [`canonical_claim_key`].
+#[cfg(test)]
+pub(crate) fn claim_key_for(path: &Path) -> PathBuf {
+    canonical_claim_key(path)
 }
 
 /// Test-only: whether the claim map contains ANY owner for the exact key.

@@ -32,6 +32,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use remuda_protocol::{AgentKind, Id, ObservationPayload, Timestamp, ToolOutcome, UsageScope};
 
@@ -68,7 +69,7 @@ pub struct CodexAdapter {
     binding: Option<AdapterBinding>,
     /// Exact claim key recorded at bind for promoted adapters (r7 item 6):
     /// released verbatim on Drop even when the file/symlink is gone.
-    claim_key: Option<PathBuf>,
+    claim_key: Option<Arc<PathBuf>>,
     tail: Option<RolloutTail>,
     /// Native id → journal node id (messages, thoughts, tool calls).
     nodes: HashMap<String, Id>,
@@ -243,8 +244,12 @@ impl CodexAdapter {
             RolloutTail::new_at_end(path.clone()).unwrap_or_else(|_| RolloutTail::new(path.clone()))
         };
         self.tail = Some(tail);
-        // Remember the exact key claim_session inserted (r7 item 6).
-        let exact_claim_key = crate::adapters::codex_discovery::claim_key_for(&path);
+        // r8 item 6: remember the exact PathBuf claim_session inserted (it
+        // canonicalizes the incoming path once). Drop must release THAT key
+        // verbatim — it never re-canonicalizes, so removing the file/symlink
+        // after bind cannot change the key and leak the claim.
+        let exact_claim_key =
+            std::sync::Arc::new(crate::adapters::codex_discovery::canonical_claim_key(&path));
         self.binding = Some(AdapterBinding {
             session_id: session_id.clone(),
             directory: path.parent().map(std::path::Path::to_path_buf),

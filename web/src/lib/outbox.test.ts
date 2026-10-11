@@ -407,7 +407,16 @@ describe("Outbox", () => {
         reads = 0;
         override async all() {
           this.reads += 1;
-          if (this.reads >= 2) await readGate; // load's own read (1) passes
+          if (this.reads >= 2) {
+            await readGate;
+            // While the wake read was suspended, another tab durably
+            // committed sent; the read now returns the changed durable state.
+            const cur = this.map.get("cmd_disp_read");
+            if (cur && cur.state === "inflight") {
+              this.map.set("cmd_disp_read", { ...cur, state: "sent", gotResponse: true, lease: undefined });
+            }
+            return await super.all();
+          }
           return await super.all();
         }
       }
@@ -436,9 +445,12 @@ describe("Outbox", () => {
       releaseRead!();
       await vi.advanceTimersByTimeAsync(10_000); // far past any retry/backoff
 
-      // Nothing reclaimed, nothing delivered, nothing re-armed.
+      // Nothing reclaimed, nothing delivered, nothing re-armed; the CHANGED
+      // durable row (sent) must NOT have been imported into the cache after
+      // dispose — this Outbox keeps its pre-teardown inflight view.
       expect(reclaimSpy).not.toHaveBeenCalled();
-      expect(store.map.get("cmd_disp_read")?.state).toBe("inflight");
+      expect(store.map.get("cmd_disp_read")?.state).toBe("sent");
+      expect(box.get("cmd_disp_read")?.state).toBe("inflight"); // cache untouched
       expect(wakes).not.toHaveBeenCalled();
       expect(box.pendingClaimWakeups()).toEqual([]);
     } finally {
@@ -459,9 +471,12 @@ describe("Outbox", () => {
         override async reclaimInflight(
           id: string,
           expected: { owner: string; until: number },
+          opts?: { requireExpired?: boolean; signal?: AbortSignal },
         ): Promise<OutboxRecord | null> {
           await reclaimGate;
-          return await super.reclaimInflight(id, expected);
+          // Forward the lifetime signal: the base backend refuses the write
+          // when dispose aborted during the suspension.
+          return await super.reclaimInflight(id, expected, opts);
         }
       }
       const store = new GatedReclaim();
@@ -483,14 +498,15 @@ describe("Outbox", () => {
 
       // Deadline: read succeeds, reclaim transaction is suspended.
       await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
-      box.dispose(); // teardown while the reclaim is in flight
-      releaseReclaim!(); // the IDB tx itself then commits pending
+      box.dispose(); // teardown while the reclaim is in flight: abort signal
+      releaseReclaim!();
       await vi.advanceTimersByTimeAsync(10_000);
 
-      // The durable tx may finish, but the disposed Outbox never caches,
-      // emits or triggers delivery, and arms no retry.
-      expect(store.map.get("cmd_disp_reclaim")?.state).toBe("pending");
-      expect(box.get("cmd_disp_reclaim")?.state).toBe("inflight"); // cache untouched
+      // Gate 13 item 3: the lifetime signal ABORTED the transaction before
+      // its put committed — the durable row stays inflight. The disposed
+      // Outbox never caches, emits, triggers delivery, or retries.
+      expect(store.map.get("cmd_disp_reclaim")?.state).toBe("inflight");
+      expect(box.get("cmd_disp_reclaim")?.state).toBe("inflight");
       expect(wakes).not.toHaveBeenCalled();
       expect(box.pendingClaimWakeups()).toEqual([]);
     } finally {

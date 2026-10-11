@@ -601,6 +601,12 @@ export class Outbox {
    * callback (gate 12 item 3). Checked at every async boundary.
    */
   private disposed = false;
+  /**
+   * Lifetime signal (gate 13 item 3): aborting makes an in-flight wake
+   * reclaim transaction roll back BEFORE its put commits, so a dispose racing
+   * a suspended IndexedDB reclaim cannot leave a durable pending write behind.
+   */
+  private lifetime = new AbortController();
 
   /**
    * Store hook fired exactly once when a tracked wakeup reclaims a row: the
@@ -952,10 +958,12 @@ export class Outbox {
         return { kind: "adopt", lease: snapshot } satisfies Outcome;
       }
       // Same exact snapshot and its deadline has passed: conditional reclaim.
-      // The transaction re-checks expiry against its own Date.now() inside.
+      // The transaction re-checks expiry against its own Date.now() inside and
+      // rolls back on dispose (gate 13 item 3 lifetime signal).
       try {
         const reclaimed = await this.storage.reclaimInflight(commandId, snapshot, {
           requireExpired: true,
+          signal: this.lifetime.signal,
         });
         // Gate 12 item 3: dispose while the reclaim was suspended.
         if (this.disposed) return { kind: "stop", rec: null };
@@ -1013,6 +1021,9 @@ export class Outbox {
    */
   dispose() {
     this.disposed = true;
+    // Abort any reclaim transaction suspended inside storage: its put must not
+    // commit after teardown (gate 13 item 3).
+    this.lifetime.abort();
     for (const entry of this.claimWakeups.values()) clearTimeout(entry.handle);
     this.claimWakeups.clear();
     this.onClaimWake = null;
@@ -1093,6 +1104,10 @@ export class Outbox {
 
   private async refreshFromStorage(): Promise<OutboxRecord[]> {
     const durable = (await this.storage.all()).filter((r) => commandIdFromKey(r.commandId));
+    // Gate 13 item 3: check lifetime RIGHT after the storage read and BEFORE
+    // touching the cache — a dispose while all() was suspended must not import
+    // changed rows (and must not re-arm a wake) into a tearing-down Outbox.
+    if (this.disposed) return [];
     for (const rec of durable) this.cache.set(rec.commandId, rec);
     this.reconcileClaimWakeups(durable);
     return durable;

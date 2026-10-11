@@ -2689,6 +2689,85 @@ mod tests {
         .to_string()
     }
 
+    /// c-effortread r11 item 2: an accepted `/effort` verdict that changes
+    /// NOTHING (a no-op switch targeting the state already in effect) produces
+    /// no tracker edge, but it still has to publish request-specific
+    /// completion evidence for OUR armed command — an observation carrying the
+    /// request id — so the web's moved axes can settle from the id instead of
+    /// leaving the chip on 切换中. Goes red when the no-edge accepted arm
+    /// emits nothing.
+    #[tokio::test]
+    async fn r11_item2_an_accepted_noop_verdict_still_echoes_the_request_id() {
+        use crate::effort::{EffortBridge, EffortRequest};
+        use remuda_protocol::EffortAxis::Flag;
+        use remuda_protocol::EffortSemantics::Decoupled;
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // The human already switched the flag OFF in the terminal: latch
+        // {high, flag false} via the accepted verdict (normal edge).
+        mapper
+            .map_line(&effort_slash_line("cmd-human", "ultracode off"))
+            .expect("map human slash");
+        let first = mapper
+            .map_line(&effort_stdout_line(
+                "out-human",
+                "Ultracode off. Effort stays high.",
+            ))
+            .expect("map human verdict");
+        assert!(
+            first
+                .iter()
+                .any(|obs| matches!(obs.body, ObservationPayload::Effort(_))),
+            "the first OFF verdict latches with a normal edge"
+        );
+
+        // Remuda now runs a NO-OP OFF configure (target already in effect).
+        let request = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            Some("req-noop"),
+        )
+        .expect("off toggle");
+        bridge.arm(request);
+        mapper
+            .map_line(&effort_slash_line("cmd-remuda", "ultracode off"))
+            .expect("map remuda slash");
+        let out = mapper
+            .map_line(&effort_stdout_line(
+                "out-remuda",
+                "Ultracode off. Effort stays high.",
+            ))
+            .expect("map remuda no-op verdict");
+        let edge = out
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("a no-op accepted verdict still publishes completion evidence");
+        assert_eq!(edge.request_id.as_deref(), Some("req-noop"));
+        assert_eq!(edge.effective.ultracode, Some(false));
+        assert!(
+            !bridge.has_pending(),
+            "the accepted no-op resolves the armed switch"
+        );
+    }
+
     /// c-effortread r11 item 1: each `/effort` verdict is labelled with the
     /// request whose SLASH GENERATION asked for it, not the bridge's latest
     /// armed request. Production sequence through the real mapper:

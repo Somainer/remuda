@@ -3121,6 +3121,24 @@ impl TranscriptMapper {
                         paired.as_ref(),
                     );
                 }
+                // c-effortread r11 item 2: an accepted verdict that changes
+                // NOTHING (the switch targeted the state already in effect)
+                // produces no tracker edge, but it IS request-specific
+                // completion evidence for the armed command that typed it.
+                // Emit the post-latch observation stamped with THAT request so
+                // the web can settle the moved axes from the id; without it a
+                // no-op switch would stay 切换中 until the pending max age.
+                if paired.is_some() {
+                    let observed = self.effort.last_observed().unwrap_or(parsed);
+                    return self.effort_observation(
+                        value,
+                        observed,
+                        EffortSource::Remuda,
+                        Some(stdout),
+                        remuda_protocol::EFFORT_STDOUT_NATIVE,
+                        paired.as_ref(),
+                    );
+                }
             }
             remuda_protocol::EffortStdout::Status(_) => {
                 // Observation only: it never resolves/rejects an armed switch.

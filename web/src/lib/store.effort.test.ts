@@ -2099,3 +2099,153 @@ it("r10 item 3: a genuine model/workflow refusal for A is recorded but never del
   expect(hubStore.effortOf(ctx.instance.id, "claude").ultracode).toBe(true);
   void toast;
 });
+
+it("r11 item 2: A ON executes, B OFF queues onto the same observation — A's ON echo and an unchanged baseline poll keep B pending", async () => {
+  const ctx = await startFollowing("r11-item2-on-off");
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const list = vi.spyOn(api, "instanceList");
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+
+  // Observed baseline: high with the flag OFF (B's own target).
+  const t0 = "2026-10-05T00:00:00.000Z";
+  ctx.receive(effortEvent(2, "high", false, "slash", t0));
+
+  // A flips ON and executes; before it reads back B flips OFF again.
+  const a = hubStore.setUltracode(ctx.instance.id, true);
+  const idA = posts[0]?.requestId!;
+  const b = hubStore.setUltracode(ctx.instance.id, false);
+  const idB = posts[1]?.requestId!;
+  await Promise.all([a, b]);
+  const pendingB = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pendingB?.requestId).toBe(idB);
+  expect(pendingB?.levelSettled).toBe(true); // the flag axis never moves the level
+  expect(pendingB?.flagSettled).toBe(false); // moved axis starts unsettled even though baseline matches
+
+  // A EXECUTES: its ON verdict echoes A's id. It must return B unchanged.
+  ctx.receive(
+    effortEvent(3, "high", true, "remuda", "2026-10-05T00:01:00.000Z", {
+      requested: { name: "high", ultracode: true },
+      requestId: idA,
+    }),
+  );
+  const afterA = hubStore.effortPendingOf(ctx.instance.id);
+  expect(afterA?.requestId).toBe(idB);
+  expect(afterA?.flagSettled).toBe(false);
+
+  // An unchanged baseline poll ({high,false}@T0 — exactly B's target and the
+  // old observation) must not clear B either: no id, not strictly newer.
+  list.mockResolvedValue({
+    items: [{ ...ctx.instance, effortEffective: { name: "high", ultracode: false, source: "remuda", observedAt: t0 } }],
+  } as never);
+  await hubStore.refresh();
+  const afterPoll = hubStore.effortPendingOf(ctx.instance.id);
+  expect(afterPoll?.requestId).toBe(idB);
+  expect(afterPoll?.flagSettled).toBe(false);
+
+  // B's own OFF read-back settles.
+  ctx.receive(
+    effortEvent(4, "high", false, "remuda", "2026-10-05T00:02:00.000Z", {
+      requested: { name: "high", ultracode: false },
+      requestId: idB,
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+it("r11 item 2 tier analogue: A max executes, B high queues — A's max echo keeps B's tier request pending", async () => {
+  const ctx = await startFollowing("r11-item2-tier");
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+
+  ctx.receive(effortEvent(2, "high", false, "slash", "2026-10-06T00:00:00.000Z"));
+
+  // A drags to max, then B drags back to high before A reads back.
+  const a = hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+  const idA = posts[0]?.requestId!;
+  const bst = hubStore.setEffort(ctx.instance.id, { index: 2, name: "high", kind: "claude", ultracode: false });
+  const idB = posts[1]?.requestId!;
+  await Promise.all([a, bst]);
+  const pendingB = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pendingB?.requestId).toBe(idB);
+  expect(pendingB?.axis).toBe("tier");
+  expect(pendingB?.levelSettled).toBe(false); // moved tier starts unsettled though baseline IS high
+  expect(pendingB?.flagSettled).toBe(true); // untouched flag axis
+
+  // A's max verdict (id A) can never settle B's high request.
+  ctx.receive(
+    effortEvent(3, "max", false, "remuda", "2026-10-06T00:01:00.000Z", {
+      requested: { name: "max", ultracode: false },
+      requestId: idA,
+    }),
+  );
+  const afterA = hubStore.effortPendingOf(ctx.instance.id);
+  expect(afterA?.requestId).toBe(idB);
+  expect(afterA?.levelSettled).toBe(false);
+
+  // B's own high verdict settles.
+  ctx.receive(
+    effortEvent(4, "high", false, "remuda", "2026-10-06T00:02:00.000Z", {
+      requested: { name: "high", ultracode: false },
+      requestId: idB,
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+it("r11 item 2: an accepted NO-OP switch still settles from its own request-id completion echo", async () => {
+  const ctx = await startFollowing("r11-item2-noop");
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+
+  // Flag already OFF; the OFF configure is a no-op at the native level.
+  ctx.receive(effortEvent(2, "high", false, "slash", "2026-10-07T00:00:00.000Z"));
+  const posted = hubStore.setUltracode(ctx.instance.id, false);
+  const idB = posts[0]?.requestId!;
+  await posted;
+  // The moved axis starts unsettled even though the value already matches.
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.flagSettled).toBe(false);
+
+  // The driver's accepted no-op verdict changes no projection but carries the
+  // request-specific completion evidence (its own id): that settles the axis.
+  ctx.receive(
+    effortEvent(3, "high", false, "remuda", "2026-10-07T00:01:00.000Z", {
+      requested: { name: "high", ultracode: false },
+      requestId: idB,
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+it("r11 item 2: a wire-synthesized queued no-op starts its moved axis unsettled", async () => {
+  const ctx = await startFollowing("r11-item2-wire-queued", { state: "known", value: "working" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  // Observed flag OFF; a configure posted OUTSIDE this UI queues an OFF (no-op).
+  ctx.receive(effortEvent(2, "high", false, "slash", "2026-10-08T00:00:00.000Z"));
+  ctx.receive(
+    configureLifecycleFor(3, "effort-queued:ultracode off", "wire-noop", ctx.instance.id, "2026-10-08T00:01:00.000Z"),
+  );
+  const queued = hubStore.effortPendingOf(ctx.instance.id);
+  expect(queued?.requestId).toBe("wire-noop");
+  expect(queued?.flagSettled).toBe(false); // moved axis must not pre-settle on the matching baseline
+
+  // Its own accepted OFF completion settles it.
+  ctx.receive(
+    effortEvent(4, "high", false, "remuda", "2026-10-08T00:02:00.000Z", {
+      requested: { name: "high", ultracode: false },
+      requestId: "wire-noop",
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});

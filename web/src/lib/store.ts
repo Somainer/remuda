@@ -1059,6 +1059,11 @@ class HubStore {
     // Rule 1: a verdict that explicitly names ANOTHER request is never ours.
     const namesOtherRequest = echoId !== null && echoId !== pending.requestId;
     const echoNamesThisRequest = echoId !== null && echoId === pending.requestId;
+    // c-effortread r11 item 2: an echo carrying a different request id is an
+    // explicit veto — return the pending UNCHANGED, however many axes were
+    // already settled (and so an untouched-but-settled axis can never combine
+    // with it into the `levelSettled && flagSettled` clear).
+    if (namesOtherRequest) return pending;
     // Rule 2: an id-less legacy echo confirms this request only when it
     // EXPLICITLY names every axis the request moves with the matching value.
     // Matching the tier alone can never confirm a flag operation, and a
@@ -1662,12 +1667,15 @@ class HubStore {
           at: Date.now(),
           baselineObservedAt: existingView?.observedAt ?? null,
           queuedObservedAt: queuedThreshold,
-          // Axes the queued command does not move need no proof; moved axes
-          // already agreeing with a current projection start settled.
-          levelSettled: !wireMovesLevel || existingView?.name === fallbackSelection.name,
-          flagSettled:
-            !wireMovesFlag ||
-            (fallbackSelection.ultracode !== true && existingView?.ultracode !== true),
+      // Axes this request does not move need no proof; every axis the
+      // request MOVES starts UNSETTLED even when the current projection
+      // already shows the requested value (c-effortread r11 item 2): a queued
+      // B targeting the old observation used to start settled and a later
+      // `levelSettled && flagSettled` cleared it on A's mismatching-id echo
+      // or an unchanged baseline poll. An accepted no-op is settled later by
+      // ITS OWN request-id echo.
+      levelSettled: !wireMovesLevel,
+      flagSettled: !wireMovesFlag,
           source: "lifecycle",
           // Synthesized from the driver's own queued word; it is its own
           // command-word identity, so leave the client prediction null and
@@ -4343,12 +4351,13 @@ class HubStore {
       // BOTH and matching the requested axis.
       baselineObservedAt: currentView?.observedAt ?? null,
       queuedObservedAt: null,
-      // Axes this request does not move need no proof; among the moved axes,
-      // ones already agreeing with the projection start settled — except an
-      // unobserved flag (null) switched ON, which is never pre-proven.
-      levelSettled: !movesLevel || currentView?.name === effort.name,
-      flagSettled:
-        !movesFlag || (effort.ultracode !== true && currentView?.ultracode !== true),
+      // Axes this request does not move need no proof; every MOVED axis
+      // starts unsettled even when the projection already shows the target
+      // (c-effortread r11 item 2): pre-settling let a queued B that targeted
+      // the old observation clear itself on A's mismatching-id echo. An
+      // accepted no-op switch settles from its own request-id echo.
+      levelSettled: !movesLevel,
+      flagSettled: !movesFlag,
       source: "client",
       commandWord,
     };

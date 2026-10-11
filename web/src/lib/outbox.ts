@@ -163,11 +163,22 @@ export interface OutboxStorage {
 }
 
 /** Lease lifetime for a delivery; a crashed owner's lease steals after this. */
+/** Lease lifetime for a delivery; a crashed owner's lease may be stolen. */
 export const LEASE_TTL_MS = 30_000;
 
 const IDB_NAME = "remuda-outbox";
 const IDB_STORE = "commands";
 const LS_KEY = "remuda-outbox-v1";
+/**
+ * Stable single-deliverer identity, persisted across page reloads. A reload is
+ * the SAME tab recovering its own crashed in-flight lease: with a fresh random
+ * owner the reloaded page was a "foreign" deliverer and had to wait out the
+ * full LEASE_TTL_MS (30 s) before it could re-POST a message it had left
+ * inflight while offline — an offline-reload flush whose re-POST races the
+ * 30 s poll could then never land. A genuinely DIFFERENT tab still gets a
+ * different owner and is correctly blocked while a lease is live.
+ */
+const OWNER_LS_KEY = "remuda-outbox-owner-v1";
 /** Exported for test teardown (the fallback store when IndexedDB is absent). */
 export const OUTBOX_LS_KEY = LS_KEY;
 
@@ -349,6 +360,26 @@ export async function openOutboxStorage(): Promise<{ storage: OutboxStorage; deg
 }
 
 /**
+ * Read the persisted single-deliverer owner, minting and storing one on first
+ * use. localStorage is the natural home (it is synchronous and shared by the
+ * IDB and localStorage storage backends); environments without a localStorage
+ * (SSR/unit callers) get an ephemeral per-process owner. Persisting it lets a
+ * page RELOAD reclaim its own still-live in-flight lease instead of waiting the
+ * full TTL as a "foreign" deliverer.
+ */
+function loadOrCreateOwner(): Id {
+  try {
+    const existing = globalThis.localStorage?.getItem(OWNER_LS_KEY);
+    if (existing) return existing;
+    const created = `owner_${newCommandId()}`;
+    globalThis.localStorage?.setItem(OWNER_LS_KEY, created);
+    return created;
+  } catch {
+    return `owner_${newCommandId()}`;
+  }
+}
+
+/**
  * The outbox: write-through cache over {@link OutboxStorage} with storage-first
  * durability (the cache and subscribers change ONLY after the storage
  * transaction commits) and a single deliverer per instance — Web Lock, or a
@@ -364,7 +395,7 @@ export class Outbox {
 
   private constructor(storage: OutboxStorage, owner?: Id) {
     this.storage = storage;
-    this.owner = owner ?? `owner_${newCommandId()}`;
+    this.owner = owner ?? loadOrCreateOwner();
   }
 
   static async load(storage: OutboxStorage, owner?: Id): Promise<Outbox> {
@@ -372,14 +403,30 @@ export class Outbox {
     for (const rec of (await storage.all()).filter((r) => commandIdFromKey(r.commandId))) {
       box.cache.set(rec.commandId, rec);
     }
-    // A row left inflight by another (possibly crashed) process is returned to
-    // a deliverable state in THIS cache; the durable lease is re-judged inside
-    // the delivery lock (an expired lease is stealable).
-    const now = Date.now();
+    // Every inflight row at load was left by a page that is gone — THIS JS
+    // context has no live request in flight — so resurrect it to a deliverable
+    // state, in BOTH the cache and durable storage (the deliverer re-reads
+    // storage under the lock, so a cache-only reset would be overwritten). The
+    // durable per-instance lease is still re-judged inside the delivery lock:
+    // our stable persisted owner reclaims its OWN (or an expired foreign)
+    // inflight immediately, while a DIFFERENT live tab's lease keeps its rows
+    // inflight for the rest of its TTL, preserving single delivery.
+    // Previously a reload minted a fresh owner and was blocked by its own
+    // prior live lease for the full TTL, delaying an offline-reload re-send.
+    const resurrected: OutboxRecord[] = [];
     for (const [id, rec] of box.cache) {
-      if (rec.state === "inflight" && rec.lease?.owner !== box.owner && (!rec.lease || rec.lease.until <= now)) {
-        box.cache.set(id, { ...rec, state: "pending", lease: undefined });
+      if (rec.state === "inflight") {
+        const foreignLive =
+          rec.lease && rec.lease.owner !== box.owner && rec.lease.until > Date.now();
+        if (!foreignLive) {
+          const pending: OutboxRecord = { ...rec, state: "pending", lease: undefined };
+          box.cache.set(id, pending);
+          resurrected.push(pending);
+        }
       }
+    }
+    for (const rec of resurrected) {
+      await storage.put(rec);
     }
     return box;
   }

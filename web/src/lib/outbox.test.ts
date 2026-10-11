@@ -254,6 +254,58 @@ describe("Outbox", () => {
     });
   });
 
+  it("a reloaded tab reclaims its OWN still-live inflight lease immediately (offline-reload re-send)", async () => {
+    // No navigator.locks: exercise the durable lease path. Persisted owner
+    // simulates the same tab reloading: it loads with the SAME owner id while
+    // its prior page left the row inflight with a live (unexpired) lease.
+    const originalLocks = (globalThis.navigator as { locks?: LockManager }).locks;
+    Object.defineProperty(globalThis.navigator, "locks", {
+      value: undefined,
+      configurable: true,
+    });
+    const shared = new MemStorage();
+    const owner = "owner_stable";
+    await shared.put(
+      rec({
+        commandId: "cmd_reload",
+        state: "inflight",
+        lease: { owner, until: Date.now() + 30_000 },
+      }),
+    );
+    // Same owner reloads: the dead-in-flight row is returned to deliverable
+    // (the old JS context's POST is gone) and the live OWN lease is re-acquired
+    // without waiting the TTL.
+    const reloaded = await Outbox.load(shared, owner);
+    expect(reloaded.get("cmd_reload")?.state).toBe("pending");
+    let handed: string[] = [];
+    const n = await reloaded.withInstanceLock("ins_1", (_id, rows) => {
+      handed = rows.map((r) => r.commandId);
+      return Promise.resolve(rows.length);
+    });
+    expect(n).toBe(1);
+    expect(handed).toContain("cmd_reload");
+    Object.defineProperty(globalThis.navigator, "locks", {
+      value: originalLocks,
+      configurable: true,
+    });
+  });
+
+  it("a different live tab's foreign live lease is NOT reset to deliverable on load (single delivery)", async () => {
+    // Same load path, but the live lease belongs to ANOTHER tab: the cache must
+    // keep it inflight so isDeliverable stays false (the durable lock then
+    // blocks until the foreign TTL — covered by the two-tab steal test).
+    const shared = new MemStorage();
+    await shared.put(
+      rec({
+        commandId: "cmd_foreign",
+        state: "inflight",
+        lease: { owner: "owner_A", until: Date.now() + 30_000 },
+      }),
+    );
+    const b = await Outbox.load(shared, "owner_B");
+    expect(b.get("cmd_foreign")?.state).toBe("inflight");
+  });
+
   it("two lock-less tabs share ONE atomic lease: single POST, zero-row loser, then a steal after the loser's TTL delivers its row once", async () => {
     const originalLocks = (globalThis.navigator as { locks?: LockManager }).locks;
     Object.defineProperty(globalThis.navigator, "locks", {

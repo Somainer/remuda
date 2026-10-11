@@ -1400,3 +1400,74 @@ fn two_promoted_adapters_cannot_co_claim_the_same_indexed_session() {
     );
     assert!(second.binding().is_none());
 }
+
+// c-usagefu r7 item 3: stable instance-id claims survive close/resume -----
+
+#[test]
+fn stable_instance_key_reclaims_after_close_and_resume() {
+    // Simulates the native-carrier shell-pty lifecycle: the first spawn
+    // claims a rollout under the stable Remuda instance id, its adapter
+    // closes on close/resume, and a fresh adapter with the SAME key reclaims.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = home.path();
+    let session_dir = home.path().join("sessions/2026/09/14");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let rollout = session_dir.join("rollout-resume.jsonl");
+    std::fs::write(
+        &rollout,
+        "{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"id\":\"resume-s\",\"session_id\":\"resume-s\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join("session_index.jsonl"),
+        "{\"id\":\"resume-s\"}\n",
+    )
+    .unwrap();
+
+    let stable_key = "ins-stable-resume";
+    {
+        // First spawn: native-carrier adapter with stable key (no launch
+        // floor? shell-pty driver launches DO pass instance_key with floor
+        // None here for promoted-style attach — but the stable key is present).
+        let mut first = CodexAdapter::new(AdapterHome {
+            home: home.path().to_path_buf(),
+            cwd: cwd.to_path_buf(),
+            pid: None,
+            launched_at: None,
+        })
+        .with_instance_key(Some(stable_key.to_owned()));
+        assert!(first.discover().unwrap());
+        assert_eq!(
+            first.binding().map(|b| b.session_id.as_str()),
+            Some("resume-s")
+        );
+        // First spawn closes — stable driver-launch claims are NOT released.
+    }
+
+    // A DIFFERENT instance key cannot grab the file after close.
+    let mut foreign = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: cwd.to_path_buf(),
+        pid: None,
+        launched_at: None,
+    })
+    .with_instance_key(Some("ins-other".to_owned()));
+    assert!(!foreign.discover().unwrap());
+
+    // Resume: fresh adapter, same stable key → reclaims.
+    let mut resumed = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: cwd.to_path_buf(),
+        pid: None,
+        launched_at: None,
+    })
+    .with_instance_key(Some(stable_key.to_owned()));
+    assert!(
+        resumed.discover().unwrap(),
+        "resumed adapter with the stable instance key reclaims the rollout"
+    );
+    assert_eq!(
+        resumed.binding().map(|b| b.session_id.as_str()),
+        Some("resume-s")
+    );
+}

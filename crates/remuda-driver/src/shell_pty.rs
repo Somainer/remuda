@@ -1431,7 +1431,10 @@ impl ShellPtyDriver {
                 .filter(|model| !model.is_empty()),
             hooks: Some(Arc::clone(hooks)),
             agent_pid: pid,
-            instance_key: Some(uuid::Uuid::new_v4().to_string()),
+            // c-usagefu r7 item 3: claim under the STABLE Remuda instance id,
+            // not a fresh UUID — close/resume re-spawns this adapter and must
+            // reclaim the rollout the previous spawn owned.
+            instance_key: Some(ctx.instance_id.as_id().as_str().to_owned()),
         };
         crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx)
     }
@@ -1497,6 +1500,10 @@ impl ShellPtyDriver {
                         fallback_model: None,
                         hooks: None,
                         agent_pid: Some(found.pid),
+                        // Promoted attaches are per-process: no driver launch
+                        // identity (r7 item 2 gives them a unique lifecycle
+                        // owner); resume of a DRIVER launch goes through the
+                        // native-carrier spawn above with the stable key.
                         instance_key: None,
                     };
                     match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {

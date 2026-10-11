@@ -1451,10 +1451,17 @@ fn spawn_transcript_pump(
     // native_at) and pops only after a successful send, so no frame is ever
     // duplicated or lost between the async flusher and the abort path.
     let slot: TranscriptSlot = Arc::new(StdMutex::new(None));
-    let pending: TranscriptPending = Arc::new(crate::transcript_queue::BoundedPending::new(
-        TRANSCRIPT_PENDING_CAPACITY,
-    ));
     let flush_notify = Arc::new(Notify::new());
+    // Test-only shrink (c-ctxusage r9 item 1): a normal replay batch then
+    // exceeds the capacity and exercises the notify-before-park ordering.
+    let pending_capacity = faults
+        .as_ref()
+        .and_then(|faults| faults.pending_capacity())
+        .unwrap_or(TRANSCRIPT_PENDING_CAPACITY);
+    let pending: TranscriptPending = Arc::new(crate::transcript_queue::BoundedPending::new(
+        pending_capacity,
+        Arc::clone(&flush_notify),
+    ));
     let flush_stop = Arc::new(AtomicBool::new(false));
     // Set by a blocking collect closure while it owns the hydrator (it has
     // taken it out of `slot`). The abort guard waits on this, never on a
@@ -1471,15 +1478,33 @@ fn spawn_transcript_pump(
     let flusher_pending = Arc::clone(&pending);
     let flusher_notify = Arc::clone(&flush_notify);
     let flusher_stop = Arc::clone(&flush_stop);
+    let flusher_in_flight = Arc::clone(&map_in_flight);
     let flusher_faults = faults.clone();
     let flusher_handle = tokio::spawn(async move {
         // Dropped on every flusher exit (including cancellation): tests use
         // the acknowledgement to prove the flusher did not quit while final
         // frames were still pending.
-        let _exit_ack = FlusherExitAck(flusher_faults);
+        let _exit_ack = FlusherExitAck(flusher_faults.clone());
         loop {
-            if flusher_stop.load(Ordering::SeqCst) && flusher_pending.is_empty() {
+            // c-ctxusage r9 item 1: stop + empty queue is not retirement
+            // while a producer still owns the hydrator (its next push may
+            // land after the drain) or is parked holding the residual batch.
+            if flusher_stop.load(Ordering::SeqCst)
+                && flusher_pending.is_empty()
+                && !flusher_pending.producer_parked()
+                && !flusher_in_flight.load(Ordering::SeqCst)
+            {
                 return;
+            }
+            if flusher_events.is_closed() {
+                flusher_pending.close_and_clear();
+                return;
+            }
+            // Acknowledgement barrier (test-only): the flusher has drained
+            // and parks idle, reachable solely via the queue-integrated
+            // Notify.
+            if let Some(faults) = &flusher_faults {
+                faults.note_flusher_idle();
             }
             flusher_notify.notified().await;
             if !drain_pending(
@@ -1646,7 +1671,6 @@ fn spawn_transcript_pump(
             let collect = tokio::task::spawn_blocking({
                 let slot = Arc::clone(&slot);
                 let pending = Arc::clone(&pending);
-                let notify = Arc::clone(&flush_notify);
                 let in_flight = Arc::clone(&map_in_flight);
                 let collect_faults = faults.clone();
                 move || {
@@ -1670,9 +1694,10 @@ fn spawn_transcript_pump(
                             return;
                         }
                         // Bounded queue: blocks this blocking thread while the
-                        // flusher is stalled (c-ctxusage r8 item 5).
+                        // flusher is stalled (c-ctxusage r8 item 5); the queue
+                        // wakes the flusher before any capacity wait (r9
+                        // item 1).
                         pending.push_all_blocking(frames.drain(..));
-                        notify.notify_one();
                     };
                     for line in &lines {
                         if pending.is_closed() {
@@ -1712,7 +1737,6 @@ fn spawn_transcript_pump(
                         final_finish_blocking(
                             &slot,
                             &pending,
-                            &flush_notify,
                             &map_in_flight,
                             faults.as_ref(),
                         )
@@ -1768,13 +1792,11 @@ async fn drain_pending(
 async fn final_finish_blocking(
     slot: &TranscriptSlot,
     pending: &TranscriptPending,
-    notify: &Arc<Notify>,
     in_flight: &Arc<AtomicBool>,
     faults: Option<&Arc<crate::test_faults::FaultState>>,
 ) {
     let slot = Arc::clone(slot);
     let pending = Arc::clone(pending);
-    let notify = Arc::clone(notify);
     let in_flight = Arc::clone(in_flight);
     let finish_faults = faults.cloned();
     let join = tokio::task::spawn_blocking(move || {
@@ -1810,10 +1832,10 @@ async fn final_finish_blocking(
         }
         // Park before clearing the flag: the guard reads "no producer" only
         // after the final frames are safely in the flusher's queue. The
-        // hydrator stays retired (slot stays None) on the close path.
+        // hydrator stays retired (slot stays None) on the close path. The
+        // queue itself wakes the flusher, before any capacity wait.
         if !frames.is_empty() {
             pending.push_all_blocking(frames);
-            notify.notify_one();
         }
         in_flight.store(false, Ordering::SeqCst);
     });

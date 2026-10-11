@@ -811,10 +811,16 @@ pub(super) fn spawn(
     // loop-local would be None in Drop, so an abort after the bounded wait
     // lost the buffered last run. The variable is read only by its Drop impl.
     let hydrator_slot: HydratorSlot = Arc::new(Mutex::new(None));
-    let pending_emissions: PendingEmissions = Arc::new(
-        crate::transcript_queue::BoundedPending::new(PENDING_CAPACITY),
-    );
     let flush_notify = Arc::new(Notify::new());
+    // Test-only shrink (c-ctxusage r9 item 1): a normal replay batch then
+    // exceeds the capacity and exercises the notify-before-park ordering.
+    let pending_capacity = faults
+        .as_ref()
+        .and_then(|faults| faults.pending_capacity())
+        .unwrap_or(PENDING_CAPACITY);
+    let pending_emissions: PendingEmissions = Arc::new(
+        crate::transcript_queue::BoundedPending::new(pending_capacity, Arc::clone(&flush_notify)),
+    );
     let flush_done = Arc::new(AtomicBool::new(false));
     // Set while a blocking collect owns the hydrator (it has taken it out of
     // the slot). The abort guard waits on THIS, never on a blindly-polled slot
@@ -2256,12 +2262,13 @@ impl Hydrator {
     /// Synchronous half of a poll pump, run on a blocking thread: take the
     /// one-shot launch snapshot, poll the tail, map every new line and
     /// poll-flush the mapper. Mapped transcript frames are parked into
-    /// `parked` in [`EMIT_CHUNK`]s as the map progresses (with `notify`
-    /// waking the streaming flusher), so callers can observe/deliver pump
-    /// progress WHILE a large first-bind replay is still being mapped rather
-    /// than after the whole (potentially minute-long) map. Returns the
-    /// one-shot launch snapshots. A tail read error is `Err`; per-line mapper
-    /// errors are skipped as before.
+    /// `parked` in [`EMIT_CHUNK`]s as the map progresses (the bounded queue
+    /// wakes the flusher itself before any capacity wait — c-ctxusage r9
+    /// item 1; the explicit ping after parking stays as a redundant permit);
+    /// callers observe pump progress WHILE a large first-bind replay is
+    /// still being mapped rather than after the whole (potentially
+    /// minute-long) map. Returns the one-shot launch snapshots. A tail read
+    /// error is `Err`; per-line mapper errors are skipped as before.
     fn collect_pump(
         &mut self,
         parked: &PendingEmissions,
@@ -2500,11 +2507,19 @@ async fn emission_flusher(
 ) {
     loop {
         // Exit only once shutdown was requested AND any abort-path residual
-        // finish has parked its frames AND the queue is fully drained. A
-        // short tick covers the residual-finish thread parking without a
-        // Notify permit (it notifies anyway, but the tick closes any gap).
-        if done.load(Ordering::SeqCst) && residual_done.load(Ordering::SeqCst) && pending.is_empty()
+        // finish has parked its frames AND no producer is parked holding a
+        // batch AND the queue is fully drained. c-ctxusage r9 item 1: a
+        // parked producer still holds the residual frames, so stop + an
+        // momentarily empty queue must not retire the flusher.
+        if done.load(Ordering::SeqCst)
+            && residual_done.load(Ordering::SeqCst)
+            && pending.is_empty()
+            && !pending.producer_parked()
         {
+            return;
+        }
+        if events.is_closed() {
+            pending.close_and_clear();
             return;
         }
         tokio::select! {
@@ -3004,10 +3019,11 @@ mod tests {
         let found = detected_claude(42, Some(session));
         let (tx, mut rx) = mpsc::channel::<Observation>(128);
         let hydrator: HydratorSlot = Arc::new(Mutex::new(None));
+        let notify = Arc::new(Notify::new());
         let pending: PendingEmissions = Arc::new(crate::transcript_queue::BoundedPending::new(
             PENDING_CAPACITY,
+            Arc::clone(&notify),
         ));
-        let notify = Arc::new(Notify::new());
         let in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // A real flusher drains parked frames: without it the "no foreign
         // content" assertions below would pass even if the degrade path
@@ -3556,10 +3572,11 @@ mod tests {
             Hydrator::open(&ctx, &binding, None, None, None, None, None, None)
                 .expect("hydrator binds the seeded transcript"),
         )));
+        let notify = Arc::new(Notify::new());
         let pending: PendingEmissions = Arc::new(crate::transcript_queue::BoundedPending::new(
             PENDING_CAPACITY,
+            Arc::clone(&notify),
         ));
-        let notify = Arc::new(Notify::new());
         let in_flight = Arc::new(AtomicBool::new(false));
         let seq = Arc::new(AtomicU64::new(0));
 
@@ -3666,10 +3683,11 @@ mod tests {
         let slot: HydratorSlot = Arc::new(Mutex::new(Some(
             Hydrator::open(&ctx, &binding, None, None, None, None, None, None).unwrap(),
         )));
+        let notify = Arc::new(Notify::new());
         let pending: PendingEmissions = Arc::new(crate::transcript_queue::BoundedPending::new(
             PENDING_CAPACITY,
+            Arc::clone(&notify),
         ));
-        let notify = Arc::new(Notify::new());
         let in_flight = Arc::new(AtomicBool::new(false));
         let seq = Arc::new(AtomicU64::new(0));
         let (tx, mut rx) = mpsc::channel::<Observation>(128);
@@ -3765,10 +3783,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = ctx_in(dir.path());
         let (tx, mut rx) = mpsc::channel(1);
+        let notify = Arc::new(Notify::new());
         let pending: PendingEmissions = Arc::new(crate::transcript_queue::BoundedPending::new(
             PENDING_CAPACITY,
+            Arc::clone(&notify),
         ));
-        let _notify = Arc::new(Notify::new());
         let marker_obs = |text: &'static str| {
             build(
                 &ctx,
@@ -3902,11 +3921,12 @@ mod tests {
             faults: None,
         };
         // Prior epoch backlog the flusher has not sent yet.
+        let notify = Arc::new(Notify::new());
         let pending: PendingEmissions = Arc::new(crate::transcript_queue::BoundedPending::new(
             PENDING_CAPACITY,
+            Arc::clone(&notify),
         ));
         pending.push_all_blocking([marker_obs("BACKLOG_B")]);
-        let notify = Arc::new(Notify::new());
         hydrator.collect_pump(&pending, &notify).expect("collect");
         let queued = pending.len();
         assert!(

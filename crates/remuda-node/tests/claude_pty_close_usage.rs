@@ -470,3 +470,165 @@ async fn claude_pty_abort_mid_cooperative_finish_still_delivers_final_usage_once
         "the aborted cooperative finish must deliver the FINAL usage exactly once"
     );
 }
+
+/// c-ctxusage r9 item 1: when the flusher has drained and is parked idle in
+/// `notified().await`, a residual replay batch LARGER than the bounded queue
+/// capacity must still be delivered — every usage frame, in full, exactly
+/// once. Before the fix the producer filled the queue and blocked for
+/// capacity BEFORE notifying, while the flusher could only be woken by that
+/// never-arriving notify: circular wait, the residual usage (including the
+/// no-stop FINAL) stranded on a parked thread.
+///
+/// The queue is shrunk to a handful of slots via the injected fault, so an
+/// ordinary-sized replay exceeds it many times over; barriers only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_residual_batch_reaches_an_idle_flusher_once() {
+    use remuda_driver::test_faults::TranscriptFaults;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.as_ref().join("herdr");
+    fs::create_dir_all(&socket_dir).unwrap();
+    let socket = socket_dir.join("herdr.sock");
+    let fake_bin = ensure_workspace_bin("fake-herdr");
+    let _fake = FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap();
+
+    let cwd = tmp.path().join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let claude = install_executable(
+        tmp.path(),
+        "claude",
+        "#!/bin/sh\necho '2.1.268 (Claude Code)'\n",
+    );
+    fs::create_dir_all(&launch).unwrap();
+    let transcript = launch.join("transcript.jsonl");
+    // Each assistant record emits its own usage frame; 60 records dwarf the
+    // shrunk queue and keep the producer parked across multiple refills.
+    seed_transcript(&transcript, 60);
+
+    let faults = TranscriptFaults::new();
+    faults.arm_pump_gate();
+    faults.arm_close_timeout(Duration::from_millis(500));
+    // Four slots: the residual batch exceeds the capacity by orders of
+    // magnitude, forcing notify-before-park wakeups to drain it.
+    faults.set_pending_capacity(4);
+
+    let driver = ClaudePtyDriver::new(ClaudePtyOptions {
+        instance_id: None,
+        media_stager: None,
+        profile: profile(),
+        launch_dir: launch.clone(),
+        native_home: home,
+        binary: BinarySource::Pinned(pin_binary(&claude).unwrap()),
+        origin: LaunchOrigin::Human,
+        session_name: "remuda-cp-oversized".into(),
+        socket_dir: Some(socket_dir),
+        herdr_binary: Some(fake_bin),
+        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker::env_only()),
+        extra_env: Default::default(),
+        agent_mcp: None,
+        setting_sources: None,
+        agent_start_timeout_ms: 5_000,
+        inherit_default_config: false,
+        settings_overlay_path: None,
+        auto_trust_registered_workspace: false,
+        seed_onboarding: true,
+        host_claude_config: None,
+    });
+    driver.set_test_faults(faults.clone());
+
+    let handle = driver.start(spec(&cwd)).await.expect("start");
+    let mut events_rx = handle.into_events();
+    fs::write(
+        launch.join("session-meta.json"),
+        serde_json::json!({
+            "session_id": "fixture-session",
+            "transcript_path": transcript,
+            "hook_event_name": "SessionStart",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Drain the channel and count EVERY usage frame by its native scope id —
+    // the assertion is completeness + exactly-once, not a sample. A oneshot
+    // fires once all 61 scopes (60 replay records + the no-stop FINAL) have
+    // been seen, so the test waits on an acknowledgement rather than the
+    // channel's unrelated process-teardown close.
+    let counts = Arc::new(StdMutex::new(HashMap::<String, u32>::new()));
+    let drainer_counts = Arc::clone(&counts);
+    let (all_tx, all_rx) = tokio::sync::oneshot::channel();
+    let all_tx = StdMutex::new(Some(all_tx));
+    let drainer = tokio::spawn(async move {
+        while let Some(obs) = events_rx.recv().await {
+            if let ObservationPayload::Usage(payload) = &obs.body
+                && !payload.scope_id.is_empty()
+            {
+                let mut seen = drainer_counts.lock().unwrap();
+                *seen.entry(payload.scope_id.clone()).or_insert(0) += 1;
+                if seen.len() == 61
+                    && let Some(tx) = all_tx.lock().unwrap().take()
+                {
+                    let _ = tx.send(());
+                }
+            }
+        }
+    });
+
+    // Barrier 1: the transcript bound and the first collect parked.
+    assert!(
+        faults.wait_pump_entered(),
+        "the first blocking collect never entered its barrier"
+    );
+    // Barrier 2: the flusher drained (nothing queued yet) and parked idle —
+    // it can now only be woken via the queue-integrated Notify.
+    assert!(
+        faults.wait_flusher_idle(),
+        "the flusher never acknowledged its idle park"
+    );
+    // Close aborts the pump while its first collect is gated; the abort
+    // residual runs (deterministically via the shortened bound) and waits on
+    // the detached collect.
+    driver.close().await.expect("close");
+    assert!(
+        faults.wait_abort_residual(),
+        "close returned without the abort-path residual running"
+    );
+
+    // Release the replay: the oversized batch now flows through a four-slot
+    // queue. With the circular wait it would never arrive and this
+    // acknowledgement could not fire.
+    faults.release();
+    tokio::time::timeout(Duration::from_secs(30), all_rx)
+        .await
+        .expect("oversized residual batch stranded: not every usage arrived")
+        .expect("completion oneshot closed without firing");
+    // Flusher retirement means no producer remains: no frame can follow, so
+    // the per-scope counts are final and assert exactly-once.
+    assert!(
+        faults.wait_flusher_exit_for(Duration::from_secs(30)),
+        "the flusher never retired after the residual drain"
+    );
+    drainer.abort();
+
+    let counts = counts.lock().unwrap();
+    for index in 0..60u32 {
+        let scope_id = format!("cp-msg-{index}");
+        assert_eq!(
+            counts.get(&scope_id).copied().unwrap_or(0),
+            1,
+            "replay usage {scope_id} must be delivered exactly once"
+        );
+    }
+    assert_eq!(
+        counts.get(FINAL_MSG_ID).copied().unwrap_or(0),
+        1,
+        "the no-stop FINAL usage must be delivered exactly once"
+    );
+}

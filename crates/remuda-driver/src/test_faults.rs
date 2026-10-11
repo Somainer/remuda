@@ -45,11 +45,19 @@ pub(crate) struct FaultState {
     abort_residual_cv: Condvar,
     flusher_exited: Mutex<bool>,
     flusher_exited_cv: Condvar,
+    /// Acknowledged once the streaming flusher has drained and is parked in
+    /// `notified().await` (c-ctxusage r9 item 1): lets a test prove the
+    /// residual batch lands while the flusher is idle/asleep.
+    flusher_idle: Mutex<bool>,
+    flusher_idle_cv: Condvar,
     skip_cooperative_finalise: AtomicBool,
     /// Overrides the driver's bounded cooperative-close wait so an abort test
     /// crosses the bound deterministically without the production 15 s / 2 s
     /// wait. Milliseconds; 0 means "use the production timeout".
     close_timeout_ms: AtomicU64,
+    /// Overrides the bounded pending queue capacity so a test can make a
+    /// normal-sized replay batch exceed it. 0 means production capacity.
+    pending_capacity: AtomicU64,
 }
 
 /// A parked phase must never wait forever on a test that forgot to release:
@@ -72,8 +80,11 @@ impl FaultState {
             abort_residual_cv: Condvar::new(),
             flusher_exited: Mutex::new(false),
             flusher_exited_cv: Condvar::new(),
+            flusher_idle: Mutex::new(false),
+            flusher_idle_cv: Condvar::new(),
             skip_cooperative_finalise: AtomicBool::new(false),
             close_timeout_ms: AtomicU64::new(0),
+            pending_capacity: AtomicU64::new(0),
         })
     }
 
@@ -160,6 +171,25 @@ impl FaultState {
         self.flusher_exited_cv.notify_all();
     }
 
+    /// Acknowledge that the flusher has drained the queue and is parked in
+    /// `notified().await` — idle, waiting solely on the queue-integrated
+    /// wake (c-ctxusage r9 item 1).
+    pub(crate) fn note_flusher_idle(&self) {
+        *self
+            .flusher_idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.flusher_idle_cv.notify_all();
+    }
+
+    /// The injected bounded-pending capacity override, if a test armed one.
+    pub(crate) fn pending_capacity(&self) -> Option<usize> {
+        match self.pending_capacity.load(Ordering::SeqCst) {
+            0 => None,
+            n => Some(n as usize),
+        }
+    }
+
     /// Whether the flusher has already exited.
     #[cfg(feature = "test-faults")]
     fn flusher_exited_now(&self) -> bool {
@@ -214,6 +244,14 @@ impl TranscriptFaults {
         );
     }
 
+    /// Shrink the bounded producer→flusher queue so a normal-sized batch
+    /// exceeds it (c-ctxusage r9 item 1).
+    pub fn set_pending_capacity(&self, capacity: usize) {
+        self.inner
+            .pending_capacity
+            .store(capacity as u64, Ordering::SeqCst);
+    }
+
     /// Open the gate and let every parked blocking phase proceed.
     pub fn release(&self) {
         *self
@@ -265,6 +303,16 @@ impl TranscriptFaults {
             &self.inner.flusher_exited,
             &self.inner.flusher_exited_cv,
             timeout,
+        )
+    }
+
+    /// Block until the streaming flusher acknowledges it drained and parked
+    /// idle (bounded).
+    pub fn wait_flusher_idle(&self) -> bool {
+        Self::wait_true(
+            &self.inner.flusher_idle,
+            &self.inner.flusher_idle_cv,
+            Duration::from_secs(60),
         )
     }
 

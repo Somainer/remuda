@@ -10,12 +10,19 @@
 //! event channel is gone (the flusher exits) [`BoundedPending::close_and_clear`]
 //! releases every waiting producer, whose frames are dropped because nothing
 //! can deliver them.
+//!
+//! c-ctxusage r9 item 1: the consumer wake is integrated with the queue. The
+//! producer now notifies as frames become available — including BEFORE it
+//! parks for capacity. Deferring the wake until the whole batch fit deadlocked
+//! a residual batch larger than the capacity: the producer blocked for room
+//! while the flusher slept in `notified().await`, and no wake could ever arrive.
 
 use std::collections::VecDeque;
 use std::sync::{
-    Condvar, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use tokio::sync::Notify;
 
 /// Generic over the frame type so the backpressure behaviour is unit-testable
 /// without constructing protocol observations.
@@ -24,21 +31,28 @@ pub(super) struct BoundedPending<T> {
     /// Producers wait here while the queue is full; the flusher notifies after
     /// every pop.
     space: Condvar,
+    /// Consumer wake, notified the moment frames may need delivery: on an
+    /// empty→non-empty transition and BEFORE a producer parks for capacity.
+    /// Owning it here makes the notify-before-wait ordering impossible for a
+    /// caller to forget.
+    notify: Arc<Notify>,
     /// Set once delivery can never resume (event channel gone); waiting
     /// producers unblock and discard their remainder.
     closed: AtomicBool,
-    /// Producers currently parked waiting for capacity. A precise barrier for
-    /// tests and an observable backpressure diagnostic.
+    /// Producers currently parked waiting for capacity. The flusher treats a
+    /// parked producer as pending work: stop + empty queue is not retirement
+    /// while a producer still holds frames.
     waiting: AtomicUsize,
     capacity: usize,
 }
 
 impl<T> BoundedPending<T> {
     #[must_use]
-    pub(super) fn new(capacity: usize) -> Self {
+    pub(super) fn new(capacity: usize, notify: Arc<Notify>) -> Self {
         Self {
             queue: Mutex::new(VecDeque::with_capacity(capacity)),
             space: Condvar::new(),
+            notify,
             closed: AtomicBool::new(false),
             waiting: AtomicUsize::new(0),
             capacity,
@@ -62,9 +76,10 @@ impl<T> BoundedPending<T> {
             .is_empty()
     }
 
-    /// Whether a producer is parked waiting for capacity right now.
-    #[cfg(test)]
-    pub(super) fn producer_waiting(&self) -> bool {
+    /// Whether a producer is parked waiting for capacity right now. The
+    /// flusher must not retire while this is true: the parked producer still
+    /// holds the residual frames.
+    pub(super) fn producer_parked(&self) -> bool {
         self.waiting.load(Ordering::SeqCst) > 0
     }
 
@@ -86,6 +101,11 @@ impl<T> BoundedPending<T> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if guard.len() >= self.capacity {
+                // Wake the consumer BEFORE parking: it may be asleep in
+                // notified().await, and waiting until this batch fully fit
+                // circularly waited on a wake that could only come after the
+                // wait returned.
+                self.notify.notify_one();
                 self.waiting.fetch_add(1, Ordering::SeqCst);
                 while guard.len() >= self.capacity && !self.closed.load(Ordering::SeqCst) {
                     guard = self
@@ -98,7 +118,14 @@ impl<T> BoundedPending<T> {
             if self.closed.load(Ordering::SeqCst) {
                 return;
             }
+            let was_empty = guard.is_empty();
             guard.push_back(frame);
+            drop(guard);
+            if was_empty {
+                // The flusher drains to empty before it sleeps; this wake (or
+                // the stored permit it leaves) hands it the new batch.
+                self.notify.notify_one();
+            }
         }
     }
 
@@ -120,10 +147,18 @@ impl<T> BoundedPending<T> {
     /// Does not wait for capacity: the frame previously occupied a slot that
     /// its pop freed.
     pub(super) fn push_front_requeue(&self, frame: T) {
-        self.queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push_front(frame);
+        let was_empty = {
+            let mut guard = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let was_empty = guard.is_empty();
+            guard.push_front(frame);
+            was_empty
+        };
+        if was_empty {
+            self.notify.notify_one();
+        }
     }
 
     /// Discard every queued frame (used after the event channel closes) and
@@ -148,21 +183,19 @@ mod tests {
     /// regression fails instead of hanging the test binary.
     fn wait_for_waiting(queue: &BoundedPending<usize>) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !queue.producer_waiting() && std::time::Instant::now() < deadline {
+        while !queue.producer_parked() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(
-            queue.producer_waiting(),
+            queue.producer_parked(),
             "producer never parked for capacity"
         );
-        // Let the observed parked state settle (the waiting counter is set
-        // just before the predicate re-check).
-        std::thread::sleep(Duration::from_millis(50));
     }
 
     #[test]
     fn stalled_consumer_caps_the_queue_and_drain_resumes_collection() {
-        let queue = Arc::new(BoundedPending::<usize>::new(3));
+        let notify = Arc::new(Notify::new());
+        let queue = Arc::new(BoundedPending::<usize>::new(3, Arc::clone(&notify)));
         let producer_queue = Arc::clone(&queue);
         let finished = Arc::new(AtomicBool::new(false));
         let producer_finished = Arc::clone(&finished);
@@ -197,7 +230,8 @@ mod tests {
 
     #[test]
     fn close_releases_a_parked_producer_and_discards_the_remainder() {
-        let queue = Arc::new(BoundedPending::<usize>::new(2));
+        let notify = Arc::new(Notify::new());
+        let queue = Arc::new(BoundedPending::<usize>::new(2, notify));
         queue.push_all_blocking(0..2);
 
         let producer_queue = Arc::clone(&queue);
@@ -212,5 +246,45 @@ mod tests {
         producer.join().expect("producer thread");
         assert_eq!(queue.len(), 0);
         assert!(queue.is_closed());
+    }
+
+    /// c-ctxusage r9 item 1: a consumer that sleeps in `notified().await`
+    /// must still receive a residual batch LARGER than the capacity. Before
+    /// the fix the producer parked for room without waking the consumer and
+    /// the wait could never return.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_batch_wakes_an_idle_consumer_before_parking() {
+        let notify = Arc::new(Notify::new());
+        let queue = Arc::new(BoundedPending::<usize>::new(4, Arc::clone(&notify)));
+
+        // The consumer starts drained and parks exactly like the production
+        // flusher: it only ever wakes on the queue-integrated Notify.
+        let consumer_queue = Arc::clone(&queue);
+        let consumer = tokio::spawn(async move {
+            let mut delivered = Vec::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while delivered.len() < 50 && std::time::Instant::now() < deadline {
+                notify.notified().await;
+                while let Some(frame) = consumer_queue.pop_for_send() {
+                    delivered.push(frame);
+                }
+            }
+            delivered
+        });
+        // Let the consumer enter notified().await with the queue empty.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let producer_queue = Arc::clone(&queue);
+        let producer = std::thread::spawn(move || {
+            producer_queue.push_all_blocking(0..50);
+        });
+
+        let delivered = tokio::time::timeout(Duration::from_secs(15), consumer)
+            .await
+            .expect("producer and consumer deadlocked on the bounded queue")
+            .expect("consumer task panicked");
+        producer.join().expect("producer thread");
+        assert_eq!(delivered, (0..50).collect::<Vec<_>>());
+        assert_eq!(queue.len(), 0);
     }
 }

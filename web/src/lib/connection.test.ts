@@ -617,6 +617,7 @@ describe("ConnectionMachine", () => {
     resume.mockImplementation(() => new Promise<void>(() => {})); // blocked upgrades
     machine.startLive();
     clock.advance(LIVE_FRAME_MS); // t=15 stale: probe t=30, offline deadline t=45
+    await Promise.resolve(); // drain frame-watchdog settle
 
     // The REST probe answers a moment early (t=29): quiet reopen attempt A
     // starts and clears the stale/probe/reconnect timers, offline carried.
@@ -660,12 +661,16 @@ describe("ConnectionMachine", () => {
     resume.mockReturnValue(new Promise<void>(() => {})); // upgrades refused
     machine.startLive();
     clock.advance(LIVE_FRAME_MS); // stale, D = 30 s
+    await Promise.resolve(); // drain frame-watchdog settle
     expect(machine.state).toBe("stale");
 
-    // Probe fails (REST down): loud offline, D must clear.
-    clock.advance(REST_PROBE_MS);
+    // Probe fails (REST down): loud offline, D must clear. The probe timer
+    // delivers the false answer itself — mock before the advance and drain its
+    // continuation instead of dispatching by hand.
     probe.mockResolvedValue(false);
-    machine.dispatch({ type: "probe", ok: false });
+    clock.advance(REST_PROBE_MS);
+    await Promise.resolve(); // probe promise
+    await Promise.resolve(); // continuation -> dispatch probe false
     expect(machine.state).toBe("offline");
 
     // Hub back: online → recovering; resume rejects (upgrades still blocked);

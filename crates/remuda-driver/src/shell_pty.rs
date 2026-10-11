@@ -1689,15 +1689,10 @@ impl ShellPtyDriver {
         *self.poller_finalised.lock().await = resumed.poller_finalised.lock().await.take();
         *self.waiter.lock().await = resumed.waiter.lock().await.take();
         // c-usagefu r8 item 2: adopt the resumed driver's file-tail adapter
-        // handle. `resumed.spawn_*` stored it on `resumed.adapters`; taking it
-        // here keeps the tail task alive on `self`. Dispose of the previous
-        // driver's handle deliberately first (its process is gone — abort
-        // before the replace so supervisor.rs does not abort the NEW task
-        // when `resumed` drops without adopting it.
-        if let Some(old) = self.adapters.lock().await.take() {
-            drop(old);
-        }
-        *self.adapters.lock().await = resumed.adapters.lock().await.take();
+        // handle (its process is the live one; the previous driver's tails
+        // followed a dead pid). Production single-point of the move:
+        // supervisor::adopt_resumed_handle.
+        crate::adapters::supervisor::adopt_resumed_handle(&self.adapters, &resumed.adapters).await;
         // §9.1: adopt the resumed run's switch coordination. Its worker and
         // mapper share a bridge, and its event sender is the live one. When a
         // switch was mid-flight at resume, adopt the resumed bridge so the
@@ -4514,49 +4509,79 @@ mod tests {
 
 #[cfg(test)]
 mod r8_adapter_adoption_tests {
+    //! c-usagefu r8 item 2: the real production adoption helper
+    //! [`crate::adapters::supervisor::adopt_resumed_handle`] — the exact
+    //! single-point start_resumed_inner calls — against slots of the same
+    //! `tokio::sync::Mutex<Option<AdapterHandle>>` type the drivers hold.
 
-    /// c-usagefu r8 item 2: when start_resumed_inner adopts the resumed
-    /// driver's fields, the file-tail AdapterHandle must move from resumed to
-    /// self (not abort when resumed drops). This verifies the exact adoption
-    /// invariant: the NEW task handle stays live after `resumed` is consumed.
+    use crate::adapters::supervisor::{AdapterHandle, adopt_resumed_handle};
+
+    /// A resumed tail must survive the scratch resumed driver being consumed
+    /// (its `Drop` aborts every task the handle still owns), the PREVIOUS
+    /// launch's tail must be torn down deliberately, and after adoption the
+    /// live tail must still deliver a NEWLY appended observation — the
+    /// close→resume regression the fix addresses.
     #[tokio::test]
     async fn adopted_adapter_handle_survives_resumed_driver_drop() {
-        // Build a real supervisor-spawned adapter task that blocks on a
-        // channel receiver (so it stays alive without a real rollout).
-        let (_tx, rx) = tokio::sync::mpsc::channel::<remuda_protocol::Observation>(8);
-        let task = tokio::spawn(async move {
-            // Park forever until aborted.
-            let _ = rx;
+        // The FIRST launch's tail: parked, holding a guard sender whose drop
+        // (task aborted) closes the receiver.
+        let (old_guard_tx, mut old_gone_rx) = tokio::sync::oneshot::channel::<()>();
+        let old_task = tokio::spawn(async move {
+            let _guard = old_guard_tx;
             std::future::pending::<()>().await;
         });
-        let handle = crate::adapters::supervisor::AdapterHandle { tasks: vec![task] };
-        // The resumed driver "holds" it (as start_resumed_inner places it).
-        let mut resumed_slot: Option<crate::adapters::supervisor::AdapterHandle> = Some(handle);
+        let live_slot = tokio::sync::Mutex::new(Some(AdapterHandle {
+            tasks: vec![old_task],
+        }));
 
-        // Simulate the adoption lines from start_resumed_inner: dispose old
-        // (None here), then take the resumed handle into self_slot.
-        let mut self_slot: Option<crate::adapters::supervisor::AdapterHandle> = None;
-        // old handle: first launch's adapter is gone (process closed)
-        if let Some(old) = self_slot.take() {
-            drop(old);
-        }
-        // THE FIX: take from resumed so it survives resumed's drop.
-        self_slot = resumed_slot.take();
+        // The RESUMED tail: it waits for an appended-line trigger the way the
+        // file poll loop waits for a new chunk, forwards one observation, then
+        // keeps tailing.
+        let (new_line_tx, mut new_line_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (obs_tx, mut obs_rx) = tokio::sync::mpsc::channel::<u32>(1);
+        let new_task = tokio::spawn(async move {
+            while new_line_rx.recv().await.is_some() {
+                // A newly appended usage observation after resume.
+                let _ = obs_tx.send(42).await;
+            }
+        });
+        let resumed_slot = tokio::sync::Mutex::new(Some(AdapterHandle {
+            tasks: vec![new_task],
+        }));
 
-        // resumed_slot is now None: dropping the (empty) resumed driver must
-        // NOT abort the task.
-        drop(resumed_slot);
+        // THE PRODUCTION PATH start_resumed_inner now uses.
+        adopt_resumed_handle(&live_slot, &resumed_slot).await;
 
-        // Yield so any spurious abort would take effect.
+        // The scratch resumed driver is consumed: its empty slot must abort
+        // nothing.
+        drop(resumed_slot.into_inner());
         tokio::task::yield_now().await;
-        let adopted = self_slot.as_ref().expect("self holds the handle");
-        assert_eq!(
-            adopted.live_task_count(),
-            1,
-            "the resumed adapter task stays alive after resumed drops"
+
+        // The old launch's tail was disposed deliberately before the replace:
+        // aborting its task drops the guard and closes the receiver.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), &mut old_gone_rx)
+                .await
+                .is_ok_and(|recv| recv.is_err()),
+            "the previous launch's tail is torn down on resume"
         );
 
-        // Cleanup: dropping self aborts as expected.
-        drop(self_slot);
+        // The adopted tail stays live on the live driver.
+        assert_eq!(
+            live_slot.lock().await.as_ref().unwrap().live_task_count(),
+            1,
+            "the resumed adapter task stays live after resumed drops"
+        );
+
+        // A usage line appended to the rollout AFTER close→resume is still
+        // observed through the adopted tail (the regression: supervisor aborted
+        // the new tail when the un-adopted resumed driver dropped).
+        new_line_tx.send(()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), obs_rx.recv())
+                .await
+                .expect("adopted tail still emits after resume"),
+            Some(42)
+        );
     }
 }

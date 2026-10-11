@@ -98,6 +98,26 @@ impl Drop for AdapterHandle {
     }
 }
 
+/// Adopt a resumed driver's file-tail handle into the LIVE driver's slot
+/// (c-usagefu r8 item 2). `start_resumed_inner` spawns a fresh driver whose
+/// adapter tasks live in ITS slot; when that scratch driver is consumed at
+/// the end of resume, simply dropping the slot would abort the new tails
+/// (the supervisor.rs `Drop` aborts every task).
+///
+/// Order matters: the previous process's handle is disposed FIRST (its tails
+/// follow a dead pid), and the resumed handle is then MOVED out of its slot,
+/// so the scratch driver's subsequent drop aborts nothing while the adopted
+/// tasks keep emitting on the live driver.
+pub(crate) async fn adopt_resumed_handle(
+    live: &tokio::sync::Mutex<Option<AdapterHandle>>,
+    resumed: &tokio::sync::Mutex<Option<AdapterHandle>>,
+) {
+    if let Some(old) = live.lock().await.take() {
+        drop(old);
+    }
+    *live.lock().await = resumed.lock().await.take();
+}
+
 /// Build the per-instance stamp context.
 #[must_use]
 pub fn stamp_ctx(

@@ -61,6 +61,14 @@ pub struct AdapterCtx {
     /// promoted attach to a process this Node did not launch: its claim is
     /// released when the adapter closes.
     pub instance_key: Option<String>,
+    /// c-usagefu r8 item 1 tier b: process-tree ownership probe + the live
+    /// agent pid roots (refreshed by the driver). A rollout held open by a
+    /// process in one of these trees is attributed to THIS instance without
+    /// relying on prompt text. `None` for promoted attaches.
+    pub ownership: Option<Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>>,
+    /// c-usagefu r8 item 1 tier b: live agent pid roots refreshed by the
+    /// driver while the pane is live.
+    pub agent_pid_roots: Option<std::sync::Arc<std::sync::Mutex<Vec<u32>>>>,
 }
 
 /// Handle to a running adapter task. Dropping/aborting it stops the poll loop.
@@ -115,6 +123,9 @@ pub fn spawn_file_adapters(
         AgentKind::Codex => {
             let mut adapter =
                 CodexAdapter::new(ctx.home.clone()).with_instance_key(ctx.instance_key.clone());
+            if let Some(probe) = &ctx.ownership {
+                adapter = adapter.with_ownership(probe.clone(), ctx.agent_pid_roots.clone());
+            }
             if let Some(model) = &ctx.fallback_model {
                 adapter = adapter.with_fallback_model(model.clone());
             }

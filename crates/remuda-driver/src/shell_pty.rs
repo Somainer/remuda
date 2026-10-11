@@ -1435,6 +1435,11 @@ impl ShellPtyDriver {
             // not a fresh UUID — close/resume re-spawns this adapter and must
             // reclaim the rollout the previous spawn owned.
             instance_key: Some(ctx.instance_id.as_id().as_str().to_owned()),
+            // Native-carrier launch relies on the stable instance key
+            // (tier a/c); process-tree probing is not wired for the pty
+            // carrier here (the shell_pty native path is hook-confirmed).
+            ownership: None,
+            agent_pid_roots: None,
         };
         crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx)
     }
@@ -1505,6 +1510,8 @@ impl ShellPtyDriver {
                         // owner); resume of a DRIVER launch goes through the
                         // native-carrier spawn above with the stable key.
                         instance_key: None,
+                        ownership: None,
+                        agent_pid_roots: None,
                     };
                     match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {
                         Ok(Some(started)) => handle = Some(started),

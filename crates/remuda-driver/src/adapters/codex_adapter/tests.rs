@@ -429,14 +429,14 @@ fn a_driver_launch_binds_only_its_own_post_launch_same_cwd_rollout() {
     );
 }
 
-/// Two same-cwd sessions inside the launch window is unprovable ownership:
-/// fail closed permanently, even after one of them goes away.
+/// r8 item 1: two same-cwd prompt-compatible sessions are ambiguous and stay
+/// UNBOUND while both exist (no guess), but discovery never latches a
+/// permanent give-up — once the competing candidate goes away, the sole
+/// remaining candidate is attributable in the sole (never-shared) epoch.
 #[test]
-fn two_post_launch_same_cwd_rollouts_fail_closed_for_the_launch_lifetime() {
+fn two_post_launch_same_cwd_rollouts_stay_unbound_then_resolve_when_unique() {
     let home = tempfile::tempdir().unwrap();
-    let cwd = Path::new("/projects/alpha-r3amb");
-    // Keep the discovery window open so this exercises the Ambiguous branch,
-    // not the deadline branch.
+    let cwd = Path::new("/projects/alpha-r8amb");
     let now = OffsetDateTime::now_utc();
     let floor = now - time::Duration::seconds(10);
     let rfc = |at: OffsetDateTime| at.format(&Rfc3339).unwrap();
@@ -445,14 +445,14 @@ fn two_post_launch_same_cwd_rollouts_fail_closed_for_the_launch_lifetime() {
         home.path(),
         "2026/09/14",
         "one",
-        "/projects/alpha-r3amb",
+        "/projects/alpha-r8amb",
         &rfc(now - time::Duration::seconds(5)),
     );
     write_rollout(
         home.path(),
         "2026/09/14",
         "two",
-        "/projects/alpha-r3amb",
+        "/projects/alpha-r8amb",
         &rfc(now - time::Duration::seconds(1)),
     );
 
@@ -463,19 +463,26 @@ fn two_post_launch_same_cwd_rollouts_fail_closed_for_the_launch_lifetime() {
         launched_at: Some(floor),
     })
     .with_instance_key(Some(INST_A.to_owned()));
-    assert!(!adapter.discover().unwrap(), "ambiguous binds nothing");
+    assert!(!adapter.discover().unwrap(), "two candidates bind nothing");
     assert!(adapter.binding().is_none());
+    assert!(!adapter.discovery_gave_up, "ambiguity never latches");
 
-    // Remove one candidate so a unique match would now exist; the ambiguity
-    // decision stands and the home is not rescanned forever.
+    // Remove the competing candidate: the remaining sole file is the only
+    // prompt-compatible rollout in a never-shared epoch → it binds.
     std::fs::remove_file(
         home.path()
             .join("sessions/2026/09/14")
             .join("rollout-two.jsonl"),
     )
     .unwrap();
-    assert!(!adapter.discover().unwrap());
-    assert!(adapter.binding().is_none());
+    assert!(
+        adapter.discover().unwrap(),
+        "unique remaining candidate binds"
+    );
+    assert_eq!(
+        adapter.binding().map(|b| b.session_id.as_str()),
+        Some("one")
+    );
 }
 
 /// codex 0.154 creates the rollout LAZILY on the first turn: an instance
@@ -601,6 +608,49 @@ fn launch_adapter_keyed(home: &Path, cwd: &str, floor: OffsetDateTime, key: &str
     .with_instance_key(Some(key.to_owned()))
 }
 
+/// r8 item 1: driver-launch adapter with an injected process-ownership
+/// probe + shared pid-root cell. Tests set/clear the fake roots and tell the
+/// FakeOwnership which files the agent process currently holds open.
+fn launch_with_fake_ownership(
+    home: &Path,
+    cwd: &str,
+    floor: OffsetDateTime,
+    key: &str,
+    pid: u32,
+    probe: &std::sync::Arc<crate::adapters::codex_ownership::FakeOwnership>,
+    roots: &std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+) -> CodexAdapter {
+    launch_adapter_keyed(home, cwd, floor, key)
+        .with_ownership(
+            probe.clone() as std::sync::Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>,
+            Some(roots.clone()),
+        )
+        .with_fake_pid(pid)
+}
+
+/// Test-only builder setting a fake single pid root (avoids pub fields).
+trait WithFakePid {
+    fn with_fake_pid(self, pid: u32) -> Self;
+}
+impl WithFakePid for CodexAdapter {
+    fn with_fake_pid(self, _pid: u32) -> Self {
+        self // roots are supplied through the Arc; kept for readability at callsites
+    }
+}
+
+/// Make a fake ownership probe and a shared pid-root cell seeded with `pid`.
+fn fake_ownership(
+    pid: u32,
+) -> (
+    std::sync::Arc<crate::adapters::codex_ownership::FakeOwnership>,
+    std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+) {
+    (
+        std::sync::Arc::new(crate::adapters::codex_ownership::FakeOwnership::new()),
+        std::sync::Arc::new(std::sync::Mutex::new(vec![pid])),
+    )
+}
+
 #[test]
 fn a_bound_first_instance_releases_its_window_and_a_later_instance_binds_its_own() {
     // r5 item 1: A binds at 10:01 and its window must not linger; B launched
@@ -690,11 +740,24 @@ fn three_overlapping_windows_do_not_latch_give_up_and_clear_as_they_close() {
         );
     }
 
-    // A's rollout appears with A-DISTINCT prompt; B and C sent different
-    // text, so attribution to A is exclusive despite overlapping windows.
-    send_fixture_prompt(Path::new(cwd), INST_A, "A distinct words", now);
-    send_fixture_prompt(Path::new(cwd), INST_B, "B distinct words", now);
-    send_fixture_prompt(Path::new(cwd), INST_C, "C distinct words", now);
+    // r8 item 1: with three live discoverers, prompt text is disabled (the
+    // epoch is shared). Only A's process-held rollout binds.
+    let (probe_a, roots_a) = fake_ownership(3001);
+    let (probe_b, roots_b) = fake_ownership(3002);
+    let (probe_c, roots_c) = fake_ownership(3003);
+    a = a.with_ownership(
+        probe_a.clone() as std::sync::Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>,
+        Some(roots_a.clone()),
+    );
+    b = b.with_ownership(
+        probe_b.clone() as std::sync::Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>,
+        Some(roots_b.clone()),
+    );
+    c = c.with_ownership(
+        probe_c.clone() as std::sync::Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>,
+        Some(roots_c.clone()),
+    );
+
     write_rollout_prompt_at(
         home.path(),
         "A1",
@@ -702,8 +765,14 @@ fn three_overlapping_windows_do_not_latch_give_up_and_clear_as_they_close() {
         &now.format(&Rfc3339).unwrap(),
         "A distinct words",
     );
-    // Exactly one poll across the three claims A1 (others see zero unclaimed
-    // or a lost claim); drive a couple of ticks so the claim resolves.
+    let a1_path = home
+        .path()
+        .join("sessions/2026/09/14")
+        .join("rollout-A1.jsonl");
+    probe_a.hold(&a1_path, 3001);
+
+    // Exactly one poll across the three: A's process owns A1; B/C probes do
+    // not hold it → unbound and STILL discovering (no give-up latch).
     let mut bound = None;
     for adapter in [&mut a, &mut b, &mut c] {
         if adapter.discover().unwrap() {
@@ -715,11 +784,11 @@ fn three_overlapping_windows_do_not_latch_give_up_and_clear_as_they_close() {
             );
         }
     }
-    assert_eq!(bound.as_deref(), Some("A1"), "exactly one adapter binds A1");
+    assert_eq!(bound.as_deref(), Some("A1"), "only A's process binds A1");
     for adapter in [&b, &c] {
         assert!(
             !adapter.discovery_gave_up,
-            "overlap never latches a permanent give-up"
+            "a stronger tier may still arrive: no permanent give-up"
         );
         assert!(adapter.binding().is_none());
     }
@@ -735,26 +804,27 @@ fn three_overlapping_windows_do_not_latch_give_up_and_clear_as_they_close() {
 
 #[test]
 fn an_idle_unbound_instance_with_a_live_window_does_not_block_b() {
-    // r6 item 8: A launched but never prompted stays ALIVE the whole time. B
-    // launches in the same cwd (so B's window overlaps A's) and binds its own
-    // prompt-authorized rollout without A ever being dropped: per-instance
-    // claims and prompts mean an idle live window no longer forces B to wait.
+    // r8 item 1: A launched but never prompted stays ALIVE the whole time. B
+    // launches in the same cwd and binds its own rollout via the PROCESS-tier
+    // probe (prompt-only attribution is off in a shared epoch).
     let home = tempfile::tempdir().unwrap();
-    let cwd = "/projects/r5-idle";
+    let cwd = "/projects/r8-idle";
     let floor = OffsetDateTime::now_utc() - time::Duration::seconds(5);
-    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
+    let (probe_a, roots_a) = fake_ownership(4001);
+    let (probe_b, roots_b) = fake_ownership(4002);
+    let mut a =
+        launch_with_fake_ownership(home.path(), cwd, floor, INST_A, 4001, &probe_a, &roots_a);
     assert!(!a.discover().unwrap(), "A has no rollout yet");
 
-    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+    let mut b =
+        launch_with_fake_ownership(home.path(), cwd, floor, INST_B, 4002, &probe_b, &roots_b);
     assert!(
         b.window.as_ref().is_some_and(|window| window.overlapping()),
         "B overlaps the still-idle, still-LIVE A"
     );
 
-    // B dispatched its own prompt and its rollout appears while A is still
-    // open (no drop).
+    // B's rollout appears, held open by B's agent pid (4002).
     let now = OffsetDateTime::now_utc();
-    send_fixture_prompt(Path::new(cwd), INST_B, "fixture driver prompt", now);
     write_rollout(
         home.path(),
         "2026/09/14",
@@ -762,12 +832,17 @@ fn an_idle_unbound_instance_with_a_live_window_does_not_block_b() {
         cwd,
         &now.format(&Rfc3339).unwrap(),
     );
+    let b_path = home
+        .path()
+        .join("sessions/2026/09/14")
+        .join("rollout-B-only.jsonl");
+    probe_b.hold(&b_path, 4002);
     assert!(b.discover().unwrap(), "B binds with A's window still live");
     assert_eq!(
         b.binding().map(|binding| binding.session_id.as_str()),
         Some("B-only")
     );
-    // A remains idle and unbound throughout.
+    // A's probe holds nothing → remains idle and unbound throughout.
     assert!(!a.discover().unwrap());
     assert!(a.binding().is_none());
 }
@@ -984,31 +1059,51 @@ fn write_rollout_prompt_at(home: &Path, id: &str, cwd: &str, started: &str, prom
 /// then binds its own distinct rollout.
 #[test]
 fn a_prompt_file_is_never_bound_by_the_instance_that_polls_first() {
+    // r8 item 1: in a shared epoch prompt text cannot attribute a rollout;
+    // the PROCESS-TIER probe decides. B scans first but holds no fd on A's
+    // file; A's fake probe holds A-first, so A binds; B binds B-second.
     let home = tempfile::tempdir().unwrap();
-    let cwd = "/projects/r6-pollorder";
+    let cwd = "/projects/r8-pollorder";
     let now = OffsetDateTime::now_utc();
     let floor = now - time::Duration::seconds(5);
     let rfc = now.format(&Rfc3339).unwrap();
 
-    send_fixture_prompt(Path::new(cwd), INST_A, "A prompt words", now);
-    send_fixture_prompt(Path::new(cwd), INST_B, "B prompt words", now);
-    write_rollout_prompt_at(home.path(), "A-first", cwd, &rfc, "A prompt words");
+    let (probe_a, roots_a) = fake_ownership(1001);
+    let (probe_b, roots_b) = fake_ownership(2002);
 
-    // B scans first (supervisor tick order is arbitrary).
-    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
-    assert!(!b.discover().unwrap(), "B must not bind A's prompt file");
+    write_rollout_prompt_at(home.path(), "A-first", cwd, &rfc, "A prompt words");
+    let a_path = home
+        .path()
+        .join("sessions/2026/09/14")
+        .join("rollout-A-first.jsonl");
+    probe_a.hold(&a_path, 1001);
+
+    // B scans first: no fd in B's tree → stays unbound.
+    let mut b =
+        launch_with_fake_ownership(home.path(), cwd, floor, INST_B, 2002, &probe_b, &roots_b);
+    assert!(
+        !b.discover().unwrap(),
+        "B must not bind A's process-owned file"
+    );
     assert!(b.binding().is_none());
 
-    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
+    // A binds even though B polled first.
+    let mut a =
+        launch_with_fake_ownership(home.path(), cwd, floor, INST_A, 1001, &probe_a, &roots_a);
     assert!(
         a.discover().unwrap(),
-        "A binds its own file despite B's early poll"
+        "A binds the file its process holds open"
     );
     assert_eq!(a.binding().map(|b| b.session_id.as_str()), Some("A-first"));
 
-    // B's own rollout then appears and binds, with A still alive.
+    // B's own rollout appears and is held by B's pid → binds with A alive.
     let later = now.format(&Rfc3339).unwrap();
     write_rollout_prompt_at(home.path(), "B-second", cwd, &later, "B prompt words");
+    let b_path = home
+        .path()
+        .join("sessions/2026/09/14")
+        .join("rollout-B-second.jsonl");
+    probe_b.hold(&b_path, 2002);
     assert!(b.discover().unwrap());
     assert_eq!(b.binding().map(|b| b.session_id.as_str()), Some("B-second"));
 }
@@ -1017,13 +1112,15 @@ fn a_prompt_file_is_never_bound_by_the_instance_that_polls_first() {
 /// released on bind; A's prompt authorizes only A).
 #[test]
 fn a_still_open_idle_while_b_binds_its_own_rollout() {
+    // r8 item 1: A stays ALIVE; B binds its own process-held file via tier b.
     let home = tempfile::tempdir().unwrap();
-    let cwd = "/projects/r6-open";
+    let cwd = "/projects/r8-open";
     let now = OffsetDateTime::now_utc();
     let floor = now - time::Duration::seconds(5);
 
-    send_fixture_prompt(Path::new(cwd), INST_A, "fixture driver prompt", now);
-    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
+    let (probe_a, roots_a) = fake_ownership(1001);
+    let (probe_b, roots_b) = fake_ownership(2002);
+
     write_rollout_prompt_at(
         home.path(),
         "A-open",
@@ -1031,11 +1128,19 @@ fn a_still_open_idle_while_b_binds_its_own_rollout() {
         &now.format(&Rfc3339).unwrap(),
         "fixture driver prompt",
     );
+    let a_path = home
+        .path()
+        .join("sessions/2026/09/14")
+        .join("rollout-A-open.jsonl");
+    probe_a.hold(&a_path, 1001);
+    let mut a =
+        launch_with_fake_ownership(home.path(), cwd, floor, INST_A, 1001, &probe_a, &roots_a);
     assert!(a.discover().unwrap());
 
-    // B launches and binds while A is still live (no drop).
-    send_fixture_prompt(Path::new(cwd), INST_B, "fixture driver prompt", now);
-    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+    // B launches while A is still live; A's claimed file is excluded and B's
+    // probe holds no fd on it.
+    let mut b =
+        launch_with_fake_ownership(home.path(), cwd, floor, INST_B, 2002, &probe_b, &roots_b);
     assert!(!b.discover().unwrap(), "B cannot touch A's bound file");
     write_rollout_prompt_at(
         home.path(),
@@ -1044,7 +1149,12 @@ fn a_still_open_idle_while_b_binds_its_own_rollout() {
         &now.format(&Rfc3339).unwrap(),
         "fixture driver prompt",
     );
-    assert!(b.discover().unwrap(), "B binds with A's window still open");
+    let b_path = home
+        .path()
+        .join("sessions/2026/09/14")
+        .join("rollout-B-open.jsonl");
+    probe_b.hold(&b_path, 2002);
+    assert!(b.discover().unwrap(), "B binds its own process-held file");
     assert_eq!(b.binding().map(|b| b.session_id.as_str()), Some("B-open"));
 }
 
@@ -1118,93 +1228,87 @@ fn a_grok_pane_prompt_does_not_authorize_a_codex_bind() {
 /// (deterministic interleaving: both scan both files; claims decide).
 #[test]
 fn two_prompted_panes_each_bind_their_own_file() {
+    // r8 item 1: two files each held open by its OWN process tree → each
+    // adapter binds exactly its file, prompts identical or distinct no longer
+    // matter.
     let home = tempfile::tempdir().unwrap();
-    let cwd = "/projects/r6-two";
+    let cwd = "/projects/r8-two";
     let now = OffsetDateTime::now_utc();
     let floor = now - time::Duration::seconds(5);
     let rfc = now.format(&Rfc3339).unwrap();
 
-    send_fixture_prompt(Path::new(cwd), INST_A, "A words", now);
-    send_fixture_prompt(Path::new(cwd), INST_B, "B words", now);
     write_rollout_prompt_at(home.path(), "A-file", cwd, &rfc, "A words");
     write_rollout_prompt_at(home.path(), "B-file", cwd, &rfc, "B words");
+    let dir = home.path().join("sessions/2026/09/14");
+    let (probe_a, roots_a) = fake_ownership(5001);
+    let (probe_b, roots_b) = fake_ownership(5002);
+    probe_a.hold(&dir.join("rollout-A-file.jsonl"), 5001);
+    probe_b.hold(&dir.join("rollout-B-file.jsonl"), 5002);
 
-    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
-    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+    let mut a =
+        launch_with_fake_ownership(home.path(), cwd, floor, INST_A, 5001, &probe_a, &roots_a);
+    let mut b =
+        launch_with_fake_ownership(home.path(), cwd, floor, INST_B, 5002, &probe_b, &roots_b);
     assert!(a.discover().unwrap());
     assert!(b.discover().unwrap());
-    let bound = |adapter: &CodexAdapter| adapter.binding().unwrap().session_id.clone();
-    let (ab, bb) = (bound(&a), bound(&b));
-    assert!(
-        ab != bb && (ab == "A-file" || ab == "B-file"),
-        "each instance binds a distinct file, got {ab} {bb}"
-    );
-    assert!(
-        (ab == "A-file" && bb == "B-file") || (ab == "B-file" && bb == "A-file"),
-        "only A-file/B-file are bindable, got {ab} {bb}"
-    );
+    assert_eq!(a.binding().map(|x| x.session_id.as_str()), Some("A-file"));
+    assert_eq!(b.binding().map(|x| x.session_id.as_str()), Some("B-file"));
 }
 
 // c-usagefu r6 item 2 ---------------------------------------------------------
 
 #[test]
 fn a_claim_loser_keeps_discovering_and_never_takes_the_winners_file() {
-    // r7 item 9: BOTH adapters must complete their scan of the SAME unclaimed
-    // file before either claims it (a deterministic interleaving). The loser
-    // must have confirmed AND discovered empty at that point, lose the claim,
-    // and then bind its own later rollout — never the winner's.
+    // r8 item 9: BOTH adapters run their REAL discover() scan of the same
+    // candidates before either binds (no bind_for_test). The winner's file is
+    // process-held by the winner's pid; the loser stays identity-empty, never
+    // takes the winner's file (even after the winner closes), then binds its
+    // own process-held rollout.
     let home = tempfile::tempdir().unwrap();
-    let cwd = "/projects/r7-loser";
+    let cwd = "/projects/r8-loser";
     let now = OffsetDateTime::now_utc();
     let floor = now - time::Duration::seconds(5);
     let rfc = now.format(&Rfc3339).unwrap();
 
-    send_fixture_prompt(Path::new(cwd), INST_A, "winner words", now);
-    send_fixture_prompt(Path::new(cwd), INST_B, "loser words", now);
     write_rollout_prompt_at(home.path(), "W", cwd, &rfc, "winner words");
+    let dir = home.path().join("sessions/2026/09/14");
+    let winner_path = dir.join("rollout-W.jsonl");
+    let (probe_a, roots_a) = fake_ownership(6001);
+    let (probe_b, roots_b) = fake_ownership(6002);
 
-    // Both adapters exist and are unbound BEFORE any discover() call — this
-    // is the "scans complete before either claim" ordering the review asks
-    // for. The file W matches A's prompt, not B's, but we drive the claim
-    // race directly.
-    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
-    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+    // Both adapters exist and are unbound BEFORE any discover() call.
+    let mut a =
+        launch_with_fake_ownership(home.path(), cwd, floor, INST_A, 6001, &probe_a, &roots_a);
+    let mut b =
+        launch_with_fake_ownership(home.path(), cwd, floor, INST_B, 6002, &probe_b, &roots_b);
     assert!(a.confirmed.is_none() && a.discovered.is_none() && a.binding().is_none());
     assert!(b.confirmed.is_none() && b.discovered.is_none() && b.binding().is_none());
 
-    // The shared unclaimed candidate both would scan.
-    let winner_path = home
-        .path()
-        .join("sessions/2026/09/14")
-        .join("rollout-W.jsonl");
-
-    // A claims first; B attempts the SAME still-unclaimed-by-B candidate.
+    // The winner's process holds W open; the loser's does not. Both scan.
+    probe_a.hold(&winner_path, 6001);
     assert!(
-        a.bind_for_test("W".into(), winner_path.clone(), false),
-        "A wins"
+        a.discover().unwrap(),
+        "winner binds its own process-held file"
     );
-    let b_bound = b.bind_for_test("W".into(), winner_path.clone(), false);
-    assert!(!b_bound, "B loses the race on the same candidate");
-    // The loser has NOT recorded a discovered/confirmed identity: a later
-    // poll must not shortcut into tier 1 on "W".
+    assert_eq!(a.binding().map(|x| x.session_id.as_str()), Some("W"));
+    // B scanned the same candidate through the real path and lost.
+    assert!(!b.discover().unwrap());
     assert!(b.confirmed.is_none(), "loser confirmed stays empty");
     assert!(b.discovered.is_none(), "loser discovered stays empty");
     assert!(b.binding().is_none(), "loser never bound W");
 
-    // B's normal discovery also cannot take A's file (excluded as claimed).
-    assert!(!b.discover().unwrap());
-    assert!(b.binding().is_none());
-
-    // After A closes B still cannot take A's file (driver-launch claim
-    // outlives A).
+    // After A closes B still cannot take A's file (claim outlives A and B's
+    // process never held it).
     drop(a);
     assert!(!b.discover().unwrap());
 
-    // B's own rollout appears and binds.
+    // B's own rollout appears and is held by B's pid → binds.
     write_rollout_prompt_at(home.path(), "L", cwd, &rfc, "loser words");
+    let loser_path = dir.join("rollout-L.jsonl");
+    probe_b.hold(&loser_path, 6002);
     assert!(b.discover().unwrap());
     assert_eq!(
-        b.binding().map(|b| b.session_id.as_str()),
+        b.binding().map(|x| x.session_id.as_str()),
         Some("L"),
         "the loser binds its own rollout, never W"
     );
@@ -1373,40 +1477,63 @@ fn claim_release_uses_the_exact_key_not_a_re_canonicalized_path() {
 
 // c-usagefu r7 item 1: EXCLUSIVE attribution -------------------------------
 
-/// Both live instances send identical "continue" within 5 s. Only B's rollout
-/// exists when A polls (B-poll-first and A-poll-first orders): A must never
-/// bind B's session. After A closes B is exclusive and binds its file.
+/// r8 item 1: two live instances send identical "continue". Prompt text is
+/// never attribution once the epoch is shared; B binds ONLY because its
+/// process holds the rollout open (tier b). A never binds it; closing A
+/// changes nothing (sticky shared epoch does not hand the file to B).
 #[test]
 fn identical_prompts_two_live_owners_never_cross_bind() {
     let home = tempfile::tempdir().unwrap();
-    let cwd = "/projects/r7-exclusive";
+    let cwd = "/projects/r8-exclusive";
     let now = OffsetDateTime::now_utc();
     let floor = now - time::Duration::seconds(5);
     let rfc = now.format(&Rfc3339).unwrap();
 
-    // Order 1: A polls BEFORE B while both windows are open.
     send_fixture_prompt(Path::new(cwd), INST_A, "continue", now);
     send_fixture_prompt(Path::new(cwd), INST_B, "continue", now);
     write_rollout_prompt_at(home.path(), "B-only", cwd, &rfc, "continue");
+    let b_path = home
+        .path()
+        .join("sessions/2026/09/14")
+        .join("rollout-B-only.jsonl");
+    let (probe_a, roots_a) = fake_ownership(7001);
+    let (probe_b, roots_b) = fake_ownership(7002);
 
-    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
-    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+    let mut a =
+        launch_with_fake_ownership(home.path(), cwd, floor, INST_A, 7001, &probe_a, &roots_a);
+    let mut b =
+        launch_with_fake_ownership(home.path(), cwd, floor, INST_B, 7002, &probe_b, &roots_b);
 
-    // A scans first: B's file matches BOTH live owners → not exclusive.
-    assert!(
-        !a.discover().unwrap(),
-        "A must not bind a file B also matches"
-    );
+    // A scans first: A's process holds no fd on B's file → unbound.
+    assert!(!a.discover().unwrap(), "A never binds B's process file");
     assert!(a.binding().is_none());
-    // B scans: the same file matches both owners too (B isn't exclusive while
-    // A is a live compatible discoverer).
-    assert!(!b.discover().unwrap(), "B is not exclusive while A is live");
-    assert!(b.binding().is_none());
+    // B's process holds it → binds even with A live and identical prompts.
+    probe_b.hold(&b_path, 7002);
+    assert!(
+        b.discover().unwrap(),
+        "B binds via process ownership, not text"
+    );
+    assert_eq!(b.binding().map(|x| x.session_id.as_str()), Some("B-only"));
 
-    // A closes: B becomes the sole live compatible owner.
+    // A closes: still cannot bind — shared epoch + no process ownership.
     drop(a);
-    assert!(b.discover().unwrap(), "B binds after A leaves");
-    assert_eq!(b.binding().map(|b| b.session_id.as_str()), Some("B-only"));
+    // A is already dropped; construct a fresh C in the same (now unshared but
+    // previously-shared) epoch to prove sticky text never cross-binds.
+    let (probe_c, roots_c) = fake_ownership(7003);
+    send_fixture_prompt(Path::new(cwd), "inst-c-key", "continue", now);
+    let mut c = launch_with_fake_ownership(
+        home.path(),
+        cwd,
+        floor,
+        "inst-c-key",
+        7003,
+        &probe_c,
+        &roots_c,
+    );
+    assert!(
+        !c.discover().unwrap(),
+        "new owner with identical text never takes B's file"
+    );
 }
 
 /// Reverse order: B scans before A exists at all (A's window opens after B's

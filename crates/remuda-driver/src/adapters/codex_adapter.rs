@@ -97,6 +97,9 @@ pub struct CodexAdapter {
     /// Process-wide same-cwd launch window for a driver launch. None for a
     /// promoted/attach adapter (no launch floor); released on bind/give-up.
     window: Option<crate::adapters::codex_discovery::DiscoveryWindow>,
+    /// r8 item 1 tier b: process-tree ownership probe + live agent roots.
+    ownership: Option<std::sync::Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>>,
+    agent_pid_roots: Option<std::sync::Arc<std::sync::Mutex<Vec<u32>>>>,
     /// Unique lifecycle owner for this adapter (r7 item 2). Every adapter —
     /// promoted included — gets its own UUID at construction so two promoted
     /// adapters never share the `hook:S` owner for the same indexed session.
@@ -128,6 +131,8 @@ impl CodexAdapter {
             fallback_model: None,
             discovery_gave_up: false,
             window: None,
+            ownership: None,
+            agent_pid_roots: None,
             lifecycle_owner: uuid::Uuid::new_v4().to_string(),
         }
     }
@@ -148,6 +153,19 @@ impl CodexAdapter {
             ));
         }
         self.instance_key = key;
+        self
+    }
+
+    /// Attach the process-tree ownership evidence for tier-b discovery (r8
+    /// item 1).
+    #[must_use]
+    pub(crate) fn with_ownership(
+        mut self,
+        probe: std::sync::Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>,
+        roots: Option<std::sync::Arc<std::sync::Mutex<Vec<u32>>>>,
+    ) -> Self {
+        self.ownership = Some(probe);
+        self.agent_pid_roots = roots;
         self
     }
 
@@ -240,27 +258,6 @@ impl CodexAdapter {
         true
     }
 
-    /// Give up discovery permanently (real file-level ambiguity) and release
-    /// the overlap window; the claim set is untouched (nothing was bound).
-    fn give_up(&mut self) {
-        self.discovery_gave_up = true;
-        if let Some(mut window) = self.window.take() {
-            window.release();
-        }
-    }
-
-    /// Test-only access to the private bind decision (r6 item 2 claim-race
-    /// test): returns whether the claim succeeded.
-    #[cfg(test)]
-    pub(crate) fn bind_for_test(
-        &mut self,
-        session_id: String,
-        path: PathBuf,
-        strict_launch: bool,
-    ) -> bool {
-        self.bind(session_id, path, strict_launch)
-    }
-
     /// Find the session's rollout.
     ///
     /// Three evidence tiers:
@@ -321,39 +318,52 @@ impl CodexAdapter {
         // No time deadline: the rollout can appear on a first prompt minutes
         // after launch. Old pre-launch rollouts are filtered by timestamp AND
         // skipped cheaply via mtime/date pruning in the locator.
-        let overlapping = self
-            .window
-            .as_ref()
-            .is_some_and(|window| window.overlapping());
         // Prompts are authorized per INSTANCE, and files already owned by a
-        // different instance are excluded: both together make an idle
-        // adapter unable to bind another pane's or a hand-run session.
+        // different instance are excluded.
         let owner = self.instance_key.clone().unwrap_or_default();
         let cwd = self.home.cwd.clone();
+        // r8 item 1 tier b: clone the process-ownership evidence so the gate
+        // closure needs no self borrow.
+        let probe = self.ownership.clone();
+        let pid_roots = self.agent_pid_roots.clone();
+        let process_owns = move |path: &Path| -> bool {
+            let (Some(probe), Some(roots)) = (&probe, &pid_roots) else {
+                return false;
+            };
+            let roots = roots.lock().map(|r| r.clone()).unwrap_or_default();
+            roots
+                .iter()
+                .any(|root| probe.file_held_in_tree(path, *root))
+        };
         match locate_rollout_by_cwd(
             &self.home.home,
             &cwd,
             launched_at,
             &|path: &Path| crate::adapters::codex_discovery::is_claimed_by_other(path, &owner),
-            &|_path, started, first_prompt, _metadata| {
-                // EXCLUSIVE attribution (r7 item 1): the candidate must match
-                // THIS owner's prompts AND no other currently-open discoverer
-                // in the cwd. Identical "continue" text from two live panes
-                // stays ambiguous; an already-claimed session of ours is
-                // re-recognized by id.
-                crate::adapters::codex_discovery::exclusively_matches_sent_input(
+            &|path, started, first_prompt, metadata| {
+                // TIER B (r8 item 1): the rollout file is open in THIS
+                // instance's agent process tree — attribution independent of
+                // prompt text and immune to identical prompts / closed owners.
+                if process_owns(path) {
+                    return true;
+                }
+                // Already-claimed by THIS owner (re-recognition by id).
+                if metadata["id"]
+                    .as_str()
+                    .is_some_and(|id| crate::adapters::codex_discovery::owned_by(&cwd, &owner, id))
+                {
+                    return true;
+                }
+                // TIER C: prompt text ONLY when this has been the sole live
+                // instance for the entire epoch. Anything else waits.
+                crate::adapters::codex_discovery::sole_instance_matches(
                     &cwd,
                     &owner,
                     first_prompt,
                     started,
-                ) || _metadata["id"]
-                    .as_str()
-                    .is_some_and(|id| crate::adapters::codex_discovery::owned_by(&cwd, &owner, id))
+                )
             },
         ) {
-            // A unique match authorized by THIS instance's prompts binds,
-            // even while another window is open (the other instance's files
-            // are excluded above and cannot match its prompts).
             CwdRollout::Found { id, path, strict } => {
                 if self.bind(id.clone(), path, strict) {
                     // Remember the discovery id only NOW (post-claim).
@@ -364,19 +374,9 @@ impl CodexAdapter {
                     Ok(false)
                 }
             }
-            // Two rollouts match THIS instance's own prompts. While a partner
-            // window is still open one may still be theirs — wait (never
-            // latch); after the overlap ends they are genuinely
-            // indistinguishable: fail closed.
-            CwdRollout::Ambiguous => {
-                if overlapping {
-                    Ok(false)
-                } else {
-                    self.give_up();
-                    Ok(false)
-                }
-            }
-            CwdRollout::NotYet => Ok(false),
+            // r8 item 1: NEVER give up while a stronger tier (hook / process
+            // ownership) can still arrive — keep polling.
+            CwdRollout::Ambiguous | CwdRollout::NotYet => Ok(false),
         }
     }
 

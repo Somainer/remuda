@@ -29,6 +29,11 @@ struct WindowEntry {
     count: u32,
     /// True while another window overlaps (count >= 2).
     tainted: bool,
+    /// r8 item 1 tier c: STICKY — once a second window has been open at any
+    /// point in this epoch, prompt text can never attribute a rollout here
+    /// (another instance closing does not make the survivor "sole"). Cleared
+    /// only when the epoch ends (the last window closes and the entry drops).
+    ever_shared: bool,
 }
 
 static OPEN_WINDOWS: LazyLock<Mutex<HashMap<PathBuf, WindowEntry>>> =
@@ -162,10 +167,12 @@ impl DiscoveryWindow {
                 .and_modify(|entry| {
                     entry.count += 1;
                     entry.tainted = true;
+                    entry.ever_shared = true;
                 })
                 .or_insert(WindowEntry {
                     count: 1,
                     tainted: false,
+                    ever_shared: false,
                 });
             OPEN_DISCOVERERS
                 .lock()
@@ -181,11 +188,13 @@ impl DiscoveryWindow {
         }
     }
 
-    /// Whether another discovery window currently overlaps this cwd (two or
-    /// more unbound/just-launched adapters). Read live every tick.
+    /// Test-only: whether another window overlaps this cwd.
+    #[cfg(test)]
     pub(crate) fn overlapping(&self) -> bool {
-        let map = OPEN_WINDOWS.lock().expect("codex discovery windows");
-        map.get(&self.key)
+        OPEN_WINDOWS
+            .lock()
+            .expect("codex discovery windows")
+            .get(&self.key)
             .is_some_and(|entry| entry.tainted || entry.count >= 2)
     }
 
@@ -336,11 +345,12 @@ pub(crate) fn record_input_at(cwd: &Path, owner: &str, text: &str, at: OffsetDat
     put_input(cwd, owner, text, at);
 }
 
-/// Whether `owner` is the ONLY live discoverer in `cwd` whose sent inputs
-/// match a rollout with first prompt `rollout_text` created at
-/// `session_started` (c-usagefu r7 item 1). A candidate compatible with
-/// another open adapter stays ambiguous; the caller must not bind.
-pub(crate) fn exclusively_matches_sent_input(
+/// r8 item 1 TIER C: prompt text authorizes a rollout ONLY when `owner` has
+/// been the single discoverer in `cwd` for the whole window epoch — the
+/// `ever_shared` sticky flag means a second instance that was live at ANY
+/// point (even if it later closed) disables prompt attribution for the
+/// epoch. Repeated sends by the same owner do not relax it.
+pub(crate) fn sole_instance_matches(
     cwd: &Path,
     owner: &str,
     rollout_text: &str,
@@ -351,38 +361,30 @@ pub(crate) fn exclusively_matches_sent_input(
     if wanted.is_empty() {
         return false;
     }
-    let inputs_map = SENT_INPUTS.lock().expect("codex sent inputs");
+    let windows = OPEN_WINDOWS.lock().expect("codex discovery windows");
     let discoverers = OPEN_DISCOVERERS.lock().expect("open discoverers");
-    let Some(by_instance) = inputs_map.get(&cwd_key) else {
+    let inputs = SENT_INPUTS.lock().expect("codex sent inputs");
+    // Owner must currently be a live discoverer AND its epoch never shared.
+    let sole_epoch = windows
+        .get(&cwd_key)
+        .is_some_and(|entry| !entry.ever_shared)
+        && discoverers
+            .get(&cwd_key)
+            .is_some_and(|set| set.contains(owner));
+    drop((windows, discoverers));
+    if !sole_epoch {
         return false;
-    };
-    let Some(live) = discoverers.get(&cwd_key) else {
-        // No discoverer set: fall back to single-owner match.
-        return by_instance.get(owner).is_some_and(|inputs| {
-            inputs.iter().any(|i| {
-                i.text == wanted
-                    && session_started >= i.at - INPUT_MATCH_SLACK
-                    && session_started <= i.at + INPUT_MATCH_WINDOW
-            })
-        });
-    };
-    let mut compatible_owners = 0u32;
-    let mut caller_matches = false;
-    for key in live {
-        if let Some(inputs) = by_instance.get(key)
-            && inputs.iter().any(|i| {
-                i.text == wanted
-                    && session_started >= i.at - INPUT_MATCH_SLACK
-                    && session_started <= i.at + INPUT_MATCH_WINDOW
-            })
-        {
-            compatible_owners += 1;
-            if key == owner {
-                caller_matches = true;
-            }
-        }
     }
-    caller_matches && compatible_owners == 1
+    inputs
+        .get(&cwd_key)
+        .and_then(|by_instance| by_instance.get(owner))
+        .is_some_and(|list| {
+            list.iter().any(|input| {
+                input.text == wanted
+                    && session_started >= input.at - INPUT_MATCH_SLACK
+                    && session_started <= input.at + INPUT_MATCH_WINDOW
+            })
+        })
 }
 
 // Test-only visibility so unit tests in other modules of this crate can

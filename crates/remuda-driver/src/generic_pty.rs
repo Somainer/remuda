@@ -150,6 +150,9 @@ struct PtyLive {
     matcher_task: Option<JoinHandle<()>>,
     /// codex/grok file-tail adapters (c-usagefu (d)); aborted on close.
     adapter_handle: Option<crate::adapters::supervisor::AdapterHandle>,
+    /// r8 item 1: task refreshing the pane's live agent pid roots for the
+    /// process-tree ownership probe; aborted on close.
+    pid_task: Option<JoinHandle<()>>,
     /// Per-launch identity shared with the codex file adapter's discovery
     /// (c-usagefu r6 item 1).
     instance_key: String,
@@ -514,8 +517,34 @@ impl GenericPtyDriver {
         // Per-launch identity shared with the codex adapter discovery (r6
         // item 1).
         let instance_key = uuid::Uuid::new_v4().to_string();
-        let adapter_handle =
-            self.spawn_file_tail_adapters(&spec, &recipe, &ctx, &tx, launched_at, &instance_key);
+        // r8 item 1 tier b: process-tree ownership of the rollout file. The
+        // pid roots are refreshed from the pane's foreground agent process
+        // list while the pane is live; the codex adapter's /proc probe
+        // attributes a file held open anywhere in those trees.
+        let ownership_probe = crate::adapters::codex_ownership::platform_probe();
+        let agent_pid_roots: Arc<std::sync::Mutex<Vec<u32>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pid_task = if ownership_probe.is_some() {
+            Some(spawn_agent_pid_refresh(
+                client.clone(),
+                pane_id.clone(),
+                preset.binary,
+                recipe.argv.clone(),
+                Arc::clone(&agent_pid_roots),
+            ))
+        } else {
+            None
+        };
+        let adapter_handle = self.spawn_file_tail_adapters(
+            &spec,
+            &recipe,
+            &ctx,
+            &tx,
+            launched_at,
+            &instance_key,
+            ownership_probe,
+            Arc::clone(&agent_pid_roots),
+        );
         *self.inner.lock().await = Some(PtyLive {
             ctx,
             client,
@@ -530,6 +559,7 @@ impl GenericPtyDriver {
             matcher_task,
             adapter_handle,
             instance_key,
+            pid_task,
             closed: false,
             failed,
         });
@@ -561,6 +591,8 @@ impl GenericPtyDriver {
     /// until the adapter binds or the instance closes. Failure
     /// to spawn degrades silently, like the promoted-adapter watch — losing
     /// the file channel never fails the launch.
+    /// r8 item 1 process-tree evidence passed to the codex file adapter.
+    #[allow(clippy::too_many_arguments)] // launch wiring already passes spec/recipe/ctx/events/key.
     fn spawn_file_tail_adapters(
         &self,
         spec: &InstanceSpec,
@@ -569,6 +601,8 @@ impl GenericPtyDriver {
         events: &mpsc::Sender<Observation>,
         launched_at: time::OffsetDateTime,
         instance_key: &str,
+        ownership_probe: Option<Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>>,
+        agent_pid_roots: Arc<std::sync::Mutex<Vec<u32>>>,
     ) -> Option<crate::adapters::supervisor::AdapterHandle> {
         let kind = match spec.kind {
             AgentKind::Codex | AgentKind::Grok => spec.kind,
@@ -607,6 +641,8 @@ impl GenericPtyDriver {
             hooks: None,
             agent_pid: None,
             instance_key: Some(instance_key.to_owned()),
+            ownership: ownership_probe,
+            agent_pid_roots: Some(agent_pid_roots),
         };
         match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {
             Ok(Some(handle)) => Some(handle),
@@ -617,6 +653,44 @@ impl GenericPtyDriver {
             }
         }
     }
+}
+
+/// r8 item 1: poll the pane's foreground process list and record the live
+/// agent pid roots (codex CLI + any agent-looking descendant foreground
+/// process) into `roots`. Stops when the pane disappears / the RPC fails.
+fn spawn_agent_pid_refresh(
+    client: Client,
+    pane_id: String,
+    binary: &'static str,
+    argv: Vec<String>,
+    roots: Arc<std::sync::Mutex<Vec<u32>>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let pids = match client.pane_process_info(Some(pane_id.clone())).await {
+                Ok(info) => info
+                    .process_info
+                    .map(|proc| {
+                        proc.foreground_processes
+                            .iter()
+                            .filter(|p| process_looks_like_agent(p, binary, &argv))
+                            .map(|p| p.pid)
+                            .collect::<Vec<u32>>()
+                    })
+                    .unwrap_or_default(),
+                Err(_) => {
+                    // Pane gone / daemon unavailable: stop refreshing.
+                    break;
+                }
+            };
+            if let Ok(mut guard) = roots.lock() {
+                *guard = pids;
+            }
+        }
+    })
 }
 
 #[async_trait]
@@ -811,6 +885,9 @@ impl Driver for GenericPtyDriver {
         // Dropping the handle aborts the codex/grok file-tail tasks.
         live.adapter_handle.take();
         if let Some(task) = live.status_task.take() {
+            task.abort();
+        }
+        if let Some(task) = live.pid_task.take() {
             task.abort();
         }
         if let Some(task) = live.matcher_task.take() {

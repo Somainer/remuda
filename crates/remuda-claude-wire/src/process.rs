@@ -279,7 +279,97 @@ enum WriterCmd {
 /// ack); a broken/closed pipe propagates to the awaiting caller instead of
 /// being swallowed by the background task. Returns `false` when the writer loop
 /// must stop (a write failed), `true` to continue.
-async fn handle_writer_cmd<S>(stdin: &mut S, cmd: WriterCmd) -> bool
+/// Per-process writer gate used by `test-stub` to park the single writer task
+/// inside the real enqueue→ack window (after it dequeues/accepts UserWrite,
+/// before it writes and acks). The driver test barrier drives it so a caller
+/// can be aborted exactly in that window (ma-sdk-state r9 item 3).
+#[cfg(feature = "test-stub")]
+pub mod write_gate {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A writer-side gate: parks each UserWrite until `open()` is called.
+    #[derive(Clone)]
+    pub struct WriteGate {
+        inner: Arc<(
+            tokio::sync::Notify,
+            AtomicBool,
+            tokio::sync::Notify,
+            AtomicBool,
+        )>,
+    }
+
+    impl Default for WriteGate {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl WriteGate {
+        /// An open gate (UserWrite does not park).
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                // (release notify, open?, reached notify, reached?)
+                inner: Arc::new((
+                    tokio::sync::Notify::new(),
+                    AtomicBool::new(true),
+                    tokio::sync::Notify::new(),
+                    AtomicBool::new(false),
+                )),
+            }
+        }
+        /// Start CLOSED: UserWrite parks inside the writer until `open`.
+        #[must_use]
+        pub fn closed() -> Self {
+            let g = Self::new();
+            g.close();
+            g
+        }
+        /// Close the gate (subsequent UserWrite parks until open) and reset the
+        /// "reached" signal so a test can await the next park.
+        pub fn close(&self) {
+            self.inner.1.store(false, Ordering::Release);
+            self.inner.3.store(false, Ordering::Release);
+        }
+        /// Resolve when the writer has parked on this gate inside the window.
+        pub async fn wait_until_parked(&self) {
+            if self.inner.3.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.inner.2.notified();
+            if self.inner.3.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+        /// Let parked (and future) UserWrite calls proceed.
+        pub fn open(&self) {
+            if !self.inner.1.swap(true, Ordering::AcqRel) {
+                self.inner.0.notify_waiters();
+            }
+        }
+        /// Park if the gate is closed; record that the writer reached the window.
+        pub(super) async fn wait(&self) {
+            self.inner.3.store(true, Ordering::Release);
+            self.inner.2.notify_waiters();
+            if self.inner.1.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.inner.0.notified();
+            if self.inner.1.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+async fn handle_writer_cmd<S>(
+    stdin: &mut S,
+    cmd: WriterCmd,
+    #[cfg(feature = "test-stub")] write_gate: &write_gate::WriteGate,
+) -> bool
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
@@ -291,17 +381,24 @@ where
             }
             true
         }
-        WriterCmd::UserWrite(msg, ack) => match codec::write_line(stdin, msg.as_ref()).await {
-            Ok(()) => {
-                let _ = ack.send(Ok(()));
-                true
+        WriterCmd::UserWrite(msg, ack) => {
+            // r9 item 3 (test-stub): the writer has ACCEPTED the command (it
+            // dequeued it from the FIFO) but has not written / acked yet. Park
+            // here so a test aborts the caller inside the real window.
+            #[cfg(feature = "test-stub")]
+            write_gate.wait().await;
+            match codec::write_line(stdin, msg.as_ref()).await {
+                Ok(()) => {
+                    let _ = ack.send(Ok(()));
+                    true
+                }
+                Err(error) => {
+                    warn!(%error, "claude stdin user write failed");
+                    let _ = ack.send(Err(error));
+                    false
+                }
             }
-            Err(error) => {
-                warn!(%error, "claude stdin user write failed");
-                let _ = ack.send(Err(error));
-                false
-            }
-        },
+        }
         WriterCmd::Close => {
             if let Err(error) = tokio::io::AsyncWriteExt::shutdown(stdin).await {
                 debug!(%error, "claude stdin shutdown");
@@ -319,11 +416,38 @@ where
 #[derive(Clone)]
 pub struct ProcessWriter {
     tx: mpsc::Sender<WriterCmd>,
+    /// r9 item 3 test-stub writer gate (the spawned writer task holds a clone).
+    #[cfg(feature = "test-stub")]
+    write_gate: write_gate::WriteGate,
 }
 
 impl ProcessWriter {
     async fn enqueue(&self, cmd: WriterCmd) -> Result<(), Error> {
         self.tx.send(cmd).await.map_err(|_| Error::StdinClosed)
+    }
+
+    /// Test-stub (r9 item 3): close the writer's in-window gate. The next
+    /// UserWrite accepted by the writer task parks INSIDE the real
+    /// enqueue→ack window (after FIFO accept, before write/ack) until
+    /// `open_write_window`.
+    #[cfg(feature = "test-stub")]
+    pub fn close_write_window_for_test(&self) {
+        self.write_gate.close();
+    }
+
+    /// Test-stub (r9 item 3): open the writer's in-window gate. Uses interior
+    /// mutability via a shared Arc so a cloned writer observes it.
+    #[cfg(feature = "test-stub")]
+    pub fn open_write_window_for_test(&self) {
+        self.write_gate.open();
+    }
+
+    /// Test-stub (r9 item 3): clone of the writer's in-window gate so a caller
+    /// can close it, await the writer parking, and reopen it.
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub fn write_gate_for_test(&self) -> write_gate::WriteGate {
+        self.write_gate.clone()
     }
 
     /// Send a user turn (`content` string or blocks).
@@ -503,11 +627,26 @@ impl ClaudeProcess {
         let (raw_out_tx, mut raw_out_rx) = mpsc::channel::<Outbound>(256);
         let (pub_out_tx, pub_out_rx) = mpsc::channel::<Outbound>(256);
 
+        // r9 item 3: open by default so non-test behaviour is unchanged.
+        #[cfg(feature = "test-stub")]
+        let write_gate = write_gate::WriteGate::new();
         let writer_task = {
             let mut stdin = stdin;
+            #[cfg(feature = "test-stub")]
+            let wg = write_gate.clone();
             tokio::spawn(async move {
                 while let Some(cmd) = writer_rx.recv().await {
-                    if !handle_writer_cmd(&mut stdin, cmd).await {
+                    let keep_going = {
+                        #[cfg(feature = "test-stub")]
+                        {
+                            handle_writer_cmd(&mut stdin, cmd, &wg).await
+                        }
+                        #[cfg(not(feature = "test-stub"))]
+                        {
+                            handle_writer_cmd(&mut stdin, cmd).await
+                        }
+                    };
+                    if !keep_going {
                         break;
                     }
                 }
@@ -628,7 +767,11 @@ impl ClaudeProcess {
 
         let process = Self {
             inbound: pub_in_tx.clone(),
-            writer: ProcessWriter { tx: writer_tx },
+            writer: ProcessWriter {
+                tx: writer_tx,
+                #[cfg(feature = "test-stub")]
+                write_gate,
+            },
             child,
             reader,
             writer_task,
@@ -651,6 +794,13 @@ impl ClaudeProcess {
     #[must_use]
     pub fn writer(&self) -> ProcessWriter {
         self.writer.clone()
+    }
+
+    /// Test-stub (r9 item 3): the writer's in-window gate for this process.
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub fn write_gate_for_test(&self) -> write_gate::WriteGate {
+        self.writer.write_gate_for_test()
     }
 
     /// Child pid, if still known.

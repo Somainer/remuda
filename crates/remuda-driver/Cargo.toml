@@ -13,7 +13,7 @@ workspace = true
 [features]
 default = []
 # In-process FakeDriver for Node/Web loopback. Not installed in release images.
-test-stub = []
+test-stub = ["remuda-claude-wire/test-stub"]
 # macOS `security` CLI keychain backend. Tests are `#[ignore]`.
 keychain = []
 

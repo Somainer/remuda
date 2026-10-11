@@ -615,6 +615,19 @@ impl ClaudePrintDriver {
         test_barrier::arm(&self.inner.barrier)
     }
 
+    /// Test-only (`test-stub`, r9 item 3): a handle on the real writer task's
+    /// in-window gate (closes UserWrite inside the writer, after FIFO accept
+    /// and before the write/ack).
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub async fn write_window(&self) -> remuda_claude_wire::write_gate::WriteGate {
+        let live = self.inner.live.lock().await;
+        live.as_ref()
+            .expect("test access: live process")
+            .process
+            .write_gate_for_test()
+    }
+
     /// Test-only (`test-stub`): make the terminal exit observation build fail
     /// inside `emit_exit` (after the reserved channel permit was taken), to
     /// prove the RunHandle still reaches EOF after close (ma-sdk-state r6 item
@@ -1456,11 +1469,6 @@ async fn prepare_prompt_write(
     let task_inner = inner.clone();
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        // r8 item 2: deterministic park in the accept→ack window (after the
-        // writer FIFO owns UserWrite, before observing the ack). The caller may
-        // be aborted here; the accepted write still runs to completion below.
-        #[cfg(feature = "test-stub")]
-        test_barrier::hold_after_accept_pre_ack(&task_inner.barrier).await;
         let result = match ack_rx.await {
             Ok(Ok(())) => {
                 #[cfg(feature = "test-stub")]
@@ -1774,17 +1782,6 @@ pub mod test_barrier {
         /// 2/5).
         write_number: AtomicUsize,
         park_from_write: AtomicUsize,
-        /// r8 item 2: the detached completion task has passed the writer accept
-        /// boundary (UserWrite is in the FIFO) and is parked in the
-        /// enqueue→ack window before observing the write ack. A test aborts the
-        /// CALLER here and proves the accepted write still completes.
-        accept_ack_parked: AtomicBool,
-        accept_ack_open: AtomicBool,
-        accept_ack_gate: tokio::sync::Notify,
-        /// 1-based write number at/after which the accept→ack gate parks
-        /// (`MAX` = never).
-        accept_ack_from: AtomicUsize,
-        accept_ack_number: AtomicUsize,
         /// r8 item 3: incremented each time the publication worker has MAPPED a
         /// Result frame (after the mapper lock released). A test waits for the
         /// specific count (A's result) before releasing B's failure.
@@ -1813,11 +1810,6 @@ pub mod test_barrier {
             write_gate: tokio::sync::Notify::new(),
             write_number: AtomicUsize::new(0),
             park_from_write: AtomicUsize::new(usize::MAX),
-            accept_ack_parked: AtomicBool::new(false),
-            accept_ack_open: AtomicBool::new(false),
-            accept_ack_gate: tokio::sync::Notify::new(),
-            accept_ack_from: AtomicUsize::new(usize::MAX),
-            accept_ack_number: AtomicUsize::new(0),
             result_mapped_count: AtomicUsize::new(0),
         });
         *slot.lock().expect("barrier lock") = Some(state.clone());
@@ -1846,29 +1838,6 @@ pub mod test_barrier {
         }
         let notified = state.write_gate.notified();
         if state.write_gate_open.load(Ordering::Acquire) {
-            return;
-        }
-        notified.await;
-    }
-
-    /// r8 item 2 hook: park the DETACHED completion task in the writer's
-    /// enqueue→ack window — UserWrite is already accepted into the FIFO, the
-    /// write ack has not been observed. The caller can be aborted here without
-    /// affecting the accepted write. Numbered via `accept_ack_from`.
-    pub(super) async fn hold_after_accept_pre_ack(slot: &Slot) {
-        let Some(state) = current(slot) else {
-            return;
-        };
-        let n = state.accept_ack_number.fetch_add(1, Ordering::AcqRel) + 1;
-        if n < state.accept_ack_from.load(Ordering::Acquire) {
-            return;
-        }
-        state.accept_ack_parked.store(true, Ordering::Release);
-        if state.accept_ack_open.load(Ordering::Acquire) {
-            return;
-        }
-        let notified = state.accept_ack_gate.notified();
-        if state.accept_ack_open.load(Ordering::Acquire) {
             return;
         }
         notified.await;
@@ -1991,38 +1960,6 @@ pub mod test_barrier {
         pub fn park_from_write(&self, n: usize) {
             self.state.park_from_write.store(n, Ordering::Release);
         }
-
-        /// r8 item 2: park the accept→ack gate (post-writer-accept, pre-ack)
-        /// starting at the 1-based write number `n`.
-        pub fn park_accept_ack_from(&self, n: usize) {
-            self.state.accept_ack_from.store(n, Ordering::Release);
-        }
-
-        /// Wait until the thresholded post-accept/pre-ack window is reached.
-        pub async fn wait_until_accept_ack_parked(&self, timeout: Duration) {
-            let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.accept_ack_parked.load(Ordering::Acquire) {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
-                        "write_commit barrier: timed out in the accept→ack window \
-                         (accept_ack_parked={})",
-                        self.state.accept_ack_parked.load(Ordering::Acquire)
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        }
-
-        /// Let the parked post-accept completion proceed to await the ack.
-        pub fn release_accept_ack(&self) {
-            if !self.state.accept_ack_open.swap(true, Ordering::AcqRel) {
-                self.state.accept_ack_gate.notify_waiters();
-            }
-        }
-
         /// Whether the parked (thresholded) write has been reached yet.
         pub async fn wait_until_write_parked(&self, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
@@ -2116,7 +2053,6 @@ pub mod test_barrier {
         /// Release both gates at once (send commits and the worker proceeds
         /// without an extra hold). Preserves the r4 single-gate behaviour.
         pub fn release(&self) {
-            self.release_accept_ack();
             self.release_write_ack();
             self.release_send();
             self.resume_worker();

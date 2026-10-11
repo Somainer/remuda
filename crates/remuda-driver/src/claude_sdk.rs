@@ -100,6 +100,13 @@ impl ClaudeSdkDriver {
     pub fn force_write_failure_from(&self, n: usize) {
         self.inner.force_write_failure_from(n);
     }
+
+    /// Test-only (`test-stub`, r9 item 3): real writer in-window gate.
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub async fn write_window(&self) -> remuda_claude_wire::write_gate::WriteGate {
+        self.inner.write_window().await
+    }
 }
 
 #[async_trait]

@@ -1890,31 +1890,32 @@ fn result_attrs(o: &Observation) -> Option<(&str, bool)> {
         _ => None,
     }
 }
-/// ma-sdk-state r8 item 2 (1b): abort the caller in the REAL writer
-/// accept→ack window — UserWrite is already in the writer FIFO, the ack is
-/// pending. The accepted write must still run: turn A is announced BEFORE its
-/// result and settles (despite the caller vanishing); a later turn B then keeps
-/// correct per-turn attribution (resultIndex 0 then 1).
+/// ma-sdk-state r9 item 3: abort the caller INSIDE THE REAL WRITER window —
+/// the single writer task has accepted UserWrite off its FIFO and is parked
+/// between the write and the ack (the wire `WriteGate`, not a driver-side
+/// observer). The accepted write must still run on caller drop: turn A is
+/// announced BEFORE its result and settles; a later B keeps attribution
+/// (resultIndex 0 then 1).
 #[tokio::test]
-async fn aborting_in_the_real_accept_ack_window_keeps_the_accepted_turn_ordered_and_settled() {
+async fn aborting_inside_the_real_writer_window_keeps_the_accepted_turn_ordered_and_settled() {
     let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
     let mut handle = driver.start(spec).await.expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
 
-    // Park ONLY the post-accept/pre-ack window for write #1; pre-accept runs.
-    let barrier = driver.arm_write_commit_barrier();
-    barrier.park_accept_ack_from(1);
+    // Close the writer's in-window gate: the writer parks INSIDE UserWrite
+    // handling (after FIFO accept, before write_line/ack).
+    let gate = driver.write_window().await;
+    gate.close();
 
     let mut send_a = Box::pin(driver.send(prompt_id("first", "msg-a")));
     tokio::select! {
-        _ = barrier.wait_until_accept_ack_parked(Duration::from_secs(5)) => {}
-        r = &mut send_a => panic!("A should park in the accept→ack window, got {r:?}"),
+        _ = gate.wait_until_parked() => {}
+        r = &mut send_a => panic!("A should park inside the writer window, got {r:?}"),
     }
-    // Caller aborts AFTER the writer accepted UserWrite but before the ack.
+    // Caller aborts while the writer holds the accepted command.
     drop(send_a);
-    // Release the accepted write's gates; B is not sent yet, so A settles on
-    // its own (no overlapping reservation to defer it).
-    barrier.release();
+    // Reopen: the writer completes the write/ack even though the caller is gone.
+    gate.open();
 
     // A completes and settles despite the dropped caller.
     let a = collect_until(&mut handle, Duration::from_secs(5), |seen| {
@@ -1937,7 +1938,6 @@ async fn aborting_in_the_real_accept_ack_window_keeps_the_accepted_turn_ordered_
         Some(("0", true)),
         "A settles, index 0"
     );
-    drop(barrier);
 
     // A normal follow-up turn B.
     driver

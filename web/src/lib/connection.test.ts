@@ -419,6 +419,122 @@ describe("ConnectionMachine", () => {
     expect(resume).toHaveBeenCalledTimes(1);
   });
 
+  it("GATE11 item 2: the close latch is CONSUMED by attempt A's completion; quiet attempt B's own frame survives B's rejection", async () => {
+    // §5.2.1 recovering row -> watchdog cell: EVERY attempt arm starts with a
+    // clean latch and a completion consumes it. A (loud) closes while active
+    // and settles quiet stale via the REST probe; B is the later QUIET reopen
+    // (deferred resume), certifies its OWN link with a frame, then its promise
+    // rejects — the gate-7 framed-follow rule must keep B live. Gate 10 deleted
+    // the consume, so A's latch poisoned B into recovering+settle-probe.
+    const { clock, machine, resume, probe, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
+    let rejectB: ((e: Error) => void) | null = null;
+    resume
+      .mockImplementationOnce(() => new Promise<void>(() => {})) // A hangs
+      .mockImplementationOnce(
+        () => new Promise<void>((_resolve, reject) => void (rejectB = reject)),
+      );
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" }); // attempt A (loud) in flight
+    machine.dispatch({ type: "close" }); // socket dies mid-A: latch set
+    // A settles (REST reachable): quiet stale; its completion CONSUMES latch.
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+    expect(probe).toHaveBeenCalledTimes(1);
+
+    // Quiet reopen B starts from the stale probe (deferred resume).
+    clock.advance(REST_PROBE_MS);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resume).toHaveBeenCalledTimes(2);
+    expect(machine.state).toBe("stale");
+    // The stale cycle fired one more probe to trigger B; B's failure must not
+    // schedule any settlement probe of its own.
+    const probesAtBArm = probe.mock.calls.length;
+    expect(probesAtBArm).toBe(2);
+
+    // B's own follow frames: it is genuinely live.
+    isFollowLive.mockReturnValue(true);
+    machine.dispatch({ type: "frame" });
+    expect(machine.state).toBe("live");
+    // B's promise rejects (a trailing REST read timeout): stays live.
+    rejectB!(new Error("resume-side read timed out"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("live");
+    // No extra settle probe from B: its failure never left live.
+    expect(probe).toHaveBeenCalledTimes(probesAtBArm);
+  });
+
+  it("GATE11 item 2: the latch is reset by the QUIET arm when A was retired by its watchdog without a completion", async () => {
+    // A's watchdog (not its promise completion) settles it quiet stale, so no
+    // completion ever consumed A's close latch. The quiet reopen arm
+    // (armResumeAttemptQuiet) must reset the latch itself; otherwise B's
+    // frame-certified follow is poisoned by A's dead socket.
+    const { clock, machine, resume, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
+    let rejectB: ((e: Error) => void) | null = null;
+    resume
+      .mockImplementationOnce(() => new Promise<void>(() => {})) // A hangs; watchdog retires it
+      .mockImplementationOnce(
+        () => new Promise<void>((_resolve, reject) => void (rejectB = reject)),
+      );
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" }); // A
+    machine.dispatch({ type: "close" }); // A's socket dead: latch set
+    expect(machine.state).toBe("recovering");
+    // Watchdog gives up on A; REST probe ok settles quiet stale.
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("stale");
+
+    // Quiet reopen B; its resume is deferred.
+    clock.advance(REST_PROBE_MS);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resume).toHaveBeenCalledTimes(2);
+
+    // B frames, then rejects: must stay live (latch was reset at B's arm).
+    isFollowLive.mockReturnValue(true);
+    machine.dispatch({ type: "frame" });
+    expect(machine.state).toBe("live");
+    rejectB!(new Error("read timed out"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("live");
+  });
+
+  it("GATE11 item 2: a completion CONSUMES the latch immediately even with no later attempt armed (white-box field contract)", async () => {
+    // Every read of the latch is a later attempt's completion, and every arm
+    // resets — so the consume-at-completion is unobservable through state in
+    // the happy ordering, but the field MUST be false the instant A's own
+    // completion returns (the latch is A's, not ambient state): a late
+    // close/open frame sequence before the next arm must not inherit it.
+    const { machine, isFollowLive } = setupTracked();
+    isFollowLive.mockReturnValue(false);
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    machine.dispatch({ type: "resume" }); // A
+    machine.dispatch({ type: "close" }); // latched
+    expect((machine as unknown as { closedDuringResume: boolean }).closedDuringResume).toBe(true);
+    // A settles (REST reachable) to quiet stale: completion consumes.
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect((machine as unknown as { closedDuringResume: boolean }).closedDuringResume).toBe(false);
+
+    // The successful arm stays clean too.
+    machine.dispatch({ type: "resume" }); // B (loud)
+    machine.dispatch({ type: "resumeAttempt", ok: true, attemptId: 2 });
+    expect((machine as unknown as { closedDuringResume: boolean }).closedDuringResume).toBe(false);
+  });
+
   it("GATE10 item 5 (gate9 item 2): rebind after noteBinding retires a REAL quiet reopen re-arms the stale deadline", async () => {
     // Real store sequence: quietReopen for A (resume in flight) → user
     // navigates to mounted B (noteBinding retires A, clears the watchdog and

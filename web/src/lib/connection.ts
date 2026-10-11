@@ -382,6 +382,12 @@ export class ConnectionMachine {
         const closed = this.closedDuringResume;
         this.resumeInFlight = false;
         this.resumeRetiredOffline = false;
+        // Gate 11 item 2 (gate 9 item 4 restored — gate 10 deleted the
+        // consume): the latch belongs to THIS completion. A close latched by
+        // attempt A must not still be latched when a later attempt's own
+        // frame-certified follow rejects a trailing read — every new arm also
+        // resets (loud: armResumeAttempt; quiet: armResumeAttemptQuiet).
+        this.closedDuringResume = false;
         this.clearTimer("watchdog");
         if (event.ok) {
           this.attempt = 0;
@@ -639,6 +645,12 @@ export class ConnectionMachine {
     // carried deadline.
     this.clearTimers("stale", "probe", "reconnect");
     // NOTE: no setState("recovering") — stay in quiet stale.
+    // Gate 11 item 2 (gate 9 item 4 restored): EVERY new attempt arm — loud
+    // AND quiet — starts with a clean latch. A may have been retired by its
+    // watchdog without a completion consuming its close latch; the quiet
+    // reopen's own frame-certified follow must not reject into A's dead-socket
+    // settlement.
+    this.closedDuringResume = false;
     this.resumeInFlight = true;
     this.resumeBindGen = gen;
     const attemptId = ++this.resumeAttemptId;

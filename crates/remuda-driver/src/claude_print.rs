@@ -2884,6 +2884,10 @@ impl TranscriptMapper {
         let Some(record) = self.group.flush() else {
             return Ok(Vec::new());
         };
+        // c-effortread r9 item 5: emit ONLY conversation records here. The
+        // run's effort/model extras were already computed exactly once at
+        // map_record (native order); they must not be recomputed against
+        // tracker state a later slash may have advanced.
         self.emit_conversation(record)
     }
 
@@ -2919,32 +2923,16 @@ impl TranscriptMapper {
         if let Some(source) = value.get("sourceToolUseID").and_then(Value::as_str) {
             frame.insert("parent_tool_use_id".into(), Value::String(source.into()));
         }
+        // c-effortread r9 item 5: emit ONLY the conversation records the
+        // outbound mapper produces. Effort/model/permission side-effects are
+        // computed exactly once elsewhere — in map_record for an immediate
+        // record, or at group start (group_extras) for a buffered run — and are
+        // never recomputed here against tracker state that a later record may
+        // have advanced.
         let mut out = map_outbound(
             &mut self.mapper,
             &Outbound::from_value(Value::Object(frame)),
         )?;
-        // The outbound mapper emits conversation records; effort/model/
-        // permission EXTRAS (the read-back side channels) were computed in
-        // map_record against the ORIGINAL record — re-apply them to the frame
-        // emitted from the flushed group so a late flush() of the buffered
-        // assistant run still produces its effort edge (c-effortread r8 item 5
-        // exposed this: a seeded re-promoted mapper's flushed assistant record
-        // otherwise lost the ultracode flag).
-        //
-        // IMPORTANT: extras are applied in BOTH places — map_record applies
-        // them for a complete (non-buffered) record, emit_conversation applies
-        // them when the same record is emitted from the group buffer on
-        // flush(). The trackers dedup identical edges (last == observed is no
-        // edge), so a record that already emitted them produces nothing the
-        // second time.
-        if value.get("type").and_then(Value::as_str) == Some("assistant") {
-            out.extend(self.map_effort_assistant(&value)?);
-            out.extend(self.map_model_assistant(&value)?);
-        } else if value.get("type").and_then(Value::as_str) == Some("user") {
-            out.extend(self.note_effort_user(&value)?);
-            out.extend(self.note_model_user(&value)?);
-            out.extend(self.note_permission_user(&value)?);
-        }
         // Stamp authorship on the messages this record produced. Tool results
         // and tool calls carry their own identity and are left alone.
         if value.get("type").and_then(Value::as_str) == Some("user") {
@@ -2982,6 +2970,11 @@ impl TranscriptMapper {
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
         let mut extra = Vec::new();
         if kind == "assistant" {
+            // c-effortread r9 item 5: the read-back side-effects are computed
+            // ONCE here, in native record order — even while the conversation
+            // blocks buffer into the group. emit_conversation/flush_group emit
+            // only the conversation records and must never recompute these
+            // against tracker state a later record (e.g. a slash) advanced.
             extra = self.map_effort_assistant(&value)?;
             extra.extend(self.map_model_assistant(&value)?);
         } else if kind == "user" {

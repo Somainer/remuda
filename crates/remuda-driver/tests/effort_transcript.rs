@@ -155,6 +155,59 @@ fn ultracode_slash_reads_back_as_xhigh_with_the_flag() {
     );
 }
 
+/// c-effortread r9 item 5: a buffered assistant run's effort/model extras are
+/// computed exactly once in NATIVE record order and kept with the group. When
+/// a later `/effort ultracode` (no verdict yet) flushes the buffered
+/// assistant, the flush must not recompute the assistant's extras against the
+/// now-armed ultracode pending — that emitted `{xhigh, ultracode:true}` as
+/// confirmed read-back. A subsequent refusal must leave no flag-on edge.
+#[test]
+fn a_flushed_buffered_assistant_never_confirms_a_flag_armed_by_a_later_slash() {
+    fn stdout(n: u64, body: &str) -> String {
+        json!({
+            "type": "user",
+            "uuid": format!("out-{n}"),
+            "sessionId": "effort-session",
+            "message": {
+                "role": "user",
+                "content": format!("<local-command-stdout>{body}</local-command-stdout>")
+            }
+        })
+        .to_string()
+    }
+
+    let mut mapper = mapper_version("2.1.272");
+    // A is a complete assistant turn at xhigh with the flag OFF. Its read-back
+    // edge is computed once in native record order on this first map.
+    let first = mapper
+        .map_line(&assistant(Some("xhigh"), 1))
+        .expect("map A");
+    assert_eq!(
+        effort_edges(&first),
+        vec![("xhigh".to_string(), EffortSource::Unknown, None)],
+        "A's single read-back edge is xhigh with no flag"
+    );
+
+    // A LATER terminal /effort ultracode with no verdict arms pending and
+    // supersedes the run, flushing the buffered A.
+    let flushed = mapper.map_line(&slash("ultracode", 2)).expect("map slash");
+
+    // The refusal verdict then lands (dynamic workflows disabled).
+    let refused = mapper
+        .map_line(&stdout(
+            3,
+            "Ultracode needs dynamic workflows enabled (see /config). Valid options are: low, medium, high, xhigh, max, auto",
+        ))
+        .expect("map refusal");
+
+    let all = [first, flushed, refused].concat();
+    let edges = effort_edges(&all);
+    assert!(
+        edges.iter().all(|(_, _, flag)| *flag != Some(true)),
+        "no effective ultracode-on edge is ever emitted: {edges:?}"
+    );
+}
+
 #[test]
 fn per_turn_effort_is_the_fallback_field() {
     let mut record = serde_json::from_str::<serde_json::Value>(&assistant(None, 1)).unwrap();

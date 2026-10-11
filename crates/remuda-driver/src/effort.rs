@@ -1005,14 +1005,46 @@ fn screen_names_target(screen_lowercased: &str, tier: &str) -> bool {
 /// A switch held for the next idle moment (D-028 §9.1 ready ladder).
 struct QueuedSwitch {
     request: EffortRequest,
+    /// Global enqueue order; the worker drains the two axis slots FIFO.
+    seq: u64,
     /// When present the caller is awaiting the outcome (idle fast path); when
     /// absent the worker journals the terminal status itself (working path).
     done: Option<oneshot::Sender<SwitchOutcome>>,
 }
 
-/// Queue of at most one pending switch (a newer switch replaces an older one).
+/// Which native axis one operation moves. On decoupled builds the orthogonal
+/// toggle is its own command; a level word (and the coupled bare `ultracode`)
+/// moves the tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuedAxis {
+    Tier,
+    Flag,
+}
+
+impl EffortRequest {
+    /// The native axis queuing must keep a separate slot for (c-effortread
+    /// r10 item 4).
+    fn queued_axis(&self) -> QueuedAxis {
+        match self.word {
+            "ultracode on" | "ultracode off" => QueuedAxis::Flag,
+            // Plain level words and the coupled bare `ultracode` (which IS the
+            // xhigh level command) move the tier.
+            _ => QueuedAxis::Tier,
+        }
+    }
+}
+
+/// Pending switches kept PER AXIS (c-effortread r10 item 4).
+///
+/// Selecting max (tier) and then ultracode ON (flag) while the agent is busy
+/// enqueues TWO operations: a newer op replaces only an older op on the SAME
+/// axis, and the worker executes every needed native command, each with its
+/// own read-back. Neither operation can be lost (the old queue had one slot,
+/// so the second enqueue overwrote the first).
 pub(crate) struct EffortQueue {
-    pending: Mutex<Option<QueuedSwitch>>,
+    tier: Mutex<Option<QueuedSwitch>>,
+    flag: Mutex<Option<QueuedSwitch>>,
+    enqueue_seq: std::sync::atomic::AtomicU64,
     notify: Notify,
     closed: AtomicBool,
 }
@@ -1020,27 +1052,70 @@ pub(crate) struct EffortQueue {
 impl EffortQueue {
     pub(crate) fn new() -> Self {
         Self {
-            pending: Mutex::new(None),
+            tier: Mutex::new(None),
+            flag: Mutex::new(None),
+            enqueue_seq: std::sync::atomic::AtomicU64::new(0),
             notify: Notify::new(),
             closed: AtomicBool::new(false),
         }
     }
 
-    /// Queue a switch. `done` is handed back when it has been applied.
+    fn slot(&self, axis: QueuedAxis) -> &Mutex<Option<QueuedSwitch>> {
+        match axis {
+            QueuedAxis::Tier => &self.tier,
+            QueuedAxis::Flag => &self.flag,
+        }
+    }
+
+    /// Queue a switch on its axis slot. A newer op on the SAME axis replaces
+    /// the older one (its waiter, if any, is told `Queued`); an op on the
+    /// other axis is kept and also executed.
     pub(crate) fn enqueue(
         &self,
         request: EffortRequest,
         done: Option<oneshot::Sender<SwitchOutcome>>,
     ) {
-        if let Ok(mut pending) = self.pending.lock() {
-            *pending = Some(QueuedSwitch { request, done });
+        let seq = self.enqueue_seq.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        if let Ok(mut slot) = self.slot(request.queued_axis()).lock() {
+            if let Some(previous) = slot.replace(QueuedSwitch { request, seq, done })
+                && let Some(previous_done) = previous.done
+            {
+                // The replaced operation never goes out; report it still
+                // queued so its idle fast-path caller never awaits a verdict
+                // that belongs to a dead generation.
+                let _ = previous_done.send(SwitchOutcome::Queued);
+            }
         }
         self.notify.notify_one();
     }
 
-    /// Take the queued switch, if any.
-    fn take(&self) -> Option<QueuedSwitch> {
-        self.pending.lock().ok().and_then(|mut guard| guard.take())
+    /// Take the oldest pending switch across BOTH axis slots (FIFO).
+    fn take_oldest(&self) -> Option<QueuedSwitch> {
+        // Lock the two slots in a fixed order (no await is held across either).
+        let mut tier = self.tier.lock().ok()?;
+        let mut flag = self.flag.lock().ok()?;
+        let take_tier = match (&*tier, &*flag) {
+            (Some(t), Some(f)) => t.seq <= f.seq,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return None,
+        };
+        if take_tier { tier.take() } else { flag.take() }
+    }
+
+    /// Whether a NEWER operation already replaced the dequeued `seq` on its
+    /// axis (the worker only discovers this while waiting out a running turn).
+    fn same_axis_was_replaced(&self, axis: QueuedAxis, seq: u64) -> bool {
+        self.slot(axis)
+            .lock()
+            .map(|slot| slot.as_ref().is_some_and(|queued| queued.seq > seq))
+            .unwrap_or(false)
+    }
+
+    /// Whether any axis slot currently holds an operation.
+    fn has_any(&self) -> bool {
+        self.tier.lock().map(|s| s.is_some()).unwrap_or(false)
+            || self.flag.lock().map(|s| s.is_some()).unwrap_or(false)
     }
 
     pub(crate) fn close(&self) {
@@ -1055,7 +1130,8 @@ impl EffortQueue {
 /// single serialization point; its `oneshot` carries the outcome straight
 /// back, so no final lifecycle is journaled. The working path journaled
 /// `queued` at enqueue time and gets its terminal `applied` / `degraded`
-/// lifecycle from this worker.
+/// lifecycle from this worker. Both axis slots are drained FIFO, so a tier
+/// move and a flag toggle queued together are BOTH typed and read back.
 pub(crate) fn spawn_worker(
     bridge: Arc<EffortBridge>,
     queue: Arc<EffortQueue>,
@@ -1065,14 +1141,16 @@ pub(crate) fn spawn_worker(
         while !queue.closed.load(AtomicOrdering::SeqCst) {
             // Arm the waiter before checking, so an enqueue cannot be missed.
             let notified = queue.notify.notified();
-            let queued = queue.take();
-            match queued {
-                Some(QueuedSwitch { request, done }) => {
+            match queue.take_oldest() {
+                Some(QueuedSwitch { request, seq, done }) => {
                     let word = request.command_word();
                     let request_id = request.request_id.clone();
+                    let axis = request.queued_axis();
                     // Wait out a running turn on the ready ladder. A newer
-                    // switch arriving meanwhile replaces this one, which never
-                    // goes out and is reported back as still `queued`.
+                    // switch arriving on the SAME axis meanwhile replaces
+                    // this one, which never goes out and is reported back as
+                    // still `queued`; a switch on the OTHER axis sits in its
+                    // own slot and runs next.
                     let mut replaced = false;
                     while !io.is_idle().await {
                         if queue.closed.load(AtomicOrdering::SeqCst) {
@@ -1082,18 +1160,17 @@ pub(crate) fn spawn_worker(
                             EFFORT_READBACK_POLL_MS,
                         ))
                         .await;
-                        if queue.pending.lock().map(|p| p.is_some()).unwrap_or(false) {
+                        if queue.same_axis_was_replaced(axis, seq) {
                             replaced = true;
                             break;
                         }
                     }
-                    if replaced || queue.pending.lock().map(|p| p.is_some()).unwrap_or(false) {
-                        // The enqueue's notify_one was consumed by us; wake the
-                        // outer iteration for the replacement explicitly.
-                        queue.notify.notify_one();
+                    if replaced {
                         if let Some(done) = done {
                             let _ = done.send(SwitchOutcome::Queued);
                         }
+                        // The replacement sits in its axis slot; the next
+                        // iteration takes it (and any other-axis operation).
                         continue;
                     }
                     let outcome = perform_switch(request, &bridge, io.as_ref()).await;
@@ -2138,5 +2215,122 @@ mod switch_tests {
                 "cr".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn r10_item4_tier_then_flag_while_busy_both_commands_execute_with_their_own_readback() {
+        two_axis_queued_while_busy_execute_both(
+            [
+                EffortRequest::from_level("max").unwrap(),
+                EffortRequest::from_level("ultracode on").unwrap(),
+            ],
+            ["", MAX_DIALOG, ""],
+            ["body:/effort max", "body:/effort ultracode on"],
+            ["effort-applied:max", "effort-applied:ultracode on"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn r10_item4_flag_then_tier_while_busy_both_commands_execute_with_their_own_readback() {
+        two_axis_queued_while_busy_execute_both(
+            [
+                EffortRequest::from_level("ultracode on").unwrap(),
+                EffortRequest::from_level("max").unwrap(),
+            ],
+            ["", XHIGH_DIALOG, ""],
+            ["body:/effort ultracode on", "body:/effort max"],
+            ["effort-applied:ultracode on", "effort-applied:max"],
+        )
+        .await;
+    }
+
+    /// Drive the REAL queue → worker → perform_switch production path with two
+    /// operations on DIFFERENT axes queued while the agent is busy, in either
+    /// enqueue order: the old single-slot queue lost one; per-axis slots keep
+    /// both and the worker types and journals each one with its own read-back.
+    async fn two_axis_queued_while_busy_execute_both(
+        requests: [EffortRequest; 2],
+        screens: [&str; 3],
+        expected_bodies: [&str; 2],
+        expected_journals: [&str; 2],
+    ) {
+        let bridge = Arc::new(EffortBridge::new());
+        let io = Arc::new(MockIo {
+            // Each perform_switch resolves once its dialog confirm lands; the
+            // global write counter keeps resolving the second switch too
+            // (sequential generations, own read-backs).
+            resolve_after: 3,
+            ..Default::default()
+        });
+        io.set_idle(false);
+        io.script(&screens);
+        *io.bridge.lock().unwrap() = Some(Arc::clone(&bridge));
+        let queue = Arc::new(EffortQueue::new());
+        let _worker = spawn_worker(
+            Arc::clone(&bridge),
+            Arc::clone(&queue),
+            Arc::clone(&io) as Arc<dyn EffortSwitchIo>,
+        );
+
+        // Two DIFFERENT-axis configures arrive while the turn is still
+        // running; the caller journals `queued` for each (as claude_pty does)
+        // and enqueues both, each with no done channel (working path).
+        for request in &requests {
+            io.journal_effort(
+                SwitchOutcome::Queued.journal_status(request.command_word(), ""),
+                Severity::Info,
+                request.request_id.clone(),
+            )
+            .await;
+            queue.enqueue(request.clone(), None);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            io.writes().is_empty(),
+            "neither command goes out while the agent is working"
+        );
+
+        // Idle: BOTH queued operations must run, in enqueue order.
+        io.set_idle(true);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(5_000);
+        while io
+            .journals()
+            .iter()
+            .filter(|(status, _)| {
+                expected_journals
+                    .iter()
+                    .any(|want| status.starts_with(want))
+            })
+            .count()
+            < 2
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let bodies: Vec<String> = io
+            .writes()
+            .iter()
+            .filter(|write| write.starts_with("body:"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            bodies,
+            expected_bodies
+                .iter()
+                .map(|body| (*body).to_owned())
+                .collect::<Vec<_>>(),
+            "both native commands are typed in enqueue order"
+        );
+        for want in expected_journals {
+            assert!(
+                io.journals()
+                    .iter()
+                    .any(|(status, _)| status.starts_with(want)),
+                "missing terminal journal {want}; got {:?}",
+                io.journals()
+            );
+        }
     }
 }

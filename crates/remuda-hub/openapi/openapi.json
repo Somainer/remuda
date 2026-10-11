@@ -9882,6 +9882,7 @@
                             "enum": [
                               "queued",
                               "running",
+                              "landing",
                               "passed",
                               "failed",
                               "landed",
@@ -9918,6 +9919,12 @@
                             ]
                           },
                           "mergeSha": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "landingSessionEpoch": {
                             "type": [
                               "string",
                               "null"
@@ -10174,6 +10181,7 @@
                             "enum": [
                               "queued",
                               "running",
+                              "landing",
                               "passed",
                               "failed",
                               "landed",
@@ -10210,6 +10218,12 @@
                             ]
                           },
                           "mergeSha": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "landingSessionEpoch": {
                             "type": [
                               "string",
                               "null"
@@ -10365,6 +10379,7 @@
                       "enum": [
                         "queued",
                         "running",
+                        "landing",
                         "passed",
                         "failed",
                         "landed",
@@ -10401,6 +10416,12 @@
                       ]
                     },
                     "mergeSha": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "landingSessionEpoch": {
                       "type": [
                         "string",
                         "null"
@@ -10530,6 +10551,7 @@
                       "enum": [
                         "queued",
                         "running",
+                        "landing",
                         "passed",
                         "failed",
                         "landed",
@@ -10566,6 +10588,12 @@
                       ]
                     },
                     "mergeSha": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "landingSessionEpoch": {
                       "type": [
                         "string",
                         "null"
@@ -10703,6 +10731,7 @@
                       "enum": [
                         "queued",
                         "running",
+                        "landing",
                         "passed",
                         "failed",
                         "landed",
@@ -10739,6 +10768,12 @@
                       ]
                     },
                     "mergeSha": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "landingSessionEpoch": {
                       "type": [
                         "string",
                         "null"

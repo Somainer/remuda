@@ -147,6 +147,42 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     //   replay points are frozen in Rust by their cumulative counters, not by a
     //   one-row unique index. The old shared index collapsed both scopes, so it
     //   is dropped on every prior schema.
+    // c-usagefu r8 item 3: before creating the unique Message index, collapse
+    // any existing duplicate Message rows (same instance_id, scope, scope_id)
+    // left by pre-r8 replays. Set-based and idempotent.
+    //
+    // Step 1 (before deleting): backfill turn_id on the surviving row from any
+    // sibling that carried a better (non-NULL) value.
+    conn.execute_batch(
+        "UPDATE usage_events
+         SET turn_id = (
+             SELECT m2.turn_id FROM usage_events m2
+             WHERE m2.instance_id = usage_events.instance_id
+               AND m2.scope = 'message'
+               AND m2.scope_id = usage_events.scope_id
+               AND m2.turn_id IS NOT NULL
+             LIMIT 1
+         )
+         WHERE scope = 'message' AND scope_id IS NOT NULL
+           AND turn_id IS NULL
+           AND EXISTS (
+             SELECT 1 FROM usage_events m3
+             WHERE m3.instance_id = usage_events.instance_id
+               AND m3.scope = 'message'
+               AND m3.scope_id = usage_events.scope_id
+               AND m3.turn_id IS NOT NULL
+           );",
+    )?;
+    // Step 2: delete every duplicate except the lowest rowid (first write).
+    conn.execute_batch(
+        "DELETE FROM usage_events
+         WHERE scope = 'message' AND scope_id IS NOT NULL
+           AND rowid NOT IN (
+               SELECT MIN(rowid) FROM usage_events
+               WHERE scope = 'message' AND scope_id IS NOT NULL
+               GROUP BY instance_id, scope, scope_id
+           );",
+    )?;
     conn.execute_batch(
         "DROP INDEX IF EXISTS usage_events_scope_dedupe;
          CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
@@ -1640,6 +1676,97 @@ mod tests {
             }),
             observed_at: "2026-09-15T00:00:00.000Z".into(),
         }
+    }
+
+    #[test]
+    fn migration_consolidates_duplicate_message_rows_idempotently() {
+        // c-usagefu r8 item 3: a pre-r8 DB holds duplicate Message rows from
+        // byte-0 replays. migrate() collapses them (one per instance/scope/
+        // scope_id), backfills the best turn_id onto the survivor, and a
+        // second migrate() is a no-op.
+        let conn = Connection::open_in_memory().unwrap();
+        // Minimal table that already has scope_id + turn_id columns (the
+        // duplicate problem arose after r7 added them but before r8's
+        // consolidation); no unique index yet.
+        conn.execute_batch(
+            "CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                scope_id TEXT,
+                turn_id TEXT,
+                mode TEXT NOT NULL,
+                metric_revision INTEGER NOT NULL DEFAULT 1,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                observed_at_source TEXT NOT NULL DEFAULT 'ingest',
+                native_context_window INTEGER,
+                PRIMARY KEY (instance_id, seq)
+             );",
+        )
+        .unwrap();
+        // Three duplicates for response r1 (seqs 1,2,3): seq 1 lacks turn_id,
+        // seq 2 has it; an unrelated r2 row; and a duplicate r2.
+        conn.execute_batch(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode, output_tokens, observed_at)
+             VALUES
+                ('ins_dup', 1, 'message', 'r1', NULL, 'snapshot', 10000, '2026-09-15T00:00:00Z'),
+                ('ins_dup', 2, 'message', 'r1', 't1',  'snapshot', 10000, '2026-09-15T00:00:00Z'),
+                ('ins_dup', 3, 'message', 'r1', 't1',  'snapshot', 10000, '2026-09-15T00:00:00Z'),
+                ('ins_dup', 4, 'message', 'r2', 't2',  'snapshot', 20000, '2026-09-15T00:00:00Z'),
+                ('ins_dup', 5, 'message', 'r2', 't2',  'snapshot', 20000, '2026-09-15T00:00:00Z');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let (n, survivors): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(output_tokens),0) FROM usage_events",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(n, 2, "r1 and r2 each survive once (was 5)");
+        assert_eq!(survivors, 30_000, "10000 + 20000, not 50000");
+        // The survivor for r1 is seq 1 with turn_id backfilled from seq 2.
+        let (seq, turn): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT seq, turn_id FROM usage_events WHERE scope_id='r1'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(turn.as_deref(), Some("t1"), "best turn_id backfilled");
+
+        // Idempotent: second migrate changes nothing.
+        migrate(&conn).unwrap();
+        let n2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n2, 2);
+
+        // The unique index exists and rejects a new duplicate.
+        let dup_insert = conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode, observed_at)
+             VALUES ('ins_dup', 99, 'message', 'r1', 't1', 'snapshot', 'x')",
+            [],
+        );
+        assert!(
+            dup_insert.is_err(),
+            "unique message index blocks duplicates"
+        );
     }
 
     #[test]

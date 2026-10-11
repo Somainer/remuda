@@ -669,17 +669,10 @@ export class Outbox {
             }
           }
         };
-        const locks = (globalThis as { navigator?: Navigator & { locks?: LockManager } }).navigator?.locks;
-        let stored: OutboxRecord | null;
-        if (locksQueryOk && locks?.request) {
-          stored = await locks.request(
-            instanceDeliveryLockName(instanceId),
-            { mode: "exclusive" },
-            () => reclaim(),
-          );
-        } else {
-          stored = await reclaim();
-        }
+        // Gate 12 item 5: serialize under the instance Web Lock WHENEVER
+        // locks.request exists — independently of whether locks.query worked
+        // (query failure is unknown OWNERSHIP, not absence of locking).
+        const stored = await box.runUnderInstanceLock(instanceId, reclaim);
         if (stored) {
           // Authoritative current row — either reclaimed to pending or the
           // terminal/changed row another tab committed.

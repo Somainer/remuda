@@ -274,6 +274,46 @@ describe("Outbox", () => {
     }
   });
 
+  it("GATE12 item 5: when locks.query throws but locks.request exists, the load-time reclaim still runs INSIDE the instance lock", async () => {
+    const lockNames: string[] = [];
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: {
+        locks: {
+          query: async () => {
+            throw new Error("LockManager.query broken");
+          },
+          request: (name: string, _opts: unknown, cb: () => Promise<unknown>) => {
+            lockNames.push(name);
+            return cb();
+          },
+        },
+      },
+    });
+    try {
+      const store = new MemStorage();
+      const instanceId = "ins_queryfail";
+      // An EXPIRED same-owner claim: query failing makes ownership unknown but
+      // the deadline has passed, so load requeues — and must take the lock.
+      await store.put(
+        rec({
+          commandId: "cmd_queryfail",
+          instanceId,
+          state: "inflight",
+          lease: { owner: "owner_qf", until: Date.now() - 1 },
+        }),
+      );
+      const box = await Outbox.load(store, "owner_qf");
+      expect(box.pendingFor(instanceId).map((r) => r.commandId)).toEqual(["cmd_queryfail"]);
+      expect(store.map.get("cmd_queryfail")?.state).toBe("pending");
+      // The reclaim serialized under the real lock even though query threw.
+      expect(lockNames).toContain(instanceDeliveryLockName(instanceId));
+    } finally {
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
   it("GATE12 item 4: refreshDurable reconciles claim wakeups — cancel terminal/missing, re-arm a changed lease", async () => {
     const originalNavigator = globalThis.navigator;
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });

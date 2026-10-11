@@ -398,13 +398,21 @@ impl EffortRequest {
             match axis {
                 // Explicit flag intent: execute exactly the toggle at this
                 // tier, no provenance guess needed (the sender disambiguated).
+                // c-effortread r11 item 5: a flag operation REQUIRES an
+                // explicit boolean. A missing/invalid `ultracode` (None) used
+                // to type `ultracode off` — silently switching a session whose
+                // flag was ON — so refuse at this boundary instead; no command
+                // is typed and the configure returns an honest rejection.
                 Some(remuda_protocol::EffortAxis::Flag) => {
                     let name = target_name?;
+                    let Some(flag) = ultracode else {
+                        return None;
+                    };
                     return Some(
                         Self {
                             name,
-                            ultracode: ultracode == Some(true),
-                            word: if ultracode == Some(true) {
+                            ultracode: flag,
+                            word: if flag {
                                 "ultracode on"
                             } else {
                                 "ultracode off"
@@ -1572,6 +1580,64 @@ mod sync_tests {
         assert!(
             EffortRequest::for_configure("bogus", None, None, Coupled, None, None, None).is_none()
         );
+    }
+
+    /// c-effortread r11 item 5: an explicit `axis: Flag` with a MISSING
+    /// boolean (`ultracode` None) must be refused at the classifier boundary —
+    /// even on a decoupled build and even when provenance says the flag is ON
+    /// (the old classifier read None as false and typed `/effort ultracode
+    /// off`, switching a flag it was never told to switch). Only an explicit
+    /// `true`/`false` produces the toggle word.
+    #[test]
+    fn r11_item5_explicit_flag_axis_requires_an_explicit_boolean() {
+        use remuda_protocol::EffortAxis::Flag;
+        use remuda_protocol::EffortSemantics::Decoupled;
+        let proven_on = Some(ObservedSelection {
+            name: EffortName::High,
+            ultracode: Some(true),
+        });
+        for proven in [None, proven_on] {
+            assert!(
+                EffortRequest::for_configure(
+                    "high",
+                    None,
+                    Some(Flag),
+                    Decoupled,
+                    proven,
+                    None,
+                    Some("effreq_missing"),
+                )
+                .is_none(),
+                "axis=flag with ultracode None is refused, proven={proven:?}"
+            );
+        }
+        // An explicit false is still the exact OFF toggle (and carries the
+        // request id); an explicit true is ON.
+        let off = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            Some("effreq_off"),
+        )
+        .expect("an explicit boolean authorizes the flag toggle");
+        assert_eq!(off.command_word(), "ultracode off");
+        assert!(!off.ultracode);
+        assert_eq!(off.request_id.as_deref(), Some("effreq_off"));
+        let on = EffortRequest::for_configure(
+            "high",
+            Some(true),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            Some("effreq_on"),
+        )
+        .expect("an explicit true types ultracode on");
+        assert_eq!(on.command_word(), "ultracode on");
+        assert!(on.ultracode);
     }
 
     /// c-effortui r4 item 2 trigger A: Remuda drags high→max; the USER then

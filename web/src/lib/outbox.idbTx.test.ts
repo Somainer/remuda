@@ -30,6 +30,8 @@ class FakeTransaction {
   readonly db: FakeDb;
   readonly mode: IDBTransactionMode;
   aborted = false;
+  private settled = false;
+  private pending = 0;
 
   constructor(db: FakeDb, mode: IDBTransactionMode) {
     this.db = db;
@@ -40,8 +42,21 @@ class FakeTransaction {
     return new FakeObjectStore(this, this.db);
   }
 
+  beginRequest() {
+    this.pending += 1;
+  }
+
+  /** A request reached its terminal microtask; auto-commit when all settle. */
+  requestSettled() {
+    this.pending -= 1;
+    if (this.pending === 0 && !this.settled && !this.aborted) {
+      this.settled = true;
+      queueMicrotask(() => this.oncomplete?.({ target: this }));
+    }
+  }
+
   abort = () => {
-    if (this.aborted) return;
+    if (this.aborted || this.settled) return;
     this.aborted = true;
     queueMicrotask(() => this.onabort?.({ target: this }));
   };
@@ -56,7 +71,8 @@ class FakeObjectStore {
     this.db = db;
   }
 
-  private finish(req: FakeRequest, prepare: () => void, commit: () => void) {
+  private finish(req: FakeRequest, prepare: () => void, commit: () => void, opts?: { gateCommit?: boolean }) {
+    this.tx.beginRequest();
     // The request completes WITH its result on an earlier turn than the
     // transaction outcome — exactly the window the write must not trust.
     queueMicrotask(() => {
@@ -68,20 +84,29 @@ class FakeObjectStore {
         queueMicrotask(() => {
           this.tx.error = err instanceof Error ? err : new Error(String(err));
           this.tx.abort();
+          this.tx.requestSettled();
         });
         return;
       }
-      queueMicrotask(() => {
-        if (this.tx.aborted) return; // external signal abort won the race
-        if (this.db.abortNextAfterRequest) {
-          this.db.abortNextAfterRequest = false;
-          this.db.requestSucceededBeforeAbort = true;
-          this.tx.abort();
-          return;
+      queueMicrotask(async () => {
+        try {
+          if (this.tx.aborted) return;
+          if (this.db.abortNextAfterRequest) {
+            this.db.abortNextAfterRequest = false;
+            this.db.requestSucceededBeforeAbort = true;
+            this.tx.abort();
+            return;
+          }
+          // WRITE commits wait on the disposal gate (reads never do) so a
+          // transaction can be suspended post-request, pre-commit.
+          if (opts?.gateCommit && this.db.commitGate) {
+            await this.db.commitGate;
+            if (this.tx.aborted) return;
+          }
+          commit();
+        } finally {
+          this.tx.requestSettled();
         }
-        if (this.db.commitGate) return; // held open for disposal-window tests
-        commit();
-        this.tx.oncomplete?.({ target: this.tx });
       });
     });
   }
@@ -90,7 +115,7 @@ class FakeObjectStore {
     const req = new FakeRequest();
     req.result = rec.commandId;
     this.db.requestsIssued.push("put");
-    this.finish(req, () => {}, () => this.db.rows.set(rec.commandId, rec));
+    this.finish(req, () => {}, () => this.db.rows.set(rec.commandId, rec), { gateCommit: true });
     return req as unknown as IDBRequest;
   }
 
@@ -123,9 +148,7 @@ class FakeObjectStore {
   delete(key: string) {
     const req = new FakeRequest();
     this.db.requestsIssued.push("delete");
-    this.finish(req, () => {}, () => {
-      this.db.rows.delete(key);
-    });
+    this.finish(req, () => {}, () => this.db.rows.delete(key), { gateCommit: true });
     return req as unknown as IDBRequest;
   }
 }
@@ -137,8 +160,8 @@ class FakeDb {
   abortNextAfterRequest = false;
   /** Recorded proof the request succeeded before the abort arrived. */
   requestSucceededBeforeAbort = false;
-  /** When truthy, requests hold their commit microtask open (disposal tests). */
-  commitGate = false;
+  /** When truthy (a promise), post-request WRITE commits wait for it (disposal window tests). */
+  commitGate: Promise<void> | null = null;
   /** Every object-store request issued (get/put/getAll/delete), in order. */
   readonly requestsIssued: string[] = [];
 
@@ -214,6 +237,69 @@ it("a write whose request succeeds but whose transaction aborts afterwards is no
   expect((await storage.all()).map((r) => r.commandId)).toContain("cmd_retry_ok");
 });
 
+it("GATE14 item 1: Outbox.dispose during a production IDB reclaim (requests issued, commit pending) aborts the tx — durable row stays inflight", async () => {
+  // Exercises the REAL IndexedDB backend, not the localStorage mock used by
+  // the gate-12 test: the reclaim has issued its get/put requests but the
+  // transaction commit is held open; dispose fires the lifetime signal; the
+  // production abort listener must roll the transaction back BEFORE commit.
+  const db = installFakeIndexedDB();
+  const originalLocks = (globalThis.navigator as { locks?: LockManager }).locks;
+  Object.defineProperty(globalThis.navigator, "locks", { value: undefined, configurable: true });
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(1_100_000);
+    const opened = await openOutboxStorage();
+    const storage = opened.storage;
+    const owner = "owner_idb_dispose";
+    const T = Date.now() + 30_000;
+    // Live inactive claim armed for the deadline.
+    await storage.put({
+      ...probeRecord("cmd_idb_dispose_wake"),
+      state: "inflight",
+      lease: { owner, until: T },
+    });
+    const box = await Outbox.load(storage, owner);
+    expect(box.pendingClaimWakeups()).toEqual(["cmd_idb_dispose_wake"]);
+    const wakes = vi.fn();
+    box.onClaimWake = wakes;
+
+    // Deadline fires: the wake reads and enters the reclaim transaction. Hold
+    // its COMMIT open (post get+put, pre oncomplete).
+    let releaseCommit: (() => void) | null = null;
+    db.commitGate = new Promise<void>((r) => void (releaseCommit = r));
+    await vi.advanceTimersByTimeAsync(30_000);
+    // Let the read (getAll) and the reclaim's get/put requests complete; the
+    // put's COMMIT stays held behind the gate.
+    for (let i = 0; i < 10 && db.requestsIssued.filter((m) => m === "put").length < 2; i += 1) {
+      await Promise.resolve();
+    }
+    expect(db.requestsIssued.filter((m) => m === "put").length).toBeGreaterThanOrEqual(2);
+
+    // Teardown while the reclaim transaction is uncommitted.
+    box.dispose();
+    await Promise.resolve();
+    await Promise.resolve(); // signal abort -> t.abort -> onabort settled
+    // Release the held commit: the aborted transaction must NOT commit.
+    releaseCommit!();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    // The durable row is unchanged (no rolled-back pending write), no delivery
+    // trigger, no wake left behind.
+    expect(db.rows.get("cmd_idb_dispose_wake")?.state).toBe("inflight");
+    expect(db.rows.get("cmd_idb_dispose_wake")?.lease?.until).toBe(T);
+    expect(box.get("cmd_idb_dispose_wake")?.state).toBe("inflight");
+    expect(wakes).not.toHaveBeenCalled();
+    expect(box.pendingClaimWakeups()).toEqual([]);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis.navigator, "locks", {
+      value: originalLocks,
+      configurable: true,
+    });
+  }
+});
+
 it("GATE14 item 3: every reclaim removes its lifetime abort listener on every terminal path (no listener accumulation)", async () => {
   const db = installFakeIndexedDB();
   const opened = await openOutboxStorage();
@@ -248,17 +334,19 @@ it("GATE14 item 3: every reclaim removes its lifetime abort listener on every te
     state: "inflight",
     lease: expiredLease,
   });
-  db.commitGate = true; // hold only the reclaim transaction open
+  let releaseGate: (() => void) | null = null;
+  db.commitGate = new Promise<void>((r) => void (releaseGate = r));
   const abortP = storage.reclaimInflight("cmd_listener_abort", expiredLease, {
     requireExpired: true,
     signal: controller.signal,
   });
-  await Promise.resolve(); // get onsuccess -> put issued, commits held open
+  await Promise.resolve(); // get onsuccess -> put issued, commit held open
   await Promise.resolve(); // put onsuccess fired
   expect(db.requestsIssued.filter((m) => m === "put").length).toBeGreaterThan(0);
   controller.abort();
   await expect(abortP).rejects.toThrow(/abort/);
-  db.commitGate = false;
+  releaseGate!();
+  db.commitGate = null;
 
   // Every registered abort handler reference was removed (detach is
   // idempotent — the fake fires oncomplete once per request, real IDB once

@@ -535,4 +535,32 @@ mod tests {
             request.with_configure(&json!({ "effort": { "name": "high", "kind": "grok" } }));
         assert_eq!(request.effort_ultracode, None);
     }
+
+    #[test]
+    fn configure_forwards_the_effort_per_request_id() {
+        // c-effortread r10: the web's per-request id rides effort.requestId
+        // through the Hub command payload to the driver, which echoes it.
+        let request: InstanceCommandRequest =
+            serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+        let request = request.with_configure(&json!({
+            "effort": { "name": "max", "ultracode": true, "index": 4, "kind": "claude",
+                         "axis": "flag", "requestId": "effreq-abc" }
+        }));
+        assert_eq!(request.effort_request_id.as_deref(), Some("effreq-abc"));
+        assert_eq!(request.effort_axis.as_deref(), Some("flag"));
+
+        // Whitespace/empty is dropped; a non-string is ignored.
+        let request: InstanceCommandRequest =
+            serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+        let request = request.with_configure(&json!({
+            "effort": { "name": "max", "kind": "claude", "requestId": "   " }
+        }));
+        assert_eq!(request.effort_request_id, None);
+        let request: InstanceCommandRequest =
+            serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+        let request = request.with_configure(&json!({
+            "effort": { "name": "max", "kind": "claude", "requestId": 42 }
+        }));
+        assert_eq!(request.effort_request_id, None);
+    }
 }

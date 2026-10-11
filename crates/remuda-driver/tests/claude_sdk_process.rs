@@ -1525,29 +1525,63 @@ async fn a_successful_turn_then_a_failed_live_write_rolls_back_without_a_b_start
     driver.close().await.expect("close");
 }
 
-/// ma-sdk-state r7/r8 item 3: a failed write must not leak the driver's Inner
-/// (the old ReservationGuard::fail used std::mem::forget). After the failed
-/// write and close, a Weak to Inner upgrades to None.
+/// Await a fake-child marker file under an overall timeout (barrier, no fixed
+/// sleep); returns once the file exists.
+async fn await_marker(path: &std::path::Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if path.exists() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for marker {path:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// ma-sdk-state r7/r8/r9 item 3: a failed write must not leak the driver's
+/// Inner (the old ReservationGuard::fail used std::mem::forget). After the
+/// failed write and close, a Weak to Inner upgrades to None.
 ///
-/// Uses the deterministic NUMBERED driver write fault (the write fails before
-/// the writer is called, exercising ReservationGuard::fail) rather than a live
-/// broken pipe, so the test cannot race the fake child's stdin-closure timing
-/// (ma-sdk-state r8 item 4).
+/// Uses a REAL write failure on a live child: the fake closes its stdin read
+/// end and writes a post-closure marker before it parks (r9 item 5), so the
+/// test waits for that ACKNOWLEDGED closure (bounded, no sleep) and then the
+/// first prompt write deterministically fails — no driver-injected fault.
 #[tokio::test]
 async fn a_failed_write_and_close_release_the_driver_inner() {
-    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let closed_marker = std::env::temp_dir().join(format!(
+        "remuda-r9-stdin-closed-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_CLOSE_STDIN".into(), "1".into());
+    env.insert(
+        "FAKE_CLAUDE_STDIN_CLOSED_FILE".into(),
+        closed_marker.to_string_lossy().into_owned(),
+    );
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
     let handle = driver.start(spec).await.expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+    // Acknowledge the child has closed stdin before we attempt the write.
+    await_marker(&closed_marker).await;
     let weak = driver.weak_inner();
     assert!(
         weak.upgrade().is_some(),
         "Inner is alive while the driver is"
     );
 
-    // The very next write fails deterministically WITHOUT touching the child.
-    driver.force_write_failure_from(1);
+    // The first real prompt write fails against the acknowledged closed stdin.
     let failed = driver.send(prompt("never written")).await;
-    assert!(failed.is_err(), "the forced write must fail: {failed:?}");
+    assert!(
+        failed.is_err(),
+        "write against acknowledged-closed stdin must fail: {failed:?}"
+    );
 
     driver.close().await.expect("close");
     drop(handle);

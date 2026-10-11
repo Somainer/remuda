@@ -80,6 +80,10 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
     // read order, so a test can assert the exact FIFO order the child saw
     // (control-then-prompt, interrupt-then-prompt, …).
     let stdin_file = std::env::var("FAKE_CLAUDE_STDIN_FILE").ok();
+    // r9 item 5: when set, write this marker file AFTER closing stdin (both the
+    // handshake-close and after-turn-close modes), so a test can await the
+    // closure deterministically before issuing the write that must fail.
+    let stdin_closed_file = std::env::var("FAKE_CLAUDE_STDIN_CLOSED_FILE").ok();
     if std::env::args()
         .skip(1)
         .any(|arg| arg == "--version" || arg == "-V")
@@ -157,6 +161,9 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
             {
                 let _ = nix::unistd::close(0);
             }
+            if let Some(path) = &stdin_closed_file {
+                let _ = std::fs::write(path, b"closed");
+            }
             std::thread::sleep(std::time::Duration::from_secs(300));
         }
         // ma-sdk-state r4 item 3: FAKE_CLAUDE_CLOSE_STDIN closes the read end
@@ -172,6 +179,9 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
                 // parks alive. `std::io::stdin()` only borrows fd 0, so close
                 // the fd outright.
                 let _ = nix::unistd::close(0);
+            }
+            if let Some(path) = &stdin_closed_file {
+                let _ = std::fs::write(path, b"closed");
             }
             std::thread::sleep(std::time::Duration::from_secs(300));
         }
@@ -261,6 +271,9 @@ impl Session {
         Ok(())
     }
 
+    /// Returns `true` when the caller should close stdin and park after this
+    /// frame (CLOSE_STDIN handshake mode), so the read end is shut before the
+    /// driver's start() returns from the init response.
     fn handle_incoming(
         &mut self,
         incoming: Value,

@@ -1478,7 +1478,10 @@ async fn prepare_prompt_write(
     // Writer accepted: disarm the caller-scoped guard and transfer it into a
     // detached task that owns the ack → commit/fail sequence.
     let guard = guard.take().unwrap();
+    #[cfg(feature = "test-stub")]
     let task_inner = inner.clone();
+    #[cfg(not(feature = "test-stub"))]
+    let _ = &inner;
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let result = match ack_rx.await {
@@ -1572,6 +1575,7 @@ enum PublishJob {
     /// drains this job (i.e. every job enqueued before it has been published),
     /// it signals the oneshot. A test enqueues it after a rollback and awaits
     /// it under a timeout instead of polling with a quiet-period loop.
+    #[cfg(feature = "test-stub")]
     Fence(tokio::sync::oneshot::Sender<()>),
 }
 
@@ -2158,6 +2162,7 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                 .await
             }
             PublishJob::StdoutEof => emit_exit(&inner, "exited").await,
+            #[cfg(feature = "test-stub")]
             PublishJob::Fence(signal) => {
                 // Everything enqueued before this fence has now been published.
                 let _ = signal.send(());

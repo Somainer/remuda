@@ -1026,17 +1026,35 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
     // the `obj_…` reference. A persistence failure must not lose the verdict.
     let mut log_object_id: Option<String> = None;
     if let Some(run_log) = &result.run_log {
-        match persist_run_log(
-            state,
-            existing.project_id.as_id().as_str(),
-            job_id,
-            &existing.requested_by,
-            run_log,
-        )
-        .await
-        {
-            Ok(object_id) => log_object_id = Some(object_id),
-            Err(error) => tracing::warn!(%error, job_id, "could not persist gate log object"),
+        // r11 item 3: re-read attempts right before persisting so a stale
+        // attempt's evidence cannot overwrite the current attempt's log.
+        let live_attempts = state
+            .store
+            .get_gate_job(job_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|job| job.attempts);
+        if live_attempts == Some(result.generation) {
+            match persist_run_log(
+                state,
+                existing.project_id.as_id().as_str(),
+                job_id,
+                &existing.requested_by,
+                run_log,
+            )
+            .await
+            {
+                Ok(object_id) => log_object_id = Some(object_id),
+                Err(error) => tracing::warn!(%error, job_id, "could not persist gate log object"),
+            }
+        } else {
+            tracing::info!(
+                job_id,
+                verdict_generation = result.generation,
+                ?live_attempts,
+                "skipping log persist for a non-current attempt"
+            );
         }
     }
     // A `pushFrom: home` land verifies on the lane and is pushed by the home
@@ -1081,6 +1099,17 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
             // cancel-grace finisher can commit the same terminal write in this
             // window. A terminal row never moves again; just stand down.
             if !matches!(row.state, GateJobState::Running | GateJobState::Canceling) {
+                return None;
+            }
+            // r11 item 3: the pre-read generation check can be stale after a
+            // requeue. Re-check generation INSIDE the writer against the live
+            // doc: an attempt-1 verdict must never mutate an attempt-2 row.
+            if row.attempts != result.generation {
+                tracing::info!(
+                    verdict_generation = result.generation,
+                    writer_attempt = row.attempts,
+                    "dropping gate verdict in writer for a non-current attempt"
+                );
                 return None;
             }
             // Re-read the live state inside the writer job: the pre-read

@@ -892,6 +892,15 @@ pub(crate) async fn handle_node_method(
                 .map_err(|error| {
                     HubError::BadRequest(format!("invalid gate.landGrant params: {error}"))
                 })?;
+            // The host is taken from the authenticated carrier, never from the
+            // frame. A non-null frame host is only validated for equality (a
+            // stdio carrier legitimately sends null); a claimed mismatch is
+            // refused rather than silently authorized.
+            if let Some(claimed) = typed.host_id.as_deref()
+                && claimed != host_id.as_str()
+            {
+                return Err(HubError::Forbidden);
+            }
             let grant = state
                 .store
                 .gate_land_grant(

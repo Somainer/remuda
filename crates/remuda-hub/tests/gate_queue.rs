@@ -500,7 +500,7 @@ async fn run_one_inline(script: &Arc<ScriptState>, params: &Value, node: &mut La
             "params": {
                 "jobId": job_id,
                 "generation": generation,
-                "hostId": "scripted-lane",
+                "hostId": Value::Null,
                 "sessionEpoch": "sess-1",
                 "mergeSha": spec.merge_sha.unwrap_or(""),
             },

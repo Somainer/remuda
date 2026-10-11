@@ -165,6 +165,8 @@ pub fn schema_document() -> Value {
         GateRunParams,
         GateRunResult,
         GateStep,
+        GateResolveLandingParams,
+        GateResolveLandingResult,
         GateThenParams,
         GateThenResult,
         GateUnpinParams,

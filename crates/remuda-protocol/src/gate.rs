@@ -618,8 +618,12 @@ pub struct GateLandGrantParams {
     /// Attempt generation that verified.
     #[serde(default)]
     pub generation: u32,
-    /// Host asking for the grant.
-    pub host_id: String,
+    /// Host asking for the grant. The Hub does NOT trust this: it always uses
+    /// the host authenticated on the carrying socket. The field is optional
+    /// and, when present, must equal the socket host (a mismatch is refused);
+    /// it is null/absent on a stdio carrier, which has no host id to stamp.
+    #[serde(default, rename = "hostId")]
+    pub host_id: Option<String>,
     /// Node session/epoch this dispatch was authorized for: a paused frame
     /// delivered to a replacement session must not match.
     #[serde(default)]

@@ -1091,8 +1091,9 @@ export type GateJobState = ("queued" | "running" | "landing" | "passed" | "faile
 /** `gate.landGrant` params (Node→Hub) at the verify→land boundary. */
 export type GateLandGrantParams = ({
   "generation": (number);
-  "hostId": (string);
+  "hostId": (string | null);
   "jobId": (string);
+  "mergeSha": (string);
   "sessionEpoch": (string);
   [key: string]: unknown;
 });
@@ -1137,6 +1138,24 @@ export type GateMode = ("verify" | "land");
 
 /** Which host pushes `main` for a land job. */
 export type GatePushFrom = ("lane" | "home");
+
+/** `gate.resolveLanding` params: a read-only probe after a Hub restart left a job `landing`. */
+export type GateResolveLandingParams = ({
+  "baseBranch": (string);
+  "jobId": (string);
+  "mergeSha": (string);
+  "repoPath": (string);
+  [key: string]: unknown;
+});
+
+/** `gate.resolveLanding` verdict. `landed` means the remote base already contains the granted merge; `unknown` means it could not be confirmed (host unreachable, fetch failed, or the merge is not an ancestor), so the Hub must not claim the push succeeded. */
+export type GateResolveLandingResult = ({
+  "baseSha"?: (string | null);
+  "error"?: (string | null);
+  "jobId": (string);
+  "status": (string);
+  [key: string]: unknown;
+});
 
 /** Bounded failure evidence for one gate run, stored by the Hub as an `obj_…` log object (never inlined into the job row). For a failed run the Node populates it for the failed step; with `--keep-logs` a green run gets a `kept` log of the whole-run tail. */
 export type GateRunLog = ({

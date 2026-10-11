@@ -4821,6 +4821,19 @@ impl Store {
     }
 
     /// Queue a command. Same `command_id` or idempotency key returns the original row.
+    ///
+    /// c-dirpicker r12 item 1: `pinned_link_generation` is the durable link
+    /// generation the forwarding attempt PINNED when it chose its transport
+    /// (unregister DELETE). It is stamped at INSERT because queue and
+    /// [`Self::mark_forward_intent`] are separate writer jobs: a hello that
+    /// bumps the hosts counter between them used to leave the row stamped with
+    /// the new generation while the frame rode the pinned older link, so the
+    /// post-hello sweep skipped the row until the link AFTER that. `None` (all
+    /// other callers) falls back to the host row's current generation via
+    /// COALESCE. The pinned value is always ≤ the hosts value (a hello only
+    /// ever increments), so a row can never be hidden by a smaller-than-hosts
+    /// stamp.
+    #[allow(clippy::too_many_arguments)]
     pub async fn queue_command(
         &self,
         command_id: Option<String>,
@@ -4829,6 +4842,7 @@ impl Store {
         operation: String,
         payload: Value,
         idempotency_key: Option<String>,
+        pinned_link_generation: Option<i64>,
     ) -> Result<(CommandRecord, bool), StoreError> {
         self.run_named("queue_command", move |conn| {
             if let Some(key) = idempotency_key.as_ref()
@@ -4880,11 +4894,16 @@ impl Store {
                 None => new_id("cmd").map_err(|e| StoreError::Id(e.to_string()))?,
             };
             let now = now_rfc3339();
+            // c-dirpicker r11 item 1 / r12 item 1: stamp at INSERT. A pinned
+            // forwarding attempt (unregister DELETE) supplies the generation it
+            // pinned; every other caller passes None and the stamp falls back
+            // to the host row's current generation.
             conn.execute(
                 "INSERT INTO commands
                     (id, instance_id, host_id, operation, state, resolution, forwarded,
-                     payload_json, idempotency_key, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'queued', 'clear', 0, ?5, ?6, ?7, ?7)",
+                     payload_json, idempotency_key, created_at, updated_at, link_generation)
+                 VALUES (?1, ?2, ?3, ?4, 'queued', 'clear', 0, ?5, ?6, ?7, ?7,
+                         COALESCE(?8, (SELECT link_generation FROM hosts WHERE id = ?3)))",
                 params![
                     command_id,
                     instance_id,
@@ -4892,7 +4911,8 @@ impl Store {
                     operation,
                     payload.to_string(),
                     idempotency_key,
-                    now
+                    now,
+                    pinned_link_generation
                 ],
             )?;
             let row = load_command(conn, &command_id)?
@@ -4903,7 +4923,26 @@ impl Store {
     }
 
     /// Persist forward intent. Returns false if already forwarded (do not resend).
-    pub async fn mark_forward_intent(&self, command_id: String) -> Result<bool, StoreError> {
+    ///
+    /// c-dirpicker r10 item 1: stamp the host link generation the forwarding
+    /// attempt PINNED when it chose its transport, so the reconnect sweep
+    /// attributes the row to that link independent of wall clocks.
+    ///
+    /// r11 item 2: the generation is an argument pinned at the registry BEFORE
+    /// this call, not re-read here. The bump (hello) and the transport registry
+    /// are two separate structures: re-reading inside this writer job could
+    /// stamp the NEW generation while the frame rides a half-open PREVIOUS
+    /// transport (the row would then survive a sweep that must abort it), or
+    /// stamp an old one for a frame that rides the new link (a live DELETE
+    /// aborted). [`crate::transport::ConnectedNodes::pin`] hands out the
+    /// transport and generation together; the row already carries the
+    /// INSERT-time stamp ([`Self::queue_command`]), which this refreshes for a
+    /// bump between INSERT and the forwarding attempt.
+    pub async fn mark_forward_intent(
+        &self,
+        command_id: String,
+        link_generation: i64,
+    ) -> Result<bool, StoreError> {
         self.run_named("mark_forward_intent", move |conn| {
             let Some(row) = load_command(conn, &command_id)? else {
                 return Err(StoreError::Id("unknown command".into()));
@@ -4913,10 +4952,99 @@ impl Store {
             }
             let now = now_rfc3339();
             conn.execute(
-                "UPDATE commands SET forwarded = 1, resolution = 'unknown', updated_at = ?1 WHERE id = ?2",
-                params![now, command_id],
+                "UPDATE commands
+                    SET forwarded = 1,
+                        resolution = 'unknown',
+                        link_generation = ?1,
+                        updated_at = ?2
+                  WHERE id = ?3",
+                params![link_generation, now, command_id],
             )?;
             Ok(true)
+        })
+        .await
+    }
+
+    /// c-dirpicker r10 item 1: atomically adopt a new link for a host. Called
+    /// by the authenticated `node.hello` path BEFORE the transport is
+    /// registered: every command forwarded after this point (forwarding
+    /// requires the registry slot the hello is about to install) stamps the
+    /// new generation, so the post-hello sweep attributes it to THIS link and
+    /// never aborts it. Returns the new generation (first adopting hello makes
+    /// it 1; hosts whose link a hello has never adopted stay at 0).
+    pub async fn bump_host_link_generation(&self, host_id: String) -> Result<i64, StoreError> {
+        let host = host_id.clone();
+        self.run_named("bump_host_link_generation", move |conn| {
+            let updated = conn.execute(
+                "UPDATE hosts SET link_generation = link_generation + 1 WHERE id = ?1",
+                params![host],
+            )?;
+            if updated == 0 {
+                return Err(StoreError::Id("unknown host".into()));
+            }
+            let generation = conn.query_row(
+                "SELECT link_generation FROM hosts WHERE id = ?1",
+                params![host_id],
+                |row| row.get(0),
+            )?;
+            Ok(generation)
+        })
+        .await
+    }
+
+    /// c-dirpicker r10 item 1: the link generation a host's hello last
+    /// adopted. The reconnect sweep aborts unregister intents stamped below
+    /// it; errors if the host row is missing.
+    pub async fn host_link_generation(&self, host_id: String) -> Result<i64, StoreError> {
+        let host = host_id;
+        self.read("host_link_generation", move |conn| {
+            let generation = conn.query_row(
+                "SELECT link_generation FROM hosts WHERE id = ?1",
+                params![host],
+                |row| row.get(0),
+            )?;
+            Ok(generation)
+        })
+        .await
+    }
+
+    /// Test-only seam (c-dirpicker r10 item 2): overwrite a command's
+    /// `created_at` with a FIXED timestamp so the reconnect-sweep suite can
+    /// prove its decision is independent of the clock (a dead-link intent
+    /// postdated to the future is still aborted; a new-link intent backdated
+    /// to the past is still spared). Production code never calls this.
+    #[doc(hidden)]
+    pub async fn test_set_command_created_at(
+        &self,
+        command_id: String,
+        created_at: String,
+    ) -> Result<(), StoreError> {
+        self.run_named("test_set_command_created_at", move |conn| {
+            conn.execute(
+                "UPDATE commands SET created_at = ?1 WHERE id = ?2",
+                params![created_at, command_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Test-only seam (c-dirpicker r11 item 1): overwrite a command's
+    /// `link_generation`. r11 stamps the generation at INSERT, so a test that
+    /// needs a genuine PRE-UPGRADE row (the NULL the sweep must keep aborting)
+    /// has to NULL it explicitly — an unmarked freshly queued row is not one.
+    #[doc(hidden)]
+    pub async fn test_set_command_link_generation(
+        &self,
+        command_id: String,
+        generation: Option<i64>,
+    ) -> Result<(), StoreError> {
+        self.run_named("test_set_command_link_generation", move |conn| {
+            conn.execute(
+                "UPDATE commands SET link_generation = ?1 WHERE id = ?2",
+                params![generation, command_id],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -5156,19 +5284,20 @@ impl Store {
     /// frame was queued when a link died). The hello reconnect path aborts
     /// them so the Node's durable unbinding mark is released.
     ///
-    /// r9 item 2: only rows created strictly before `created_before` (the new
-    /// link's hello instant). A DELETE accepted on the NEW link is created at
-    /// or after that instant; aborting it would kill an in-flight removal the
-    /// operator just issued. Timestamps are fixed-width millisecond UTC
-    /// RFC3339 (see [`crate::config::now_rfc3339`]), so the lexical SQL
-    /// comparison is chronological.
+    /// r10 item 1 (replaces the r9 wall-clock cutoff): attribution is by LINK
+    /// GENERATION, stamped on the command at [`Store::mark_forward_intent`].
+    /// Every `node.hello` that adopts a link bumps the host generation, so a
+    /// command belongs here exactly when its stamp is older than the link the
+    /// sweep is running on. A command stamped by the CURRENT link is never
+    /// returned regardless of its `created_at`, and commands with a NULL stamp
+    /// (rows persisted before the column existed) are treated as dead-link
+    /// intent and aborted. Clock steps cannot change the result.
     pub async fn list_unsettled_workspace_unregisters(
         &self,
         host_id: &str,
-        created_before: &str,
+        current_generation: i64,
     ) -> Result<Vec<CommandRecord>, StoreError> {
         let host = host_id.to_owned();
-        let cutoff = created_before.to_owned();
         self.run_named("list_unsettled_workspace_unregisters", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
@@ -5179,11 +5308,11 @@ impl Store {
                  WHERE host_id = ?1
                    AND operation = 'workspace.unregister'
                    AND state IN ('queued', 'accepted')
-                   AND created_at < ?2
+                   AND (link_generation IS NULL OR link_generation < ?2)
                  ORDER BY created_at ASC, id ASC",
             )?;
             let rows = stmt
-                .query_map(params![host, cutoff], command_from_row)?
+                .query_map(params![host, current_generation], command_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
@@ -6590,7 +6719,12 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             resources_json TEXT,
             max_instances INTEGER NOT NULL DEFAULT 8,
             hostname TEXT,
-            os TEXT
+            os TEXT,
+            -- c-dirpicker r10 item 1: bumped by every node.hello that adopts
+            -- a new link; commands stamp it at mark_forward_intent so the
+            -- reconnect sweep can attribute a command to a link without any
+            -- clock comparison.
+            link_generation INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS objects (
             id TEXT PRIMARY KEY,
@@ -6650,7 +6784,12 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             settlement_outcome TEXT,
             settlement_reason TEXT,
             settlement_http_status INTEGER,
-            settlement_http_body TEXT
+            settlement_http_body TEXT,
+            -- Generation of the host link this command's forward intent was
+            -- recorded on (c-dirpicker r10 item 1); NULL for rows written
+            -- before the column existed, which the reconnect sweep treats as
+            -- belonging to a dead pre-upgrade link.
+            link_generation INTEGER
         );
         CREATE TABLE IF NOT EXISTS journal (
             instance_id TEXT NOT NULL,
@@ -7026,6 +7165,16 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // Last `nodeEpoch` announced by this host, used to detect a Node restart.
     ensure_column(&conn, "hosts", "node_epoch", "TEXT")?;
     ensure_column(&conn, "hosts", "offline_since", "TEXT")?;
+    // c-dirpicker r10 item 1: durable per-host link generation. Every adopting
+    // node.hello bumps it; commands stamp it when forwarded. Never derived
+    // from a timestamp: wall-clock steps (NTP, skew) must not change which
+    // unregister intents a reconnect sweep aborts.
+    ensure_column(
+        &conn,
+        "hosts",
+        "link_generation",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_column(&conn, "devices", "token_prefix", "TEXT")?;
     ensure_column(&conn, "hosts", "token_prefix", "TEXT")?;
     // 2026-09-15: [Image #n] anchor assigned by the send manifest.
@@ -7051,6 +7200,10 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // exact HTTP status and body; NULL for 200 rows and pre-round-2 data.
     ensure_column(&conn, "commands", "settlement_http_status", "INTEGER")?;
     ensure_column(&conn, "commands", "settlement_http_body", "TEXT")?;
+    // c-dirpicker r10 item 1: the host link generation current when this
+    // command's forward intent was recorded. NULL on pre-upgrade rows; the
+    // reconnect sweep attributes those to a dead link and aborts them.
+    ensure_column(&conn, "commands", "link_generation", "INTEGER")?;
     // c-cardsettle r5 item 8: tombstones retain the real invalidation reason
     // so reconnect/lag replay labels a demotion as agent-demoted, not
     // generation-ended.
@@ -8002,11 +8155,12 @@ mod tests {
                 "instance.create".into(),
                 json!({"instanceId": instance.instance_id}),
                 None,
+                None,
             )
             .await
             .expect("command");
         store
-            .mark_forward_intent(command.command_id.clone())
+            .mark_forward_intent(command.command_id.clone(), 0)
             .await
             .expect("forward intent");
 
@@ -8138,11 +8292,12 @@ mod tests {
                 "instance.create".into(),
                 json!({"instanceId": instance.instance_id}),
                 None,
+                None,
             )
             .await
             .expect("command");
         store
-            .mark_forward_intent(command.command_id.clone())
+            .mark_forward_intent(command.command_id.clone(), 0)
             .await
             .expect("forward once");
         // The RPC accept deadline elapsed: unknown, not resent.
@@ -8234,11 +8389,12 @@ mod tests {
                 "instance.send".into(),
                 json!({"instanceId": instance.instance_id}),
                 None,
+                None,
             )
             .await
             .expect("command");
         store
-            .mark_forward_intent(command.command_id.clone())
+            .mark_forward_intent(command.command_id.clone(), 0)
             .await
             .expect("forward once");
 
@@ -8346,11 +8502,12 @@ mod tests {
                 "instance.send".into(),
                 json!({"instanceId": instance.instance_id}),
                 None,
+                None,
             )
             .await
             .expect("command");
         store
-            .mark_forward_intent(command.command_id.clone())
+            .mark_forward_intent(command.command_id.clone(), 0)
             .await
             .expect("forward once");
 
@@ -8403,6 +8560,7 @@ mod tests {
                 host_id.clone(),
                 "instance.send".into(),
                 json!({"instanceId": instance.instance_id}),
+                None,
                 None,
             )
             .await
@@ -8471,6 +8629,7 @@ mod tests {
                         host_id.clone(),
                         "instance.send".into(),
                         json!({"instanceId": instance.instance_id}),
+                        None,
                         None,
                     )
                     .await
@@ -8789,6 +8948,7 @@ mod tests {
                 "instance.configure".into(),
                 payload.clone(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -8981,6 +9141,7 @@ mod tests {
                     host.clone(),
                     "instance.configure".into(),
                     payload.clone(),
+                    None,
                     None,
                 )
                 .await
@@ -13734,6 +13895,136 @@ mod tests {
             Some("remuda")
         );
     }
+
+    /// c-dirpicker r11 item 3: `dedup_duplicate_hosts` moves a loser host's
+    /// commands onto the survivor, but the two hosts have UNRELATED link
+    /// generation counters. A loser at generation 7 with a stale unregister
+    /// intent must not be hidden on a survivor currently at 2 (swept only once
+    /// it happens to reach 8): the merge NULLs the stamp so the survivor's very
+    /// next reconnect sweep treats it as dead-link intent and aborts it.
+    #[tokio::test]
+    async fn host_dedup_nulls_link_generation_of_moved_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let command_id = {
+            let store = Store::open(&path).unwrap();
+            let survivor = new_id("hst").unwrap();
+            let loser = new_id("hst").unwrap();
+            let dup_inventory = |hostname: &str| crate::inventory::HostInventoryUpdate {
+                display_label: Some("dup-node".into()),
+                hostname: Some(hostname.into()),
+                ..Default::default()
+            };
+            store
+                .authenticate_host(
+                    HostAuthRequest {
+                        presented: enroll_token(&store, "dup-survivor").await,
+                        hello_host_id: Some(survivor.clone()),
+                        label: Some("dup-node".into()),
+                        node_version: None,
+                    },
+                    verify_eq,
+                    |_| Ok("test-hash".into()),
+                )
+                .await
+                .unwrap();
+            store
+                .authenticate_host(
+                    HostAuthRequest {
+                        presented: enroll_token(&store, "dup-loser").await,
+                        hello_host_id: Some(loser.clone()),
+                        label: Some("dup-node".into()),
+                        node_version: None,
+                    },
+                    verify_eq,
+                    |_| Ok("test-hash".into()),
+                )
+                .await
+                .unwrap();
+            store
+                .apply_inventory(survivor.clone(), dup_inventory("dup-host"), None)
+                .await
+                .unwrap();
+            store
+                .apply_inventory(loser.clone(), dup_inventory("dup-host"), None)
+                .await
+                .unwrap();
+            // The survivor must win the dedup ordering (online sorts first).
+            store.mark_host_offline(loser.clone()).await.unwrap();
+            // Counters deliberately diverge: survivor 2, loser 7.
+            for _ in 0..2 {
+                store
+                    .bump_host_link_generation(survivor.clone())
+                    .await
+                    .unwrap();
+            }
+            for _ in 0..7 {
+                store
+                    .bump_host_link_generation(loser.clone())
+                    .await
+                    .unwrap();
+            }
+            let (command, _) = store
+                .queue_command(
+                    None,
+                    None,
+                    loser.clone(),
+                    "workspace.unregister".into(),
+                    json!({"path": "/srv/dup", "workspaceId": "wsp_dup"}),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            // The INSERT stamp is the loser's current generation (7).
+            assert!(
+                store
+                    .list_unsettled_workspace_unregisters(&loser, 8)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.command_id == command.command_id),
+                "on the loser the gen-7 row is dead-link only past generation 7"
+            );
+            command.command_id
+        };
+        // A fresh process opens the data dir; dedup runs on every open.
+        let store = Store::open(&path).unwrap();
+        let hosts = store
+            .read("test hosts", |conn| {
+                let mut stmt = conn.prepare("SELECT id FROM hosts").unwrap();
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap();
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert_eq!(hosts.len(), 1, "the duplicate host pair merged into one");
+        let survivor = hosts[0].clone();
+        let moved = store
+            .get_command(command_id.clone())
+            .await
+            .unwrap()
+            .expect("the command survived the merge");
+        assert_eq!(
+            moved.host_id, survivor,
+            "the command now belongs to the survivor"
+        );
+        // NULL semantics: a gen-2 sweep on the survivor aborts it. With the
+        // loser's 7 carried over, 7 < 2 is false and the row would be hidden
+        // until generation 8.
+        let pending = store
+            .list_unsettled_workspace_unregisters(&survivor, 2)
+            .await
+            .unwrap();
+        assert!(
+            pending.iter().any(|row| row.command_id == command_id),
+            "the merged stale unregister is swept on the survivor's current link, not hidden: {pending:?}"
+        );
+    }
 }
 
 fn touch_host_online(
@@ -13806,8 +14097,17 @@ fn dedup_duplicate_hosts(conn: &Connection) -> Result<(), rusqlite::Error> {
                 "UPDATE instances SET host_id = ?1 WHERE host_id = ?2",
                 params![&survivor, &row.id],
             )?;
+            // c-dirpicker r11 item 3: a moved command rode the LOSER host's
+            // link, whose generation counter is unrelated to the survivor's.
+            // Keeping the loser's stamp (e.g. 7) on a survivor at 2 would hide
+            // a dead-link unregister from the reconnect sweep until the
+            // survivor happened to reach generation 8. NULL it instead: the
+            // next sweep on the survivor treats the row as belonging to a dead
+            // pre-merge link and aborts it, the same semantics a pre-upgrade
+            // NULL has. Settled rows are filtered by state regardless, so the
+            // null costs them nothing.
             conn.execute(
-                "UPDATE commands SET host_id = ?1 WHERE host_id = ?2",
+                "UPDATE commands SET host_id = ?1, link_generation = NULL WHERE host_id = ?2",
                 params![&survivor, &row.id],
             )?;
             conn.execute(

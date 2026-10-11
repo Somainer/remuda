@@ -6745,7 +6745,7 @@ mod api_relay_launch_test {
         struct ExitCase {
             name: &'static str,
             data: serde_json::Value,
-            expected: &'static str,
+            expected: String,
             /// Fragments carried by the event's stderr that must appear
             /// NOWHERE persisted (journal payload or Hub row). Empty for the
             /// structured cases.
@@ -6754,11 +6754,11 @@ mod api_relay_launch_test {
         let stderr = "Authorization decoy Bearer abc123xyz-leak \
 --token secretvalue-9931-leak {\"password\":\"hunter2-secret-leak\"} \
 escaped \\\"Authorization: Bearer tok-live-AA:BB:CC\\\" end";
-        let cases = [
+        let mut cases: Vec<ExitCase> = vec![
             ExitCase {
                 name: "stderr-only",
                 data: serde_json::json!({ "lastStderr": stderr }),
-                expected: "pane exited; agent process is gone",
+                expected: "pane exited; agent process is gone".to_owned(),
                 leak_fragments: &[
                     "abc123xyz-leak",
                     "secretvalue-9931-leak",
@@ -6771,16 +6771,36 @@ escaped \\\"Authorization: Bearer tok-live-AA:BB:CC\\\" end";
             ExitCase {
                 name: "exit-code-42",
                 data: serde_json::json!({ "exitCode": 42 }),
-                expected: "agent process exited with code 42",
+                expected: "agent process exited with code 42".to_owned(),
                 leak_fragments: &[],
             },
+            // r5 item 1: a numeric signal the platform does not recognize is
+            // not signal evidence — the exit code alongside it renders.
             ExitCase {
-                name: "signal-9",
-                data: serde_json::json!({ "signal": 9 }),
-                expected: "agent process killed by signal KILL (9)",
+                name: "signal-200-falls-through-to-code",
+                data: serde_json::json!({ "signal": 200, "exitCode": 42 }),
+                expected: "agent process exited with code 42".to_owned(),
                 leak_fragments: &[],
             },
         ];
+        // r5 item 1: the signal number/name are derived from the PLATFORM's
+        // nix definitions (9/KILL on both Linux and macOS, but BUS/USR1
+        // differ) — never a hard-coded number.
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::Signal;
+            let kill = Signal::SIGKILL;
+            cases.push(ExitCase {
+                name: "signal-kill",
+                data: serde_json::json!({ "signal": i64::from(kill as i32) }),
+                expected: format!(
+                    "agent process killed by signal {} ({})",
+                    kill.as_str().strip_prefix("SIG").unwrap(),
+                    kill as i32
+                ),
+                leak_fragments: &[],
+            });
+        }
 
         for case in cases {
             // Build the observation exactly the way the generic_pty status
@@ -6832,7 +6852,7 @@ escaped \\\"Authorization: Bearer tok-live-AA:BB:CC\\\" end";
             };
             assert_eq!(
                 native.related_ids.get("reason").map(String::as_str),
-                Some(case.expected),
+                Some(case.expected.as_str()),
                 "[{}] failure_lifecycle must stamp related_ids.reason",
                 case.name
             );
@@ -6878,7 +6898,7 @@ escaped \\\"Authorization: Bearer tok-live-AA:BB:CC\\\" end";
             assert_eq!(node_row.lifecycle, InstanceLifecycle::Failed);
             assert_eq!(
                 node_row.last_error.as_deref(),
-                Some(case.expected),
+                Some(case.expected.as_str()),
                 "[{}] the Node store must persist the structured text",
                 case.name
             );
@@ -6937,7 +6957,7 @@ escaped \\\"Authorization: Bearer tok-live-AA:BB:CC\\\" end";
             assert_eq!(hub_row.lifecycle, "failed");
             assert_eq!(
                 hub_row.last_error.as_deref(),
-                Some(case.expected),
+                Some(case.expected.as_str()),
                 "[{}] the Hub projection must persist the structured text",
                 case.name
             );

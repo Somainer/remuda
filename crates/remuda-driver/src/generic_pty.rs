@@ -1048,73 +1048,70 @@ pub fn pane_exit_diagnostic(data: &serde_json::Value) -> String {
     FALLBACK.to_owned()
 }
 
-/// Fixed conventional Unix signal table (number ↔ name without the `SIG`
-/// prefix). Signal evidence is rendered from THIS vocabulary only: a pane
-/// event's free-form name string never reaches the persisted diagnostic
-/// verbatim, and a number resolves to its canonical name.
-const SIGNAL_NAMES: &[(i64, &str)] = &[
-    (1, "HUP"),
-    (2, "INT"),
-    (3, "QUIT"),
-    (4, "ILL"),
-    (5, "TRAP"),
-    (6, "ABRT"),
-    (7, "BUS"),
-    (8, "FPE"),
-    (9, "KILL"),
-    (10, "USR1"),
-    (11, "SEGV"),
-    (12, "USR2"),
-    (13, "PIPE"),
-    (14, "ALRM"),
-    (15, "TERM"),
-    (16, "STKFLT"),
-    (17, "CHLD"),
-    (18, "CONT"),
-    (19, "STOP"),
-    (20, "TSTP"),
-    (21, "TTIN"),
-    (22, "TTOU"),
-    (23, "URG"),
-    (24, "XCPU"),
-    (25, "XFSZ"),
-    (26, "VTALRM"),
-    (27, "PROF"),
-    (28, "WINCH"),
-    (29, "IO"),
-    (30, "PWR"),
-    (31, "SYS"),
-];
-
 /// Build the structured `killed by signal` diagnostic from a signal NAME
-/// string and/or NUMBER carried by the pane event (both optional).
+/// string and/or NUMBER carried by the pane event (both optional), using
+/// the PLATFORM's own signal definitions (`nix`) — the same source
+/// shell_pty's `signal_name` uses — never a baked-in table: numbers mean
+/// different signals on macOS vs Linux (10 is BUS there, USR1 here; 30 is
+/// USR1 there, PWR here).
 ///
-/// - A number in the table renders canonically as `NAME (N)`; the 128+N
-///   shell encoding (e.g. 137) is decoded first. A positive number outside
-///   the table renders as the integer alone (still structured, no text).
-/// - A name without a number renders `NAME (N)` only when it resolves in
-///   the table; an unrecognized name contributes nothing (it is
-///   untrusted free text).
+/// Number resolution:
+/// - `129..=192` decodes the shell `128+N` encoding and is signal evidence
+///   only when the platform recognizes `N`;
+/// - `1..=127` is taken as a direct signal number and must be recognized;
+/// - anything else (0, 128, >=193, negatives) is not a signal.
+///
+/// A numeric field the platform does NOT recognize (0, 72, 200, …) is not
+/// signal evidence at all — the caller falls through to the exit-code field
+/// and then the fixed fallback, so `{"signal":200,"exitCode":42}` reports
+/// the exit code instead of inventing "signal 72".
+///
+/// Name resolution (only when no numeric field is present): uppercase
+/// FIRST, then prepend `SIG` when missing ("usr1" → "SIGUSR1"); the
+/// resolved signal renders as its name without the prefix plus its
+/// platform number. An unrecognized name contributes nothing.
+#[cfg(unix)]
 fn pane_signal_diagnostic(name: Option<String>, number: Option<i64>) -> Option<String> {
-    let name = name.map(|raw| raw.strip_prefix("SIG").unwrap_or(&raw).to_ascii_uppercase());
-    let number = number.map(|raw| if raw > 128 { raw - 128 } else { raw });
-    if let Some(num) = number {
-        let canonical = SIGNAL_NAMES
-            .iter()
-            .find(|(n, _)| *n == num)
-            .map(|(_, name)| *name);
-        return Some(match canonical {
-            Some(name) => format!("agent process killed by signal {name} ({num})"),
-            None => format!("agent process killed by signal {num}"),
-        });
+    use nix::sys::signal::Signal;
+    use std::str::FromStr;
+
+    /// Render exactly "agent process killed by signal NAME (N)".
+    fn render(signal: Signal) -> String {
+        let name = signal
+            .as_str()
+            .strip_prefix("SIG")
+            .unwrap_or(signal.as_str());
+        format!("agent process killed by signal {name} ({})", signal as i32)
     }
-    if let Some(name) = name {
-        let num = SIGNAL_NAMES
-            .iter()
-            .find(|(_, n)| *n == name)
-            .map(|(num, _)| *num)?;
-        return Some(format!("agent process killed by signal {name} ({num})"));
+
+    if let Some(raw) = number {
+        let candidate: Option<i32> = match raw {
+            129..=192 => i32::try_from(raw - 128).ok(),
+            1..=127 => i32::try_from(raw).ok(),
+            _ => None,
+        };
+        // Present-but-unrecognized numeric signal vetoes the whole signal
+        // branch, including a name carried alongside it.
+        let signal = Signal::try_from(candidate?).ok()?;
+        return Some(render(signal));
     }
+    if let Some(raw) = name {
+        let upper = raw.trim().to_ascii_uppercase();
+        let prefixed = if upper.starts_with("SIG") {
+            upper
+        } else {
+            format!("SIG{upper}")
+        };
+        let signal = Signal::from_str(&prefixed).ok()?;
+        return Some(render(signal));
+    }
+    None
+}
+
+/// Non-Unix builds carry no signal vocabulary; signal fields are ignored and
+/// the caller renders the exit code or fixed fallback.
+#[cfg(not(unix))]
+fn pane_signal_diagnostic(_name: Option<String>, _number: Option<i64>) -> Option<String> {
     None
 }
 
@@ -1436,10 +1433,10 @@ mod tests {
         assert!(!looks_like_shell_prompt("OK\n❯ \n"));
     }
 
-    /// c-cardsettle-fu r1 item 3 / r4 item 1: the stored PaneExited
-    /// diagnostic carries ONLY structured evidence — exit code, fixed-table
-    /// signal name+number, or the fixed fallback. Child stderr is never
-    /// rendered.
+    /// c-cardsettle-fu r1 item 3 / r4-r5 item 1: the stored PaneExited
+    /// diagnostic carries ONLY structured evidence — exit code, a signal
+    /// resolved through the PLATFORM's own definitions, or the fixed
+    /// fallback. Child stderr is never rendered.
     #[test]
     fn pane_exit_diagnostic_names_the_real_exit_code() {
         let diag = |data: serde_json::Value| pane_exit_diagnostic(&data);
@@ -1451,29 +1448,6 @@ mod tests {
             diag(serde_json::json!({ "pane_id": "p1", "exit_code": 7 })),
             "agent process exited with code 7"
         );
-        // A numeric signal renders its canonical fixed-table name AND number.
-        assert_eq!(
-            diag(serde_json::json!({ "pane_id": "p1", "signal": 9 })),
-            "agent process killed by signal KILL (9)"
-        );
-        // The 128+N shell encoding decodes to the same text.
-        assert_eq!(
-            diag(serde_json::json!({ "pane_id": "p1", "signal": 137 })),
-            "agent process killed by signal KILL (9)"
-        );
-        assert_eq!(
-            diag(serde_json::json!({ "pane_id": "p1", "signalNumber": 15 })),
-            "agent process killed by signal TERM (15)"
-        );
-        // A name resolves through the same fixed table (SIG prefix, any case).
-        assert_eq!(
-            diag(serde_json::json!({ "pane_id": "p1", "signalName": "SIGKILL" })),
-            "agent process killed by signal KILL (9)"
-        );
-        assert_eq!(
-            diag(serde_json::json!({ "pane_id": "p1", "signal_name": "term" })),
-            "agent process killed by signal TERM (15)"
-        );
         // A bare code 0 adds no failure diagnostic; fall through.
         assert_eq!(
             diag(serde_json::json!({ "pane_id": "p1", "exitCode": 0 })),
@@ -1483,6 +1457,89 @@ mod tests {
         assert_eq!(
             diag(serde_json::json!({ "pane_id": "p1" })),
             "pane exited; agent process is gone"
+        );
+        // 137 standing alone is an EXIT CODE, never silently decoded as a
+        // signal.
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "exitCode": 137 })),
+            "agent process exited with code 137"
+        );
+        // Numeric fields the platform does not recognize as signals (0, 200)
+        // are NOT signal evidence: the exit code still renders.
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "signal": 0, "exitCode": 42 })),
+            "agent process exited with code 42"
+        );
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "signal": 200, "exitCode": 42 })),
+            "agent process exited with code 42"
+        );
+        // …and with no exit code they collapse to the fallback.
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "signal": 200 })),
+            "pane exited; agent process is gone"
+        );
+    }
+
+    /// Signal cases resolved with the platform's own nix definitions. Numbers
+    /// are computed from nix (never hard-coded): BUS is 7 on Linux but 10 on
+    /// macOS, USR1 is 10 on Linux but 30 on macOS, so a baked-in table named
+    /// them wrong for the owner's macOS gate.
+    #[cfg(unix)]
+    #[test]
+    fn pane_exit_signal_resolved_from_platform_definitions() {
+        use nix::sys::signal::Signal;
+        use std::str::FromStr;
+
+        let diag = |data: serde_json::Value| pane_exit_diagnostic(&data);
+        let expected = |signal: Signal| {
+            format!(
+                "agent process killed by signal {} ({})",
+                signal.as_str().strip_prefix("SIG").unwrap(),
+                signal as i32
+            )
+        };
+
+        for signal in [Signal::SIGBUS, Signal::SIGUSR1, Signal::SIGKILL] {
+            let num = i64::from(signal as i32);
+            // Direct number.
+            assert_eq!(
+                diag(serde_json::json!({ "signal": num })),
+                expected(signal),
+                "numeric {num} must resolve via nix on THIS platform"
+            );
+            // Shell 128+N encoding.
+            assert_eq!(
+                diag(serde_json::json!({ "signal": 128 + num })),
+                expected(signal),
+                "128+{num} must decode via nix on THIS platform"
+            );
+        }
+
+        // Name-only shapes: SIG-prefixed, bare lowercase, and the literal
+        // reviewer example.
+        assert_eq!(
+            diag(serde_json::json!({ "signalName": "SIGBUS" })),
+            expected(Signal::from_str("SIGBUS").unwrap())
+        );
+        assert_eq!(
+            diag(serde_json::json!({ "signalName": "usr1" })),
+            expected(Signal::SIGUSR1)
+        );
+        assert_eq!(
+            diag(serde_json::json!({ "signal_name": "sigkill" })),
+            expected(Signal::SIGKILL)
+        );
+
+        // A 128+N whose N the platform does not recognize is not a signal.
+        assert_eq!(
+            diag(serde_json::json!({ "signal": 128 + 72, "exitCode": 42 })),
+            "agent process exited with code 42"
+        );
+        // An unrecognized name alongside a good exit code falls through.
+        assert_eq!(
+            diag(serde_json::json!({ "signalName": "SIGBOGUS", "exitCode": 42 })),
+            "agent process exited with code 42"
         );
     }
 

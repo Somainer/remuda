@@ -409,17 +409,26 @@ async fn abort_before_a_queued_terminal_claims_still_delivers_final_usage_once()
         "close returned without the abort residual running"
     );
     // Barrier: the cooperative terminal closure reached its pre-claim park
-    // (registered, hydrator unclaimed). The abort residual has registered a
-    // second terminal by now and waits inside its claim.
+    // (registered, hydrator unclaimed).
     assert!(
         faults.wait_terminal_entered(),
         "the cooperative terminal finalise never reached its pre-claim barrier"
     );
+    // Barrier: the abort residual's SECOND terminal registered and parked in
+    // its claim behind the elected cooperative owner. No elapsed-time
+    // inference: without this ack the test could release before the second
+    // terminal ever existed and still pass (c-ctxusage r11 item 3).
+    assert!(
+        faults.wait_abort_terminal_waiting_for(Duration::from_secs(30)),
+        "the abort terminal never registered/waited behind the elected owner"
+    );
 
     // Neither terminal may finish while the elected one is parked: the
-    // flusher must not retire and no FINAL usage is delivered.
+    // flusher must not retire and no FINAL usage is delivered. The state is
+    // already established by the two barriers above, so these are immediate
+    // observations, not a settling wait.
     assert!(
-        !faults.wait_flusher_exit_for(Duration::from_millis(500)),
+        !faults.flusher_exited(),
         "the flusher retired while the terminal owner was still parked"
     );
     assert_eq!(

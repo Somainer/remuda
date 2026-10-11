@@ -808,6 +808,17 @@ pub(super) fn spawn(
     // abort can never read "no producer, empty slot" in the gap before a
     // queued finalisation claims the hydrator.
     let hydrator_slot: PromoteGate = Arc::new(crate::producer_gate::ProducerGate::new());
+    // c-ctxusage r11 item 3: prove the abort residual's SECOND terminal
+    // registered and parked behind the elected owner, instead of the test
+    // inferring its existence from an elapsed delay. Inert in production
+    // (faults is None).
+    #[cfg(feature = "test-faults")]
+    if let Some(faults) = faults.as_ref() {
+        let yield_faults = Arc::clone(faults);
+        hydrator_slot.set_terminal_yield_hook(Arc::new(move || {
+            yield_faults.note_abort_terminal_waiting();
+        }));
+    }
     let flush_notify = Arc::new(Notify::new());
     // Test-only shrink (c-ctxusage r9 item 1): a normal replay batch then
     // exceeds the capacity and exercises the notify-before-park ordering.

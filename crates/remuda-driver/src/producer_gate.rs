@@ -60,6 +60,13 @@ struct Phase<T> {
     terminal_queue: VecDeque<TerminalTicket>,
     /// Ticket of the terminal currently owning the hydrator, if any.
     terminal_owner: Option<TerminalTicket>,
+    #[cfg(feature = "test-faults")]
+    /// Test-only acknowledgement: invoked the moment a terminal claimant
+    /// parks because an earlier-registered terminal is ahead of it in ticket
+    /// order (it waits behind the elected owner). Lets an integration test
+    /// prove the second terminal REGISTERED and reached its yield wait
+    /// without inferring that from an elapsed delay. `None` in production.
+    terminal_yield_hook: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync + 'static>>>,
     #[cfg(test)]
     /// Test-only acknowledgement: signalled (blocking rendezvous) the moment
     /// a thread enters a condvar wait, so a test can prove "parked" without a
@@ -88,6 +95,8 @@ impl<T> ProducerGate<T> {
                 terminal_next: 0,
                 terminal_queue: VecDeque::new(),
                 terminal_owner: None,
+                #[cfg(feature = "test-faults")]
+                terminal_yield_hook: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 wait_barrier: std::sync::Mutex::new(None),
             }),
@@ -107,29 +116,71 @@ impl<T> ProducerGate<T> {
             .unwrap() = Some(tx);
     }
 
+    #[cfg(feature = "test-faults")]
+    /// Install the test-only acknowledgement fired when a terminal claimant
+    /// parks behind an earlier-registered terminal (c-ctxusage r11 item 3).
+    pub(crate) fn set_terminal_yield_hook(
+        &self,
+        hook: std::sync::Arc<dyn Fn() + Send + Sync + 'static>,
+    ) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .terminal_yield_hook
+            .lock()
+            .unwrap() = Some(hook);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Phase<T>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Fire the test-only condvar-wait rendezvous while the gate lock is
+    /// held, immediately before parking. Shared by every wait path so unit
+    /// tests observe every park.
+    #[cfg(test)]
+    fn rendezvous_wait_barrier(guard: &Phase<T>) {
+        let tx = guard
+            .wait_barrier
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(std::clone::Clone::clone);
+        if let Some(tx) = tx {
+            // Blocks until the test acknowledges the parked thread.
+            let _ = tx.send(());
+        }
     }
 
     /// Condvar wait with a test-only acknowledgement fired the instant a
     /// thread parks. Inert in every non-test build.
     fn wait<'a>(&self, guard: MutexGuard<'a, Phase<T>>) -> MutexGuard<'a, Phase<T>> {
         #[cfg(test)]
-        {
-            // Clone the sender while holding only the barrier lock, then
-            // rendezvous OUTSIDE both locks.
-            let tx = guard
-                .wait_barrier
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(std::clone::Clone::clone);
-            if let Some(tx) = tx {
-                // Blocks until the test acknowledges the parked thread.
-                let _ = tx.send(());
-            }
+        Self::rendezvous_wait_barrier(&guard);
+        self.cv.wait(guard).unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Condvar wait on a TERMINAL-yield path (the claimant is a later
+    /// terminal waiting behind the elected owner). Under `test-faults` it
+    /// fires the terminal-yield acknowledgement while the gate mutex is held,
+    /// immediately before parking: any observer reaction that lets the owner
+    /// finish must first acquire this same mutex, so it cannot make the owner
+    /// notify before this wait actually parks. Otherwise identical to
+    /// [`Self::wait`].
+    #[cfg(feature = "test-faults")]
+    fn wait_terminal_yield<'a>(&self, guard: MutexGuard<'a, Phase<T>>) -> MutexGuard<'a, Phase<T>> {
+        #[cfg(test)]
+        Self::rendezvous_wait_barrier(&guard);
+        if let Some(hook) = guard.terminal_yield_hook.lock().unwrap().clone() {
+            hook();
         }
         self.cv.wait(guard).unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(not(feature = "test-faults"))]
+    fn wait_terminal_yield<'a>(&self, guard: MutexGuard<'a, Phase<T>>) -> MutexGuard<'a, Phase<T>> {
+        self.wait(guard)
     }
 
     /// Publish the live hydrator (first bind). Completes instantly when the
@@ -209,12 +260,12 @@ impl<T> ProducerGate<T> {
             }
             // The elected owner is finishing: no-op once it is done.
             if state.terminal_owner.is_some() {
-                state = self.wait(state);
+                state = self.wait_terminal_yield(state);
                 continue;
             }
             // Strict registration order among the queued terminals.
             if state.terminal_queue.front() != Some(&ticket) {
-                state = self.wait(state);
+                state = self.wait_terminal_yield(state);
                 continue;
             }
             // My turn, and no collector or owner stands ahead.
@@ -349,6 +400,32 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
+
+    /// Every test wait is bounded: a deadlock under test must fail loudly and
+    /// promptly, never hang the test binary (c-ctxusage r11 item 3).
+    const TEST_WAIT: Duration = Duration::from_secs(30);
+
+    fn recv_bounded<T: Send>(rx: &std::sync::mpsc::Receiver<T>, what: &str) -> T {
+        rx.recv_timeout(TEST_WAIT)
+            .unwrap_or_else(|err| panic!("{what} within {TEST_WAIT:?}: {err:?}"))
+    }
+
+    fn join_bounded<T: Send + 'static>(handle: std::thread::JoinHandle<T>, what: &str) -> T {
+        let (tx, rx) = sync_channel(1);
+        // The handle is moved onto a watcher so a join that would block
+        // forever is observed through the bounded channel instead.
+        let watcher = std::thread::spawn(move || {
+            let _ = tx.send(handle.join());
+        });
+        match rx.recv_timeout(TEST_WAIT) {
+            Ok(Ok(value)) => value,
+            Ok(Err(payload)) => std::panic::resume_unwind(payload),
+            Err(err) => panic!("{what} within {TEST_WAIT:?}: {err:?}"),
+        }
+        // The watcher exits right after sending; on a timeout panic it
+        // detaches with the hung thread and process exit reaps it.
+    }
 
     #[test]
     fn a_queued_producer_blocks_the_abort_decision_until_retirement() {
@@ -365,15 +442,13 @@ mod tests {
         gate.set_wait_barrier(wait_tx);
         let waiter_gate = Arc::clone(&gate);
         let waiter = std::thread::spawn(move || waiter_gate.wait_retired());
-        wait_rx
-            .recv()
-            .expect("waiter never entered the retirement wait");
+        recv_bounded(&wait_rx, "waiter never entered the retirement wait");
 
         // The queued closure runs, claims, finishes and retires.
         let claimed = gate.claim();
         assert_eq!(claimed, Some(7));
         gate.retire();
-        waiter.join().expect("waiter thread");
+        join_bounded(waiter, "waiter thread never returned from wait_retired");
         assert!(gate.is_retired());
         // Nothing can claim after retirement.
         assert!(gate.claim().is_none());
@@ -394,10 +469,12 @@ mod tests {
         let first = std::thread::spawn(move || {
             let h = first_gate.claim().expect("collect claims");
             got_tx.send(()).expect("acknowledge ownership");
-            release_rx.recv().expect("await release");
+            release_rx
+                .recv_timeout(TEST_WAIT)
+                .expect("release never arrived within bound");
             first_gate.restore(h);
         });
-        got_rx.recv().expect("first claimant never owned the slot");
+        recv_bounded(&got_rx, "first claimant never owned the slot");
 
         // B must park waiting for the owned hydrator; the wait barrier makes
         // that state observable without a sleep.
@@ -409,13 +486,11 @@ mod tests {
             second_gate.retire();
             h
         });
-        wait_rx
-            .recv()
-            .expect("second claimant never parked on the slot");
+        recv_bounded(&wait_rx, "second claimant never parked on the slot");
 
         release_tx.send(()).expect("release the first claimant");
-        first.join().expect("first");
-        let finished_by = second.join().expect("second");
+        join_bounded(first, "first claimant thread never finished");
+        let finished_by = join_bounded(second, "second claimant thread never finished");
         assert_eq!(finished_by, 1);
         assert!(gate.is_retired());
         assert!(!gate.producer_active());
@@ -438,12 +513,12 @@ mod tests {
         let terminal = std::thread::spawn(move || terminal_gate.claim_terminal(ticket));
         // Hard acknowledgement: the terminal is parked yielding, rather than
         // a "still running after N ms" timing guess.
-        wait_rx.recv().expect("terminal never parked to yield");
+        recv_bounded(&wait_rx, "terminal never parked to yield");
 
         // The collector claims and runs only now.
         assert_eq!(gate.claim(), Some(42));
         gate.restore(42);
-        let claimed = terminal.join().expect("terminal thread");
+        let claimed = join_bounded(terminal, "terminal thread never claimed after restore");
         assert_eq!(claimed, Some(42), "terminal claims the restored hydrator");
         gate.retire();
         assert!(gate.is_retired());
@@ -486,9 +561,7 @@ mod tests {
                 }
             }
         });
-        wait_rx
-            .recv()
-            .expect("B parked while A was ahead in ticket order");
+        recv_bounded(&wait_rx, "B never parked while A was ahead in ticket order");
 
         // A now runs: it is the sole owner and takes the hydrator.
         let a_gate = Arc::clone(&gate);
@@ -499,10 +572,14 @@ mod tests {
             a_gate.retire();
             hydrator
         });
-        assert_eq!(a.join().expect("A thread"), 99, "A owns the hydrator");
+        assert_eq!(
+            join_bounded(a, "owner terminal A never finished"),
+            99,
+            "A owns the hydrator"
+        );
 
         // B wakes retired and returns the no-op: exactly-once delivery.
-        let b_claim = b.join().expect("B thread");
+        let b_claim = join_bounded(b, "later terminal B never returned from its claim");
         assert_eq!(b_claim, None, "the later terminal never finishes twice");
         assert!(gate.is_retired());
         assert!(!gate.producer_active());

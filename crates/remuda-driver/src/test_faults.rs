@@ -57,6 +57,12 @@ pub(crate) struct FaultState {
     gate_cv: Condvar,
     abort_residual: Mutex<bool>,
     abort_residual_cv: Condvar,
+    /// Acknowledged once the abort-residual terminal has REGISTERED and parked
+    /// in its claim behind the elected owner terminal - hard proof the second
+    /// terminal exists, instead of inferring it from an elapsed delay
+    /// (c-ctxusage r11 item 3).
+    abort_terminal_waiting: Mutex<bool>,
+    abort_terminal_waiting_cv: Condvar,
     flusher_exited: Mutex<bool>,
     flusher_exited_cv: Condvar,
     /// Acknowledged once the streaming flusher has drained and is parked in
@@ -105,6 +111,8 @@ impl FaultState {
             gate_cv: Condvar::new(),
             abort_residual: Mutex::new(false),
             abort_residual_cv: Condvar::new(),
+            abort_terminal_waiting: Mutex::new(false),
+            abort_terminal_waiting_cv: Condvar::new(),
             flusher_exited: Mutex::new(false),
             flusher_exited_cv: Condvar::new(),
             flusher_idle: Mutex::new(false),
@@ -224,6 +232,17 @@ impl FaultState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         self.abort_residual_cv.notify_all();
+    }
+
+    /// Acknowledge that the abort residual's terminal registered and is parked
+    /// in its claim, waiting behind the elected owner terminal (c-ctxusage
+    /// r11 item 3). Fired from the gate's terminal-yield hook.
+    pub(crate) fn note_abort_terminal_waiting(&self) {
+        *self
+            .abort_terminal_waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.abort_terminal_waiting_cv.notify_all();
     }
 
     /// The injected cooperative-close timeout override, if a test armed one.
@@ -401,6 +420,16 @@ impl TranscriptFaults {
             &self.inner.abort_residual,
             &self.inner.abort_residual_cv,
             Duration::from_secs(60),
+        )
+    }
+
+    /// Block until the abort residual's second terminal registers and parks
+    /// behind the elected owner (bounded, c-ctxusage r11 item 3).
+    pub fn wait_abort_terminal_waiting_for(&self, timeout: Duration) -> bool {
+        Self::wait_true(
+            &self.inner.abort_terminal_waiting,
+            &self.inner.abort_terminal_waiting_cv,
+            timeout,
         )
     }
 

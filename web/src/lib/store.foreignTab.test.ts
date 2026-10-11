@@ -209,6 +209,75 @@ it("GATE12 item 6: two aborting load reclaims arm the tracked wakeup that delive
   hubStore.logout();
 });
 
+it("GATE15 item 3: navigating away from mounted A (deferred REST catch-up owed) to mounted B runs A's catch-up via the real follow() path", async () => {
+  const { api, hubStore } = await fresh();
+  await bootLive(api, hubStore); // mounts A = INSTANCE (journal JOURNAL)
+
+  const JOURNAL_B = "obj_journal_b";
+  const INSTANCE_B = "ins_mounted_b";
+  const instanceB = {
+    id: INSTANCE_B,
+    journalId: JOURNAL_B,
+    lifecycle: "running",
+    revision: "0",
+    durableSeq: "0",
+  } as never as Awaited<ReturnType<Api["instanceGet"]>>;
+  vi.spyOn(api, "instanceGet").mockImplementation(async (id: string) =>
+    id === INSTANCE_B ? instanceB : ({} as Awaited<ReturnType<Api["instanceGet"]>>),
+  );
+  vi.spyOn(api, "eventsRead").mockResolvedValue({
+    events: [],
+    windowFromSeq: "1",
+    durableSeq: "0",
+    reachedAfterSeq: "0",
+  } as Awaited<ReturnType<Api["eventsRead"]>>);
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(async () =>
+    ({
+      subscriptionId: "sub_b" as never,
+      getReadyState: () => 1,
+      snapshot: { asOfSeq: "0", fromSeq: null },
+      close: () => undefined,
+    }) as never,
+  );
+
+  // First mount B, then return to A, so the test navigation below lands on the
+  // mounted-journal early-return branch (the branch that used to skip
+  // bindConnection).
+  await hubStore.follow(INSTANCE_B);
+  await hubStore.follow(INSTANCE);
+
+  // A owes a deferred catch-up: its accepted response arrived during
+  // reconnect backoff and was stamped via recordOwed rather than read inline.
+  const storeInternal = hubStore as unknown as {
+    recordOwed: (id: string) => void;
+    reconcileOwed: Map<string, unknown>;
+  };
+  storeInternal.recordOwed(INSTANCE);
+  expect(storeInternal.reconcileOwed.has(INSTANCE)).toBe(true);
+
+  // Navigate to the already-mounted B (as SessionPage does). With the fix
+  // follow() routes through bindConnection, which sees the bind-away A→B and
+  // services A's abandoned debt immediately.
+  const journalReadsAfterNav: string[] = [];
+  vi.mocked(api.eventsRead).mockImplementation(async (args) => {
+    journalReadsAfterNav.push(args.journalId);
+    return {
+      events: [],
+      windowFromSeq: "1",
+      durableSeq: "0",
+      reachedAfterSeq: "0",
+    } as Awaited<ReturnType<Api["eventsRead"]>>;
+  });
+  await hubStore.follow(INSTANCE_B);
+  await vi.waitFor(
+    () => expect(journalReadsAfterNav).toContain(JOURNAL),
+    { timeout: 2_000 },
+  );
+  // Debt honoured after the catch-up completed.
+  await vi.waitFor(() => expect(storeInternal.reconcileOwed.has(INSTANCE)).toBe(false), { timeout: 2_000 });
+  hubStore.logout();
+});
+
 it("discovers and delivers a row another tab persisted after this tab loaded", async () => {
   const { api, hubStore } = await fresh();
   await bootLive(api, hubStore);

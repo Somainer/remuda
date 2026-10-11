@@ -2869,24 +2869,25 @@ class HubStore {
 
   async follow(instanceId: Id) {
     const instance = this.state.instances.find((i) => i.id === instanceId) ?? (await api.instanceGet(instanceId));
-    // This mounted session owns the connection machine BEFORE the socket is
-    // opened: if the subscribe fails while the Hub is unreachable (offline
-    // reload), the machine's reconnect resume must still know which instance
-    // to reopen — binding only after a successful open left reloaded sessions
-    // with a delivered row but no follow and no journal join.
-    this.connectionBoundTo = instance.id;
-    this.connectionBoundJournal = instance.journalId;
+    // Own the connection machine through bindConnection BEFORE any other
+    // binding work (c-reconnfu gate 15 item 3): it registers this journal as
+    // the bound session, bumps the binding generation on a real bind-away, and
+    // runs the abandoned-session REST fallback when the instance we left had a
+    // deferred catch-up. Assigning the fields directly (as the old code did)
+    // stranded session A's accepted-but-unjoined row when the user navigated
+    // to an already-mounted B — the mounted-journal early return never reached
+    // openFollowSocket, so bindConnection's fallback never ran.
+    this.bindConnection(instance.id, instance.journalId);
     if (!this.state.instances.some((i) => i.id === instanceId)) {
       this.emit({ instances: [instance, ...this.state.instances] });
     }
     // Fold projected effective state/catalog the single record carries.
     this.hydrateEffortEffective([instance]);
     this.hydrateModels([instance]);
-    // Already mounted (SessionPage re-render): rebind the connection machine
-    // to this active follow; a dead socket is reopened by the machine.
+    // Already mounted (SessionPage re-render): the bind above rebound the
+    // connection machine to this active follow (and serviced any abandoned
+    // instance); a dead socket is reopened by the machine.
     if (this.journals.has(instance.journalId)) {
-      this.connectionBoundTo = instanceId;
-      this.connectionBoundJournal = instance.journalId;
       return;
     }
     this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: "live" } });

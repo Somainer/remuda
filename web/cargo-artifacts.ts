@@ -1,19 +1,24 @@
 /**
  * Resolve where cargo actually wrote a just-built binary (c-ctxusage r10
- * item 6).
+ * item 6; hardened in r11 item 2).
  *
- * The output is NOT always `<target dir>/debug/<name>`: with a default
- * target triple configured (`.cargo/config.toml build.target`, `--target`,
+ * The output is NOT always `<target dir>/debug/<name>`: with a default target
+ * triple configured (`.cargo/config.toml build.target`, `--target`,
  * `CARGO_BUILD_TARGET`) cargo writes to
- * `<target dir>/<host-triple>/debug/<name>`. The e2e hook builds the binaries
- * itself, so a freshly built binary that is missing from the resolved path is
- * a real hook failure and must surface — never masquerade as the
- * fixture-less-host ENOENT skip.
+ * `<target dir>/<selected-triple>/debug/<name>`, and the selected triple is
+ * not necessarily the HOST triple. Probing conventional locations therefore
+ * (a) lets a stale binary in `target/debug` mask a missing fresh output under
+ * the triple dir and (b) guesses the host triple instead of cargo's selected
+ * target. The e2e hook builds with `--message-format=json`; cargo then reports
+ * each `compiler-artifact.executable` itself, so resolution takes the
+ * executable paths from THAT bounded build and requires exactly those files
+ * to exist. No `cargo metadata` / `rustc -vV` probes run after the build, so
+ * nothing can block the Playwright worker beyond its own bounded build.
  *
- * Only pure path selection is exported for unit testing; the metadata probes
- * (`cargo metadata`, `rustc -vV`) run lazily behind {@link resolveBuiltBinary}.
+ * Only pure parsing/path selection is exported for unit testing; the build
+ * itself is run by the e2e hook and its stdout handed to
+ * {@link parseBuiltExecutables}.
  */
-import { execFileSync } from "node:child_process";
 import { accessSync } from "node:fs";
 import path from "node:path";
 
@@ -31,37 +36,62 @@ export const HUB_E2E_BUILT_BINARIES: BuiltBinary[] = [
   { label: "native node", relPath: path.join("examples", "native_hub_e2e") },
 ];
 
-/** Where cargo puts its output, independent of the probed `$CARGO_TARGET_DIR`.
- * `null` means cargo/rustc could not be queried. */
-export interface CargoLayout {
-  targetDirectory: string;
-  hostTriple: string;
-}
+/** Cargo's reported executable for each built binary, keyed by
+ * {@link BuiltBinary.relPath}. `relPath` is the target name for a bin and
+ * `examples/<name>` for an example target. */
+export type BuiltExecutables = Map<string, string>;
 
-/** Distinct profile directories a just-built artifact can land in, in probe
- * order. `targetDir` is `$CARGO_TARGET_DIR` (or `<root>/target`); cargo's own
- * `target_directory` from metadata is normally the same value but probed
- * independently, and the host-triple subdir is added for a configured default
- * target. */
-export function artifactProfileDirs(
-  targetDir: string,
-  layout: CargoLayout | null,
-): string[] {
-  const dirs = [path.join(targetDir, "debug")];
-  if (layout) {
-    dirs.push(path.join(layout.targetDirectory, "debug"));
-    dirs.push(path.join(layout.targetDirectory, layout.hostTriple, "debug"));
+/**
+ * Parse cargo's `--message-format=json` stdout into the executable cargo
+ * itself wrote for each bin/example target it built as an artifact.
+ *
+ * Only `compiler-artifact` messages with a non-null `executable` and a `bin`
+ * or `example` target kind contribute; examples are keyed under
+ * `examples/<name>` to match {@link BuiltBinary.relPath}. Malformed lines and
+ * unrelated messages (libraries, build scripts, compiler diagnostics) are
+ * ignored. Duplicate emissions (the same artifact reported from more than
+ * one package graph) must agree; a disagreement is a cargo error and throws
+ * rather than silently picking one.
+ */
+export function parseBuiltExecutables(jsonStream: string): BuiltExecutables {
+  const executables = new Map<string, string>();
+  for (const line of jsonStream.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    let message: {
+      reason?: string;
+      target?: { name?: string; kind?: unknown };
+      executable?: unknown;
+    };
+    try {
+      message = JSON.parse(trimmed) as typeof message;
+    } catch {
+      continue;
+    }
+    if (message.reason !== "compiler-artifact" || typeof message.executable !== "string") {
+      continue;
+    }
+    const name = message.target?.name;
+    const kinds = Array.isArray(message.target?.kind) ? message.target!.kind : [];
+    const relPath = kinds.includes("bin")
+      ? name
+      : kinds.includes("example")
+        ? path.join("examples", name ?? "")
+        : undefined;
+    if (!name || !relPath) {
+      continue;
+    }
+    const previous = executables.get(relPath);
+    if (previous !== undefined && previous !== message.executable) {
+      throw new Error(
+        `cargo reported two different executable paths for ${relPath}: ${previous} vs ${message.executable}`,
+      );
+    }
+    executables.set(relPath, message.executable);
   }
-  return [...new Set(dirs.map((dir) => path.resolve(dir)))];
-}
-
-/** Every path cargo might have written `relPath` to, in probe order. */
-export function binaryCandidates(
-  targetDir: string,
-  layout: CargoLayout | null,
-  relPath: string,
-): string[] {
-  return artifactProfileDirs(targetDir, layout).map((dir) => path.join(dir, relPath));
+  return executables;
 }
 
 function exists(candidate: string): boolean {
@@ -74,59 +104,26 @@ function exists(candidate: string): boolean {
 }
 
 /**
- * Resolve against an explicit cargo layout (the probe lives in
- * {@link resolveBuiltBinary}; tests inject a deterministic layout).
- * Throws when the artifact is at none of cargo's output paths: the build
- * claimed success, so a miss is a hook failure, never a skip.
+ * Resolve a binary the hook JUST built against cargo's own reported artifact
+ * paths. Throws when cargo never reported the target, or when the exact path
+ * cargo reported does not exist on disk: the build claimed success, so a miss
+ * is a hook failure and must never be downgraded to a skip or masked by a
+ * stale binary in another directory.
  */
-export function resolveBuiltBinaryWithLayout(
-  targetDir: string,
-  layout: CargoLayout | null,
+export function resolveBuiltBinary(
+  built: BuiltExecutables,
   binary: BuiltBinary,
 ): string {
-  const candidates = binaryCandidates(targetDir, layout, binary.relPath);
-  const found = candidates.find(exists);
-  if (found) {
-    return found;
-  }
-  throw new Error(
-    `freshly built ${binary.label} binary is missing from every cargo output path: ${candidates.join(
-      ", ",
-    )}`,
-  );
-}
-
-let layoutCache: CargoLayout | null | undefined;
-
-/** Ask cargo where its target directory is and what the host triple is. Both
- * are repo/host properties, so the probe runs at most once; `null` is cached
- * when cargo is unavailable. */
-function cargoLayout(root: string): CargoLayout | null {
-  if (layoutCache !== undefined) {
-    return layoutCache;
-  }
-  try {
-    const raw = execFileSync(
-      "cargo",
-      ["metadata", "--no-deps", "--format-version", "1"],
-      { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+  const reported = built.get(binary.relPath);
+  if (reported === undefined) {
+    throw new Error(
+      `freshly built ${binary.label} binary was not reported by cargo in the --message-format=json build output`,
     );
-    const targetDirectory = (JSON.parse(raw) as { target_directory?: string }).target_directory;
-    const versionVerbose = execFileSync("rustc", ["-vV"], { encoding: "utf8" });
-    const hostTriple = /^host:\s*(\S+)$/m.exec(versionVerbose)?.[1];
-    layoutCache = targetDirectory && hostTriple ? { targetDirectory, hostTriple } : null;
-  } catch {
-    layoutCache = null;
   }
-  return layoutCache;
-}
-
-/**
- * Resolve a binary the hook JUST built, probing cargo's real output layout
- * (including a configured target-triple subdirectory). Throws when the
- * artifact is at none of the output paths: the build claimed success, so a
- * miss here is a hook failure and must never be downgraded to a skip.
- */
-export function resolveBuiltBinary(root: string, targetDir: string, binary: BuiltBinary): string {
-  return resolveBuiltBinaryWithLayout(targetDir, cargoLayout(root), binary);
+  if (!exists(reported)) {
+    throw new Error(
+      `freshly built ${binary.label} binary is missing from cargo's reported path: ${reported}`,
+    );
+  }
+  return reported;
 }

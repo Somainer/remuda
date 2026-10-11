@@ -32,7 +32,11 @@ import { fileURLToPath } from "node:url";
 
 import { expect, test, type Page } from "@playwright/test";
 
-import { resolveBuiltBinary, type BuiltBinary } from "../../cargo-artifacts";
+import {
+  parseBuiltExecutables,
+  resolveBuiltBinary,
+  type BuiltBinary,
+} from "../../cargo-artifacts";
 import { login } from "./hub-auth";
 
 const root = path.resolve(
@@ -67,7 +71,13 @@ const bins: Record<string, string> = {};
 // Refresh the three executables so a standalone gate run uses this tree.
 test.beforeAll(async () => {
   test.setTimeout(600_000);
-  const args = ["build", "--locked"];
+  // Take the executable paths from THIS bounded build: --message-format=json
+  // makes cargo report each compiler-artifact.executable itself, so a stale
+  // target/debug binary can never mask a missing fresh output under the
+  // selected target triple (and the selected triple, not the host triple,
+  // is what gets used). No post-build cargo/rustc probes - they ran
+  // unbounded and could hang the Playwright worker (c-ctxusage r11 item 2).
+  const args = ["build", "--locked", "--message-format=json"];
   for (const spec of BIN_SPECS) {
     if (spec.override) {
       continue;
@@ -80,21 +90,23 @@ test.beforeAll(async () => {
       args.push("-p", "remuda-node", "--example", "native_hub_e2e");
     }
   }
-  if (args.length > 2) {
-    await promisify(execFile)("cargo", args, {
+  let built = new Map<string, string>();
+  if (args.length > 3) {
+    const { stdout } = await promisify(execFile)("cargo", args, {
       cwd: root,
       env: process.env,
       timeout: 570_000,
-      maxBuffer: 8 * 1024 * 1024,
+      maxBuffer: 256 * 1024 * 1024,
     });
+    built = parseBuiltExecutables(stdout);
   }
   // Runs AFTER the build. A binary the hook did NOT just build (an operator
   // override env var) may legitimately be absent on a fixture-less host: ENOENT
   // on that path is the real missing-prerequisite SKIP; every other access
-  // error still surfaces. A binary the hook DID just build is resolved through
-  // cargo's real output layout (including a target-triple subdir) and a miss
-  // there THROWS — a failed build or wrong path resolution must fail the hook,
-  // never masquerade as a skip (c-ctxusage r10 item 6).
+  // error still surfaces. A binary the hook DID just build is resolved against
+  // cargo's own reported artifact path and a miss there THROWS - a failed
+  // build or wrong path resolution must fail the hook, never masquerade as a
+  // skip (c-ctxusage r10 item 6, r11 item 2).
   const missing: string[] = [];
   for (const spec of BIN_SPECS) {
     if (spec.override) {
@@ -109,7 +121,7 @@ test.beforeAll(async () => {
       }
       bins[spec.binary.label] = spec.override;
     } else {
-      bins[spec.binary.label] = resolveBuiltBinary(root, target, spec.binary);
+      bins[spec.binary.label] = resolveBuiltBinary(built, spec.binary);
     }
   }
   test.skip(

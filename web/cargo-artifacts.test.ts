@@ -5,52 +5,126 @@ import { describe, expect, it } from "vitest";
 
 import {
   HUB_E2E_BUILT_BINARIES,
-  artifactProfileDirs,
-  binaryCandidates,
-  resolveBuiltBinaryWithLayout,
+  parseBuiltExecutables,
+  resolveBuiltBinary,
 } from "./cargo-artifacts.ts";
 
-describe("artifactProfileDirs", () => {
-  it("probes the conventional dir, cargo metadata dir and the target-triple dir", () => {
-    const dirs = artifactProfileDirs("/work/target", {
-      targetDirectory: "/work/target",
-      hostTriple: "x86_64-unknown-linux-gnu",
-    });
-    expect(dirs).toEqual([
-      "/work/target/debug",
-      "/work/target/x86_64-unknown-linux-gnu/debug",
-    ]);
+/** A cargo `compiler-artifact` line, with only the fields the parser reads. */
+function artifactLine(name: string, kinds: string[], executable: string | null): string {
+  return JSON.stringify({
+    reason: "compiler-artifact",
+    target: { name, kind: kinds },
+    executable,
+  });
+}
+
+describe("parseBuiltExecutables", () => {
+  it("maps bins by name and examples by examples/<name> from cargo's json stream", () => {
+    const stream = [
+      JSON.stringify({ reason: "compiler-message", message: { level: "warning" } }),
+      artifactLine("remuda_lib", ["lib"], null),
+      artifactLine("remuda", ["bin"], "/t/debug/remuda"),
+      artifactLine("fake-harness", ["bin"], "/t/debug/fake-harness"),
+      artifactLine(
+        "native_hub_e2e",
+        ["example"],
+        "/t/debug/examples/native_hub_e2e",
+      ),
+      "",
+    ].join("\n");
+    const artifacts = parseBuiltExecutables(stream);
+    expect(artifacts.get("remuda")).toBe("/t/debug/remuda");
+    expect(artifacts.get("fake-harness")).toBe("/t/debug/fake-harness");
+    expect(artifacts.get(path.join("examples", "native_hub_e2e"))).toBe(
+      "/t/debug/examples/native_hub_e2e",
+    );
+    expect(artifacts.size).toBe(3);
   });
 
-  it("falls back to the conventional dir when cargo cannot be probed", () => {
-    expect(artifactProfileDirs("/work/target", null)).toEqual(["/work/target/debug"]);
+  it("takes cargo's selected triple subdirectory verbatim, with no host guess", () => {
+    const stream = [
+      artifactLine(
+        "remuda",
+        ["bin"],
+        "/t/aarch64-unknown-linux-gnu/debug/remuda",
+      ),
+    ].join("\n");
+    const artifacts = parseBuiltExecutables(stream);
+    expect(artifacts.get("remuda")).toBe("/t/aarch64-unknown-linux-gnu/debug/remuda");
   });
 
-  it("includes a distinct CARGO_TARGET_DIR and metadata target without duplicates", () => {
-    const dirs = artifactProfileDirs("/per-job/cargo-target", {
-      targetDirectory: "/repo/target",
-      hostTriple: "aarch64-apple-darwin",
-    });
-    expect(dirs).toEqual([
-      "/per-job/cargo-target/debug",
-      "/repo/target/debug",
-      "/repo/target/aarch64-apple-darwin/debug",
-    ]);
-    expect(new Set(dirs).size).toBe(dirs.length);
+  it("ignores malformed lines and non-bin artifacts without executable paths", () => {
+    const stream = [
+      "not json",
+      artifactLine("a_cdylib", ["cdylib"], null),
+      JSON.stringify({ reason: "build-script-executable" }),
+    ].join("\n");
+    expect(parseBuiltExecutables(stream).size).toBe(0);
   });
 });
 
-describe("binaryCandidates", () => {
-  it("places example binaries under examples/ in every candidate dir", () => {
-    const candidates = binaryCandidates(
-      "/t",
-      { targetDirectory: "/t", hostTriple: "x86_64-unknown-linux-gnu" },
-      path.join("examples", "native_hub_e2e"),
+describe("resolveBuiltBinary", () => {
+  it("uses cargo's reported fresh target output even when a stale default-dir binary exists", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cargo-bin-"));
+    const target = path.join(root, "target");
+    // A STALE binary left in the conventional dir by an earlier host build.
+    const stale = path.join(target, "debug", "remuda");
+    mkdirSync(path.dirname(stale), { recursive: true });
+    writeFileSync(stale, "stale");
+    // The fresh build emitted under the configured target triple instead.
+    const fresh = path.join(
+      target,
+      "aarch64-unknown-linux-gnu",
+      "debug",
+      "remuda",
     );
-    expect(candidates).toEqual([
-      "/t/debug/examples/native_hub_e2e",
-      "/t/x86_64-unknown-linux-gnu/debug/examples/native_hub_e2e",
-    ]);
+    mkdirSync(path.dirname(fresh), { recursive: true });
+    writeFileSync(fresh, "fresh");
+    const artifacts = parseBuiltExecutables(
+      artifactLine("remuda", ["bin"], fresh),
+    );
+    expect(resolveBuiltBinary(artifacts, { label: "remuda", relPath: "remuda" })).toBe(
+      fresh,
+    );
+  });
+
+  it("resolves a selected target different from the host", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cargo-bin-"));
+    const reported = path.join(root, "target", "wasm32-wasip1", "debug", "fake-harness");
+    mkdirSync(path.dirname(reported), { recursive: true });
+    writeFileSync(reported, "");
+    const artifacts = parseBuiltExecutables(
+      artifactLine("fake-harness", ["bin"], reported),
+    );
+    expect(
+      resolveBuiltBinary(artifacts, {
+        label: "fake-harness",
+        relPath: "fake-harness",
+      }),
+    ).toBe(reported);
+  });
+
+  it("throws when cargo reported the fresh output but the file is missing", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cargo-bin-"));
+    const reported = path.join(root, "target", "triple-x", "debug", "remuda");
+    const artifacts = parseBuiltExecutables(
+      artifactLine("remuda", ["bin"], reported),
+    );
+    expect(() =>
+      resolveBuiltBinary(artifacts, { label: "remuda", relPath: "remuda" }),
+    ).toThrow(/freshly built remuda binary is missing from cargo's reported path/);
+  });
+
+  it("throws when cargo never reported the artifact in the build stream", () => {
+    const artifacts = parseBuiltExecutables(
+      artifactLine("remuda", ["bin"], "/t/debug/remuda"),
+    );
+    expect(() =>
+      resolveBuiltBinary(artifacts, {
+        label: "native node",
+        relPath: path.join("examples", "native_hub_e2e"),
+      }),
+    ).toThrow(/freshly built native node binary was not reported by cargo/);
   });
 
   it("covers the three built binaries the e2e hook produces", () => {
@@ -59,49 +133,5 @@ describe("binaryCandidates", () => {
       "fake-harness",
       path.join("examples", "native_hub_e2e"),
     ]);
-  });
-});
-
-describe("resolveBuiltBinaryWithLayout", () => {
-  it("returns the conventional path when it exists", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "cargo-bin-"));
-    const target = path.join(root, "target");
-    const bin = path.join(target, "debug", "remuda");
-    mkdirSync(path.dirname(bin), { recursive: true });
-    writeFileSync(bin, "");
-    expect(
-      resolveBuiltBinaryWithLayout(target, null, { label: "remuda", relPath: "remuda" }),
-    ).toBe(path.resolve(bin));
-  });
-
-  it("finds an artifact only present in the target-triple subdir", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "cargo-bin-"));
-    const target = path.join(root, "target");
-    const triple = "x86_64-unknown-linux-gnu";
-    const bin = path.join(target, triple, "debug", "fake-harness");
-    mkdirSync(path.dirname(bin), { recursive: true });
-    writeFileSync(bin, "");
-    expect(
-      resolveBuiltBinaryWithLayout(
-        target,
-        { targetDirectory: target, hostTriple: triple },
-        { label: "fake-harness", relPath: "fake-harness" },
-      ),
-    ).toBe(path.resolve(bin));
-  });
-
-  it("throws when a freshly built artifact is at no output path", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "cargo-bin-"));
-    const target = path.join(root, "target");
-    expect(() =>
-      resolveBuiltBinaryWithLayout(
-        target,
-        { targetDirectory: target, hostTriple: "x86_64-unknown-linux-gnu" },
-        {
-          label: "native node",
-          relPath: path.join("examples", "native_hub_e2e"),
-        },
-      ),
-    ).toThrow(/freshly built native node binary is missing/);
   });
 });

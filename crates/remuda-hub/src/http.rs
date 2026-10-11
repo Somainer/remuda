@@ -648,12 +648,25 @@ pub async fn delete_instance(
         }
     }
 
-    let deleted = state
-        .store
-        .delete_instance(instance_id.clone())
+    // c-cardsettle r11 item 3: run the delete AND its settlement broadcast
+    // under the publication-order lock. A journal exit on another connection
+    // could otherwise hold the lock, commit and broadcast N+1, then have
+    // this late N send overtake it: a follower taking cursor N+1 would lag
+    // across N. publish_settlement acquires the lock before the store
+    // operation and releases it only after the bus send, so a delete
+    // settlement is ordered against every other settlement exactly like an
+    // in-transaction one. This stays BEFORE the post-commit tail spawns.
+    let deleted_exists = state
+        .publish_settlement(async {
+            state
+                .store
+                .delete_instance(instance_id.clone())
+                .await
+                .map(|d| (d.is_some(), d.map(|d| d.settlement).unwrap_or_default()))
+        })
         .await
         .map_err(map_store)?;
-    if !deleted {
+    if !deleted_exists {
         return Err(HubError::NotFound);
     }
 

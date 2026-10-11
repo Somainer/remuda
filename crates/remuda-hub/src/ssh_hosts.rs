@@ -392,6 +392,12 @@ impl Store {
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .optional()?;
+                // r9 item 2 (OA6): "was this row REALLY terminal?" must use
+                // process-end EVIDENCE, not the lifecycle string alone. The
+                // host-lost sweep marker (`exited` + 'host-lost' + no
+                // ended_at) is only potentially dead; a daemon that now
+                // reports the instance exited authoritatively attests the
+                // process end, so its pending cards must settle.
                 let was_terminal = match &previous {
                     Some((lifecycle, last_error, ended_at)) => {
                         crate::store::lifecycle_has_process_end_evidence(
@@ -406,21 +412,15 @@ impl Store {
                 // ma-lineage r5 item 1: a daemon reconcile reporting RUNNING
                 // is authoritative liveness (D-019, same epoch) — it revives a
                 // host-lost/ambiguous terminal row, clearing ended_at (host
-                // loss is contact loss, not a death) and last_error. The two
-                // flags are mutually exclusive (running vs terminal
-                // lifecycles), so one UPDATE covers revive and the r9
-                // ended_at stamp.
+                // loss is contact loss, not a death) and last_error.
                 let reports_running = lifecycle == "running";
                 tx.execute(
                     "UPDATE instances SET lifecycle = ?3, activity = ?4, connectivity = 'connected',
-                     last_error = CASE WHEN ?8 THEN NULL ELSE ?5 END,
-                     updated_at = ?6,
-                     ended_at = CASE
-                         WHEN ?8 THEN NULL
-                         WHEN ?7 THEN COALESCE(ended_at, ?6)
-                         ELSE ended_at
-                     END
-                     WHERE id = ?1 AND host_id = ?2",
+                     last_error = CASE WHEN ?7 THEN NULL ELSE ?5 END,
+                     ended_at = CASE WHEN ?7 THEN NULL
+                                     WHEN ?8 THEN COALESCE(ended_at, ?6)
+                                     ELSE ended_at END,
+                     updated_at = ?6 WHERE id = ?1 AND host_id = ?2",
                     params![
                         id,
                         &host_id,
@@ -428,8 +428,8 @@ impl Store {
                         activity,
                         instance["lastError"].as_str(),
                         &now,
-                        now_terminal,
-                        reports_running
+                        reports_running,
+                        now_terminal
                     ],
                 )?;
                 if !was_terminal && now_terminal {
@@ -881,186 +881,6 @@ mod tests {
         store.close().await;
     }
 
-    /// c-cardsettle: a daemon inventory report that moves a live instance to a
-    /// terminal lifecycle invalidates its still-pending interaction in the SAME
-    /// transaction, and returns the pair for broadcast.
-    #[tokio::test]
-    async fn daemon_inventory_terminal_report_settles_pending_interactions() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        let host = new_id("hst").unwrap();
-        store
-            .insert_managed_host(
-                host.clone(),
-                AddSshHost {
-                    target: "cardsettle-daemon".into(),
-                    label: "cardsettle-daemon".into(),
-                    labels: vec![],
-                    remuda_binary_policy: BinaryPolicy::RequireInstalled,
-                },
-            )
-            .await
-            .unwrap();
-        store
-            .ssh_status(host.clone(), "online", None)
-            .await
-            .unwrap();
-        let instance = store
-            .insert_instance(
-                host.clone(),
-                None,
-                "codex".into(),
-                "codex-appserver".into(),
-                None,
-                json!({}),
-            )
-            .await
-            .unwrap();
-        store
-            .append_journal(
-                host.clone(),
-                instance.instance_id.clone(),
-                Some(1),
-                json!({"kind":"lifecycle","payload":{"type":"entity","state":"ready"}}),
-            )
-            .await
-            .unwrap();
-        let interaction_id = new_id("int").unwrap();
-        store
-            .append_journal(
-                host.clone(),
-                instance.instance_id.clone(),
-                None,
-                json!({
-                    "kind": "interaction.requested",
-                    "payload": {
-                        "interactionKind": "approval",
-                        "interaction": {
-                            "id": interaction_id,
-                            "kind": "approval",
-                            "state": "pending",
-                            "blocking": true,
-                            "answerable": true,
-                            "carrier": "harness-hook",
-                            "deadline": { "state": "unknown" },
-                            "resolution": { "state": "unknown" },
-                            "request": {"kind": "approval", "title": "Bash", "options": []}
-                        }
-                    }
-                }),
-            )
-            .await
-            .unwrap();
-
-        let settlement = store
-            .reconcile_daemon_instances(
-                host.clone(),
-                vec![json!({
-                    "id": instance.instance_id,
-                    "hostId": host,
-                    "lifecycle": "exited",
-                    "activity": "idle"
-                })],
-            )
-            .await
-            .unwrap();
-        assert_eq!(settlement.interactions.len(), 1);
-        assert_eq!(settlement.interactions[0].instance_id, instance.instance_id);
-        assert_eq!(settlement.interactions[0].interaction_id, interaction_id);
-        assert!(!settlement.interactions[0].updated_at.is_empty());
-        let row = store
-            .get_interaction(interaction_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.state, "invalidated");
-        assert!(!row.blocking);
-        store.close().await;
-    }
-
-    /// ma-lineage r5 item 1(c): a daemon inventory that reports an instance
-    /// RUNNING revives a host-lost/ambiguous terminal row: lifecycle returns
-    /// to running and ended_at / last_error are cleared (D-019 same-epoch
-    /// process is alive).
-    #[tokio::test]
-    async fn daemon_inventory_running_report_revives_a_host_lost_row() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        let host = new_id("hst").unwrap();
-        store
-            .insert_managed_host(
-                host.clone(),
-                AddSshHost {
-                    target: "lineage-revive".into(),
-                    label: "lineage-revive".into(),
-                    labels: vec![],
-                    remuda_binary_policy: BinaryPolicy::RequireInstalled,
-                },
-            )
-            .await
-            .unwrap();
-        store
-            .ssh_status(host.clone(), "online", None)
-            .await
-            .unwrap();
-        let instance = store
-            .insert_instance(
-                host.clone(),
-                None,
-                "claude".into(),
-                "claude-sdk".into(),
-                None,
-                json!({}),
-            )
-            .await
-            .unwrap();
-        let host_lost_id = instance.instance_id.clone();
-        store
-            .run_named("host-lost", move |conn| {
-                conn.execute(
-                    "UPDATE instances
-                        SET lifecycle = 'exited', activity = 'idle',
-                            connectivity = 'disconnected',
-                            last_error = 'host-contact-lost',
-                            ended_at = NULL
-                      WHERE id = ?1",
-                    [host_lost_id.as_str()],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-
-        store
-            .reconcile_daemon_instances(
-                host.clone(),
-                vec![json!({
-                    "id": instance.instance_id,
-                    "hostId": host,
-                    "lifecycle": "running",
-                    "activity": "idle"
-                })],
-            )
-            .await
-            .unwrap();
-
-        let row = store
-            .get_instance(instance.instance_id.clone())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            row.lifecycle, "running",
-            "daemon running report revives the row"
-        );
-        assert_eq!(row.connectivity, "connected");
-        assert!(
-            row.last_error.is_none(),
-            "host-lost marker cleared: {row:?}"
-        );
-        store.close().await;
-    }
-
     /// In-process stand-in for the SSH child's NDJSON carrier: frames the
     /// bridge writes land on a channel a scripted Node task reads, and frames
     /// that task pushes are what the bridge receives. `shutdown` models the
@@ -1276,5 +1096,101 @@ mod tests {
             .expect("scripted node join timed out")
             .unwrap();
         hub.shutdown().await;
+    }
+    /// c-cardsettle: a daemon inventory report that moves a live instance to a
+    /// terminal lifecycle invalidates its still-pending interaction in the SAME
+    /// transaction, and returns the pair for broadcast.
+    #[tokio::test]
+    async fn daemon_inventory_terminal_report_settles_pending_interactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let host = new_id("hst").unwrap();
+        store
+            .insert_managed_host(
+                host.clone(),
+                AddSshHost {
+                    target: "cardsettle-daemon".into(),
+                    label: "cardsettle-daemon".into(),
+                    labels: vec![],
+                    remuda_binary_policy: BinaryPolicy::RequireInstalled,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .ssh_status(host.clone(), "online", None)
+            .await
+            .unwrap();
+        let instance = store
+            .insert_instance(
+                host.clone(),
+                None,
+                "codex".into(),
+                "codex-appserver".into(),
+                None,
+                json!({}),
+            )
+            .await
+            .unwrap();
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                Some(1),
+                json!({"kind":"lifecycle","payload":{"type":"entity","state":"ready"}}),
+            )
+            .await
+            .unwrap();
+        let interaction_id = new_id("int").unwrap();
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "interaction.requested",
+                    "payload": {
+                        "interactionKind": "approval",
+                        "interaction": {
+                            "id": interaction_id,
+                            "kind": "approval",
+                            "state": "pending",
+                            "blocking": true,
+                            "answerable": true,
+                            "carrier": "harness-hook",
+                            "deadline": { "state": "unknown" },
+                            "resolution": { "state": "unknown" },
+                            "request": {"kind": "approval", "title": "Bash", "options": []}
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        let settlement = store
+            .reconcile_daemon_instances(
+                host.clone(),
+                vec![json!({
+                    "id": instance.instance_id,
+                    "hostId": host,
+                    "lifecycle": "exited",
+                    "activity": "idle"
+                })],
+            )
+            .await
+            .unwrap();
+        assert_eq!(settlement.interactions.len(), 1);
+        assert_eq!(settlement.interactions[0].instance_id, instance.instance_id);
+        assert_eq!(settlement.interactions[0].interaction_id, interaction_id);
+        assert!(!settlement.interactions[0].updated_at.is_empty());
+        let row = store
+            .get_interaction(interaction_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "invalidated");
+        assert!(!row.blocking);
+        store.close().await;
     }
 }

@@ -779,17 +779,6 @@ pub struct InstanceRecord {
         rename = "usageRollup"
     )]
     pub usage_rollup: Option<crate::usage_store::InstanceUsageRollup>,
-    /// D-057 OA6 (ma-sdk-state): the most recent settled **root-turn** failure
-    /// (an API error such as 429 on the turn's `result`). Additive display
-    /// state only: a turn error never changes `lifecycle`, and the next turn
-    /// start clears it. Absent after a clean turn end and on rows constructed
-    /// outside [`load_instance`].
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "lastTurnError"
-    )]
-    pub last_turn_error: Option<TurnErrorMarker>,
     /// D-057 §5: lineage this chapter belongs to (its own id for a plain
     /// instance); serialized as `lineageId`.
     #[serde(rename = "lineageId")]
@@ -810,21 +799,6 @@ pub struct InstanceRecord {
     /// C1 restart policy copied to every chapter of a continuity lineage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart: Option<Value>,
-}
-
-/// Additive marker for a root turn that ended in failure while the process
-/// kept running (D-057 OA6).
-///
-/// This is deliberately not a lifecycle: the instance stays `running` and
-/// keeps every grant (e.g. `address-owner`); the composer shows the text and
-/// the owner can retry.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnErrorMarker {
-    /// RFC3339 timestamp of the turn's `result` observation.
-    pub at: String,
-    /// Native error text, truncated to 200 characters.
-    pub text: String,
 }
 
 /// C1 restart policy chosen at create time (D-057 §6.1).
@@ -2082,6 +2056,30 @@ pub struct Settlement {
     pub interactions: Vec<SettledInteraction>,
 }
 
+/// Result of [`Store::reconcile_reported_instances`] (c-cardsettle r10 item
+/// 4(c)).
+#[derive(Debug)]
+pub struct ReconcileOutcome {
+    /// Chapters THIS reconcile ended and which get the full per-row side
+    /// effects (diagnostic, egress revocation, worker failure).
+    pub lost: Vec<String>,
+    /// LEGACY host-lost rows (pre-contact-loss marker) already exited on an
+    /// upgraded database: dated from their own `updated_at`, kept as-is, and
+    /// given NO new diagnostic — only their pending cards are settled.
+    pub legacy_exited: Vec<String>,
+    /// Settlement covering the pending cards of both groups.
+    pub settlement: Settlement,
+}
+
+/// Result of a successful [`Store::delete_instance`] (c-cardsettle r10 item
+/// 4(d)). The settlement covers pending cards invalidated inside the delete
+/// transaction (empty when the stop already settled them).
+#[derive(Debug, Default)]
+pub struct DeletedInstance {
+    /// Cards settled because their chapter was deleted while still pending.
+    pub settlement: Settlement,
+}
+
 /// One interaction a terminal transaction settled. `seq` is the per-Hub
 /// monotonic settlement sequence assigned in the SAME transaction
 /// (c-cardsettle r9 item 3); it is the follower delivery cursor key.
@@ -2095,6 +2093,11 @@ pub struct SettledInteraction {
     pub seq: i64,
     /// Durable `updated_at` of the terminal row.
     pub updated_at: String,
+    /// Settlement reason written to `settlement_events.reason` and carried on
+    /// the live follower frame (r10 item 4(a)): `generation-ended` for a
+    /// process end, the real reason code (e.g. `agent-demoted`) for an
+    /// entity-driven invalidation.
+    pub reason: String,
 }
 
 impl Settlement {
@@ -2879,14 +2882,12 @@ impl Store {
             // — rewriting either to exited/host-lost would destroy the
             // evidence and block the seat and fresh recovery forever.
             //
-            // ma-lineage r5/r6 item 1+3 + c-cardsettle r8 item 2 (OA6): host
-            // loss is CONTACT loss, not process end (D-019) — no ended_at, and
-            // the sweep does NOT settle cards: the child may still be running
-            // and a pending approval must stay answerable when the host
-            // returns (revive_host_lost_instances). r7 item 5(b) writes a NEW
-            // marker (HOST_LOST_MARKER), distinct from the legacy spelling, so
-            // rows written before contact-loss semantics keep their old ended
-            // meaning.
+            // r8 item 2 (OA6): host loss is CONTACT loss, never process end —
+            // no ended_at (COALESCE would stamp the sweep time as process-end
+            // evidence) and the r6 marker is HOST_LOST_MARKER, distinct from
+            // the legacy value so upgraded rows keep their old ended meaning
+            // (the new-epoch reconcile backfills those). The still-live child
+            // is reconciled when the host returns via revive.
             let changed = tx.execute(
                 "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
                     connectivity = 'disconnected', last_error = ?3,
@@ -3128,17 +3129,24 @@ impl Store {
     /// Permanently delete an Instance and everything the Hub keeps for it.
     ///
     /// Only a stopped Instance can be deleted; the caller is responsible for
-    /// stopping it first (`force`). Returns `false` when the row is already
-    /// gone, which is what makes `DELETE` idempotent, and an
-    /// [`StoreError::Id`] naming the lifecycle when it is still live.
+    /// stopping it first (`force`). Returns `None` when the row is already
+    /// gone (idempotent), and an
+    /// [`crate::store::DeletedInstance`] naming the settlement (c-cardsettle
+    /// r10 item 4(d): a host-lost row still carries pending cards when it is
+    /// force-deleted; those cards are invalidated and logged in the SAME
+    /// transaction that tombstones them, and the HTTP handler publishes the
+    /// settlement so open inboxes drop them).
     ///
     /// Journal rows, queued commands, interactions, and fleet membership go
     /// with it: leaving any of them behind would resurrect the session in a
     /// list view or keep a command queued against an id that no longer exists.
-    pub async fn delete_instance(&self, instance_id: String) -> Result<bool, StoreError> {
+    pub async fn delete_instance(
+        &self,
+        instance_id: String,
+    ) -> Result<Option<DeletedInstance>, StoreError> {
         self.run_named("delete_instance", move |conn| {
             let Some(instance) = load_instance(conn, &instance_id)? else {
-                return Ok(false);
+                return Ok(None);
             };
             if !matches!(instance.lifecycle.as_str(), "exited" | "failed" | "closed") {
                 return Err(StoreError::Id(format!(
@@ -3215,6 +3223,23 @@ impl Store {
                 }
             }
             let tx = conn.transaction()?;
+            // c-cardsettle r10 item 4(d): settle every chapter's still-pending
+            // cards BEFORE the rows are tombstoned and deleted. A force-delete
+            // of a host-lost chapter never received a settlement (host loss is
+            // contact loss, not a process end), so without this its cards were
+            // tombstoned pending with no settlement_events row and no notice —
+            // an open inbox kept an actionable card for a deleted instance.
+            // The tombstones written by delete_instance_rows then retain the
+            // invalidated state and reason.
+            let mut settlement = Settlement::default();
+            let now = now_rfc3339();
+            for chapter_id in &chapter_ids {
+                settlement.merge(settle_instance_interactions(
+                    &tx,
+                    std::slice::from_ref(chapter_id),
+                    &now,
+                )?);
+            }
             for chapter_id in &chapter_ids {
                 delete_instance_rows(&tx, chapter_id)?;
             }
@@ -3225,7 +3250,7 @@ impl Store {
                 )?;
             }
             tx.commit()?;
-            Ok(true)
+            Ok(Some(DeletedInstance { settlement }))
         })
         .await
     }
@@ -3800,13 +3825,18 @@ impl Store {
     /// lost — settling it here would kill a create that may yet land. Those
     /// rows have their own, age-bounded reaper:
     /// [`Store::expire_stale_requested`].
+    /// `[`Store::reconcile_reported_instances`]` result: the chapters THIS
+    /// reconcile ended (full per-row side effects: diagnostics, egress
+    /// revocation, worker failure), the LEGACY host-lost rows on upgraded
+    /// databases that were already exited and only had their cards settled
+    /// (r10 item 4(c): no new diagnostic for old news), and the settlement.
     pub async fn reconcile_reported_instances(
         &self,
         host_id: String,
         reported: Vec<String>,
         reason: String,
         epoch_changed: bool,
-    ) -> Result<(Vec<String>, Settlement), StoreError> {
+    ) -> Result<ReconcileOutcome, StoreError> {
         self.run_named("reconcile_reported_instances", move |conn| {
             // The instance settlement and the interaction invalidation
             // (c-cardsettle) commit in ONE transaction: an inbox must never
@@ -3818,12 +3848,6 @@ impl Store {
             // terminal rows the new Node does not report are ALSO reconciled
             // and stamped with process-end evidence. Rows that already carry
             // ended_at (genuine ends) and unacked `requested` rows stay out.
-            // (This supersedes c-cardsettle r9 item 2's unconditional
-            // host-lost-only shape: the epoch-attested settle it needs is
-            // covered by the epoch branch here, while a same-epoch reconcile
-            // still treats every evidence-less terminal as potentially live;
-            // the real exit arriving later settles via the evidence-based
-            // terminal-transition guard.)
             let candidate_sql = if epoch_changed {
                 "SELECT id FROM instances
                  WHERE host_id = ?1
@@ -3836,101 +3860,157 @@ impl Store {
                  WHERE host_id = ?1 AND lifecycle NOT IN ('exited', 'failed', 'requested', 'closed')"
             };
             let mut stmt = tx.prepare(candidate_sql)?;
-            let live: Vec<String> = stmt
+            let candidates: Vec<String> = stmt
                 .query_map(params![&host_id], |row| row.get(0))?
                 .collect::<Result<_, _>>()?;
             drop(stmt);
-            let lost: Vec<String> = live
+            let candidates: Vec<String> = candidates
                 .into_iter()
                 .filter(|id| !reported.iter().any(|seen| seen == id))
                 .collect();
             let now = now_rfc3339();
-            for id in &lost {
-                if epoch_changed {
-                    // The node epoch changed: the old process is provably
-                    // gone — stamp ended_at so the row releases its seat/
-                    // fan-out, preserving the reason as context.
-                    //
-                    // ma-lineage r7 item 4: a chapter that was LIVE when the
-                    // Node restarted gets last_error = `node-epoch-changed`
-                    // UNCONDITIONALLY, even when a stale entity error is still
-                    // on the row (the projection keeps a non-null last_error
-                    // via COALESCE after the chapter returned to ready). The
-                    // web keys its "Node restarted" end reason and Resume
-                    // affordance on that exact spelling, so the old error must
-                    // not leak. Only rows that were ALREADY exited/failed keep
-                    // their existing error (COALESCE) — EXCEPT the
-                    // contact-loss sweep markers (legacy 'host-lost' and
-                    // HOST_LOST_MARKER), which c-cardsettle r9 item 2 requires
-                    // to read `node-epoch-changed`: the new epoch attests the
-                    // process is really gone, so the marker is replaced.
-                    tx.execute(
-                        "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
-                            ended_at = COALESCE(ended_at, ?1),
-                            last_error = CASE
-                                WHEN lifecycle IN ('exited', 'failed')
-                                     AND COALESCE(last_error, '') NOT IN (?4, ?5)
-                                    THEN COALESCE(last_error, ?2)
-                                ELSE ?2
-                            END,
-                            updated_at = ?1
-                         WHERE id = ?3",
-                        params![
-                            &now,
-                            &reason,
-                            id,
-                            HOST_LOST_MARKER,
-                            LEGACY_HOST_LOST_MARKER
-                        ],
+            let mut lost: Vec<String> = Vec::new();
+            let mut legacy_exited: Vec<String> = Vec::new();
+            for id in &candidates {
+                // Read the candidate's own shape so an EVIDENCE-LESS terminal
+                // row (the epoch SQL includes every ended_at-null exited/failed
+                // row) is classified by its marker, not assumed newly lost.
+                let prev: (String, Option<String>, Option<String>, String) = tx
+                    .query_row(
+                        "SELECT lifecycle, last_error, ended_at, updated_at
+                         FROM instances WHERE id = ?1",
+                        [id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )?;
-                } else {
+                let (prev_lifecycle, prev_error, prev_ended, prev_updated) = prev;
+                let already_terminal =
+                    matches!(prev_lifecycle.as_str(), "exited" | "failed" | "closed");
+                // c-cardsettle r11 item 4: the gentle legacy treatment (date
+                // the end from the row's own updated_at, never advance it)
+                // applies ONLY to an already-terminal legacy row. A LIVE
+                // running/ready row whose last_error still carries the
+                // pre-upgrade 'host-lost' marker after a pre-upgrade flap is
+                // a chapter the new epoch omits: it is a fresh loss here, so
+                // it gets node-epoch-changed and a current timestamp, not the
+                // stale legacy treatment.
+                let legacy_end =
+                    already_terminal && prev_error.as_deref() == Some(LEGACY_HOST_LOST_MARKER);
+                if epoch_changed && already_terminal {
+                    if !legacy_end {
+                        // A non-legacy evidence-less terminal row the inventory
+                        // omits: the new epoch attests the end; it is treated
+                        // as lost below (new marker rows included — omission
+                        // proves their process is gone, so rewrite the marker).
+                        lost.push(id.clone());
+                    } else {
+                        // r10 item 4(c): a genuine end recorded by pre-upgrade
+                        // code. Its cards settle below, but the row itself is
+                        // old news and gets no new per-row diagnostic.
+                        legacy_exited.push(id.clone());
+                    }
+                } else if !already_terminal {
+                    lost.push(id.clone());
+                }
+                if !epoch_changed {
                     tx.execute(
                         "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
                             last_error = ?1, updated_at = ?2
                          WHERE id = ?3 AND ended_at IS NULL",
                         params![&reason, &now, id],
                     )?;
+                    continue;
                 }
+                // Epoch changed: the node epoch change is provable loss —
+                // stamp ended_at so the row releases its seat/fan-out,
+                // preserving the reason as context.
+                //
+                // ma-lineage r7 item 4: a chapter that was LIVE when the Node
+                // restarted gets last_error = `node-epoch-changed`
+                // UNCONDITIONALLY, even when a stale entity error is still on
+                // the row (the projection keeps a non-null last_error via
+                // COALESCE after the chapter returned to ready). The web keys
+                // its "Node restarted" end reason and Resume affordance on
+                // that exact spelling, so the old error must not leak.
+                //
+                // c-cardsettle r9 item 2 / r10 item 4(c): the sweep marker
+                // decides which already-exited row is which: a NEW
+                // contact-loss marker (HOST_LOST_MARKER, no ended_at) is
+                // potentially-live and the omission rewrites it like any live
+                // row; a LEGACY marker is a genuine end on upgraded databases
+                // — keep last_error and updated_at, date the end from
+                // updated_at rather than this reconcile clock.
+                let rewrite_error =
+                    !already_terminal || prev_error.as_deref() == Some(HOST_LOST_MARKER);
+                tx.execute(
+                    "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
+                        ended_at = CASE WHEN ?5 THEN COALESCE(ended_at, ?6)
+                                        ELSE COALESCE(ended_at, ?1) END,
+                        last_error = CASE WHEN ?4 THEN ?2
+                                          ELSE COALESCE(last_error, ?2) END,
+                        updated_at = CASE WHEN ?5 THEN updated_at ELSE ?1 END
+                     WHERE id = ?3",
+                    params![
+                        &now,
+                        &reason,
+                        id,
+                        rewrite_error,
+                        legacy_end,
+                        &prev_updated
+                    ],
+                )?;
+                let _ = prev_ended;
             }
-            // A generation that ended owns no still-answerable request.
-            let settlement = settle_instance_interactions(&tx, &lost, &now)?;
+            // A generation that ended owns no still-answerable request. The
+            // legacy already-exited rows settle their cards too (r10 item
+            // 4(c)) but are reported separately so ws skips their diagnostics.
+            let mut settle_ids = lost.clone();
+            settle_ids.extend(legacy_exited.iter().cloned());
+            let settlement = settle_instance_interactions(&tx, &settle_ids, &now)?;
             tx.commit()?;
-            Ok((lost, settlement))
+            Ok(ReconcileOutcome {
+                lost,
+                legacy_exited,
+                settlement,
+            })
         })
         .await
     }
 
-    /// Same-epoch reconnect revival (c-cardsettle r8 item 2, OA6): bring rows
-    /// the contact-loss sweep marked `exited` with HOST_LOST_MARKER back to
-    /// `running` when the SAME Node reports them live in its hello inventory.
+    /// Reconnect revival (c-cardsettle r8 item 2 + r10 item 1, OA6): bring
+    /// rows the contact-loss sweep marked `exited`/[`HOST_LOST_MARKER`] back
+    /// to the lifecycle the live Node reports, when the SAME or a NEW Node
+    /// epoch lists the instance in its hello inventory.
     ///
     /// Host loss is CONTACT loss, never process end: the child kept running
     /// while the Hub could not see the host, the sweep only marked the row
-    /// contact-lost (no `ended_at`, cards untouched), and on reconnect the
-    /// live process's own inventory is the evidence that the chapter never
-    /// ended. Only rows with exactly that shape revive — a real exit
-    /// (`ended_at` set, a legacy/other marker) is never resurrected.
+    /// host-lost (no `ended_at`, cards untouched), and on reconnect the live
+    /// process's own inventory is the evidence that the chapter never ended.
+    /// Only rows with exactly that shape revive — a real exit (`ended_at`
+    /// set, the legacy marker, or any other marker) is never resurrected.
+    ///
+    /// `live_inventory` carries `(id, lifecycle, activity)` with the lifecycle
+    /// already normalised to the Hub vocabulary by the caller.
     ///
     /// Returns the revived instance ids.
     pub async fn revive_host_lost_instances(
         &self,
         host_id: String,
-        live_inventory: &[(String, String)],
+        live_inventory: &[(String, String, String)],
     ) -> Result<Vec<String>, StoreError> {
-        let live: Vec<(String, String)> = live_inventory.to_vec();
+        let live: Vec<(String, String, String)> = live_inventory.to_vec();
         self.run_named("revive_host_lost_instances", move |conn| {
             let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
             let mut revived = Vec::new();
-            for (id, activity) in &live {
+            for (id, lifecycle, activity) in &live {
                 let changed = tx.execute(
-                    "UPDATE instances SET lifecycle = 'running', activity = ?3,
-                        connectivity = 'connected', last_error = NULL, updated_at = ?4
+                    "UPDATE instances SET lifecycle = ?3, activity = ?4,
+                        connectivity = 'connected', last_error = NULL, updated_at = ?5
                      WHERE id = ?1 AND host_id = ?2
                        AND lifecycle = 'exited'
-                       AND last_error = ?5
+                       AND COALESCE(last_error, '') = ?6
                        AND ended_at IS NULL",
-                    params![id, &host_id, activity, &now, HOST_LOST_MARKER],
+                    params![id, &host_id, lifecycle, activity, &now, HOST_LOST_MARKER],
                 )?;
                 if changed > 0 {
                     revived.push(id.clone());
@@ -5452,14 +5532,23 @@ impl Store {
         // replay the newest ones — the rows a page navigation just missed —
         // not the oldest page. Only the windowless lag-drain walk is
         // ascending.
-        self.run_named("recent_invalidated_interactions", |conn| {
+        //
+        // c-cardsettle r10 item 4(e): compare created_at against a
+        // Rust-formatted RFC3339 cutoff rather than julianday(created_at).
+        // Every created_at is a fixed-width now_rfc3339 string, so a
+        // lexicographic `>=` is chronological and the
+        // settlement_events_recent(created_at, seq) index is usable. The old
+        // julianday() wrapping forced a full table scan; this read-only page
+        // also runs on the READER pool, never the writer.
+        let cutoff = crate::config::rfc3339_minutes_ago(5);
+        self.read("recent_invalidated_interactions", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT instance_id, interaction_id, reason FROM settlement_events
-                 WHERE julianday(created_at) >= julianday('now', '-5 minutes')
+                 WHERE created_at >= ?1
                  ORDER BY seq DESC
-                 LIMIT ?1",
+                 LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![SETTLEMENT_LAG_PAGE], |row| {
+            let rows = stmt.query_map(params![cutoff, SETTLEMENT_LAG_PAGE], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -6544,8 +6633,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             last_error TEXT,
-            configure_seq INTEGER NOT NULL DEFAULT 0,
-            turn_error_json TEXT
+            configure_seq INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS commands (
             id TEXT PRIMARY KEY,
@@ -6814,9 +6902,6 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "configure_seq",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    // D-057 OA6 (ma-sdk-state): additive last root-turn-error marker, kept
-    // separate from `last_error` (which belongs to terminal/failed rows).
-    ensure_column(&conn, "instances", "turn_error_json", "TEXT")?;
     // D-057 (ma-lineage): every instance belongs to a lineage (its own id by
     // default); a continuity lineage's chapters carry a generation and cause.
     // `fenced_at` marks a chapter whose authority moved to its successor, and
@@ -6844,27 +6929,26 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     if backfill_version < 2 {
         // r6 item 3(b) ONE-TIME legacy fallback (guarded by PRAGMA
         // user_version): evidence-less historical rows that already reached a
-        // live lifecycle are stamped from updated_at. Rows that never reached
-        // live (requested / attested launch failures) stay NULL.
-        //
-        // c-cardsettle r8 item 2 follow-up: a NULL-ended_at
-        // last_error='host-lost'/'host-contact-lost' row is CONTACT loss (the
-        // sweep stopped stamping ends), so it is NEVER backfilled here —
-        // stamping it would fabricate process-end evidence and block the
-        // same-epoch revive.
+        // live lifecycle, and LEGACY 'host-lost'-marked rows (the pre-r7
+        // marker — genuine ends), are stamped from updated_at. Rows that
+        // never reached live (requested / attested launch failures) stay
+        // NULL.
         conn.execute(
             "UPDATE instances SET ended_at = updated_at
              WHERE ended_at IS NULL
                AND lifecycle IN ('exited', 'failed')
-               AND last_error IS NULL
-               AND lifecycle = 'exited'
-               AND EXISTS (
-                    SELECT 1 FROM journal
-                     WHERE journal.instance_id = instances.id
-                       AND json_extract(journal.payload_json,
-                           '$.payload.state') IN ('ready','running')
+               AND (
+                    last_error = ?1
+                    OR (last_error IS NULL
+                        AND lifecycle = 'exited'
+                        AND EXISTS (
+                            SELECT 1 FROM journal
+                             WHERE journal.instance_id = instances.id
+                               AND json_extract(journal.payload_json,
+                                   '$.payload.state') IN ('ready','running')
+                        ))
                )",
-            [],
+            params![LEGACY_HOST_LOST_MARKER],
         )?;
         conn.execute_batch("PRAGMA user_version = 2;")?;
     }
@@ -7302,21 +7386,35 @@ fn apply_instance_projection(
             }
         }
         let native_name = name.to_ascii_lowercase();
-        // ma-lineage / ma-sdk-state (OA6): terminal ONLY from the SHARED
-        // remuda_protocol::process_end classifier, driven by the REAL driver
-        // event shapes (exact name/status). No name-substring or bare-severity
-        // rule: a turn/configure/hook/diagnostic error on a live process
-        // returns None and never marks the row (or ended_at) terminal. A
-        // clean SDK/print exit (topic=session, nativeName=session, status
-        // exited) and a clean PTY exit (native_exit, status exited, info)
-        // classify as `exited`, NOT failed. Subagent-scoped native events
-        // never end the root.
+        // ma-lineage r4 item 1+2 / c-cardsettle r5 addendum (OA6): terminal
+        // ONLY from the SHARED remuda_protocol::process_end classifier, driven
+        // by the REAL driver event shapes (exact name/status). There is no
+        // name-substring or bare-severity rule: a turn/configure/hook/diagnostic
+        // error on a live process returns None and can never mark the row (or
+        // ended_at) terminal. A clean SDK/print exit (topic=session,
+        // nativeName=session, status=exited) and a clean PTY exit (native_exit,
+        // status=exited, severity info) classify as `exited`, NOT failed.
+        // Subagent-scoped native events never end the root. The ended_at
+        // discipline (stamp only on process-end evidence, clear on
+        // ready/running) lives in apply_ended_at below.
         let subagent_scoped = native_payload_is_subagent(&payload);
         if !subagent_scoped
             && let Some(end) = remuda_protocol::process_end::process_end_event(event)
         {
             lifecycle = Some(end.lifecycle());
             end_evidence = Some(end);
+            if last_error.is_none() {
+                last_error = payload
+                    .pointer("/relatedIds/lastError")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        payload
+                            .pointer("/status/value")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+            }
         }
         let _ = native_name;
     }
@@ -9153,6 +9251,61 @@ mod tests {
         (row.state, reason)
     }
 
+    /// c-cardsettle r10 item 4(e): the replay window compares created_at
+    /// against a Rust-formatted RFC3339 cutoff on the READER pool. Lock the
+    /// boundary semantics of that cutoff (the old predicate used SQLite's own
+    /// julianday clock): just inside the window is replayed, just outside is
+    /// not.
+    #[tokio::test]
+    async fn recent_invalidated_replay_cutoff_is_a_rfc3339_window_boundary() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r10-replay-cutoff").await;
+
+        async fn settle_and_stamp(store: &Store, host: &str, minutes_ago: i64) -> String {
+            let instance = seed_acknowledged_instance(store, host).await;
+            let int_id = seed_pending_interaction(store, host, &instance.instance_id).await;
+            store
+                .settle_instance_exited(instance.instance_id.clone(), "x".into())
+                .await
+                .expect("settle");
+            let stamped = crate::config::rfc3339_minutes_ago(minutes_ago);
+            let int_for_update = int_id.clone();
+            store
+                .run_named("r10_stamp_cutoff_row", move |conn| {
+                    conn.execute(
+                        "UPDATE settlement_events SET created_at = ?1 WHERE interaction_id = ?2",
+                        params![stamped, int_for_update],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .expect("stamp");
+            int_id
+        }
+
+        // 4 minutes ago: inside; 6 minutes ago: outside.
+        let inside = settle_and_stamp(&store, &host, 4).await;
+        let outside = settle_and_stamp(&store, &host, 6).await;
+
+        let recent = store
+            .recent_invalidated_interactions()
+            .await
+            .expect("recent");
+        let ids: std::collections::HashSet<String> =
+            recent.into_iter().map(|(_, id, _)| id).collect();
+        assert!(
+            ids.contains(&inside),
+            "a 4-minute-old settlement is inside the window"
+        );
+        assert!(
+            !ids.contains(&outside),
+            "a 6-minute-old settlement is outside the window"
+        );
+        store.close().await;
+    }
+
     /// c-cardsettle r3 item 4: the replay-on-connect window returns recent
     /// settlements from the monotonic settlement log but not aged ones, and
     /// never a still-pending interaction. r9 item 3: the log entry survives
@@ -9194,6 +9347,7 @@ mod tests {
                 .delete_instance(deleted.instance_id)
                 .await
                 .expect("delete")
+                .is_some()
         );
 
         // Still-pending: never replayed as a settlement.
@@ -9533,6 +9687,7 @@ mod tests {
                 .delete_instance(deleted_instance.instance_id)
                 .await
                 .expect("delete")
+                .is_some()
         );
 
         // A still-pending interaction raises no settlement event.
@@ -10077,7 +10232,7 @@ mod tests {
         // in that window says nothing about whether it was lost. Its own
         // age-bounded reaper is what eventually settles it.
         let in_flight = seed_instance(&store, &host).await;
-        let (reconciled, _settlement) = store
+        let reconciled = store
             .reconcile_reported_instances(
                 host.clone(),
                 vec![kept.instance_id.clone()],
@@ -10085,7 +10240,8 @@ mod tests {
                 true,
             )
             .await
-            .expect("reconcile");
+            .expect("reconcile")
+            .lost;
         assert_eq!(
             reconciled,
             vec![lost.instance_id.clone()],
@@ -10151,7 +10307,7 @@ mod tests {
         drop(db);
 
         // Same-epoch (non-epoch) reconcile must NOT stamp end evidence.
-        let (_, _) = store
+        let _ = store
             .reconcile_reported_instances(host.clone(), vec![], "reconnect".into(), false)
             .await
             .unwrap();
@@ -10179,10 +10335,11 @@ mod tests {
             .record_node_epoch(host.clone(), Some("b".into()))
             .await
             .unwrap();
-        let (lost, _) = store
+        let lost = store
             .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into(), true)
             .await
-            .unwrap();
+            .unwrap()
+            .lost;
         assert_eq!(lost.len(), 2, "both evidence-less terminal rows reconciled");
         for id in [&host_lost.instance_id, &ambiguous.instance_id] {
             assert!(
@@ -10233,10 +10390,11 @@ mod tests {
             .record_node_epoch(host.clone(), Some("b".into()))
             .await
             .unwrap();
-        let (lost, _) = store
+        let lost = store
             .reconcile_reported_instances(host, vec![], "node-epoch-changed".into(), true)
             .await
-            .unwrap();
+            .unwrap()
+            .lost;
         assert_eq!(lost.len(), 2);
 
         let recovered = store
@@ -10439,13 +10597,12 @@ mod tests {
         store.close().await;
     }
 
-    /// ma-lineage r7 item 5(b) + c-cardsettle r8 item 2 follow-up: a
-    /// NULL-ended_at host-lost row is CONTACT loss under BOTH the legacy
-    /// `"host-lost"` spelling (rows swept while the no-ended_at sweep was
-    /// deployed) and the NEW `"host-contact-lost"` marker — the one-time
-    /// user_version migration fabricates no process-end evidence for either.
+    /// ma-lineage r7 item 5(b)/(c): the legacy `"host-lost"` marker is an
+    /// ENDED row and gets its ended_at from the one-time user_version
+    /// migration; the NEW `"host-contact-lost"` marker stays potentially live
+    /// (no ended_at) across reopens.
     #[tokio::test]
-    async fn host_lost_markers_stay_evidence_less_across_migration() {
+    async fn legacy_host_lost_marker_migrates_but_new_marker_stays_live() {
         let dir = tempfile::tempdir().expect("dir");
         let store = Store::open(dir.path()).expect("store");
         let host = new_id("hst").expect("host");
@@ -10496,10 +10653,10 @@ mod tests {
                 .unwrap()
             }
         };
-        assert!(
-            ended_at(&legacy.instance_id).await.is_none(),
-            "c-cardsettle r8: a NULL-ended_at legacy host-lost row is contact \
-             loss and is never backfilled"
+        assert_eq!(
+            ended_at(&legacy.instance_id).await.as_deref(),
+            Some("2026-09-01T08:00:00.000Z"),
+            "the legacy marker takes its old ended meaning from updated_at"
         );
         assert!(
             ended_at(&new.instance_id).await.is_none(),
@@ -10673,7 +10830,7 @@ mod tests {
         let kept_int = seed_pending_interaction(&store, &host, &kept.instance_id).await;
         let lost_int = seed_pending_interaction(&store, &host, &lost.instance_id).await;
 
-        let (reconciled, settlement) = store
+        let outcome = store
             .reconcile_reported_instances(
                 host.clone(),
                 vec![kept.instance_id.clone()],
@@ -10682,6 +10839,8 @@ mod tests {
             )
             .await
             .expect("reconcile");
+        let reconciled = outcome.lost;
+        let settlement = outcome.settlement;
         assert_eq!(reconciled, vec![lost.instance_id.clone()]);
         // The settlement returned to callers names exactly the lost card.
         let lost_settled: Vec<(String, String)> = settlement
@@ -10774,10 +10933,12 @@ mod tests {
             .await
             .expect("set known future deadline");
 
-        let (reconciled, settlement) = store
+        let outcome = store
             .reconcile_reported_instances(host, vec![], "node-epoch-changed".to_string(), true)
             .await
             .expect("reconcile");
+        let reconciled = outcome.lost;
+        let settlement = outcome.settlement;
         assert_eq!(reconciled, vec![lost.instance_id.clone()]);
         let settled: Vec<String> = settlement
             .interactions
@@ -10816,20 +10977,20 @@ mod tests {
         let lost = seed_acknowledged_instance(&store, &host).await;
         let int_id = seed_pending_interaction(&store, &host, &lost.instance_id).await;
 
-        let (lost_first, first) = store
+        let first = store
             .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into(), true)
             .await
             .expect("first reconcile");
-        assert_eq!(lost_first, vec![lost.instance_id.clone()]);
-        assert_eq!(first.interactions.len(), 1);
+        assert_eq!(first.lost, vec![lost.instance_id.clone()]);
+        assert_eq!(first.settlement.interactions.len(), 1);
         // Second reconcile: the instance is already exited, returns no new lost
         // rows, no settlement, and does not error on the terminal interaction.
-        let (again, second) = store
+        let second = store
             .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into(), true)
             .await
             .expect("second reconcile");
-        assert!(again.is_empty());
-        assert!(second.is_empty(), "no card is settled twice");
+        assert!(second.lost.is_empty());
+        assert!(second.settlement.is_empty(), "no card is settled twice");
         let (state, _) = interaction_state_and_reason(&store, &int_id).await;
         assert_eq!(state, "invalidated");
         store.close().await;
@@ -11076,10 +11237,11 @@ mod tests {
 
         // A new Node epoch omits the instance: the reconcile ends it first,
         // exactly like the real reconnect ordering.
-        let (_, reconcile_settlement) = store
+        let reconcile_settlement = store
             .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into(), true)
             .await
-            .expect("reconcile");
+            .expect("reconcile")
+            .settlement;
         assert!(reconcile_settlement.is_empty(), "no card existed yet");
         let owner = store
             .get_instance(instance.instance_id.clone())
@@ -11580,7 +11742,7 @@ mod tests {
         // The exact shell_pty retire_payload("invalidated", "agent-demoted")
         // entity lifecycle: the producer supplies reasonCode but the
         // Interaction entity's resolution is still UNKNOWN (r6 item 4).
-        store
+        let appended = store
             .append_journal(
                 host.clone(),
                 instance.instance_id.clone(),
@@ -11608,6 +11770,15 @@ mod tests {
             )
             .await
             .expect("demotion replay");
+
+        // r10 item 4(a): the LIVE settlement the ws broadcasts carries the
+        // real demotion reason, never the hard-coded generation-ended frame.
+        assert_eq!(appended.settlement.interactions.len(), 1);
+        assert_eq!(
+            appended.settlement.interactions[0].reason, "agent-demoted",
+            "the live settlement frame carries the demotion reason"
+        );
+        assert_eq!(appended.settlement.interactions[0].interaction_id, int_id);
 
         let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
         assert_eq!(state, "invalidated");
@@ -11639,6 +11810,7 @@ mod tests {
                 .delete_instance(instance.instance_id.clone())
                 .await
                 .expect("delete")
+                .is_some()
         );
         let page = store
             .invalidated_interactions_after(None)
@@ -11651,6 +11823,94 @@ mod tests {
         assert_eq!(
             tomb.2, "agent-demoted",
             "the tombstone labels a demotion as agent-demoted, not generation-ended"
+        );
+        store.close().await;
+    }
+
+    /// c-cardsettle r10 item 4(b): replaying the entity-driven invalidation
+    /// (a demotion replayed across reconnects) must not append a second
+    /// `settlement_events` row. SQLite counts a WHERE match as changed even
+    /// with identical values, so without the `state <> 'invalidated'` guard
+    /// each replay logged a duplicate notice and stepped the delivery cursor.
+    #[tokio::test]
+    async fn a_replayed_entity_invalidation_logs_one_settlement_event() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r10-demotion-replay").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        let demotion = json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "entity",
+                "entityType": "interaction",
+                "entityId": int_id,
+                "revision": "3",
+                "previousState": "pending",
+                "state": "invalidated",
+                "reasonCode": "agent-demoted",
+                "evidenceEventIds": [],
+                "entity": {
+                    "id": int_id,
+                    "state": "invalidated",
+                    "blocking": false,
+                    "answerable": false,
+                    "resolution": { "state": "unknown" }
+                }
+            }
+        });
+        let first = store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                demotion.clone(),
+            )
+            .await
+            .expect("first demotion");
+        assert_eq!(
+            first.settlement.interactions.len(),
+            1,
+            "the first invalidation logs one"
+        );
+
+        // Two replays of the SAME terminal entity (reconnect journal catch-up
+        // can deliver it repeatedly): neither moves the row nor logs an event.
+        for seq in [Some(2_i64), Some(3_i64)] {
+            let replay = store
+                .append_journal(
+                    host.clone(),
+                    instance.instance_id.clone(),
+                    seq,
+                    demotion.clone(),
+                )
+                .await
+                .expect("replay");
+            assert!(
+                replay.settlement.is_empty(),
+                "a replay of an invalidation entity produces no live settlement"
+            );
+        }
+
+        let count: i64 = {
+            let interaction = int_id.clone();
+            store
+                .run_named("r10_count_settlement_events", move |conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM settlement_events WHERE interaction_id = ?1",
+                        params![&interaction],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+                })
+                .await
+                .expect("count")
+        };
+        assert_eq!(
+            count, 1,
+            "exactly one settlement_events row survives the replays"
         );
         store.close().await;
     }
@@ -11867,29 +12127,46 @@ mod tests {
         store.close().await;
     }
 
-    /// ma-sdk-state r5 item 2: on the long-lived claude-sdk child a turn result
-    /// can be an is_error with the process-global resultIndex 1 and the
-    /// print-derived affectsCompletion=true WHILE A WORKFLOW IS STILL OPEN. The
-    /// mapper then omits settledRootTurn. The Hub projection must NOT idle the
-    /// row on the index heuristic for a claude-sdk/claude-print source; the same
-    /// observation from a legacy/other source still idles (older journals).
+    /// ma-sdk-state r5 item 2: a root `result` error arriving from the
+    /// long-lived claude-sdk child WITHOUT settledRootTurn (an is_error result
+    /// while a workflow is still open — the index is process-global) must NOT
+    /// idle the row. The structured carriers settle a turn error only via the
+    /// explicit settledRootTurn decision; a legacy/sourceless event keeps the
+    /// generic root-turn-failure idle.
     #[tokio::test]
-    async fn an_sdk_open_workflow_result_error_never_idles_unlike_a_legacy_source() {
-        let open_workflow_result = json!({
-            "type":"native","topic":"turn","nativeName":"result",
-            "severity":"info",
-            "nativeId":{"state":"known","value":"sess-1"},
-            "status":{"state":"known","value":"error"},
-            "affectsCompletion":true,
-            // No settledRootTurn: the owning turn still has an open workflow;
-            // result_index is process-global (1 = second result of the child).
-            "relatedIds":{"resultIndex":"1","numTurns":"1"}});
+    async fn an_sdk_open_workflow_result_error_does_not_idle_unlike_a_legacy_source() {
+        // Unit projection: sdk open-workflow error keeps working.
+        let sdk = derive_instance_state(&json!({
+            "source":{"driverKind":"claude-sdk","channel":"stdout"},
+            "payload":{"type":"native","topic":"turn","nativeName":"result",
+                "status":{"state":"known","value":"error"},
+                "affectsCompletion":true,
+                "relatedIds":{"resultIndex":"1","numTurns":"1"}}}));
+        assert_ne!(
+            sdk.1,
+            Some("idle"),
+            "an unsettled claude-sdk result error must not idle mid-workflow"
+        );
+        // Same payload, legacy/sourceless: the generic fallback still idles.
+        let legacy = derive_instance_state(&json!({
+            "payload":{"type":"native","topic":"turn","nativeName":"result",
+                "status":{"state":"known","value":"error"},
+                "affectsCompletion":true,
+                "relatedIds":{"resultIndex":"1","numTurns":"1"}}}));
+        assert_eq!(legacy, (Some("running"), Some("idle")));
+        // Once the driver settles the sdk turn, it idles through the flag.
+        let settled = derive_instance_state(&json!({
+            "source":{"driverKind":"claude-sdk","channel":"stdout"},
+            "payload":{"type":"native","topic":"turn","nativeName":"result",
+                "status":{"state":"known","value":"error"},
+                "relatedIds":{"resultIndex":"1","settledRootTurn":"true"}}}));
+        assert_eq!(settled, (Some("running"), Some("idle")));
 
-        // claude-sdk: stays working.
+        // Through the real append/fold as well.
         let dir = tempfile::tempdir().expect("dir");
         let store = Store::open(dir.path()).expect("store");
         let host = new_id("hst").expect("host");
-        enroll_labeled(&store, host.clone(), "r5-sdk-open-workflow").await;
+        enroll_labeled(&store, host.clone(), "r6-item0-sdk-open-workflow").await;
         let instance = seed_acknowledged_instance(&store, &host).await;
         store
             .append_journal(
@@ -11910,7 +12187,11 @@ mod tests {
                 None,
                 json!({"kind":"lifecycle",
                     "source":{"driverKind":"claude-sdk","channel":"stdout"},
-                    "payload": open_workflow_result}),
+                    "payload":{"type":"native","topic":"turn","nativeName":"result",
+                        "severity":"info",
+                        "status":{"state":"known","value":"error"},
+                        "affectsCompletion":true,
+                        "relatedIds":{"resultIndex":"1","numTurns":"1"}}}),
             )
             .await
             .expect("append open-workflow sdk result error");
@@ -11919,43 +12200,15 @@ mod tests {
             .await
             .expect("get")
             .expect("row");
-        assert_eq!(
-            row.lifecycle, "running",
-            "an open-workflow sdk result is not terminal"
-        );
+        assert_eq!(row.lifecycle, "running");
         assert_eq!(
             row.activity, "working",
-            "the index heuristic must not idle an open-workflow claude-sdk turn"
-        );
-
-        // Same payload, legacy/other source: the index heuristic still idles.
-        let (lifecycle, activity) = crate::store::derive_instance_state(&json!({
-            "source":{"driverKind":"claude-pty","channel":"stdout"},
-            "payload":{"type":"native","topic":"turn","nativeName":"result",
-                "status":{"state":"known","value":"error"},
-                "affectsCompletion":true,
-                "relatedIds":{"resultIndex":"1","numTurns":"1"}}}));
-        assert_eq!(
-            (lifecycle, activity),
-            (Some("running"), Some("idle")),
-            "a legacy source keeps the affectsCompletion fallback"
-        );
-
-        // And once the workflow closes the real mapper settles the sdk turn:
-        // the same result carrying settledRootTurn idles.
-        let (lifecycle, activity) = crate::store::derive_instance_state(&json!({
-            "source":{"driverKind":"claude-sdk","channel":"stdout"},
-            "payload":{"type":"native","topic":"turn","nativeName":"result",
-                "status":{"state":"known","value":"error"},
-                "affectsCompletion":true,
-                "relatedIds":{"resultIndex":"1","numTurns":"1","settledRootTurn":"true"}}}));
-        assert_eq!(
-            (lifecycle, activity),
-            (Some("running"), Some("idle")),
-            "a settled sdk result idles through settledRootTurn"
+            "the Hub fold must not idle an unsettled claude-sdk turn error"
         );
         store.close().await;
     }
+
+    /// c-cardsettle r5 item 1 (the owner's bug): feed the REAL
     /// WorkflowJournalTailer agent_failed output through the Hub — both the
     /// synthesized `workflow.member` observation (kind=workflow.member,
     /// payload.state=failed) and, defensively, the same fact carried as a
@@ -12265,8 +12518,9 @@ mod tests {
         assert_eq!(row.lifecycle, "requested");
         store.close().await;
     }
+
     /// c-cardsettle r8 item 2 (OA6): the host-lost sweep marks the ROW
-    /// exited/contact-lost but host loss is CONTACT loss, not process end — it
+    /// exited/host-lost but host loss is CONTACT loss, not process end — it
     /// does NOT invalidate pending cards and does NOT stamp `ended_at`. The
     /// row is the potentially-live shape the same-epoch revive clears.
     #[tokio::test]
@@ -12326,7 +12580,11 @@ mod tests {
         let revived = store
             .revive_host_lost_instances(
                 host.clone(),
-                &[(instance.instance_id.clone(), "idle".to_string())],
+                &[(
+                    instance.instance_id.clone(),
+                    "running".to_string(),
+                    "idle".to_string(),
+                )],
             )
             .await
             .expect("revive");
@@ -12344,6 +12602,143 @@ mod tests {
         let (state, _reason) = interaction_state_and_reason(&store, &int_id).await;
         assert_eq!(state, "pending", "the card stays pending through revival");
         store.close().await;
+    }
+
+    /// c-cardsettle r10 item 1 (OA6 regression): the contact-loss sweep leaves
+    /// a row `exited`/host-contact-lost with NO `ended_at` while its process
+    /// still lives. A state-bearing event the live agent journals WITHOUT a
+    /// reviving hello — an `interaction.requested` deriving (running, blocked)
+    /// — keeps the stored RANK at `exited`, but the settlement guard must key
+    /// on the EVENT'S OWN verdict. The old code passed the rank-held lifecycle
+    /// and invalidated every pending card of a live process (the answer then
+    /// 404'd before the RPC). Both the old card and the new one stay pending.
+    #[tokio::test]
+    async fn state_event_on_a_host_lost_rank_keeps_the_live_processs_cards_pending() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("dir store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r10-rank-event").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let first_card = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        store
+            .mark_host_offline(host.clone())
+            .await
+            .expect("offline");
+        let (swept, sweep_settlement) = store.expire_lost_hosts(0).await.expect("sweep");
+        assert_eq!(swept, 1);
+        assert!(sweep_settlement.interactions.is_empty());
+
+        // The live process raises a NEW approval; no hello inventory has
+        // revived the row in between.
+        let second_card = format!("int_{}", uuid::Uuid::now_v7());
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "interaction.requested",
+                    "payload": {
+                        "interactionKind": "approval",
+                        "interaction": {
+                            "id": second_card,
+                            "kind": "approval",
+                            "state": "pending",
+                            "blocking": true,
+                            "answerable": true,
+                            "carrier": "harness-hook",
+                            "deadline": { "state": "unknown" },
+                            "resolution": { "state": "unknown" },
+                            "request": {
+                                "kind": "approval",
+                                "title": "Bash",
+                                "description": "echo live",
+                                "options": [],
+                            }
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("a host-lost row without end evidence is not an ended owner");
+
+        // The rank stays at the sweep's shape (a non-terminal event never
+        // downgrades the stored lifecycle) …
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.lifecycle, "exited");
+        assert_eq!(row.last_error.as_deref(), Some(HOST_LOST_MARKER));
+        // … but BOTH cards are still live and answerable.
+        for card in [&first_card, &second_card] {
+            let (state, reason) = interaction_state_and_reason(&store, card).await;
+            assert_eq!(state, "pending", "{card} must not be born dead");
+            assert!(reason.is_none(), "{card} carries no end reason");
+        }
+        let rows = store
+            .list_interactions(None, Some(instance.instance_id.clone()), None, false)
+            .await
+            .expect("list");
+        for record in &rows {
+            assert!(record.blocking, "{} stays blocking", record.interaction_id);
+        }
+        store.close().await;
+    }
+
+    /// c-cardsettle r10 item 1 (revive widening): a reconnect inventory that
+    /// holds a swept instance reports it with lifecycles OTHER than
+    /// ready/running — a herdr-adopted chapter is listed `starting`, a draining
+    /// one `closing`, and an older Node omits the lifecycle (`unknown`). Each
+    /// revives the host-lost row to the closest LIVE Hub lifecycle; the
+    /// pending card is untouched and a closed/requested entry never revives.
+    #[tokio::test]
+    async fn host_lost_row_revives_from_starting_closing_unknown_inventory() {
+        for (reported, expected_life) in [
+            ("starting", "starting"),
+            ("closing", "closing"),
+            ("reconciling", "running"),
+            ("", "running"),
+            ("unknown", "running"),
+        ] {
+            let dir = tempfile::tempdir().expect("dir");
+            let store = Store::open(dir.path()).expect("dir store");
+            let host = new_id("hst").expect("host");
+            enroll_labeled(&store, host.clone(), "r10-revive-lifecycles").await;
+            let instance = seed_acknowledged_instance(&store, &host).await;
+            let card = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+            store
+                .mark_host_offline(host.clone())
+                .await
+                .expect("offline");
+            let (swept, _) = store.expire_lost_hosts(0).await.expect("sweep");
+            assert_eq!(swept, 1);
+
+            let revived = store
+                .revive_host_lost_instances(
+                    host.clone(),
+                    &[(
+                        instance.instance_id.clone(),
+                        expected_life.to_string(),
+                        "idle".to_string(),
+                    )],
+                )
+                .await
+                .expect("revive");
+            assert_eq!(revived, vec![instance.instance_id.clone()], "{reported}");
+            let row = store
+                .get_instance(instance.instance_id.clone())
+                .await
+                .expect("get")
+                .expect("row");
+            assert_eq!(row.lifecycle, expected_life, "reported {reported:?}");
+            assert!(row.last_error.is_none(), "revival clears the marker");
+            let (state, _) = interaction_state_and_reason(&store, &card).await;
+            assert_eq!(state, "pending", "the card survives the {reported} revival");
+            store.close().await;
+        }
     }
 
     /// Read an instance row's `ended_at` directly (InstanceRecord does not
@@ -12393,7 +12788,7 @@ mod tests {
 
         // The Node comes back under a NEW epoch and holds nothing for this
         // instance (empty attested inventory).
-        let (lost, settlement) = store
+        let outcome = store
             .reconcile_reported_instances(
                 host.clone(),
                 vec![],
@@ -12402,6 +12797,8 @@ mod tests {
             )
             .await
             .expect("new-epoch reconcile");
+        let lost = outcome.lost;
+        let settlement = outcome.settlement;
         assert_eq!(lost, vec![instance.instance_id.clone()]);
         assert_eq!(
             settlement
@@ -12430,8 +12827,176 @@ mod tests {
         store.close().await;
     }
 
-    /// c-cardsettle r9 item 2 (b): after the contact-loss sweep, a SAME-epoch
-    /// reconnect whose journal catch-up carries the REAL exit (an entity
+    /// c-cardsettle r10 item 4(c): on an upgraded database a LEGACY
+    /// host-lost row (the pre-contact-loss `host-lost` marker, genuine end
+    /// semantics) the new epoch omits is re-swept GENTLY: ended_at is dated
+    /// from its own `updated_at`, last_error/updated_at are preserved, only
+    /// its cards settle, and it is NOT reported as newly lost (so ws emits no
+    /// second node_epoch_changed diagnostic for old news).
+    #[tokio::test]
+    async fn new_epoch_reconcile_resweeps_a_legacy_host_lost_row_without_touching_its_evidence() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r10-legacy-hostlost").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        // Simulate a row an older binary swept: legacy marker, no ended_at,
+        // and a fixed past updated_at the end must be dated from.
+        let past = "2026-08-01T00:00:00.000Z";
+        {
+            let id = instance.instance_id.clone();
+            store
+                .run_named("r10_seed_legacy_row", move |conn| {
+                    conn.execute(
+                        "UPDATE instances
+                            SET lifecycle = 'exited', activity = 'idle',
+                                last_error = 'host-lost', ended_at = NULL,
+                                updated_at = ?2
+                          WHERE id = ?1",
+                        params![&id, past],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .expect("seed legacy row");
+        }
+
+        let outcome = store
+            .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into(), true)
+            .await
+            .expect("legacy reconcile");
+        assert!(
+            !outcome.lost.iter().any(|id| id == &instance.instance_id),
+            "a legacy row is not reported as newly lost: {:?}",
+            outcome.lost
+        );
+        assert_eq!(
+            outcome.legacy_exited,
+            vec![instance.instance_id.clone()],
+            "the legacy row is reported in legacy_exited"
+        );
+        // Its pending card DID settle, with a notice.
+        assert_eq!(
+            outcome
+                .settlement
+                .interactions
+                .iter()
+                .map(|s| s.interaction_id.clone())
+                .collect::<Vec<_>>(),
+            vec![int_id.clone()]
+        );
+
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.lifecycle, "exited");
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("host-lost"),
+            "the legacy marker is preserved"
+        );
+        assert_eq!(
+            ended_at_of(&store, &instance.instance_id).await.as_deref(),
+            Some(past),
+            "ended_at comes from the row's own updated_at, not the reconcile clock"
+        );
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "invalidated");
+        assert_eq!(reason.as_deref(), Some("generation-ended"));
+        store.close().await;
+    }
+
+    /// c-cardsettle r11 item 4: a LIVE row whose last_error still carries the
+    /// legacy 'host-lost' marker after a pre-upgrade flap is a fresh loss when
+    /// a new epoch omits it — it must NOT get the gentle legacy treatment
+    /// (which would date ended_at from a stale updated_at and freeze
+    /// updated_at); it is reported as lost and stamped like any other new
+    /// epoch loss.
+    #[tokio::test]
+    async fn new_epoch_loss_on_a_live_row_carrying_the_legacy_marker_is_not_legacy_treated() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r11-live-legacy-marker").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        // A LIVE running row (a pre-upgrade flap left the stale legacy marker
+        // and an old updated_at).
+        let past = "2026-08-01T00:00:00.000Z";
+        {
+            let id = instance.instance_id.clone();
+            store
+                .run_named("r11_seed_live_legacy_marker", move |conn| {
+                    conn.execute(
+                        "UPDATE instances
+                            SET lifecycle = 'running', activity = 'idle',
+                                last_error = 'host-lost', ended_at = NULL,
+                                updated_at = ?2
+                          WHERE id = ?1",
+                        params![&id, past],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .expect("seed live legacy-marker row");
+        }
+
+        let outcome = store
+            .reconcile_reported_instances(host.clone(), vec![], "node-epoch-changed".into(), true)
+            .await
+            .expect("reconcile");
+        assert_eq!(
+            outcome.lost,
+            vec![instance.instance_id.clone()],
+            "a live row omitted by the new epoch is a fresh loss"
+        );
+        assert!(
+            !outcome
+                .legacy_exited
+                .iter()
+                .any(|id| id == &instance.instance_id),
+            "a live row is never in legacy_exited"
+        );
+        assert_eq!(
+            outcome
+                .settlement
+                .interactions
+                .iter()
+                .map(|s| s.interaction_id.clone())
+                .collect::<Vec<_>>(),
+            vec![int_id.clone()],
+            "its card still settles"
+        );
+
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.lifecycle, "exited");
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("node-epoch-changed"),
+            "a fresh loss rewrites the stale legacy marker"
+        );
+        assert_ne!(
+            row.updated_at, past,
+            "a fresh loss advances updated_at (legacy rows alone keep it)"
+        );
+        let ended = ended_at_of(&store, &instance.instance_id).await;
+        let ended = ended.as_deref().expect("a fresh loss stamps ended_at");
+        assert_ne!(
+            ended, past,
+            "ended_at is the reconcile clock, not the stale updated_at"
+        );
+        store.close().await;
+    }
+
     /// exited event) settles the card. The row already reads `exited`, so a
     /// lifecycle-only "previous terminal" guard made this a no-op forever.
     #[tokio::test]
@@ -12576,6 +13141,81 @@ mod tests {
         store.close().await;
     }
 
+    /// c-cardsettle r10 item 4(d): force-deleting a HOST-LOST chapter whose
+    /// cards the sweep deliberately left pending must invalidate them INSIDE
+    /// the delete transaction (not tombstone them pending with no notice) and
+    /// return the settlement so the HTTP handler publishes it.
+    #[tokio::test]
+    async fn deleting_a_host_lost_instance_settles_its_pending_cards_first() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "r10-delete-hostlost").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        // Contact loss past grace: the sweep marks the row host-lost WITHOUT
+        // settling the card.
+        store
+            .mark_host_offline(host.clone())
+            .await
+            .expect("offline");
+        let (_, sweep_settlement) = store.expire_lost_hosts(0).await.expect("sweep");
+        assert!(sweep_settlement.is_empty());
+
+        // Delete (the row is already exited, so no stop is needed).
+        let deleted = store
+            .delete_instance(instance.instance_id.clone())
+            .await
+            .expect("delete")
+            .expect("the row existed");
+        assert_eq!(
+            deleted
+                .settlement
+                .interactions
+                .iter()
+                .map(|s| s.interaction_id.clone())
+                .collect::<Vec<_>>(),
+            vec![int_id.clone()],
+            "the delete returns the pending card it invalidated"
+        );
+
+        // The settlement log carries the event, so a follower drains it.
+        let page = store
+            .invalidated_interactions_after(None)
+            .await
+            .expect("page");
+        assert!(
+            page.iter().any(|(_, id, _, _)| id == &int_id),
+            "the delete logged a settlement_events row for the card"
+        );
+
+        // The tombstone retains the invalidated state and the end reason, so
+        // a late answer is rejected without fanning out.
+        let tomb: (String, Option<String>) = store
+            .run_named("r10_read_tombstone", move |conn| {
+                conn.query_row(
+                    "SELECT state, reason FROM interaction_tombstones WHERE id = ?1",
+                    params![&int_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .expect("tombstone");
+        assert_eq!(tomb.0, "invalidated", "the card is not tombstoned pending");
+        assert_eq!(tomb.1.as_deref(), Some("generation-ended"));
+        assert!(
+            store
+                .get_instance(instance.instance_id)
+                .await
+                .expect("get")
+                .is_none(),
+            "the instance row is gone"
+        );
+        store.close().await;
+    }
+
     /// c-cardsettle r2 item 2: deleting a terminal instance removes the live
     /// interaction rows but retains their terminal state as tombstones, so a
     /// late answer can be rejected without fanning out to Nodes.
@@ -12598,6 +13238,7 @@ mod tests {
                 .delete_instance(instance.instance_id.clone())
                 .await
                 .expect("delete")
+                .is_some()
         );
 
         // The live row is gone with the instance…
@@ -13383,7 +14024,6 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 title, journal_id, durable_seq, created_at, updated_at, spec_json, last_error,
                 mode, promoted_at, launched_by,
                 role, scope_json, grants_json, task_id, api_route_json, configure_seq,
-                turn_error_json,
                 lineage_id, generation, chapter_cause, fenced_at, restart_json
          FROM instances WHERE id = ?1",
         params![id],
@@ -13566,10 +14206,6 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 journal_id: row.get(9)?,
                 durable_seq: durable.to_string(),
                 configure_seq: row.get(23)?,
-                last_turn_error: row
-                    .get::<_, Option<String>>(24)?
-                    .filter(|raw| !raw.is_empty())
-                    .and_then(|raw| serde_json::from_str(&raw).ok()),
                 created_at: row.get(11)?,
                 updated_at: row.get(12)?,
                 last_error: row.get(14)?,
@@ -13583,14 +14219,14 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 task_id,
                 usage_rollup,
                 lineage_id: {
-                    let stamped: Option<String> = row.get(25)?;
+                    let stamped: Option<String> = row.get(24)?;
                     stamped.unwrap_or_else(|| row.get::<_, String>(0).unwrap_or_default())
                 },
-                generation: row.get(26)?,
-                chapter_cause: row.get(27)?,
-                fenced_at: row.get(28)?,
+                generation: row.get(25)?,
+                chapter_cause: row.get(26)?,
+                fenced_at: row.get(27)?,
                 restart: row
-                    .get::<_, Option<String>>(29)?
+                    .get::<_, Option<String>>(28)?
                     .and_then(|raw| serde_json::from_str(&raw).ok()),
             })
         },
@@ -13849,10 +14485,16 @@ fn apply_interaction_event(
             _ => event.to_string(),
         };
         let now = now_rfc3339();
+        // r10 item 4(b): never re-stamp an already-invalidated row. SQLite
+        // counts a WHERE match as changed even when the values are identical,
+        // so a replay of the demotion/invalidation entity used to match the
+        // terminal row again and append a SECOND settlement_events row (a
+        // duplicate follower notice and a phantom delivery-cursor step).
         let changed = conn.execute(
-                "UPDATE interactions SET state = ?1, blocking = 0, payload_json = ?2, updated_at = ?3 WHERE id = ?4",
-                params![state, payload_json, now, id],
-            )?;
+            "UPDATE interactions SET state = ?1, blocking = 0, payload_json = ?2, updated_at = ?3
+                 WHERE id = ?4 AND state <> 'invalidated'",
+            params![state, payload_json, now, id],
+        )?;
         // r9 item 3: an entity-driven INVALIDATION (e.g. a transcript
         // picker demotion) is a settlement too — record it in the
         // monotonic log with its REAL reason and return the notice so
@@ -13883,6 +14525,7 @@ fn apply_interaction_event(
                 interaction_id: id.to_owned(),
                 seq,
                 updated_at: now,
+                reason: reason.to_owned(),
             });
         }
         return Ok(settlement);
@@ -13963,6 +14606,7 @@ fn apply_interaction_event(
                         interaction_id: id.to_owned(),
                         seq,
                         updated_at: now.clone(),
+                        reason: "generation-ended".to_owned(),
                     });
                 }
             }
@@ -14108,11 +14752,8 @@ fn stamp_ended_at(conn: &Connection, instance_id: &str, at: &str) -> Result<(), 
 /// ma-lineage r7 item 5(b): this is a NEW, distinct marker, NOT the legacy
 /// `"host-lost"` string. Legacy rows stamped before contact-loss semantics
 /// keep their old ENDED meaning — [`lifecycle_has_process_end_evidence`]
-/// treats only THIS marker as potentially live, so a legacy-spelling row
-/// without `ended_at` already counts as end evidence. The one-time
-/// user_version migration deliberately backfills NEITHER spelling
-/// (c-cardsettle r8 item 2 follow-up); the node-epoch reconcile replaces
-/// both markers with its restart reason.
+/// treats only THIS marker as potentially live, and the user_version
+/// migration stamps `ended_at` on rows carrying the legacy spelling.
 ///
 /// The exact `last_error` marker the stale-create sweep stamps when a create
 /// is never acknowledged by the node. Attests the launch never started.
@@ -14120,14 +14761,9 @@ pub(crate) const CREATE_NEVER_ACKNOWLEDGED_MARKER: &str = "create-never-acknowle
 
 pub(crate) const HOST_LOST_MARKER: &str = "host-contact-lost";
 
-/// The legacy host-loss marker, stamped by older sweeps
-/// (ma-lineage r7 item 5(b)). No code path stamps it anymore; it remains in
-/// the vocabulary because old rows carry it, because
-/// [`lifecycle_has_process_end_evidence`] distinguishes it from the current
-/// contact-loss marker, and because the node-epoch reconcile must replace it
-/// with the restart reason when it ends such a row. The one-time migration
-/// never fabricates `ended_at` for a NULL-ended_at row carrying either
-/// spelling (c-cardsettle r8 item 2 follow-up).
+/// The legacy host-loss marker, stamped by code before contact-loss
+/// semantics (ma-lineage r7 item 5(b)): such a row means a genuine end. The
+/// migration stamps `ended_at` on evidence-less rows carrying this spelling.
 pub(crate) const LEGACY_HOST_LOST_MARKER: &str = "host-lost";
 
 /// Top-level envelope `origin` value stamped on every Hub-AUTHORED journal
@@ -14347,6 +14983,7 @@ pub(crate) fn settle_instance_interactions(
                 interaction_id: id,
                 seq,
                 updated_at: now.to_owned(),
+                reason: "generation-ended".to_owned(),
             });
         }
     }
@@ -14479,7 +15116,7 @@ fn root_turn_failed(payload: &Value, native_name: &str, status: Option<&str>) ->
 
 fn normalize_activity(status: &str) -> Option<&'static str> {
     match status {
-        "idle" | "done" | "turn_done" => Some("idle"),
+        "idle" | "done" => Some("idle"),
         "working" => Some("working"),
         "blocked" | "waiting-interaction" => Some("blocked"),
         "draining" => Some("draining"),
@@ -14560,12 +15197,10 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
     let subagent_scoped = payload_type == "native" && native_payload_is_subagent(payload);
     let topic = payload.get("topic").and_then(Value::as_str).unwrap_or("");
 
-    // ma-lineage/ma-sdk-state: process-end via the SHARED classifier. Native
-    // event → process_end_value(); instance entity → entity_process_end().
-    // Anything else (turn result/StopFailure, configure/diagnostic, subagent,
-    // workflow member) is NOT a process end. This supersedes the ma-lineage r3
-    // name/severity heuristic; ended_at discipline still rides on
-    // apply_ended_at_from_event below.
+    // ma-lineage r4: process-end via the SHARED classifier. Native event →
+    // process_end_value(); instance entity → entity_process_end(). Anything
+    // else (turn result/StopFailure, configure/diagnostic, subagent, workflow
+    // member) is NOT a process end.
     let native_end: Option<remuda_protocol::process_end::ProcessEnd> =
         if payload_type == "native" && !subagent_scoped {
             remuda_protocol::process_end::process_end_value(payload)
@@ -14587,65 +15222,49 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
         return (Some(end.lifecycle()), None);
     }
 
-    // ma-sdk-state: ROOT (non-subagent) topic=turn activity. turn_started
-    // sets working after the user frame is written; a SETTLED result idles
-    // whether it is turn_done or a turn error (an API 429 frees the composer
-    // without ending the process). "Settled" is the driver's explicit
-    // relatedIds.settledRootTurn decision (open workflows / queued follow-up
-    // turns carry no flag and change nothing) — deliberately separate from
-    // the one-shot affectsCompletion heuristic.
-    let settled_root_turn = payload
-        .pointer("/relatedIds/settledRootTurn")
-        .and_then(Value::as_str)
-        == Some("true");
-    let affects_completion = payload.get("affectsCompletion").and_then(Value::as_str)
-        == Some("true")
-        || payload.get("affectsCompletion").and_then(Value::as_bool) == Some(true);
-    // ma-sdk-state r5 item 2: affectsCompletion is the mapper's one-shot
-    // process-completion heuristic derived from the process-global result_index
-    // (index>0 && queued==0). It is meaningless on the long-lived sdk child —
-    // an is_error result with index 1 while a workflow is open must not idle —
-    // and is redundant for print: claude-sdk/claude-print results always carry
-    // the explicit settledRootTurn decision handled above. Only honor the index
-    // heuristic for OTHER sources (legacy journals / mapper-bypassed shapes).
-    let index_heuristic_source = !matches!(
-        event.pointer("/source/driverKind").and_then(Value::as_str),
-        Some("claude-sdk" | "claude-print")
-    );
+    // c-cardsettle r5 item 4 (OA6): a ROOT (non-subagent) `topic=turn` event
+    // can end the TURN with activity idle while the lifecycle stays running.
+    //
+    // ma-sdk-state settlement, re-applied over cardsettle's derive:
+    //  * an EXPLICIT settled root turn (the print/sdk driver's
+    //    relatedIds.settledRootTurn, set from per-turn evidence — the turn's
+    //    workflows closed and no newer turn outstanding) idles on status
+    //    `error` OR `turn_done`. This is the authoritative signal; a sourceless
+    //    mapper fixture carrying the flag settles the same way.
+    //  * without the flag, a root `result` error idles only for a LEGACY/other
+    //    source whose final result is not queued. The structured
+    //    claude-sdk/claude-print carriers settle ONLY via the flag (r5 item 2:
+    //    an is_error result with a process-global result_index can still arrive
+    //    mid-workflow and must not reopen the composer), and a result carrying
+    //    queuedTurnCount=1 is a queued follow-up on every source.
+    //  * a root StopFailure(outcome=failed) keeps the generic idle fallback.
     if payload_type == "native" && topic == "turn" && !subagent_scoped {
-        if (native_name, status) == ("turn_started", Some("working")) {
-            return (Some("running"), Some("working"));
-        }
-        if native_name == "result" {
-            // Settled result (success or turn failure): the turn is over, the
-            // process is still running (c-cardsettle r5 item 4).
-            if settled_root_turn && matches!(status, Some("error" | "turn_done")) {
-                return (Some("running"), Some("idle"));
-            }
-            // ma-sdk-state r4 item 2: an UNSETTLED result changes NOTHING
-            // while another turn is queued or a workflow is open (its flag is
-            // absent precisely in those cases). The sole legacy exception is
-            // the one-shot print shape — a failed result that explicitly
-            // claims affectsCompletion (final result, no queued turn): that
-            // still frees the composer. Intermediate index-0 / queued results
-            // never carry the claim, so they keep the row working.
-            if affects_completion
-                && index_heuristic_source
-                && root_turn_failed(payload, native_name, status)
-            {
-                return (Some("running"), Some("idle"));
-            }
-            return (None, None);
-        }
-        // A ROOT StopFailure reporting a failed turn outcome ends the TURN
-        // (idle, retryable) even without a settled flag; lifecycle runs on.
-        if native_name == "StopFailure"
+        let settled_root = matches!(status, Some("error" | "turn_done"))
             && payload
-                .pointer("/relatedIds/outcome")
+                .pointer("/relatedIds/settledRootTurn")
                 .and_then(Value::as_str)
-                .is_some_and(|outcome| outcome.eq_ignore_ascii_case("failed"))
-        {
+                == Some("true");
+        if settled_root {
             return (Some("running"), Some("idle"));
+        }
+        if root_turn_failed(payload, native_name, status) {
+            let structured_carrier = matches!(
+                event.pointer("/source/driverKind").and_then(Value::as_str),
+                Some("claude-sdk" | "claude-print")
+            );
+            let is_result_error = native_name == "result" && status == Some("error");
+            // Structured carriers settle a result ONLY via settledRootTurn (an
+            // open-workflow index-1 error must not idle). A legacy/sourceless
+            // result error idles only with the print one-shot completion claim
+            // (result_index>0 && queued==0); a first-turn (index 0) or
+            // queued/intermediate result keeps working. A root
+            // StopFailure(outcome=failed) is not a result and always idles.
+            let legacy_final =
+                payload.get("affectsCompletion").and_then(Value::as_bool) == Some(true);
+            let settles = !is_result_error || (!structured_carrier && legacy_final);
+            if settles {
+                return (Some("running"), Some("idle"));
+            }
         }
     }
 
@@ -14680,8 +15299,8 @@ pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Opt
                 lifecycle = Some("running");
                 activity = normalize_activity(status);
             }
-            // ma-lineage/ma-sdk-state: exited/failed STATUS is process-end and
-            // is returned above through the shared classifier; never infer a
+            // ma-lineage r4: exited/failed STATUS is process-end and is
+            // returned above through the shared classifier; never infer a
             // terminal lifecycle from a bare status here (a turn/configure
             // error reaches this arm while the process is alive).
             _ => {}
@@ -14737,30 +15356,24 @@ fn apply_instance_lifecycle(
     } else {
         next_act.unwrap_or(current.activity.as_str())
     };
-    // D-057 OA6: maintain the additive last-turn-error marker alongside the
-    // state change. `Some("")` clears it (next turn start), `Some(json)` sets
-    // it (a settled turn error), `None` leaves it untouched.
-    let turn_error = turn_error_projection(event, &now);
     conn.execute(
-        "UPDATE instances
-         SET lifecycle = ?1, activity = ?2, updated_at = ?3,
-             turn_error_json = COALESCE(?4, turn_error_json)
-         WHERE id = ?5",
-        params![lifecycle, activity, now, turn_error, instance_id],
+        "UPDATE instances SET lifecycle = ?1, activity = ?2, updated_at = ?3 WHERE id = ?4",
+        params![lifecycle, activity, now, instance_id],
     )?;
     // ma-lineage r4: the derived write settles pending cards through the SAME
     // transition guard the projection write uses. ended_at is stamped by the
     // projection (which runs earlier in this append and carries the shared
-    // classifier's ProcessEnd evidence); `current`/`previous_row` are read
-    // after it, so a terminal the projection already wrote/settled is a no-op,
-    // while a terminal only THIS derivation recognises still settles its
-    // generation.
+    // classifier's ProcessEnd evidence); `current` is read after it, so a
+    // terminal the projection already wrote/settled is a no-op, while a
+    // terminal only THIS derivation recognises still settles its generation.
     //
-    // c-cardsettle r9 item 2: the guard's "already terminal?" question is
-    // answered by lifecycle_has_process_end_evidence over the previous row
-    // shape, so a host-lost pseudo-terminal marker (`exited` plus the legacy
-    // 'host-lost' or current HOST_LOST_MARKER spelling, no ended_at) does not
-    // suppress the settle a real process end needs.
+    // c-cardsettle r10 item 1 (OA6): the guard's `next` is the EVENT'S OWN
+    // derived verdict (`next_life`), never the rank-held EFFECTIVE lifecycle.
+    // A state-bearing event on an `exited` host-lost row whose process still
+    // lives — an interaction.requested that derives (running, blocked) — keeps
+    // the stored rank at `exited`; passing that rank settled a live process's
+    // card. `next_life` is terminal ONLY when the shared classifier returned
+    // an end for this exact event.
     settle_on_terminal_transition(
         conn,
         instance_id,
@@ -14773,70 +15386,11 @@ fn apply_instance_lifecycle(
                     ended_at.as_deref(),
                 )
             }),
-        Some(lifecycle),
+        next_life,
         &now,
         settlement,
     )?;
     Ok(())
-}
-
-/// Bound on [`TurnErrorMarker::text`]; mirrors the driver's clamp on the
-/// `lastError` related id, and is applied again here defensively.
-const TURN_ERROR_TEXT_MAX_CHARS: usize = 200;
-
-/// Build the `turn_error_json` write value for one journal event.
-///
-/// See [`derive_instance_state`] for the settled-end rule: a `turn/result`
-/// with status `error` and no queued follow-up turn sets the marker; a
-/// `turn/turn_started` clears it; every other event leaves the column alone
-/// (`None`, which the UPDATE coalesces away).
-fn turn_error_projection(event: &Value, now: &str) -> Option<String> {
-    let payload = event.get("payload").unwrap_or(event);
-    if payload.get("type").and_then(Value::as_str) != Some("native")
-        || payload.get("topic").and_then(Value::as_str) != Some("turn")
-    {
-        return None;
-    }
-    let name = payload
-        .get("nativeName")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let status = knowledge_value(payload.get("status"));
-    if name == "turn_started" && status == Some("working") {
-        return Some(String::new());
-    }
-    if name != "result" || status != Some("error") {
-        return None;
-    }
-    // Set the marker only when the error SETTLES the root turn (the driver's
-    // explicit settledRootTurn decision). An intermediate workflow error or a
-    // queued follow-up turn's error keeps the turn open and sets no marker.
-    if payload
-        .pointer("/relatedIds/settledRootTurn")
-        .and_then(Value::as_str)
-        != Some("true")
-    {
-        return None;
-    }
-    let text = payload
-        .pointer("/relatedIds/lastError")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(|text| {
-            if text.chars().count() <= TURN_ERROR_TEXT_MAX_CHARS {
-                text.to_owned()
-            } else {
-                text.chars().take(TURN_ERROR_TEXT_MAX_CHARS).collect()
-            }
-        })
-        .unwrap_or_else(|| "turn error".to_owned());
-    let at = event
-        .get("observedAt")
-        .and_then(Value::as_str)
-        .filter(|at| !at.is_empty())
-        .unwrap_or(now);
-    Some(json!({ "at": at, "text": text }).to_string())
 }
 
 fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> {

@@ -146,3 +146,44 @@ describe("AnnotationBadge + AnnotationPanel", () => {
     expect(readAnnotations(iid)).toHaveLength(0);
   });
 });
+
+describe("AnnotationBadge placement variants", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    seed([{ id: "a1", createdAt: 1, carrier: "card", body: "note", taskId: "t1" }]);
+  });
+  afterEach(() => localStorage.clear());
+
+  function renderBadge(floating: boolean) {
+    const { rerender } = render(
+      <AnnotationProvider>
+        <AnnotationBadge instanceId={iid} floating={floating} />
+      </AnnotationProvider>,
+    );
+    // The provider reads localStorage on mount; seed ran first, but nudge a
+    // render to guarantee the badge list is observed.
+    rerender(
+      <AnnotationProvider>
+        <AnnotationBadge instanceId={iid} floating={floating} />
+      </AnnotationProvider>,
+    );
+    return screen.getByTestId("annotation-badge");
+  }
+
+  it("renders the quiet in-flow row by default", () => {
+    const badge = renderBadge(false);
+    expect(screen.getByTestId("annotation-badge-row")).toContainElement(badge);
+    expect(screen.queryByTestId("annotation-badge-float")).toBeNull();
+  });
+
+  it("renders a clickable, pointer-events-auto floating chip", () => {
+    const badge = renderBadge(true);
+    const floatRow = screen.getByTestId("annotation-badge-float");
+    expect(floatRow).toContainElement(badge);
+    expect(screen.queryByTestId("annotation-badge-row")).toBeNull();
+    expect(badge.tagName).toBe("BUTTON");
+    expect(badge).not.toBeDisabled();
+    expect(badge).toHaveStyle({ pointerEvents: "auto" });
+    expect(floatRow).toHaveStyle({ pointerEvents: "auto" });
+  });
+});

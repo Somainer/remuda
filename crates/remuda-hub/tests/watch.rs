@@ -679,9 +679,8 @@ fn turn_error_event() -> Value {
     })
 }
 
-/// The driver's REAL process-exit observation (print/SDK topic=session,
-/// nativeName=session, status=exited): the only evidence a failed turn's
-/// process actually ended.
+/// The print/SDK driver's REAL session exit: topic=session, status=exited —
+/// process-end evidence distinct from the failed TURN that precedes it.
 fn session_exit_event() -> Value {
     json!({
         "kind": "lifecycle",
@@ -739,9 +738,9 @@ async fn failed_first_turn_on_screenless_worker_is_classified_and_persisted() {
     assert_eq!(row["state"]["state"], "working");
     assert!(row["watch"]["observedAt"].is_string(), "{row}");
 
-    // ma-sdk-state / ma-lineage / c-cardsettle: a failed TURN is not a process
-    // death — the durable Hub row does NOT converge to failed from the turn
-    // error alone (the driver emits a separate process-exit event when the
+    // ma-lineage r4 / c-cardsettle r5: a failed TURN is not a process death —
+    // the durable Hub row does NOT converge to failed from the turn error
+    // alone (the print/sdk driver emits a separate process exit event when the
     // child ends), and the live child still accepts a REAL next prompt.
     let (status, instance) = ctx
         .request("GET", &format!("/v1/instances/{instance_id}"), None)

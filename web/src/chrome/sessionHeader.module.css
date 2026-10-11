@@ -1,272 +1,297 @@
+/* @tokens strict */
+/* The one-row session header (ui-spec §2.2, D-053). Hit areas follow
+   pointer: coarse, never viewport width (§3.4): fine pointers keep the
+   20 / 26 / 32 / 32 visible glyphs with no reach added. UI type only — mono
+   is reserved for code, paths, terminal output and IDs (D-053). */
+
 .header {
   flex: none;
-  border-bottom: 1px solid var(--line);
-  padding: 11px 18px 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.headRow {
   display: flex;
   align-items: center;
-  gap: 12px;
-}
-
-.back {
-  font-family: var(--mono);
-  font-size: 14px;
-  color: var(--mute);
-  width: 20px;
-  flex: none;
-  /* The 20px glyph keeps its look; touch reach comes from a mobile-only
-     44px ::after, never a visual resize (ui-spec.md §3.4, D-039). */
-  position: relative;
-}
-
-.title {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--paper);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  gap: var(--space-3);
+  height: var(--header-h);
+  padding: 0 20px;
+  border-bottom: 1px solid var(--border);
   min-width: 0;
 }
 
-.status {
+/* ---- desktop: breadcrumb · title · meta ------------------------------ */
+
+.lead {
+  flex: 1 1 0;
+  min-width: 0;
   display: flex;
-  align-items: center;
-  gap: 6px;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--mute);
-  flex: none;
+  align-items: baseline;
+  gap: 10px;
+  white-space: nowrap;
 }
 
+/* The breadcrumb gives way first so the title never disappears (768). */
+.crumbs {
+  flex: 0 100 auto;
+  min-width: 0;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 13px;
+  color: var(--fg-muted);
+}
+
+.crumbLead,
+.crumbLast {
+  display: inline;
+}
+
+.crumbSep {
+  color: var(--fg-faint);
+}
+
+.title {
+  flex: 0 1 auto;
+  min-width: 6em;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-title);
+  line-height: var(--lh-title);
+  font-weight: 600;
+  color: var(--fg-strong);
+}
+
+.meta {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  gap: 6px;
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
+}
+
+/* One status vocabulary (§2.1); blocked draws attention, unknown stays
+   neutral — never a positive colour. */
+.statusWord {
+  flex: none;
+  color: var(--fg-body);
+  white-space: nowrap;
+}
+
+.statusWord[data-status="blocked"] {
+  color: var(--attention-fg);
+}
+
+.statusWord[data-status="unknown"] {
+  color: var(--unknown-fg);
+}
+
+.sep {
+  flex: none;
+  color: var(--fg-faint);
+}
+
+.host {
+  min-width: 3em;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-body);
+}
+
+.cost {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Composed by the decision and tool cards as a flex filler. */
 .spacer {
   flex: 1;
 }
 
-/* D-040: the one current-space chip folded into the compact session header.
-   The button keeps spaces.module.css's .chip look; here it only takes the
-   header's 32px height (44px touch reach comes from the mobile ::after below)
-   and a bounded width so a long space name ellipsises instead of pushing Stop
-   off the row. */
-.headSpaceChip {
+.cluster {
   flex: none;
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  min-width: 0;
+  gap: var(--space-2);
 }
 
-.headSpaceChip button {
+.filesBtn {
+  min-height: var(--icon-btn);
+}
+
+.stopBtn:hover:not(:disabled) {
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+}
+
+/* Stop and ⋯ sit 16px apart: their coarse 44px reach (6px each side) keeps
+   4px of clearance, since abutting zones hand the sub-pixel seam to ⋯. */
+.moreAnchor {
   position: relative;
-  height: 32px;
-  min-height: 32px;
-  max-width: 110px;
-  padding: 0 10px;
-}
-
-/* Provenance/promotion badges ride the desktop row; on compact they remain
-   readable inside the 运行详情 disclosure. */
-.headBadges {
+  flex: none;
   display: inline-flex;
-  align-items: center;
-  gap: 12px;
-  flex: none;
+  margin-left: var(--space-2);
 }
 
-.hostChip {
-  flex: none;
-  font-family: var(--mono);
-  font-size: var(--text-aux);
-  color: var(--paper);
-  max-width: 180px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.costChip {
-  flex: none;
-  font-family: var(--mono);
-  font-size: var(--text-aux);
-  color: var(--mute);
-  font-variant-numeric: tabular-nums;
-}
-
-.headBtn {
-  height: 27px;
-  white-space: nowrap;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--mute);
-  font-family: var(--mono);
-  font-size: 11px;
-  padding: 0 10px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  min-height: 27px;
-}
-
-.headBtnOn {
-  color: var(--paper);
-}
-
-.headBtnActive {
-  composes: headBtn;
-  color: var(--paper);
-  border-color: var(--cold);
-}
-
-.stopBtn {
-  composes: headBtn;
-  color: var(--paper);
-  font-size: 12px;
-  padding: 0 11px;
-}
-
-/* The compact ⋯ trigger: visually a 27px header button on desktop, a 32px
-   square with a 44px hot zone on phones (same rule as .stopBtn). */
-.moreBtn {
-  composes: headBtn;
-  flex: none;
-  justify-content: center;
-  padding: 0;
-  width: 34px;
+.morePopover {
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  right: 0;
+  z-index: 30;
 }
 
 .moreMenu {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  align-items: stretch;
 }
 
-.metaHost {
-  color: var(--paper);
+.moreItem {
+  min-height: 48px;
 }
 
-@media (max-width: 767px) {
-  .header {
-    padding: 8px 14px 9px;
-    gap: 5px;
+@media (max-width: 1023px) {
+  .crumbLead {
+    display: none;
   }
 
-  .headRow {
-    gap: 8px;
+  .crumbs {
+    max-width: 160px;
   }
 
-  .title {
-    flex: 1;
+  .host {
+    max-width: 120px;
+  }
+}
+
+/* ---- compact: ‹ / title block / 终端|结构 / Stop / ⋯ --------------------- */
+
+.header[data-layout="compact"] {
+  height: 52px;
+  padding: 0 4px;
+  gap: var(--space-2);
+}
+
+.back {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: var(--fg-muted);
+  border-radius: var(--radius-sm);
+}
+
+.titleHeading {
+  flex: 1 1 0;
+  min-width: 0;
+  margin: 0;
+  display: flex;
+  font: inherit;
+}
+
+.titleBlock {
+  flex: 1 1 0;
+  min-width: 0;
+  container-type: inline-size;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0;
+  min-height: 40px;
+  padding: 0 var(--space-1);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.titleBlock:hover {
+  background: var(--bg-hover);
+}
+
+.titleLine {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.titleText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-title);
+  line-height: var(--lh-title);
+  font-weight: 600;
+  color: var(--fg-strong);
+}
+
+.subLine {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+  font-size: var(--text-meta);
+  line-height: 16px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+
+.spaceName {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.subSep {
+  flex: none;
+  white-space: pre;
+}
+
+/* D-049 step 2: the Space name falls back to its initial. */
+@container (max-width: 120px) {
+  .spaceFull {
+    display: none;
   }
 
-  /* The chip's 44px ::after must not meet the back arrow's; visual separation
-     keeps their hot zones 2px apart (D-039 non-overlap). */
-  .headSpaceChip {
-    margin-left: 14px;
+  .spaceName::before {
+    content: attr(data-initial);
   }
+}
 
-  .stopBtn,
-  .moreBtn {
-    width: 32px;
-    height: 32px;
-    min-height: 32px;
-    padding: 0;
-    justify-content: center;
-    /* Never let the crowded row flex-shrink the 32px square: a shrunk visual
-       centred under a 44px ::after would extend its hot zone past the gap and
-       swallow the neighbour's edge (D-039 non-overlap). Kept at 32, the zone
-       spills 6px into an 8px gap — 2px clearance. */
-    flex: none;
-    /* The square stays 32px visually; the ::after below supplies the reach. */
+/* D-049 step 3: only the state dot (line 1) keeps the status. */
+@container (max-width: 72px) {
+  .subSep,
+  .subLine .statusWord {
+    display: none;
+  }
+}
+
+/* ⋯ keeps its reach inside the viewport edge. */
+.header[data-layout="compact"] .moreAnchor {
+  margin-right: var(--space-1);
+}
+
+@media (pointer: coarse) {
+  /* 20px glyph box; a square 44×44 ::after is the reach (a padded, rounded
+     box would lose its hit-tested corners). The 12px either side keeps the
+     zone inside the viewport and clear of the title block. */
+  .header[data-layout="compact"] .back {
     position: relative;
+    margin: 0 var(--space-1) 0 var(--space-2);
   }
 
-  /*
-   * Invisible 44px hit areas over small glyphs/segments, same mechanism as
-   * .effortIconBtn::after below: absolutely centred on the visible control,
-   * so the visual size never changes (ui-spec.md §3.4, D-039).
-   */
-  .back::after,
-  .stopBtn::after,
-  .moreBtn::after,
-  .headSpaceChip button::after {
+  .header[data-layout="compact"] .back::after {
     content: "";
     position: absolute;
-    top: 50%;
-    left: 50%;
-    width: var(--touch);
-    height: var(--touch);
-    transform: translate(-50%, -50%);
+    inset: calc((20px - var(--touch)) / 2);
   }
 
-  @media (max-width: 640px) {
-  /* D-040 crowded fold: the ⋯ sheet takes Compact / 文件 / 原始事件, so the
-     status label can shrink instead of flex: none and the main row keeps
-     返回 · space chip · 标题 · 状态 · 分段 · Stop · ⋯ on one line at 390px. */
-
-    /* 12px left so the back arrow's un-clamped 44px hot corner stays inside
-       the viewport edge; 8px right balances it within the same width. */
-    .header {
-      padding-left: 12px;
-      padding-right: 8px;
-    }
-
-    .headRow {
-      gap: 5px;
-    }
-
-    /* Only the dot shows on the crowded row; the word stays in textContent
-       and the title attribute, so the session title gets the freed width. */
-    .status {
-      gap: 0;
-    }
-
-    .statusWord {
-      display: none;
-    }
-
-    .status,
-    .title {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .headSpaceChip {
-      /* Sized so the chip's 44px zone starts after the back arrow's zone
-         (D-039 non-overlap): back centre 22 + 21.5 = 43.7, chip x must be
-         >= 49.7 — the margin lands it at ~54. */
-      margin-left: 17px;
-    }
-
-    .headSpaceChip button {
-      /* The active tab strip already carries the full session title; the
-         chip's job is naming the space, so keep the whole name rather than
-         splitting the truncation budget. */
-      max-width: 88px;
-    }
-
-    .stopBtn {
-      margin-left: 2px;
-    }
-
-    /* Desktop uses the spacer to push the controls right; on the crowded row
-       the session title must itself receive every free pixel. */
-    .spacer {
-      flex: 0 0 0;
-      width: 0;
-    }
-
-    /* 6px visual gap + this 8px margin = 14px between Stop and ⋯ so their
-       44px zones clear each other (D-039 non-overlap). */
-    .moreBtn {
-      margin-left: 8px;
-    }
+  .titleBlock {
+    min-height: var(--touch);
   }
 }

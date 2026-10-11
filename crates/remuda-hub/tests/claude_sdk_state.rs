@@ -4,8 +4,8 @@
 //! * a user frame (`turn/turn_started`) gives activity `working`;
 //! * a settled `turn/result` (`turn_done`) gives `idle`;
 //! * a settled result `error` (an API error such as 429) leaves lifecycle
-//!   `running`, activity `idle`, and sets an additive `lastTurnError` marker;
-//! * the next turn start clears the marker;
+//!   `running`, activity `idle`;
+
 //! * an instance holding `address-owner` stays an active holder after a turn
 //!   error (a second address-owner insert still gets 409);
 //! * genuine start-failure evidence still projects `failed`.
@@ -461,17 +461,12 @@ async fn user_frame_working_then_settled_turn_done_idles() -> Result<()> {
     let view = ctx.after_append(&id, seq).await;
     assert_eq!(view["activity"], json!("idle"));
     assert_eq!(view["lifecycle"], json!("running"));
-    assert!(
-        view["lastTurnError"].is_null(),
-        "a clean turn leaves no marker"
-    );
     assert_eq!(node.task_error().await, None, "fake-node task panicked");
     Ok(())
 }
 
 #[tokio::test]
-async fn an_error_result_leaves_running_idle_with_a_marker_and_keeps_the_seat_grant() -> Result<()>
-{
+async fn an_error_result_leaves_running_idle_and_keeps_the_seat_grant() -> Result<()> {
     let ctx = Ctx::boot().await;
     let mut node = FakeNode::connect(&ctx.hub, &ctx.host).await;
     let id = ctx.create_holder(&mut node).await;
@@ -502,9 +497,6 @@ async fn an_error_result_leaves_running_idle_with_a_marker_and_keeps_the_seat_gr
         json!("idle"),
         "a failed turn still frees the composer"
     );
-    let marker = &view["lastTurnError"];
-    assert_eq!(marker["text"], json!("API Error: 429 no eligible upstream"));
-    assert!(marker["at"].is_string());
 
     // The seat grant is still held: a second address-owner insert is rejected.
     let body = json!({
@@ -518,15 +510,11 @@ async fn an_error_result_leaves_running_idle_with_a_marker_and_keeps_the_seat_gr
     assert_eq!(status, 409, "{text}");
     assert!(text.contains("address-owner"));
 
-    // The next turn start clears the marker and flips activity back to working.
+    // The next turn start flips activity back to working.
     let seq = ctx.durable_seq(&id).await;
     node.append(&id, turn_started());
     let view = ctx.after_append(&id, seq).await;
     assert_eq!(view["activity"], json!("working"));
-    assert!(
-        view["lastTurnError"].is_null(),
-        "the next turn start clears the marker"
-    );
     assert_eq!(node.task_error().await, None, "fake-node task panicked");
     Ok(())
 }
@@ -554,7 +542,6 @@ async fn a_queued_or_intermediate_result_does_not_idle_or_mark() -> Result<()> {
     );
     let view = ctx.after_append(&id, seq).await;
     assert_eq!(view["activity"], json!("working"));
-    assert!(view["lastTurnError"].is_null());
 
     // A background workflow opens; its first result (index 0, queued 0) is an
     // INTERMEDIATE result with no settledRootTurn flag — it must not idle.
@@ -565,7 +552,6 @@ async fn a_queued_or_intermediate_result_does_not_idle_or_mark() -> Result<()> {
     node.append(&id, turn_result("turn_done", 0, 0, false, None));
     let view = ctx.after_append(&id, seq).await;
     assert_eq!(view["activity"], json!("working"));
-    assert!(view["lastTurnError"].is_null());
 
     // An intermediate ERROR result (r2 item 5): same settlement decision, error
     // or success, does not settle the root while the workflow is open.
@@ -579,10 +565,6 @@ async fn a_queued_or_intermediate_result_does_not_idle_or_mark() -> Result<()> {
         view["activity"],
         json!("working"),
         "an intermediate workflow error does not settle the root"
-    );
-    assert!(
-        view["lastTurnError"].is_null(),
-        "an intermediate workflow error sets no marker"
     );
     assert_ne!(view["lifecycle"], json!("failed"));
     assert_eq!(node.task_error().await, None, "fake-node task panicked");
@@ -615,7 +597,7 @@ async fn a_genuine_start_failure_still_projects_failed_and_a_print_turn_error_th
     ctx.wait_until(&printed, |v| v["lifecycle"] == json!("running"))
         .await;
     node.append(&printed, first_turn_result("error", Some("API Error: 500")));
-    ctx.wait_until(&printed, |v| v["lastTurnError"].is_object())
+    ctx.wait_until(&printed, |v| v["activity"] == json!("idle"))
         .await;
     let mid = ctx.get_instance(&printed).await;
     assert_eq!(
@@ -697,10 +679,6 @@ async fn scoped_and_nonterminal_failures_never_fail_the_root_instance() -> Resul
             view["lifecycle"],
             json!("exited"),
             "{label} must not exit the root"
-        );
-        assert!(
-            view["lastTurnError"].is_null(),
-            "{label} must not set the root turn-error marker"
         );
     }
     assert_eq!(node.task_error().await, None, "fake-node task panicked");

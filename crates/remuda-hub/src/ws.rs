@@ -58,6 +58,74 @@ pub struct SettlementNotice {
     pub seq: i64,
 }
 
+/// Test-only park seam for a follower's settlement pump (c-cardsettle r11
+/// item 1). Production builds contain no seam: every call site and the
+/// [`AppState`](crate::AppState) field are gated behind
+/// `cfg(any(test, feature = "test-faults"))`.
+///
+/// Unlike shrinking the client socket SO_RCVBUF (which the Hub's ~16 KiB
+/// send buffer defeats: batch A can sit in the kernel buffer with the pump
+/// already at A's END), this parks the PUMP itself deterministically after
+/// it processes the live notice whose seq is `after_seq`, so the follower's
+/// durable delivery cursor provably sits mid-batch before the next batch
+/// is published.
+#[cfg(any(test, feature = "test-faults"))]
+#[derive(Default, Clone)]
+pub(crate) struct FollowParks {
+    slot: Arc<tokio::sync::Mutex<Option<FollowParkSlot>>>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+struct FollowParkSlot {
+    /// Park once the pump processes a notice with exactly this seq.
+    after_seq: i64,
+    /// The pump sends back the seq it parked at (the test asserts it equals
+    /// the armed K).
+    reached: tokio::sync::oneshot::Sender<i64>,
+    /// The pump waits on this until the test releases it.
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+impl FollowParks {
+    /// Arm a one-shot park at `after_seq`. Returns `(reached, release)`:
+    /// `reached` resolves with the seq the pump parked at; sending on
+    /// `release` lets the pump continue.
+    pub(crate) async fn arm(
+        &self,
+        after_seq: i64,
+    ) -> (
+        tokio::sync::oneshot::Receiver<i64>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.slot.lock().await = Some(FollowParkSlot {
+            after_seq,
+            reached: reached_tx,
+            release: release_rx,
+        });
+        (reached_rx, release_tx)
+    }
+
+    /// If the pump just processed the armed seq, report it and park until
+    /// released. One-shot: the slot is removed on entry. A dropped release
+    /// sender (test aborted) closes the channel and the pump proceeds.
+    pub(crate) async fn park_if_reached(&self, seq: i64) {
+        let slot = self.slot.lock().await.take();
+        if let Some(slot) = slot {
+            if slot.after_seq == seq {
+                let _ = slot.reached.send(seq);
+                let _ = slot.release.await;
+            } else {
+                // Not this notice: re-arm so a later notice in the same pump
+                // can still hit the park point.
+                *self.slot.lock().await = Some(slot);
+            }
+        }
+    }
+}
+
 /// Live event for `/v1/follow`.
 #[derive(Clone, Debug)]
 pub struct FollowEvent {
@@ -1061,14 +1129,39 @@ async fn reconcile_lost_instances(
                 .map(str::to_string)
         })
         .collect();
-    let lost = state
-        .publish_settlement(state.store.reconcile_reported_instances(
-            host_id.to_string(),
-            reported,
-            NODE_EPOCH_CHANGED.to_string(),
-            true,
-        ))
+    let (lost, legacy_exited) = state
+        .publish_settlement(async {
+            state
+                .store
+                .reconcile_reported_instances(
+                    host_id.to_string(),
+                    reported,
+                    NODE_EPOCH_CHANGED.to_string(),
+                    true,
+                )
+                .await
+                .map(|outcome| ((outcome.lost, outcome.legacy_exited), outcome.settlement))
+        })
         .await?;
+    for legacy_id in &legacy_exited {
+        tracing::info!(
+            %host_id,
+            instance_id = %legacy_id,
+            "new epoch re-swept a legacy host-lost row on an upgraded database; \
+             settled its cards without a new diagnostic"
+        );
+    }
+    // c-cardsettle r10 item 1 (OA6): a NEW Node epoch that LISTS a swept,
+    // still-pending instance as live is liveness evidence from the new
+    // process itself (a herdr-adopted chapter is normally listed starting or
+    // ready). Revive such rows BEFORE the lost side effects run — they were
+    // excluded from `lost` by the inventory, but the rank-held row is still
+    // the sweep's exited/host-lost shape until revived here. Cards the
+    // chapter still owns stay pending and answerable.
+    revive_live_inventory(state, host_id, params).await?;
+    // r10 item 4(c): legacy already-exited rows on upgraded databases only
+    // had their cards settled (the settlement above covered them); they are
+    // old news and get no diagnostic/egress/worker side effects.
     for instance_id in lost {
         tracing::warn!(
             %host_id,
@@ -1093,10 +1186,18 @@ async fn reconcile_lost_instances(
     Ok(())
 }
 
-/// Extract the instances a hello inventory reports as LIVE
-/// (`ready`/`running`) as `(id, activity)` pairs, the input to
+/// Extract the instances a hello inventory reports as LIVE as
+/// `(id, hub_lifecycle, activity)` triples, the input to
 /// [`Store::revive_host_lost_instances`].
-fn live_inventory_entries(params: &Value) -> Vec<(String, String)> {
+///
+/// c-cardsettle r10 item 1 (OA6): a same- or new-epoch inventory that still
+/// holds a chapter is liveness evidence even when its lifecycle is not the
+/// Node's narrow ready/running pair — a herdr-adopted instance is listed
+/// `starting`, a draining chapter `closing`, and an older Node omits the key
+/// entirely (`unknown`). Each maps onto the closest LIVE Hub lifecycle; only
+/// confessed terminal entries (`exited`/`failed`/`closed`/`requested`) are
+/// excluded.
+fn live_inventory_entries(params: &Value) -> Vec<(String, String, String)> {
     params
         .get("instances")
         .and_then(Value::as_array)
@@ -1110,10 +1211,16 @@ fn live_inventory_entries(params: &Value) -> Vec<(String, String)> {
                 .and_then(Value::as_str)?
                 .to_string();
             // Only rows the Node claims are live revive a host-lost row.
-            let lifecycle = item.get("lifecycle").and_then(Value::as_str).unwrap_or("");
-            if !matches!(lifecycle, "ready" | "running") {
-                return None;
-            }
+            let reported = item.get("lifecycle").and_then(Value::as_str).unwrap_or("");
+            let lifecycle = match reported {
+                "ready" | "running" | "reconciling" | "" | "unknown" => "running",
+                "starting" | "preparing" => "starting",
+                "closing" => "closing",
+                // "closed" is a real end; "requested" is an unacked Hub
+                // create the Node does not hold; anything unrecognised is
+                // not liveness evidence.
+                _ => return None,
+            };
             let activity = match item
                 .get("activity")
                 .and_then(Value::as_str)
@@ -1123,17 +1230,17 @@ fn live_inventory_entries(params: &Value) -> Vec<(String, String)> {
                 Some(value @ ("idle" | "working" | "blocked" | "draining")) => value,
                 _ => "idle",
             };
-            Some((id, activity.to_string()))
+            Some((id, lifecycle.to_string(), activity.to_string()))
         })
         .collect()
 }
 
-/// Same-epoch reconnect: revive host-lost rows the reconnecting Node still
-/// reports live (c-cardsettle r8 item 2). Runs on BOTH daemon and plain
-/// runtime hellos — the daemon inventory overlay
-/// (`reconcile_daemon_instances`) already rewrites the rows it names, and the
-/// host-lost predicate revival here is idempotent for those and the only
-/// revival path for a non-daemon runtime link.
+/// Reconnect: revive host-lost rows the reconnecting or restarted Node still
+/// reports live (c-cardsettle r8 item 2; r10 item 1 runs this on BOTH epoch
+/// branches). Runs on daemon and plain runtime hellos — the daemon inventory
+/// overlay (`reconcile_daemon_instances`) already rewrites the rows it names,
+/// and the host-lost predicate revival here is idempotent for those and the
+/// only revival path for a non-daemon runtime link.
 async fn revive_live_inventory(
     state: &AppState,
     host_id: &str,
@@ -1151,7 +1258,7 @@ async fn revive_live_inventory(
         tracing::info!(
             %host_id,
             %instance_id,
-            "same-epoch reconnect reports a host-lost instance live; revived without settling cards"
+            "a reconnect inventory reports a host-lost instance live; revived without settling cards"
         );
     }
     Ok(())
@@ -1730,6 +1837,13 @@ async fn follow_session(
                                 settlement_cursor.as_deref(),
                                 notice.seq,
                             ));
+                            // c-cardsettle r11 item 1: deterministic test
+                            // park AFTER the live notice advanced the cursor
+                            // (no-op unless armed; outside the per-instance
+                            // filter so the seq contract holds for any
+                            // follower).
+                            #[cfg(any(test, feature = "test-faults"))]
+                            state.follow_parks.park_if_reached(notice.seq).await;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             // c-cardsettle r4 item 6 / r6 item 2: drain every
@@ -2338,6 +2452,16 @@ mod tests {
     /// total order even when the two settles share a millisecond and their
     /// interaction ids interleave, so a strictly-forward seq cursor can never
     /// skip a row of the earlier batch.
+    ///
+    /// c-cardsettle r10 item 5 SCOPE NOTE: the "cursor mid-A" here is built
+    /// DIRECTLY from invalidated_interactions_after(None) and handed to
+    /// drain_settlement_lag — the live follower never received the first
+    /// three rows, so this test proves ONLY the durable seq ordering/drain
+    /// path, not production backpressure (it does not make the r9 commit's
+    /// "delivers part of a batch" claim true). The end-to-end assertion — a
+    /// REAL follow_session whose cursor advances mid-batch through the live
+    /// settlement bus before the block — lives in
+    /// tests/cardsettle.rs::follower_blocked_mid_batch_recovers_a_larger_later_batch_in_order.
     #[tokio::test]
     async fn settlement_cursor_mid_first_batch_recovers_a_later_overring_sweep() {
         let dir = tempfile::tempdir().expect("tmp");

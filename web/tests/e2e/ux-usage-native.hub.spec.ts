@@ -89,6 +89,23 @@ async function stopNode(node: ChildProcess) {
   clearTimeout(timer);
 }
 
+/** Single-quote a path for the pane shell. */
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/** Send literal keystrokes to the session TTY through the Hub command API. */
+async function sendTtyKeys(page: import("@playwright/test").Page, id: string, text: string) {
+  const response = await page.request.post(`/v1/instances/${id}/commands`, {
+    headers: { Origin: new URL(page.url()).origin },
+    data: {
+      operation: "tty.write",
+      payload: { dataBase64: Buffer.from(text).toString("base64"), source: "ui" },
+    },
+  });
+  expect(response.status(), `tty.write ${response.status()}`).toBe(200);
+}
+
 test("native transcript usage drives the context chip through the real rollup", async ({ page }) => {
   test.skip((await access(nativeNode).then(() => false).catch(() => true)), "native_hub_e2e not built");
   test.setTimeout(180_000);
@@ -203,31 +220,38 @@ test("native transcript usage drives the context chip through the real rollup", 
     instanceId = result.instance.instanceId ?? result.instance.id;
     const id = instanceId!;
 
-    await page.goto(`/s/${id}`);
-    await expect(page.getByTestId("session-page")).toHaveAttribute("data-lifecycle", "running", { timeout: 20_000 });
-    // The Hub HTTP command API wraps params in {dataBase64, source}; the WSS
-    // node's keys_from_params also reads instanceId from the params (it is
-    // injected by the Hub alongside commandId). Send a standalone write after
-    // the session settles, then poll for the chip.
-    await expect.poll(async () => {
-      const response = await page.request.post(`/v1/instances/${id}/commands`, {
-        headers: { Origin: new URL(page.url()).origin },
-        data: {
-          operation: "tty.write",
-          payload: { dataBase64: Buffer.from("NATIVEUSAGE\n").toString("base64"), source: "ui" },
-        },
-      });
-      return response.status();
-    }, { timeout: 30_000, intervals: [200, 500, 1000] }).toBe(200);
+    await page.goto(`/s/${id}/tty`);
+    const session = page.getByTestId("session-page");
+    await expect(session).toHaveAttribute("data-lifecycle", "running", { timeout: 20_000 });
+    await expect(page.locator("[data-tty-lab='1']")).toHaveAttribute(
+      "data-tty-status",
+      "live",
+      { timeout: 20_000 },
+    );
 
-    // The chip renders the native transcript usage: 100k of 200k = 50%.
-    try {
-      await expect(page.getByTestId("context-chip")).toHaveText("50%", { timeout: 60_000 });
-    } catch (error) {
-      // The native turn did not hydrate in this environment's PTY. The same
-      // production path is proven in Rust by usage_native_rollup.rs.
-      test.skip(true, `native transcript usage did not appear: ${String(error).slice(0, 200)}`);
-    }
+    // Launch the copied fake harness the way promoted-claude.hub.spec.ts does:
+    // type the production launch line into the shell pane and wait for
+    // promotion. The harness scenario matches NATIVEUSAGE and writes a real
+    // transcript carrying the 2.1.289 split usage. Typing into /bin/sh alone
+    // (the old approach) never started the harness at all.
+    const launchLine =
+      `claude --kind claude --home ${shellQuote(claudeHome)} ` +
+      `--script ${shellQuote(scriptFile)}\r`;
+    await sendTtyKeys(page, id, launchLine);
+    await expect(session).toHaveAttribute("data-mode", "promoted", { timeout: 20_000 });
+    await expect.poll(async () => {
+      const record = await (await page.request.get(`/v1/instances/${id}`)).json();
+      return record.signalTier;
+    }, { timeout: 10_000 }).toBe("hook");
+
+    // Drive the scenario turn through the REAL harness: body then Enter as
+    // separate keystrokes (paste boundary), like promoted-claude's submit().
+    await sendTtyKeys(page, id, "NATIVEUSAGE");
+    await page.waitForTimeout(150);
+    await sendTtyKeys(page, id, "\r");
+
+    // Successful launch above -> a missing turn is a FAILURE, not a skip.
+    await expect(page.getByTestId("context-chip")).toHaveText("50%", { timeout: 60_000 });
     const chip = page.getByTestId("context-chip");
     await chip.click();
     const popover = page.getByTestId("context-usage-popover");

@@ -2648,68 +2648,124 @@ mod tests {
     #[test]
     fn message_and_session_cumulative_history_are_never_added() {
         // c-usagefu r8 item 4: Message per-call rows AND cumulative Session
-        // snapshots describe the SAME calls. Message 10 + Session 10 +
-        // Message 20 + Session 30 must yield 30 (latest flow), not 70.
+        // snapshots describe the SAME calls, in the REAL codex observation
+        // shape — each turn emits one additive Message and one cumulative
+        // Session growth point.
+        //   Message 10 + Session 10 + Message 20 + Session 30 -> 30, not 70.
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        let at = "2026-09-15T00:00:00.000Z";
+        let t1 = ago(4);
+        let t2 = ago(2);
+        // One projection for either scope: flow rows carry per-call counters,
+        // session rows carry the same counters CUMULATIVELY.
         let project = |seq: i64,
                        scope: &str,
                        scope_id: &str,
-                       out: Option<i64>,
-                       cost: Option<&str>| {
-            let cost_json = if let Some(c) = cost {
-                json!({"state":"known","value":{"amount":c,"currency":"USD"}})
-            } else {
-                json!({"state":"unknown","reason":"x","evidenceEventIds":[]})
-            };
+                       rev: i64,
+                       input: i64,
+                       out: i64,
+                       cache_read: i64,
+                       cache_write: i64,
+                       cost: &str,
+                       at: &str,
+                       turn: Option<&str>| {
+            let mut event = json!({
+                "kind":"usage",
+                "nativeAt":{"state":"known","value":at},
+                "payload":{
+                    "scope":scope,"scopeId":scope_id,"mode":"snapshot",
+                    "metricRevision":rev.to_string(),
+                    "inputTokens":{"state":"known","value":input.to_string()},
+                    "outputTokens":{"state":"known","value":out.to_string()},
+                    "cacheReadTokens":{"state":"known","value":cache_read.to_string()},
+                    "cacheWriteTokens":{"state":"known","value":cache_write.to_string()},
+                    "cost":{"state":"known","value":{"amount":cost,"currency":"USD"}},
+                    "accounting":"estimated",
+                }
+            });
+            if let Some(id) = turn {
+                event["source"] = json!({"nativeTurnId":{"state":"known","value":id}});
+            }
             let rec = JournalRecord {
                 instance_id: "ins_mix".into(),
                 seq,
                 event_id: format!("e{seq}"),
-                event: json!({
-                    "kind":"usage",
-                    "source":{"nativeTurnId":{"state":"known","value":"t1"}},
-                    "payload":{
-                        "scope":scope,"scopeId":scope_id,"mode":"snapshot","metricRevision":"1",
-                        "inputTokens":{"state":"known","value":"0"},
-                        "outputTokens": out.map(|n| json!({"state":"known","value":n.to_string()}))
-                            .unwrap_or_else(|| json!({"state":"unknown","reason":"x","evidenceEventIds":[]})),
-                        "cost": cost_json, "accounting":"estimated",
-                        "nativeAt":{"state":"known","value":at},
-                    }
-                }),
+                event,
                 observed_at: at.into(),
             };
             project_usage_event(&rec, Some("pvp_mix"), Some("gpt-5.4")).unwrap()
         };
-        // Turn 1: Message 10 + cumulative Session 10.
-        insert_row(&conn, &project(1, "message", "r1", Some(10), Some("0.10"))).unwrap();
-        let s1a = tokenless_session_record_for("ins_mix", 2, "s1", 1, Some("0.10"));
+        // Turn 1: additive Message (40/10, cache 100/5) and the cumulative
+        // Session point at the same totals (cost 0.10).
         insert_row(
             &conn,
-            &project_usage_event(&s1a, Some("pvp_mix"), Some("gpt-5.4")).unwrap(),
+            &project(
+                1,
+                "message",
+                "r1",
+                1,
+                40,
+                10,
+                100,
+                5,
+                "0.10",
+                &t1,
+                Some("t1"),
+            ),
         )
         .unwrap();
-        // Turn 2: Message 20 + cumulative Session 30.
-        insert_row(&conn, &project(3, "message", "r2", Some(20), Some("0.20"))).unwrap();
-        let s1b = tokenless_session_record_for("ins_mix", 4, "s1", 2, None);
         insert_row(
             &conn,
-            &project_usage_event(&s1b, Some("pvp_mix"), Some("gpt-5.4")).unwrap(),
+            &project(2, "session", "s1", 1, 40, 10, 100, 5, "0.10", &t1, None),
+        )
+        .unwrap();
+        // Turn 2: additive Message (60/20, cache 150/7) and the Session point
+        // now reporting the CUMULATIVE 100/30 (cache 250/12, cost 0.30).
+        insert_row(
+            &conn,
+            &project(
+                3,
+                "message",
+                "r2",
+                1,
+                60,
+                20,
+                150,
+                7,
+                "0.20",
+                &t2,
+                Some("t2"),
+            ),
+        )
+        .unwrap();
+        insert_row(
+            &conn,
+            &project(4, "session", "s1", 2, 100, 30, 250, 12, "0.30", &t2, None),
         )
         .unwrap();
 
+        // Both aggregates: one representation, never flow + cumulative stock.
         let agg = aggregate_instance(&conn, "ins_mix").unwrap();
-        assert_eq!(
-            agg.output_tokens, 30,
-            "10+20 Message, Session cumulative never added"
-        );
-        assert!((agg.cost_usd - 0.30).abs() < 1e-9);
+        assert_eq!(agg.input_tokens, 100, "40+60 Message, not +140 Session");
+        assert_eq!(agg.output_tokens, 30, "10+20 Message, not 10+10+20+30");
+        assert!((agg.cost_usd - 0.30).abs() < 1e-9, "cumulative cost 0.30");
+        let supply = aggregate_supply(&conn, "pvp_mix", "gpt-5.4").unwrap();
+        assert_eq!(supply.input_tokens, 100);
+        assert_eq!(supply.output_tokens, 30);
+        assert!((supply.cost_usd - 0.30).abs() < 1e-9);
+
+        // Rollup: one flow representation, session stock used only as the
+        // fallback (here flow covers it). Totals, cache and rates agree.
         let rollup = rollup_fold(&conn, "ins_mix", "codex", Some("gpt-5.4"))
             .unwrap()
             .unwrap();
+        assert_eq!(rollup.session_input_tokens, Some(100));
         assert_eq!(rollup.session_output_tokens, Some(30));
+        assert_eq!(rollup.cache_read_tokens, Some(250), "100+150, not +100+250");
+        assert_eq!(rollup.cache_creation_tokens, Some(12), "5+7, not +5+12");
+        assert_eq!(rollup.tpm_in_60s, Some(100), "flow rate window");
+        assert_eq!(rollup.tpm_out_60s, Some(30));
+        assert_eq!(rollup.tpm_out_5m, Some(6), "30 tokens / 5 minutes");
     }
 
     #[test]

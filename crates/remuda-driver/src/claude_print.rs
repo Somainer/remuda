@@ -1663,10 +1663,10 @@ impl ReservationGuard {
             // Enqueue while the worker is still parked on this ticket: the Emit
             // job sits behind it (and any already-queued frames) and is drained
             // only after the cancel wakes the worker past the ticket.
-            if let Some(publisher) = self.inner.publish.lock().await.clone() {
-                if publisher.send(PublishJob::Emit(vec![observation])).is_err() {
-                    debug!("publication gone; deferred settle dropped on close");
-                }
+            if let Some(publisher) = self.inner.publish.lock().await.clone()
+                && publisher.send(PublishJob::Emit(vec![observation])).is_err()
+            {
+                debug!("publication gone; deferred settle dropped on close");
             }
         }
         self.resolved = true;

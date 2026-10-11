@@ -1075,6 +1075,11 @@ fn failure_lifecycle(
             related_ids: BTreeMap::from([
                 ("paneId".into(), pane_id.into()),
                 ("lastError".into(), reason.into()),
+                // c-cardsettle-fu2 r1 item 2: the node's native_exit reads
+                // related_ids["reason"] first; without this the stored
+                // instance failure collapsed to "failed" even though
+                // status/lastError carried the real diagnostic.
+                ("reason".into(), reason.into()),
             ]),
             data_ref: None,
             severity: Severity::Error,

@@ -2732,13 +2732,26 @@ fn native_exit(observation: &remuda_protocol::Observation) -> Option<NativeExit>
         ProcessEndKind::Exited => "exited",
         ProcessEndKind::Failed => "failed",
     };
+    // c-cardsettle-fu2 r1 item 2: pick the REAL diagnostic in order —
+    // related_ids["reason"] (what generic_pty's failure_lifecycle stamps),
+    // then related_ids["lastError"], then a non-empty prose status; fall back
+    // to the literal state ("failed") only when none carries detail.
+    let status_value = match &native.status {
+        Knowledge::Known { value } if !value.trim().is_empty() => Some(value.as_str()),
+        _ => None,
+    };
+    let reason = native
+        .related_ids
+        .get("reason")
+        .or_else(|| native.related_ids.get("lastError"))
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or(status_value)
+        .unwrap_or(state)
+        .to_owned();
     Some(NativeExit {
         state: state.to_string(),
-        reason: native
-            .related_ids
-            .get("reason")
-            .cloned()
-            .unwrap_or_else(|| state.to_string()),
+        reason,
     })
 }
 
@@ -5795,6 +5808,97 @@ mod tests {
             );
             assert!(!gate.settled);
         }
+    }
+
+    /// c-cardsettle-fu2 r1 item 2: a generic-PTY pane exit carrying an exit
+    /// code in status + reason/lastError related ids flows through the REAL
+    /// native_exit classifier and record_native_exit, and the stored instance
+    /// failure reason is the real diagnostic — never the literal "failed".
+    #[test]
+    fn generic_pty_exit_code_is_the_stored_failure_reason() {
+        let instance_id = InstanceId::new();
+        let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(16));
+        store
+            .insert_instance(
+                fixture_instance(
+                    instance_id.clone(),
+                    HostId::new(),
+                    WorkspaceId::new(),
+                    DriverKind::ShellPty,
+                )
+                .expect("fixture instance"),
+            )
+            .expect("seed instance");
+
+        // The exact observation generic_pty::failure_lifecycle now emits when
+        // a pane exits with code 42.
+        let observation = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Session,
+            "exit",
+            "agent-01",
+            &[
+                ("paneId", "pane-1"),
+                ("lastError", "agent process exited with code 42"),
+                ("reason", "agent process exited with code 42"),
+            ],
+            remuda_protocol::Severity::Error,
+            true,
+            "agent process exited with code 42",
+        );
+
+        // 1) The real classifier picks the diagnostic.
+        let exit = native_exit(&observation).expect("a generic-PTY error exit is a process end");
+        assert_eq!(exit.state, "failed");
+        assert_eq!(
+            exit.reason, "agent process exited with code 42",
+            "native_exit must read the real reason, not default to failed"
+        );
+
+        // 2) record_native_exit stores it on the instance.
+        record_native_exit(store.as_ref(), &instance_id, &exit);
+        let stored = store.get_instance(&instance_id).expect("instance exists");
+        assert_eq!(stored.lifecycle, InstanceLifecycle::Failed);
+        assert_eq!(
+            stored.last_error.as_deref(),
+            Some("agent process exited with code 42"),
+            "the stored instance failure names the exit code, not \"failed\""
+        );
+    }
+
+    /// c-cardsettle-fu2 r1 item 2 fallback chain: without a reason field,
+    /// lastError is used; with neither, a non-empty prose status is used; only
+    /// a completely empty diagnostic falls back to "failed".
+    #[test]
+    fn native_exit_reason_falls_through_last_error_status() {
+        let mk = |related: &[(&str, &str)], status: &str| {
+            native_lifecycle_full(
+                remuda_protocol::LifecycleTopic::Session,
+                "exit",
+                "agent-02",
+                related,
+                remuda_protocol::Severity::Error,
+                true,
+                status,
+            )
+        };
+        // lastError used when reason absent.
+        let exit = native_exit(&mk(
+            &[
+                ("paneId", "p"),
+                ("lastError", "agent process killed by signal 9"),
+            ],
+            "pane exited",
+        ))
+        .unwrap();
+        assert_eq!(exit.reason, "agent process killed by signal 9");
+
+        // Non-empty prose status used when neither related field present.
+        let exit = native_exit(&mk(&[("paneId", "p")], "boom in stderr")).unwrap();
+        assert_eq!(exit.reason, "boom in stderr");
+
+        // Empty everything falls back to "failed".
+        let exit = native_exit(&mk(&[("paneId", "p")], "")).unwrap();
+        assert_eq!(exit.reason, "failed");
     }
 }
 

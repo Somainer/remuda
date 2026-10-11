@@ -781,6 +781,15 @@ pub(crate) struct TailAnchor {
     head: Option<HeadFingerprint>,
 }
 
+impl TailAnchor {
+    /// Whether this anchor was captured from a live (Fresh, no resume
+    /// boundary) tail. c-effortread r9 items 2/3: distinct from `current`.
+    #[must_use]
+    pub(crate) fn is_live_origin(&self) -> bool {
+        self.origin == TailOrigin::Live
+    }
+}
+
 #[derive(Debug)]
 struct ResumeState {
     /// File identity that must hold for reads past `start` to be trusted.

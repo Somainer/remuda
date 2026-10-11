@@ -1836,6 +1836,21 @@ fn epoch_mode(
     }
 }
 
+/// Resume mode a re-opened hydrator uses when continuing a captured anchor.
+///
+/// c-effortread r9 item 3: this keys on the anchor's ORIGIN, not on whether
+/// its gate was open. A LIVE (Fresh) anchor reopens as [`ResumeMode::Fresh`];
+/// a RESUME anchor — even a *verified* one currently reading Current — reopens
+/// in the session's OWN `epoch` mode. Otherwise a verified-resume X whose
+/// inode changed while inactive would continue-fail into `Hydrator::open` and
+/// fall back to Fresh, replaying X's history as current evidence.
+fn continuation_resume_mode(anchor: Option<&TailAnchor>, epoch: ResumeMode) -> ResumeMode {
+    match anchor {
+        Some(anchor) if anchor.is_live_origin() => ResumeMode::Fresh,
+        _ => epoch,
+    }
+}
+
 /// Boundary for a pid's FIRST session that has no pre-spawn capture.
 ///
 /// The decision is argv provenance, not the transcript size when the
@@ -2042,14 +2057,12 @@ async fn maintain_binding(
         let continue_anchor = read_anchors
             .get(&(found.pid, binding.session_id.clone()))
             .cloned();
-        let continue_live = continue_anchor
-            .as_ref()
-            .is_some_and(|anchor| anchor.current);
-        let continue_resume_mode = if continue_live {
-            ResumeMode::Fresh
-        } else {
-            mode
-        };
+        // c-effortread r9 item 3: key on the anchor's ORIGIN, not its
+        // gate-open flag — a verified resume currently reading Current must
+        // reopen in this session's own mode so a failed continuation (its
+        // inode changed while inactive) never falls back to Fresh and replays
+        // the resumed history as current.
+        let continue_resume_mode = continuation_resume_mode(continue_anchor.as_ref(), mode);
         *hydrator = Hydrator::open(
             ctx,
             &binding,
@@ -4031,6 +4044,94 @@ mod tests {
             .wait(generation, std::time::Duration::from_millis(150))
             .await;
         assert!(settled.is_none(), "the switch keeps waiting, never Applied");
+    }
+
+    /// c-effortread r9 item 3: a previously-CURRENT RESUME anchor X whose
+    /// inode changed while the session was inactive must NOT fall back to
+    /// Fresh on `/resume X` (that replayed X's history as current, so an old
+    /// verdict could resolve a newly armed switch). Continuation failing must
+    /// reopen against X's OWN boundary/unverified mode. The origin (live vs
+    /// resume) is distinct from the gate-open flag — a verified resume reads
+    /// Current but is still a resume origin.
+    #[tokio::test]
+    async fn r9_item3_resume_x_with_a_changed_inode_reopens_at_its_own_mode_not_fresh() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(tmp.path(), &assistant_line(Some("high"), 1));
+        // A proven pre-spawn EOF boundary anchors X; post-anchor content is
+        // verified Current, so the captured anchor is a CURRENT resume anchor
+        // (current=true) with a RESUME origin.
+        let boundary = crate::claude_transcript::ResumeBoundary::snapshot(&fx.binding.path)
+            .expect("verified pre-spawn snapshot");
+        let bridge = Arc::new(crate::effort::EffortBridge::new());
+        let mut hydrator = open_hydrator(&fx, ResumeMode::Boundary(boundary), Some(&bridge));
+        append_line(&fx.binding.path, &assistant_line(Some("xhigh"), 2));
+        pump_once(&mut hydrator, &fx).await;
+        assert!(
+            effort_rows(&drain(&mut fx))
+                .iter()
+                .any(|(name, _)| *name == Some(remuda_protocol::EffortName::Xhigh)),
+            "the post-boundary xhigh is verified Current"
+        );
+        let anchor = hydrator
+            .tail
+            .anchor()
+            .expect("the current resume tail yields an anchor");
+        assert!(
+            !anchor.is_live_origin(),
+            "a verified resume still has a RESUME origin even while current"
+        );
+
+        // Switch away to Z, then return: argv --resume X derives X's OWN mode
+        // (never time-verified) exactly as the poller does.
+        let row = ProcessRow {
+            pid: 7,
+            args: format!("claude --resume {PUMP_SESSION}"),
+        };
+        let found = crate::promote::detect(std::slice::from_ref(&row), None)
+            .expect("the exec argv detects as claude");
+        let mut launch = LaunchModeBinding::Unbound;
+        let x_mode = epoch_mode(&mut launch, None, None, &found);
+        assert!(
+            matches!(x_mode, ResumeMode::Unverified | ResumeMode::Boundary(_)),
+            "X's own returning mode is an unverified/boundary resume, not Fresh"
+        );
+
+        // While inactive X.jsonl is replaced (new inode) carrying a STALE
+        // verdict for max — history that must never become current evidence.
+        let stale = assistant_line(Some("max"), 3);
+        std::fs::write(&fx.binding.path, &stale).expect("X.jsonl rewritten to a new inode");
+
+        // The production continuation decision: even though the stored anchor
+        // was current, its RESUME origin means a failed continuation reopens in
+        // X's own mode, never Fresh.
+        let reopen_mode = continuation_resume_mode(Some(&anchor), x_mode);
+        assert!(
+            !matches!(reopen_mode, ResumeMode::Fresh),
+            "a resume anchor must not substitute Fresh on a failed continuation"
+        );
+
+        // Full reopen through the production Hydrator: continued() rejects the
+        // stale inode, so it opens X's own unverified EOF — the stale max
+        // history publishes nothing.
+        let mut returned = Hydrator::open(
+            &fx.ctx,
+            &fx.binding,
+            Some(&bridge),
+            None,
+            None,
+            None,
+            None,
+            reopen_mode,
+            Some(anchor),
+            None,
+        )
+        .expect("hydrator reopens at X's own boundary");
+        pump_once(&mut returned, &fx).await;
+        let rows = effort_rows(&drain(&mut fx));
+        assert!(
+            rows.is_empty(),
+            "X's replaced history must not publish as current: {rows:?}"
+        );
     }
 
     /// c-effortread r9 item 2: a Fresh (live) tail that is demoted and then

@@ -94,6 +94,10 @@ pub struct CodexAdapter {
     /// Process-wide same-cwd launch window for a driver launch. None for a
     /// promoted/attach adapter (no launch floor); released on bind/give-up.
     window: Option<crate::adapters::codex_discovery::DiscoveryWindow>,
+    /// Unique lifecycle owner for this adapter (r7 item 2). Every adapter —
+    /// promoted included — gets its own UUID at construction so two promoted
+    /// adapters never share the `hook:S` owner for the same indexed session.
+    lifecycle_owner: String,
 }
 
 impl CodexAdapter {
@@ -120,6 +124,7 @@ impl CodexAdapter {
             fallback_model: None,
             discovery_gave_up: false,
             window: None,
+            lifecycle_owner: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -182,12 +187,13 @@ impl CodexAdapter {
     /// driver launch, releases the same-cwd discovery window so a later
     /// launch is not tainted by this instance (c-usagefu r5 item 1).
     fn bind(&mut self, session_id: String, path: PathBuf, strict_launch: bool) -> bool {
-        // Owner of the claim: the driver launch's instance key; promoted
-        // attaches use an ephemeral hook-scoped owner and release on close.
+        // Owner of the claim: the driver launch's instance key when present;
+        // promoted attaches use their unique lifecycle_owner UUID (r7 item 2),
+        // so two promoted adapters never co-claim the same indexed session.
         let owner = self
             .instance_key
             .clone()
-            .unwrap_or_else(|| format!("hook:{session_id}"));
+            .unwrap_or_else(|| self.lifecycle_owner.clone());
         // Two adapters polling in parallel can race for the same file; a lost
         // claim means the candidate is someone else's — don't bind and don't
         // remember the id (r6 item 2).
@@ -678,8 +684,7 @@ impl Drop for CodexAdapter {
             && let Some(path) = binding.main_file
         {
             let key = crate::adapters::codex_discovery::claim_key_for(&path);
-            let owner = format!("hook:{}", binding.session_id);
-            crate::adapters::codex_discovery::release_claim_key(&key, &owner);
+            crate::adapters::codex_discovery::release_claim_key(&key, &self.lifecycle_owner);
         }
     }
 }

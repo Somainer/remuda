@@ -1359,3 +1359,44 @@ fn identical_prompts_late_opening_window_does_not_cross_bind() {
     assert!(!a.discover().unwrap());
     assert!(a.binding().is_none());
 }
+
+// c-usagefu r7 item 2: promoted adapters have unique lifecycle owners ----
+
+#[test]
+fn two_promoted_adapters_cannot_co_claim_the_same_indexed_session() {
+    // Both adapters have no launch floor (promoted/hand-run); the newest
+    // indexed session resolves to the same file. Only one must bind.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = home.path();
+    let session_dir = home.path().join("sessions/2026/09/14");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    std::fs::write(
+        session_dir.join("rollout-shared.jsonl"),
+        "{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"id\":\"shared-s\",\"session_id\":\"shared-s\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join("session_index.jsonl"),
+        "{\"id\":\"shared-s\"}\n",
+    )
+    .unwrap();
+
+    let mut first = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: cwd.to_path_buf(),
+        pid: None,
+        launched_at: None,
+    });
+    let mut second = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: cwd.to_path_buf(),
+        pid: None,
+        launched_at: None,
+    });
+    assert!(first.discover().unwrap(), "first promoted adapter binds");
+    assert!(
+        !second.discover().unwrap(),
+        "second promoted adapter must not co-claim the same file"
+    );
+    assert!(second.binding().is_none());
+}

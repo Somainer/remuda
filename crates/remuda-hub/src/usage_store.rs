@@ -801,16 +801,17 @@ fn session_stock_increments(
     diff_rows(scoped)
 }
 
-/// One ordered cumulative-session point: the two rate buckets, its native
-/// end time and the session scope id (NULL for legacy rows).
-type SessionPointRow = (Option<i64>, Option<i64>, String, Option<String>);
+/// One ordered cumulative-session point: the two rate buckets, its observed
+/// time, the session scope id (NULL for legacy rows) and the time source.
+type SessionPointRow = (Option<i64>, Option<i64>, String, Option<String>, String);
 
-/// Ordered session points; scoped or legacy NULL-scope only.
-/// Ordered session points; scoped or legacy NULL-scope only. Rate windows
-/// (c-ctxusage r8 item 9) may use NATIVE timestamps only: a timestamp-free
-/// historical replay is stamped with the ingest time and would otherwise look
-/// like current throughput. Legacy rows are conservatively 'ingest' and
-/// therefore produce no trustworthy increments.
+/// Ordered session points; scoped or legacy NULL-scope only. EVERY accepted
+/// point is walked — including ingest-stamped historical replays — because a
+/// timestamp-free replay still ADVANCES the cumulative baseline: skipping it
+/// made the next native point diff against a stale stock and inflate a single
+/// increment (native 100 → untimed 120, 140 → native 150 read as +50 instead
+/// of the true +10). Only the increment EMISSION is native-gated
+/// (c-ctxusage r9 item 3).
 fn session_point_rows(
     conn: &Connection,
     instance_id: &str,
@@ -822,29 +823,43 @@ fn session_point_rows(
         "scope_id IS NULL"
     };
     let sql = format!(
-        "SELECT input_tokens, output_tokens, observed_at, scope_id
+        "SELECT input_tokens, output_tokens, observed_at, scope_id, observed_at_source
          FROM usage_events
          WHERE instance_id = ?1 AND scope = 'session' AND {predicate}
-           AND observed_at_source = 'native'
          ORDER BY scope_id ASC, observed_at ASC, seq ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
     stmt.query_map(params![instance_id], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        ))
     })?
     .collect()
 }
 
-/// Diff ordered points, restarting the chain at every scope boundary.
+/// Diff ordered points, restarting the chain at every scope boundary. Every
+/// point advances the predecessor baseline; an increment is emitted ONLY for
+/// a NATIVE-timed point against its IMMEDIATE predecessor (whatever that
+/// predecessor's source), and only when the predecessor exists. A native
+/// point with no predecessor, or an interval whose predecessor counters are
+/// unknown, yields no increment — the interval is unknown, never the stock
+/// (c-ctxusage r9 item 3).
 fn diff_rows(rows: Vec<SessionPointRow>) -> rusqlite::Result<Vec<StockIncrement>> {
     let mut increments = Vec::new();
     let mut previous: Option<(Option<String>, Option<i64>, Option<i64>)> = None;
-    for (input, output, end_at, scope_id) in rows {
+    for (input, output, end_at, scope_id, source) in rows {
         let boundary = previous
             .as_ref()
             .map(|(prev_scope, _, _)| *prev_scope != scope_id)
             .unwrap_or(true);
-        if !boundary && let Some((_, prev_input, prev_output)) = &previous {
+        if !boundary
+            && source == "native"
+            && let Some((_, prev_input, prev_output)) = &previous
+        {
             let bucket = |current: Option<i64>, previous: Option<i64>| -> Option<i64> {
                 match (current, previous) {
                     (Some(current), Some(previous)) => Some(if current < previous {
@@ -862,6 +877,8 @@ fn diff_rows(rows: Vec<SessionPointRow>) -> rusqlite::Result<Vec<StockIncrement>
                 end_at,
             });
         }
+        // Every accepted point — ingest or native — is the next point's
+        // immediate baseline.
         previous = Some((scope_id, input, output));
     }
     Ok(increments)
@@ -3360,9 +3377,110 @@ mod tests {
         );
         assert_eq!(
             rollup.tpm_in_60s,
-            Some(50),
-            "increment between native stocks 100 -> 150, replay points ignored"
+            Some(10),
+            "150 minus the IMMEDIATE predecessor 140 (an ingest replay that \
+             still advances the baseline); not 150 minus the stale native 100"
         );
-        assert_eq!(rollup.tpm_out_60s, Some(5));
+        assert_eq!(rollup.tpm_out_60s, Some(1));
+    }
+
+    /// c-ctxusage r9 item 3: ingest-stamped replay points still walk the
+    /// cumulative chain as baselines; only increment EMISSION is native
+    /// gated. The real Codex adapter emits a native-timed Turn snapshot
+    /// BESIDE every Session snapshot (codex_adapter end_turn), so the test
+    /// includes the Turn row too and proves it never enters the session
+    /// stock diff.
+    #[test]
+    fn ingest_replay_points_advance_the_session_diff_baseline() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let now = {
+            let t = time::OffsetDateTime::now_utc();
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                t.year(),
+                u8::from(t.month()),
+                t.day(),
+                t.hour(),
+                t.minute(),
+                t.second(),
+                t.millisecond()
+            )
+        };
+        // Native live point, then two timestamp-free replay growth points,
+        // then a fresh native live point — exactly the r8 shape.
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                1,
+                "ins_cx",
+                "session",
+                Some("c1"),
+                1,
+                100,
+                10,
+                0,
+                0,
+                Some("2026-09-14T12:00:00.000Z")
+            )
+        ));
+        assert!(insert(
+            &conn,
+            &scoped_record(2, "ins_cx", "session", Some("c1"), 2, 120, 12, 0, 0, None)
+        ));
+        assert!(insert(
+            &conn,
+            &scoped_record(3, "ins_cx", "session", Some("c1"), 3, 140, 14, 0, 0, None)
+        ));
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                4,
+                "ins_cx",
+                "session",
+                Some("c1"),
+                4,
+                150,
+                15,
+                0,
+                0,
+                Some(&now)
+            )
+        ));
+        // The Turn snapshot the real Codex adapter emits beside the Session
+        // snapshot at the same turn end (native time, per-call flow).
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                5,
+                "ins_cx",
+                "turn",
+                Some("msg_cx_t1"),
+                1,
+                7,
+                2,
+                0,
+                0,
+                Some(&now)
+            )
+        ));
+
+        let increments = session_stock_increments(&conn, "ins_cx").unwrap();
+        // Only the final native point emits, diffed against its IMMEDIATE
+        // predecessor (the ingest 140), not the stale native 100: 10, not 50.
+        assert_eq!(increments.len(), 1, "one native-ended interval");
+        assert_eq!(increments[0].input, Some(10));
+        assert_eq!(increments[0].output, Some(1));
+        assert_eq!(increments[0].end_at, now);
+
+        // With a Turn row present the rollup rates come from the per-call
+        // turn flow; the session stock stays the current 150/15 regardless.
+        let rollup = rollup_instance(&conn, "ins_cx", "codex", Some("codex"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_input_tokens, Some(150));
+        assert_eq!(rollup.session_output_tokens, Some(15));
+        assert_eq!(rollup.tpm_in_60s, Some(7));
+        assert_eq!(rollup.tpm_out_60s, Some(2));
     }
 }

@@ -703,11 +703,15 @@ impl ClaudePrintDriver {
         PublishMutexHold(self.inner.publish.lock().await)
     }
 
-    /// Test-only (`test-stub`, r10 item 3): hold the `write_seq` lock
-    /// directly, so a test can deterministically queue a stale cleanup BEHIND
-    /// a later send and prove ordering. Drop the returned hold to release.
+    /// Test-only (`test-stub`, r10 item 3; r11 item 4b): hold the `write_seq`
+    /// lock directly, so a test can deterministically queue a stale cleanup
+    /// BEHIND a later send and prove ordering. Notes a write_seq wait like the
+    /// send path, so a test can ACKNOWLEDGE this holder parked behind queued
+    /// sends (count includes the holder) before it aborts the suspended send.
+    /// Drop the returned hold to release.
     #[cfg(feature = "test-stub")]
     pub async fn hold_write_seq_for_test(&self) -> WriteSeqHold<'_> {
+        test_barrier::note_write_seq_wait(&self.inner.barrier);
         WriteSeqHold(self.inner.write_seq.lock().await)
     }
 
@@ -2057,6 +2061,10 @@ pub mod test_barrier {
         /// The reader enqueued a frame (the child's result) behind the parked
         /// ticket.
         result_queued: AtomicBool,
+        /// r11 item 4(a): total RESULT frames the reader enqueued. Unlike the
+        /// one-shot `result_queued` flag, this acknowledges specific results
+        /// (e.g. C's answer) BEFORE a natural child kill queues StdoutEof.
+        result_enqueued_count: AtomicUsize,
         /// Number of Reserve tickets the send task has enqueued.
         reserve_enqueued: AtomicUsize,
         /// Gates the SEND task parked in `hold_write_commit`.
@@ -2130,6 +2138,7 @@ pub mod test_barrier {
             write_reached: AtomicBool::new(false),
             reserve_parked: AtomicBool::new(false),
             result_queued: AtomicBool::new(false),
+            result_enqueued_count: AtomicUsize::new(0),
             reserve_enqueued: AtomicUsize::new(0),
             send_released: AtomicBool::new(false),
             send_release: tokio::sync::Notify::new(),
@@ -2244,6 +2253,7 @@ pub mod test_barrier {
     pub(super) fn note_frame_enqueued(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.result_queued.store(true, Ordering::Release);
+            state.result_enqueued_count.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -2439,6 +2449,26 @@ pub mod test_barrier {
                 }
                 if tokio::time::Instant::now() >= deadline {
                     panic!("write_commit barrier: timed out waiting for stdout EOF to be queued");
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// r11 item 4(a): wait until the READER has enqueued `n` Result frames
+        /// (behind the parked/held tickets), so a natural EOF provoked after
+        /// this is provably queued behind those results, not ahead of them.
+        pub async fn wait_until_results_enqueued(&self, n: usize, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.result_enqueued_count.load(Ordering::Acquire) >= n {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "write_commit barrier: timed out waiting for {n} results to be enqueued \
+                         (enqueued={})",
+                        self.state.result_enqueued_count.load(Ordering::Acquire)
+                    );
                 }
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }

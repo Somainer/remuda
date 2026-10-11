@@ -1880,6 +1880,14 @@ async fn aborting_a_suspended_b_does_not_let_c_result_pop_a_phantom_b() {
         drop(hold);
     });
 
+    // r11 item 4(b): ACKNOWLEDGE X has actually queued for write_seq (behind C)
+    // BEFORE B is aborted — count 3 (B, C, X all reached the lock await). This
+    // is what puts the old detached cleanup behind X; without it the abort only
+    // hoped X was in line.
+    barrier
+        .wait_until_write_seq_waits(3, Duration::from_secs(5))
+        .await;
+
     // Abort B: write_seq transfers C -> X -> (old detached cleanup). Open ALL
     // worker/send gates so C's frames map up to its result: B's reservation is
     // consumed at its ticket position (fixed arm) before C maps; the old no-op
@@ -1955,7 +1963,11 @@ async fn aborting_while_parked_on_the_publish_mutex_leaves_no_phantom_reservatio
 
     // Hold the publish mutex (a concurrent fence/close does the same), then
     // send B. Under the fix B parks on the mutex BEFORE its book entry opens.
-    let publish_hold = driver.hold_publish_mutex_for_test().await;
+    // r11 item 4(d): the acquisition itself is bounded with a named failure.
+    let publish_hold =
+        tokio::time::timeout(Duration::from_secs(5), driver.hold_publish_mutex_for_test())
+            .await
+            .expect("publish mutex hold within 5s");
     let db = driver.clone();
     let send_b = tokio::spawn(async move { db.send(prompt_id("second", "msg-b")).await });
     barrier
@@ -1991,7 +2003,11 @@ async fn aborting_while_parked_on_the_publish_mutex_leaves_no_phantom_reservatio
         .await;
 
     // Count ALL starts/settlements through one acknowledged fence drain.
-    let fence = driver.publication_fence().await;
+    // r11 item 4(d): bound the fence acquisition (it takes the publish mutex)
+    // separately from the drain.
+    let fence = tokio::time::timeout(Duration::from_secs(5), driver.publication_fence())
+        .await
+        .expect("publication fence enqueued within 5s");
     let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
 
     assert_eq!(
@@ -2078,25 +2094,41 @@ async fn cancelling_b_emits_a_settlement_at_its_ticket_position_before_c_starts(
     barrier
         .wait_until_reserves_enqueued(3, Duration::from_secs(5))
         .await;
-    // C parked at the pre-ack gate; open it so C writes after the rollback gate
-    // is released.
+    // C parked at the pre-ack gate; open it so C writes and the fake answers
+    // turn 2 while the worker is STILL parked at B's cancelled ticket.
     barrier.release_write_ack();
-
-    // Release the rollback: fixed code emits A's correction at B's position,
-    // i.e. before the worker visits C's ticket and emits start_C.
-    barrier.release_cancelled_ticket();
     tokio::time::timeout(Duration::from_secs(5), send_c)
         .await
         .expect("send_c task within 5s")
         .expect("send_c joined")
-        .expect("C sends after B cancelled");
-    // Acknowledge C's result is mapped (A's was count 1) before fencing so the
-    // fence cannot overtake C's live frames.
+        .expect("C writes and commits after B cancelled");
+    // r11 item 4(a): ACKNOWLEDGE C's result frame is ENQUEUED (reader side,
+    // count 2: A then C) before provoking the natural EOF — the EOF must queue
+    // behind result_C, not overtake it.
     barrier
-        .wait_until_results_mapped(2, Duration::from_secs(5))
+        .wait_until_results_enqueued(2, Duration::from_secs(5))
         .await;
 
-    let fence = driver.publication_fence().await;
+    // r11 item 4(a): provoke a NATURAL stdout EOF while the rollback is still
+    // pending at B's cancelled ticket. SIGKILL closes the child's stdout; the
+    // reader seals admission and queues StdoutEof behind result_C. ACKNOWLEDGE
+    // the EOF is queued before the rollback is released, so the queue is
+    // provably [B ticket(parked), C ticket, result_C, StdoutEof].
+    driver.kill().await.expect("kill the fake child");
+    barrier
+        .wait_until_stdout_eof_queued(Duration::from_secs(5))
+        .await;
+
+    // Release the rollback with the EOF already queued: the fixed code emits
+    // A's correction at B's position — before C's start, result_C and the
+    // terminal exited — then drains to the EOF.
+    barrier.release_cancelled_ticket();
+
+    // r11 item 4(d): bound the fence acquisition (it takes the publish mutex)
+    // separately from the acknowledged drain.
+    let fence = tokio::time::timeout(Duration::from_secs(5), driver.publication_fence())
+        .await
+        .expect("publication fence enqueued within 5s");
     let mut all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
 
     assert_eq!(
@@ -2130,30 +2162,40 @@ async fn cancelling_b_emits_a_settlement_at_its_ticket_position_before_c_starts(
         "A's settlement is emitted at B's ticket position, BEFORE C's start \
          (correction={correction}, start_c={start_c}): {all:?}"
     );
-
-    // Close and drain to EOF: no settlement/correction may follow the
-    // session/exited observation (a tail-appended correction could).
-    drop(barrier);
-    let _ = driver.close().await;
-    while let Some(obs) = tokio::time::timeout(Duration::from_secs(5), handle.recv())
-        .await
-        .ok()
-        .flatten()
-    {
-        all.push(obs);
-    }
+    // The natural EOF was interleaved with the pending rollback: its exited
+    // observation is already in the fence-drained sequence.
     let exited = first_where(&all, |o| {
         lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("exited")
     });
     assert!(
         correction < exited,
-        "A's correction precedes the session exit: {all:?}"
+        "A's correction precedes the natural session exit: {all:?}"
     );
-    assert!(
-        all[exited + 1..]
-            .iter()
-            .all(|o| lifecycle_named(o) != Some("result")),
-        "no result/settlement is published after StdoutEof: {all:?}"
+
+    // r11 item 4(c): close seals the events channel; collect the tail to recv
+    // None inside ONE overall timeout and REQUIRE the None to arrive — a 5 s
+    // quiet period must never be mistaken for EOF.
+    drop(barrier);
+    let _ = driver.close().await;
+    let drain_to_none = async {
+        while let Some(obs) = handle.recv().await {
+            all.push(obs);
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), drain_to_none)
+        .await
+        .expect("events channel reaches recv=None after natural EOF and close");
+
+    // Re-locate exited in the completed sequence and demand it be the LAST
+    // observation: nothing — no correction, no result — follows the terminal
+    // state (a tail-appended correction would land here).
+    let exited = first_where(&all, |o| {
+        lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("exited")
+    });
+    assert_eq!(
+        exited + 1,
+        all.len(),
+        "nothing is published after the natural exited observation: {all:?}"
     );
 }
 

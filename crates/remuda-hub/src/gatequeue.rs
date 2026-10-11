@@ -122,8 +122,13 @@ pub struct GateApplyBarrier {
     /// When false arrivals pass straight through (every other test).
     armed: std::sync::atomic::AtomicBool,
     parked: std::sync::atomic::AtomicUsize,
+    /// Signalled each time an arrival parks (no sleeps in wait_parked).
+    parked_notify: tokio::sync::Notify,
     fired: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
+    /// apply_result calls fully returned, and their notify.
+    completed: std::sync::atomic::AtomicUsize,
+    completed_notify: tokio::sync::Notify,
 }
 
 #[cfg(any(test, feature = "test-faults"))]
@@ -132,14 +137,18 @@ impl GateApplyBarrier {
         Self {
             armed: std::sync::atomic::AtomicBool::new(false),
             parked: std::sync::atomic::AtomicUsize::new(0),
+            parked_notify: tokio::sync::Notify::new(),
             fired: std::sync::atomic::AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
+            completed: std::sync::atomic::AtomicUsize::new(0),
+            completed_notify: tokio::sync::Notify::new(),
         }
     }
 
     /// Start gating arrivals (resets counters/fire).
     pub fn arm(&self) {
         self.parked.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.completed.store(0, std::sync::atomic::Ordering::SeqCst);
         self.fired.store(false, std::sync::atomic::Ordering::SeqCst);
         self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -160,18 +169,23 @@ impl GateApplyBarrier {
         }
     }
 
-    /// Wait until `n` arrivals have parked at the pre-read boundary.
+    /// Wait until `n` arrivals have parked. Latch-driven (no sleeps): each
+    /// parking arrival notifies, and the notified future is constructed
+    /// before the counter read.
     pub async fn wait_parked(&self, n: usize) {
-        for _ in 0..1000 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let notified = self.parked_notify.notified();
             if self.parked.load(std::sync::atomic::Ordering::SeqCst) >= n {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                panic!(
+                    "only {} arrivals parked (wanted {n})",
+                    self.parked.load(std::sync::atomic::Ordering::SeqCst)
+                );
+            }
         }
-        panic!(
-            "only {} arrivals parked (wanted {n})",
-            self.parked.load(std::sync::atomic::Ordering::SeqCst)
-        );
     }
 
     /// Park until released. The notified future is created BEFORE the flag
@@ -183,6 +197,7 @@ impl GateApplyBarrier {
         }
         self.parked
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.parked_notify.notify_waiters();
         let notified = self.notify.notified();
         if self.fired.load(std::sync::atomic::Ordering::Acquire) {
             return;
@@ -192,6 +207,31 @@ impl GateApplyBarrier {
             .is_err()
         {
             panic!("gate apply barrier never released");
+        }
+    }
+
+    /// Count an apply_result call that has FINISHED its whole path (r11 item 7:
+    /// tests wait for both arrivals before asserting).
+    pub fn note_completed(&self) {
+        self.completed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.completed_notify.notify_waiters();
+    }
+
+    /// Wait until `n` apply_result calls have fully returned (no sleeps).
+    pub async fn wait_completed(&self, n: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let notified = self.completed_notify.notified();
+            if self.completed.load(std::sync::atomic::Ordering::SeqCst) >= n {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                panic!(
+                    "only {} apply_result calls completed (wanted {n})",
+                    self.completed.load(std::sync::atomic::Ordering::SeqCst)
+                );
+            }
         }
     }
 }
@@ -1051,10 +1091,14 @@ pub(crate) async fn on_event(
 /// running/canceling job transitions. `pub(crate)` for the deterministic
 /// pre-read-vs-writer race test in the initiator suite.
 pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
+    #[cfg(any(test, feature = "test-faults"))]
+    let barrier = state.store.gate_apply_barrier();
     // The terminal `finished` event and the `gate.run` reply carry the same
     // verdict; this read makes the second arrival a no-op before it would
     // replace the stored log object.
     let Some(existing) = state.store.get_gate_job(job_id).await.ok().flatten() else {
+        #[cfg(any(test, feature = "test-faults"))]
+        barrier.note_completed();
         return;
     };
     // GENERATION FENCE: a verdict belongs to the attempt that produced it.
@@ -1069,12 +1113,16 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
             current_attempt = existing.attempts,
             "dropping gate verdict for a non-current attempt"
         );
+        #[cfg(any(test, feature = "test-faults"))]
+        barrier.note_completed();
         return;
     }
     if !matches!(
         existing.state,
         GateJobState::Running | GateJobState::Canceling
     ) {
+        #[cfg(any(test, feature = "test-faults"))]
+        barrier.note_completed();
         return;
     }
     // Test-only pre-read barrier: park here (row confirmed live + generation
@@ -1309,6 +1357,10 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
         })
         .await;
     let Ok(Some(job)) = outcome else {
+        // Writer stood down (terminal guard / duplicate / generation mismatch
+        // inside the closure). Count it as completed for barrier tests.
+        #[cfg(any(test, feature = "test-faults"))]
+        barrier.note_completed();
         return;
     };
     // A claimed handoff: verified on the lane, now push from the home host.
@@ -1354,6 +1406,10 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
     if job.state == GateJobState::Landed {
         run_then_hook(state, &job).await;
     }
+    // r11 item 7: let tests that park arrivals know the full apply path
+    // (persist + writer + side effects) has returned.
+    #[cfg(any(test, feature = "test-faults"))]
+    barrier.note_completed();
 }
 
 /// Serialize and store the bounded run log as an `obj_…` gate log object.

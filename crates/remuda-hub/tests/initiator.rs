@@ -2383,6 +2383,7 @@ async fn the_finished_event_and_the_gate_run_reply_both_feed_the_real_log_path()
         "method": "gate.event",
         "params": {
             "jobId": job_id,
+            "generation": 1,
             "kind": "finished",
             "result": failed_gate_result(&job_id, job_seed),
         }
@@ -2402,17 +2403,17 @@ async fn the_finished_event_and_the_gate_run_reply_both_feed_the_real_log_path()
     // guard.
     barrier.release();
 
-    // Wait for the terminal commit.
-    let mut object_id = None;
-    for _ in 0..100 {
-        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-        if doc["state"] == json!("failed") && doc["logObjectId"].is_string() {
-            object_id = Some(doc["logObjectId"].as_str().unwrap().to_owned());
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    let object_id = object_id.expect("the job never settled Failed with a log object");
+    // r11 item 7: wait for BOTH apply_result calls to fully return before
+    // reading the lookup routes (no premature assertion on one arrival).
+    barrier.wait_completed(2).await;
+
+    // The terminal commit is present and the reference resolvable.
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("failed"), "{doc}");
+    let object_id = doc["logObjectId"]
+        .as_str()
+        .expect("the job never settled Failed with a log object")
+        .to_owned();
     assert!(object_id.starts_with("obj_"), "{object_id}");
 
     // The gate.run frame really crossed the link.

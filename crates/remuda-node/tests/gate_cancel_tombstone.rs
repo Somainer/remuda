@@ -396,3 +396,66 @@ async fn after_local_state_is_lost_the_hub_fence_still_refuses() {
     );
     assert!(!repo.exists(), "no git after Hub refusal");
 }
+
+/// r11 item 7: at capacity, the refused NEW job's cancel is not recorded, so a
+/// later delayed dispatch for it is NOT blocked by the local floor (it reaches
+/// the Hub-authorize stage; with no carrier it falls through to execution and
+/// fails on git — proving nothing was silently evicted/recorded). The tracked
+/// full-capacity jobs still refuse their dispatch by the floor and never push.
+#[tokio::test]
+async fn at_capacity_a_refused_cancel_does_not_block_a_later_dispatch() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+    for i in 0..4096u32 {
+        gate_rpc(
+            &node,
+            "gate.cancel",
+            json!({ "jobId": format!("gjb_cap2_{i}"), "generation": 1 }),
+        )
+        .await;
+    }
+    // Overflow job's cancel is refused.
+    assert!(
+        node.dispatch_gate_rpc(
+            "gate.cancel",
+            &json!({ "jobId": "gjb_cap2_overflow", "generation": 1 }),
+        )
+        .await
+        .is_err()
+    );
+
+    // (1) a tracked at-capacity job's dispatch is refused by the floor and
+    // never reaches git.
+    let tracked_repo = dir.path().join("tracked-no-push");
+    let tracked = gate_rpc(
+        &node,
+        "gate.run",
+        run_params("gjb_cap2_0", "lane-cap-tracked", &tracked_repo, 1),
+    )
+    .await;
+    assert_eq!(
+        tracked["status"],
+        json!("canceled"),
+        "the tracked job's dispatch must be refused before git: {tracked}"
+    );
+    assert!(
+        !tracked_repo.exists(),
+        "refused dispatch must not create the checkout"
+    );
+
+    // (2) the overflow job (no record) is NOT blocked by the local floor:
+    // with no carrier attached it executes (and fails on the missing repo —
+    // not canceled), proving the refused cancel recorded nothing.
+    let overflow_repo = dir.path().join("overflow-runs");
+    let overflow = gate_rpc(
+        &node,
+        "gate.run",
+        run_params("gjb_cap2_overflow", "lane-cap-overflow", &overflow_repo, 1),
+    )
+    .await;
+    assert_ne!(
+        overflow["status"],
+        json!("canceled"),
+        "the refused cancel must not block the overflow dispatch: {overflow}"
+    );
+}

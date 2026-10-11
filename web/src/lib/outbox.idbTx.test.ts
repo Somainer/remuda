@@ -26,16 +26,28 @@ class FakeTransaction {
   oncomplete: ((ev: unknown) => void) | null = null;
   onabort: ((ev: unknown) => void) | null = null;
   onerror: ((ev: unknown) => void) | null = null;
+  /** Resolved when the db grants this tx its serialized start. */
+  readonly started: Promise<void>;
+  private startedResolve!: () => void;
   error: Error | null = null;
   readonly db: FakeDb;
   readonly mode: IDBTransactionMode;
   aborted = false;
   private settled = false;
   private pending = 0;
+  private readonly onEnd: () => void;
 
-  constructor(db: FakeDb, mode: IDBTransactionMode) {
+  constructor(db: FakeDb, mode: IDBTransactionMode, onEnd: () => void) {
     this.db = db;
     this.mode = mode;
+    this.onEnd = onEnd;
+    this.started = new Promise<void>((r) => {
+      this.startedResolve = r;
+    });
+  }
+
+  grantStart() {
+    this.startedResolve();
   }
 
   objectStore(_name: string) {
@@ -49,10 +61,14 @@ class FakeTransaction {
   /** A request reached its terminal microtask; auto-commit when all settle. */
   requestSettled() {
     this.pending -= 1;
-    if (this.pending === 0 && !this.settled && !this.aborted) {
+    if (this.pending !== 0) return;
+    if (!this.settled && !this.aborted) {
       this.settled = true;
       queueMicrotask(() => this.oncomplete?.({ target: this }));
     }
+    // All requests settled and the tx ended (committed or aborted) — release
+    // the db readwrite slot so a queued transaction can start.
+    this.onEnd();
   }
 
   abort = () => {
@@ -73,40 +89,43 @@ class FakeObjectStore {
 
   private finish(req: FakeRequest, prepare: () => void, commit: () => void, opts?: { gateCommit?: boolean }) {
     this.tx.beginRequest();
-    // The request completes WITH its result on an earlier turn than the
-    // transaction outcome — exactly the window the write must not trust.
-    queueMicrotask(() => {
-      prepare();
-      try {
-        req.onsuccess?.({ target: req });
-      } catch (err) {
-        // Real IndexedDB aborts the transaction when an event handler throws.
-        queueMicrotask(() => {
-          this.tx.error = err instanceof Error ? err : new Error(String(err));
-          this.tx.abort();
-          this.tx.requestSettled();
-        });
-        return;
-      }
-      queueMicrotask(async () => {
+    // Requests only run once the transaction is granted its serialized start.
+    void this.tx.started.then(() => {
+      // The request completes WITH its result on an earlier turn than the
+      // transaction outcome — exactly the window the write must not trust.
+      queueMicrotask(() => {
+        prepare();
         try {
-          if (this.tx.aborted) return;
-          if (this.db.abortNextAfterRequest) {
-            this.db.abortNextAfterRequest = false;
-            this.db.requestSucceededBeforeAbort = true;
+          req.onsuccess?.({ target: req });
+        } catch (err) {
+          // Real IndexedDB aborts the transaction when an event handler throws.
+          queueMicrotask(() => {
+            this.tx.error = err instanceof Error ? err : new Error(String(err));
             this.tx.abort();
-            return;
-          }
-          // WRITE commits wait on the disposal gate (reads never do) so a
-          // transaction can be suspended post-request, pre-commit.
-          if (opts?.gateCommit && this.db.commitGate) {
-            await this.db.commitGate;
-            if (this.tx.aborted) return;
-          }
-          commit();
-        } finally {
-          this.tx.requestSettled();
+            this.tx.requestSettled();
+          });
+          return;
         }
+        queueMicrotask(async () => {
+          try {
+            if (this.tx.aborted) return;
+            if (this.db.abortNextAfterRequest) {
+              this.db.abortNextAfterRequest = false;
+              this.db.requestSucceededBeforeAbort = true;
+              this.tx.abort();
+              return;
+            }
+            // WRITE commits wait on the disposal gate (reads never do) so a
+            // transaction can be suspended post-request, pre-commit.
+            if (opts?.gateCommit && this.db.commitGate) {
+              await this.db.commitGate;
+              if (this.tx.aborted) return;
+            }
+            commit();
+          } finally {
+            this.tx.requestSettled();
+          }
+        });
       });
     });
   }
@@ -156,6 +175,14 @@ class FakeObjectStore {
 class FakeDb {
   readonly rows = new Map<string, OutboxRecord>();
   private readonly names = new Set<string>();
+  /**
+   * Real IndexedDB serializes overlapping readwrite transactions on one
+   * database: a new readwrite transaction does NOT begin until prior
+   * readwrite transactions finish. This pending queue models that, so a
+   * contended lease tx starts only after the holder's deliverer releases.
+   */
+  private pendingStart: (() => void)[] = [];
+  private activeReadwrite = 0;
   /** Test switch: abort the NEXT transaction after its request succeeds. */
   abortNextAfterRequest = false;
   /** Recorded proof the request succeeded before the abort arrived. */
@@ -175,9 +202,29 @@ class FakeDb {
     return { contains: (n: string) => names.has(n) };
   }
 
+  private waitForSerialStart(mode: IDBTransactionMode): Promise<void> {
+    if (mode === "readonly" || this.activeReadwrite === 0) {
+      this.activeReadwrite += 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      this.pendingStart.push(() => {
+        this.activeReadwrite += 1;
+        resolve();
+      });
+    });
+  }
+
+  endTransaction() {
+    this.activeReadwrite -= 1;
+    this.pendingStart.shift()?.();
+  }
+
   transaction(name: string | string[], mode: IDBTransactionMode) {
     void name;
-    return new FakeTransaction(this, mode) as unknown as IDBTransaction;
+    const tx = new FakeTransaction(this, mode, () => this.endTransaction()) as unknown as FakeTransaction;
+    void this.waitForSerialStart(mode).then(() => tx.grantStart());
+    return tx as unknown as IDBTransaction;
   }
 }
 
@@ -235,6 +282,105 @@ it("a write whose request succeeds but whose transaction aborts afterwards is no
   // A follow-up transaction in a new attempt commits normally.
   await storage.put(probeRecord("cmd_retry_ok"));
   expect((await storage.all()).map((r) => r.commandId)).toContain("cmd_retry_ok");
+});
+
+it("GATE15 item 1: two cloned-owner documents without Web Locks are mutually excluded by the instance lease — exactly one POST", async () => {
+  // Two documents that cloned sessionStorage share the PERSISTED owner id;
+  // without Web Locks they must still serialize on the durable instance
+  // mutex, whose identity is a fresh per-document token.
+  const db = installFakeIndexedDB();
+  const opened = await openOutboxStorage();
+  const storage = opened.storage;
+  const originalLocks = (globalThis.navigator as { locks?: LockManager }).locks;
+  Object.defineProperty(globalThis.navigator, "locks", { value: undefined, configurable: true });
+  try {
+    const owner = "owner_clone_mutex";
+    const a = await Outbox.load(storage, owner);
+    const b = await Outbox.load(storage, owner); // cloned owner, fresh token
+    await a.enqueue({
+      commandId: "cmd_mutex",
+      clientRequestId: "local_mutex",
+      instanceId: "ins_mutex",
+      prompt: "once",
+      createdAt: 1_000,
+      attempts: 0,
+      state: "pending",
+    });
+
+    // Observe refused lease claims deterministically (B polls every 250 ms).
+    let refused = false;
+    const origAcquire = storage.acquireLease.bind(storage);
+    vi.spyOn(storage, "acquireLease").mockImplementation(async (key, rec, now) => {
+      const ok = await origAcquire(key, rec, now);
+      if (!ok) refused = true;
+      return ok;
+    });
+
+    const posts: string[] = [];
+    let releaseA: (() => void) | null = null;
+    const gateA = new Promise<void>((r) => void (releaseA = r));
+    const deliver = (name: string, box: Outbox) =>
+      box.withInstanceLock("ins_mutex", async (_iid, rows) => {
+        for (const row of rows) {
+          posts.push(name);
+          // A performs the single delivery and marks sent durably, holding the
+          // mutex while B is parked.
+          if (name === "A") {
+            await storage.mergeUnlessDone(row.commandId, {
+              state: "sent",
+              gotResponse: true,
+              lease: undefined,
+            });
+            await gateA;
+          }
+        }
+        return rows.length;
+      });
+
+    const pA = deliver("A", a);
+    const pB = deliver("B", b);
+    // Wait until B has been refused at least once while A holds the mutex.
+    await vi.waitFor(() => expect(refused).toBe(true), { timeout: 3_000 });
+    // A is the only deliverer so far: B's fn never ran.
+    expect(posts).toEqual(["A"]);
+
+    releaseA!();
+    await Promise.all([pA, pB]);
+    // B then acquires but sees the sent row and POSTs nothing.
+    expect(posts).toEqual(["A"]);
+    expect(db.rows.get("cmd_mutex")?.state).toBe("sent");
+    a.dispose();
+    b.dispose();
+  } finally {
+    Object.defineProperty(globalThis.navigator, "locks", { value: originalLocks, configurable: true });
+  }
+});
+
+it("GATE15 item 1: releaseLease deletes only the matching owner's mutex row", async () => {
+  const db = installFakeIndexedDB();
+  const opened = await openOutboxStorage();
+  const storage = opened.storage;
+  const now = Date.now();
+  const key = "__lock__:ins_rel";
+  const rec = (token: string): OutboxRecord => ({
+    commandId: key,
+    clientRequestId: key,
+    instanceId: "ins_rel",
+    prompt: "",
+    createdAt: now,
+    attempts: 0,
+    state: "inflight",
+    lease: { owner: token, until: now + 30_000 },
+  });
+  expect(await storage.acquireLease(key, rec("tok_A"), now)).toBe(true);
+  // A different token cannot erase A's live lock.
+  expect(await storage.releaseLease(key, "tok_B")).toBe(false);
+  expect((await storage.all()).some((r) => r.commandId === key)).toBe(true);
+  // The real owner releases.
+  expect(await storage.releaseLease(key, "tok_A")).toBe(true);
+  expect((await storage.all()).some((r) => r.commandId === key)).toBe(false);
+  // Releasing an absent row is a no-op (false), not an error.
+  expect(await storage.releaseLease(key, "tok_A")).toBe(false);
 });
 
 it("GATE14 item 1: Outbox.dispose during a production IDB reclaim (requests issued, commit pending) aborts the tx — durable row stays inflight", async () => {

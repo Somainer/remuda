@@ -60,6 +60,18 @@ class MemStorage implements OutboxStorage {
     this.writeChain = run.then(() => undefined, () => undefined);
     return await run;
   }
+  /** Conditional lease release on the same chain as the lease claim. */
+  async releaseLease(key: string, owner: string) {
+    const run = this.writeChain.then(async () => {
+      await new Promise((r) => setTimeout(r, 1));
+      const existing = this.map.get(key);
+      if (!existing || existing.lease?.owner !== owner) return false;
+      this.map.delete(key);
+      return true;
+    });
+    this.writeChain = run.then(() => undefined, () => undefined);
+    return await run;
+  }
   /** Atomic read-check-write on the same chain as the lease claim. */
   async mergeUnlessDone(commandId: string, patch: Partial<OutboxRecord>): Promise<OutboxRecord | null> {
     const run = this.writeChain.then(async () => {
@@ -1590,6 +1602,9 @@ describe("Outbox", () => {
       },
       delete: async () => undefined,
       acquireLease: async () => {
+        throw new Error("IDB transaction aborted");
+      },
+      releaseLease: async () => {
         throw new Error("IDB transaction aborted");
       },
       mergeUnlessDone: async () => {

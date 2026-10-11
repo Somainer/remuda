@@ -162,6 +162,16 @@ export interface OutboxStorage {
    */
   acquireLease(key: Id, rec: OutboxRecord, now: number): Promise<boolean>;
   /**
+   * Release the per-instance delivery lease ONLY when the stored lease owner
+   * still matches `owner` (c-reconnfu gate 15 item 1). One readwrite
+   * transaction (or one synchronous read-check-write turn in the degraded
+   * backend): if the row is missing, not a lease, or currently held by a
+   * different owner (e.g. a steal after TTL expiry), NOTHING is deleted —
+   * otherwise an exiting deliverer would erase a successor's live mutex.
+   * Resolves true when this owner's row was removed.
+   */
+  releaseLease(key: Id, owner: Id): Promise<boolean>;
+  /**
    * Merge a patch into one row atomically INSIDE one readwrite transaction:
    * the stored row is read and the merged record written in the SAME
    * transaction, so a terminal `done` committed by a journal callback whose
@@ -339,6 +349,32 @@ class IdbOutboxStorage implements OutboxStorage {
   }
 
   /**
+   * Conditional lease release in ONE readwrite transaction: delete the
+   * `__lock__:` row only while its stored lease owner still matches
+   * `owner`. A lock stolen after expiry (or otherwise held by a different
+   * owner) is left exactly in place (gate 15 item 1).
+   */
+  async releaseLease(key: Id, owner: Id): Promise<boolean> {
+    return await new Promise<boolean>((resolve, reject) => {
+      const t = this.db.transaction(IDB_STORE, "readwrite");
+      const store = t.objectStore(IDB_STORE);
+      let released = false;
+      const getReq = store.get(key);
+      getReq.onsuccess = () => {
+        const existing = getReq.result as OutboxRecord | undefined;
+        if (existing?.lease?.owner === owner) {
+          store.delete(key);
+          released = true;
+        }
+      };
+      getReq.onerror = () => reject(getReq.error);
+      t.oncomplete = () => resolve(released);
+      t.onabort = () => reject(t.error ?? new Error("IndexedDB lease release aborted"));
+      t.onerror = () => reject(t.error ?? getReq.error);
+    });
+  }
+
+  /**
    * Terminal preservation in ONE readwrite transaction (same serialization as
    * {@link acquireLease}): the get and the put share `t`, so IndexedDB runs
    * this read against every earlier readwrite tx on the store in creation
@@ -508,6 +544,16 @@ class LocalStorageOutboxStorage implements OutboxStorage {
     return true;
   }
 
+  async releaseLease(key: Id, owner: Id): Promise<boolean> {
+    // One synchronous read-check-write turn: delete only while the stored
+    // lease owner matches (gate 15 item 1).
+    const recs = this.read();
+    const existing = recs.find((r) => r.commandId === key);
+    if (!existing || existing.lease?.owner !== owner) return false;
+    this.write(recs.filter((r) => r.commandId !== key));
+    return true;
+  }
+
   /**
    * Synchronous read-check-write turn — atomic within the supported
    * single-tab degraded case (two same-tab callers cannot interleave); the
@@ -592,6 +638,16 @@ export class Outbox {
   private listeners = new Set<() => void>();
   private storage: OutboxStorage;
   private readonly owner: Id;
+  /**
+   * PER-DOCUMENT identity for the no-Web-Locks instance mutex (c-reconnfu
+   * gate 15 item 1): fresh for every Outbox instance/document and NEVER
+   * persisted. It is deliberately distinct from {@link owner}, the persisted
+   * sessionStorage id reused across reloads for crash-recovery reclaim: two
+   * documents that cloned sessionStorage share `owner`, but their
+   * `leaseToken`s differ, so `acquireLease` refuses the second document
+   * instead of granting both the same instance mutex (which let both POST).
+   */
+  private readonly leaseToken: Id = newCommandId();
   /**
    * Tracked lease-expiry wakeups for INACTIVE persisted claims (rows this
    * context is not itself POSTing): same-owner claims kept until their
@@ -1196,7 +1252,10 @@ export class Outbox {
         createdAt: now,
         attempts: 0,
         state: "inflight",
-        lease: { owner: this.owner, until: now + LEASE_TTL_MS },
+        // Per-DOCUMENT token, not the persisted (cloned) recovery owner:
+        // another document must not be granted this mutex even if it cloned
+        // this tab's sessionStorage owner id (gate 15 item 1).
+        lease: { owner: this.leaseToken, until: now + LEASE_TTL_MS },
       };
       let acquired = false;
       try {
@@ -1210,7 +1269,9 @@ export class Outbox {
         try {
           return await this.runDeliverer(instanceId, fn);
         } finally {
-          await this.storage.delete(key).catch(() => undefined);
+          // Release ONLY our own mutex — a successor that stole the lease
+          // after TTL expiry must keep its lock (gate 15 item 1).
+          await this.storage.releaseLease(key, this.leaseToken).catch(() => undefined);
         }
       }
       if (Date.now() > deadline) throw new Error("outbox lease wait timed out");

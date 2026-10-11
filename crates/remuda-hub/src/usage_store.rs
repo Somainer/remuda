@@ -124,6 +124,14 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
          WHERE observed_at_source IS NULL OR observed_at_source = ''",
         [],
     )?;
+    // c-ctxusage r9 item 5: rows written in the pre-scopeId world have a NULL
+    // scope_id, but the matching retained journal payload (keyed by
+    // (instance_id, seq)) can still PROVE which session the cumulative stock
+    // belonged to. Without this backfill the legacy stock silently drops out
+    // of the totals the moment the first scoped session point arrives, since
+    // rollups sum scoped sessions and otherwise fall back to a single legacy
+    // row. Provenance comes ONLY from our own journal — never guessed.
+    backfill_legacy_scope_ids(conn)?;
     // Now the columns exist on both a fresh CREATE and an upgraded DB.
     //
     // Dedupe indexes are scope-specific (c-ctxusage r4 item 3):
@@ -138,6 +146,54 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
          CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
              ON usage_events(instance_id, scope, scope_id)
              WHERE scope = 'turn' AND scope_id IS NOT NULL;",
+    )?;
+    Ok(())
+}
+
+/// Backfill pre-`scopeId` NULL-scope session rows from the matching retained
+/// journal payloads (c-ctxusage r9 item 5). A legacy row's identity is
+/// provable when the journal's `(instance_id, seq)` event is a usage event
+/// whose `payload.scopeId` is a non-empty string; that id is stamped onto the
+/// row so the stock joins the scoped totals instead of vanishing on the first
+/// scoped point. No-op when the database has no `journal` table (standalone
+/// usage-store migrations).
+fn backfill_legacy_scope_ids(conn: &Connection) -> rusqlite::Result<()> {
+    let has_journal: bool = conn.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'journal'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_journal {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE usage_events AS u
+         SET scope_id = (
+             SELECT json_extract(j.payload_json, '$.payload.scopeId')
+             FROM journal AS j
+             WHERE j.instance_id = u.instance_id
+               AND j.seq = u.seq
+               AND json_valid(j.payload_json)
+               AND json_extract(j.payload_json, '$.kind') = 'usage'
+               AND json_extract(j.payload_json, '$.payload.scope') = 'session'
+               AND json_type(j.payload_json, '$.payload.scopeId') = 'text'
+               AND length(json_extract(j.payload_json, '$.payload.scopeId')) > 0
+         )
+         WHERE u.scope = 'session' AND u.scope_id IS NULL
+           AND EXISTS (
+             SELECT 1 FROM journal AS j
+             WHERE j.instance_id = u.instance_id
+               AND j.seq = u.seq
+               AND json_valid(j.payload_json)
+               AND json_extract(j.payload_json, '$.kind') = 'usage'
+               AND json_extract(j.payload_json, '$.payload.scope') = 'session'
+               AND json_type(j.payload_json, '$.payload.scopeId') = 'text'
+               AND length(json_extract(j.payload_json, '$.payload.scopeId')) > 0
+         )",
+        [],
     )?;
     Ok(())
 }
@@ -2856,6 +2912,48 @@ mod tests {
 
     // --- c-ctxusage r5 item 3 ----------------------------------------------
 
+    /// Create the real store's `journal` table shape (r9 item 5 tests the
+    /// migration-time backfill against retained journal payloads).
+    fn create_journal_table(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE journal (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (instance_id, seq)
+            );",
+        )
+        .unwrap();
+    }
+
+    /// Persist a journal record exactly like the real store append path.
+    fn insert_journal_raw(conn: &Connection, record: &JournalRecord) {
+        conn.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                record.instance_id,
+                record.seq,
+                record.event_id,
+                serde_json::to_string(&record.event).unwrap(),
+                record.observed_at
+            ],
+        )
+        .unwrap();
+    }
+
+    /// The current scope_id stamped on an instance's session row by seq.
+    fn scope_id_at(conn: &Connection, seq: i64) -> Option<String> {
+        conn.query_row(
+            "SELECT scope_id FROM usage_events WHERE seq = ?1 AND scope = 'session'",
+            params![seq],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     fn legacy_session_row(
         seq: i64,
         instance: &str,
@@ -2983,30 +3081,75 @@ mod tests {
     }
 
     /// r8 item 8: the legacy NULL-scope floor does not apply WITHIN a scope id
-    /// chain either — only same-scope-id points floor each other.
+    /// chain either — only same-scope-id points floor each other. c-ctxusage
+    /// r9 item 6 adds legacy NULL rows to both sides of the rule: a PROVEN
+    /// legacy row (retained journal payload with scopeId) backfills into its
+    /// session and floors that chain; an UNPROVEN legacy row stays NULL and
+    /// floors nothing.
     #[test]
     fn scoped_points_are_floored_only_by_their_own_scope_id() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        assert!(insert(
-            &conn,
-            &scoped_record(1, "ins_8", "session", Some("s1"), 1, 1000, 100, 0, 0, None)
-        ));
-        // Same session, backwards: frozen.
+        create_journal_table(&conn);
+        // Proven legacy NULL row for s1 (1000/100), exactly as an upgraded
+        // database carries it, plus the matching retained journal payload.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &legacy_session_row(1, "ins_8", 1000, 100, "2020-01-01T00:00:00.000Z")
+            )
+            .unwrap()
+        );
+        let proven = scoped_record(
+            1,
+            "ins_8",
+            "session",
+            Some("s1"),
+            1,
+            1000,
+            100,
+            0,
+            0,
+            Some("2020-01-01T00:00:00.000Z"),
+        );
+        insert_journal_raw(&conn, &proven);
+        // An UNPROVEN legacy row with a much larger stock: no journal proves
+        // its identity, so it must never floor any scoped session.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &legacy_session_row(2, "ins_8", 9000, 900, "2020-01-02T00:00:00.000Z")
+            )
+            .unwrap()
+        );
+        // Re-run the migration: the proven legacy row must backfill to s1.
+        migrate(&conn).unwrap();
+        assert_eq!(
+            scope_id_at(&conn, 1),
+            Some("s1".to_string()),
+            "the retained journal payload proves the legacy row's session"
+        );
+        assert_eq!(
+            scope_id_at(&conn, 2),
+            None,
+            "an unproven legacy row must stay NULL-scope"
+        );
+        // Same session, backwards: frozen by the BACKFILLED s1 floor.
         assert!(
             !insert(
                 &conn,
-                &scoped_record(2, "ins_8", "session", Some("s1"), 1, 800, 80, 0, 0, None)
+                &scoped_record(3, "ins_8", "session", Some("s1"), 1, 800, 80, 0, 0, None)
             ),
-            "a backwards point within the same scope id is frozen"
+            "a backwards point within the backfilled scope id is frozen"
         );
-        // Different session with a smaller stock: counted.
+        // Different session with a smaller stock: counted despite the 9000
+        // unproven legacy row.
         assert!(
             insert(
                 &conn,
-                &scoped_record(3, "ins_8", "session", Some("s2"), 1, 50, 5, 0, 0, None)
+                &scoped_record(4, "ins_8", "session", Some("s2"), 1, 50, 5, 0, 0, None)
             ),
-            "s1's stock must never floor a different session s2"
+            "neither s1's stock nor the unproven legacy row may floor s2"
         );
         let rollup = rollup_instance(&conn, "ins_8", "codex", Some("codex"))
             .unwrap()
@@ -3014,8 +3157,113 @@ mod tests {
         assert_eq!(
             rollup.session_input_tokens,
             Some(1050),
-            "current stocks sum per session: 1000 (s1) + 50 (s2)"
+            "current stocks sum per session: 1000 (backfilled s1) + 50 (s2); \
+             the unproven 9000 legacy row contributes nothing"
         );
+    }
+
+    /// c-ctxusage r9 item 5: a legacy NULL-scope stock (1000/100 for s1) used
+    /// to disappear from the totals once a scoped s2 (100/10) arrived. With
+    /// the retained journal payload proving s1, the migration backfills the
+    /// identity BEFORE floors/aggregation: the smaller new session is
+    /// accepted and the totals are 1100/110.
+    #[test]
+    fn journal_backfilled_legacy_scope_survives_alongside_a_scoped_session() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        // Old-schema usage row: NULL scope_id.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &legacy_session_row(1, "ins_5b", 1000, 100, "2020-01-01T00:00:00.000Z")
+            )
+            .unwrap()
+        );
+        // The journal still holds the original event with payload.scopeId.
+        let proven = scoped_record(
+            1,
+            "ins_5b",
+            "session",
+            Some("s1"),
+            1,
+            1000,
+            100,
+            0,
+            0,
+            Some("2020-01-01T00:00:00.000Z"),
+        );
+        insert_journal_raw(&conn, &proven);
+        migrate(&conn).unwrap();
+        assert_eq!(scope_id_at(&conn, 1), Some("s1".to_string()));
+
+        // A smaller NEW scoped session is still accepted.
+        assert!(
+            insert(
+                &conn,
+                &scoped_record(10, "ins_5b", "session", Some("s2"), 1, 100, 10, 0, 0, None)
+            ),
+            "the new smaller session s2 must be accepted"
+        );
+        // The discriminated case from the review: previously the legacy s1
+        // stock vanished the instant any scoped row existed, leaving only
+        // s2's 100/10. The backfilled identity keeps it in the total:
+        // 1000 + 100 = 1100 / 110.
+        let rollup = rollup_instance(&conn, "ins_5b", "codex", Some("codex"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_input_tokens, Some(1100));
+        assert_eq!(rollup.session_output_tokens, Some(110));
+
+        // s1 later grows: the backfilled legacy row is its floor chain, so
+        // 1200 is accepted ON TOP of the proven 1000 stock.
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                11,
+                "ins_5b",
+                "session",
+                Some("s1"),
+                2,
+                1200,
+                120,
+                0,
+                0,
+                None
+            )
+        ));
+
+        let rollup = rollup_instance(&conn, "ins_5b", "codex", Some("codex"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(1300),
+            "1200 (s1) + 100 (s2)"
+        );
+        assert_eq!(rollup.session_output_tokens, Some(130));
+    }
+
+    /// c-ctxusage r9 item 5 negative case: a legacy NULL row whose journal
+    /// payload carries no scopeId stays unproven and is not stamped.
+    #[test]
+    fn legacy_row_without_a_provable_journal_scope_stays_null() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        create_journal_table(&conn);
+        assert!(
+            insert_usage_event(
+                &conn,
+                &legacy_session_row(1, "ins_5c", 1000, 100, "2020-01-01T00:00:00.000Z")
+            )
+            .unwrap()
+        );
+        // Journal event present but with NO scopeId (a genuinely pre-scopeId
+        // payload): identity is unprovable.
+        let unproven = scoped_record(1, "ins_5c", "session", None, 1, 1000, 100, 0, 0, None);
+        insert_journal_raw(&conn, &unproven);
+        migrate(&conn).unwrap();
+        assert_eq!(scope_id_at(&conn, 1), None);
     }
 
     /// r8 item 8 regression: the legacy NULL-scope row is a different,

@@ -466,7 +466,7 @@ hello 在单 writer 前排成一串，尾延迟 ≈ N × 单 hello 串行时间�
   REST 已恢复的链路上线即离线、亚秒级重连风暴）。一次真实 frame 重新认证 live
   后该截止清零。
 
-### 5.2.1 定时器归属表（c-reconnfu gate 10 item 0；gate 11 items 1/6/7、gate 12 item 8、gate 13 item 5 校订）
+### 5.2.1 定时器归属表（c-reconnfu gate 10 item 0；gate 11 items 1/6/7、gate 12 item 8、gate 13 item 5、gate 14 item 4 校订）
 
 客户端状态机的每个命名定时器只有一个 owner；`setTimer(name, ms, fn)` 在写入
 新 handle 前总是先 `clearTimer(name)`，所以旧 job 绝不会在后来的状态 episode 里
@@ -496,16 +496,24 @@ wakeup：它记住租约快照、租约续约（含已经过期的替换租约�
 让在飞 reclaim 事务提交前回滚（gate 13 items 1–3，outbox 交付语义见 §5.4 的
 D-055）。
 
-两种 offline 退休语义相反，不要混淆（gate 13 item 5 校订）：
+两条退休路径对「在飞 attempt 的迟到 completion」的处置相反（gate 14 item 4
+校订）：
 
 * **浏览器 `offline` 事件** → `retireInFlightForOffline`：clear
-  bind/stale/probe/offline/watchdog，并把 `resumeRetiredOffline` **置 true**——
-  旧 attempt 的迟到 completion 照常被 attempt id 丢弃，该 flag 让随后的 `online`
-  事件可以立即启动新 attempt；`reconnect` 定时器不动。
+  bind/stale/probe/offline/watchdog，`resumeInFlight=false` 但把
+  `resumeRetiredOffline` **置 true**。完成入口的守卫是
+  `(!resumeInFlight && !resumeRetiredOffline) || attemptId !== resumeAttemptId`：
+  A 被退休后其 **id 仍 current**，所以 A 的 same-id completion（成功或失败）
+  **仍然被接受**，直到某个更新的 attempt 把 `resumeAttemptId` 顶掉——之后该
+  completion 才因 attemptId 不匹配被丢弃。flag 的另一作用是让随后的 `online`
+  事件（或前台 resume）立即启动新 attempt；浏览器 `offline` 不动 `reconnect`
+  定时器。
 * **episode 截止 fire**（`offline` 定时器 → `goOffline`）→ `goOffline` 把
-  `resumeRetiredOffline` **置 false（清掉）**后退休在飞的 quiet attempt；因此该
-  attempt 的迟到 completion 因 attempt id 不匹配被忽略，恢复只由随后
-  `goOfflineAndSchedule` → `scheduleReconnect` 的 reconnect 时钟接管。
+  `resumeInFlight=false`、`resumeRetiredOffline=false`（**清掉**）后退休在飞的
+  quiet attempt。此时 same-id completion 到达，两个资格标志都为 false，被
+  **retired-state 守卫**直接拒绝（不是因为 attempt id 不匹配——id 恰好相同）；
+  恢复只由随后 `goOfflineAndSchedule` → `scheduleReconnect` 的 reconnect 时钟
+  接管。
 
 ### 5.3 最高优先级规则：绝不把旧数据当新数据
 

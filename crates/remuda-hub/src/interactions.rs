@@ -368,13 +368,16 @@ pub async fn list_interactions(
             return Err(HubError::Forbidden);
         }
     }
+    // c-cardsettle: the inbox feed carries every actionable pending row plus
+    // recently ended/expired rows (24h) for the 已离队 presentation after a
+    // poll or reload; strictly-pending badge counters use list_interactions
+    // (pending_only=true) elsewhere, so terminal rows never count as pending.
     let mut items: Vec<Value> = state
         .store
-        .list_interactions(
+        .list_inbox_interactions(
             query.host_id.clone(),
             query.instance_id.clone(),
             query.kind.clone(),
-            true,
         )
         .await?
         .into_iter()
@@ -435,18 +438,51 @@ pub async fn list_interactions(
             Ok(Some(frame)) => match rpc_result(frame) {
                 Ok(result) => {
                     if let Some(batch) = result.get("items").and_then(Value::as_array) {
-                        for item in batch {
-                            if query.kind.as_ref().is_none_or(|want| {
-                                item.get("kind").and_then(Value::as_str) == Some(want.as_str())
-                            }) {
-                                let id = item
-                                    .get("interactionId")
+                        // c-cardsettle r2 item 3: display retention (24 h) is
+                        // separate from authoritative dedup. A Node may still
+                        // list as pending an id the Hub settled; even when the
+                        // durable row is too old to be in the inbox page, the
+                        // Hub's terminal state wins and the live copy is
+                        // suppressed so it cannot return to the queue/badge.
+                        let candidate_ids: Vec<String> = batch
+                            .iter()
+                            .filter(|item| {
+                                query.kind.as_ref().is_none_or(|want| {
+                                    item.get("kind").and_then(Value::as_str) == Some(want.as_str())
+                                })
+                            })
+                            .filter_map(|item| {
+                                item.get("interactionId")
                                     .or_else(|| item.get("id"))
                                     .and_then(Value::as_str)
-                                    .unwrap_or("");
-                                if id.is_empty() || seen.insert(id.to_string()) {
-                                    items.push(flatten_interaction(item.clone()));
-                                }
+                                    .map(str::to_string)
+                            })
+                            .filter(|id| !id.is_empty())
+                            .collect();
+                        let durable_terminal = state
+                            .store
+                            .terminal_interaction_ids(candidate_ids.clone())
+                            .await?;
+                        for item in batch {
+                            if !query.kind.as_ref().is_none_or(|want| {
+                                item.get("kind").and_then(Value::as_str) == Some(want.as_str())
+                            }) {
+                                continue;
+                            }
+                            let id = item
+                                .get("interactionId")
+                                .or_else(|| item.get("id"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            if durable_terminal.contains(id) {
+                                tracing::debug!(
+                                    interaction_id = %id,
+                                    "suppressing node live copy: durable Hub row is terminal"
+                                );
+                                continue;
+                            }
+                            if id.is_empty() || seen.insert(id.to_string()) {
+                                items.push(flatten_interaction(item.clone()));
                             }
                         }
                     }
@@ -559,6 +595,27 @@ pub async fn answer_interaction(
         }
     };
     let in_memory_grant_instance = if stored.is_none() {
+        // c-cardsettle r2 item 2: the live row may be gone because the
+        // instance was deleted, but its terminal state was retained as a
+        // tombstone. Reject by that state BEFORE the in-memory CAS and any
+        // Node fan-out — a missing row must never become an interaction.answer
+        // broadcast to every connected Node (a still-connected node whose
+        // purge failed would otherwise release the allow).
+        if let Some(tombstone) = state
+            .store
+            .get_interaction_tombstone(interaction_id.as_id().to_string())
+            .await?
+        {
+            return Err(match tombstone.state.as_str() {
+                "expired" => HubError::Expired,
+                "answer-committed" | "resolved" => HubError::Superseded {
+                    winner: String::new(),
+                },
+                // invalidated / a card still pending at delete time: the
+                // owning entity no longer exists.
+                _ => HubError::NotFound,
+            });
+        }
         let interaction_id_str = interaction_id.as_id().as_str();
         state
             .agent_approvals
@@ -579,6 +636,26 @@ pub async fn answer_interaction(
     } else {
         None
     };
+    // c-cardsettle: a late answer to a DURABLE card whose generation ended is
+    // rejected BEFORE the in-memory CAS and BEFORE any Node RPC — so a settled
+    // generation is never a 500, a silent success, or an `interaction.answer`
+    // (hence an allow) forwarded to a hook that may still exist. Only the two
+    // states that can NEVER answer again short-circuit here:
+    //  * invalidated (settled here with generation-ended) / a row the owning
+    //    instance no longer vouches for -> 404, the entity does not exist;
+    //  * expired by its deadline -> 410.
+    // `answer-committed`/`resolved` deliberately fall through to the Node fan-
+    // out: the Node's own CAS keeps the established semantics — the SAME
+    // commandId replays to 200 {outcome:'idempotent'}, a competing command
+    // gets 409 (INTERACTION_SUPERSEDED). Distinguishing the two Hub-side would
+    // need winner backfill, which is the later fencing ADR (c-deadcards part B).
+    if let Some(stored) = &stored {
+        match stored.state.as_str() {
+            "expired" => return Err(HubError::Expired),
+            "invalidated" => return Err(HubError::NotFound),
+            _ => {}
+        }
+    }
     if let Some(result) = state
         .agent_approvals
         .answer(

@@ -276,6 +276,9 @@ wire_enum!(InteractionResolutionReason, "2.6", {
     NativeCancelled => "native-cancelled",
     GenerationEnded => "generation-ended",
     TimedOut => "timed-out",
+    // c-cardsettle r6 item 4: a transcript-picker interaction retired when
+    // the agent loses the promoted session (shell_pty promotion demotion).
+    AgentDemoted => "agent-demoted",
 });
 
 wire_enum!(CapabilityName, "3.2", {

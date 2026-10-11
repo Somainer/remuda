@@ -14,7 +14,11 @@ import { hubStore, useHub } from "../../lib/store";
 import { useIncrementalLimit } from "../../lib/useIncrementalLimit";
 import { formatClock } from "../../lib/format";
 import { profileRegion } from "../../lib/profileFlags";
-import { thisDeviceId } from "../../lib/interactionStatus";
+import {
+  DEPARTED_GENERATION_ENDED_TEXT,
+  generationEnded,
+  thisDeviceId,
+} from "../../lib/interactionStatus";
 import { readPushStatus, subscribePush, type PushStatus } from "../../lib/push";
 import type { Interaction, InteractionAnswer } from "../../types/interaction";
 import ui from "../../styles/ui.module.css";
@@ -297,12 +301,18 @@ export function DepartedList({
       </h2>
       {rows.map((row) => {
         const base = desktopView(row, workspaceLabel(row.instance?.workspaceId ?? ""));
+        // c-cardsettle: a Hub-invalidated card (generation ended) shares the
+        // superseded projection, but its reason is the process ending, not
+        // another device answering.
+        const stateText = generationEnded(row.item)
+          ? DEPARTED_GENERATION_ENDED_TEXT
+          : DEPARTED_STATUS_TEXT[row.uiState as "expired" | "superseded"];
         return (
           <DepartedRow
             key={row.item.id}
             view={{
               ...base,
-              stateText: DEPARTED_STATUS_TEXT[row.uiState as "expired" | "superseded"],
+              stateText,
               title: decisionTitle(row.item),
               previewText: decisionPreview(row.item),
             }}

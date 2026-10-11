@@ -74,6 +74,7 @@ class FakeTransaction {
   abort = () => {
     if (this.aborted || this.settled) return;
     this.aborted = true;
+    this.db.abortCount += 1;
     queueMicrotask(() => this.onabort?.({ target: this }));
   };
 }
@@ -118,6 +119,7 @@ class FakeObjectStore {
             // WRITE commits wait on the disposal gate (reads never do) so a
             // transaction can be suspended post-request, pre-commit.
             if (opts?.gateCommit && this.db.commitGate) {
+              this.db.gatedCommitEntered?.(req.result as string);
               await this.db.commitGate;
               if (this.tx.aborted) return;
             }
@@ -187,8 +189,12 @@ class FakeDb {
   abortNextAfterRequest = false;
   /** Recorded proof the request succeeded before the abort arrived. */
   requestSucceededBeforeAbort = false;
+  /** Total abort transitions across all transactions (gate-14 item 1 proof). */
+  abortCount = 0;
   /** When truthy (a promise), post-request WRITE commits wait for it (disposal window tests). */
   commitGate: Promise<void> | null = null;
+  /** Resolves (with the command id) when a gated write reaches its suspended commit. */
+  gatedCommitEntered: ((commandId: string) => void) | null = null;
   /** Every object-store request issued (get/put/getAll/delete), in order. */
   readonly requestsIssued: string[] = [];
 
@@ -464,21 +470,30 @@ it("GATE14 item 1: Outbox.dispose during a production IDB reclaim (requests issu
     box.onClaimWake = wakes;
 
     // Deadline fires: the wake reads and enters the reclaim transaction. Hold
-    // its COMMIT open (post get+put, pre oncomplete).
+    // its COMMIT open (post get+put, pre oncomplete) and wait SPECIFICALLY for
+    // the target row's reclaim write to enter the gate — not an unrelated
+    // probe/seed write (gate 15 item 4 tightens the old '>= 2 puts' check).
     let releaseCommit: (() => void) | null = null;
+    let gateEntered = false;
     db.commitGate = new Promise<void>((r) => void (releaseCommit = r));
+    db.gatedCommitEntered = (commandId: string) => {
+      if (commandId === "cmd_idb_dispose_wake") gateEntered = true;
+    };
     await vi.advanceTimersByTimeAsync(30_000);
-    // Let the read (getAll) and the reclaim's get/put requests complete; the
-    // put's COMMIT stays held behind the gate.
-    for (let i = 0; i < 10 && db.requestsIssued.filter((m) => m === "put").length < 2; i += 1) {
+    for (let i = 0; i < 50 && !gateEntered; i += 1) {
       await Promise.resolve();
     }
-    expect(db.requestsIssued.filter((m) => m === "put").length).toBeGreaterThanOrEqual(2);
+    expect(gateEntered).toBe(true);
 
-    // Teardown while the reclaim transaction is uncommitted.
+    // Exactly the target reclaim transaction is suspended.
+    const abortsBeforeDispose = db.abortCount;
+    // Teardown while THAT transaction is uncommitted.
     box.dispose();
-    await Promise.resolve();
-    await Promise.resolve(); // signal abort -> t.abort -> onabort settled
+    for (let i = 0; i < 20 && db.abortCount === abortsBeforeDispose; i += 1) {
+      await Promise.resolve(); // signal abort -> t.abort -> onabort settled
+    }
+    // The reclaim transaction itself fired an abort event.
+    expect(db.abortCount).toBe(abortsBeforeDispose + 1);
     // Release the held commit: the aborted transaction must NOT commit.
     releaseCommit!();
     await Promise.resolve();

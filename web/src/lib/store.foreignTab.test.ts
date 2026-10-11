@@ -60,6 +60,169 @@ function row(over: Partial<OutboxRecord>): OutboxRecord {
   };
 }
 
+it("GATE16 item 4a: two documents with a cloned owner deliver a shared pending row exactly once (real store flushes, no Web Locks/IDB)", async () => {
+  // Production no-Web-Locks path through TWO HubStores sharing the
+  // localStorage backend and a cloned sessionStorage owner id: their flushes
+  // race on the per-document leaseToken mutex; api.instanceSend must fire
+  // exactly once (the gate-15 idbTx test only counted its own posts.push).
+  const owner = "owner_g16_4a";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks: { query: async () => ({ held: [] }) } }, // query present, NO request
+  });
+  // Two documents share the persisted owner (simulate cloned sessionStorage).
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  localStorage.setItem("remuda-outbox-owner", owner);
+  try {
+    const { api, hubStore: a } = await fresh();
+    // B must read the same persisted owner: share its sessionStorage by setting
+    // the key before the second module loads (fresh() resets modules but keeps
+    // localStorage/sessionStorage globals).
+    sessionStorage.setItem("remuda-outbox-owner", owner);
+    const { api: apiB, hubStore: b } = await fresh();
+
+    await bootLive(api, a);
+    await bootLive(apiB, b);
+    // Settle the fire-and-forget bootstrap flushes against the EMPTY outbox
+    // so they cannot race the row seeded below through the unmocked API.
+    await (a as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await (b as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+
+    // Shared pending row in the localStorage backend (both stores read it).
+    const row: OutboxRecord = {
+      commandId: "cmd_4a_once",
+      clientRequestId: "local_4a",
+      instanceId: INSTANCE,
+      journalId: JOURNAL,
+      prompt: "one",
+      createdAt: Date.now() - 1_000,
+      attempts: 0,
+      state: "pending",
+    };
+    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([row]));
+
+    const sendA = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_iid: string, _p: string, _a: unknown, _m: unknown, commandId: string) => {
+        // Hold A's POST open long enough for B to attempt delivery too.
+        await new Promise<void>((r) => setTimeout(r, 500));
+        return {
+          relatedCommandIds: [],
+          command: {
+            commandId,
+            id: commandId,
+            state: "accepted",
+            revision: "1",
+            dispatch: "native-acknowledged",
+            resolution: "clear",
+          },
+        } as unknown as Awaited<ReturnType<Api["instanceSend"]>>;
+      }) as Api["instanceSend"],
+    );
+    const sendB = vi.spyOn(apiB, "instanceSend");
+    sendB.mockImplementation(sendA.getMockImplementation() ?? (() => Promise.reject(new Error("no impl"))));
+
+    const flushA = (a as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    const flushB = (b as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await flushA;
+    await flushB;
+
+    expect(sendA.mock.calls.length + sendB.mock.calls.length).toBe(1);
+    // A either won the mutex; B never POSTed (it parked behind the lease and
+    // only re-read the authoritative sent row once A released).
+    expect(sendB).not.toHaveBeenCalled();
+    const stored = JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(stored.find((r) => r.commandId === "cmd_4a_once")?.state).toBe("sent");
+    a.logout();
+    b.logout();
+  } finally {
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+}, 15_000);
+
+it("GATE16 item 4b: a same-owner inflight claim first seen AFTER load is delivered at its lease deadline with exactly one POST and no other trigger", async () => {
+  // The gate-15 idbTx test replaced delivery with a bare spy; this asserts the
+  // real store: a cloned sibling's inflight row appearing after this store's
+  // bootstrap is reclaimed by the Outbox expiry wake at the deadline, the
+  // registered onClaimWake -> flushAllOutbox POSTs exactly once.
+  vi.useFakeTimers();
+  const owner = "owner_g16_4b";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks: { query: async () => ({ held: [] }) } }, // query, no request
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  sessionStorage.setItem("remuda-outbox-owner", owner);
+  try {
+    const { api, hubStore } = await fresh();
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) => ({
+        relatedCommandIds: [],
+        command: {
+          commandId,
+          id: commandId,
+          state: "accepted",
+          revision: "1",
+          dispatch: "native-acknowledged",
+          resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    // Empty boot flush settled (no POST).
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    expect(send).not.toHaveBeenCalled();
+
+    // A sibling (same persisted owner) claims the row AFTER load, then crashes.
+    const LEASE_MS = 30_000;
+    localStorage.setItem(
+      OUTBOX_LS_KEY,
+      JSON.stringify([
+        {
+          commandId: "cmd_4b_late",
+          clientRequestId: "local_4b",
+          instanceId: INSTANCE,
+          journalId: JOURNAL,
+          prompt: "late",
+          createdAt: Date.now() - 1_000,
+          attempts: 1,
+          state: "inflight",
+          lease: { owner, until: Date.now() + LEASE_MS },
+        } satisfies OutboxRecord,
+      ]),
+    );
+    // The store's periodic durable refresh discovers the late claim; the
+    // Outbox reconciles and arms its expiry wake.
+    const box = (hubStore as unknown as { outbox: { refreshDurable: () => Promise<unknown> } }).outbox;
+    await box.refreshDurable();
+    expect(send).not.toHaveBeenCalled();
+
+    // Advance EXACTLY to the deadline; zero extra wall time. Drain only
+    // zero-duration microtasks until the single POST lands.
+    await vi.advanceTimersByTimeAsync(LEASE_MS);
+    for (let i = 0; i < 30 && send.mock.calls.length === 0; i += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBe("cmd_4b_late");
+    const stored = JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(stored.find((r) => r.commandId === "cmd_4b_late")?.state).toBe("sent");
+
+    // No duplicate long afterwards.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
 it("GATE10 item 7: a lease-less done row committed by another tab skips without aborting the flush; B still sends", async () => {
   const { api, hubStore } = await fresh();
   await bootLive(api, hubStore);
@@ -291,6 +454,107 @@ it("GATE16 item 1: follow(B) while bound to A in recovering adopts mounted B —
   expect(store.connection.state).toBe("recovering");
   await hubStore.follow(INSTANCE_B); // adopt the live mounted socket
   expect(store.connection.state).toBe("live");
+  hubStore.logout();
+});
+
+it("GATE16 item 4c: an accepted delivery stamped during offline recovery is caught up via the REAL path after navigating away to mounted B", async () => {
+  // Replaces the gate-15 version that injected debt through private
+  // recordOwed. Here the debt forms the way production forms it: a pending row
+  // is delivered while the bound session A is in recovering/offline (its
+  // follow does not own catch-up), so the drain chains recordOwed. Navigating
+  // to already-mounted B then services the abandoned debt (eventsRead A).
+  const { api, hubStore } = await fresh();
+  await bootLive(api, hubStore); // mounts A = INSTANCE (journal JOURNAL)
+  const store = hubStore as unknown as {
+    connection: ConnectionMachine;
+    setFollowLiveForTest: (open: boolean, framed: boolean, journalId?: string) => void;
+    reconcileOwed: Map<string, unknown>;
+  };
+
+  const JOURNAL_B = "obj_journal_b";
+  const INSTANCE_B = "ins_mounted_b";
+  const instanceB = {
+    id: INSTANCE_B,
+    journalId: JOURNAL_B,
+    lifecycle: "running",
+    revision: "0",
+    durableSeq: "0",
+  } as never as Awaited<ReturnType<Api["instanceGet"]>>;
+  vi.spyOn(api, "instanceGet").mockImplementation(async (id: string) =>
+    id === INSTANCE_B ? instanceB : ({} as Awaited<ReturnType<Api["instanceGet"]>>),
+  );
+  const eventsReadSpy = vi.spyOn(api, "eventsRead").mockResolvedValue({
+    events: [],
+    windowFromSeq: "1",
+    durableSeq: "0",
+    reachedAfterSeq: true,
+  } as Awaited<ReturnType<Api["eventsRead"]>>);
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(async () =>
+    ({
+      subscriptionId: "sub_b_c" as never,
+      getReadyState: () => 1,
+      snapshot: { asOfSeq: "0", fromSeq: null },
+      close: () => undefined,
+    }) as never,
+  );
+  // A's POST succeeds (the row reaches the Hub); its deferred journal
+  // catch-up is what must later be serviced.
+  vi.spyOn(api, "instanceSend").mockImplementation(
+    (async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) =>
+      ({
+        relatedCommandIds: [],
+        command: {
+          commandId,
+          id: commandId,
+          state: "accepted",
+          revision: "1",
+          dispatch: "native-acknowledged",
+          resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"],
+  );
+
+  // Mount B first, return to A, so the navigation lands on the mounted branch.
+  await hubStore.follow(INSTANCE_B);
+  await hubStore.follow(INSTANCE);
+
+  // Seed a pending row and take A's link OFFLINE: the follow no longer owns
+  // catch-up (followOwnsCatchupNow checks offline/recovering + bound journal).
+  localStorage.setItem(
+    OUTBOX_LS_KEY,
+    JSON.stringify([
+      {
+        commandId: "cmd_owed_real",
+        clientRequestId: "local_owed",
+        instanceId: INSTANCE,
+        journalId: JOURNAL,
+        prompt: "owed",
+        createdAt: Date.now() - 1_000,
+        attempts: 0,
+        state: "pending",
+      } satisfies OutboxRecord,
+    ]),
+  );
+  store.setFollowLiveForTest(false, false, JOURNAL);
+  store.connection.dispatch({ type: "close" });
+  store.connection.dispatch({ type: "offline" });
+
+  // The REAL delivery path: POST succeeds while A is offline; the post-drain
+  // chain sees the follow does not own catch-up and records debt.
+  await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(store.reconcileOwed.has(INSTANCE)).toBe(true);
+
+  // Navigate to the already-mounted B. bindConnection bind-away services A's
+  // abandoned debt via a bounded journal catch-up (eventsRead on A's journal).
+  eventsReadSpy.mockClear();
+  await hubStore.follow(INSTANCE_B);
+  await vi.waitFor(
+    () => expect(eventsReadSpy.mock.calls.some((c) => c[0].journalId === JOURNAL)).toBe(true),
+    { timeout: 2_000 },
+  );
+  await vi.waitFor(() => expect(store.reconcileOwed.has(INSTANCE)).toBe(false), { timeout: 2_000 });
   hubStore.logout();
 });
 

@@ -494,6 +494,11 @@ pub struct ShellPtyDriver {
     permission_bridge: Mutex<Arc<crate::permission::PermissionBridge>>,
     permission_queue: Mutex<Arc<crate::permission::PermissionQueue>>,
     permission_worker: Mutex<Option<JoinHandle<()>>>,
+    /// One-shot scoped catalog refresh task; detached on spawn but it holds an
+    /// event-sender clone, so it is tracked here and cancelled at close (and
+    /// on a restart) for the event channel to close with the session
+    /// (c-ctxusage r10 item 5).
+    catalog_refresh: Mutex<Option<JoinHandle<()>>>,
     /// Event sender for the current run, retained so an effort switch can
     /// journal `queued`/`degraded` without going through the worker.
     events_tx: Mutex<Option<mpsc::Sender<remuda_protocol::Observation>>>,
@@ -531,6 +536,28 @@ impl ShellPtyDriver {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(faults.inner);
     }
 
+    /// Test-only: stop the long-lived effort/model/permission worker tasks
+    /// and wait for their event-sender clones to drop, so the last senders of
+    /// the event channel are gone and a receiver observes closure. These
+    /// workers outlive `close()` by design (they are per-started-session
+    /// tasks torn down with the driver); exactly-once tests must await
+    /// RECEIVER COMPLETION rather than aborting the drainer while a duplicate
+    /// could still be buffered (c-ctxusage r10 item 5). The promoter, its
+    /// flusher and the adapters have already shut down in `close()`.
+    #[cfg(feature = "test-faults")]
+    pub async fn abort_event_workers_for_test(&self) {
+        for slot in [
+            &self.effort_worker,
+            &self.model_worker,
+            &self.permission_worker,
+        ] {
+            if let Some(worker) = slot.lock().await.take() {
+                worker.abort();
+                let _ = worker.await;
+            }
+        }
+    }
+
     /// Build a driver whose promotion detection reads `table` instead of the
     /// host process table. Tests drive detection from a fixture this way.
     #[must_use]
@@ -562,6 +589,7 @@ impl ShellPtyDriver {
             ))),
             permission_queue: Mutex::new(Arc::new(crate::permission::PermissionQueue::new())),
             permission_worker: Mutex::new(None),
+            catalog_refresh: Mutex::new(None),
             events_tx: Mutex::new(None),
             promote_ctx: Mutex::new(None),
             interrupt_pid: Arc::new(AtomicI32::new(0)),
@@ -1204,7 +1232,11 @@ impl ShellPtyDriver {
             let host_dir = host_config_dir.clone();
             let current = launch_model.clone();
             let env = catalog_env.clone();
-            tokio::spawn(async move {
+            // Cancel any prior run's still-pending refresh.
+            if let Some(previous) = self.catalog_refresh.lock().await.take() {
+                previous.abort();
+            }
+            let refresh = tokio::spawn(async move {
                 let payload = crate::model_discovery::scoped_refresh_payload(
                     std::path::PathBuf::from(native_home),
                     host_dir,
@@ -1229,6 +1261,7 @@ impl ShellPtyDriver {
                     tracing::debug!(%error, "model catalog refresh: event channel closed");
                 }
             });
+            *self.catalog_refresh.lock().await = Some(refresh);
         }
         let model_io: Arc<dyn crate::model::SwitchIo> = Arc::new(ShellEffortIo {
             state: Arc::clone(&state),
@@ -2770,8 +2803,18 @@ impl Driver for ShellPtyDriver {
         self.hooks.lock().await.take();
         // Stop the file-tail adapters; their shadow files likewise survive for
         // purge as audit evidence.
-        if let Some(handle) = self.adapters.lock().await.take() {
+        if let Some(mut handle) = self.adapters.lock().await.take() {
             handle.abort();
+            // Wait for the cancellations to land so the adapters' event-sender
+            // clones drop inside close() (r10 item 5): close returning while
+            // sender clones linger lets the event channel outlive shutdown.
+            for task in &mut handle.tasks {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+            }
+        }
+        if let Some(mut refresh) = self.catalog_refresh.lock().await.take() {
+            refresh.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut refresh).await;
         }
         self.interrupt_pid.store(0, Ordering::SeqCst);
         // Drop any transcript claim so a respawn starts a fresh epoch.
@@ -2783,8 +2826,13 @@ impl Driver for ShellPtyDriver {
         // ladder working rather than as an unexplained crash.
         state.closed.store(true, Ordering::SeqCst);
         let outcome = self.stop_tree(&state).await;
-        if let Some(waiter) = self.waiter.lock().await.take() {
+        if let Some(mut waiter) = self.waiter.lock().await.take() {
             waiter.abort();
+            // Wait for the cancellation to land so the waiter's event-sender
+            // clone drops inside close() (the waiter parks on a 50 ms poll, so
+            // this returns immediately): a close that returns while sender
+            // clones linger lets the event channel outlive shutdown.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut waiter).await;
         }
         match outcome {
             Ok(outcome) if outcome.group_gone => {

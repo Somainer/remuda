@@ -201,18 +201,19 @@ async fn claude_pty_close_finalises_no_stop_usage_and_projects_to_hub_row() {
     .unwrap();
 
     let final_count = Arc::new(AtomicU32::new(0));
-    let bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
     let (final_tx, final_rx) = tokio::sync::oneshot::channel();
     let final_tx = std::sync::Mutex::new(Some(final_tx));
     let drainer_count = Arc::clone(&final_count);
-    let drainer_bound = Arc::clone(&bound);
     let drainer = tokio::spawn(async move {
         while let Some(obs) = events_rx.recv().await {
             if let ObservationPayload::Lifecycle(payload) = &obs.body
                 && let remuda_protocol::LifecyclePayload::Native(native) = payload.as_ref()
                 && native.native_name == "transcript_bound"
+                && let Some(tx) = bound_tx.lock().unwrap().take()
             {
-                drainer_bound.store(true, AtomicOrdering::SeqCst);
+                let _ = tx.send(());
             }
             if let ObservationPayload::Usage(payload) = &obs.body
                 && payload.scope_id == FINAL_MSG_ID
@@ -225,11 +226,11 @@ async fn claude_pty_close_finalises_no_stop_usage_and_projects_to_hub_row() {
         }
     });
 
-    let bind_deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !bound.load(AtomicOrdering::SeqCst) && std::time::Instant::now() < bind_deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(bound.load(AtomicOrdering::SeqCst), "transcript never bound");
+    // Acknowledgement barrier: the transcript_bound event, not an idle gap.
+    tokio::time::timeout(Duration::from_secs(30), bound_rx)
+        .await
+        .expect("transcript never bound (timed out)")
+        .expect("bound oneshot closed without firing");
 
     // Barrier: the first collect is parked before tail.poll; FINAL is absent.
     assert!(
@@ -259,8 +260,12 @@ async fn claude_pty_close_finalises_no_stop_usage_and_projects_to_hub_row() {
         .expect("close never rescued the no-stop usage (channel closed)")
         .expect("final oneshot closed without a frame");
     // r9 item 6: keep draining to channel close and prove the FINAL was
-    // delivered exactly once, instead of aborting the observer early.
-    drainer.await.expect("event drainer panicked");
+    // delivered exactly once, instead of aborting the observer early. The
+    // close is bounded so a sender leak fails the test instead of hanging.
+    tokio::time::timeout(Duration::from_secs(30), drainer)
+        .await
+        .expect("event channel never closed after the rescue")
+        .expect("event drainer panicked");
     assert_eq!(
         final_count.load(AtomicOrdering::SeqCst),
         1,
@@ -392,18 +397,19 @@ async fn claude_pty_abort_mid_cooperative_finish_still_delivers_final_usage_once
     // deliveries exactly. Barriers: a bind oneshot, a FINAL oneshot, and the
     // channel close after the pump/flusher wind down.
     let final_count = Arc::new(AtomicU32::new(0));
-    let bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
     let (final_tx, final_rx) = tokio::sync::oneshot::channel();
     let final_tx = std::sync::Mutex::new(Some(final_tx));
     let drainer_count = Arc::clone(&final_count);
-    let drainer_bound = Arc::clone(&bound);
     let drainer = tokio::spawn(async move {
         while let Some(obs) = events_rx.recv().await {
             if let ObservationPayload::Lifecycle(payload) = &obs.body
                 && let remuda_protocol::LifecyclePayload::Native(native) = payload.as_ref()
                 && native.native_name == "transcript_bound"
+                && let Some(tx) = bound_tx.lock().unwrap().take()
             {
-                drainer_bound.store(true, AtomicOrdering::SeqCst);
+                let _ = tx.send(());
             }
             if let ObservationPayload::Usage(payload) = &obs.body
                 && payload.scope_id == FINAL_MSG_ID
@@ -416,12 +422,11 @@ async fn claude_pty_abort_mid_cooperative_finish_still_delivers_final_usage_once
         }
     });
 
-    // Event barrier: wait for the bind, not an idle gap.
-    let bind_deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !bound.load(AtomicOrdering::SeqCst) && std::time::Instant::now() < bind_deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(bound.load(AtomicOrdering::SeqCst), "transcript never bound");
+    // Event barrier: wait for the bind event, not an idle gap.
+    tokio::time::timeout(Duration::from_secs(30), bound_rx)
+        .await
+        .expect("transcript never bound (timed out)")
+        .expect("bound oneshot closed without firing");
     assert_eq!(
         final_count.load(AtomicOrdering::SeqCst),
         0,
@@ -464,8 +469,12 @@ async fn claude_pty_abort_mid_cooperative_finish_still_delivers_final_usage_once
         .expect("the aborted cooperative finish never delivered the FINAL usage")
         .expect("final oneshot closed without a frame");
     // r9 item 6: drain to channel close; two producers (finish + guard) ran,
-    // the FINAL must still have been delivered exactly once.
-    drainer.await.expect("event drainer panicked");
+    // the FINAL must still have been delivered exactly once. Bounded so a
+    // sender leak fails loudly instead of hanging the test binary.
+    tokio::time::timeout(Duration::from_secs(30), drainer)
+        .await
+        .expect("event channel never closed after the abort finish")
+        .expect("event drainer panicked");
     assert_eq!(
         final_count.load(AtomicOrdering::SeqCst),
         1,
@@ -611,13 +620,18 @@ async fn oversized_residual_batch_reaches_an_idle_flusher_once() {
         .await
         .expect("oversized residual batch stranded: not every usage arrived")
         .expect("completion oneshot closed without firing");
-    // Flusher retirement means no producer remains: no frame can follow, so
-    // the per-scope counts are final and assert exactly-once.
+    // Flusher retirement means no producer remains: no frame can follow.
+    // Await RECEIVER COMPLETION (channel close), bounded — aborting here could
+    // leave a duplicate still buffered in the channel and uncounted, masking
+    // a double delivery (r10 item 5).
     assert!(
         faults.wait_flusher_exit_for(Duration::from_secs(30)),
         "the flusher never retired after the residual drain"
     );
-    drainer.abort();
+    tokio::time::timeout(Duration::from_secs(30), drainer)
+        .await
+        .expect("event channel never closed after flusher retirement")
+        .expect("event drainer panicked");
 
     let counts = counts.lock().unwrap();
     for index in 0..60u32 {

@@ -145,23 +145,28 @@ async fn unbound_shell_close_finishes_well_under_one_second() {
     options.args = vec!["/bin/sh".into(), "-c".into(), "read _unused".into()];
     let driver = ShellPtyDriver::new(options);
 
+    // A plain shell's wait_control() returns Ok immediately (there is no
+    // composer to gate on), so it cannot prove the promoter exists. Use the
+    // promoter-started acknowledgement instead: it fires only once the
+    // promoter task, flusher and gate handshake are live (r10 item 5). It
+    // must NOT fire before start.
+    use remuda_driver::test_faults::TranscriptFaults;
+    let faults = TranscriptFaults::new();
+    assert!(
+        !faults.wait_promoter_started_for(Duration::from_millis(300)),
+        "the promoter-started ack fired before start: it proves nothing"
+    );
+    driver.set_test_faults(faults.clone());
+
     let _handle = driver
         .start(spec_for(&workspace, DriverKind::ShellPty))
         .await
         .expect("start");
-    // Acknowledgement barrier (r9 item 6): wait for the driver's control
-    // readiness instead of a load-dependent settling sleep — by then the
-    // promoter task and its flusher/residual handshake exist, which is what
-    // close must not deadlock against.
-    let ready_deadline = Instant::now() + Duration::from_secs(25);
-    while Instant::now() < ready_deadline {
-        if Driver::wait_control(&driver).await.is_ok() {
-            break;
-        }
-    }
+    // Acknowledgement barrier: the promoter task and its flusher/residual
+    // handshake exist, which is what close must not deadlock against.
     assert!(
-        Driver::wait_control(&driver).await.is_ok(),
-        "composer never became ready"
+        faults.wait_promoter_started_for(Duration::from_secs(25)),
+        "the promoter task/flusher handshake never came up"
     );
 
     let started = Instant::now();
@@ -235,16 +240,17 @@ async fn bound_shell_close_finishes_well_under_one_second_and_delivers_final_usa
         .expect("start");
     let mut events_rx = handle.into_events();
     let final_count = Arc::new(AtomicUsize::new(0));
-    let bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
     let drainer_count = Arc::clone(&final_count);
-    let drainer_bound = Arc::clone(&bound);
     let drainer = tokio::spawn(async move {
         while let Some(observation) = events_rx.recv().await {
             if let ObservationPayload::Lifecycle(lc) = &observation.body
                 && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
                 && native.native_name == "transcript_bound"
+                && let Some(tx) = bound_tx.lock().unwrap().take()
             {
-                drainer_bound.store(true, Ordering::SeqCst);
+                let _ = tx.send(());
             }
             if let ObservationPayload::Usage(payload) = &observation.body
                 && payload.scope_id == FINAL_MSG_ID
@@ -254,25 +260,11 @@ async fn bound_shell_close_finishes_well_under_one_second_and_delivers_final_usa
         }
     });
 
-    // Wait for readiness and the bind (event barriers, not idle gaps).
-    let ready_deadline = Instant::now() + Duration::from_secs(25);
-    while Instant::now() < ready_deadline {
-        if Driver::wait_control(&driver).await.is_ok() {
-            break;
-        }
-    }
-    assert!(
-        Driver::wait_control(&driver).await.is_ok(),
-        "composer never became ready"
-    );
-    let bind_deadline = Instant::now() + Duration::from_secs(20);
-    while !bound.load(Ordering::SeqCst) && Instant::now() < bind_deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        bound.load(Ordering::SeqCst),
-        "the seeded replay never bound"
-    );
+    // Event barrier: the transcript_bound event, not an idle gap.
+    tokio::time::timeout(Duration::from_secs(20), bound_rx)
+        .await
+        .expect("the seeded replay never bound")
+        .expect("bound oneshot closed without firing");
     assert_eq!(
         final_count.load(Ordering::SeqCst),
         0,
@@ -287,12 +279,16 @@ async fn bound_shell_close_finishes_well_under_one_second_and_delivers_final_usa
         started.elapsed()
     );
 
-    // The final usage arrives from the cooperative drain exactly once.
-    let delivered_deadline = Instant::now() + Duration::from_secs(10);
-    while final_count.load(Ordering::SeqCst) == 0 && Instant::now() < delivered_deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    drainer.abort();
+    // Exactly-once counting waits for RECEIVER COMPLETION (the event channel
+    // closing after flusher retirement), under a timeout — aborting the
+    // drainer here could leave a duplicate still buffered in the channel and
+    // uncounted (r10 item 5). The long-lived per-session workers are the last
+    // sender clones; stop them (test seam) to observe channel closure.
+    driver.abort_event_workers_for_test().await;
+    tokio::time::timeout(Duration::from_secs(30), drainer)
+        .await
+        .expect("event channel never closed after cooperative close")
+        .expect("event drainer panicked");
     assert_eq!(
         final_count.load(Ordering::SeqCst),
         1,
@@ -300,16 +296,15 @@ async fn bound_shell_close_finishes_well_under_one_second_and_delivers_final_usa
     );
 }
 
-/// c-ctxusage r9 item 2: close aborts the promoter while the FIRST blocking
-/// collect is merely QUEUED — registered in the producer gate but parked
-/// BEFORE it claims the hydrator. The old loose atomics let the abort guard
-/// read "no producer, empty slot" in that gap, declare completion on a ~120 s
-/// budget, and let the flusher exit before the queued collect (and the final
-/// finish) parked their frames. The unified gate makes the queued closure
-/// Active before it runs; the terminal finish waits on actual retirement. The
-/// FINAL no-stop usage must still be delivered exactly once.
+/// c-ctxusage r10 item 1 (was the r9 item 2 regression): close aborts the
+/// promoter while the cooperative TERMINAL finalise is registered and its
+/// blocking closure is parked BEFORE it claims the hydrator. The abort
+/// residual then registers a SECOND terminal. The r9 gate made both see
+/// "another terminal" and wait on each other forever. Ticket order elects the
+/// earlier (cooperative) terminal the sole owner; the residual no-ops after
+/// retirement. The FINAL no-stop usage must still be delivered exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn abort_before_a_queued_collect_claims_still_delivers_final_usage_once() {
+async fn abort_before_a_queued_terminal_claims_still_delivers_final_usage_once() {
     use remuda_driver::test_faults::TranscriptFaults;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -361,10 +356,11 @@ async fn abort_before_a_queued_collect_claims_still_delivers_final_usage_once() 
     });
     let driver = ShellPtyDriver::new(options);
 
-    // Park the first blocking collect the moment its closure runs, BEFORE it
-    // claims the hydrator; shorten close's bound so the abort is deterministic.
+    // Park the first registered TERMINAL finalise the moment its blocking
+    // closure starts, BEFORE it claims the hydrator; shorten close's bound so
+    // the abort (and its second terminal) is deterministic.
     let faults = TranscriptFaults::new();
-    faults.arm_queued_gate();
+    faults.arm_terminal_gate();
     faults.arm_close_timeout(Duration::from_millis(500));
     driver.set_test_faults(faults.clone());
 
@@ -374,16 +370,17 @@ async fn abort_before_a_queued_collect_claims_still_delivers_final_usage_once() 
         .expect("start");
     let mut events_rx = handle.into_events();
     let final_count = Arc::new(AtomicUsize::new(0));
-    let bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
     let drainer_count = Arc::clone(&final_count);
-    let drainer_bound = Arc::clone(&bound);
     let drainer = tokio::spawn(async move {
         while let Some(observation) = events_rx.recv().await {
             if let ObservationPayload::Lifecycle(lc) = &observation.body
                 && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
                 && native.native_name == "transcript_bound"
+                && let Some(tx) = bound_tx.lock().unwrap().take()
             {
-                drainer_bound.store(true, Ordering::SeqCst);
+                let _ = tx.send(());
             }
             if let ObservationPayload::Usage(payload) = &observation.body
                 && payload.scope_id == FINAL_MSG_ID
@@ -393,71 +390,64 @@ async fn abort_before_a_queued_collect_claims_still_delivers_final_usage_once() 
         }
     });
 
-    let ready_deadline = Instant::now() + Duration::from_secs(25);
-    while Instant::now() < ready_deadline {
-        if Driver::wait_control(&driver).await.is_ok() {
-            break;
-        }
-    }
-    let bind_deadline = Instant::now() + Duration::from_secs(20);
-    while !bound.load(Ordering::SeqCst) && Instant::now() < bind_deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // Acknowledgement barriers only: the promoter handshake is live, then the
+    // seeded replay binds (an event, not an idle gap).
     assert!(
-        bound.load(Ordering::SeqCst),
-        "the seeded replay never bound"
+        faults.wait_promoter_started_for(Duration::from_secs(25)),
+        "the promoter task/flusher handshake never came up"
     );
+    tokio::time::timeout(Duration::from_secs(20), bound_rx)
+        .await
+        .expect("the seeded replay never bound")
+        .expect("bound oneshot closed without firing");
 
-    // Barrier: the first collect closure is queued and parked BEFORE its
-    // claim — the producer is registered but the hydrator is unclaimed.
-    assert!(
-        faults.wait_queued_entered(),
-        "the queued blocking collect never reached its pre-claim barrier"
-    );
-
-    // Close crosses its shortened bound and aborts the promoter.
+    // Close crosses its shortened bound while the cooperative terminal
+    // finalise is merely REGISTERED+queued, and aborts the promoter.
     driver.close().await.expect("close");
     assert!(
         faults.wait_abort_residual(),
         "close returned without the abort residual running"
     );
+    // Barrier: the cooperative terminal closure reached its pre-claim park
+    // (registered, hydrator unclaimed). The abort residual has registered a
+    // second terminal by now and waits inside its claim.
+    assert!(
+        faults.wait_terminal_entered(),
+        "the cooperative terminal finalise never reached its pre-claim barrier"
+    );
 
-    // The terminal finish is YIELDING to the parked collector: nothing may
-    // be finished, the flusher must not retire while the queued producer is
-    // active.
+    // Neither terminal may finish while the elected one is parked: the
+    // flusher must not retire and no FINAL usage is delivered.
     assert!(
         !faults.wait_flusher_exit_for(Duration::from_millis(500)),
-        "the flusher retired while the queued collect was still registered"
+        "the flusher retired while the terminal owner was still parked"
     );
     assert_eq!(
         final_count.load(Ordering::SeqCst),
         0,
-        "FINAL usage delivered while the queued collect was parked"
+        "FINAL usage delivered while the terminal owner was parked"
     );
 
-    // Release: the collector claims, maps the replay and restores; the
-    // waiting terminal finish then claims, finishes the buffered run and
-    // retires; the flusher delivers the FINAL usage exactly once.
+    // Release: the elected cooperative terminal claims, finishes the
+    // buffered run and retires; the residual terminal wakes retired and
+    // no-ops. The flusher delivers the FINAL usage exactly once and retires.
     faults.release();
-    let delivered_deadline = Instant::now() + Duration::from_secs(30);
-    while final_count.load(Ordering::SeqCst) < 1 && Instant::now() < delivered_deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(
-        final_count.load(Ordering::SeqCst),
-        1,
-        "the queued collect + abort finish must deliver the FINAL usage exactly once"
-    );
-    // Let the flusher wind down, then prove exactly-once even though both a
-    // collector and the abort terminal finish ran.
     assert!(
         faults.wait_flusher_exit_for(Duration::from_secs(30)),
-        "the flusher never retired after the queued collect drained"
+        "the flusher never retired after the terminal finish drained"
     );
-    drainer.abort();
+    // Await RECEIVER COMPLETION (channel close) under a timeout before
+    // counting: aborting here could leave a duplicate still buffered in the
+    // channel and uncounted (r10 item 5). The long-lived per-session workers
+    // are the last sender clones after the promoter/waiter shut down.
+    driver.abort_event_workers_for_test().await;
+    tokio::time::timeout(Duration::from_secs(30), drainer)
+        .await
+        .expect("event channel never closed after flusher retirement")
+        .expect("event drainer panicked");
     assert_eq!(
         final_count.load(Ordering::SeqCst),
         1,
-        "the queued collect + abort finish must deliver the FINAL usage exactly once"
+        "cooperative terminal + abort residual must deliver the FINAL usage exactly once"
     );
 }

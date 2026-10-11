@@ -843,6 +843,12 @@ pub(super) fn spawn(
         done: false,
     };
     tokio::spawn(async move {
+        // Test-only acknowledgement (r10 item 5): the promoter task and the
+        // flusher/gate handshake above are live — the state a close must not
+        // deadlock against. Inert in production (faults is None).
+        if let Some(faults) = faults.as_ref() {
+            faults.note_promoter_started();
+        }
         let mut promote = PromoteState::default();
         let hydrator = hydrator_slot;
         let pending = pending_emissions;

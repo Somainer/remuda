@@ -64,6 +64,12 @@ pub(crate) struct FaultState {
     /// residual batch lands while the flusher is idle/asleep.
     flusher_idle: Mutex<bool>,
     flusher_idle_cv: Condvar,
+    /// Acknowledged once the promoter task (with its flusher and gate) has
+    /// actually spawned — the state an unbound close must not deadlock
+    /// against. `wait_control` returns Ok immediately for a plain shell, so it
+    /// cannot prove this (c-ctxusage r10 item 5).
+    promoter_started: Mutex<bool>,
+    promoter_started_cv: Condvar,
     skip_cooperative_finalise: AtomicBool,
     /// Overrides the driver's bounded cooperative-close wait so an abort test
     /// crosses the bound deterministically without the production 15 s / 2 s
@@ -103,6 +109,8 @@ impl FaultState {
             flusher_exited_cv: Condvar::new(),
             flusher_idle: Mutex::new(false),
             flusher_idle_cv: Condvar::new(),
+            promoter_started: Mutex::new(false),
+            promoter_started_cv: Condvar::new(),
             skip_cooperative_finalise: AtomicBool::new(false),
             close_timeout_ms: AtomicU64::new(0),
             pending_capacity: AtomicU64::new(0),
@@ -246,6 +254,16 @@ impl FaultState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         self.flusher_idle_cv.notify_all();
+    }
+
+    /// Acknowledge that the promoter task spawned with its flusher/gate
+    /// handshake in place (c-ctxusage r10 item 5).
+    pub(crate) fn note_promoter_started(&self) {
+        *self
+            .promoter_started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.promoter_started_cv.notify_all();
     }
 
     /// The injected bounded-pending capacity override, if a test armed one.
@@ -409,6 +427,16 @@ impl TranscriptFaults {
             &self.inner.flusher_idle,
             &self.inner.flusher_idle_cv,
             Duration::from_secs(60),
+        )
+    }
+
+    /// Block until the promoter task acknowledges it spawned with the
+    /// flusher/gate handshake live (bounded, c-ctxusage r10 item 5).
+    pub fn wait_promoter_started_for(&self, timeout: Duration) -> bool {
+        Self::wait_true(
+            &self.inner.promoter_started,
+            &self.inner.promoter_started_cv,
+            timeout,
         )
     }
 

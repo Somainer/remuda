@@ -93,12 +93,14 @@ pub struct WorkflowJournalTailer {
     /// order). When the run later registers (or the member starts), the member
     /// is marked Failed immediately.
     pending_failed: HashSet<String>,
-    /// c-cardsettle-fu2 r5 item 2: agent ids whose live StopFailure arrived
-    /// while their RETRY's own journal `started` was already written but not
-    /// yet folded. Armed on the member(s) for the duration of the next poll's
-    /// journal fold so that start cannot resurrect the failure; consumed
-    /// (drained) after that run's lines have folded.
-    failure_ahead_agents: HashSet<String>,
+    /// c-cardsettle-fu2 r5-r6 item 2: terminal watermark for a live
+    /// StopFailure that arrived while the retry's own journal `started` was
+    /// already on disk but not yet folded. `(file generation, byte offset)`
+    /// of the newest start record the failure settles: the fold suppresses
+    /// resurrection only for a start at or before that position, and only
+    /// until that record is actually consumed (empty polls leave it armed; a
+    /// later start in the same or a later poll is a genuine retry).
+    failure_watermarks: HashMap<String, (u64, u64)>,
     /// Main session transcript path. Every run adopts an end-anchored tail at
     /// registration, so a run launched minutes after the SessionStart bind
     /// never re-reads pre-launch transcript bytes.
@@ -159,14 +161,13 @@ struct MemberState {
     /// counter was already bumped by ANOTHER agent must only resurrect when
     /// THIS member previously consumed a start.
     consumed_journal_start: bool,
-    /// c-cardsettle-fu2 r5 item 2: a live StopFailure for a RETRY arrived
-    /// while that retry's own journal `started` was already written but not
-    /// yet folded. The start folding in the current poll is bound to THAT
-    /// failure (not evidence the member is running again), so it must not
-    /// resurrect the member; the flag is armed for the duration of one poll
-    /// by the tailer (which can see both the hook failure and the unread
-    /// journal tail) and cleared after the run's lines are folded.
-    failure_ahead: bool,
+    /// c-cardsettle-fu2 r5-r6 item 2: terminal watermark for a live
+    /// StopFailure that arrived ahead of its settled attempt's journal
+    /// `started`. `(file generation, byte offset)` of that start record; the
+    /// fold suppresses resurrection for a start at or before the position and
+    /// clears the watermark once that record is consumed (or the journal
+    /// rotates to a different generation).
+    failure_watermark: Option<(u64, u64)>,
     state: WorkflowState,
     label: Option<String>,
     phase: Option<String>,
@@ -215,7 +216,7 @@ impl WorkflowJournalTailer {
             ids,
             runs: Vec::new(),
             pending_failed: HashSet::new(),
-            failure_ahead_agents: HashSet::new(),
+            failure_watermarks: HashMap::new(),
             main_transcript_path: None,
             main_transcript_scan: false,
         }
@@ -386,19 +387,21 @@ impl WorkflowJournalTailer {
             .position(|run| run.native_id == run_id)
             .expect("run registered above");
         self.runs[index].agent_failed(agent_id, agent_transcript_path);
-        // c-cardsettle-fu2 r5 item 2: if a journal `started` for this agent is
-        // already on disk but unread, this StopFailure settles THAT attempt
-        // (a failed RETRY whose start record the poll has not folded yet).
-        // Arm the one-poll marker so the start cannot resurrect the member at
-        // the next fold; only a start appended AFTER this poll is a genuine
-        // retry.
+        // c-cardsettle-fu2 r5-r6 item 2: if a journal `started` for this
+        // agent is already on disk but unread, this StopFailure settles THAT
+        // attempt (a failed RETRY whose start record the poll has not folded
+        // yet). Record the record's position as the terminal watermark: the
+        // fold suppresses resurrection only for starts at or before it, so a
+        // start appended AFTER the failure — even one that folds in the same
+        // poll — is still a genuine retry.
         let journal_path = self.runs[index].dir.join("journal.jsonl");
-        let start_ahead = self
+        if let Some(watermark) = self
             .tails
             .get(&journal_path)
-            .is_some_and(|tail| tail.unread_starts_agent(agent_id).unwrap_or(false));
-        if start_ahead {
-            self.failure_ahead_agents.insert(agent_id.to_owned());
+            .and_then(|tail| tail.unread_start_position(agent_id).ok().flatten())
+        {
+            self.failure_watermarks
+                .insert(agent_id.to_owned(), watermark);
         }
         self.emit_snapshots()
     }
@@ -472,29 +475,31 @@ impl WorkflowJournalTailer {
         // Journal lines are native transitions: fold one at a time and emit the
         // snapshot each line changes, preserving transition order on catch-up.
         for index in 0..self.runs.len() {
-            // r5 item 2: arm the members whose live StopFailure arrived ahead
-            // of their (already-written, unread) retry start, for the duration
-            // of this run's fold below.
-            let armed: Vec<String> = self
-                .failure_ahead_agents
+            // r5-r6 item 2: arm members carrying a terminal watermark from a
+            // live StopFailure. The watermark survives empty polls and is
+            // consumed by the fold only when the exact record it covers is
+            // read, so it is armed afresh here on every poll (re-arming the
+            // same member with the same position is a no-op).
+            let armed: Vec<(String, (u64, u64))> = self
+                .failure_watermarks
                 .iter()
-                .filter(|agent_id| {
+                .filter(|(agent_id, _)| {
                     self.runs[index]
                         .members
                         .iter()
                         .any(|member| member.agent_id == **agent_id)
                 })
-                .cloned()
+                .map(|(agent_id, watermark)| (agent_id.clone(), *watermark))
                 .collect();
-            self.runs[index].arm_failure_ahead(&armed);
+            self.runs[index].arm_failure_watermarks(&armed);
             let journal_path = self.runs[index].dir.join("journal.jsonl");
             let lines = match self.tails.get_mut(&journal_path) {
                 Some(tail) => tail.poll()?,
                 None => Vec::new(),
             };
-            for (line, _) in lines {
+            for (line, cursor) in lines {
                 let line = line.clone();
-                self.runs[index].fold_journal_line(&line);
+                self.runs[index].fold_journal_line(&line, &cursor);
                 self.runs[index].refresh_agents()?;
                 // Recompute phase state per journal line so a phase running
                 // between two lines still emits its running revision (it is a
@@ -502,14 +507,12 @@ impl WorkflowJournalTailer {
                 self.runs[index].recompute_phases();
                 out.extend(self.run_envelopes(index)?);
             }
-            // All unread lines the failure was ahead of are now folded: the
-            // member held terminal for every one of them; consume the markers
-            // (a genuinely NEWER start appended after this poll resurrects
-            // through the normal retry rule).
-            if !armed.is_empty() {
-                self.runs[index].clear_failure_ahead();
-                for agent_id in armed {
-                    self.failure_ahead_agents.remove(&agent_id);
+            // Drop tailer-side entries the fold actually consumed (or
+            // invalidated by rotation). An empty poll — the covered record is
+            // still unread — keeps both sides armed.
+            for (agent_id, _) in &armed {
+                if !self.runs[index].member_has_failure_watermark(agent_id) {
+                    self.failure_watermarks.remove(agent_id);
                 }
             }
         }
@@ -1299,7 +1302,7 @@ impl RunState {
         }
     }
 
-    fn fold_journal_line(&mut self, line: &[u8]) {
+    fn fold_journal_line(&mut self, line: &[u8], cursor: &FileCursor) {
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
             return;
         };
@@ -1362,14 +1365,21 @@ impl RunState {
                 //   different agent id already bumped (started(k,a0) then
                 //   started(k,a1) counts the key to 2, but a1 never consumed
                 //   a start).
-                // r5 item 2: it also must not fire when a live StopFailure
-                // for THIS attempt is already known but its failure record
-                // has not folded yet (failure_ahead): the start being folded
-                // is the settled attempt's own start, not a newer retry.
-                // Same-attempt folds and the placeholder's own first start
-                // never downgrade a terminal outcome.
+                // r6 item 1: it also must not fire when this start record is
+                // at or before the terminal watermark of a live StopFailure
+                // (the failed attempt's own start, or an even older catch-up
+                // record). A start at a LATER offset — including one folded
+                // later in the SAME poll — is a genuinely newer attempt and
+                // resurrects. Same-attempt folds and a placeholder's own
+                // first start never downgrade a terminal outcome.
+                let settled_by_watermark =
+                    member
+                        .failure_watermark
+                        .is_some_and(|(generation, offset)| {
+                            cursor.file_generation.0 == generation && cursor.offset.0 <= offset
+                        });
                 let genuine_retry =
-                    is_newer_attempt && member.consumed_journal_start && !member.failure_ahead;
+                    is_newer_attempt && member.consumed_journal_start && !settled_by_watermark;
                 member.key = Some(key.clone());
                 member.attempt = attempt;
                 if !terminal || genuine_retry {
@@ -1379,6 +1389,17 @@ impl RunState {
                     // Terminal outcome held against a same-attempt started;
                     // force one file-catch-up convergence emission.
                     self.force_member_refresh.insert(agent_id.clone());
+                }
+                // r6 item 1: the watermark is spent once the fold reaches its
+                // position — this record itself (cursor at the watermark), or
+                // a journal rotation (different generation). A genuinely
+                // newer start at a LATER offset that resurrects also clears it
+                // via the `>=` comparison. Empty polls never reach here and
+                // therefore keep it armed.
+                if let Some((generation, offset)) = member.failure_watermark
+                    && (cursor.file_generation.0 != generation || cursor.offset.0 >= offset)
+                {
+                    member.failure_watermark = None;
                 }
                 // This journal `started` has now been consumed by THIS member,
                 // regardless of whether it resurrected it or was held terminal;
@@ -1455,24 +1476,25 @@ impl RunState {
         }
     }
 
-    /// r5 item 2: arm [`MemberState::failure_ahead`] on the named members for
-    /// the duration of one journal fold.
-    fn arm_failure_ahead(&mut self, agent_ids: &[String]) {
+    /// r5-r6 item 2: arm [`MemberState::failure_watermark`] on the named
+    /// members from the tailer's live-StopFailure positions.
+    fn arm_failure_watermarks(&mut self, armed: &[(String, (u64, u64))]) {
         for member in &mut self.members {
-            if agent_ids
+            if let Some((_, watermark)) = armed
                 .iter()
-                .any(|agent_id| agent_id == &member.agent_id)
+                .find(|(agent_id, _)| agent_id == &member.agent_id)
             {
-                member.failure_ahead = true;
+                member.failure_watermark = Some(*watermark);
             }
         }
     }
 
-    /// Clear all one-poll failure-ahead markers in this run.
-    fn clear_failure_ahead(&mut self) {
-        for member in &mut self.members {
-            member.failure_ahead = false;
-        }
+    /// Whether the named member still carries an unconsumed terminal
+    /// watermark (the tailer drops its side entry once the fold consumes it).
+    fn member_has_failure_watermark(&self, agent_id: &str) -> bool {
+        self.members
+            .iter()
+            .any(|member| member.agent_id == agent_id && member.failure_watermark.is_some())
     }
 
     fn agent_started(
@@ -1781,7 +1803,7 @@ impl MemberState {
             jsonl: None,
             meta_read: false,
             stopped: false,
-            failure_ahead: false,
+            failure_watermark: None,
         }
     }
 }

@@ -183,40 +183,50 @@ impl FileTail {
         self.offset
     }
 
-    /// Whether the still-unread tail contains a complete `started` journal
-    /// record whose `agentId` is `agent_id` (or whose `key` is, for records
-    /// that omit `agentId`). Does NOT advance the cursor: the caller is
-    /// deciding whether a live hook event arrived ahead of this record's
-    /// fold.
-    pub fn unread_starts_agent(&self, agent_id: &str) -> Result<bool, Error> {
+    /// Position of the NEWEST complete (newline-terminated) `started` record
+    /// for `agent_id` in the still-unread tail, as `(file generation, byte
+    /// offset of the record's first byte)` — or `None`. Matches on `agentId`
+    /// (falling back to `key`, for records that omit `agentId`).
+    ///
+    /// Does NOT advance the cursor. A live StopFailure uses the result as a
+    /// terminal watermark: only starts at or before that position are the
+    /// failure's own settled attempt; a start at a later offset is a genuine
+    /// retry and must resurrect the member even when both fold in the same
+    /// poll. Uses the SAME completeness rule as [`Self::poll`] (a trailing
+    /// newline-free segment is not a record yet).
+    pub fn unread_start_position(&self, agent_id: &str) -> Result<Option<(u64, u64)>, Error> {
         let mut file = match File::open(&self.path) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
             Ok(file) => file,
         };
         file.seek(SeekFrom::Start(self.offset))?;
         let mut rest = Vec::new();
         file.read_to_end(&mut rest)?;
-        for line in rest.split(|byte| *byte == b'\n') {
-            if line.is_empty() {
+        let mut newest: Option<(u64, u64)> = None;
+        let mut start = 0usize;
+        for (i, byte) in rest.iter().enumerate() {
+            if *byte != b'\n' {
                 continue;
             }
-            let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
-                continue;
-            };
-            if value.get("type").and_then(serde_json::Value::as_str) != Some("started") {
-                continue;
+            let mut line = &rest[start..i];
+            if let Some(without_cr) = line.strip_suffix(b"\r") {
+                line = without_cr;
             }
-            let named = value
-                .get("agentId")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| value.get("key").and_then(serde_json::Value::as_str))
-                .is_some_and(|id| id == agent_id);
-            if named {
-                return Ok(true);
+            if !line.is_empty()
+                && let Ok(value) = serde_json::from_slice::<serde_json::Value>(line)
+                && value.get("type").and_then(serde_json::Value::as_str) == Some("started")
+                && value
+                    .get("agentId")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| value.get("key").and_then(serde_json::Value::as_str))
+                    .is_some_and(|id| id == agent_id)
+            {
+                newest = Some((self.generation, self.offset + start as u64));
             }
+            start = i + 1;
         }
-        Ok(false)
+        Ok(newest)
     }
 
     /// Persistable cursor.

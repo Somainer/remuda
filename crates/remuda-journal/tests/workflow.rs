@@ -850,3 +850,119 @@ fn a_failed_retry_is_not_resurrected_by_its_own_delayed_start() {
         "a third start after the failure is a genuine retry and resurrects a1"
     );
 }
+
+/// c-cardsettle-fu2 r6 item 1: the live failure's terminal marker must be a
+/// per-member WATERMARK at the failed attempt's journal position, not a
+/// boolean covering the whole next poll. Attempt 1 starts+folds to Failed;
+/// attempt 2's complete start is on disk when the live StopFailure arrives
+/// (watermark = attempt 2's record position); attempt 3's start is appended
+/// AFTER the failure but BEFORE the next poll. Folding both starts in one
+/// poll must hold attempt 2 Failed and then resurrect attempt 3 to Running.
+#[test]
+fn a_start_between_the_live_failure_and_the_poll_resurrects_in_that_poll() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_r6_watermark";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    // Attempt 1: started then failed, both folded on the first poll.
+    std::fs::write(
+        run_dir.join("journal.jsonl"),
+        "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n\
+         {\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n",
+    )
+    .unwrap();
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        bodies(tailer.poll().unwrap())
+            .iter()
+            .rev()
+            .find_map(|body| match body {
+                ObservationPayload::WorkflowMember(m)
+                    if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+                {
+                    Some(m.state)
+                }
+                _ => None,
+            })
+            .expect("a1 observed"),
+        WorkflowState::Failed,
+        "attempt 1 ends Failed"
+    );
+
+    // Attempt 2's complete start lands before the live failure…
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}}"
+        )
+        .unwrap();
+    }
+    // …live SubagentStart + StopFailure for attempt 2 (the failure settles the
+    // start already on disk, arming a watermark at ITS position)…
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    // …and attempt 3's complete start lands AFTER the failure but before any
+    // poll folds either record.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}}"
+        )
+        .unwrap();
+    }
+
+    // One poll folds BOTH starts: attempt 2 held Failed, attempt 3 Running.
+    let a1_states: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        *a1_states.first().expect("an a1 observation while folding"),
+        WorkflowState::Failed,
+        "attempt 2's own start (at the watermark) must stay Failed: {a1_states:?}"
+    );
+    assert_eq!(
+        *a1_states.last().expect("an a1 observation while folding"),
+        WorkflowState::Running,
+        "attempt 3 started AFTER the failure is a genuine retry, even in the same poll: \
+         {a1_states:?}"
+    );
+    assert!(
+        !a1_states[..a1_states.len() - 1].contains(&WorkflowState::Running),
+        "nothing may resurrect until the past-watermark record folds: {a1_states:?}"
+    );
+}

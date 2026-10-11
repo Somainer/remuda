@@ -899,6 +899,14 @@ type SessionPointRow = (Option<i64>, Option<i64>, String, Option<String>, String
 /// increment (native 100 → untimed 120, 140 → native 150 read as +50 instead
 /// of the true +10). Only the increment EMISSION is native-gated
 /// (c-ctxusage r9 item 3).
+///
+/// c-ctxusage r10 item 3: the chain order is the ACCEPTED order (insertion
+/// `rowid`), never `observed_at`: a buffered native point carrying an EARLIER
+/// timestamp can be accepted AFTER ingest-stamped rows, and ordering by the
+/// mixed clocks would both pick the wrong predecessor and promote a stale
+/// ingest stock to "current". Native timestamps only place the resulting
+/// increment into a rate window (see [`diff_rows`]); they do not order the
+/// cumulative sequence.
 fn session_point_rows(
     conn: &Connection,
     instance_id: &str,
@@ -913,7 +921,7 @@ fn session_point_rows(
         "SELECT input_tokens, output_tokens, observed_at, scope_id, observed_at_source
          FROM usage_events
          WHERE instance_id = ?1 AND scope = 'session' AND {predicate}
-         ORDER BY scope_id ASC, observed_at ASC, seq ASC"
+         ORDER BY scope_id ASC, rowid ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
     stmt.query_map(params![instance_id], |row| {
@@ -934,7 +942,9 @@ fn session_point_rows(
 /// predecessor's source), and only when the predecessor exists. A native
 /// point with no predecessor, or an interval whose predecessor counters are
 /// unknown, yields no increment — the interval is unknown, never the stock
-/// (c-ctxusage r9 item 3).
+/// (c-ctxusage r9 item 3). An unknown PREDECESSOR bucket stays unknown rather
+/// than being treated as zero: unknown→150 cannot be read as a 150 increment
+/// (c-ctxusage r10 item 4).
 fn diff_rows(rows: Vec<SessionPointRow>) -> rusqlite::Result<Vec<StockIncrement>> {
     let mut increments = Vec::new();
     let mut previous: Option<(Option<String>, Option<i64>, Option<i64>)> = None;
@@ -947,14 +957,16 @@ fn diff_rows(rows: Vec<SessionPointRow>) -> rusqlite::Result<Vec<StockIncrement>
             && source == "native"
             && let Some((_, prev_input, prev_output)) = &previous
         {
+            // None for either side of a bucket means "unknown for this
+            // interval": only two KNOWN adjacent counters produce a number.
             let bucket = |current: Option<i64>, previous: Option<i64>| -> Option<i64> {
                 match (current, previous) {
                     (Some(current), Some(previous)) => Some(if current < previous {
+                        // Saturating reset: the stock restarted at `current`.
                         current
                     } else {
                         current - previous
                     }),
-                    (Some(current), None) => Some(current),
                     _ => None,
                 }
             };
@@ -1029,24 +1041,27 @@ fn latest_session_stock(
     conn: &Connection,
     instance_id: &str,
 ) -> rusqlite::Result<(SessionStock, bool)> {
-    // Newest point per scoped session id for counters, in observed time / seq
-    // order. The timestamp source travels with the point so an ingest
-    // fallback can never be mistaken for a native session time (c-ctxusage r8
-    // item 9).
+    // Newest point per scoped session id for counters, in ACCEPTANCE order
+    // (insertion rowid, c-ctxusage r10 item 3): the current stock is the last
+    // accepted cumulative point, not the point with the newest mixed clock —
+    // a late-ingested buffered native point with an earlier native timestamp
+    // must not demote the stock. The timestamp source travels with the point
+    // so an ingest fallback can never be mistaken for a native session time
+    // (c-ctxusage r8 item 9).
     let mut stmt = conn.prepare(
         "WITH ranked AS (
             SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                   observed_at, scope_id,
+                   observed_at, scope_id, rowid,
                    ROW_NUMBER() OVER (
                        PARTITION BY scope_id
-                       ORDER BY observed_at DESC, seq DESC
+                       ORDER BY rowid DESC
                    ) AS rn
             FROM usage_events
             WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NOT NULL
          )
          SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, observed_at
          FROM ranked WHERE rn = 1
-         ORDER BY observed_at DESC",
+         ORDER BY rowid DESC",
     )?;
     let points: Vec<LatestStockPoint> = stmt
         .query_map(params![instance_id], |r| {
@@ -1077,15 +1092,16 @@ fn latest_session_stock(
             .unwrap_or(None);
         return Ok((stock, true));
     }
-    // Legacy fallback: the newest NULL-scope row. Legacy rows predate source
-    // tracking and are conservatively 'ingest', so native_observed_at stays
-    // None — a legacy cumulative total cannot author a lastTurnAt.
+    // Legacy fallback: the last ACCEPTED NULL-scope row (acceptance order,
+    // r10 item 3). Legacy rows predate source tracking and are conservatively
+    // 'ingest', so native_observed_at stays None — a legacy cumulative total
+    // cannot author a lastTurnAt.
     let stock = conn
         .query_row(
             "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, observed_at
              FROM usage_events
              WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NULL
-             ORDER BY observed_at DESC, seq DESC LIMIT 1",
+             ORDER BY rowid DESC LIMIT 1",
             params![instance_id],
             |r| {
                 Ok(SessionStock {
@@ -3295,6 +3311,155 @@ mod tests {
         insert_journal_raw(&conn, &unproven);
         migrate(&conn).unwrap();
         assert_eq!(scope_id_at(&conn, 1), None);
+    }
+
+    /// c-ctxusage r10 item 2: a database still carrying the OBSOLETE shared
+    /// unique index `usage_events_scope_dedupe` (last opened by RC1-era code),
+    /// with several NULL-scope legacy rows whose retained journal payloads
+    /// prove ONE session — including an identical-counters duplicate and a row
+    /// matching an already-scoped point — must open. The old migration stamped
+    /// scope ids while the obsolete index was live and failed with a UNIQUE
+    /// violation on EVERY Hub startup; the fixed migration drops first,
+    /// backfills, collapses duplicates, creates the new index atomically, and
+    /// is idempotent.
+    #[test]
+    fn old_schema_with_obsolete_index_backfills_one_proven_session_and_opens() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The RC1-era table: no cache_* / metric_revision / source columns.
+        conn.execute_batch(
+            "CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                scope_id TEXT,
+                mode TEXT NOT NULL,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (instance_id, seq)
+             );
+             CREATE UNIQUE INDEX usage_events_scope_dedupe
+                 ON usage_events(instance_id, scope, scope_id)
+                 WHERE scope_id IS NOT NULL;",
+        )
+        .unwrap();
+        let insert_legacy = |seq: i64, input: i64, output: i64, at: &str| {
+            conn.execute(
+                "INSERT INTO usage_events
+                    (instance_id, seq, scope, scope_id, mode, total_tokens,
+                     input_tokens, output_tokens, accounting, observed_at)
+                 VALUES ('ins_r10', ?1, 'session', NULL, 'snapshot',
+                         ?2, ?3, ?4, 'estimated', ?5)",
+                params![seq, input + output, input, output, at],
+            )
+            .unwrap();
+        };
+        // Three NULL rows proving s1: 100/10, an IDENTICAL 100/10 replay, and
+        // 150/15 growth.
+        insert_legacy(1, 100, 10, "2020-01-01T00:00:00.000Z");
+        insert_legacy(2, 100, 10, "2020-01-01T00:00:01.000Z");
+        insert_legacy(3, 150, 15, "2020-01-01T00:00:02.000Z");
+        // A fourth NULL row proving s1 whose 200/20 stock MATCHES an existing
+        // already-scoped s1 point written after the upgrade.
+        insert_legacy(4, 200, 20, "2020-01-01T00:00:04.000Z");
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, mode, total_tokens,
+                 input_tokens, output_tokens, accounting, observed_at)
+             VALUES ('ins_r10', 10, 'session', 's1', 'snapshot',
+                     220, 200, 20, 'estimated', '2020-01-01T00:00:05.000Z')",
+            [],
+        )
+        .unwrap();
+        create_journal_table(&conn);
+        // Every legacy row's retained journal payload proves session s1.
+        insert_journal_raw(
+            &conn,
+            &scoped_record(1, "ins_r10", "session", Some("s1"), 1, 100, 10, 0, 0, None),
+        );
+        insert_journal_raw(
+            &conn,
+            &scoped_record(2, "ins_r10", "session", Some("s1"), 1, 100, 10, 0, 0, None),
+        );
+        insert_journal_raw(
+            &conn,
+            &scoped_record(3, "ins_r10", "session", Some("s1"), 1, 150, 15, 0, 0, None),
+        );
+        insert_journal_raw(
+            &conn,
+            &scoped_record(4, "ins_r10", "session", Some("s1"), 1, 200, 20, 0, 0, None),
+        );
+
+        // The migration itself must succeed — it runs in Store::open, so an
+        // error here is the "Hub DB cannot open on any retry" failure.
+        migrate(&conn).unwrap();
+
+        // The obsolete index is gone; the scope-specific turn index exists.
+        let old_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'usage_events_scope_dedupe'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_index, 0, "the obsolete shared index was not dropped");
+        let new_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'usage_events_turn_dedupe'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_index, 1);
+
+        // All rows are stamped s1; the identical 100/10 replay and the
+        // matching 200/20 point collapsed: 100/10, 150/15, 200/20 remain.
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events
+                 WHERE instance_id = 'ins_r10' AND scope = 'session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 3, "identical proven points must be consolidated");
+        let null_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events
+                 WHERE instance_id = 'ins_r10' AND scope_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_rows, 0);
+        let rollup = rollup_instance(&conn, "ins_r10", "codex", Some("codex"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(200),
+            "current stock is the latest proven growth point, not a doubled sum"
+        );
+        assert_eq!(rollup.session_output_tokens, Some(20));
+
+        // The migration is idempotent: a second open runs it unchanged.
+        migrate(&conn).unwrap();
+        let rows_again: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events
+                 WHERE instance_id = 'ins_r10' AND scope = 'session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows_again, 3);
     }
 
     /// r8 item 8 regression: the legacy NULL-scope row is a different,

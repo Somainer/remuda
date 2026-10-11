@@ -18,10 +18,12 @@ import {
   buildHomeGroups,
   buildHomeRows,
   homeError,
+  homeTurnError,
   homeRowsSignature,
   readHomeOrder,
   writeHomeOrder,
 } from "./homeRows";
+import { mapInstance } from "../../lib/api";
 
 /**
  * Fixtures: the mock's first instance is a connected claude-print session
@@ -298,33 +300,37 @@ describe("buildHomeGroups body text", () => {
     }
   });
 
-  it("(r7 item 6) reads a SERIALIZED Hub instance's lastTurnError after a settled API error", () => {
-    // The exact JSON the Hub serializes for InstanceRecord (camelCase
-    // lastTurnError from the turn_error_json column). Parsing this raw shape
-    // (not a hand-built mock) proves the mobile consumer agrees with the real
-    // backend contract end to end.
-    const hubJson = JSON.parse(`{
-      "id": "ins-hub-turn-error",
-      "hostId": "host-alpha",
-      "workspaceId": "wsp-alpha",
-      "kind": "claude",
-      "driver": "claude-sdk",
-      "lifecycle": "running",
-      "activity": { "state": "known", "value": "idle" },
-      "connectivity": "connected",
-      "createdAt": "2026-10-11T00:00:00.000Z",
-      "updatedAt": "2026-10-11T00:00:01.000Z",
-      "lastError": null,
-      "lineageId": "ins-hub-turn-error",
-      "generation": 1,
-      "lastTurnError": { "at": "2026-10-11T00:00:01.000Z", "text": "API Error: 429 no eligible upstream" }
-    }`) as Instance;
+  it("(r8 item 5) consumes a REAL Hub-serialized instance with lastTurnError (contract golden)", async () => {
+    // Golden produced by the Hub store contract test
+    // (crates/remuda-hub/tests/turn_error_contract.rs): a real InstanceRecord
+    // after a settled turn API error, through the production append/fold path.
+    // It is parsed as the WIRE InstanceRecord schema, mapped via mapInstance
+    // (the same transform the live client applies), then built into a row — so
+    // breaking Hub persistence/serialization or the api mapping fails here.
+    const raw = (await import("./__fixtures__/last-turn-error-instance.json", {
+      with: { type: "json" },
+    })) as unknown as Parameters<typeof mapInstance>[0];
 
-    const groups = build(named([hubJson]));
+    const ui = mapInstance(raw);
+    // The marker survives the wire→UI mapping.
+    expect(ui.lastTurnError?.text).toBe("API Error: 429 no eligible upstream");
+
+    const groups = build(named([ui]));
     const row = groups[0].rows[0];
     expect(row.status).toBe("idle");
     expect(row.body).toBe("API Error: 429 no eligible upstream");
     expect(row.bodyIsError, "durable turn error on a live process is not red").toBe(false);
+
+    // Removal after the next turn start: a real UI instance with no marker
+    // surfaces no turn-error body even on an idle row.
+    const cleared = mapInstance({
+      ...raw,
+      activity: "working",
+      lastTurnError: undefined,
+    });
+    const clearedRow = build(named([cleared]))[0].rows[0];
+    expect(clearedRow.bodyIsError).toBe(false);
+    expect(homeTurnError(cleared)).toBeNull();
   });
 
   it("(r3 item 8) unknown connectivity wins over a durable lastTurnError: disconnect and reconcile", () => {

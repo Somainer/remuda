@@ -170,12 +170,15 @@ pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::R
 }
 
 /// Query every cumulative session stock a new scoped point must not move
-/// backwards against: the point's OWN session id, and — only while that
-/// instance has no scoped session rows yet — LEGACY NULL-scope session rows
-/// (c-ctxusage r5 item 3B / r6 item 5). A byte-0 restart replay cannot
-/// re-append a smaller stock than the old-format cumulative total, but once
-/// scoped rows exist for the instance the legacy total is stale history and
-/// must not floor a DIFFERENT, later scoped session's stock.
+/// backwards against. Floors apply ONLY within a proven matching session id:
+/// the point's OWN `scope_id` chain (c-ctxusage r8 item 8).
+///
+/// A legacy NULL-scope session row carries no session identity at all, so it
+/// can never be proven to belong to the incoming scoped point's session. The
+/// old "floor the first scoped row with the legacy total" rule froze a
+/// DIFFERENT, smaller first post-upgrade session's genuine usage; it was
+/// removed. Legacy rows still floor other legacy rows in
+/// [`insert_legacy_session_point`].
 fn existing_session_floors(
     conn: &Connection,
     row: &UsageEventRow,
@@ -184,16 +187,7 @@ fn existing_session_floors(
         "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
          FROM usage_events
          WHERE instance_id = ?1 AND scope = 'session'
-           AND scope_id = ?2
-         UNION ALL
-         SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
-         FROM usage_events
-         WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NULL
-           AND NOT EXISTS (
-               SELECT 1 FROM usage_events
-               WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NOT NULL
-               LIMIT 1
-           )",
+           AND scope_id = ?2",
     )?;
     let floors = stmt
         .query_map(params![row.instance_id, row.scope_id], |r| {
@@ -224,15 +218,16 @@ fn freezes_against(incoming: &SnapshotCounters, existing: &[SnapshotCounters]) -
 }
 
 /// Append a new scoped cumulative-session growth point, freezing
-/// historical/duplicate replays (c-ctxusage r4 item 3 / r5 item 3B).
+/// historical/duplicate replays (c-ctxusage r4 item 3, refined in r8 item 8).
 ///
-/// The cumulative stock is monotonic by contract, so acceptance is content-
-/// based and independent of the restart-unsafe producer revision and ingest
-/// seq:
-/// - identical counters already recorded for this session (or for a legacy
-///   NULL-scope row) -> frozen;
-/// - any reported bucket smaller than the current stock -> frozen;
+/// The cumulative stock is monotonic by contract WITHIN a session, so
+/// acceptance is content-based against the point's own `scope_id` chain only:
+/// - identical counters already recorded for THIS session -> frozen;
+/// - any reported bucket smaller than this session's current stock -> frozen;
 /// - otherwise the point is appended.
+///
+/// Legacy NULL-scope rows carry no session identity and therefore never floor
+/// a scoped point (r8 item 8).
 fn insert_session_growth_point(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
     let incoming = SnapshotCounters::of(row);
     let floors = existing_session_floors(conn, row)?;
@@ -2895,10 +2890,13 @@ mod tests {
         assert_eq!(rollup.tpm_in_60s, None);
     }
 
-    /// r5 item 3B: legacy NULL-scope cumulative stock floors a restarted
-    /// scoped replay; a smaller historical stock is frozen, growth accepted.
+    /// r8 item 8 (formerly r5 item 3B): a legacy NULL-scope cumulative stock
+    /// carries no session identity, so it must NOT floor scoped points — even
+    /// the instance's first one. A byte-0 restart replay is simply an early
+    /// per-scope growth point; the rollup's current stock follows native time,
+    /// so an older historical point never lowers the current totals.
     #[test]
-    fn legacy_null_scope_stock_floors_a_restarted_scoped_replay() {
+    fn legacy_null_scope_stock_never_floors_an_unrelated_scoped_replay() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         assert!(
@@ -2908,11 +2906,12 @@ mod tests {
             )
             .unwrap()
         );
+        // A scoped replay below the legacy number lands: identity unprovable.
         let replay_smaller =
             scoped_record(10, "ins_3b", "session", Some("s1"), 1, 100, 10, 0, 0, None);
         assert!(
-            !insert(&conn, &replay_smaller),
-            "a scoped stock below the legacy cumulative floor is frozen"
+            insert(&conn, &replay_smaller),
+            "an unprovably-related scoped stock must not be frozen by the legacy row"
         );
         let current = scoped_record(
             11,
@@ -2926,29 +2925,62 @@ mod tests {
             0,
             None,
         );
-        assert!(
-            insert(&conn, &current),
-            "growth above the legacy floor appends"
-        );
+        assert!(insert(&conn, &current), "growth above the floor appends");
         let rollup = rollup_instance(&conn, "ins_3b", "codex", Some("codex"))
             .unwrap()
             .unwrap();
         assert_eq!(
             rollup.session_input_tokens,
             Some(1200),
-            "scoped world ignores the legacy row; the small replay never clobbered 1000"
+            "current stock follows the newest native-time scoped point"
         );
     }
 
-    /// r6 item 5: the legacy NULL-scope floor applies only WHILE the instance
-    /// has no scoped session rows. The FIRST scoped session is still floored
-    /// by the old cumulative total, but once scoped rows exist a DIFFERENT
-    /// later session must not be frozen by that unrelated legacy number.
+    /// r8 item 8: the legacy NULL-scope floor does not apply WITHIN a scope id
+    /// chain either — only same-scope-id points floor each other.
     #[test]
-    fn legacy_null_scope_floor_does_not_freeze_a_second_scoped_session() {
+    fn scoped_points_are_floored_only_by_their_own_scope_id() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        // One legacy cumulative row for a former session: 1000.
+        assert!(insert(
+            &conn,
+            &scoped_record(1, "ins_8", "session", Some("s1"), 1, 1000, 100, 0, 0, None)
+        ));
+        // Same session, backwards: frozen.
+        assert!(
+            !insert(
+                &conn,
+                &scoped_record(2, "ins_8", "session", Some("s1"), 1, 800, 80, 0, 0, None)
+            ),
+            "a backwards point within the same scope id is frozen"
+        );
+        // Different session with a smaller stock: counted.
+        assert!(
+            insert(
+                &conn,
+                &scoped_record(3, "ins_8", "session", Some("s2"), 1, 50, 5, 0, 0, None)
+            ),
+            "s1's stock must never floor a different session s2"
+        );
+        let rollup = rollup_instance(&conn, "ins_8", "codex", Some("codex"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(1050),
+            "current stocks sum per session: 1000 (s1) + 50 (s2)"
+        );
+    }
+
+    /// r8 item 8 regression: the legacy NULL-scope row is a different,
+    /// unidentifiable session; the FIRST post-upgrade scoped session with a
+    /// smaller stock is still counted, while each scope id keeps its own
+    /// monotonic floor.
+    #[test]
+    fn first_small_scoped_session_is_counted_against_legacy_stock() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // One legacy cumulative row for a former session: 1000/100.
         assert!(
             insert_usage_event(
                 &conn,
@@ -2956,22 +2988,20 @@ mod tests {
             )
             .unwrap()
         );
-        // First scoped session: no scoped rows yet, so the legacy floor
-        // applies; 500 is frozen, 1200 lands.
+        // First scoped session at 500: counted (identity cannot be proven).
         assert!(
-            !insert(
+            insert(
                 &conn,
                 &scoped_record(10, "ins_5", "session", Some("s1"), 1, 500, 50, 0, 0, None)
             ),
-            "the FIRST scoped session is still floored by the legacy row"
+            "the first scoped session must not be floored by the legacy row"
         );
         assert!(insert(
             &conn,
             &scoped_record(11, "ins_5", "session", Some("s1"), 1, 1200, 120, 0, 0, None)
         ));
 
-        // A different, later session with a much smaller stock: scoped rows
-        // now exist, so the legacy floor is irrelevant and it appends.
+        // A different later session with a much smaller stock: counted too.
         assert!(
             insert(
                 &conn,

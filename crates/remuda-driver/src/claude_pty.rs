@@ -32,7 +32,7 @@ use remuda_protocol::{
     SourceDelivery, Timestamp, TranscriptRef, TtyOutput, TtyRepresentation, U64,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -48,12 +48,15 @@ use tracing::info;
 /// the map (it finishes and parks the hydrator back), and the guard's Drop
 /// waits for it, then synchronously `finish()`es the buffered run.
 type TranscriptSlot = Arc<StdMutex<Option<TranscriptHydrator>>>;
-/// Mapped frames waiting for confirmed delivery (c-ctxusage r6 item 3/4c). A
-/// blocking map parks them in chunks while it runs; the streaming flusher
-/// drains them asynchronously and the abort guard takes over synchronously.
-type TranscriptPending = Arc<StdMutex<VecDeque<Observation>>>;
+/// Mapped frames waiting for confirmed delivery (c-ctxusage r6 item 3/4c).
+/// Bounded since r8 item 5: blocking producers wait for capacity instead of
+/// growing without limit when the flusher is stalled.
+type TranscriptPending = Arc<crate::transcript_queue::BoundedPending<Observation>>;
 /// Frames mapped per blocking chunk before parking.
 const TRANSCRIPT_EMIT_CHUNK: usize = 2_048;
+/// Max queued frames between the blocking producers and the streaming
+/// flusher (see [`crate::transcript_queue::BoundedPending`]).
+const TRANSCRIPT_PENDING_CAPACITY: usize = 4 * TRANSCRIPT_EMIT_CHUNK;
 
 struct TranscriptHydrator {
     tail: crate::claude_transcript::TranscriptTail,
@@ -64,14 +67,6 @@ fn transcript_slot_lock(
     slot: &TranscriptSlot,
 ) -> std::sync::MutexGuard<'_, Option<TranscriptHydrator>> {
     slot.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn transcript_pending_lock(
-    pending: &TranscriptPending,
-) -> std::sync::MutexGuard<'_, VecDeque<Observation>> {
-    pending
-        .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -1456,7 +1451,9 @@ fn spawn_transcript_pump(
     // native_at) and pops only after a successful send, so no frame is ever
     // duplicated or lost between the async flusher and the abort path.
     let slot: TranscriptSlot = Arc::new(StdMutex::new(None));
-    let pending: TranscriptPending = Arc::new(StdMutex::new(VecDeque::new()));
+    let pending: TranscriptPending = Arc::new(crate::transcript_queue::BoundedPending::new(
+        TRANSCRIPT_PENDING_CAPACITY,
+    ));
     let flush_notify = Arc::new(Notify::new());
     let flush_stop = Arc::new(AtomicBool::new(false));
     // Set by a blocking collect closure while it owns the hydrator (it has
@@ -1481,9 +1478,7 @@ fn spawn_transcript_pump(
         // frames were still pending.
         let _exit_ack = FlusherExitAck(flusher_faults);
         loop {
-            if flusher_stop.load(Ordering::SeqCst)
-                && transcript_pending_lock(&flusher_pending).is_empty()
-            {
+            if flusher_stop.load(Ordering::SeqCst) && flusher_pending.is_empty() {
                 return;
             }
             flusher_notify.notified().await;
@@ -1495,7 +1490,7 @@ fn spawn_transcript_pump(
             )
             .await
             {
-                transcript_pending_lock(&flusher_pending).clear();
+                flusher_pending.close_and_clear();
                 return;
             }
         }
@@ -1657,10 +1652,15 @@ fn spawn_transcript_pump(
                         if frames.is_empty() {
                             return;
                         }
-                        transcript_pending_lock(&pending).extend(frames.drain(..));
+                        // Bounded queue: blocks this blocking thread while the
+                        // flusher is stalled (c-ctxusage r8 item 5).
+                        pending.push_all_blocking(frames.drain(..));
                         notify.notify_one();
                     };
                     for line in &lines {
+                        if pending.is_closed() {
+                            break;
+                        }
                         if let Ok(batch) = hydrated.mapper.map_line(line) {
                             chunk.extend(batch);
                             if chunk.len() >= TRANSCRIPT_EMIT_CHUNK {
@@ -1668,7 +1668,9 @@ fn spawn_transcript_pump(
                             }
                         }
                     }
-                    if let Ok(batch) = hydrated.mapper.flush() {
+                    if !pending.is_closed()
+                        && let Ok(batch) = hydrated.mapper.flush()
+                    {
                         chunk.extend(batch);
                     }
                     park(&mut chunk);
@@ -1726,15 +1728,18 @@ async fn drain_pending(
     ctx: &ObsCtx,
 ) -> bool {
     loop {
-        let stamped = transcript_pending_lock(pending).front().cloned();
-        let Some(stamped) = stamped else {
+        // Pop before send (same rule as the promoter flusher, r8 item 4):
+        // popping frees bounded capacity immediately, and a failed send
+        // requeues the frame at the front.
+        let Some(stamped) = pending.pop_for_send() else {
             return true;
         };
         match emit_native_obs(tx, seq, ctx, SourceChannel::Transcript, &stamped).await {
-            Ok(()) => {
-                transcript_pending_lock(pending).pop_front();
+            Ok(()) => {}
+            Err(_) => {
+                pending.push_front_requeue(stamped);
+                return false;
             }
-            Err(_) => return false,
         }
     }
 }
@@ -1790,7 +1795,7 @@ async fn final_finish_blocking(
         // after the final frames are safely in the flusher's queue. The
         // hydrator stays retired (slot stays None) on the close path.
         if !frames.is_empty() {
-            transcript_pending_lock(&pending).append(&mut frames.into());
+            pending.push_all_blocking(frames);
             notify.notify_one();
         }
         in_flight.store(false, Ordering::SeqCst);
@@ -1904,7 +1909,7 @@ impl Drop for AbortTranscriptGuard {
                     frames.extend(batch);
                 }
                 if !frames.is_empty() {
-                    transcript_pending_lock(&pending).append(&mut frames.into());
+                    pending.push_all_blocking(frames);
                 }
             }
             // Release the flusher once the residual frames are queued.

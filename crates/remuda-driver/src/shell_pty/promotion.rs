@@ -812,7 +812,9 @@ pub(super) fn spawn(
     // lost the buffered last run. The variable is read only by its Drop impl.
     let hydrator_slot: HydratorSlot = Arc::new(Mutex::new(None));
     let pending_emissions: PendingEmissions =
-        Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        Arc::new(crate::transcript_queue::BoundedPending::new(
+            PENDING_CAPACITY,
+        ));
     let flush_notify = Arc::new(Notify::new());
     let flush_done = Arc::new(AtomicBool::new(false));
     // Set while a blocking collect owns the hydrator (it has taken it out of
@@ -1462,17 +1464,20 @@ pub(super) fn spawn(
 type HydratorSlot = Arc<Mutex<Option<Hydrator>>>;
 
 /// Mapper observations already collected for emission but not yet confirmed
-/// sent. A blocking collection parks frames here IN CHUNKS while the map is
-/// still running and the async [`emission_flusher`] streams them out, so a
-/// large first-bind replay neither buffers its whole batch nor makes pump
-/// progress unobservable. Frames are popped only after a confirmed send —
-/// an aborted task's [`FinaliseGuard`] delivers whatever remains
-/// (c-ctxusage r6 item 3).
-type PendingEmissions = Arc<Mutex<std::collections::VecDeque<Observation>>>;
+/// sent. The bounded queue blocks producers on their blocking thread when the
+/// flusher is stalled (c-ctxusage r8 item 5); frames are popped before the
+/// send await and requeued on failure (r8 item 4). An aborted task's
+/// [`FinaliseGuard`] lets the detached flusher deliver whatever remains.
+type PendingEmissions = Arc<crate::transcript_queue::BoundedPending<Observation>>;
 
 /// Lines mapped per blocking-collect chunk before the frames are parked for
 /// the flusher.
 const EMIT_CHUNK: usize = 2_048;
+
+/// Max queued frames between the blocking producers and the streaming
+/// flusher: a few chunks of headroom so a fast replay stays ahead of a slow
+/// send, but bounded so a stalled consumer cannot grow memory without limit.
+const PENDING_CAPACITY: usize = 4 * EMIT_CHUNK;
 
 /// Lock the slot, tolerating a poisoned mutex (a panic inside a mapped line
 /// must not prevent the abort-path finalise).
@@ -1492,17 +1497,11 @@ async fn flush_pending(
     ctx: &PromoteCtx,
 ) -> bool {
     loop {
-        // c-ctxusage r8 item 4: pop the OWNED frame under the lock BEFORE
-        // awaiting send. The old clone-front → send → pop sequence raced a
-        // concurrent rebind prepending the launch snapshot: the post-send
-        // pop_front removed the snapshot (lost) while the in-flight frame was
-        // sent twice. A failed send requeues the frame at the front, so
-        // delivery is at-least-once from the queue and strictly FIFO.
-        let Some(stamped) = pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop_front()
-        else {
+        // c-ctxusage r8 item 4: pop the OWNED frame BEFORE awaiting send, so a
+        // concurrent rebind producer can never make the post-send pop remove a
+        // different frame. The bounded queue frees the slot on pop (r8 item 5)
+        // and requeues on send failure.
+        let Some(stamped) = pending.pop_for_send() else {
             return true;
         };
         let Ok(mut observation) = build(
@@ -1522,10 +1521,7 @@ async fn flush_pending(
             Err(_) => {
                 // Channel gone: requeue so the abort path owns the frames and
                 // nothing is lost to a transient closed receiver.
-                pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push_front(stamped);
+                pending.push_front_requeue(stamped);
                 return false;
             }
         }
@@ -1626,10 +1622,7 @@ impl Drop for FinaliseGuard {
                 }
             };
             if !frames.is_empty() {
-                pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .extend(frames);
+                pending.push_all_blocking(frames);
             }
             residual_done.store(true, Ordering::SeqCst);
             notify.notify_one();
@@ -2281,40 +2274,36 @@ impl Hydrator {
         if let Some(faults) = &self.faults {
             faults.pump_collect_entered();
         }
-        let mut launch: std::collections::VecDeque<Observation> =
-            std::mem::take(&mut self.pending).into_iter().collect();
+        let launch = std::mem::take(&mut self.pending);
         let lines = self.tail.poll()?;
-        // c-ctxusage r8 item 4: the launch model snapshot must precede THIS
-        // collect's replayed frames, but must not jump ahead of a prior
-        // epoch's backlog. It is merged into the FRONT of the first chunk this
-        // collect parks; appending the chunk leaves every already-queued frame
-        // ahead of it while a concurrent flusher still drains FIFO. (The old
-        // version moved the whole existing queue behind the snapshot, and a
-        // concurrent rebind could pop the snapshot itself.)
-        let mut front_parked = launch.is_empty();
+        // c-ctxusage r8 item 4+5: queue the launch snapshot BEFORE this
+        // collect's mapped frames. FIFO append keeps any prior-epoch backlog
+        // ahead of it without moving parked frames, and the bounded queue
+        // blocks this (blocking) thread for capacity when the flusher is
+        // stalled instead of growing without limit. The snapshot is simply the
+        // first thing this collect enqueues.
+        if !launch.is_empty() {
+            parked.push_all_blocking(launch);
+            notify.notify_one();
+        }
         // The mapper buffers an assistant run until something supersedes it, so
         // the last message of a batch would otherwise sit unseen until the next
         // record arrives — which, at the end of a turn, may be minutes away.
         // Flushing at the end of each poll is what makes a finished turn appear.
         let mut chunk: Vec<Observation> = Vec::with_capacity(EMIT_CHUNK);
-        let mut park = |frames: &mut Vec<Observation>| {
-            if frames.is_empty() && (front_parked || launch.is_empty()) {
+        let park = |frames: &mut Vec<Observation>| {
+            if frames.is_empty() {
                 return;
             }
-            {
-                let mut guard = parked
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if !front_parked {
-                    // Snapshot first, then this chunk: backlog stays ahead.
-                    guard.extend(launch.drain(..));
-                    front_parked = true;
-                }
-                guard.extend(frames.drain(..));
-            }
+            parked.push_all_blocking(frames.drain(..));
             notify.notify_one();
         };
         for line in &lines {
+            if parked.is_closed() {
+                // Event channel gone: do not spend the rest of the replay
+                // mapping frames nobody can deliver.
+                break;
+            }
             match self.mapper.map_line(line) {
                 Ok(batch) => {
                     chunk.extend(batch);
@@ -2326,21 +2315,12 @@ impl Hydrator {
                 Err(error) => tracing::debug!(%error, "transcript line did not map"),
             }
         }
-        match self.mapper.flush() {
-            Ok(batch) => chunk.extend(batch),
-            Err(error) => tracing::debug!(%error, "transcript flush failed"),
-        }
-        park(&mut chunk);
-        // No mapped frames this collect: the snapshot still has to queue, after
-        // the prior backlog (it never overtakes an earlier epoch).
-        if !front_parked && !launch.is_empty() {
-            {
-                let mut guard = parked
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.extend(launch.drain(..));
+        if !parked.is_closed() {
+            match self.mapper.flush() {
+                Ok(batch) => chunk.extend(batch),
+                Err(error) => tracing::debug!(%error, "transcript flush failed"),
             }
-            notify.notify_one();
+            park(&mut chunk);
         }
         Ok(Vec::new())
     }
@@ -2444,13 +2424,8 @@ async fn finalize_hydrator(
             faults.cooperative_finish_entered();
         }
         let frames = hydrator.finish_collect().unwrap_or_default();
-        if !frames.is_empty() {
-            parked
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend(frames);
-            pinged.notify_one();
-        }
+        parked.push_all_blocking(frames);
+        pinged.notify_one();
         retire_in_flight.store(false, Ordering::SeqCst);
     });
     let _ = join.await;
@@ -2531,10 +2506,7 @@ async fn emission_flusher(
         // Notify permit (it notifies anyway, but the tick closes any gap).
         if done.load(Ordering::SeqCst)
             && residual_done.load(Ordering::SeqCst)
-            && pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty()
+            && pending.is_empty()
         {
             return;
         }
@@ -2543,11 +2515,9 @@ async fn emission_flusher(
             _ = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
         if !flush_pending(&pending, &events, &seq, &ctx).await {
-            // Channel went away with the task: nothing more can be delivered.
-            pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
+            // Channel went away with the task: nothing more can be delivered;
+            // close releases any producer blocked on capacity.
+            pending.close_and_clear();
             return;
         }
     }
@@ -3037,7 +3007,8 @@ mod tests {
         let found = detected_claude(42, Some(session));
         let (tx, mut rx) = mpsc::channel::<Observation>(128);
         let hydrator: HydratorSlot = Arc::new(Mutex::new(None));
-        let pending: PendingEmissions = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let pending: PendingEmissions =
+            Arc::new(crate::transcript_queue::BoundedPending::new(PENDING_CAPACITY));
         let notify = Arc::new(Notify::new());
         let in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // A real flusher drains parked frames: without it the "no foreign
@@ -3587,7 +3558,8 @@ mod tests {
             Hydrator::open(&ctx, &binding, None, None, None, None, None, None)
                 .expect("hydrator binds the seeded transcript"),
         )));
-        let pending: PendingEmissions = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let pending: PendingEmissions =
+            Arc::new(crate::transcript_queue::BoundedPending::new(PENDING_CAPACITY));
         let notify = Arc::new(Notify::new());
         let in_flight = Arc::new(AtomicBool::new(false));
         let seq = Arc::new(AtomicU64::new(0));
@@ -3695,7 +3667,8 @@ mod tests {
         let slot: HydratorSlot = Arc::new(Mutex::new(Some(
             Hydrator::open(&ctx, &binding, None, None, None, None, None, None).unwrap(),
         )));
-        let pending: PendingEmissions = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let pending: PendingEmissions =
+            Arc::new(crate::transcript_queue::BoundedPending::new(PENDING_CAPACITY));
         let notify = Arc::new(Notify::new());
         let in_flight = Arc::new(AtomicBool::new(false));
         let seq = Arc::new(AtomicU64::new(0));
@@ -3793,8 +3766,8 @@ mod tests {
         let ctx = ctx_in(dir.path());
         let (tx, mut rx) = mpsc::channel(1);
         let pending: PendingEmissions =
-            Arc::new(Mutex::new(std::collections::VecDeque::new()));
-        let notify = Arc::new(Notify::new());
+            Arc::new(crate::transcript_queue::BoundedPending::new(PENDING_CAPACITY));
+        let _notify = Arc::new(Notify::new());
         let marker_obs = |text: &'static str| {
             build(
                 &ctx,
@@ -3810,13 +3783,7 @@ mod tests {
             )
             .expect("observation")
         };
-        {
-            let mut queue = pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            queue.push_back(marker_obs("FIRST"));
-            queue.push_back(marker_obs("SECOND"));
-        }
+        pending.push_all_blocking([marker_obs("FIRST"), marker_obs("SECOND")]);
         let flusher_pending = Arc::clone(&pending);
         let flusher_ctx = ctx.clone();
         let handle = tokio::spawn(async move {
@@ -3835,20 +3802,12 @@ mod tests {
         // assertions below discriminate the two implementations regardless of
         // whether this state was observed.
         let park_deadline = std::time::Instant::now() + Duration::from_millis(500);
-        while std::time::Instant::now() < park_deadline
-            && !pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty()
-        {
+        while std::time::Instant::now() < park_deadline && !pending.is_empty() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         // A concurrent REBIND prepends the new epoch's snapshot while the
         // SECOND send is in flight — the exact r8 item 4 race.
-        pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push_front(marker_obs("SNAPSHOT_R"));
+        pending.push_front_requeue(marker_obs("SNAPSHOT_R"));
 
         // New code: buffer drains FIRST, the parked send then resolves with
         // SECOND, and the rebind snapshot is last — none lost or duplicated.
@@ -3947,19 +3906,13 @@ mod tests {
         };
         // Prior epoch backlog the flusher has not sent yet.
         let pending: PendingEmissions =
-            Arc::new(Mutex::new(std::collections::VecDeque::new()));
-        pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push_back(marker_obs("BACKLOG_B"));
+            Arc::new(crate::transcript_queue::BoundedPending::new(PENDING_CAPACITY));
+        pending.push_all_blocking([marker_obs("BACKLOG_B")]);
         let notify = Arc::new(Notify::new());
         hydrator
             .collect_pump(&pending, &notify)
             .expect("collect");
-        let queued = pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len();
+        let queued = pending.len();
         assert!(queued >= 3, "backlog + snapshot + replay queued, got {queued}");
 
         // Drain through the production flusher and capture delivered order.

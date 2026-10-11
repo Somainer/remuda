@@ -45,6 +45,7 @@ pub mod tty;
 pub mod usage;
 
 pub mod test_faults;
+mod transcript_queue;
 
 #[cfg(any(test, feature = "test-stub"))]
 mod fake;

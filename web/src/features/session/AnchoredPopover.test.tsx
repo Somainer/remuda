@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   computeAnchored,
   useAnchoredPopover,
+  POPOVER_DOWN_USABLE_PX,
   type AnchoredStyle,
 } from "./AnchoredPopover";
 import { useRef } from "react";
@@ -102,6 +103,30 @@ describe("computeAnchored placement math", () => {
     expect(measured.placement).toBe("up");
     expect(measured.top).toBeLessThan(857);
     expect(measured.maxHeight).toBe(540); // min(841 plain above-room, 60vh)
+  });
+
+  it("r10 item 10: the cleared strip counts BOTH gaps; a one-gap 112px is the narrow fallback, not a usable 120", () => {
+    // The composer-effort e2e used to compute trigger.y − card.bottom − 8 and
+    // call 112px "usable" (857 − 737 − 8 = 112... with its gap bookkeeping it
+    // compared 857 − 729 − 8 = 120). Production keeps gap on BOTH sides:
+    // upperBoundary = card.bottom + 8, strip = trigger.y − 8 − that, i.e.
+    // 857 − 8 − (729 + 8) = 112, UNDER the 120 minimum → bounded fallback.
+    const measured = computeAnchored(
+      { top: 857, bottom: 887, left: 590, right: 699, width: 109 },
+      { preferredHeight: 131, width: 300 },
+      { width: 1440, height: 900 },
+      { ...OPTS, avoidBottom: 729 },
+    );
+    expect(measured.placement).toBe("up");
+    expect(measured.maxHeight).toBe(540);
+    // Boundary one millimetre taller clears: 857 − 8 − (721 + 8) = 120.
+    const atMinimum = computeAnchored(
+      { top: 857, bottom: 887, left: 590, right: 699, width: 109 },
+      { preferredHeight: 131, width: 300 },
+      { width: 1440, height: 900 },
+      { ...OPTS, avoidBottom: 721 },
+    );
+    expect(atMinimum.maxHeight).toBe(POPOVER_DOWN_USABLE_PX);
   });
 
   it("item 5(a): a card-cleared strip AT the usable minimum keeps the clearance", () => {

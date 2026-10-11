@@ -594,8 +594,15 @@ impl EffortTracker {
 
     /// Mark effective effort read-back as unavailable for the rest of the
     /// process (D-056 (4): a resume boundary that was verified became
-    /// unverifiable — a shrink/replacement/EOF, an exec that kept the shell
-    /// pid, or a backward clock step).
+    /// unverifiable).
+    ///
+    /// The ONLY triggers are the tracked transcript shrinking below the read
+    /// cursor, being replaced (different inode/head), or vanishing (one
+    /// ENOENT/EOF) (c-effortread r10 item 10). A session-local `exec` that
+    /// keeps the shell pid is NOT one: it preserves the verified boundary, as
+    /// is a backward clock step — a session that merely lacked process-start
+    /// evidence (or ran under such an exec) was simply Unverified from the
+    /// outset, so no withdrawal edge is emitted.
     ///
     /// Clears the projected effective level/flag so a previously published
     /// `{high, ultracode on}` no longer masquerades as "effective" (the UI

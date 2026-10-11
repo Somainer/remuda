@@ -1122,12 +1122,6 @@ impl EffortQueue {
             .unwrap_or(false)
     }
 
-    /// Whether any axis slot currently holds an operation.
-    fn has_any(&self) -> bool {
-        self.tier.lock().map(|s| s.is_some()).unwrap_or(false)
-            || self.flag.lock().map(|s| s.is_some()).unwrap_or(false)
-    }
-
     pub(crate) fn close(&self) {
         self.closed.store(true, AtomicOrdering::SeqCst);
         self.notify.notify_waiters();

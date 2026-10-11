@@ -31,6 +31,16 @@ import {
 
 export type PopoverPlacement = "up" | "down";
 
+/**
+ * Geometry constants shared by the placement math and the e2e/unit geometry
+ * assertions (c-effortread r10 item 10), so the spec computes the card-cleared
+ * strip with BOTH gaps instead of its own one-gap constant.
+ */
+export const POPOVER_GAP_PX = 8;
+export const POPOVER_MARGIN_PX = 8;
+/** Minimum usable panel height for dodging below / capping a card-cleared strip. */
+export const POPOVER_DOWN_USABLE_PX = 120;
+
 export interface AnchoredStyle {
   placement: PopoverPlacement;
   /** Inline style to put on the positioned panel element. */
@@ -92,8 +102,8 @@ export function computeAnchored(
     avoidBottom?: number;
   },
 ): Measured {
-  const gap = options.gap ?? 8;
-  const margin = options.margin ?? 8;
+  const gap = options.gap ?? POPOVER_GAP_PX;
+  const margin = options.margin ?? POPOVER_MARGIN_PX;
   const align = options.align ?? "start";
   const maxHeightVh = options.maxHeightVh ?? 0.6;
   const preferUp = options.preferUp ?? true;
@@ -115,7 +125,7 @@ export function computeAnchored(
   // the viewport bottom (no room below) opening down would push the controls
   // off-screen, so stay up — covering a dismissible card is the lesser evil
   // over an unreachable menu.
-  const DOWN_USABLE = 120;
+  const DOWN_USABLE = POPOVER_DOWN_USABLE_PX;
   const canDodgeDown = roomBelow >= DOWN_USABLE;
 
   // Side choice:

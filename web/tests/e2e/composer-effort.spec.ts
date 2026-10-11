@@ -3,6 +3,11 @@ import { setMode } from "./appearanceHelper";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  POPOVER_DOWN_USABLE_PX,
+  POPOVER_GAP_PX,
+  POPOVER_MARGIN_PX,
+} from "../../src/features/session/AnchoredPopover";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 /**
@@ -392,25 +397,25 @@ test.describe("composer control bar and effort", () => {
     expect(trigger).toBeTruthy();
     const bottom = (box: { y: number; height: number }) => box.y + box.height;
 
-    // c-effortui r5 item 4 / c-effortui r6 item 11: compute the card-cleared
-    // strip the same way the popover does (trigger.y − approval.bottom − 8px
-    // gap; bottom is y + height — a Playwright box has no `.bottom`) and assert
-    // the branch the FINITE geometry dictates, rather than accepting an
-    // always-NaN strip into the permissive else-branch:
-    //  - strip >= 120 usable: the panel MUST clear the card entirely;
-    //  - strip < 120 (docked, no room to dodge): bounded lesser-evil fallback
-    //    (on-screen, bottom edge at/above the trigger).
-    const gap = 8;
-    const downUsable = 120;
+    // c-effortui r5 item 4 / c-effortui r6 item 11 / c-effortread r10 item 10:
+    // compute the card-cleared strip with the PRODUCTION constants
+    // (AnchoredPopover): the upper boundary sits gap below the trigger AND
+    // gap above the card top over the margin, i.e. trigger.y − card.bottom −
+    // gap − margin (BOTH gaps), not a one-gap 857 − 729 − 8 = 120. The old
+    // one-gap threshold accepted the 112px narrow-strip geometry as "usable"
+    // and required strict non-overlap where the popover actually falls back.
+    //  - strip >= POPOVER_DOWN_USABLE_PX usable: panel MUST clear the card;
+    //  - strip < that (docked, no room to dodge): bounded lesser-evil
+    //    fallback (on-screen, bottom edge at/above the trigger).
     for (const box of [approval!, panel!, trigger!]) {
       expect(
         Number.isFinite(box.x) && Number.isFinite(box.y) && box.width > 0 && box.height > 0,
         `all measured boxes must be finite and non-empty: ${JSON.stringify(box)}`,
       ).toBeTruthy();
     }
-    const strip = trigger!.y - bottom(approval!) - gap;
+    const strip = trigger!.y - bottom(approval!) - POPOVER_GAP_PX - POPOVER_MARGIN_PX;
     expect(Number.isFinite(strip)).toBeTruthy();
-    if (strip >= downUsable) {
+    if (strip >= POPOVER_DOWN_USABLE_PX) {
       expect(
         noOverlap(approval!, panel!),
         `cleared strip ${strip}px is usable; panel must not overlap the card`

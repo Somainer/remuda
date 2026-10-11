@@ -44,13 +44,25 @@ pub(super) struct BoundedPending<T> {
     /// while a producer still holds frames.
     waiting: AtomicUsize,
     #[cfg(test)]
-    /// Test-only rendezvous: a producer signals here the moment it parks for
-    /// capacity and again when its push completes, so tests block on
-    /// acknowledgements instead of sleep-polling `producer_parked`/`finished`.
-    park_barrier: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
-    #[cfg(test)]
-    done_barrier: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// Test-only rendezvous carrying a TYPED producer event: [`ProducerEvent::Parked`]
+    /// the moment a producer parks for capacity, [`ProducerEvent::Done`] as the
+    /// producer's final action once every frame is queued (or discarded after a
+    /// close). Receiving `Done` IS completion - a consumer never has to infer
+    /// it from a flag a caller stores only after the push returns
+    /// (c-ctxusage r11 item 4).
+    event_barrier: std::sync::Mutex<Option<std::sync::mpsc::Sender<ProducerEvent>>>,
     capacity: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProducerEvent {
+    /// A producer parked waiting for capacity; it still holds frames.
+    Parked,
+    /// The producer finished: every frame was queued, or the remainder was
+    /// discarded after [`BoundedPending::close_and_clear`]. Fired as the last
+    /// action of [`BoundedPending::push_all_blocking`].
+    Done,
 }
 
 impl<T> BoundedPending<T> {
@@ -63,53 +75,29 @@ impl<T> BoundedPending<T> {
             closed: AtomicBool::new(false),
             waiting: AtomicUsize::new(0),
             #[cfg(test)]
-            park_barrier: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            done_barrier: std::sync::Mutex::new(None),
+            event_barrier: std::sync::Mutex::new(None),
             capacity,
         }
     }
 
     #[cfg(test)]
-    /// Install the test-only "producer parked for capacity" acknowledgement.
-    pub(super) fn set_park_barrier(&self, tx: std::sync::mpsc::Sender<()>) {
+    /// Install the test-only typed producer-event acknowledgement channel.
+    pub(super) fn set_event_barrier(&self, tx: std::sync::mpsc::Sender<ProducerEvent>) {
         *self
-            .park_barrier
+            .event_barrier
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
     }
 
     #[cfg(test)]
-    /// Install the test-only "push completed" acknowledgement.
-    pub(super) fn set_done_barrier(&self, tx: std::sync::mpsc::Sender<()>) {
-        *self
-            .done_barrier
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
-    }
-
-    #[cfg(test)]
-    fn note_parked(&self) {
+    fn note_event(&self, event: ProducerEvent) {
         if let Some(tx) = self
-            .park_barrier
+            .event_barrier
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
         {
-            // Rendezvous: blocks until the test acknowledges the parked state.
-            let _ = tx.send(());
-        }
-    }
-
-    #[cfg(test)]
-    fn note_done(&self) {
-        if let Some(tx) = self
-            .done_barrier
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            let _ = tx.send(());
+            let _ = tx.send(event);
         }
     }
 
@@ -162,7 +150,7 @@ impl<T> BoundedPending<T> {
                 self.notify.notify_one();
                 self.waiting.fetch_add(1, Ordering::SeqCst);
                 #[cfg(test)]
-                self.note_parked();
+                self.note_event(ProducerEvent::Parked);
                 while guard.len() >= self.capacity && !self.closed.load(Ordering::SeqCst) {
                     guard = self
                         .space
@@ -173,7 +161,7 @@ impl<T> BoundedPending<T> {
             }
             if self.closed.load(Ordering::SeqCst) {
                 #[cfg(test)]
-                self.note_done();
+                self.note_event(ProducerEvent::Done);
                 return;
             }
             let was_empty = guard.is_empty();
@@ -186,7 +174,7 @@ impl<T> BoundedPending<T> {
             }
         }
         #[cfg(test)]
-        self.note_done();
+        self.note_event(ProducerEvent::Done);
     }
 
     /// Pop the frame at the front for delivery. The flusher pops BEFORE it
@@ -240,39 +228,70 @@ mod tests {
     use std::sync::mpsc::channel;
     use std::time::Duration;
 
+    /// Every test wait is bounded: a producer/consumer deadlock must fail the
+    /// test loudly and promptly, never hang the binary (c-ctxusage r11 item 4).
+    const TEST_WAIT: Duration = Duration::from_secs(30);
+
+    fn recv_event(rx: &std::sync::mpsc::Receiver<ProducerEvent>, what: &str) -> ProducerEvent {
+        rx.recv_timeout(TEST_WAIT)
+            .unwrap_or_else(|err| panic!("{what} within {TEST_WAIT:?}: {err:?}"))
+    }
+
+    fn join_bounded<T: Send + 'static>(handle: std::thread::JoinHandle<T>, what: &str) -> T {
+        let (tx, rx) = channel();
+        // The handle is moved onto a watcher so a join that would block
+        // forever is observed through the bounded channel instead.
+        std::thread::spawn(move || {
+            let _ = tx.send(handle.join());
+        });
+        match rx.recv_timeout(TEST_WAIT) {
+            Ok(Ok(value)) => value,
+            Ok(Err(payload)) => std::panic::resume_unwind(payload),
+            Err(err) => panic!("{what} within {TEST_WAIT:?}: {err:?}"),
+        }
+    }
+
     #[test]
     fn stalled_consumer_caps_the_queue_and_drain_resumes_collection() {
         let notify = Arc::new(Notify::new());
         let queue = Arc::new(BoundedPending::<usize>::new(3, Arc::clone(&notify)));
-        // One acknowledgement channel: the producer rendezvous on every park
-        // for capacity and once more when the push completes, so the consumer
-        // drains strictly on acknowledgements (no idle-gap polling).
+        // One TYPED acknowledgement channel: Parked when the producer wants
+        // capacity, Done as its final action. Receiving Done IS completion -
+        // no separate finished flag a caller could store only afterwards.
         let (event_tx, event_rx) = channel();
-        queue.set_park_barrier(event_tx.clone());
-        queue.set_done_barrier(event_tx);
-        let finished = Arc::new(AtomicBool::new(false));
-        let producer_finished = Arc::clone(&finished);
+        queue.set_event_barrier(event_tx);
         let producer_queue = Arc::clone(&queue);
         let producer = std::thread::spawn(move || {
             producer_queue.push_all_blocking(0..6);
-            producer_finished.store(true, Ordering::SeqCst);
         });
 
         let mut delivered = Vec::new();
-        while delivered.len() < 6 {
-            // Block until the producer says it parked (capacity wanted) or
-            // finished; the very first rendezvous proves the bound.
-            event_rx.recv().expect("producer barrier closed");
-            assert!(queue.producer_parked() || finished.load(Ordering::SeqCst));
-            if delivered.is_empty() {
+        let mut saw_capacity_park = false;
+        // recv_event returns Parked or Done (it panics on a timeout or a
+        // closed channel): drain after every Parked and exit exactly on the
+        // producer's Done - the typed event IS the completion proof.
+        while let ProducerEvent::Parked = recv_event(&event_rx, "producer never parked or finished")
+        {
+            assert!(
+                queue.producer_parked(),
+                "a Parked event means the producer holds frames at capacity"
+            );
+            if !saw_capacity_park {
                 assert_eq!(queue.len(), 3, "parked at exactly the capacity");
+                saw_capacity_park = true;
             }
             while let Some(frame) = queue.pop_for_send() {
                 delivered.push(frame);
             }
         }
-        producer.join().expect("producer thread");
-        assert!(finished.load(Ordering::SeqCst));
+        while let Some(frame) = queue.pop_for_send() {
+            delivered.push(frame);
+        }
+        join_bounded(producer, "producer thread never returned");
+        assert!(
+            saw_capacity_park,
+            "the producer never exercised the capacity park"
+        );
         assert_eq!(delivered, vec![0, 1, 2, 3, 4, 5]);
     }
 
@@ -280,24 +299,31 @@ mod tests {
     fn close_releases_a_parked_producer_and_discards_the_remainder() {
         let notify = Arc::new(Notify::new());
         let queue = Arc::new(BoundedPending::<usize>::new(2, notify));
-        let (park_tx, park_rx) = channel();
-        let (done_tx, done_rx) = channel();
-        queue.set_park_barrier(park_tx);
-        queue.set_done_barrier(done_tx);
+        // Prefill FIRST, with no hook installed: its completion emits nothing,
+        // so the Done awaited after close_and_clear can only be the parked
+        // producer's own completion (c-ctxusage r11 item 4).
         queue.push_all_blocking(0..2);
 
+        let (event_tx, event_rx) = channel();
+        queue.set_event_barrier(event_tx);
         let producer_queue = Arc::clone(&queue);
         let producer = std::thread::spawn(move || {
             producer_queue.push_all_blocking(2..6);
         });
-        park_rx.recv().expect("producer never parked for capacity");
+        assert_eq!(
+            recv_event(&event_rx, "producer never parked for capacity"),
+            ProducerEvent::Parked
+        );
         assert_eq!(queue.len(), 2);
 
         // Simulates the flusher exiting after the event channel closes.
         queue.close_and_clear();
-        // The early-return completion acknowledgement (remainder discarded).
-        done_rx.recv().expect("producer never returned after close");
-        producer.join().expect("producer thread");
+        // The parked producer's own completion acknowledgement.
+        assert_eq!(
+            recv_event(&event_rx, "producer never returned after close"),
+            ProducerEvent::Done
+        );
+        join_bounded(producer, "producer thread never returned");
         assert_eq!(queue.len(), 0);
         assert!(queue.is_closed());
     }
@@ -341,7 +367,7 @@ mod tests {
             .await
             .expect("producer and consumer deadlocked on the bounded queue")
             .expect("consumer task panicked");
-        producer.join().expect("producer thread");
+        join_bounded(producer, "producer thread never returned");
         assert_eq!(delivered, (0..50).collect::<Vec<_>>());
         assert_eq!(queue.len(), 0);
     }

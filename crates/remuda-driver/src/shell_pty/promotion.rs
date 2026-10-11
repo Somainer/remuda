@@ -2517,6 +2517,7 @@ impl Hydrator {
         // the last offset the previous hydrator read instead of replaying the
         // sticky anchor. A changed identity/shrink invalidates the captured
         // anchor, so fall back to the mode's own boundary/EOF open.
+        let had_anchor = continue_anchor.is_some();
         let tail = continue_anchor
             .and_then(|anchor| TranscriptTail::continued(binding.path.clone(), anchor))
             .or_else(|| mode.open_tail(&binding.path))?;
@@ -4664,70 +4665,176 @@ mod tests {
         );
     }
 
-    /// c-effortread r8 item 6 (Opus): returning to the LAUNCH session after a
-    /// `/clear` must inherit the launch sticky's own mode, never the rebound
-    /// /clear session's Dead(Fresh). Dead(Fresh) for the launch made
-    /// /resume X fall back to a byte-0 live tail and replay X's history.
-    #[test]
-    fn r8_item6_returning_to_launch_session_never_inherits_a_rebound_dead_mode() {
+    /// c-effortread r8 item 6 (Opus) / c-effortread r10 item 9: returning to
+    /// the LAUNCH session after a `/clear` must inherit the launch sticky's
+    /// own (Unverified) mode, never the rebound /clear session's Dead(Fresh).
+    /// Driven through the PRODUCTION orchestration (maintain_binding ticks +
+    /// rebind_authenticated_start), not table.record/epoch_mode directly.
+    /// The X return uses a DISTINCT inode (remove + recreate) so a continued
+    /// anchor cannot accidentally validate; the resumed history must never
+    /// publish Current evidence.
+    #[tokio::test]
+    async fn r8_item6_returning_to_launch_after_clear_reopens_unverified_via_maintain_binding() {
         let dir = tempfile::tempdir().expect("tmp");
         let cwd = dir.path().join("repo");
         std::fs::create_dir_all(&cwd).expect("mkdir");
-        let launch = slug_session(dir.path(), &cwd, "launch-x", "{}\n");
-        let clear_z = slug_session(dir.path(), &cwd, "clear-z", "{}\n");
-        let mut table = SessionModeTable::default();
-        let mut launch_binding = LaunchModeBinding::Unbound;
+        let launch_path = slug_session(dir.path(), &cwd, "launch-x", "{}\n");
+        let clear_path = slug_session(dir.path(), &cwd, "clear-z", "{}\n");
+        let mut fx = pump_fixture(dir.path(), "{}\n");
+        fx.ctx.cwd = cwd.clone();
+        fx.binding.session_id = "launch-x".to_owned();
+        fx.binding.path = launch_path.clone();
 
-        // 1. Launch session X (argv --resume → pre_resume_mode = an
-        //    Unverified boundary) is recorded first: non-rebound.
-        let launch_found = detected_claude(7, Some("launch-x"));
-        let launch_sticky = table.record(
-            7,
-            "launch-x",
-            Some(&launch),
-            Some(ResumeMode::Unverified),
-            None,
-            &launch_found,
-        );
-        assert!(!launch_sticky.rebound);
-        let mode = epoch_mode(
-            &mut launch_binding,
-            Some(ResumeMode::Unverified),
-            Some(launch_sticky),
-            &launch_found,
-        );
-        assert!(
-            matches!(mode, ResumeMode::Unverified),
-            "launch uses its own resume mode"
-        );
+        let bindings = BindingHandle::empty();
+        bindings.begin_epoch(&cwd, dir.path());
+        let mut hydrator: Option<Hydrator> = None;
+        let mut announced: Option<String> = None;
+        let mut session_modes = SessionModeTable::default();
+        let mut launch_mode = LaunchModeBinding::Unbound;
+        let mut read_anchors = std::collections::HashMap::new();
+        let mut effort_seeds = std::collections::HashMap::new();
+        let mut withdrawn_sessions = std::collections::HashSet::new();
+        let mut active_session: Option<(i32, String)> = None;
+        let found_x = detected_claude(7, Some("launch-x"));
 
-        // 2. /clear to Z (a Fresh rebound) marks the binding Dead(Fresh).
-        let clear_found = detected_claude(7, Some("clear-z"));
-        let clear_sticky = table.record(
-            7,
-            "clear-z",
-            Some(&clear_z),
+        let report_for =
+            |session_id: &str, path: &std::path::Path, source: Option<&str>| SessionStartReport {
+                session_id: session_id.to_owned(),
+                transcript_path: path.to_path_buf(),
+                cwd: Some(cwd.clone()),
+                ppid: Some(7),
+                start_source: source.map(str::to_owned),
+            };
+        bindings.ingest_session_start(report_for("launch-x", &launch_path, None));
+
+        // Tick 1: the launch session binds with a pre-spawn Unverified mode
+        // (a Remuda --resume capture), exactly as the loop passes it.
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &found_x,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
             None,
-            Some("clear"),
-            &clear_found,
-        );
-        assert!(clear_sticky.rebound);
-        assert_eq!(clear_sticky.mode, ResumeMode::Fresh);
-        let mode = epoch_mode(&mut launch_binding, None, Some(clear_sticky), &clear_found);
-        assert_eq!(mode, ResumeMode::Fresh);
-        assert!(matches!(
-            launch_binding,
-            LaunchModeBinding::Dead(ResumeMode::Fresh)
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            Some(ResumeMode::Unverified),
+            &mut read_anchors,
+            &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        )
+        .await;
+        assert!(hydrator.is_some(), "launch X hydrates");
+        let _ = drain(&mut fx);
+
+        // Tick 2: an in-TUI /clear to Z (Fresh rebound). The production loop
+        // rebinds on the authenticated start and drops the hydrator; the mode
+        // table records Z as Fresh from the source.
+        bindings.ingest_session_start(report_for("clear-z", &clear_path, Some("clear")));
+        let found_z = detected_claude(7, Some("clear-z"));
+        assert!(bindings.rebind_authenticated_start(
+            &found_z,
+            &report_for("clear-z", &clear_path, Some("clear"))
         ));
+        // Production rebind arm: the previous session's hydrator is dropped.
+        hydrator = None;
+        fx.binding.session_id = "clear-z".to_owned();
+        fx.binding.path = clear_path.clone();
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &found_z,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            None,
+            &mut read_anchors,
+            &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        )
+        .await;
+        assert!(hydrator.is_some(), "the /clear rebound hydrates Fresh");
+        let _ = drain(&mut fx);
 
-        // 3. /resume X while X's read anchor is unusable (X.jsonl rewritten):
-        //    argv names launch-x again. The launch sticky is non-rebound; the
-        //    stored Dead(Fresh) MUST NOT apply.
-        let re_found = detected_claude(7, Some("launch-x"));
-        let mode = epoch_mode(&mut launch_binding, None, Some(launch_sticky), &re_found);
+        // Tick 3: /resume back to X. X.jsonl was REPLACED with a DISTINCT
+        // inode carrying a prior session's high record; the old anchor cannot
+        // validate. Rename the old file aside first so the recreated session
+        // file gets a NEW inode (a quick remove+create can reuse the inode).
+        std::fs::rename(&launch_path, dir.path().join("launch-x.old"))
+            .expect("move the old X inode aside");
+        let high_record = serde_json::json!({
+            "type": "assistant",
+            "uuid": "msg-5",
+            "sessionId": "launch-x",
+            "version": DECOUPLED,
+            "message": { "id": "msg-5", "role": "assistant",
+                "content": [{"type":"text","text":"high reply"}],
+                "effort": "high" },
+        })
+        .to_string()
+            + "\n";
+        let restored = slug_session(dir.path(), &cwd, "launch-x", &high_record);
+        bindings.ingest_session_start(report_for("launch-x", &restored, Some("resume")));
+        assert!(bindings.rebind_authenticated_start(
+            &found_x,
+            &report_for("launch-x", &restored, Some("resume"))
+        ));
+        // Production rebind arm: the prior session's hydrator is dropped.
+        hydrator = None;
+        fx.binding.session_id = "launch-x".to_owned();
+        fx.binding.path = restored.clone();
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &found_x,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            Some(ResumeMode::Unverified),
+            &mut read_anchors,
+            &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        )
+        .await;
+        let reopened = hydrator.as_ref().expect("X reopens after the rebind");
+        let dbg8 = drain(&mut fx);
         assert!(
-            matches!(mode, ResumeMode::Unverified),
-            "returning to the launch session re-uses its own Unverified mode, not Z's Fresh: {mode:?}"
+            !reopened.tail.verified(),
+            "returning to X reuses its Unverified boundary, not Z's Fresh: {:?}",
+            session_modes.mode_for(7, "launch-x").map(|m| m.mode)
+        );
+        let observations = drain(&mut fx);
+        assert!(
+            !effort_rows(&observations)
+                .iter()
+                .any(|(name, _)| *name == Some(remuda_protocol::EffortName::High)),
+            "the replaced X history never publishes Current effort: {:?}",
+            effort_rows(&observations)
         );
     }
 
@@ -4859,76 +4966,104 @@ mod tests {
         let binding = bus.binding().expect("the native bus folded a binding");
         assert_eq!(binding.source.as_deref(), Some("clear"));
 
-        // The poll loop's own conversion (production seam) and first-tick
-        // classification. The start_sources registry is still empty here, so a
-        // record that read the registry instead of the binding would get None.
+        // The poll loop's own conversion (production seam).
         let report =
             SessionStartReport::from_bus_binding(&binding).expect("a named path yields a report");
-        let mut table = SessionModeTable::default();
+        assert_eq!(report.start_source.as_deref(), Some("clear"));
+
+        // c-effortread r10 item 9: the source rides the NATIVE bus all the
+        // way through the PRODUCTION binding + maintain_binding orchestration
+        // (no table.record hand-off, no direct Hydrator::open). The pid's
+        // launch session binds first, exactly like the real loop, then the
+        // authenticated /clear report rebinds it to Z and the next tick
+        // records the sticky mode and pumps the transcript.
+        let mut fx = pump_fixture(dir.path(), "{}");
+        fx.ctx.cwd = cwd.clone();
+        fx.binding.session_id = CORRECT.to_owned();
+        fx.binding.path = launch.clone();
+        let bindings = BindingHandle::empty();
+        bindings.begin_epoch(&cwd, dir.path());
+        let mut hydrator: Option<Hydrator> = None;
+        let mut announced: Option<String> = None;
+        let mut session_modes = SessionModeTable::default();
+        let mut launch_mode = LaunchModeBinding::Unbound;
+        let mut read_anchors = std::collections::HashMap::new();
+        let mut effort_seeds = std::collections::HashMap::new();
+        let mut withdrawn_sessions = std::collections::HashSet::new();
+        let mut active_session: Option<(i32, String)> = None;
         let launch_found = detected_claude(7, Some(CORRECT));
-        let launch_sticky = table.record(7, CORRECT, Some(&launch), None, None, &launch_found);
-        assert!(!launch_sticky.rebound);
-        let z_found = detected_claude(7, Some("clear-z"));
-        let z_sticky = table.record(
-            7,
-            "clear-z",
-            Some(report.transcript_path.as_path()),
+        bindings.ingest_session_start(SessionStartReport {
+            session_id: CORRECT.to_owned(),
+            transcript_path: launch.clone(),
+            cwd: Some(cwd.clone()),
+            ppid: Some(7),
+            start_source: Some("startup".into()),
+        });
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &launch_found,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
             None,
-            report.start_source.as_deref(),
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            None,
+            &mut read_anchors,
+            &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        )
+        .await;
+        assert!(hydrator.is_some(), "the launch session hydrates first");
+        let _ = drain(&mut fx);
+
+        // The /clear SessionStart (source carried on the native bus) rebinds
+        // the epoch to Z; the next maintain_binding tick records the Fresh
+        // sticky mode from the report and pumps Z's non-empty file.
+        bindings.ingest_session_start(report.clone());
+        let z_found = detected_claude(7, Some("clear-z"));
+        assert!(bindings.rebind_authenticated_start(&z_found, &report));
+        // The production rebind arm drops the previous session's hydrator.
+        hydrator = None;
+        fx.binding.session_id = "clear-z".to_owned();
+        fx.binding.path = report.transcript_path.clone();
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
             &z_found,
-        );
-        assert!(z_sticky.rebound, "Z is an in-TUI rebound session");
-        assert_eq!(
-            z_sticky.mode,
-            ResumeMode::Fresh,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            None,
+            &mut read_anchors,
+            &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        )
+        .await;
+        let reopened = hydrator.as_ref().expect("the /clear rebound hydrates");
+        assert!(
+            reopened.tail.verified(),
             "the bus-carried /clear source makes Z Fresh despite the non-empty file"
         );
-
-        // The production read gate: a Fresh tail hydrates the queued prompt as
-        // current session content. Under the old None-source path this opened
-        // as an unverified EOF anchor and emitted nothing.
-        let ctx = PromoteCtx {
-            instance_id: InstanceId::new(),
-            host_id: HostId::new(),
-            journal_id: Id::new("obj").expect("journal id"),
-            run_id: RunId::new(),
-            cwd: cwd.clone(),
-            claude_home: dir.path().to_path_buf(),
-        };
-        let z_binding = TranscriptBinding {
-            session_id: "clear-z".to_owned(),
-            path: z,
-            cwd,
-            source: crate::claude_transcript::BindingSource::Hook,
-        };
-        let (etx, mut erx) = mpsc::channel(256);
-        let seq = Arc::new(AtomicU64::new(0));
-        let mut hydrator = Hydrator::open(
-            &ctx,
-            &z_binding,
-            None,
-            None,
-            None,
-            None,
-            None,
-            z_sticky.mode,
-            None,
-            None,
-        )
-        .expect("Fresh hydrator opens on Z");
-        pump(&mut hydrator, &etx, &seq, &ctx)
-            .await
-            .expect("production pump");
-        let observations: Vec<Observation> = {
-            let mut out = Vec::new();
-            while let Ok(observation) = erx.try_recv() {
-                out.push(observation);
-            }
-            out
-        };
         assert!(
-            conversation_hydrated(&observations, "queued before first tick"),
-            "the Fresh gate hydrates Z's queued prompt (read-back gate open): {observations:?}"
+            conversation_hydrated(&drain(&mut fx), "queued before first tick"),
+            "the Fresh gate hydrates Z's queued prompt (read-back gate open)"
         );
     }
 

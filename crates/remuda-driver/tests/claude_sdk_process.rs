@@ -1719,3 +1719,96 @@ async fn aborting_before_the_writer_accepts_never_writes_the_prompt() {
 
     driver.close().await.expect("close");
 }
+
+/// Result-index/settled attributes of a lifecycle observation, in emission
+/// order.
+fn result_attrs(o: &Observation) -> Option<(&str, bool)> {
+    match &o.body {
+        ObservationPayload::Lifecycle(p) => match p.as_ref() {
+            LifecyclePayload::Native(n) if n.native_name == "result" => Some((
+                n.related_ids
+                    .get("resultIndex")
+                    .map(String::as_str)
+                    .unwrap_or("?"),
+                n.related_ids.get("settledRootTurn").map(String::as_str) == Some("true"),
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+/// ma-sdk-state r8 item 2 (1b): abort the caller in the REAL writer
+/// accept→ack window — UserWrite is already in the writer FIFO, the ack is
+/// pending. The accepted write must still run: turn A is announced BEFORE its
+/// result and settles (despite the caller vanishing); a later turn B then keeps
+/// correct per-turn attribution (resultIndex 0 then 1).
+#[tokio::test]
+async fn aborting_in_the_real_accept_ack_window_keeps_the_accepted_turn_ordered_and_settled() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Park ONLY the post-accept/pre-ack window for write #1; pre-accept runs.
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.park_accept_ack_from(1);
+
+    let mut send_a = Box::pin(driver.send(prompt_id("first", "msg-a")));
+    tokio::select! {
+        _ = barrier.wait_until_accept_ack_parked(Duration::from_secs(5)) => {}
+        r = &mut send_a => panic!("A should park in the accept→ack window, got {r:?}"),
+    }
+    // Caller aborts AFTER the writer accepted UserWrite but before the ack.
+    drop(send_a);
+    // Release the accepted write's gates; B is not sent yet, so A settles on
+    // its own (no overlapping reservation to defer it).
+    barrier.release();
+
+    // A completes and settles despite the dropped caller.
+    let a = collect_until(&mut handle, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .any(|o| lifecycle_named(o) == Some("turn_started"))
+            && turn_done_count(seen) >= 1
+    })
+    .await;
+    let a_start = a
+        .iter()
+        .position(|o| lifecycle_named(o) == Some("turn_started"))
+        .expect("start_A");
+    let a_result = a
+        .iter()
+        .position(|o| result_attrs(o).is_some())
+        .expect("result_A");
+    assert!(a_start < a_result, "start_A precedes result_A");
+    assert_eq!(
+        result_attrs(&a[a_result]),
+        Some(("0", true)),
+        "A settles, index 0"
+    );
+    drop(barrier);
+
+    // A normal follow-up turn B.
+    driver
+        .send(prompt_id("second", "msg-b"))
+        .await
+        .expect("B sends");
+    let b = collect_until(&mut handle, Duration::from_secs(5), |seen| {
+        turn_done_count(seen) >= 1
+    })
+    .await;
+    let b_start = b
+        .iter()
+        .position(|o| lifecycle_named(o) == Some("turn_started"))
+        .expect("start_B");
+    let b_result = b
+        .iter()
+        .position(|o| result_attrs(o).is_some())
+        .expect("result_B");
+    assert!(b_start < b_result, "start_B precedes result_B");
+    assert_eq!(
+        result_attrs(&b[b_result]),
+        Some(("1", true)),
+        "B settles, index 1"
+    );
+
+    driver.close().await.expect("close");
+}

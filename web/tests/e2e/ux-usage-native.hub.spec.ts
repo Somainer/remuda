@@ -220,35 +220,41 @@ test("native transcript usage drives the context chip through the real rollup", 
     instanceId = result.instance.instanceId ?? result.instance.id;
     const id = instanceId!;
 
-    await page.goto(`/s/${id}/tty`);
-    const session = page.getByTestId("session-page");
-    await expect(session).toHaveAttribute("data-lifecycle", "running", { timeout: 20_000 });
-    await expect(page.locator("[data-tty-lab='1']")).toHaveAttribute(
-      "data-tty-status",
-      "live",
+    // The context chip lives in the structured-view Composer (not the TTY
+    // dock), so drive the session from /s/:id and use the Hub command API for
+    // tty bytes (the same shape the working ux-usage sentinel spec uses).
+    await page.goto(`/s/${id}`);
+    await expect(page.getByTestId("session-page")).toHaveAttribute(
+      "data-lifecycle",
+      "running",
       { timeout: 20_000 },
     );
 
-    // Launch the copied fake harness the way promoted-claude.hub.spec.ts does:
-    // type the production launch line into the shell pane and wait for
-    // promotion. The harness scenario matches NATIVEUSAGE and writes a real
-    // transcript carrying the 2.1.289 split usage. Typing into /bin/sh alone
-    // (the old approach) never started the harness at all.
+    // Launch the copied fake harness in the shell pane, the way
+    // promoted-claude.hub.spec.ts types it: production launch line with
+    // --kind/--home/--script. The harness then waits for NATIVEUSAGE and
+    // writes a real 2.1.289 transcript carrying the split usage.
     const launchLine =
       `claude --kind claude --home ${shellQuote(claudeHome)} ` +
-      `--script ${shellQuote(scriptFile)}\r`;
+      `--script ${shellQuote(scriptFile)}\n`;
     await sendTtyKeys(page, id, launchLine);
-    await expect(session).toHaveAttribute("data-mode", "promoted", { timeout: 20_000 });
-    await expect.poll(async () => {
-      const record = await (await page.request.get(`/v1/instances/${id}`)).json();
-      return record.signalTier;
-    }, { timeout: 10_000 }).toBe("hook");
+    await expect(page.getByTestId("session-page")).toHaveAttribute(
+      "data-mode",
+      "promoted",
+      { timeout: 20_000 },
+    );
+    await expect
+      .poll(
+        async () => (await (await page.request.get(`/v1/instances/${id}`)).json()).signalTier,
+        { timeout: 10_000 },
+      )
+      .toBe("hook");
 
     // Drive the scenario turn through the REAL harness: body then Enter as
-    // separate keystrokes (paste boundary), like promoted-claude's submit().
+    // separate writes (the harness reads body+CR as one paste boundary).
     await sendTtyKeys(page, id, "NATIVEUSAGE");
     await page.waitForTimeout(150);
-    await sendTtyKeys(page, id, "\r");
+    await sendTtyKeys(page, id, "\n");
 
     // Successful launch above -> a missing turn is a FAILURE, not a skip.
     await expect(page.getByTestId("context-chip")).toHaveText("50%", { timeout: 60_000 });

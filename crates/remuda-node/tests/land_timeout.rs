@@ -184,3 +184,114 @@ fi
         "main advanced despite the killed land"
     );
 }
+
+/// r12 item 7: `merge --land` exits NONZERO when the CAS lost (base moved)
+/// but still emits its structured verdict. The Node must keep base-moved (and
+/// the currentMain sha) so the Hub runs the bounded reverify/requeue, instead
+/// of collapsing the nonzero exit to a generic failed.
+#[tokio::test]
+async fn a_nonzero_land_exit_carrying_base_moved_keeps_the_requeue_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin.git");
+    Command::new("git")
+        .args(["init", "--bare", "-b", "main"])
+        .arg(&origin)
+        .status()
+        .unwrap();
+    let seed = dir.path().join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    git(&seed, &["init", "-b", "main"]);
+    git(&seed, &["config", "user.email", "t@example.com"]);
+    git(&seed, &["config", "user.name", "T"]);
+    std::fs::write(seed.join("f.txt"), "base\n").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-q", "-m", "init"]);
+    git(&seed, &["checkout", "-q", "-b", "wt/land/moved"]);
+    std::fs::write(seed.join("f.txt"), "task\n").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-q", "-m", "task"]);
+    git(
+        &seed,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&seed, &["push", "-q", "origin", "main", "wt/land/moved"]);
+
+    let lane = dir.path().join("lane");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            lane.to_str().unwrap(),
+        ],
+    );
+    git(&lane, &["config", "user.email", "t@example.com"]);
+    git(&lane, &["config", "user.name", "T"]);
+    git(&lane, &["fetch", "-q", "origin"]);
+    let target = dir.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+
+    let bin = dir.path().join("fake-land-moved.sh");
+    let script = r#"#!/bin/bash
+set -eu
+branch=""; onto="main"; mode=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --onto) onto="$2"; shift 2;;
+    --land) mode=land; shift;;
+    --gate) mode=gate; shift;;
+    --no-push) shift;;
+    --repo|--target-dir) shift 2;;
+    --*) shift;;
+    merge) shift;;
+    *) if [ -z "$branch" ]; then branch="$1"; fi; shift;;
+  esac
+done
+git fetch -q origin
+if [ "$mode" = "gate" ]; then
+  git checkout -qB "$onto" "origin/$onto"
+  base=$(git rev-parse "$onto"); head=$(git rev-parse "origin/$branch")
+  git merge -q --no-ff "origin/$branch" -m "merge $branch"
+  printf '{"exitCode":0,"status":"verified","base":"%s","head":"%s","merged":"%s"}\n' "$base" "$head" "$(git rev-parse HEAD)"
+else
+  # CAS lost: nonzero exit, but the structured verdict is still on stdout.
+  printf '{"exitCode":3,"status":"base_moved","currentMain":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","error":"remote main moved"}\n'
+  exit 3
+fi
+"#;
+    std::fs::write(&bin, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let node = DevNode::new(&DevServerConfig::loopback(0)).unwrap();
+    node.gate_test_set_authorizer(std::sync::Arc::new(GrantAll))
+        .await;
+
+    let params = json!({
+        "jobId": "gjb_land_base_moved", "laneId": "lane1",
+        "repoPath": lane.to_string_lossy(),
+        "targetDir": target.to_string_lossy(),
+        "branch": "wt/land/moved", "baseBranch": "main",
+        "mode": "land", "web": "never", "push": true, "generation": 1,
+        "binary": bin.to_string_lossy(),
+    });
+    let reply = tokio::time::timeout(
+        Duration::from_secs(30),
+        node.dispatch_gate_rpc("gate.run", &params),
+    )
+    .await
+    .expect("gate.run hung")
+    .expect("gate.run errored");
+
+    assert_eq!(
+        reply["status"],
+        json!("base-moved"),
+        "nonzero land exit with a verdict must keep base-moved: {reply}"
+    );
+    assert_eq!(
+        reply["currentMainSha"],
+        json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "currentMain sha is preserved for the requeue: {reply}"
+    );
+}

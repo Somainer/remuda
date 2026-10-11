@@ -1662,14 +1662,36 @@ impl DevNode {
                     result.current_main_sha = string_field(&land_report, "currentMain");
                     result.merge_sha = string_field(&land_report, "merged").or(result.merge_sha);
                 }
-                Ok(land_output) => {
-                    result.status = "failed".into();
-                    result.error = Some(match land_output {
-                        Some(output) => {
-                            format!("land failed after grant (exit {:?})", output.status.code())
+                Ok(Some(output)) => {
+                    // A nonzero land exit can still carry a structured verdict:
+                    // `merge --land` exits nonzero when the compare-and-swap
+                    // lost (base moved under the lease). Parse stdout even on
+                    // failure so base-moved keeps its requeue verdict (and the
+                    // currentMain sha) instead of becoming a generic failure
+                    // and losing the bounded reverify/requeue path (r12 item 7).
+                    let land_report: Value =
+                        serde_json::from_slice(&output.stdout).unwrap_or_else(|_| json!({}));
+                    match land_report.get("status").and_then(Value::as_str) {
+                        Some("base_moved") | Some("base-moved") => {
+                            result.status = "base-moved".into();
+                            result.current_main_sha = string_field(&land_report, "currentMain");
+                            result.error = string_field(&land_report, "error");
+                            result.reason = None;
                         }
-                        None => "land child produced no result".into(),
-                    });
+                        _ => {
+                            result.status = "failed".into();
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            result.error = Some(format!(
+                                "land failed after grant (exit {:?}): {}",
+                                output.status.code(),
+                                stderr.trim()
+                            ));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    result.status = "failed".into();
+                    result.error = Some("land child produced no result".into());
                 }
             }
         }

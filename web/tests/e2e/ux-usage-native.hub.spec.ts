@@ -73,16 +73,27 @@ test.beforeAll(async () => {
   // Runs AFTER the build: on a fixture-less host binaries genuinely do not
   // exist, so this is a real missing-prerequisite SKIP rather than a failing
   // hook (a raw access() rejection failed beforeAll and failed the file).
+  // c-ctxusage r9 item 7: only ENOENT (a binary the build did not produce)
+  // skips; every other access failure (EACCES, ENOTDIR, …) is a real error
+  // and must surface, not masquerade as a missing prerequisite.
   const checks = await Promise.allSettled([
     access(remuda),
     access(harness),
     access(nativeNode),
   ]);
-  const missing = checks
-    .map((check, index) =>
-      check.status === "rejected" ? ["remuda", "fake-harness", "native node"][index] : null,
-    )
-    .filter(Boolean);
+  const names = ["remuda", "fake-harness", "native node"];
+  const missing: string[] = [];
+  checks.forEach((check, index) => {
+    if (check.status !== "rejected") {
+      return;
+    }
+    const code = (check.reason as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT") {
+      missing.push(names[index]);
+    } else {
+      throw check.reason;
+    }
+  });
   test.skip(
     missing.length > 0,
     `native usage e2e binaries missing after build: ${missing.join(", ")}`,

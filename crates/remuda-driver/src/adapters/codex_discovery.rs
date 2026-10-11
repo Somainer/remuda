@@ -278,12 +278,28 @@ const INPUT_MAX_AGE: time::Duration = time::Duration::hours(1);
 /// Evict all recorded inputs older than `now - INPUT_MAX_AGE` (r7 item 10).
 /// Called on every record_input so stale per-instance prompts disappear
 /// without a background task.
+///
+/// Lifecycle first (r8 item 7): age eviction never removes the ONLY prompt
+/// evidence of an instance that is still a LIVE, unbound discoverer in that
+/// cwd. A rollout created inside the prompt's match window can be discovered
+/// late (a sessions directory that appears or is scanned well after the
+/// keystroke); dropping the prompt would leave that instance unable to bind
+/// its own file. Such evidence is reclaimed by the lifecycle instead — bind
+/// or window close clears it in [`DiscoveryWindow::release`]. Fresh prompts
+/// for the same owner still replace aged ones in the normal retain.
 pub(crate) fn evict_expired_inputs(now: OffsetDateTime) {
     let cutoff = now - INPUT_MAX_AGE;
+    let live = OPEN_DISCOVERERS.lock().expect("open discoverers");
     let mut map = SENT_INPUTS.lock().expect("codex sent inputs");
-    map.retain(|_, by_instance| {
-        by_instance.retain(|_, inputs| {
-            inputs.retain(|input| input.at >= cutoff);
+    map.retain(|cwd, by_instance| {
+        by_instance.retain(|owner, inputs| {
+            // Every surviving prompt being aged out means the sweep would
+            // strip this owner's only evidence; a live discoverer keeps it
+            // until the lifecycle ends.
+            let only_evidence_is_aged = !inputs.is_empty()
+                && inputs.iter().all(|input| input.at < cutoff)
+                && live.get(cwd).is_some_and(|set| set.contains(owner));
+            inputs.retain(|input| only_evidence_is_aged || input.at >= cutoff);
             !inputs.is_empty()
         });
         !by_instance.is_empty()

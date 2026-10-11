@@ -1743,6 +1743,50 @@ fn closing_the_last_discovery_window_clears_recorded_prompts() {
     assert!(late.binding().is_none());
 }
 
+// c-usagefu r8 item 7: age sweep preserves a live discoverer's only prompt -
+
+#[test]
+fn age_eviction_keeps_the_only_prompt_of_a_live_unbound_discoverer() {
+    use time::Duration;
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r8-item7-livekeep";
+    let now = OffsetDateTime::now_utc();
+
+    // A launches and stays live, still unbound. Its only prompt was sent 90
+    // minutes ago; the rollout (created within the prompt's 5-minute match
+    // window) is discovered only now.
+    let mut a = launch_adapter_keyed(home.path(), cwd, now - Duration::minutes(91), INST_A);
+    let prompt_at = now - Duration::minutes(90);
+    send_fixture_prompt(Path::new(cwd), INST_A, "late discovered prompt", prompt_at);
+
+    // An UNRELATED instance records a prompt at `now`: the global age sweep
+    // fired by that write must not strip the live discoverer's only evidence.
+    send_fixture_prompt(
+        Path::new("/projects/r8-item7-other-cwd"),
+        "other-key",
+        "unrelated",
+        now,
+    );
+
+    write_rollout_prompt_at(
+        home.path(),
+        "late-file",
+        cwd,
+        &(prompt_at + Duration::seconds(10))
+            .format(&Rfc3339)
+            .unwrap(),
+        "late discovered prompt",
+    );
+    assert!(
+        a.discover().unwrap(),
+        "live discoverer binds its rollout from aged-but-retained evidence"
+    );
+    assert_eq!(
+        a.binding().map(|b| b.session_id.as_str()),
+        Some("late-file")
+    );
+}
+
 // c-usagefu r8 item 5: aggregator-rejected usage is not emitted -----------
 
 #[test]

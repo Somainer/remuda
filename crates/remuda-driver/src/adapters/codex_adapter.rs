@@ -100,12 +100,8 @@ impl CodexAdapter {
     /// Create an unbound adapter for a shadow `CODEX_HOME`.
     #[must_use]
     pub fn new(home: AdapterHome) -> Self {
-        // A driver launch joins/opens the process-wide same-cwd discovery
-        // window; a promoted attach (no floor) does not participate.
-        let window = home
-            .launched_at
-            .is_some()
-            .then(|| crate::adapters::codex_discovery::DiscoveryWindow::open(&home.cwd));
+        // The discovery window opens in with_instance_key so its owner matches
+        // the instance key (r7 item 1).
         Self {
             home,
             instance_key: None,
@@ -123,14 +119,25 @@ impl CodexAdapter {
             usage_totals: UsageAggregator::new(),
             fallback_model: None,
             discovery_gave_up: false,
-            window,
+            window: None,
         }
     }
 
     /// Attach the stable per-launch identity used for prompt matching and
-    /// rollout claims (c-usagefu r6 item 1).
+    /// rollout claims (c-usagefu r6 item 1). Opens the discovery window for a
+    /// driver-launched adapter so live cross-owner exclusivity works (r7
+    /// item 1).
     #[must_use]
     pub fn with_instance_key(mut self, key: Option<String>) -> Self {
+        if let Some(ref key) = key
+            && self.window.is_none()
+            && self.home.launched_at.is_some()
+        {
+            self.window = Some(crate::adapters::codex_discovery::DiscoveryWindow::open(
+                &self.home.cwd,
+                key.clone(),
+            ));
+        }
         self.instance_key = key;
         self
     }
@@ -315,16 +322,18 @@ impl CodexAdapter {
             &cwd,
             launched_at,
             &|path: &Path| crate::adapters::codex_discovery::is_claimed_by_other(path, &owner),
-            &|_path, started, first_prompt, metadata| {
-                // Exact own prompt, or a duplicate own prompt (the harness can
-                // re-run identical text) whose session id is already claimed
-                // by THIS owner from an earlier poll.
-                crate::adapters::codex_discovery::matches_sent_input(
+            &|_path, started, first_prompt, _metadata| {
+                // EXCLUSIVE attribution (r7 item 1): the candidate must match
+                // THIS owner's prompts AND no other currently-open discoverer
+                // in the cwd. Identical "continue" text from two live panes
+                // stays ambiguous; an already-claimed session of ours is
+                // re-recognized by id.
+                crate::adapters::codex_discovery::exclusively_matches_sent_input(
                     &cwd,
                     &owner,
                     first_prompt,
                     started,
-                ) || metadata["id"]
+                ) || _metadata["id"]
                     .as_str()
                     .is_some_and(|id| crate::adapters::codex_discovery::owned_by(&cwd, &owner, id))
             },

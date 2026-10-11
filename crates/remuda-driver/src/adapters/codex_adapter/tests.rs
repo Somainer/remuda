@@ -690,17 +690,17 @@ fn three_overlapping_windows_do_not_latch_give_up_and_clear_as_they_close() {
         );
     }
 
-    // A's rollout appears and A wins it; B and C must not latch give-up and
-    // must not touch A's file.
-    send_fixture_prompt(Path::new(cwd), INST_A, "fixture driver prompt", now);
-    send_fixture_prompt(Path::new(cwd), INST_B, "fixture driver prompt", now);
-    send_fixture_prompt(Path::new(cwd), INST_C, "fixture driver prompt", now);
-    write_rollout(
+    // A's rollout appears with A-DISTINCT prompt; B and C sent different
+    // text, so attribution to A is exclusive despite overlapping windows.
+    send_fixture_prompt(Path::new(cwd), INST_A, "A distinct words", now);
+    send_fixture_prompt(Path::new(cwd), INST_B, "B distinct words", now);
+    send_fixture_prompt(Path::new(cwd), INST_C, "C distinct words", now);
+    write_rollout_prompt_at(
         home.path(),
-        "2026/09/14",
         "A1",
         cwd,
         &now.format(&Rfc3339).unwrap(),
+        "A distinct words",
     );
     // Exactly one poll across the three claims A1 (others see zero unclaimed
     // or a lost claim); drive a couple of ticks so the claim resolves.
@@ -1295,4 +1295,67 @@ fn claim_release_uses_the_exact_key_not_a_re_canonicalized_path() {
         !crate::adapters::codex_discovery::is_claim_present_exact(&key, owner),
         "exact recorded key releases after the path and symlink are gone"
     );
+}
+
+// c-usagefu r7 item 1: EXCLUSIVE attribution -------------------------------
+
+/// Both live instances send identical "continue" within 5 s. Only B's rollout
+/// exists when A polls (B-poll-first and A-poll-first orders): A must never
+/// bind B's session. After A closes B is exclusive and binds its file.
+#[test]
+fn identical_prompts_two_live_owners_never_cross_bind() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r7-exclusive";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+    let rfc = now.format(&Rfc3339).unwrap();
+
+    // Order 1: A polls BEFORE B while both windows are open.
+    send_fixture_prompt(Path::new(cwd), INST_A, "continue", now);
+    send_fixture_prompt(Path::new(cwd), INST_B, "continue", now);
+    write_rollout_prompt_at(home.path(), "B-only", cwd, &rfc, "continue");
+
+    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
+    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+
+    // A scans first: B's file matches BOTH live owners → not exclusive.
+    assert!(
+        !a.discover().unwrap(),
+        "A must not bind a file B also matches"
+    );
+    assert!(a.binding().is_none());
+    // B scans: the same file matches both owners too (B isn't exclusive while
+    // A is a live compatible discoverer).
+    assert!(!b.discover().unwrap(), "B is not exclusive while A is live");
+    assert!(b.binding().is_none());
+
+    // A closes: B becomes the sole live compatible owner.
+    drop(a);
+    assert!(b.discover().unwrap(), "B binds after A leaves");
+    assert_eq!(b.binding().map(|b| b.session_id.as_str()), Some("B-only"));
+}
+
+/// Reverse order: B scans before A exists at all (A's window opens after B's
+/// file is present). A must still not bind once A appears.
+#[test]
+fn identical_prompts_late_opening_window_does_not_cross_bind() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r7-exclusive2";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+    let rfc = now.format(&Rfc3339).unwrap();
+
+    send_fixture_prompt(Path::new(cwd), INST_B, "continue", now);
+    write_rollout_prompt_at(home.path(), "B-file", cwd, &rfc, "continue");
+    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+    // B alone: exclusive → binds.
+    assert!(b.discover().unwrap());
+    assert_eq!(b.binding().map(|b| b.session_id.as_str()), Some("B-file"));
+
+    // A launches later and sends the same text; B's file is already claimed
+    // by B (excluded), so A never binds it.
+    send_fixture_prompt(Path::new(cwd), INST_A, "continue", now);
+    let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
+    assert!(!a.discover().unwrap());
+    assert!(a.binding().is_none());
 }

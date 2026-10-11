@@ -18,7 +18,7 @@
 //! scope within which two Remuda launches could race for one file; separate
 //! processes/hosts have separate homes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use time::OffsetDateTime;
@@ -32,6 +32,13 @@ struct WindowEntry {
 }
 
 static OPEN_WINDOWS: LazyLock<Mutex<HashMap<PathBuf, WindowEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// cwd -> set of instance keys with an open discovery window (unbound
+/// adapters that may still match a new rollout). Used for EXCLUSIVE
+/// attribution (c-usagefu r7 item 1): a candidate compatible with more than
+/// one live discoverer is ambiguous.
+static OPEN_DISCOVERERS: LazyLock<Mutex<HashMap<PathBuf, HashSet<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// rollout path -> owning instance key.
@@ -131,13 +138,15 @@ pub(crate) fn is_claim_present_exact(key: &Path, owner: &str) -> bool {
 /// impl is the safety net for an adapter that closes unbound.
 pub(crate) struct DiscoveryWindow {
     key: PathBuf,
+    owner: String,
     released: bool,
 }
 
 impl DiscoveryWindow {
     /// Open (or join) the discovery window for a launch cwd.
-    pub(crate) fn open(cwd: &Path) -> Self {
+    pub(crate) fn open(cwd: &Path, owner: impl Into<String>) -> Self {
         let key = canonical(cwd);
+        let owner = owner.into();
         {
             let mut map = OPEN_WINDOWS.lock().expect("codex discovery windows");
             map.entry(key.clone())
@@ -149,9 +158,16 @@ impl DiscoveryWindow {
                     count: 1,
                     tainted: false,
                 });
+            OPEN_DISCOVERERS
+                .lock()
+                .expect("open discoverers")
+                .entry(key.clone())
+                .or_default()
+                .insert(owner.clone());
         }
         Self {
             key,
+            owner,
             released: false,
         }
     }
@@ -182,6 +198,15 @@ impl DiscoveryWindow {
             if entry.count == 0 {
                 map.remove(&self.key);
             }
+        }
+        // Remove this owner from the live-discoverer set regardless of
+        // refcount (the window key is per-cwd, the owner is unique).
+        if let Some(set) = OPEN_DISCOVERERS
+            .lock()
+            .expect("open discoverers")
+            .get_mut(&self.key)
+        {
+            set.remove(&self.owner);
         }
     }
 }
@@ -263,33 +288,53 @@ pub(crate) fn record_input_at(cwd: &Path, owner: &str, text: &str, at: OffsetDat
     put_input(cwd, owner, text, at);
 }
 
-/// Whether a rollout created at `session_started` whose first real user
-/// message is `rollout_text` is evidence of a prompt instance `owner` sent in
-/// `cwd`: exact trimmed-text match and creation within the slack/window
-/// bounds of the LATEST dispatch of that text.
-pub(crate) fn matches_sent_input(
+/// Whether `owner` is the ONLY live discoverer in `cwd` whose sent inputs
+/// match a rollout with first prompt `rollout_text` created at
+/// `session_started` (c-usagefu r7 item 1). A candidate compatible with
+/// another open adapter stays ambiguous; the caller must not bind.
+pub(crate) fn exclusively_matches_sent_input(
     cwd: &Path,
     owner: &str,
     rollout_text: &str,
     session_started: OffsetDateTime,
 ) -> bool {
+    let cwd_key = canonical(cwd);
     let wanted = normalize_input(rollout_text);
     if wanted.is_empty() {
         return false;
     }
-    let map = SENT_INPUTS.lock().expect("codex sent inputs");
-    let Some(by_instance) = map.get(&canonical(cwd)) else {
+    let inputs_map = SENT_INPUTS.lock().expect("codex sent inputs");
+    let discoverers = OPEN_DISCOVERERS.lock().expect("open discoverers");
+    let Some(by_instance) = inputs_map.get(&cwd_key) else {
         return false;
     };
-    let Some(inputs) = by_instance.get(owner) else {
-        // Another instance's prompts do not authorize this adapter.
-        return false;
+    let Some(live) = discoverers.get(&cwd_key) else {
+        // No discoverer set: fall back to single-owner match.
+        return by_instance.get(owner).is_some_and(|inputs| {
+            inputs.iter().any(|i| {
+                i.text == wanted
+                    && session_started >= i.at - INPUT_MATCH_SLACK
+                    && session_started <= i.at + INPUT_MATCH_WINDOW
+            })
+        });
     };
-    inputs.iter().any(|input| {
-        input.text == wanted
-            && session_started >= input.at - INPUT_MATCH_SLACK
-            && session_started <= input.at + INPUT_MATCH_WINDOW
-    })
+    let mut compatible_owners = 0u32;
+    let mut caller_matches = false;
+    for key in live {
+        if let Some(inputs) = by_instance.get(key)
+            && inputs.iter().any(|i| {
+                i.text == wanted
+                    && session_started >= i.at - INPUT_MATCH_SLACK
+                    && session_started <= i.at + INPUT_MATCH_WINDOW
+            })
+        {
+            compatible_owners += 1;
+            if key == owner {
+                caller_matches = true;
+            }
+        }
+    }
+    caller_matches && compatible_owners == 1
 }
 
 // Test-only visibility so unit tests in other modules of this crate can

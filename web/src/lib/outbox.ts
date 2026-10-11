@@ -674,10 +674,17 @@ export class Outbox {
         // (query failure is unknown OWNERSHIP, not absence of locking).
         const stored = await box.runUnderInstanceLock(instanceId, reclaim);
         if (stored) {
-          // Authoritative current row — either reclaimed to pending or the
-          // terminal/changed row another tab committed.
+          // Authoritative current row — reclaimed to pending, terminal, or a
+          // replacement inflight lease a live owner renewed while this load
+          // reclaimed. Gate 13 item 1 (c): an inflight replacement is NEVER
+          // terminal here — adopt its lease (future deadline armed, overdue
+          // reclaimed immediately by the scheduled wake).
           box.cache.set(id, stored);
-          if (stored.state !== "inflight") box.clearClaimWakeup(id);
+          if (stored.state === "inflight" && stored.lease) {
+            box.scheduleClaimWakeup(id, instanceId, stored.lease, 0);
+          } else {
+            box.clearClaimWakeup(id);
+          }
         } else {
           // Persist failed twice: the row is still (durable) inflight with its
           // lease. The TRACKED expiry wakeup (item 5) reclaims and triggers
@@ -852,7 +859,7 @@ export class Outbox {
     type Outcome =
       | { kind: "failure" }
       | { kind: "stop"; rec: OutboxRecord | null }
-      | { kind: "rearm"; lease: { owner: Id; until: number } }
+      | { kind: "adopt"; lease: { owner: Id; until: number } }
       | { kind: "deliver"; rec: OutboxRecord };
     let outcome: Outcome;
     try {
@@ -866,19 +873,20 @@ export class Outbox {
       // Gate 12 item 3: dispose while the read was suspended — never reclaim.
       if (this.disposed) return { kind: "stop", rec: null };
       const current = durable.find((r) => r.commandId === commandId);
-      // A successful read found the row missing or terminal: stop.
+      // A successful read found the row missing or terminal (NOT inflight):
+      // stop for real.
       if (!current || current.state !== "inflight" || !current.lease) {
         return { kind: "stop", rec: current ?? null };
       }
       const lease = current.lease;
       if (lease.owner !== snapshot.owner || lease.until !== snapshot.until) {
-        // The live owner renewed/replaced the lease. Follow it ONLY while it
-        // is still in the future (fresh failure counter — new deadline); an
-        // expired different lease is not ours to reclaim here (the ordinary
-        // foreign-lease flush owns that).
-        return lease.until > Date.now()
-          ? { kind: "rearm", lease }
-          : { kind: "stop", rec: current };
+        // Gate 13 item 1 (a/b): the authoritative row is STILL inflight under
+        // a different lease — the live owner renewed it, or this throttled
+        // timer fired after the replacement also expired. "Still inflight" is
+        // never terminal: ADOPT {owner, until}; the caller arms with
+        // delay max(0, until-now) and resets the failure count, so an overdue
+        // replacement is reclaimed immediately under this lock.
+        return { kind: "adopt", lease };
       }
       // Same exact snapshot and its deadline has passed: conditional reclaim.
       try {
@@ -886,9 +894,14 @@ export class Outbox {
         // Gate 12 item 3: dispose while the reclaim was suspended.
         if (this.disposed) return { kind: "stop", rec: null };
         if (!reclaimed) return { kind: "stop", rec: null };
-        return reclaimed.state === "pending"
-          ? { kind: "deliver", rec: reclaimed }
-          : { kind: "stop", rec: reclaimed };
+        if (reclaimed.state === "pending") return { kind: "deliver", rec: reclaimed };
+        // Gate 13 item 1 (b): a concurrent renewal between read and claim
+        // makes the conditional return the replacement inflight row — adopt
+        // its lease rather than stopping (or delivering stale).
+        if (reclaimed.state === "inflight" && reclaimed.lease) {
+          return { kind: "adopt", lease: reclaimed.lease };
+        }
+        return { kind: "stop", rec: reclaimed };
       } catch {
         return { kind: "failure" };
       }
@@ -910,8 +923,10 @@ export class Outbox {
       }
       return;
     }
-    if (outcome.kind === "rearm") {
-      this.scheduleClaimWakeup(commandId, instanceId, outcome.lease);
+    if (outcome.kind === "adopt") {
+      // Fresh failure counter for the new lease; scheduleClaimWakeup turns an
+      // overdue deadline into an immediate wake.
+      this.scheduleClaimWakeup(commandId, instanceId, outcome.lease, 0);
       return;
     }
     if (outcome.rec) this.cache.set(commandId, outcome.rec);
@@ -1022,9 +1037,11 @@ export class Outbox {
    * item 4): another tab may have delivered/deleted the row a wakeup is
    * waiting on, or renewed its lease. Cancel when the row is missing or no
    * longer inflight; re-arm for the new FUTURE lease when the observed lease
-   * changed; drop an expired different lease (the ordinary foreign-lease
-   * flush owns that delivery). The command whose own wakeup is firing is not
-   * in the map yet, so this never disturbs the in-flight critical section.
+   * changed. Gate 13 item 1 (d): a changed lease that is ALREADY expired is
+   * adopted and scheduled immediately (conditional reclaim under the lock),
+   * never cancelled — "still inflight" is not terminal. The command whose own
+   * wakeup is firing is not in the map yet, so this never disturbs the
+   * in-flight critical section.
    */
   private reconcileClaimWakeups(durable: OutboxRecord[]) {
     if (this.disposed || this.claimWakeups.size === 0) return;
@@ -1037,11 +1054,9 @@ export class Outbox {
       }
       const lease = fresh.lease;
       if (lease.owner === entry.snapshot.owner && lease.until === entry.snapshot.until) continue;
-      if (lease.until > Date.now()) {
-        this.scheduleClaimWakeup(id, entry.instanceId, lease);
-      } else {
-        this.clearClaimWakeup(id);
-      }
+      // Adopt the replacement lease — future deadline armed, overdue armed
+      // immediately (delay max(0, until-now)), failure count reset.
+      this.scheduleClaimWakeup(id, entry.instanceId, lease, 0);
     }
   }
 

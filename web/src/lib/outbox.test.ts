@@ -552,6 +552,224 @@ describe("Outbox", () => {
     }
   });
 
+  it("GATE13 item 1a: a wake that fires after the REPLACEMENT lease also expired adopts it and reclaims immediately (throttled timer)", async () => {
+    // The background timer fires late (throttled tab): by T the durable row
+    // carries a RENEWED lease T2 that has ITSELF expired. "Still inflight" must
+    // never be treated as terminal — adopt the replacement and reclaim now.
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(600_000);
+      const T = Date.now() + LEASE_TTL_MS;
+      class LateReplaceStorage extends MemStorage {
+        readCount = 0;
+        override async all() {
+          this.readCount += 1;
+          // On the wake's read (load's own read is #1) the durable row now
+          // carries the renewed-but-expired replacement lease.
+          if (this.readCount >= 2) {
+            const cur = this.map.get("cmd_late");
+            if (cur && cur.lease?.until === T) {
+              this.map.set("cmd_late", {
+                ...cur,
+                lease: { owner: cur.lease.owner, until: T - 1_000 },
+              });
+            }
+          }
+          return await super.all();
+        }
+      }
+      const store = new LateReplaceStorage();
+      const putP = store.put(
+        rec({
+          commandId: "cmd_late",
+          instanceId: "ins_late",
+          state: "inflight",
+          lease: { owner: "owner_late", until: T },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await putP;
+      const box = await Outbox.load(store, "owner_late");
+      await vi.advanceTimersByTimeAsync(0);
+      const wakes = vi.fn();
+      box.onClaimWake = wakes;
+
+      await vi.advanceTimersByTimeAsync(LEASE_TTL_MS); // T (and T2-1000 both past)
+      await vi.advanceTimersByTimeAsync(10);
+      expect(store.map.get("cmd_late")?.state).toBe("pending");
+      expect(wakes).toHaveBeenCalledTimes(1);
+      expect(box.pendingClaimWakeups()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
+  it("GATE13 item 1b: a replacement lease written between read and reclaim is ADOPTED — re-arm for future T2, deliver at T2", async () => {
+    // No Web Locks: the other context renews between read and reclaimInflight;
+    // the conditional transaction correctly returns the replacement inflight
+    // row. The wake must adopt it (not stop): no delivery at T, re-armed for
+    // T2, delivered at T2 once the claim is inactive.
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(700_000);
+      const T = Date.now() + LEASE_TTL_MS;
+      const T2 = T + LEASE_TTL_MS;
+      class RenewBetweenStorage extends MemStorage {
+        readCount = 0;
+        override async all() {
+          this.readCount += 1;
+          const rows = await super.all();
+          // On the wake's read (load's own read is #1) the row still shows the
+          // old snapshot; the renewal lands before reclaimInflight runs.
+          if (this.readCount >= 2) {
+            const cur = this.map.get("cmd_renew_between")!;
+            if (cur.lease?.until === T) {
+              this.map.set("cmd_renew_between", {
+                ...cur,
+                attempts: 2,
+                lease: { owner: cur.lease.owner, until: T2 },
+              });
+            }
+          }
+          return rows;
+        }
+      }
+      const store = new RenewBetweenStorage();
+      const putP = store.put(
+        rec({
+          commandId: "cmd_renew_between",
+          instanceId: "ins_between",
+          state: "inflight",
+          lease: { owner: "owner_between", until: T },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await putP;
+      const box = await Outbox.load(store, "owner_between");
+      await vi.advanceTimersByTimeAsync(0);
+      const wakes = vi.fn();
+      box.onClaimWake = wakes;
+
+      await vi.advanceTimersByTimeAsync(LEASE_TTL_MS); // T
+      await vi.advanceTimersByTimeAsync(10);
+      // Renewed future lease: adopted, not delivered, wake moved to T2.
+      expect(store.map.get("cmd_renew_between")?.state).toBe("inflight");
+      expect(store.map.get("cmd_renew_between")?.lease?.until).toBe(T2);
+      expect(wakes).not.toHaveBeenCalled();
+      expect(box.pendingClaimWakeups()).toEqual(["cmd_renew_between"]);
+
+      await vi.advanceTimersByTimeAsync(LEASE_TTL_MS); // T2
+      await vi.advanceTimersByTimeAsync(10);
+      expect(store.map.get("cmd_renew_between")?.state).toBe("pending");
+      expect(wakes).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
+  it("GATE13 item 1c: a load-time reclaim returning a replacement inflight row arms that lease's wake", async () => {
+    // query says holder gone -> load reclaims; the conditional transaction
+    // finds the live owner renewed the lease while load was in flight and
+    // returns the replacement inflight row verbatim. The box must cache it AND
+    // adopt its deadline (future -> armed), so a later crash still recovers it.
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: { locks: { query: async () => ({ held: [] }) } },
+    });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(800_000);
+      const T = Date.now() + LEASE_TTL_MS;
+      const T2 = T + LEASE_TTL_MS;
+      class ReplaceOnReclaim extends MemStorage {
+        override async reclaimInflight(
+          id: string,
+          expected: { owner: string; until: number },
+        ): Promise<OutboxRecord | null> {
+          const existing = this.map.get(id);
+          if (!existing) return null;
+          // Live owner renewed concurrently: conditional returns the row.
+          return { ...existing, attempts: 3, lease: { owner: expected.owner, until: T2 } };
+        }
+      }
+      const store = new ReplaceOnReclaim();
+      const putP = store.put(
+        rec({
+          commandId: "cmd_load_replace",
+          instanceId: "ins_load_replace",
+          state: "inflight",
+          lease: { owner: "owner_lr", until: T },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await putP;
+      const box = await Outbox.load(store, "owner_lr");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(box.get("cmd_load_replace")?.state).toBe("inflight");
+      expect(box.get("cmd_load_replace")?.lease?.until).toBe(T2);
+      expect(box.pendingClaimWakeups()).toEqual(["cmd_load_replace"]);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
+  it("GATE13 item 1d: refresh seeing an already-expired REPLACEMENT lease adopts and reclaims, not cancels", async () => {
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(900_000);
+      const T = Date.now() + LEASE_TTL_MS;
+      const store = new MemStorage();
+      const putP = store.put(
+        rec({
+          commandId: "cmd_refresh_replace",
+          instanceId: "ins_rr",
+          state: "inflight",
+          lease: { owner: "owner_rr", until: T },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await putP;
+      const box = await Outbox.load(store, "owner_rr");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(box.pendingClaimWakeups()).toEqual(["cmd_refresh_replace"]);
+      const wakes = vi.fn();
+      box.onClaimWake = wakes;
+
+      // Another context renewed to T2, then crashed; at refresh time that
+      // replacement lease is ALREADY expired (absolute past timestamp).
+      const p = store.put(
+        rec({
+          commandId: "cmd_refresh_replace",
+          instanceId: "ins_rr",
+          state: "inflight",
+          lease: { owner: "owner_rr", until: Date.now() - 1_000 },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await p;
+      await box.refreshDurable();
+
+      // Adopted and scheduled immediately (not cancelled).
+      expect(box.pendingClaimWakeups()).toEqual(["cmd_refresh_replace"]);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(store.map.get("cmd_refresh_replace")?.state).toBe("pending");
+      expect(wakes).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
   it("GATE12 item 1: a wakeup reclaims ONLY its lease snapshot after it is due — a renewed later lease re-arms for T2, then reclaims", async () => {
     // T  = lease deadline observed at load (fresh same-owner claim, Web Locks
     //      absent -> UNKNOWN ownership -> kept, wakeup armed at T).

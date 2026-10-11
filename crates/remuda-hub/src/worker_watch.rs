@@ -858,6 +858,7 @@ async fn deliver_note_file(
             "instance.send".into(),
             payload,
             None,
+            None,
         )
         .await
         .map_err(map_store)?;
@@ -937,6 +938,7 @@ async fn write_keys(
                 "dataBase64": data_base64,
                 "source": "coordinator",
             }),
+            None,
             None,
         )
         .await
@@ -1283,6 +1285,7 @@ async fn resume_worker(
             worker.host_id.as_id().to_string(),
             "instance.send".into(),
             payload,
+            None,
             None,
         )
         .await
@@ -1632,6 +1635,7 @@ async fn stop_worker(
                 worker.host_id.as_id().to_string(),
                 "instance.close".into(),
                 json!({ "instanceId": instance_id.as_id() }),
+                None,
                 None,
             )
             .await

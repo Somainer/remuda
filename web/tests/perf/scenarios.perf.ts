@@ -90,6 +90,16 @@ type ScenarioResult = {
    * every engine, so it is never null.
    */
   regionTimings: Record<string, { calls: number; totalMs: number; maxMs: number }>;
+  /**
+   * React Profiler commit cost per instrumented subtree within the scenario
+   * window (`commit:<name>` probes; phase counts + total/max actualDuration).
+   * This is what attributes long tasks to React render waves the region
+   * markers do not cover (rail, columns, app shell).
+   */
+  commitTimings?: Record<
+    string,
+    { calls: number; mount: number; update: number; totalMs: number; maxMs: number }
+  >;
   /** null when the engine exposes no JS heap API (non-Chromium), not zero. */
   peakJsHeapBytes: number | null;
   terminalRenderer: string | null;
@@ -108,6 +118,12 @@ type ScenarioResult = {
     quietTickCommits: number;
     /** Quiet-window commits not explained by a relative-time label crossing. */
     quietUnexplainedCommits: number;
+    /**
+     * React Profiler update commits per instrumented subtree during the quiet
+     * window (rail, columns, shell, …). A stabilized poll must leave every
+     * subtree at zero except label-crossing BoardCards.
+     */
+    quietCommitKinds?: Record<string, number>;
     changedTickCommits: number;
     /** Update commits attributed to the one PATCHed card (must be exactly 1). */
     changedCardCommits: number;
@@ -404,6 +420,28 @@ function summarise(
     entry.maxMs = Math.max(entry.maxMs, ms);
   }
   const rendererProbes = report.probes.filter((probe) => probe.kind === "terminal-renderer");
+  // React Profiler commit cost per instrumented subtree (commit:<name> probes
+  // carry {phase, actualDuration}; BoardCard also carries cardId).
+  const commitTimings: NonNullable<ScenarioResult["commitTimings"]> = {};
+  for (const probe of report.probes) {
+    if (!probe.kind.startsWith("commit:") || probe.at < intervalStart || probe.at > intervalEnd) {
+      continue;
+    }
+    const value = (probe.value ?? {}) as { phase?: string; actualDuration?: number };
+    const ms = value.actualDuration ?? 0;
+    const entry = (commitTimings[probe.kind] ??= {
+      calls: 0,
+      mount: 0,
+      update: 0,
+      totalMs: 0,
+      maxMs: 0,
+    });
+    entry.calls += 1;
+    if (value.phase === "mount") entry.mount += 1;
+    if (value.phase === "update") entry.update += 1;
+    entry.totalMs += ms;
+    entry.maxMs = Math.max(entry.maxMs, ms);
+  }
   // No Long Tasks API on this engine (e.g. WebKit): emit null, not 0, so an
   // unsupported metric is never mistaken for a measured zero.
   const longTasksSupported = report.capabilities?.longTasks ?? true;
@@ -424,6 +462,7 @@ function summarise(
     unattributedLongTasks: longTasksSupported ? (histogram["(unattributed)"] ?? 0) : null,
     regionHistogram: longTasksSupported ? histogram : null,
     regionTimings: timings,
+    commitTimings,
     peakJsHeapBytes: peakHeap,
     terminalRenderer: rendererProbes.length
       ? (rendererProbes[rendererProbes.length - 1]!.value as string)
@@ -805,11 +844,21 @@ test("E: 80 board tasks with 40 pending interactions — unchanged ticks commit 
     const labelFlipIds = new Set(
       Object.keys(labelsAfter).filter((id) => labelsAfter[id] !== labelsBefore[id]),
     );
-    const quietCommitsAll = boardCardCommits(await getReport(page));
+    const quietReport = await getReport(page);
+    const quietCommitsAll = boardCardCommits(quietReport);
     const quietCommits = quietCommitsAll.length;
     const quietUnexplained = quietCommitsAll.filter(
       (commit) => !labelFlipIds.has(cardIdOf(commit)),
     );
+    // Per-subtree update commits during the quiet window (report was reset at
+    // window start, so every commit probe here belongs to this window).
+    const quietCommitKinds: Record<string, number> = {};
+    for (const probe of quietReport.probes) {
+      if (!probe.kind.startsWith("commit:")) continue;
+      const phase = (probe.value as { phase?: string } | null)?.phase;
+      if (phase !== "update") continue;
+      quietCommitKinds[probe.kind] = (quietCommitKinds[probe.kind] ?? 0) + 1;
+    }
     expect(
       quietUnexplained.length,
       "an unchanged tick commits nothing except cards whose time label changed",
@@ -910,6 +959,7 @@ test("E: 80 board tasks with 40 pending interactions — unchanged ticks commit 
       initialCommitMaxMs: Math.round(Math.max(0, ...initial.map((c) => c.actualDuration)) * 100) / 100,
       quietTickCommits: quietCommits,
       quietUnexplainedCommits: quietUnexplained.length,
+      quietCommitKinds,
       changedTickCommits: changedCommits.length,
       changedCardCommits: targetCommits.length,
       changeWallMs,

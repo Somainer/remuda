@@ -5,9 +5,14 @@
  * <html data-keyboard="1"> from the visualViewport shrink), the visible band
  * on a phone can be ~320 px tall. Non-essential chrome is collapsed so the
  * two things the operator needs keep the band: the conversation (the
- * transcript flex area stays >= 40%) and the whole composer. The composer and
- * transcript are never targeted here; with the keyboard down nothing in this
- * file applies.
+ * transcript flex area stays >= 40%, sessionPage.module.css) and the whole
+ * composer. With the keyboard down nothing in this file applies.
+ *
+ * ui-spec §2 keyboard band: hidden — live row, notifications, TaskTrack, run
+ * details, composer caption, annotation row, InstallBar. Never hidden — the
+ * header, the pending-card area, the route-down notice and the composer
+ * (including its top area). The live row can go because the header's title
+ * block keeps the status dot and word.
  *
  * Selectors use stable testids (the components' CSS-module hashes are not
  * reachable from a global stylesheet), all scoped to the html attribute.
@@ -15,11 +20,13 @@
 
 html[data-keyboard="1"] [data-testid="install-bar"],
 html[data-keyboard="1"] [data-testid="update-bar"],
-html[data-keyboard="1"] [data-testid="resume-row"],
 html[data-keyboard="1"] [data-testid="run-details"],
+html[data-keyboard="1"] [data-testid="live-status-strip"],
+html[data-keyboard="1"] [data-testid="annotation-badge-row"],
 html[data-keyboard="1"] [data-testid="annotation-dock"],
 html[data-keyboard="1"] [data-testid="task-track"],
 html[data-keyboard="1"] [data-testid="session-notifications"],
+html[data-keyboard="1"] [data-testid="composer-caption"],
 /* c-mfix round 3: an open transcript search and the gap banner sit ABOVE the
    message scroller and were why the real scrollport kept only ~29% of the
    band. Neither is needed while typing in the composer; search is reachable
@@ -35,55 +42,57 @@ html[data-keyboard="1"]:not([data-keyboard-focus="search"])
   display: none !important;
 }
 
-/* Status strip: one clipped line — phase dot + tool, the hook health note.
-   Timer/token/tier/spinner phrase/Esc fold away until the keyboard closes;
-   Esc stays available from the composer affordances, and the transcript row
-   keeps every status detail. */
-html[data-keyboard="1"] [data-testid="live-status-strip"] {
-  flex-wrap: nowrap;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  gap: 8px;
+/* The composer text box holds at most three lines in the band (its 11px
+   padding and 1px border top and bottom ride on top); longer drafts scroll
+   inside it. */
+html[data-keyboard="1"] [data-testid="composer-input"] {
+  max-height: calc(3lh + 24px);
 }
 
-html[data-keyboard="1"]
-  [data-testid="live-status-strip"]
-  [data-testid="live-verb"],
-html[data-keyboard="1"]
-  [data-testid="live-status-strip"]
-  [data-testid="live-elapsed"],
-html[data-keyboard="1"]
-  [data-testid="live-status-strip"]
-  [data-testid="live-token-count"],
-html[data-keyboard="1"]
-  [data-testid="live-status-strip"]
-  [data-testid="live-tier"],
-html[data-keyboard="1"]
-  [data-testid="live-status-strip"]
-  [data-testid="live-phrase"],
-html[data-keyboard="1"]
-  [data-testid="live-status-strip"]
-  [data-testid="live-decided-by"],
-html[data-keyboard="1"]
-  [data-testid="live-status-strip"]
-  [data-testid="live-interrupt"] {
-  display: none;
-}
-
-html[data-keyboard="1"]
-  [data-testid="live-status-strip"]
-  [data-testid^="live-health-"] {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* The dock's 12px padding + 12px gaps were sized for the full-height layout;
-   in the keyboard band the same strip-to-composer rhythm costs ~40px the
-   transcript needs. Tighten both — the composer's own rows keep their 44px
-   hit heights, only the wrapper spacing shrinks. */
+/* The dock's padding and gaps were sized for the full-height layout; in the
+   keyboard band the same strip-to-composer rhythm costs space the transcript
+   needs. Tighten both — the composer's own rows keep their 44px hit heights,
+   only the wrapper spacing shrinks. */
 html[data-keyboard="1"] [data-testid="session-dock"] {
-  padding: 4px 12px;
+  padding: 4px 0;
   gap: 4px;
+}
+
+/* UO-6a round 2: the WHOLE composer — text box and control bar — fits in the
+   band under the pending-card area (ui-spec §2). At a 323px band the dock
+   has ~86px for it: a 44px text box, a 4px gap and ONE 32px control row.
+   - The control bar never wraps. Its essential controls (the options
+     trigger, 插队 / 打断 and the primary button) keep their size; the notes
+     (「尚未验证」, the voice hint) shrink to an ellipsis on the same row
+     instead of pushing the buttons onto a second one.
+   - The queued rows collapse into the bar's 「已排队 N」 chip, the one
+     affordance for them while typing; the rows (with their 插队发送 / 撤回)
+     return the moment the keyboard closes. The 已打断 receipt, a turn fact
+     already shown in the transcript, steps aside with them.
+   - Attachment and code-quote chips stay (they are part of the draft) but
+     keep to one scrolling line. */
+html[data-keyboard="1"] [data-testid="composer"] {
+  gap: 4px;
+}
+
+html[data-keyboard="1"] [data-testid="composer-bar"] {
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+html[data-keyboard="1"] [data-testid="composer-bar"] > [data-testid="composer-cap-note"],
+html[data-keyboard="1"] [data-testid="composer-bar"] > [data-testid="composer-voice-hint"] {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+html[data-keyboard="1"] [data-testid="composer-queued-row"],
+html[data-keyboard="1"] [data-testid="composer-interrupted-chip"] {
+  display: none !important;
+}
+
+html[data-keyboard="1"] [data-testid="attachment-chips"],
+html[data-keyboard="1"] [data-testid="code-quote-chips"] {
+  flex-wrap: nowrap;
+  overflow-x: auto;
 }

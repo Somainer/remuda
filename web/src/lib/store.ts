@@ -1,4 +1,6 @@
 import { useSyncExternalStore } from "react";
+import { profileRegion } from "./profileFlags";
+import { structuralEqual } from "./structuralEqual";
 
 /** Bounded journal tail the list reads per live instance to project its phrase. */
 const SUMMARY_TAIL = 64;
@@ -6,6 +8,7 @@ import type { Command, CommandSettlementOutcome } from "../types/command";
 import type { components } from "./api.generated";
 import type { Host, Instance } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
+import type { InteractionResolutionReason } from "../types/generated";
 import type { Observation } from "../types/observation";
 import type { Id, U64 } from "../types/wire";
 import type { PromptMode } from "../types/generated";
@@ -555,6 +558,14 @@ export type HubState = {
   interactionsHydrated: boolean;
   events: Record<string, Observation[]>;
   journalStatus: Record<string, JournalClient["status"]>;
+  /**
+   * Lowest LOADED (retained) journal seq per instance, mirrored from the
+   * JournalClient's descending pager. The transcript's load-earlier button
+   * points at THIS floor rather than the min event seq: a reconnect snapshot
+   * re-anchors the server window above manually paged rows, which stay held.
+   * "1" (or absent for an unfollowed instance) hides the button.
+   */
+  journalFloors: Record<string, string>;
   bubbles: LocalBubble[];
   permissionMode: Record<string, string>;
   effort: Record<string, EffortSelection>;
@@ -622,6 +633,7 @@ const initial: HubState = {
   interactionsHydrated: false,
   events: {},
   journalStatus: {},
+  journalFloors: {},
   bubbles: [],
   permissionMode: {},
   effort: {},
@@ -695,6 +707,22 @@ function applyInstanceActivity(instances: Instance[], events: Observation[]): In
  * unresolved — including a newer response that lands while an older one is
  * still pending.
  */
+/**
+ * True when the merge produced no element changes (same length, every row
+ * still reference-identical at the same index). Pair with the identity
+ * preservation inside the merge functions: an unchanged poll parses fresh
+ * JSON objects but the merge maps each one back onto the prior row, so this
+ * check lets the caller reuse the previous ARRAY reference and skip the
+ * store emission entirely (c-perffu: a quiet 2 s poll must not re-render).
+ */
+function sameArrayIdentity<T>(next: readonly T[], prev: readonly T[]): boolean {
+  if (next.length !== prev.length) return false;
+  for (let i = 0; i < next.length; i += 1) {
+    if (next[i] !== prev[i]) return false;
+  }
+  return true;
+}
+
 function mergeInstanceSnapshots(
   incoming: Instance[],
   current: Instance[],
@@ -705,7 +733,11 @@ function mergeInstanceSnapshots(
   const previous = new Map(current.map((instance) => [instance.id, instance]));
   const merged = incoming.map((instance) => {
     const newer = previous.get(instance.id);
-    return newer && BigInt(newer.durableSeq) > BigInt(instance.durableSeq) ? newer : instance;
+    if (newer && BigInt(newer.durableSeq) > BigInt(instance.durableSeq)) return newer;
+    // Equal content from a fresh JSON parse: keep the prior object identity so
+    // an unchanged poll is a no-op for every memoized consumer.
+    if (newer && structuralEqual(newer, instance)) return newer;
+    return instance;
   });
   if (!pins?.size) return merged;
   const seen = new Set(merged.map((instance) => instance.id));
@@ -714,9 +746,7 @@ function mergeInstanceSnapshots(
     const optimistic = previous.get(id);
     if (!optimistic) continue;
     // This response (in `outstanding`), or an even older request still
-    // pending, may predate the create: keep the optimistic row. A response
-    // that started strictly after the create AND has no older in-flight
-    // sibling is authoritative.
+    // pending, may predate the create: keep the optimistic row.
     if (Array.from(outstanding ?? [reqSeq]).some((seq) => seq <= pin.seq)) {
       merged.unshift(optimistic);
     }
@@ -741,7 +771,8 @@ function mergeInstanceSnapshots(
  * Only a strictly newer response releases the pin (the caller marks it), and
  * the row is then dropped/confirmed normally.
  */
-function mergeInteractionSnapshots(
+/** c-cardsettle r2 item 4: exported for the settlement-race unit test. */
+export function mergeInteractionSnapshots(
   incoming: Interaction[],
   current: Interaction[],
   settled: ReadonlyMap<Id, { seq: number; confirmedByNewer: boolean }>,
@@ -781,7 +812,8 @@ function mergeInteractionSnapshots(
       merged.push(prior);
       continue;
     }
-    merged.push(row);
+    // Unchanged row from a fresh JSON parse: preserve the prior identity.
+    merged.push(prior && structuralEqual(prior, row) ? prior : row);
   }
   if (settled.size) {
     // Tombstone retention: the committed id is missing from this page. A
@@ -941,6 +973,12 @@ class HubStore {
   private screenBackoffUntil = new Map<Id, number>();
   private screenBackoffTimers = new Map<Id, ReturnType<typeof setTimeout>>();
   private stopWorkspaceFollow: (() => void) | null = null;
+  /** c-cardsettle: global Hub settlement socket (instances ending → cards drop). */
+  private stopSettlementFollow: (() => void) | null = null;
+  /** Trailing coalescer so a burst of settlement notices triggers one refresh. */
+  private settlementRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Dev/observability: how many settlement frames THIS store handled. */
+  private settlementCount = 0;
 
   subscribe = (listener: Listener) => {
     this.listeners.add(listener);
@@ -1171,7 +1209,13 @@ class HubStore {
       const rollup = instance.usageRollup;
       if (!rollup) continue;
       const current = next[instance.id];
-      if (!current || rollup.turns >= current.turns) {
+      // Equal turn count with equal content is not a change; the server
+      // rebuilds the rollup object on every read.
+      if (
+        !current ||
+        rollup.turns > current.turns ||
+        (rollup.turns === current.turns && !structuralEqual(current, rollup))
+      ) {
         next[instance.id] = rollup;
         updated = true;
       }
@@ -1189,15 +1233,26 @@ class HubStore {
       const view = modelFromRecord(instance.modelEffective);
       if (view) {
         const current = effectiveNext[instance.id];
-        if (!current || view.observedAt >= current.observedAt) {
+        if (
+          !current ||
+          view.observedAt > current.observedAt ||
+          (view.observedAt === current.observedAt && !structuralEqual(current, view))
+        ) {
           effectiveNext[instance.id] = view;
           effUpdated = true;
         }
       }
       const catalog = catalogFromRecord(instance.modelCatalog);
       if (catalog) {
-        catalogNext[instance.id] = catalog;
-        catUpdated = true;
+        // The catalog payload is rebuilt server-side per read; fold it only
+        // when the content actually differs.
+        if (
+          catalogNext[instance.id] === undefined ||
+          !structuralEqual(catalogNext[instance.id], catalog)
+        ) {
+          catalogNext[instance.id] = catalog;
+          catUpdated = true;
+        }
       }
     }
     if (effUpdated || catUpdated) {
@@ -1305,7 +1360,11 @@ class HubStore {
       const view = effectivePermissionFromRecord(instance.permissionEffective);
       if (!view) continue;
       const current = next[instance.id];
-      if (!current || view.observedAt >= current.observedAt) {
+      if (
+        !current ||
+        view.observedAt > current.observedAt ||
+        (view.observedAt === current.observedAt && !structuralEqual(current, view))
+      ) {
         next[instance.id] = view;
         updated = true;
       }
@@ -2423,17 +2482,37 @@ class HubStore {
         // watchers may take their baseline from this page.
         interactionsHydrated: true,
       });
-      this.hydrateEffortEffective(instances.items);
-      this.hydrateUsageRollups(instances.items);
-      this.hydrateModels(instances.items);
-      this.hydratePermissionEffective(instances.items);
+      profileRegion("store.pollHydrate", () => {
+        this.hydrateEffortEffective(instances.items);
+        this.hydrateUsageRollups(instances.items);
+        this.hydrateModels(instances.items);
+        this.hydratePermissionEffective(instances.items);
+      });
       this.stopWorkspaceFollow?.();
       this.stopWorkspaceFollow = api.hostWorkspaceSubscribe(
         (snapshot) => this.applyWorkspaceSnapshot(snapshot),
         () => { void this.refreshHosts().catch(() => undefined); },
       );
+      // c-cardsettle: the Hub invalidates a session's pending card in the same
+      // transaction that ends the instance. Its settlement notice makes every
+      // mounted inbox/badge drop the card immediately via one trailing-coalesced
+      // interaction refresh; missed notices converge on the next 2 s poll.
+      this.stopSettlementFollow?.();
+      this.stopSettlementFollow = api.settlementSubscribe((interactionId, reason) => {
+        this.settlementCount += 1;
+        // Install the terminal pin against the CURRENT list seq BEFORE
+        // refreshing, so an older in-flight poll resolving last cannot
+        // resurrect the settled card (r2 item 4).
+        this.pinHubSettlement(interactionId, reason);
+        if (this.settlementRefreshTimer) clearTimeout(this.settlementRefreshTimer);
+        this.settlementRefreshTimer = setTimeout(() => {
+          this.settlementRefreshTimer = null;
+          void this.refresh().catch(() => undefined);
+        }, 300);
+      });
       await this.initConnection();
       this.startPoll();
+      this.installDevHandle();
     } catch (err) {
       if (gen !== this.bootGen) return;
       const unauth = isUnauthorized(err);
@@ -2542,14 +2621,57 @@ class HubStore {
     }, 2000);
   }
 
+  /** Stop the periodic poll. Settlement-driven and user-triggered refreshes
+   * still run; used by the cardsettle hub spec to prove a card drops from the
+   * settlement frame rather than a poll. */
+  stopPoll() {
+    if (this.pollTimer != null && typeof window !== "undefined") {
+      window.clearInterval(this.pollTimer);
+    }
+    this.pollTimer = null;
+  }
+
+  /** Dev-only debug handle (the hub e2e runs against the vite dev server):
+   * lets a spec halt the 2 s interaction poll so a UI change can be
+   * attributed to the settlement follow frame instead of polling. */
+  private installDevHandle() {
+    if (!import.meta.env.DEV || typeof window === "undefined") return;
+    (window as unknown as {
+      __remudaHub?: {
+        stopPoll: () => void;
+        settlementCount: () => number;
+        interactionState: (id: string) => string | undefined;
+      };
+    }).__remudaHub = {
+      stopPoll: () => this.stopPoll(),
+      settlementCount: () => this.settlementCount,
+      interactionState: (id: string) =>
+        this.state.interactions.find((row) => row.id === id)?.state,
+    };
+  }
+
+  private clearDevHandle() {
+    if (typeof window !== "undefined") {
+      delete (window as unknown as { __remudaHub?: unknown }).__remudaHub;
+    }
+  }
+
   logout() {
     const mine = this.state.session?.deviceId;
     if (mine) void api.deviceRevoke(mine).catch(() => undefined);
     clearSession();
     dropDeviceCookie();
     api.disconnect();
+    this.stopPoll();
+    this.clearDevHandle();
     this.stopWorkspaceFollow?.();
     this.stopWorkspaceFollow = null;
+    this.stopSettlementFollow?.();
+    this.stopSettlementFollow = null;
+    if (this.settlementRefreshTimer) {
+      clearTimeout(this.settlementRefreshTimer);
+      this.settlementRefreshTimer = null;
+    }
     // Invalidate this auth epoch: a list fetch already in flight (the 2 s
     // poll may be awaiting when the user logs out) must be dropped wholesale
     // when it resolves — neither replace the wiped instance list with the old
@@ -2627,8 +2749,29 @@ class HubStore {
 
   async refreshHosts() {
     const page = await api.hostList();
-    const hosts = mergeHostWorkspaces(page.items, this.state.hosts);
-    this.emit({ hosts, workspaces: hosts.flatMap((host) => (host.workspaces ?? []).map(mapWorkspace)) });
+    profileRegion("store.hostsMerge", () => {
+      const hosts = mergeHostWorkspaces(page.items, this.state.hosts);
+      if (sameArrayIdentity(hosts, this.state.hosts)) return;
+      // mapWorkspace rebuilds every row object; reuse the prior mapped
+      // workspace when content is equal so buildSpaces inputs stay stable.
+      const prior = new Map(this.state.workspaces.map((w) => [`${w.hostId}|${w.id}`, w]));
+      let changed = false;
+      const workspaces = hosts.flatMap((host) =>
+        (host.workspaces ?? []).map((row) => {
+          const mapped = mapWorkspace(row);
+          const old = prior.get(`${mapped.hostId}|${mapped.id}`);
+          if (!old) {
+            changed = true;
+          } else if (!structuralEqual(old, mapped)) {
+            changed = true;
+            return mapped;
+          }
+          return old ?? mapped;
+        }),
+      );
+      changed ||= workspaces.length !== this.state.workspaces.length;
+      this.emit(changed ? { hosts, workspaces } : { hosts });
+    });
   }
 
   private applyWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
@@ -2670,26 +2813,44 @@ class HubStore {
       // An older in-flight poll that returns a still-pending row must not
       // revert a locally committed review; merge with the same seq/outstanding
       // pin discipline as the instance list.
-      const mergedInteractions = mergeInteractionSnapshots(
-        interactions,
-        this.state.interactions,
-        this.settledInteractions,
-        reqSeq,
-        this.listOutstanding,
-      );
-      this.emit({
-        instances: mergeInstanceSnapshots(
+      profileRegion("store.pollMerge", () => {
+        // The merges (including the structuralEqual identity checks) are timed
+        // inside this region, not just the emit — the r1 probe boundary wrongly
+        // measured only the latter (c-perffu r2 item 5).
+        const nextInteractions = mergeInteractionSnapshots(
+          interactions,
+          this.state.interactions,
+          this.settledInteractions,
+          reqSeq,
+          this.listOutstanding,
+        );
+        const nextInstances = mergeInstanceSnapshots(
           instances.items,
           this.state.instances,
           this.pinnedCreates,
           reqSeq,
           this.listOutstanding,
-        ),
-        interactions: mergedInteractions,
-        // A successful poll/refresh read settles the baseline even when the
-        // bootstrap fetch failed (offline reload): an empty page here is a
-        // valid success.
-        interactionsHydrated: true,
+        );
+        // An unchanged poll preserves every row identity (see the merge
+        // functions), so skip the emission — and every consumer render wave —
+        // entirely when neither snapshot changed. The hydration flag is
+        // main's offline-reload baseline: a failed bootstrap leaves it false,
+        // so the first SUCCESSFUL poll must still emit to flip it even when
+        // both lists are empty/identical.
+        if (
+          !this.state.interactionsHydrated ||
+          !sameArrayIdentity(nextInstances, this.state.instances) ||
+          !sameArrayIdentity(nextInteractions, this.state.interactions)
+        ) {
+          this.emit({
+            instances: nextInstances,
+            interactions: nextInteractions,
+            // A successful poll/refresh read settles the baseline even when the
+            // bootstrap fetch failed (offline reload): an empty page here is a
+            // valid success.
+            interactionsHydrated: true,
+          });
+        }
       });
       // A response newer than a pin proves the server has spoken after the
       // create/answer. Combined with the in-flight sweep below (every older
@@ -2704,10 +2865,12 @@ class HubStore {
         const row = interactions.find((candidate) => candidate.id === id);
         if (!row || row.state !== "pending") pin.confirmedByNewer = true;
       }
-      this.hydrateEffortEffective(instances.items);
-      this.hydrateUsageRollups(instances.items);
-      this.hydrateModels(instances.items);
-      this.hydratePermissionEffective(instances.items);
+      profileRegion("store.pollHydrate", () => {
+        this.hydrateEffortEffective(instances.items);
+        this.hydrateUsageRollups(instances.items);
+        this.hydrateModels(instances.items);
+        this.hydratePermissionEffective(instances.items);
+      });
       // NOTE: list-row live phrases are NOT derived here. refresh() fans into
       // every authenticated path (close/cancel/create/resume re-enter it) and
       // must not add journal polling; the mounted SessionList hydrates phrases
@@ -2958,6 +3121,7 @@ class HubStore {
         this.emit({
           instances: applyInstanceActivity(this.state.instances, fresh),
           events: { ...this.state.events, [instanceId]: merged },
+          journalFloors: { ...this.state.journalFloors, [instanceId]: client.retainedFloorSeq },
         });
       },
       onStatus: (status) => {
@@ -2974,6 +3138,10 @@ class HubStore {
       },
     });
     this.journals.set(instance.journalId, client);
+    // The seed rows crossed the events READ, not the follow socket: register
+    // them so a descending load-earlier window overlapping the seed counts as
+    // duplicate-only (advancing the cursor) rather than a false prepend.
+    client.noteHistory(history);
     client.applySnapshot({
       projectionVersion: "v1",
       projectionEpoch: id("epoch_"),
@@ -2989,6 +3157,7 @@ class HubStore {
       // load-earlier anchor and live-batch stale check).
       history: { earliestRetainedSeq: seed.windowFromSeq ?? "1", complete: seed.reachedAfterSeq },
     });
+    this.emit({ journalFloors: { ...this.state.journalFloors, [instanceId]: client.retainedFloorSeq } });
     await this.openFollowSocket(instance, client, last, {
       earliestRetainedSeq: seed.windowFromSeq ?? "1",
       complete: seed.reachedAfterSeq,
@@ -3075,13 +3244,21 @@ class HubStore {
     }
   }
 
-  /** Fetch one window of older history for the transcript's load-earlier row. */
+  /**
+   * Fetch one window of older history for the transcript's load-earlier row.
+   * Returns whether rows were prepended and whether the retained end was
+   * reached (null when the instance/journal is not followed here).
+   */
   async loadEarlier(instanceId: Id) {
     const instance = this.state.instances.find((i) => i.id === instanceId);
     if (!instance) return null;
     const client = this.journals.get(instance.journalId);
     if (!client) return null;
-    return client.loadEarlier();
+    const result = await client.loadEarlier();
+    // Duplicate-only pages fire no onPrepend, so emit the (possibly advanced)
+    // retained floor here: the button must stay visible while history remains.
+    this.emit({ journalFloors: { ...this.state.journalFloors, [instanceId]: client.retainedFloorSeq } });
+    return result;
   }
 
   /**
@@ -4335,6 +4512,49 @@ class HubStore {
           : row,
       ),
     });
+  }
+
+  /**
+   * c-cardsettle r2 item 4: pin a Hub settlement (instance ended → card
+   * invalidated) against the list seq captured at frame receipt, BEFORE the
+   * settlement refresh starts. An older in-flight interaction poll that
+   * resolves afterwards carries an older reqSeq and a stale pending copy; the
+   * pin makes mergeInteractionSnapshots suppress it and keeps the tombstone
+   * until a newer page confirms. The local row is flipped immediately so the
+   * card drops even before the refresh resolves.
+   */
+  private pinHubSettlement(interactionId: Id, reason?: string) {
+    this.settledInteractions.set(interactionId, {
+      seq: this.listReqSeq,
+      confirmedByNewer: false,
+    });
+    if (this.state.interactions.some((row) => row.id === interactionId)) {
+      this.emit({
+        interactions: this.state.interactions.map((row) => {
+          if (row.id !== interactionId) return row;
+          // c-cardsettle r3 item 7: stamp the terminal resolution on the
+          // immediate projection too. r6 item 5: carry the Hub's reason
+          // verbatim — a non-process-end settlement (e.g. transcript-picker
+          // demotion = agent-demoted) must not be overwritten with
+          // generation-ended; absent/unknown reasons default to generation-
+          // ended (the only settlement the process-end paths publish).
+          const now = new Date().toISOString();
+          const settlementReason: InteractionResolutionReason =
+            reason === "agent-demoted" ? "agent-demoted" : "generation-ended";
+          return {
+            ...row,
+            state: "invalidated" as const,
+            answerable: false,
+            blocking: false,
+            updatedAt: now,
+            resolution: {
+              state: "known" as const,
+              value: { reason: settlementReason, eventIds: [] },
+            },
+          };
+        }),
+      });
+    }
   }
 
   titleOf(instanceId: Id) {

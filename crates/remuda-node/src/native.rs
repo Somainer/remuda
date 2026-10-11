@@ -849,6 +849,10 @@ impl Driver for NativeAdapter {
         self.startup_error.lock().ok().and_then(|slot| slot.clone())
     }
 
+    fn process_gone(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async move { self.native.process_gone().await })
+    }
+
     /// Ask the live driver what this session can do (§4.3, §6).
     ///
     /// A failure is not fatal and not a downgrade: the create-time snapshot

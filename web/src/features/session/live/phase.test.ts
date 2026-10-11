@@ -214,3 +214,63 @@ describe("isActivePhase", () => {
     expect(isActivePhase("tool-started")).toBe(true);
   });
 });
+
+describe("subagent-scoped phases (c-cardsettle r3 item 8)", () => {
+  it("ignores a workflow subagent's turn-ended/failed, keeps the root turn live", () => {
+    // Main turn is working…
+    const working = turnLive(
+      1,
+      phase("thinking", T0),
+      T0,
+    );
+    // …then a SUBAGENT's StopFailure carries a turn-ended+failed tag.
+    const subagentFailed = turnLive(
+      2,
+      phase("turn-ended", T0, {
+        outcome: "failed",
+        agentId: "agent0sub0agent000",
+        agentType: "workflow-subagent",
+      }),
+      "2026-10-05T00:00:05.000Z",
+    );
+    const got = livePhase([working, subagentFailed]);
+    expect(got?.phase, "a subagent turn-ended never settles the root strip").toBe(
+      "thinking",
+    );
+  });
+
+  it("still settles a ROOT turn-ended failed (no agentId)", () => {
+    const working = turnLive(1, phase("thinking", T0), T0);
+    const rootFailed = turnLive(
+      2,
+      phase("turn-ended", T0, { outcome: "failed" }),
+      "2026-10-05T00:00:05.000Z",
+      "hook",
+      "StopFailure",
+    );
+    const got = livePhase([working, rootFailed]);
+    expect(got?.phase).toBe("turn-ended");
+  });
+
+  it("r4 item 3: agentId ALONE (missing or empty agentType) is still subagent scope", () => {
+    const working = turnLive(1, phase("thinking", T0), T0);
+    // agentId present, agentType MISSING.
+    const idOnly = turnLive(
+      2,
+      phase("turn-ended", T0, { outcome: "failed", agentId: "agentwithouttype" }),
+      "2026-10-05T00:00:05.000Z",
+      "hook",
+      "StopFailure",
+    );
+    expect(livePhase([working, idOnly])?.phase).toBe("thinking");
+    // agentId present, agentType EMPTY.
+    const emptyType = turnLive(
+      3,
+      phase("turn-ended", T0, { outcome: "failed", agentId: "x", agentType: "" }),
+      "2026-10-05T00:00:06.000Z",
+      "hook",
+      "StopFailure",
+    );
+    expect(livePhase([working, emptyType])?.phase).toBe("thinking");
+  });
+});

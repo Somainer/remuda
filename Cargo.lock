@@ -3317,6 +3317,7 @@ dependencies = [
  "nix",
  "openssl",
  "remuda-driver",
+ "remuda-hub",
  "remuda-journal",
  "remuda-protocol",
  "remuda-push",

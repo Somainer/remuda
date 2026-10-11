@@ -427,51 +427,63 @@ describe("ConnectionMachine", () => {
     expect(resume).toHaveBeenCalledTimes(1);
   });
 
-  it("GATE11 item 6: a stale probe answering for an OLD attempt id cannot take the newer attempt's Q-settled stale offline", async () => {
+  it("GATE11 item 6: a stale probe answering for an OLD attempt id cannot take the newer ACTIVE quiet attempt offline", async () => {
     // Same binding, no navigation:
     //  t=30 stale probe P starts (no attempt in flight; captures attempt id 0)
-    //  t=31 foreground resume starts attempt 1 and fails; its settle probe Q
-    //       starts
-    //  t=32 Q answers ok -> quiet stale
+    //  t=31 a LATER stale cycle answers ok -> quietReopen starts attempt 1; its
+    //       resume is DEFERRED, so the attempt is PROVABLY active (state stays
+    //       stale, resumeInFlight=true, attemptRef id 1)
     //  t=35 P answers FALSE. P's generation matches, so the gen-only gate
-    //       accepted it and goOfflineAndSchedule flipped the link offline —
-    //       even though Q (for attempt 1) had already decided stale. The probe
-    //       must capture resumeAttemptId too and require BOTH to match.
-    const { clock, machine, probe, resume, isFollowLive, onState } = setupTracked();
-    isFollowLive.mockReturnValue(false);
-    const resolvers: ((ok: boolean) => void)[] = [];
+    //       accepted it and goOfflineAndSchedule flipped the link offline
+    //       while attempt 1 was still genuinely in flight — even though
+    //       attempt 1 owns the decision. The probe must capture
+    //       resumeAttemptId too and require BOTH to match.
+    const { clock, machine, probe, resume, onState } = setupTracked();
+    const pResolvers: ((ok: boolean) => void)[] = [];
+    let resumeCalls = 0;
+    let rejectQuiet: ((e: Error) => void) | null = null;
     probe.mockImplementation(
-      () => new Promise<boolean>((resolve) => resolvers.push(resolve)),
+      () => new Promise<boolean>((resolve) => pResolvers.push(resolve)),
     );
-    resume.mockRejectedValueOnce(new Error("foreground resume failed"));
+    resume.mockImplementation(() => {
+      resumeCalls += 1;
+      // The quiet attempt's resume stays pending (active) until released.
+      return new Promise<void>((_resolve, reject) => {
+        if (resumeCalls === 1) rejectQuiet = reject;
+      });
+    });
     machine.startLive();
     clock.advance(LIVE_FRAME_MS); // t=15 stale
-    clock.advance(REST_PROBE_MS); // t=30: stale probe P in flight
-    expect(resolvers).toHaveLength(1);
+    clock.advance(REST_PROBE_MS); // t=30: stale probe P in flight (id 0)
+    expect(pResolvers).toHaveLength(1);
 
-    // t=31: foreground resume (attempt 1) fails; its settle probe Q starts.
-    clock.advance(1_000);
-    machine.dispatch({ type: "resume" });
-    expect(machine.state).toBe("recovering");
+    // t=31: a later stale cycle answers ok DIRECTLY: quietReopen attempt 1
+    // starts and stays active (deferred resume); state remains quiet stale.
+    machine.dispatch({ type: "probe", ok: true });
     await Promise.resolve();
-    await Promise.resolve();
-    expect(resolvers).toHaveLength(2);
-
-    // t=32: Q wins — quiet stale.
-    resolvers[1]!(true);
-    await Promise.resolve();
-    await Promise.resolve();
+    expect(resume).toHaveBeenCalledTimes(1);
     expect(machine.state).toBe("stale");
+    expect((machine as unknown as { resumeInFlight: boolean }).resumeInFlight).toBe(true);
+    expect(machine.attemptRef()).toEqual({ gen: 0, attemptId: 1 });
 
-    // t=35: the stale P answers false for an attempt that is no longer
-    // current: dropped, state stays stale — no offline banner, no reconnect.
+    // t=35: the stale P answers false while attempt 1 is ACTIVE: dropped (id
+    // 0 != 1) — no offline banner, attempt still owns the link.
     const offlineEvents: string[] = [];
     onState.mockImplementation((s: string) => {
       if (s === "offline") offlineEvents.push(s);
     });
-    resolvers[0]!(false);
+    pResolvers[0]!(false);
     await Promise.resolve();
     await Promise.resolve();
+    expect(machine.state).toBe("stale");
+    expect((machine as unknown as { resumeInFlight: boolean }).resumeInFlight).toBe(true);
+    expect(offlineEvents).toEqual([]);
+
+    // The quiet attempt later rejects: a quiet failure merely re-arms the
+    // stale probe/offline timers, state stays quiet stale; P never changed
+    // anything and no offline transition ever happened.
+    rejectQuiet!(new Error("snapshot timeout"));
+    for (let i = 0; i < 4; i += 1) await Promise.resolve();
     expect(machine.state).toBe("stale");
     expect(offlineEvents).toEqual([]);
   });
@@ -609,7 +621,9 @@ describe("ConnectionMachine", () => {
     // The REST probe answers a moment early (t=29): quiet reopen attempt A
     // starts and clears the stale/probe/reconnect timers, offline carried.
     clock.advance(STALE_TO_OFFLINE_MS - REST_PROBE_MS - 1_000);
+    await Promise.resolve(); // drain (probe timer not yet due)
     machine.dispatch({ type: "probe", ok: true });
+    await Promise.resolve(); // quietReopen -> resume call
     expect(resume).toHaveBeenCalledTimes(1);
     // Navigate away: noteBinding retires A (watchdog cleared). Only the
     // carried offline deadline remains.
@@ -623,8 +637,8 @@ describe("ConnectionMachine", () => {
     // t=44: the NEW probe fires; its ok answer starts quiet attempt B BEFORE
     // the inherited deadline.
     clock.advance(REST_PROBE_MS);
-    await Promise.resolve();
-    await Promise.resolve();
+    await Promise.resolve(); // probe promise
+    await Promise.resolve(); // continuation -> dispatch -> quietReopen B
     expect(resume).toHaveBeenCalledTimes(2);
     expect(machine.attemptRef()).not.toBeNull(); // B genuinely in flight
     expect(machine.state).toBe("stale");
@@ -632,6 +646,7 @@ describe("ConnectionMachine", () => {
     // t=45: the inherited deadline still owns the loud transition (gate 10
     // item 4 retires B without the offline flag).
     clock.advance(1_000);
+    await Promise.resolve(); // drain goOfflineAndSchedule/scheduleReconnect
     expect(machine.state).toBe("offline");
   });
 
@@ -679,8 +694,8 @@ describe("ConnectionMachine", () => {
 
     // The fresh stale probe starts exactly one quiet attempt.
     clock.advance(REST_PROBE_MS);
-    await Promise.resolve();
-    await Promise.resolve();
+    await Promise.resolve(); // probe promise
+    await Promise.resolve(); // probe continuation -> dispatch -> quietReopen
     expect(resume.mock.calls.length).toBe(callsAtStale + 1);
     expect(machine.attemptRef()).not.toBeNull(); // quiet attempt STARTED
     expect(machine.state).toBe("stale");
@@ -689,6 +704,7 @@ describe("ConnectionMachine", () => {
     // One ms before the fresh bound the quiet attempt is still the only owner
     // — retired by nothing, no reconnect scheduled early.
     clock.advance(STALE_TO_OFFLINE_MS - REST_PROBE_MS - 1);
+    await Promise.resolve(); // drain any fired continuations
     expect(machine.state).toBe("stale");
     expect(machine.attemptRef()).not.toBeNull();
     expect(timerNames()).not.toContain("reconnect");
@@ -698,6 +714,7 @@ describe("ConnectionMachine", () => {
     // offline flag), loud offline; the autonomous reconnect is scheduled only
     // AFTER this point.
     clock.advance(1);
+    await Promise.resolve(); // goOfflineAndSchedule schedules reconnect async-safe
     expect(machine.state).toBe("offline");
     expect(machine.attemptRef()).toBeNull();
     expect(timerNames()).toContain("reconnect");

@@ -703,6 +703,7 @@ class HubStore {
    */
   private connection: ConnectionMachine | null = null;
   private outbox: Outbox | null = null;
+  private outboxUnsubscribe: (() => void) | null = null;
   private outboxDegraded = false;
   private connectionBoundTo: Id | null = null;
   private connectionBoundJournal: Id | null = null;
@@ -750,7 +751,14 @@ class HubStore {
         this.outboxDegraded = opened.degraded;
         const box = await Outbox.load(opened.storage);
         this.outbox = box;
-        box.subscribe(() => this.emit({ outboxPending: box.pendingCount() }));
+        this.outboxUnsubscribe = box.subscribe(() => this.emit({ outboxPending: box.pendingCount() }));
+        // Gate 11 item 5: a tracked lease-expiry wakeup inside Outbox reclaims
+        // an inactive claim (kept for a cloned live tab / unknown ownership /
+        // a failed load-time reclaim) and then triggers the normal
+        // single-deliverer flush here — no unrelated UI event required.
+        box.onClaimWake = () => {
+          void this.flushAllOutbox();
+        };
         this.emit({ outboxPending: box.pendingCount() });
         if (opened.degraded) this.toast("本机无法可靠保存待发消息（存储不可用）");
         // Rows left inflight by a closed tab are due immediately.
@@ -2556,6 +2564,16 @@ class HubStore {
     for (const [, t] of this.leaseWakeupTimer) clearTimeout(t);
     this.leaseWakeupTimer.clear();
     this.leaseWakeupUntil.clear();
+    // Drop the outbox INSTANCE (durable rows stay in storage): cancel its
+    // tracked lease-expiry claim wakeups so none fires a flush into the
+    // logged-out auth epoch; the next bootstrap re-runs Outbox.load and
+    // re-evaluates ownership/leases (gate 11 item 5).
+    this.outbox?.dispose();
+    this.outbox = null;
+    this.outboxUnsubscribe?.();
+    this.outboxUnsubscribe = null;
+    this.outboxInit = null;
+    this.outboxDegraded = false;
     if (this.unloadClearTimer) {
       clearTimeout(this.unloadClearTimer);
       this.unloadClearTimer = null;

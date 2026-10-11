@@ -514,6 +514,23 @@ export class Outbox {
   private listeners = new Set<() => void>();
   private storage: OutboxStorage;
   private readonly owner: Id;
+  /**
+   * Tracked lease-expiry wakeups for INACTIVE persisted claims (rows this
+   * context is not itself POSTing): same-owner claims kept until their
+   * deadline (held/unknown, gate 11 item 3) and claims whose load-time
+   * reclaim failed (gate 10 item 8). One handle per commandId; a row leaving
+   * inflight (or {@link dispose}) cancels it (c-reconnfu gate 11 item 5: the
+   * old load fallback armed an UNTRACKED setTimeout that only refreshed the
+   * cache — no requeue, no flush — so the row stranded until an unrelated UI
+   * event and could never be cancelled).
+   */
+  private claimWakeups = new Map<Id, ReturnType<typeof setTimeout>>();
+
+  /**
+   * Store hook fired exactly once when a tracked wakeup reclaims a row: the
+   * store runs its single-deliverer flush (the Outbox itself never POSTs).
+   */
+  onClaimWake: (() => void) | null = null;
 
   private constructor(storage: OutboxStorage, owner?: Id) {
     this.storage = storage;
@@ -591,7 +608,10 @@ export class Outbox {
             : "free";
         if (ownership !== "free" && rec.lease.until > now) {
           // Held by a live cloned tab, or ownership unknowable: the fresh
-          // same-owner lease stands until its deadline.
+          // same-owner lease stands until its deadline. A TRACKED wakeup
+          // reclaims it at expiry (item 5) — the cloned tab may be gone by
+          // then; until then this context neither requeues nor delivers.
+          box.scheduleClaimWakeup(id, rec.lease.until);
           continue;
         }
         requeue.push({ id, instanceId: rec.instanceId, expected: rec.lease });
@@ -643,17 +663,12 @@ export class Outbox {
           // Authoritative current row — either reclaimed to pending or the
           // terminal/changed row another tab committed.
           box.cache.set(id, stored);
+          if (stored.state !== "inflight") box.clearClaimWakeup(id);
         } else {
-          // Persist failed: the row is still (durable) inflight with a lease.
-          // This context is not delivering anything yet; wake at the lease
-          // deadline so an unrelated trigger is not required.
-          const until = expected.until;
-          if (until > Date.now()) {
-            const delay = until - Date.now();
-            setTimeout(() => {
-              void box.refreshDurable().catch(() => undefined);
-            }, delay);
-          }
+          // Persist failed twice: the row is still (durable) inflight with its
+          // lease. The TRACKED expiry wakeup (item 5) reclaims and triggers
+          // delivery at the deadline instead of merely refreshing the cache.
+          box.scheduleClaimWakeup(id, expected.until);
         }
       }),
     );
@@ -736,6 +751,8 @@ export class Outbox {
     const stored = await this.storage.mergeUnlessDone(commandId, patch);
     if (!stored) return null;
     this.cache.set(commandId, stored);
+    // The claim has a definite answer: its expiry wakeup must never fire.
+    if (stored.state !== "inflight") this.clearClaimWakeup(commandId);
     this.emit();
     return stored;
   }
@@ -743,7 +760,73 @@ export class Outbox {
   async remove(commandId: Id) {
     await this.storage.delete(commandId);
     this.cache.delete(commandId);
+    this.clearClaimWakeup(commandId);
     this.emit();
+  }
+
+  /**
+   * Arm (or replace) the tracked lease-expiry wakeup for one inactive claim.
+   * At the deadline it re-reads the durable row and, only if the row is STILL
+   * the inflight claim with the expected lease, atomically reclaims it to
+   * pending and fires {@link onClaimWake} exactly once (the store's
+   * flushAllOutbox then performs exactly one delivery under the single
+   * deliverer lock). A lease renewed past the deadline re-arms the wakeup; a
+   * terminal/changed row or a missing row cancels silently.
+   */
+  private scheduleClaimWakeup(commandId: Id, until: number) {
+    const old = this.claimWakeups.get(commandId);
+    if (old) clearTimeout(old);
+    const delay = Math.max(0, until - Date.now());
+    const handle = setTimeout(() => {
+      this.claimWakeups.delete(commandId);
+      void this.fireClaimWakeup(commandId);
+    }, delay);
+    this.claimWakeups.set(commandId, handle);
+  }
+
+  private clearClaimWakeup(commandId: Id) {
+    const handle = this.claimWakeups.get(commandId);
+    if (handle) {
+      clearTimeout(handle);
+      this.claimWakeups.delete(commandId);
+    }
+  }
+
+  /** Test/teardown visibility for the set of pending tracked claim wakeups. */
+  pendingClaimWakeups(): Id[] {
+    return [...this.claimWakeups.keys()];
+  }
+
+  private async fireClaimWakeup(commandId: Id) {
+    const durable = await this.refreshFromStorage().catch(() => null);
+    const rec = durable?.find((r) => r.commandId === commandId);
+    // Delivered, deleted or no longer a claim: nothing to wake.
+    if (!rec || rec.state !== "inflight" || !rec.lease) return;
+    const reclaimed = await this.storage.reclaimInflight(commandId, rec.lease).catch(() => null);
+    if (!reclaimed) {
+      // Storage still failing: retry the reclaim at a bounded short poll
+      // instead of losing the row; the lease is already expired.
+      this.scheduleClaimWakeup(commandId, Date.now() + 250);
+      return;
+    }
+    if (reclaimed.state !== "pending") {
+      // The live owner moved the lease/row: follow a renewed fresh lease,
+      // otherwise the row is terminal and the wakeup is done.
+      const until = reclaimed.state === "inflight" ? reclaimed.lease?.until : undefined;
+      if (typeof until === "number" && until > Date.now()) this.scheduleClaimWakeup(commandId, until);
+      this.cache.set(commandId, reclaimed);
+      return;
+    }
+    this.cache.set(commandId, reclaimed);
+    this.emit();
+    // Exactly one delivery trigger for this wakeup.
+    this.onClaimWake?.();
+  }
+
+  /** Cancel every tracked claim wakeup (page teardown / test disposal). */
+  dispose() {
+    for (const handle of this.claimWakeups.values()) clearTimeout(handle);
+    this.claimWakeups.clear();
   }
 
   isFlushing(instanceId: Id): boolean {

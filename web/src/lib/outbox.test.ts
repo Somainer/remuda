@@ -274,6 +274,140 @@ describe("Outbox", () => {
     }
   });
 
+  it("GATE11 item 5: a failed load-time reclaim arms a TRACKED expiry wakeup that requeues and triggers exactly one delivery", async () => {
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: { locks: { query: async () => ({ held: [] }) } },
+    });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(10_000);
+      // reclaimInflight fails BOTH load attempts (one-shot abort + retry),
+      // then works when the tracked wakeup fires at the lease deadline.
+      class FlakyStorage extends MemStorage {
+        reclaimCalls = 0;
+        override async reclaimInflight(
+          id: string,
+          expected: { owner: string; until: number },
+        ): Promise<OutboxRecord | null> {
+          this.reclaimCalls++;
+          if (this.reclaimCalls <= 2) throw new Error("tx abort");
+          return await super.reclaimInflight(id, expected);
+        }
+      }
+      const store = new FlakyStorage();
+      const instanceId = "ins_wake";
+      const putP = store.put(
+        rec({
+          commandId: "cmd_wake",
+          instanceId,
+          state: "inflight",
+          lease: { owner: "owner_wake", until: Date.now() + LEASE_TTL_MS },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await putP;
+
+      const box = await Outbox.load(store, "owner_wake");
+      await vi.advanceTimersByTimeAsync(0);
+      // Both reclaim writes aborted: still inflight, and the tracked wakeup is
+      // armed (the old code armed an untracked refresh-only timer).
+      expect(store.map.get("cmd_wake")?.state).toBe("inflight");
+      expect(box.pendingClaimWakeups()).toEqual(["cmd_wake"]);
+
+      // Delivery stand-in for the store's flushAllOutbox: one lock turn, one
+      // POST per delivered row.
+      const wakes = vi.fn();
+      const posts: string[][] = [];
+      box.onClaimWake = () => {
+        wakes();
+        void box.withInstanceLock(instanceId, async (_iid, rows) => {
+          posts.push(rows.map((r) => r.commandId));
+          return rows.length;
+        });
+      };
+
+      // Well before the lease deadline: nothing.
+      await vi.advanceTimersByTimeAsync(LEASE_TTL_MS - 1_000);
+      expect(wakes).not.toHaveBeenCalled();
+      expect(posts).toEqual([]);
+
+      // At the deadline, with NO other trigger: requeue -> exactly one POST.
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(store.map.get("cmd_wake")?.state).toBe("pending");
+      expect(wakes).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(posts).toEqual([["cmd_wake"]]);
+
+      // Long afterwards: no duplicate wake/delivery.
+      await vi.advanceTimersByTimeAsync(LEASE_TTL_MS * 2);
+      expect(wakes).toHaveBeenCalledTimes(1);
+      expect(posts).toEqual([["cmd_wake"]]);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
+  it("GATE11 item 5: the tracked wakeup is cancelled when the row is delivered before the deadline", async () => {
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: { locks: { query: async () => ({ held: [] }) } },
+    });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(50_000);
+      class FlakyStorage extends MemStorage {
+        reclaimCalls = 0;
+        override async reclaimInflight(
+          id: string,
+          expected: { owner: string; until: number },
+        ): Promise<OutboxRecord | null> {
+          this.reclaimCalls++;
+          if (this.reclaimCalls <= 2) throw new Error("tx abort");
+          return await super.reclaimInflight(id, expected);
+        }
+      }
+      const store = new FlakyStorage();
+      const putP = store.put(
+        rec({
+          commandId: "cmd_wake_delivered",
+          instanceId: "ins_wake2",
+          state: "inflight",
+          lease: { owner: "owner_wake2", until: Date.now() + LEASE_TTL_MS },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await putP;
+      const box = await Outbox.load(store, "owner_wake2");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(box.pendingClaimWakeups()).toEqual(["cmd_wake_delivered"]);
+
+      const wakes = vi.fn();
+      box.onClaimWake = wakes;
+
+      // The claim gets a definite answer before the deadline (deliverer's
+      // finish write): the tracked wakeup is cancelled.
+      const patchP = box.patch("cmd_wake_delivered", {
+        state: "sent",
+        gotResponse: true,
+        lease: undefined,
+      });
+      await vi.advanceTimersByTimeAsync(5);
+      await patchP;
+      expect(store.map.get("cmd_wake_delivered")?.state).toBe("sent");
+      expect(box.pendingClaimWakeups()).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(LEASE_TTL_MS * 2);
+      expect(wakes).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
   it("GATE11 item 4: reclaim never downgrades a row another tab moved to sent before the reclaim transaction (and runs inside the real Web Lock)", async () => {
     // B loads and observes the inflight row; its reclaim transaction is gated
     // until A's finish write lands. Old reclaim (mergeUnlessDone with a

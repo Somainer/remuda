@@ -793,6 +793,7 @@ mod tests {
     fn gate_event_is_internally_tagged_on_the_wire() {
         let event = GateEventParams {
             job_id: "gjb_x".into(),
+            generation: 1,
             kind: GateEventKind::Phase {
                 phase: "fetch".into(),
             },

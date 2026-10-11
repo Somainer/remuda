@@ -3354,7 +3354,7 @@ async fn an_rpc_failure_for_attempt_one_does_not_fail_running_attempt_two() {
 /// evidence on the current attempt after a requeue.
 #[tokio::test]
 async fn a_stale_attempts_step_event_does_not_overwrite_the_current_steps() {
-    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    let (ctx, node) = Ctx::boot().await.unwrap();
     let job_id = queued_job(&ctx).await;
     // claim 1, requeue, claim 2.
     let _ = ctx

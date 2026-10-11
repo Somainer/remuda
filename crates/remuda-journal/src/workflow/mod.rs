@@ -1290,17 +1290,25 @@ impl RunState {
                         member.state,
                         WorkflowState::Failed | WorkflowState::Completed | WorkflowState::Cancelled
                     );
-                // A strictly newer attempt (a real retry) is authoritative: it
-                // resurrects an earlier terminal member; a same-attempt
-                // started never downgrades a terminal outcome regardless of
-                // fold order.
+                // A strictly newer attempt number relative to the recorded
+                // member; combined with the member having consumed a start
+                // before (attempt > 0) this identifies a genuine retry.
                 let is_newer_attempt = attempt > member.attempt;
+                // A strictly newer attempt (a real retry of an agent id that
+                // already consumed a start) is authoritative: it resurrects
+                // an earlier terminal member — set Running/stopped=false and
+                // tie the terminal evidence to the OLD attempt. A same-attempt
+                // started never downgrades a terminal outcome regardless of
+                // fold order; a failure placeholder (attempt 0) that sees its
+                // OWN first start (attempt 1) is also not a retry and stays
+                // Failed (see agent_failed).
+                let genuine_retry = is_newer_attempt && member.attempt > 0;
                 member.key = Some(key.clone());
                 member.attempt = attempt;
-                if !terminal {
+                if !terminal || genuine_retry {
                     member.state = WorkflowState::Running;
                     member.stopped = false;
-                } else if !is_newer_attempt {
+                } else {
                     // Terminal outcome held against a same-attempt started;
                     // force one file-catch-up convergence emission.
                     self.force_member_refresh.insert(agent_id.clone());
@@ -1402,7 +1410,14 @@ impl RunState {
     /// SubagentStart. The root instance is untouched; only the member row.
     fn agent_failed(&mut self, agent_id: &str, transcript_path: Option<&Path>) {
         if !self.members.iter().any(|m| m.agent_id == agent_id) {
-            let mut member = MemberState::new(agent_id.to_owned(), None, 1);
+            // c-cardsettle-fu2 r1 item 1: the placeholder for a StopFailure
+            // that beat its SubagentStart carries NO key and attempt 0 (not 1).
+            // A `started` record that lands AFTER this failure is then attempt
+            // 1 > 0, but it is the failure's OWN first start (the agent id had
+            // consumed no start yet), so it must NOT be treated as a genuine
+            // retry and must NOT resurrect the member. Only a started whose
+            // agent id already consumed a start (attempt recorded) resurrects.
+            let mut member = MemberState::new(agent_id.to_owned(), None, 0);
             if let Some(path) = transcript_path
                 && let Ok(tail) = FileTail::new(path)
             {

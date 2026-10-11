@@ -497,3 +497,112 @@ fn a_later_folded_started_never_downgrades_a_failed_member() {
         "the later-folded started must not resurrect a Failed member"
     );
 }
+
+/// c-cardsettle-fu2 r1 item 1: a GENUINE retry — started(k,a1) → failed(a1) →
+/// started(k,a1) again — resurrects the member to Running. The second started
+/// is attempt 2 on an agent id that already consumed attempt 1, so it is a
+/// real retry, not an out-of-order fold of the member's own first start.
+#[test]
+fn a_genuine_same_agent_retry_resurrects_a_failed_member() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_retry";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    // attempt 1 started, then failed, then attempt 2 started — same key/agent.
+    std::fs::write(
+        run_dir.join("journal.jsonl"),
+        "{\"type\":\"started\",\"key\":\"v2:r\",\"agentId\":\"a1\"}\n\
+         {\"type\":\"failed\",\"key\":\"v2:r\",\"agentId\":\"a1\"}\n\
+         {\"type\":\"started\",\"key\":\"v2:r\",\"agentId\":\"a1\"}\n",
+    )
+    .unwrap();
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    let bodies = bodies(tailer.poll().unwrap());
+    let final_state = bodies
+        .iter()
+        .rev()
+        .find_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .expect("member observed");
+    assert_eq!(
+        final_state,
+        WorkflowState::Running,
+        "a genuine same-agent retry (attempt 2) must resurrect the Failed member"
+    );
+}
+
+/// c-cardsettle-fu2 r1 item 1: a StopFailure that beats its SubagentStart
+/// (placeholder member with attempt 0, no key) must NOT be resurrected when
+/// the failure's OWN first `started` (attempt 1) is folded — only a started
+/// after the agent id already consumed a start counts as a retry.
+#[test]
+fn a_failure_placeholder_own_first_start_does_not_resurrect() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_placeholder";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a2.jsonl"), "{}\n").unwrap();
+    // Only one started (the failure's own first); no failure journal line —
+    // the failure arrives out-of-band before the run registers.
+    std::fs::write(
+        run_dir.join("journal.jsonl"),
+        "{\"type\":\"started\",\"key\":\"v2:p\",\"agentId\":\"a2\"}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(session.join("workflows/scripts")).unwrap();
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    // Out-of-band StopFailure BEFORE the SubagentStart/journal fold creates
+    // the attempt-0 placeholder and marks it Failed.
+    tailer
+        .agent_failed("a2", Some(&run_dir.join("agent-a2.jsonl")))
+        .unwrap();
+    // Poll folds the single first started (attempt 1 > placeholder 0): this
+    // is the failure's OWN first start, not a retry, so it stays Failed.
+    let bodies = bodies(tailer.poll().unwrap());
+    let states: Vec<_> = bodies
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m) => Some(m.state),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        states.contains(&WorkflowState::Failed),
+        "the failure placeholder must not be resurrected by its own first start: {states:?}"
+    );
+    assert!(
+        !states.contains(&WorkflowState::Running),
+        "no Running observation for the placeholder's own first start: {states:?}"
+    );
+}

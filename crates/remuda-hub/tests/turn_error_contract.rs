@@ -110,31 +110,73 @@ async fn serialized_instance_with_last_turn_error_matches_web_golden() {
         .expect("a settled error persists lastTurnError");
     assert_eq!(marker.text, "API Error: 429 no eligible upstream");
 
-    let mut actual = normalize(serde_json::to_value(&row).unwrap());
-    // Normalize the marker timestamp too (observedAt/now derived at append).
-    if let Some(obj) = actual.as_object_mut()
+    // --- Golden 1: settled error carries the marker. ---
+    let errored = normalize(serde_json::to_value(&row).unwrap());
+    let errored = normalize_marker_at(errored);
+    let errored_path = fixture_path().with_file_name("last-turn-error-instance.json");
+
+    // --- Next turn start goes through the REAL store clearing branch and
+    // removes the durable marker. ---
+    let next_start = turn(
+        "turn_started",
+        "working",
+        json!({"nativeClientMessageId": "m2"}),
+    );
+    store
+        .append_journal(host_id.clone(), INSTANCE.into(), None, next_start)
+        .await
+        .unwrap();
+    let cleared_row = store
+        .get_instance(INSTANCE.to_string())
+        .await
+        .unwrap()
+        .expect("row after next turn start");
+    assert_eq!(
+        cleared_row.activity, "working",
+        "the next turn start sets the row back to working"
+    );
+    assert!(
+        cleared_row.last_turn_error.is_none(),
+        "the Hub's next-turn-start clearing branch removes lastTurnError"
+    );
+
+    // --- Golden 2: same instance after the next turn, marker gone. ---
+    let cleared = normalize(serde_json::to_value(&cleared_row).unwrap());
+    let cleared_path = fixture_path().with_file_name("last-turn-error-cleared-instance.json");
+
+    let errored_str = serde_json::to_string_pretty(&errored).unwrap();
+    let cleared_str = serde_json::to_string_pretty(&cleared).unwrap();
+    if std::env::var_os("UPDATE_LAST_TURN_ERROR_FIXTURE").is_some() {
+        for (path, body) in [(&errored_path, &errored_str), (&cleared_path, &cleared_str)] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("{body}\n")).unwrap();
+        }
+        panic!("fixtures regenerated under web/src/features/mobile/__fixtures__");
+    }
+    check_golden(&errored_path, &errored_str);
+    check_golden(&cleared_path, &cleared_str);
+}
+
+/// Normalize the marker timestamp to a fixed value for byte-stable goldens.
+fn normalize_marker_at(mut v: Value) -> Value {
+    if let Some(obj) = v.as_object_mut()
         && let Some(m) = obj.get_mut("lastTurnError")
         && let Some(mo) = m.as_object_mut()
     {
         mo.insert("at".into(), json!("2026-01-01T00:00:01.000Z"));
     }
+    v
+}
 
-    let actual_str = serde_json::to_string_pretty(&actual).unwrap();
-    let path = fixture_path();
-
-    if std::env::var_os("UPDATE_LAST_TURN_ERROR_FIXTURE").is_some() {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, format!("{actual_str}\n")).unwrap();
-        panic!("fixture regenerated at {}", path.display());
-    }
-
-    let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+/// Compare `actual` to the golden at `path`.
+fn check_golden(path: &std::path::Path, actual: &str) {
+    let expected = std::fs::read_to_string(path).unwrap_or_else(|e| {
         panic!("missing web golden {path:?}: {e}; regenerate with UPDATE_LAST_TURN_ERROR_FIXTURE=1")
     });
     assert_eq!(
-        actual_str.trim(),
+        actual.trim(),
         expected.trim(),
-        "Hub-serialized InstanceRecord drifted from the web golden; \
+        "Hub-serialized InstanceRecord drifted from {path:?}; \
          regenerate with UPDATE_LAST_TURN_ERROR_FIXTURE=1"
     );
 }

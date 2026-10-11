@@ -1,0 +1,22 @@
+{
+  "instanceId": "ins-turn-error-contract",
+  "parentInstanceId": null,
+  "hostId": "hst-turn-error-contract",
+  "workspaceId": null,
+  "kind": "claude",
+  "driver": "claude-print",
+  "lifecycle": "running",
+  "activity": "working",
+  "connectivity": "connected",
+  "title": null,
+  "journalId": "obj-journal",
+  "durableSeq": "3",
+  "configureSeq": 0,
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "updatedAt": "2026-01-01T00:00:01.000Z",
+  "launchedBy": "remuda",
+  "scope": {},
+  "lineageId": "ins-turn-error-contract",
+  "generation": 1,
+  "id": "ins-turn-error-contract"
+}

@@ -300,37 +300,37 @@ describe("buildHomeGroups body text", () => {
     }
   });
 
-  it("(r8 item 5) consumes a REAL Hub-serialized instance with lastTurnError (contract golden)", async () => {
-    // Golden produced by the Hub store contract test
-    // (crates/remuda-hub/tests/turn_error_contract.rs): a real InstanceRecord
-    // after a settled turn API error, through the production append/fold path.
-    // It is parsed as the WIRE InstanceRecord schema, mapped via mapInstance
-    // (the same transform the live client applies), then built into a row — so
-    // breaking Hub persistence/serialization or the api mapping fails here.
-    const raw = (await import("./__fixtures__/last-turn-error-instance.json", {
+  it("(r9 item 6) consumes the Hub's real settled-error and next-turn-cleared goldens (contract)", async () => {
+    // Two goldens produced by the Hub store contract test
+    // (crates/remuda-hub/tests/turn_error_contract.rs) through the production
+    // append/fold path: (1) the InstanceRecord after a settled turn API error,
+    // (2) the SAME record after the next turn start clears the marker. Parsed
+    // as the WIRE InstanceRecord schema and mapped via mapInstance, so breaking
+    // Hub persistence, the clearing branch, serialization, or the mapping fails
+    // here.
+    const erroredRaw = (await import("./__fixtures__/last-turn-error-instance.json", {
+      with: { type: "json" },
+    })) as unknown as Parameters<typeof mapInstance>[0];
+    const clearedRaw = (await import("./__fixtures__/last-turn-error-cleared-instance.json", {
       with: { type: "json" },
     })) as unknown as Parameters<typeof mapInstance>[0];
 
-    const ui = mapInstance(raw);
-    // The marker survives the wire→UI mapping.
-    expect(ui.lastTurnError?.text).toBe("API Error: 429 no eligible upstream");
+    // 1) Settled error: marker survives the wire→UI mapping and surfaces as a
+    // non-red idle status.
+    const errored = mapInstance(erroredRaw);
+    expect(errored.lastTurnError?.text).toBe("API Error: 429 no eligible upstream");
+    const erroredRow = build(named([errored]))[0].rows[0];
+    expect(erroredRow.status).toBe("idle");
+    expect(erroredRow.body).toBe("API Error: 429 no eligible upstream");
+    expect(erroredRow.bodyIsError, "durable turn error on a live process is not red").toBe(false);
 
-    const groups = build(named([ui]));
-    const row = groups[0].rows[0];
-    expect(row.status).toBe("idle");
-    expect(row.body).toBe("API Error: 429 no eligible upstream");
-    expect(row.bodyIsError, "durable turn error on a live process is not red").toBe(false);
-
-    // Removal after the next turn start: a real UI instance with no marker
-    // surfaces no turn-error body even on an idle row.
-    const cleared = mapInstance({
-      ...raw,
-      activity: "working",
-      lastTurnError: undefined,
-    });
-    const clearedRow = build(named([cleared]))[0].rows[0];
-    expect(clearedRow.bodyIsError).toBe(false);
+    // 2) Next turn start (real Hub clearing branch): the golden carries NO
+    // marker and is back to working, so no turn-error body.
+    const cleared = mapInstance(clearedRaw);
     expect(homeTurnError(cleared)).toBeNull();
+    const clearedRow = build(named([cleared]))[0].rows[0];
+    expect(clearedRow.status).toBe("working");
+    expect(clearedRow.bodyIsError).toBe(false);
   });
 
   it("(r3 item 8) unknown connectivity wins over a durable lastTurnError: disconnect and reconcile", () => {

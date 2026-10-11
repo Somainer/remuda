@@ -1813,11 +1813,21 @@ async fn cancelling_a_pre_accept_b_publishes_a_deferred_a_settle() {
     let _ = driver.close().await;
 }
 
-/// ma-sdk-state r9 item 2: B reserves and SUSPENDS pre-accept (holding
-/// write_seq); C is already waiting on write_seq behind it. Abort B: B's book
-/// entry must be removed at its cancelled ticket's FIFO position BEFORE C's
-/// frames map, so C's real result settles C itself — result_settles_root never
-/// pops a phantom B for C's turn and attribution stays correct from then on.
+/// ma-sdk-state r9 item 2 / r10 item 3: B reserves and SUSPENDS pre-accept
+/// (holding write_seq); C is already waiting on write_seq behind it. Abort B:
+/// B's book entry must be removed at its cancelled ticket's FIFO position
+/// BEFORE C's frames map, so C's real result settles C itself —
+/// result_settles_root never pops a phantom B for C's turn and attribution
+/// stays correct from then on.
+///
+/// r10 item 3 makes the failing schedule ACKNOWLEDGED rather than hoped for:
+/// (1) the test waits until C is parked on write_seq behind B BEFORE B is
+/// aborted; (2) a third holder X queues behind C and does not release write_seq
+/// until C's result has actually been MAPPED. Under the OLD cleanup (a detached
+/// Drop task re-acquiring write_seq) that task can only run AFTER C's result
+/// maps — deterministically reproducing the phantom pop instead of winning the
+/// race — while the fixed worker-side rollback runs at B's ticket position and
+/// needs no write_seq at all.
 #[tokio::test]
 async fn aborting_a_suspended_b_does_not_let_c_result_pop_a_phantom_b() {
     let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
@@ -1834,25 +1844,50 @@ async fn aborting_a_suspended_b_does_not_let_c_result_pop_a_phantom_b() {
     let db = driver.clone();
     let send_b = tokio::spawn(async move { db.send(prompt_id("suspended-b", "msg-b")).await });
     barrier
+        .wait_until_write_parked(Duration::from_secs(5))
+        .await;
+    barrier
         .wait_until_reserves_enqueued(1, Duration::from_secs(5))
         .await;
-    // The pre-ack gate is also shut, so B is fully suspended before accept.
 
-    // C queues behind B for write_seq; it cannot begin until B is aborted.
+    // C queues behind B for write_seq; ACKNOWLEDGE C is actually parked there
+    // before B is aborted (count 2: B and C both reached the lock await).
     let dc = driver.clone();
     let send_c = tokio::spawn(async move { dc.send(prompt_id("first", "msg-c")).await });
+    barrier
+        .wait_until_write_seq_waits(2, Duration::from_secs(5))
+        .await;
 
-    // Abort B: write_seq releases and C proceeds. B's reservation must be
-    // consumed (rolled back) at its ticket position before C's frames map.
+    // X queues behind C. It acquires write_seq only after C's prepare releases
+    // it and HOLDS it until C's result is mapped — so a detached cleanup that
+    // re-acquires write_seq (the old Drop path) provably runs only after C's
+    // result has been mapped against the stale book. The fixed rollback runs on
+    // the worker and never waits on X.
+    let dx = driver.clone();
+    let seq_holder = tokio::spawn(async move {
+        let hold = dx.hold_write_seq_for_test().await;
+        dx.test_wait_results_mapped(1, Duration::from_secs(5)).await;
+        drop(hold);
+    });
+
+    // Abort B: write_seq transfers C -> X -> (old detached cleanup). Open ALL
+    // worker/send gates so C's frames map up to its result: B's reservation is
+    // consumed at its ticket position (fixed arm) before C maps; the old no-op
+    // arm leaves B in the book for C's result to pop as a phantom.
     send_b.abort();
-    barrier.release_write_ack();
-    barrier.release_send();
-    drop(barrier);
+    barrier.release();
 
-    send_c
+    // Bounded joins: C completes and X releases (both acknowledge the schedule
+    // actually played out).
+    tokio::time::timeout(Duration::from_secs(5), send_c)
         .await
-        .expect("send_c task")
+        .expect("send_c task within 5s")
+        .expect("send_c joined")
         .expect("C sends after B aborted");
+    tokio::time::timeout(Duration::from_secs(5), seq_holder)
+        .await
+        .expect("write_seq holder within 5s")
+        .expect("holder task");
 
     // C's single turn starts and settles as C (index 0, settledRootTurn) — its
     // result did not pop a phantom B leaving C outstanding.
@@ -1874,6 +1909,7 @@ async fn aborting_a_suspended_b_does_not_let_c_result_pop_a_phantom_b() {
         "C's result settles C (no phantom B pop)"
     );
 
+    drop(barrier);
     let _ = driver.close().await;
 }
 
@@ -1941,16 +1977,9 @@ async fn aborting_while_parked_on_the_publish_mutex_leaves_no_phantom_reservatio
         .wait_until_results_mapped(2, Duration::from_secs(5))
         .await;
 
-    // One acknowledged fence, one overall timeout, then drain what is buffered.
+    // Count ALL starts/settlements through one acknowledged fence drain.
     let fence = driver.publication_fence().await;
-    tokio::time::timeout(Duration::from_secs(5), fence)
-        .await
-        .expect("publication fence within 5s")
-        .expect("fence sender alive");
-    let mut all = Vec::new();
-    while let Some(obs) = handle.try_recv() {
-        all.push(obs);
-    }
+    let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
 
     assert_eq!(
         turn_started_count(&all),

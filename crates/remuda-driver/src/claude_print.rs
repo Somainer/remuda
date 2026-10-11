@@ -612,6 +612,13 @@ pub struct PublishMutexHold<'a>(
     tokio::sync::MutexGuard<'a, Option<mpsc::UnboundedSender<PublishJob>>>,
 );
 
+/// Test-only (`test-stub`): held `write_seq` guard (r10 item 3).
+/// The field exists solely to keep the lock held until this handle drops.
+#[cfg(feature = "test-stub")]
+#[must_use = "holding the guard is the point; drop it to release the lock"]
+#[allow(dead_code)]
+pub struct WriteSeqHold<'a>(tokio::sync::MutexGuard<'a, ()>);
+
 impl ClaudePrintDriver {
     /// Test-only (`test-stub`): true when the bounded observation channel is
     /// full and the publication worker is parked — the close-under-pressure
@@ -667,6 +674,22 @@ impl ClaudePrintDriver {
     #[cfg(feature = "test-stub")]
     pub async fn hold_publish_mutex_for_test(&self) -> PublishMutexHold<'_> {
         PublishMutexHold(self.inner.publish.lock().await)
+    }
+
+    /// Test-only (`test-stub`, r10 item 3): hold the `write_seq` lock
+    /// directly, so a test can deterministically queue a stale cleanup BEHIND
+    /// a later send and prove ordering. Drop the returned hold to release.
+    #[cfg(feature = "test-stub")]
+    pub async fn hold_write_seq_for_test(&self) -> WriteSeqHold<'_> {
+        WriteSeqHold(self.inner.write_seq.lock().await)
+    }
+
+    /// Test-only (`test-stub`, r10 item 3): wait until `n` Result frames have
+    /// been mapped by the publication worker, using the armed barrier slot
+    /// directly (for spawned tasks that do not own the [`WriteCommitBarrier`]).
+    #[cfg(feature = "test-stub")]
+    pub async fn test_wait_results_mapped(&self, n: usize, timeout: Duration) {
+        test_barrier::wait_results_mapped(&self.inner.barrier, n, timeout).await;
     }
 
     /// Test-only (`test-stub`): make the terminal exit observation build fail
@@ -2054,6 +2077,27 @@ pub mod test_barrier {
     pub(super) fn note_result_mapped(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.result_mapped_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Wait until `n` Result frames have been mapped by the worker (r8 item 3),
+    /// usable without owning a [`WriteCommitBarrier`] (r10 item 3: a spawned
+    /// lock-holding task).
+    pub(super) async fn wait_results_mapped(slot: &Slot, n: usize, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let mapped = current(slot)
+                .map(|state| state.result_mapped_count.load(Ordering::Acquire))
+                .unwrap_or(0);
+            if mapped >= n {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "write_commit barrier: timed out waiting for {n} mapped results (mapped={mapped})"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     }
 

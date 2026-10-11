@@ -121,6 +121,19 @@ impl ClaudeSdkDriver {
     ) -> crate::claude_print::PublishMutexHold<'_> {
         self.inner.hold_publish_mutex_for_test().await
     }
+
+    /// Test-only (`test-stub`, r10 item 3): hold the `write_seq` lock.
+    #[cfg(feature = "test-stub")]
+    pub async fn hold_write_seq_for_test(&self) -> crate::claude_print::WriteSeqHold<'_> {
+        self.inner.hold_write_seq_for_test().await
+    }
+
+    /// Test-only (`test-stub`, r10 item 3): wait for mapped results via the
+    /// armed barrier slot, without owning the barrier handle.
+    #[cfg(feature = "test-stub")]
+    pub async fn test_wait_results_mapped(&self, n: usize, timeout: std::time::Duration) {
+        self.inner.test_wait_results_mapped(n, timeout).await;
+    }
 }
 
 #[async_trait]

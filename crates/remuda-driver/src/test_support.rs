@@ -85,6 +85,30 @@ impl Default for Bridge {
     }
 }
 
+/// c-effortread r9 items 6 / 9c: classify a live `instance.configure` exactly
+/// as the claude-pty driver does and return the in-session `/effort` word it
+/// would type (`None` = the configure is refused). Integration tests use this
+/// after driving the real mapper → bridge provenance path.
+#[must_use]
+pub fn configure_word(
+    level: &str,
+    ultracode: Option<bool>,
+    axis: Option<remuda_protocol::EffortAxis>,
+    semantics: remuda_protocol::EffortSemantics,
+    observed: Option<(remuda_protocol::EffortName, Option<bool>)>,
+    requested: Option<(remuda_protocol::EffortName, bool)>,
+) -> Option<&'static str> {
+    EffortRequest::for_configure(
+        level,
+        ultracode,
+        axis,
+        semantics,
+        observed.map(|(name, ultracode)| crate::effort::ObservedSelection { name, ultracode }),
+        requested.map(|(name, ultracode)| remuda_protocol::EffortSelection { name, ultracode }),
+    )
+    .map(|request| request.command_word())
+}
+
 /// Test handle over one [`ModelBridge`].
 pub struct ModelBridgeHandle {
     pub(crate) inner: Arc<ModelBridge>,

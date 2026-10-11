@@ -1223,4 +1223,50 @@ async fn r5_terminal_effort_updates_bridge_observed_and_classifies_configure() {
         Some((remuda_protocol::EffortName::Max, Some(true))),
         "the terminal toggle updates bridge.observed() to {{max, on}}"
     );
+
+    // c-effortread r9 item 9c: drive the production configure classifier with
+    // the NEW explicit-intent form against the provenance the mapper just
+    // populated. A TIER axis at a different observed tier is the plain level
+    // word; a FLAG axis at the same tier is the orthogonal toggle.
+    let proven = bridge.proven_selection();
+    let tier_word = remuda_driver::test_support::configure_word(
+        "high",
+        Some(false),
+        Some(remuda_protocol::EffortAxis::Tier),
+        remuda_protocol::EffortSemantics::Decoupled,
+        proven,
+        None,
+    );
+    assert_eq!(
+        tier_word,
+        Some("high"),
+        "a tier move from observed max types the plain /effort high"
+    );
+    let flag_word = remuda_driver::test_support::configure_word(
+        "max",
+        Some(true),
+        Some(remuda_protocol::EffortAxis::Flag),
+        remuda_protocol::EffortSemantics::Decoupled,
+        proven,
+        None,
+    );
+    assert_eq!(
+        flag_word,
+        Some("ultracode on"),
+        "a same-tier flag axis types the orthogonal toggle"
+    );
+    // A LEGACY request (no axis) with a cold flag-on is refused rather than
+    // substituted to a different tier command.
+    assert_eq!(
+        remuda_driver::test_support::configure_word(
+            "high",
+            Some(true),
+            None,
+            remuda_protocol::EffortSemantics::Decoupled,
+            None,
+            None,
+        ),
+        None,
+        "an ambiguous cold legacy flag-on is refused, never a tier word"
+    );
 }

@@ -421,8 +421,18 @@ impl EffortRequest {
                         .map(|req| req.with_request_id(request_id));
                 }
                 None => {
-                    // Legacy client: a same-tier proven selection lets either
-                    // flag direction mean the toggle.
+                    // c-effortread r10 item 5: a legacy tier-only request
+                    // carries NO boolean (`ultracode` absent). It is the plain
+                    // level word BEFORE any toggle inference — even when the
+                    // observed session has the flag ON at the same tier. An
+                    // ON/OFF command requires an explicit boolean.
+                    if ultracode.is_none() {
+                        return Self::from_level(&normalized)
+                            .map(|request| request.with_request_id(request_id));
+                    }
+                    // Legacy client with an explicit boolean: a same-tier
+                    // proven selection lets either flag direction mean the
+                    // toggle.
                     let proven = Self::classify_provenance(observed, requested);
                     if let Some(name) = target_name
                         .filter(|name| proven.as_ref().is_some_and(|obs| obs.name == *name))
@@ -1653,6 +1663,80 @@ mod sync_tests {
         .unwrap();
         assert_eq!(req.command_word(), "max");
         assert_eq!(req.name, EffortName::Max);
+    }
+
+    /// c-effortread r10 item 5: a legacy TIER-ONLY request (no axis,
+    /// `ultracode` absent) on an observed `{high, flag ON}` session must be
+    /// the plain level word — never `ultracode off`. The toggle inference
+    /// fires only for an explicit boolean, and a cold flag-on with no proven
+    /// same tier is still refused.
+    #[test]
+    fn r10_item5_legacy_tier_only_request_never_infers_a_toggle_against_flag_on() {
+        use remuda_protocol::EffortSemantics::Decoupled;
+        let observed_on = ObservedSelection {
+            name: EffortName::High,
+            ultracode: Some(true),
+        };
+        // {name:"high"} with ultracode None at the same tier the flag is on:
+        // plain `/effort high`, flag left untouched.
+        let req = EffortRequest::for_configure(
+            "high",
+            None,
+            None,
+            Decoupled,
+            Some(observed_on),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.command_word(), "high", "tier-only is never a toggle");
+        assert_eq!(req.name, EffortName::High);
+        assert!(!req.ultracode);
+
+        // Another tier (max) with no boolean is the level word too.
+        let req = EffortRequest::for_configure(
+            "max",
+            None,
+            None,
+            Decoupled,
+            Some(observed_on),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.command_word(), "max");
+
+        // The request id still rides the plain level command.
+        let req = EffortRequest::for_configure(
+            "high",
+            None,
+            None,
+            Decoupled,
+            Some(observed_on),
+            None,
+            Some("req-42"),
+        )
+        .unwrap();
+        assert_eq!(req.request_id.as_deref(), Some("req-42"));
+
+        // An explicit boolean still drives the toggle on same-tier provenance…
+        let off = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            None,
+            Decoupled,
+            Some(observed_on),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(off.command_word(), "ultracode off");
+        // …and a cold explicit flag-ON with no proven same tier is rejected.
+        assert!(
+            EffortRequest::for_configure("max", Some(true), None, Decoupled, None, None, None)
+                .is_none(),
+            "the remaining ambiguous request (cold flag-on, no provenance) is refused"
+        );
     }
 
     /// c-effortui r4 item 2: the bridge records observed selections from

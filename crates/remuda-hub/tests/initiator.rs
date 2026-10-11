@@ -51,27 +51,62 @@ impl ReplyHold {
 /// Deterministic control over the fake Node's handling of ONE `gate.run`
 /// RPC: the canned result is withheld until `release()` (so the job stays
 /// Running on the Hub while the test drives the `gate.event` finished
-/// notification), and `arrived` fires when the frame reaches the Node.
+/// notification), and `arrived_rx` latches when the frame reaches the Node.
+///
+/// Arrival is a latched shared flag (its signal survives even if nobody
+/// awaits yet — `Notify::notify_waiters()` alone would drop it), and every
+/// wait below is bounded by a timeout.
 #[derive(Clone)]
 struct GateRunHook {
-    arrived: Arc<Notify>,
+    /// Latch shared by the Node task and the test; set on the first frame.
+    arrived: Arc<GateRunArrival>,
     released: Arc<AtomicBool>,
     release: Arc<Notify>,
     result: Arc<std::sync::Mutex<Value>>,
 }
 
+/// A cloneable one-shot arrival latch: `signal()` stores a permit that a
+/// later `wait()` observes (no publish-before-await race).
+#[derive(Debug)]
+struct GateRunArrival {
+    notified: Notify,
+    fired: AtomicBool,
+}
+
 impl GateRunHook {
     fn new(result: Value) -> Self {
         Self {
-            arrived: Arc::new(Notify::new()),
+            arrived: Arc::new(GateRunArrival {
+                notified: Notify::new(),
+                fired: AtomicBool::new(false),
+            }),
             released: Arc::new(AtomicBool::new(false)),
             release: Arc::new(Notify::new()),
             result: Arc::new(std::sync::Mutex::new(result)),
         }
     }
 
+    /// Latch arrival (idempotent: only the first frame fires it).
+    fn mark_arrived(&self) {
+        if self
+            .arrived
+            .fired
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.arrived.notified.notify_waiters();
+        }
+    }
+
     async fn wait_arrived(&self) {
-        self.arrived.notified().await;
+        let timeout = Duration::from_secs(10);
+        let notified = self.arrived.notified.notified();
+        if self.arrived.fired.load(Ordering::Acquire) {
+            return;
+        }
+        tokio::time::timeout(timeout, notified)
+            .await
+            .expect("gate.run frame never arrived");
     }
 
     fn release(&self) {
@@ -148,7 +183,7 @@ async fn service_inbound(
     if method == "gate.run"
         && let Some(hook) = gate_run.lock().await.clone()
     {
-        hook.arrived.notify_waiters();
+        hook.mark_arrived();
         // Background reply so the read loop keeps servicing other
         // frames (a node->Hub gate.event) while this RPC is held.
         let out = out.clone();
@@ -165,6 +200,11 @@ async fn service_inbound(
         return;
     }
     let result = match method {
+        // r10: answer the Hub-authority pre-run fence for this dispatch.
+        "gate.authorize" => json!({
+            "authorized": true,
+            "generation": frame["params"]["generation"].clone(),
+        }),
         "worker.provision" => json!({
             "name": frame["params"]["name"].clone(),
             "branch": "wt/x/work",
@@ -1720,6 +1760,7 @@ async fn a_cancel_between_a_result_preread_and_its_writer_keeps_the_row_cancelin
             json!({
                 "jobId": job_id,
                 "status": "base-moved",
+                "generation": 1,
                 "currentMainSha": "0123456789abcdef0123456789abcdef01234567"
             }),
         )
@@ -1821,6 +1862,7 @@ async fn a_duplicate_base_moved_verdict_after_the_row_is_canceled_never_requeues
             json!({
                 "jobId": job_id,
                 "status": "base-moved",
+                "generation": 1,
                 "currentMainSha": "0123456789abcdef0123456789abcdef01234567"
             }),
         )
@@ -1843,6 +1885,7 @@ async fn a_duplicate_base_moved_verdict_after_the_row_is_canceled_never_requeues
             json!({
                 "jobId": job_id,
                 "status": "base-moved",
+                "generation": 1,
                 "currentMainSha": "fedcba9876543210fedcba9876543210fedcba98"
             }),
         )
@@ -1898,6 +1941,7 @@ async fn a_grace_expiry_finish_between_a_result_preread_and_its_writer_keeps_the
             json!({
                 "jobId": job_id,
                 "status": "base-moved",
+                "generation": 1,
                 "currentMainSha": "0123456789abcdef0123456789abcdef01234567"
             }),
         )
@@ -1967,6 +2011,7 @@ async fn a_duplicate_failed_verdict_keeps_the_referenced_gate_log_object() {
 
     let failed_result = json!({
         "jobId": job_id,
+        "generation": 1,
         "status": "failed",
         "failedStep": "cargo-test",
         "error": "cargo-test failed: 1 test",
@@ -2138,6 +2183,7 @@ async fn running_job_with_legacy_log(ctx: &Ctx) -> (String, String, Vec<u8>) {
 fn failed_result_with_log(job_id: &str, headline: &str) -> Value {
     json!({
         "jobId": job_id,
+        "generation": 1,
         "status": "failed",
         "failedStep": "cargo-test",
         "error": "cargo-test failed: 1 test",
@@ -2160,6 +2206,7 @@ fn failed_result_with_log(job_id: &str, headline: &str) -> Value {
 fn failed_gate_result(job_id: &str, _branch: &str) -> Value {
     json!({
         "jobId": job_id,
+        "generation": 1,
         "status": "failed",
         "failedStep": "cargo-test",
         "error": "cargo-test failed: 1 test",
@@ -2296,25 +2343,24 @@ async fn a_failed_log_insert_keeps_the_previous_object_served() {
 /// The Node delivers a FAILED verdict with runLog through BOTH real Hub
 /// entry points — the `gate.event` finished NOTIFICATION and the gate.run
 /// RPC REPLY — not a shared in-process helper. The event lands while the
-/// job is Running (the RPC reply is parked at the Node), settles it and
-/// stores the log; the released reply is then the terminal duplicate. The
-/// stored logObjectId resolves by object id AND by job id. No SQL writes
-/// to job state.
+/// job is Running. Deterministic barriers at apply_result's real
+/// pre-read/pre-write boundaries hold BOTH arrivals while the row is still
+/// Running: the first commits its reference, the second persists its bytes
+/// and only then is allowed to reach the terminal guard. The stored
+/// logObjectId resolves by object id AND by job id. No SQL writes to job
+/// state.
 #[tokio::test]
 async fn the_finished_event_and_the_gate_run_reply_both_feed_the_real_log_path() {
     let (ctx, mut node) = Ctx::boot().await.unwrap();
 
-    // Eligible lane BEFORE enqueue so the POST's schedule_once dispatches
-    // gate.run for real to the fake Node.
     ctx.configure_gate_lane().await;
+    let barrier = ctx.store().gate_apply_barrier();
 
-    // Park the gate.run RPC at the Node (the canned verdict is set once the
-    // job id is known); the event is driven first while the row stays
-    // Running.
     let job_seed = "wt/gate/two-arrival-paths";
     let hook = node
         .arm_gate_run(json!({ "jobId": "placeholder", "status": "failed" }))
         .await;
+    // Enqueue WITHOUT the barrier first so the scheduler can claim+dispatch.
     let (status, enqueued) = ctx
         .agent_post(
             &format!("/v1/projects/{}/gate", ctx.project),
@@ -2323,48 +2369,53 @@ async fn the_finished_event_and_the_gate_run_reply_both_feed_the_real_log_path()
         .await;
     assert_eq!(status, 200, "{enqueued}");
     let job_id = enqueued["id"].as_str().unwrap().to_owned();
-    // Now that the id is known, set the real verdict (identical runLog on
-    // both paths) before the reply is released.
     hook.set_result(failed_gate_result(&job_id, job_seed));
-
-    // The scheduler really sent gate.run to the Node; the hook parks it so
-    // the Hub row is still Running.
     hook.wait_arrived().await;
     let running = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
     assert_eq!(running["state"], json!("running"), "{running}");
+    // The dispatch is parked at the Node; NOW arm the result barrier before
+    // either verdict arrives.
+    barrier.arm();
 
-    // ENTRY POINT 1: the Node's `gate.event` finished notification (the
-    // wire shape the real Node's gate pump emits).
-    let result = failed_gate_result(&job_id, job_seed);
+    // ENTRY POINT 1: the real `gate.event` finished notification.
     node.send_raw(json!({
         "jsonrpc": "2.0",
         "method": "gate.event",
-        "params": { "jobId": job_id, "kind": "finished", "result": result }
+        "params": {
+            "jobId": job_id,
+            "kind": "finished",
+            "result": failed_gate_result(&job_id, job_seed),
+        }
     }));
+    // ENTRY POINT 2: release the parked gate.run RPC so its reply — the
+    // second real entry — is delivered. The pre-read barrier stops BOTH
+    // after they observe the still-Running row (neither commits yet).
+    hook.release();
+    barrier.wait_parked(2).await;
+    assert_eq!(
+        ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap()["state"],
+        json!("running"),
+        "both arrivals must observe a Running row"
+    );
+    // Release BOTH: each persists its log (stable id, identical digest),
+    // the first writer commits Failed and the second stops at the terminal
+    // guard.
+    barrier.release();
 
-    // The event applies and settles the job Failed with the stored log.
-    let mut settled = None;
+    // Wait for the terminal commit.
+    let mut object_id = None;
     for _ in 0..100 {
         let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-        if doc["state"] == json!("failed") {
-            settled = Some(doc);
+        if doc["state"] == json!("failed") && doc["logObjectId"].is_string() {
+            object_id = Some(doc["logObjectId"].as_str().unwrap().to_owned());
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let settled = settled.expect("the finished event never settled the job");
-    let object_id = settled["logObjectId"]
-        .as_str()
-        .expect("event stored no logObjectId")
-        .to_owned();
+    let object_id = object_id.expect("the job never settled Failed with a log object");
     assert!(object_id.starts_with("obj_"), "{object_id}");
 
-    // ENTRY POINT 2: release the parked gate.run — the RPC reply carries the
-    // same failed verdict. It arrives after the row is terminal and must not
-    // disturb the stored object (stable id, identical digest).
-    hook.release();
-
-    // The inbound gate.run frame is observable on the Node.
+    // The gate.run frame really crossed the link.
     let mut saw_gate_run = false;
     while let Ok((method, _params)) =
         tokio::time::timeout(Duration::from_millis(200), node.next_frame()).await
@@ -3172,4 +3223,77 @@ async fn mark_forward_intent_rechecks_the_stamp_on_the_row() {
         .await
         .unwrap();
     assert_eq!(successor.initiator_device_id, None);
+}
+
+/// A verdict carries the attempt generation it belongs to. After a
+/// base-moved requeue the OLD attempt's delayed verdict (generation 1) must
+/// be dropped when the row is already a newly Running attempt 2 — accepting
+/// it would requeue attempt 2, burn a retry and cause a later lane-busy.
+/// No SQL: the generation gate is in the normal pre-read.
+#[tokio::test]
+async fn a_stale_attempts_verdict_is_dropped_after_a_requeue() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    let job_id = queued_job(&ctx).await;
+    // Claim twice the way a real scheduler re-dispatch does after a
+    // base-moved requeue: running at attempt 2.
+    let _ = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap();
+    // Force the base-moved path: attempt 1 -> Queued (attempts becomes 2).
+    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+    db.execute(
+        "UPDATE gate_jobs SET state = 'queued',
+            doc_json = json_set(json_set(doc_json, '$.state','queued'),
+                                '$.startedAt', NULL)
+          WHERE id = ?1",
+        rusqlite::params![job_id],
+    )
+    .unwrap();
+    drop(db);
+    let _ = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap();
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("running"), "{doc}");
+    assert_eq!(doc["attempts"], json!(2), "{doc}");
+
+    // The OLD attempt's verdict arrives late. It must be dropped entirely
+    // (no state change, no log reference) rather than applied to attempt 2.
+    let stale = json!({
+        "jobId": job_id,
+        "generation": 1,
+        "status": "base-moved",
+        "currentMainSha": "0123456789abcdef0123456789abcdef01234567",
+    });
+    ctx.hub
+        .test_apply_gate_result(&job_id, stale)
+        .await
+        .unwrap();
+
+    // A CURRENT-generation (2) failed verdict on attempt 2 is applied
+    // normally, proving the drop was generation-specific, not a dead path.
+    ctx.hub
+        .test_apply_gate_result(
+            &job_id,
+            json!({
+                "jobId": job_id,
+                "generation": 2,
+                "status": "failed",
+                "error": "attempt 2 failed",
+                "reason": "attempt 2 failed",
+            }),
+        )
+        .await
+        .unwrap();
+    let final_doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(final_doc["state"], json!("failed"), "{final_doc}");
+    assert_eq!(
+        final_doc["error"],
+        json!("attempt 2 failed"),
+        "the stale verdict must not have applied: {final_doc}"
+    );
 }

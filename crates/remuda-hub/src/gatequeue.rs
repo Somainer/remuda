@@ -991,6 +991,20 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
     let Some(existing) = state.store.get_gate_job(job_id).await.ok().flatten() else {
         return;
     };
+    // GENERATION FENCE: a verdict belongs to the attempt that produced it.
+    // After a base-moved requeue the OLD attempt's delayed finished event or
+    // RPC reply (generation < the current row) must be dropped entirely —
+    // accepting it would requeue/kill the newly running attempt, burn a retry
+    // and cause a later lane-busy. Only the exact current attempt applies.
+    if result.generation != existing.attempts {
+        tracing::info!(
+            job_id,
+            verdict_generation = result.generation,
+            current_attempt = existing.attempts,
+            "dropping gate verdict for a non-current attempt"
+        );
+        return;
+    }
     if !matches!(
         existing.state,
         GateJobState::Running | GateJobState::Canceling

@@ -1559,7 +1559,6 @@ struct RollupTotals {
     turn_output: Option<i64>,
     turn_cache_read: Option<i64>,
     turn_cache_write: Option<i64>,
-    has_turn: bool,
     has_session: bool,
     last_turn_at: Option<String>,
 }
@@ -1648,7 +1647,6 @@ pub fn rollup_instance(
                 turn_output: row.get(2)?,
                 turn_cache_read: row.get(3)?,
                 turn_cache_write: row.get(4)?,
-                has_turn: turns > 0,
                 has_session: row.get::<_, i64>(5)? > 0,
                 last_turn_at: row.get(7)?,
             })
@@ -1716,12 +1714,28 @@ pub fn rollup_instance(
         });
     let context_pct_approximate = context_pct.is_some() && window_approximate;
 
+    // Rate windows are summed from NATIVE-timestamped flow rows only (an
+    // ingest-stamped replay must not read as a burst). The route therefore
+    // depends on whether a native flow row EXISTS, not on has_turn: legacy
+    // NULL-scope Turn rows (upgraded pre-delivery DBs, source backfilled to
+    // 'ingest') make has_turn true, but the native-only flow query would
+    // return NULL for them, blanking TPM on an instance whose cumulative
+    // Session growth points can still supply increments (r8 item 5).
+    let has_native_flow: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM usage_events
+                       WHERE instance_id = ?1
+                         AND scope IN ('turn', 'message')
+                         AND observed_at_source = 'native')",
+        params![instance_id],
+        |row| row.get(0),
+    )?;
+
     // Rate windows: per-turn flows for harnesses that emit them; otherwise
     // timestamped increments between cumulative session snapshots (r4 item 6).
     // A single stock with no predecessor yields no trustworthy rate.
     let window = |seconds: i64| -> rusqlite::Result<(Option<i64>, Option<i64>)> {
         let since = threshold_rfc3339(seconds);
-        if totals.has_turn {
+        if has_native_flow {
             sum_turn_tokens_since(conn, instance_id, &since)
         } else {
             sum_session_increments_since(conn, instance_id, &since)
@@ -1937,6 +1951,30 @@ mod tests {
              );",
         )
         .unwrap();
+        // r8 item 5: a second, pre-`scopeId` CODEX-style instance — its old
+        // rows are NULL-scope Turn flow AND cumulative Session growth points
+        // (the pre-r6 codex shape). After migration every row's source is
+        // backfilled to 'ingest'; TPM must still come from the session-stock
+        // increments, not be blanked by a native-only turn query that has_turn
+        // routes to. Points: 100/60 twenty seconds ago, 160/84 two seconds ago
+        // (increment 60/24 inside both windows); a legacy turn row at 30s.
+        let at_30s = threshold_rfc3339(30);
+        let at_20s = threshold_rfc3339(20);
+        let at_2s = threshold_rfc3339(2);
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, mode, input_tokens, output_tokens,
+                 accounting, observed_at)
+             VALUES
+                ('ins_old_cx', 1, 'turn', 'snapshot', 40, 30,
+                 'estimated', ?1),
+                ('ins_old_cx', 2, 'session', 'snapshot', 100, 60,
+                 'estimated', ?2),
+                ('ins_old_cx', 3, 'session', 'snapshot', 160, 84,
+                 'estimated', ?3)",
+            params![at_30s, at_20s, at_2s],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO usage_events
                 (instance_id, seq, scope, mode, total_tokens, input_tokens,
@@ -1974,8 +2012,7 @@ mod tests {
             "old row has no scope_id, so is not deduped"
         );
         // Rollup works after upgrade AND counts the legacy NULL-scope_id Turn
-        // row correctly (r7 item 8): one turn, its tokens in totals, and it is
-        // eligible for the rate-window flow (native timestamp present).
+        // row correctly (r7 item 8): one turn, its tokens in totals.
         let upgraded = rollup_fold(&conn, "ins_old", "claude", Some("fake"))
             .unwrap()
             .expect("legacy row rolls up");
@@ -1985,7 +2022,24 @@ mod tests {
         // Legacy rows were written before the native/ingest source split;
         // they default to observed_at_source='ingest', so lastTurnAt is not
         // driven from them (r7 item 8 asserts the COUNT fix, not source repair
-        // of pre-split rows).
+        // of pre-split rows). This lone row is also outside every rate window.
+
+        // r8 item 5: on the legacy codex-shaped instance the NULL-scope Turn
+        // row makes has_turn true, but no flow row is native; rates must still
+        // come from the cumulative Session increments (60/24), never be
+        // blanked to NULL by the native-only turn query.
+        let upgraded_cx = rollup_fold(&conn, "ins_old_cx", "codex", None)
+            .unwrap()
+            .expect("legacy mixed-shape rows roll up");
+        assert_eq!(upgraded_cx.turns, 1, "legacy NULL-scope turn is counted");
+        assert_eq!(
+            upgraded_cx.tpm_in_60s,
+            Some(60),
+            "session increment supplies the rate despite has_turn"
+        );
+        assert_eq!(upgraded_cx.tpm_out_60s, Some(24));
+        assert_eq!(upgraded_cx.tpm_in_5m, Some(12), "60 tokens / 5 minutes");
+        assert_eq!(upgraded_cx.tpm_out_5m, Some(5), "24 tokens / 5 rounds to 5");
     }
 
     #[test]

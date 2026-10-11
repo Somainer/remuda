@@ -106,15 +106,13 @@ it("GATE10 item 7: a lease-less done row committed by another tab skips without 
     } as Awaited<ReturnType<Api["instanceSend"]>>["command"],
   });
 
+  // Gate 11 item 8f: B must be delivered by the FIRST flush — no second
+  // trigger may be needed to get past the lease-less done A.
   await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
-  // The done row is skipped but its claim outcome previously looked like a
-  // foreign-owner abort; flush [A, B] then inspects the durable cache (which
-  // patch would mutate), so call flush TWICE to rule out ordering flukes.
-  await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
-  // A is never POSTed (done), B IS sent — the old lease-owner-first check
-  // returned claim-aborted on A and stopped BOTH passes.
+  // Exactly one POST, it is B, and the done row A was never POSTed.
   expect(send).toHaveBeenCalledTimes(1);
   expect(send.mock.calls[0]?.[4]).toBe("cmd_after_done");
+  expect(send.mock.calls.some((c) => c[4] === "cmd_done_no_lease")).toBe(false);
   hubStore.logout();
 });
 

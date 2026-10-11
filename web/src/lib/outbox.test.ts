@@ -684,6 +684,48 @@ describe("Outbox", () => {
     expect(b.ownerId).toBe("owner_tab_b");
   });
 
+  it("GATE11 item 8e: DEFAULT Outbox.load derives DISTINCT owners from two separate sessionStorage stubs (never the shared localStorage profile)", async () => {
+    // Replaces the gate-9 test that only passed explicit owner strings: the
+    // production path takes owner from tabOwner()'s sessionStorage. Two tabs
+    // have separate sessionStorage over one shared durable store and one
+    // shared localStorage (the old gate-7 per-profile owner key lived here and
+    // made every tab identical).
+    const originalSession = globalThis.sessionStorage;
+    const originalLocal = globalThis.localStorage;
+    const makeStorage = (m: Map<string, string>): Storage =>
+      ({
+        getItem: (k: string) => m.get(k) ?? null,
+        setItem: (k: string, v: string) => void m.set(k, v),
+        removeItem: (k: string) => void m.delete(k),
+        clear: () => m.clear(),
+        key: () => null,
+        length: m.size,
+      }) as Storage;
+    const sharedLocal = new Map<string, string>([["remuda-outbox-owner", "owner_SHARED_PROFILE"]]);
+    const sessionA = new Map<string, string>();
+    const sessionB = new Map<string, string>();
+    const shared = new MemStorage();
+    try {
+      Object.defineProperty(globalThis, "localStorage", { configurable: true, value: makeStorage(sharedLocal) });
+      Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: makeStorage(sessionA) });
+      const a = await Outbox.load(shared);
+      Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: makeStorage(sessionB) });
+      const b = await Outbox.load(shared);
+      expect(a.ownerId.startsWith("owner_")).toBe(true);
+      expect(a.ownerId).not.toBe(b.ownerId);
+      // The shared localStorage profile key is ignored.
+      expect(a.ownerId).not.toBe("owner_SHARED_PROFILE");
+      expect(b.ownerId).not.toBe("owner_SHARED_PROFILE");
+      // Owner stability within one tab across reloads.
+      Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: makeStorage(sessionA) });
+      const aReload = await Outbox.load(shared);
+      expect(aReload.ownerId).toBe(a.ownerId);
+    } finally {
+      Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: originalSession });
+      Object.defineProperty(globalThis, "localStorage", { configurable: true, value: originalLocal });
+    }
+  });
+
   it("GATE8 item 4: tabOwner is stable across reload/SW restore (sessionStorage) but unique per tab", () => {
     const a = Outbox.tabOwner();
     const b = Outbox.tabOwner();

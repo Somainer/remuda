@@ -37,6 +37,8 @@ function fakeTimers() {
       }
       now = deadline;
     },
+    /** Pending scheduled jobs (the machine must leave ZERO after dispose). */
+    pendingCount: () => jobs.size,
   };
 }
 
@@ -350,6 +352,12 @@ describe("ConnectionMachine", () => {
     await Promise.resolve();
     expect(resume).toHaveBeenCalledTimes(1);
     expect(machine.state).toBe("stale"); // quiet reopen stays stale
+    // Gate 11 item 8c: assert BY TIMER NAME — no `bind` during the in-flight
+    // resume (the watchdog/episode deadline own this window).
+    const timerNames = () =>
+      [...(machine as unknown as { timers: Map<string, unknown> }).timers.keys()];
+    expect(timerNames()).not.toContain("bind");
+    expect(timerNames()).toContain("offline");
 
     // t=45: with the fix NOTHING happens (no bind timer). The old code's bind
     // timer would fire here and begin a (coalesced) resume; more importantly
@@ -584,31 +592,46 @@ describe("ConnectionMachine", () => {
     expect((machine as unknown as { closedDuringResume: boolean }).closedDuringResume).toBe(false);
   });
 
-  it("GATE10 item 5 (gate9 item 2): rebind after noteBinding retires a REAL quiet reopen re-arms the stale deadline", async () => {
-    // Real store sequence: quietReopen for A (resume in flight) → user
-    // navigates to mounted B (noteBinding retires A, clears the watchdog and
-    // — via the quiet path — leaves stale with no timers) → followBound
-    // ({rebind:true}) must re-arm probe/offline so B's stale is not frozen.
+  it("GATE11 item 8b: a rebind after a retired quiet reopen arms a NEW probe that STARTS the attempt before the inherited offline deadline", async () => {
+    // gate 10's version only asserted the carried offline deadline fired; that
+    // passes without the rebind-stale re-arm (armStaleProbeTimers) because the
+    // quiet arm deliberately keeps the offline timer. Here the NEW probe is
+    // required to fire and start a real quiet attempt strictly before the
+    // inherited deadline; without the re-arm the rebind arms `bind` instead,
+    // whose follow-up probe lands AFTER the deadline and never starts.
     const { clock, machine, resume } = setupTracked();
-    resume.mockImplementation(() => new Promise<void>(() => {})); // blocked upgrade
+    const timerNames = () =>
+      [...(machine as unknown as { timers: Map<string, unknown> }).timers.keys()];
+    resume.mockImplementation(() => new Promise<void>(() => {})); // blocked upgrades
     machine.startLive();
-    clock.advance(LIVE_FRAME_MS); // stale, deadline t=45
-    // Probe ok → quiet reopen starts (attempt armed, resume in flight).
+    clock.advance(LIVE_FRAME_MS); // t=15 stale: probe t=30, offline deadline t=45
+
+    // The REST probe answers a moment early (t=29): quiet reopen attempt A
+    // starts and clears the stale/probe/reconnect timers, offline carried.
+    clock.advance(STALE_TO_OFFLINE_MS - REST_PROBE_MS - 1_000);
+    machine.dispatch({ type: "probe", ok: true });
+    expect(resume).toHaveBeenCalledTimes(1);
+    // Navigate away: noteBinding retires A (watchdog cleared). Only the
+    // carried offline deadline remains.
+    machine.noteBinding(1);
+    // Navigate back into the mounted stale session: rebind must re-arm the
+    // STALE timers — probe at t=44, inherited offline at t=45.
+    machine.followBound({ rebind: true });
+    expect(timerNames()).toContain("probe");
+    expect(timerNames()).not.toContain("bind");
+
+    // t=44: the NEW probe fires; its ok answer starts quiet attempt B BEFORE
+    // the inherited deadline.
     clock.advance(REST_PROBE_MS);
     await Promise.resolve();
-    expect(resume).toHaveBeenCalledTimes(1);
-    // Navigate to B: noteBinding retires A's attempt.
-    machine.noteBinding(1);
-    // Rebind B, which is mounted but silent (stale), with NO attempt in
-    // flight after the retirement.
-    machine.followBound({ rebind: true });
-    expect((machine as unknown as { resumeInFlight: boolean }).resumeInFlight).toBe(false);
-    // The episode deadline (t=45) is still carried; at one ms before it the
-    // machine is quiet stale, then it goes loud offline. Without the rebind
-    // re-arm there would be NO timer at all after noteBinding cleared them.
-    clock.advance(45_000 - 30_000 - 1);
+    await Promise.resolve();
+    expect(resume).toHaveBeenCalledTimes(2);
+    expect(machine.attemptRef()).not.toBeNull(); // B genuinely in flight
     expect(machine.state).toBe("stale");
-    clock.advance(1);
+
+    // t=45: the inherited deadline still owns the loud transition (gate 10
+    // item 4 retires B without the offline flag).
+    clock.advance(1_000);
     expect(machine.state).toBe("offline");
   });
 
@@ -645,14 +668,40 @@ describe("ConnectionMachine", () => {
     await Promise.resolve();
     expect(machine.state).toBe("stale");
 
-    // No second resume fires inside the fresh 30 s window.
-    const calls = resume.mock.calls.length;
-    clock.advance(STALE_TO_OFFLINE_MS - 1);
-    expect(resume.mock.calls.length).toBe(calls);
+    // No sub-second reconnect storm. Inside the FRESH 30 s window the only
+    // legitimate activity is a probe-driven QUIET reopen: it starts and stays
+    // in quiet stale until the episode deadline retires it — a loud reconnect
+    // clock must never appear inside the window.
+    const timerNames = () =>
+      [...(machine as unknown as { timers: Map<string, unknown> }).timers.keys()];
+    const callsAtStale = resume.mock.calls.length;
+    expect(callsAtStale).toBe(1); // the one loud online resume
+
+    // The fresh stale probe starts exactly one quiet attempt.
+    clock.advance(REST_PROBE_MS);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(resume.mock.calls.length).toBe(callsAtStale + 1);
+    expect(machine.attemptRef()).not.toBeNull(); // quiet attempt STARTED
     expect(machine.state).toBe("stale");
-    // Only after the full fresh bound does it give up to loud offline.
+    expect(timerNames()).not.toContain("reconnect"); // no loud clock
+
+    // One ms before the fresh bound the quiet attempt is still the only owner
+    // — retired by nothing, no reconnect scheduled early.
+    clock.advance(STALE_TO_OFFLINE_MS - REST_PROBE_MS - 1);
+    expect(machine.state).toBe("stale");
+    expect(machine.attemptRef()).not.toBeNull();
+    expect(timerNames()).not.toContain("reconnect");
+    expect(resume.mock.calls.length).toBe(callsAtStale + 1);
+
+    // At the bound: RETIREMENT via the episode deadline (gate 10 item 4 — no
+    // offline flag), loud offline; the autonomous reconnect is scheduled only
+    // AFTER this point.
     clock.advance(1);
     expect(machine.state).toBe("offline");
+    expect(machine.attemptRef()).toBeNull();
+    expect(timerNames()).toContain("reconnect");
+    expect(resume.mock.calls.length).toBe(callsAtStale + 1);
   });
 
   it("GATE10 item 4: episode-deadline offline during a quiet resume ignores the late rejection (reconnect owns recovery)", async () => {
@@ -752,15 +801,25 @@ describe("ConnectionMachine", () => {
     expect(machine.state).toBe("offline");
   });
 
-  it("GATE10 item 2: dispose cancels every pending timer", () => {
-    const { clock, machine } = setupTracked();
-    machine.startLive();
-    clock.advance(LIVE_FRAME_MS); // stale: probe+offline armed
-    machine.dispatch({ type: "offline" }); // offline: reconnect armed
+  it("GATE11 item 8a: dispose leaves ZERO scheduler jobs after real arms and handle replacements", () => {
+    // Exercise genuine jobs and REPLACED handles (a cancel implementation that
+    // drops only the last handle would leave the replaced jobs scheduled),
+    // then dispose and assert the scheduler itself has no pending job.
+    const { clock, machine, resume } = setupTracked();
+    machine.startLive(); // frame-watchdog job
+    machine.dispatch({ type: "frame" }); // replaces the frame job
+    clock.advance(LIVE_FRAME_MS); // fires frame job; stale arms probe+offline
+    machine.followBound({ rebind: true }); // stale re-arm REPLACES probe+offline
+    machine.dispatch({ type: "close" }); // clears them; goOfflineAndSchedule arms reconnect
+    expect(clock.pendingCount()).toBe(1);
+
     machine.dispose();
-    // Advancing past every possible delay fires nothing and must not panic.
+    expect(clock.pendingCount()).toBe(0);
+
+    // Nothing fires afterwards: no state change, no resume.
     clock.advance(600_000);
     expect(machine.state).toBe("offline");
+    expect(resume).not.toHaveBeenCalled();
   });
 
   it("GATE8/10 item 8+5: quiet stale bound is enforced during a REAL quiet reopen", async () => {

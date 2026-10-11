@@ -620,6 +620,7 @@ impl RunningHub {
     /// Test-only: claim a queued gate job the way the scheduler tick would,
     /// without needing a registered lane Node. Returns the claimed job.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub async fn test_claim_gate_job(
         &self,
         job_id: &str,
@@ -647,6 +648,7 @@ impl RunningHub {
     /// Test-only: run one scheduler tick deterministically (no wait for the
     /// 1s interval).
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub async fn test_gate_tick(&self) {
         crate::gatequeue::tick(&self.state).await;
     }
@@ -654,6 +656,7 @@ impl RunningHub {
     /// Test-only: apply a gate run verdict through the real `apply_result`
     /// path (pre-read + writer job), for the cancel-vs-result race suite.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
     pub async fn test_apply_gate_result(
         &self,
         job_id: &str,

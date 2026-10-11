@@ -106,7 +106,8 @@ function sameValue(a: unknown, b: unknown): boolean {
  * emit that touches another session, the host/workspace lists, or re-fetches
  * an unchanged row selects an equal slice and the body does not re-render.
  */
-function selectSession(state: HubState, instanceId: string) {
+/** Selected slice for one session (c-effortread r10 item 8: exported for tests). */
+export function selectSession(state: HubState, instanceId: string) {
   const instance = state.instances.find((i) => i.id === instanceId);
   const kind = instance?.kind;
   return {
@@ -136,6 +137,23 @@ function selectSession(state: HubState, instanceId: string) {
     effort: hubStore.effortOf(instanceId, kind),
     effortEffective: hubStore.effortEffectiveOf(instanceId),
     effortPending: hubStore.effortPendingOf(instanceId),
+    // c-effortread r10 item 8: the composer's gate inputs come from the slice,
+    // not hubStore calls in the render — the version gate reads the HOST's
+    // pinned CLI (a host inventory refresh changes the host row, not this
+    // instance), and the refusal/withdrawal/default-index change on
+    // observations. Without them in the selected slice a refresh that finally
+    // supplies the CLI version left the switch disabled.
+    effortVersionGate:
+      kind === "claude" ? hubStore.effortVersionGate(instanceId) : undefined,
+    effortRefusal: hubStore.effortRefusalOf(instanceId),
+    effortReadbackWithdrawn: hubStore.effortReadbackWithdrawnOf(instanceId),
+    effortDefaultIndex:
+      kind === "claude"
+        ? (claudeDefaultTier(
+            hubStore.modelEffectiveOf(instanceId)?.id ?? (instance?.model ?? null),
+            hubStore.supplyCatalogRows(),
+          )?.index ?? null)
+        : null,
     usageRollup: hubStore.usageRollupOf(instanceId),
   };
 }
@@ -981,26 +999,18 @@ function SessionPageBody({
           modelPending={hubStore.modelPendingOf(instance.id)}
           modelSelectionPath={hubStore.modelEffectiveOf(instance.id)?.selectionPath ?? null}
           modelCatalog={hubStore.modelCatalogOf(instance.id)}
-          effort={hubStore.effortOf(instance.id, instance.kind)}
-          effortEffective={hubStore.effortEffectiveOf(instance.id)}
-          effortReadbackWithdrawn={hubStore.effortReadbackWithdrawnOf(instance.id)}
-          effortPending={hubStore.effortPendingOf(instance.id)}
-          ultraGate={instance.kind === "claude" ? hubStore.effortVersionGate(instance.id) : undefined}
+          effort={hub.effort}
+          effortEffective={hub.effortEffective}
+          effortReadbackWithdrawn={hub.effortReadbackWithdrawn}
+          effortPending={hub.effortPending}
+          ultraGate={hub.effortVersionGate}
           ultraBlocked={
-            instance.kind === "claude"
-              ? (() => {
-                  const refusal = hubStore.effortRefusalOf(instance.id);
-                  return refusal ? { reason: refusal.reason, model: refusal.modelId } : null;
-                })()
+            instance.kind === "claude" && hub.effortRefusal
+              ? { reason: hub.effortRefusal.reason, model: hub.effortRefusal.modelId }
               : null
           }
           effortDefaultIndex={
-            instance.kind === "claude"
-              ? (claudeDefaultTier(
-                  hubStore.modelEffectiveOf(instance.id)?.id ?? instance.model ?? null,
-                  hubStore.supplyCatalogRows(),
-                )?.index ?? null)
-              : undefined
+            instance.kind === "claude" ? hub.effortDefaultIndex : undefined
           }
           contextLabel={(() => {
             const pct = contextPercent(usage, instance.kind);

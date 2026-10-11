@@ -7,6 +7,12 @@
 //! Uses the production claude-pty driver against fake-herdr (same harness as
 //! the driver integration suite), but lives in remuda-node so it can call the
 //! Hub usage pipeline (remuda-hub is a dev-dependency here).
+//!
+//! c-ctxusage r8 item 7: the close-abort path is forced deterministically
+//! with the injected fault seam (a barrier INSIDE the first blocking
+//! collect, plus a shortened close bound) instead of a load-dependent 30k
+//! backlog and a 5 s idle break that could accept a missing rescue or reject
+//! a slow-but-valid one.
 
 use remuda_driver::{
     BinarySource, ClaudePtyDriver, ClaudePtyOptions, Delegation, Driver, DriverKind, LaunchOrigin,
@@ -123,6 +129,10 @@ fn to_journal_record(observation: &Observation) -> JournalRecord {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn claude_pty_close_finalises_no_stop_usage_and_projects_to_hub_row() {
+    use remuda_driver::test_faults::TranscriptFaults;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket_root = ShortTempDir::new().unwrap();
     let socket_dir = socket_root.as_ref().join("herdr");
@@ -142,12 +152,16 @@ async fn claude_pty_close_finalises_no_stop_usage_and_projects_to_hub_row() {
         "#!/bin/sh\necho '2.1.268 (Claude Code)'\n",
     );
 
-    // Seed the transcript the pump binds via session-meta before it starts.
     fs::create_dir_all(&launch).unwrap();
     let transcript = launch.join("transcript.jsonl");
-    // A small closed-turn backlog plus the no-stop final record; close timing
-    // is asserted on events, not on the mapping duration.
+    // Backlog size is irrelevant: the injected barrier parks the FIRST
+    // collect, so close deterministically aborts the pump mid-map.
     seed_transcript(&transcript, 30);
+
+    // Barrier INSIDE the first blocking collect + a 500 ms close bound.
+    let faults = TranscriptFaults::new();
+    faults.arm_pump_gate();
+    faults.arm_close_timeout(Duration::from_millis(500));
 
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
         instance_id: None,
@@ -171,8 +185,10 @@ async fn claude_pty_close_finalises_no_stop_usage_and_projects_to_hub_row() {
         seed_onboarding: true,
         host_claude_config: None,
     });
+    driver.set_test_faults(faults.clone());
 
-    let mut handle = driver.start(spec(&cwd)).await.expect("start");
+    let handle = driver.start(spec(&cwd)).await.expect("start");
+    let mut events_rx = handle.into_events();
     fs::write(
         launch.join("session-meta.json"),
         serde_json::json!({
@@ -184,43 +200,71 @@ async fn claude_pty_close_finalises_no_stop_usage_and_projects_to_hub_row() {
     )
     .unwrap();
 
-    // Wait for the bind, event-driven (no idle-gap sleeps).
-    let mut bound = false;
-    let bound_deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while std::time::Instant::now() < bound_deadline {
-        let obs = match tokio::time::timeout(Duration::from_millis(500), handle.recv()).await {
-            Ok(Some(obs)) => obs,
-            _ => continue,
-        };
-        if let ObservationPayload::Lifecycle(payload) = &obs.body
-            && let remuda_protocol::LifecyclePayload::Native(native) = payload.as_ref()
-            && native.native_name == "transcript_bound"
-        {
-            bound = true;
-            break;
+    let final_count = Arc::new(AtomicU32::new(0));
+    let bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (final_tx, final_rx) = tokio::sync::oneshot::channel();
+    let final_tx = std::sync::Mutex::new(Some(final_tx));
+    let drainer_count = Arc::clone(&final_count);
+    let drainer_bound = Arc::clone(&bound);
+    let drainer = tokio::spawn(async move {
+        while let Some(obs) = events_rx.recv().await {
+            if let ObservationPayload::Lifecycle(payload) = &obs.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = payload.as_ref()
+                && native.native_name == "transcript_bound"
+            {
+                drainer_bound.store(true, AtomicOrdering::SeqCst);
+            }
+            if let ObservationPayload::Usage(payload) = &obs.body
+                && payload.scope_id == FINAL_MSG_ID
+            {
+                drainer_count.fetch_add(1, AtomicOrdering::SeqCst);
+                if let Some(tx) = final_tx.lock().unwrap().take() {
+                    let _ = tx.send(obs);
+                }
+            }
         }
-    }
-    assert!(bound, "transcript never bound");
+    });
 
-    // Close: cooperative finalise (fast box) or the abort guard (slow box).
+    let bind_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !bound.load(AtomicOrdering::SeqCst) && std::time::Instant::now() < bind_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(bound.load(AtomicOrdering::SeqCst), "transcript never bound");
+
+    // Barrier: the first collect is parked before tail.poll; FINAL is absent.
+    assert!(
+        faults.wait_pump_entered(),
+        "the first blocking collect never entered its barrier"
+    );
+    assert_eq!(final_count.load(AtomicOrdering::SeqCst), 0);
+
     driver.close().await.expect("close");
+    // Prove the timeout-driven abort actually happened (not a fast-box
+    // cooperative path that happened to win).
+    assert!(
+        faults.wait_abort_residual(),
+        "close returned without the abort-path residual running"
+    );
+    assert_eq!(
+        final_count.load(AtomicOrdering::SeqCst),
+        0,
+        "FINAL published before the parked collect was released"
+    );
 
-    // Drain until the no-stop usage is delivered.
-    let mut rescued: Option<Observation> = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    while tokio::time::Instant::now() < deadline {
-        let obs = match tokio::time::timeout(Duration::from_secs(5), handle.recv()).await {
-            Ok(Some(obs)) => obs,
-            _ => break,
-        };
-        if let ObservationPayload::Usage(payload) = &obs.body
-            && payload.scope_id == FINAL_MSG_ID
-        {
-            rescued = Some(obs);
-            break;
-        }
-    }
-    let rescued = rescued.expect("close did not finalise the no-stop usage");
+    // Release the detached first collect; the guard finishes the buffered run
+    // and the flusher delivers its no-stop usage exactly once.
+    faults.release();
+    let rescued = tokio::time::timeout(Duration::from_secs(60), final_rx)
+        .await
+        .expect("close never rescued the no-stop usage (channel closed)")
+        .expect("final oneshot closed without a frame");
+    drainer.abort();
+    assert_eq!(
+        final_count.load(AtomicOrdering::SeqCst),
+        1,
+        "the rescued no-stop usage must be delivered exactly once"
+    );
+
     // Project through the REAL Hub pipeline BEFORE moving the body out.
     let conn = Connection::open_in_memory().expect("sqlite");
     migrate(&conn).expect("migrate");

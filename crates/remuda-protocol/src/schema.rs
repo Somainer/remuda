@@ -149,6 +149,8 @@ pub fn schema_document() -> Value {
         ForwardIntent,
         GateAuthorizeParams,
         GateAuthorizeResult,
+        GateLandGrantParams,
+        GateLandGrantResult,
         GateCancelParams,
         GateEventKind,
         GateEventParams,

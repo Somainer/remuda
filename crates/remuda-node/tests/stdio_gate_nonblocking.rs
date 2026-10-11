@@ -270,6 +270,25 @@ fn start_gate(home: &std::path::Path, fixture: &Fixture) -> Node {
             "generation": authorize["params"]["generation"].clone(),
         },
     }));
+
+    // r11 item 1: a LAND run asks gate.landGrant at the verify→land boundary
+    // before pushing. A verify-only run never asks.
+    if gate_run_params(fixture)["mode"] == json!("land") {
+        let grant = node
+            .wait_for(Instant::now() + Duration::from_secs(30), |frame| {
+                frame["method"] == json!("gate.landGrant")
+            })
+            .expect("the Node must ask gate.landGrant before pushing");
+        node.send(&json!({
+            "jsonrpc": "2.0",
+            "id": grant["id"].clone(),
+            "result": {
+                "granted": true,
+                "generation": grant["params"]["generation"].clone(),
+                "landingInProgress": false,
+            },
+        }));
+    }
     node
 }
 

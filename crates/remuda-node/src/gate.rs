@@ -24,7 +24,7 @@ use remuda_protocol::{
     GateRunParams, GateRunResult, GateStep, GateThenParams, GateThenResult, GateUnpinParams,
     GateUnpinResult,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -590,10 +590,19 @@ impl GateRunTable {
     }
 }
 
-/// Outbound authority check a lane run asks before executing. Registered by
-/// the live carrier session; absent on carrier-less/direct callers (tests,
-/// foreground stdio), where the Node-local floor alone applies and the Hub
-/// still guards the terminal result.
+/// Answer to a land-grant request at the verify→land boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LandGrantAnswer {
+    /// True when the Hub transitioned (or had transitioned) Running → Landing.
+    pub granted: bool,
+    /// True when a grant was already held (idempotent re-answer).
+    pub landing_in_progress: bool,
+}
+
+/// Outbound authority checks a lane run asks before executing and at the
+/// irreversible land boundary. Registered by the live carrier session;
+/// absent on carrier-less/direct callers (tests, foreground stdio), where
+/// the Node-local floor alone applies and the Hub still guards the result.
 pub trait GateAuthorizer: Send + Sync {
     /// Ask the Hub whether `(job_id, generation)` is still the live Running
     /// attempt. Any error/timeout/missing link must be treated as false.
@@ -602,6 +611,14 @@ pub trait GateAuthorizer: Send + Sync {
         job_id: &'a str,
         generation: u32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+
+    /// Ask the Hub to transition Running → Landing before the push. Any
+    /// error/timeout/refusal must be treated as not granted.
+    fn request_land_grant<'a>(
+        &'a self,
+        job_id: &'a str,
+        generation: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = LandGrantAnswer> + Send + 'a>>;
 }
 
 /// Build the verdict for a `gate.run` whose generation is at or below the
@@ -693,6 +710,41 @@ impl GateRegistry {
             None => !self
                 .carrier_attached
                 .load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+
+    /// Request the Running → Landing grant at the verify→land boundary. On a
+    /// never-attached direct/dev caller the local floor grants (tests); on a
+    /// live/attached carrier any non-grant/refusal/timeout is a refusal and
+    /// the push must not happen.
+    async fn hub_land_grant(&self, job_id: &str, generation: u32) -> LandGrantAnswer {
+        let authorizer = self.authorizer.read().await.clone();
+        match authorizer {
+            Some(authorizer) => tokio::time::timeout(
+                Duration::from_secs(5),
+                authorizer.request_land_grant(job_id, generation),
+            )
+            .await
+            .unwrap_or(LandGrantAnswer {
+                granted: false,
+                landing_in_progress: false,
+            }),
+            None => {
+                if self
+                    .carrier_attached
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    LandGrantAnswer {
+                        granted: false,
+                        landing_in_progress: false,
+                    }
+                } else {
+                    LandGrantAnswer {
+                        granted: true,
+                        landing_in_progress: false,
+                    }
+                }
+            }
         }
     }
 
@@ -1120,6 +1172,7 @@ impl DevNode {
         live: Arc<LiveRun>,
         mut cancel_rx: watch::Receiver<bool>,
     ) -> GateRunResult {
+        let registry = self.gate_registry();
         let mut result = GateRunResult {
             job_id: request.job_id.clone(),
             generation: request.generation,
@@ -1165,12 +1218,11 @@ impl DevNode {
             return finalize(result);
         }
 
-        // 3. Run the consumed merge CLI in the lane checkout.
-        let phase = if request.mode == "land" {
-            "land"
-        } else {
-            "gate"
-        };
+        // PHASE 1 — verify only. The merge CLI verifies (`--gate`) but never
+        // advances/pushes main in this child. A land is a SEPARATE child
+        // after the Hub grants Landing (below), so a cancel/drop before the
+        // grant cannot be followed by a push.
+        let phase = "gate";
         emit(GateEventKind::Phase {
             phase: phase.into(),
         });
@@ -1191,26 +1243,14 @@ impl DevNode {
             "--target-dir".to_owned(),
             request.target_dir.clone(),
         ];
-        // Both modes verify the merge onto current `main` inside this
-        // invocation; land additionally CAS-updates and pushes main. A
-        // base-moved result makes the Hub re-queue and re-verify (D-034).
-        //
-        // `pushFrom: home` is the exception: this host holds no push
-        // credential, so the lane must stay a pure verify. Running `--land`
-        // here would advance lane-local main and report `landed` with nothing
-        // on the remote — the half-updated outcome D-034 forbids. The Hub
-        // lands the pinned merge from the home host instead.
+        // The lane host lands when mode==land and pushFrom!=home. The home
+        // host performs the CAS push via a separate `gate.land` RPC; the lane
+        // is always verify-only.
         let lands_here =
             request.mode == "land" && request.push_from != remuda_protocol::GatePushFrom::Home;
         args.push("--gate".into());
-        if lands_here {
-            args.push("--land".into());
-            if !request.push {
-                args.push("--no-push".into());
-            }
-        } else {
-            args.push("--no-push".into());
-        }
+        // Verify child: never land/push.
+        args.push("--no-push".into());
         if request.web == "always" {
             args.push("--web".into());
             args.push("--web-e2e".into());
@@ -1390,7 +1430,6 @@ impl DevNode {
         result.current_main_sha = string_field(&report, "currentMain");
         match report.get("status").and_then(Value::as_str).unwrap_or("") {
             "ok" | "verified" => result.status = "passed".into(),
-            "landed" => result.status = "landed".into(),
             "base_moved" => {
                 result.status = "base-moved".into();
                 result.error = string_field(&report, "error");
@@ -1439,6 +1478,109 @@ impl DevNode {
                             "could not pin the verified merge; the pass is not landable"
                         );
                     }
+                }
+            }
+        }
+        // PHASE 2 — land. Only AFTER a passing verify, and only when THIS lane
+        // host is the pusher, ask the Hub to transition Running → Landing for
+        // exactly this (job, generation, session). A cancel committed first is
+        // refused and nothing is pushed. Once granted, run the land-only
+        // merge child (CAS + push); the grant already held survives a cancel.
+        if lands_here && result.status == "passed" {
+            // Final local re-check right before the grant RPC: a
+            // gate.cancel that landed while the verify child ran is visible.
+            {
+                let table = registry.runs.lock().await;
+                if table.is_canceled_generation(&request.job_id, request.generation) {
+                    let refused =
+                        canceled_before_run(registry, &request.job_id, request.generation);
+                    drop(table);
+                    return refused;
+                }
+            }
+            let grant = registry
+                .hub_land_grant(&request.job_id, request.generation)
+                .await;
+            if !grant.granted {
+                let why = "land not granted (canceled/stale/session changed); not pushed";
+                result.status = "canceled".into();
+                result.error = Some(why.into());
+                result.reason = Some(why.into());
+                let _ = registry.events.send(GateEventParams {
+                    job_id: request.job_id.clone(),
+                    kind: GateEventKind::Finished {
+                        result: Box::new(result.clone()),
+                    },
+                });
+                return result;
+            }
+            emit(GateEventKind::Phase {
+                phase: "land".into(),
+            });
+            let mut land_args = vec![
+                "merge".to_owned(),
+                request.branch.clone(),
+                "--land".to_owned(),
+                "--onto".to_owned(),
+                request.base_branch.clone(),
+                "--json".to_owned(),
+                "--repo".to_owned(),
+                request.repo_path.clone(),
+                "--target-dir".to_owned(),
+                request.target_dir.clone(),
+            ];
+            if !request.push {
+                land_args.push("--no-push".into());
+            }
+            let land_child_env = gate_run_child_env(request, &host_env_snapshot());
+            let mut land_command = Command::new(&binary);
+            land_command
+                .args(&land_args)
+                .current_dir(&repo)
+                .env_clear()
+                .envs(&land_child_env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(false);
+            #[cfg(unix)]
+            land_command.process_group(0);
+            let land_child = match land_command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    result.status = "failed".into();
+                    result.error = Some(format!("spawn land child: {error}"));
+                    attach_failure_evidence(&mut result, &trace, request.keep_logs);
+                    return finalize(result);
+                }
+            };
+            // Land runs to completion even if cancel fires (grant already
+            // held); just await it bounded by the land timeout.
+            let land_output = tokio::time::timeout(
+                Duration::from_secs(DEFAULT_LAND_TIMEOUT_SECS),
+                land_child.wait_with_output(),
+            )
+            .await;
+            match land_output {
+                Ok(Ok(land_output)) if land_output.status.success() => {
+                    let land_report: Value =
+                        serde_json::from_slice(&land_output.stdout).unwrap_or_else(|_| json!({}));
+                    result.status = "landed".into();
+                    result.current_main_sha = string_field(&land_report, "currentMain");
+                    result.merge_sha = string_field(&land_report, "merged").or(result.merge_sha);
+                }
+                Ok(Ok(land_output)) => {
+                    let stderr = String::from_utf8_lossy(&land_output.stderr);
+                    result.status = "failed".into();
+                    result.error = Some(format!("land failed after grant: {}", stderr.trim()));
+                }
+                Ok(Err(error)) => {
+                    result.status = "failed".into();
+                    result.error = Some(format!("land child failed: {error}"));
+                }
+                Err(_elapsed) => {
+                    result.status = "failed".into();
+                    result.error = Some(format!("land exceeded {DEFAULT_LAND_TIMEOUT_SECS}s"));
                 }
             }
         }

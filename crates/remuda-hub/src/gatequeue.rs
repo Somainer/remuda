@@ -340,6 +340,7 @@ async fn enqueue_job(
         attempts: 0,
         then_command: body.then_command,
         then_output: None,
+        landing_session_epoch: None,
     };
     state.store.insert_gate_job(&job).await.map_err(map_store)?;
     journal(&state, &device.id, "gate.queued", &job).await;
@@ -491,6 +492,12 @@ async fn cancel_project_job(
                 }
             }
             Ok(Json(json!(updated)))
+        }
+        GateJobCancelOutcome::Landing(job) => {
+            tracing::info!(job_id = job.id.as_id().as_str(), "cancel after land grant");
+            Err(HubError::Conflict(
+                "job landing in progress; cancel cannot stop the granted push".to_string(),
+            ))
         }
         GateJobCancelOutcome::Terminal(job) => Err(HubError::Conflict(format!(
             "job already {}",
@@ -2047,6 +2054,7 @@ impl Store {
                         job.cancel_requested_at = Some(now_ts());
                     }
                 }
+                GateJobState::Landing => return Ok(Some(GateJobCancelOutcome::Landing(job))),
                 // Terminal: leave the row untouched; the handler returns 409.
                 _ => return Ok(Some(GateJobCancelOutcome::Terminal(job))),
             }
@@ -2166,6 +2174,10 @@ pub(crate) enum GateJobCancelOutcome {
     /// The row was `running`/`canceling` inside the writer: it is now
     /// `canceling` and the handler owes one `gate.cancel` frame.
     CancelRequested(GateJob),
+    /// The row was `landing` inside the writer: the irreversible push is
+    /// granted and runs to completion. The cancel API reports
+    /// landing-in-progress rather than a false cancellation.
+    Landing(GateJob),
     /// The row was already terminal inside the writer; it was left
     /// untouched and the handler answers 409.
     Terminal(GateJob),
@@ -2266,6 +2278,13 @@ pub(crate) enum GateJobClaim {
 pub(crate) struct GateDispatchAuth {
     pub(crate) authorized: bool,
     pub(crate) state: Option<String>,
+}
+
+/// Result of the Running → Landing land-grant transition.
+pub(crate) struct GateLandGrant {
+    pub(crate) granted: bool,
+    pub(crate) state: Option<String>,
+    pub(crate) landing_in_progress: bool,
 }
 
 /// One persisted bounded gate log (`obj_…`); bytes are the JSON-serialized
@@ -2419,6 +2438,91 @@ impl Store {
             Ok(GateDispatchAuth {
                 authorized: authorized > 0,
                 state,
+            })
+        })
+        .await
+    }
+
+    /// Running → Landing transition at the verify→land boundary. Serialized
+    /// in the same writer path as cancel, so a cancel committing first wins:
+    /// the grant is refused when the row is no longer Running at exactly this
+    /// generation/host. Idempotent: a repeat grant for an already-Landing row
+    /// (same generation/host) returns granted=true.
+    pub(crate) async fn gate_land_grant(
+        &self,
+        job_id: &str,
+        host_id: &str,
+        generation: u32,
+        session_epoch: &str,
+    ) -> Result<GateLandGrant, crate::store::StoreError> {
+        let job_id = job_id.to_owned();
+        let host_id = host_id.to_owned();
+        let session_epoch = session_epoch.to_owned();
+        let host_id2 = host_id.clone();
+        let session_epoch2 = session_epoch.clone();
+        self.run_named("gate_land_grant", move |conn| {
+            let now = now();
+            // Current state (JSON-path read, no serde error conversion).
+            let state: Option<String> = conn
+                .query_row(
+                    "SELECT json_extract(doc_json, '$.state') FROM gate_jobs WHERE id = ?1",
+                    params![job_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(state) = state else {
+                return Ok(GateLandGrant {
+                    granted: false,
+                    state: Some("missing".into()),
+                    landing_in_progress: false,
+                });
+            };
+            // Already landing at this generation: idempotent re-answer.
+            if state == GateJobState::Landing.as_str() {
+                let same_gen: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM gate_jobs
+                      WHERE id = ?1 AND json_extract(doc_json,'$.attempts') = ?2",
+                    params![job_id, generation],
+                    |row| row.get(0),
+                )?;
+                return Ok(GateLandGrant {
+                    granted: same_gen > 0,
+                    state: (same_gen == 0).then_some(state),
+                    landing_in_progress: same_gen > 0,
+                });
+            }
+            // Conditional Running → Landing for exactly this tuple.
+            let updated = conn.execute(
+                "UPDATE gate_jobs
+                    SET doc_json = json_set(json_set(doc_json,
+                            '$.state', 'landing'),
+                            '$.landingSessionEpoch', ?2),
+                        state = 'landing',
+                        revision = revision + 1,
+                        updated_at = ?3
+                  WHERE id = ?1
+                    AND json_extract(doc_json,'$.state') = 'running'
+                    AND json_extract(doc_json,'$.attempts') = ?4
+                    AND json_extract(doc_json,'$.hostId') = ?5",
+                params![job_id, session_epoch, now, generation, host_id],
+            )?;
+            if updated > 0 {
+                return Ok(GateLandGrant {
+                    granted: true,
+                    state: None,
+                    landing_in_progress: false,
+                });
+            }
+            let state_after: String = conn.query_row(
+                "SELECT json_extract(doc_json,'$.state') FROM gate_jobs WHERE id = ?1",
+                params![job_id],
+                |row| row.get(0),
+            )?;
+            let _ = (host_id2, session_epoch2);
+            Ok(GateLandGrant {
+                granted: false,
+                state: Some(state_after),
+                landing_in_progress: false,
             })
         })
         .await

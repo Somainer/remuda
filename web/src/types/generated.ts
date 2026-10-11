@@ -1063,6 +1063,7 @@ export type GateJob = ({
   "id": GateJobId;
   "initiator"?: (Initiator | (null));
   "keepLogs": (boolean);
+  "landingSessionEpoch"?: (string | null);
   "laneId"?: (string | null);
   "logObjectId"?: (string | null);
   "mergeRef"?: (string | null);
@@ -1084,7 +1085,25 @@ export type GateJob = ({
 export type GateJobId = (string);
 
 /** Gate job lifecycle: queued → running → passed|failed|landed, with cancel. */
-export type GateJobState = ("queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled");
+export type GateJobState = ("queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled");
+
+/** `gate.landGrant` params (Node→Hub) at the verify→land boundary. */
+export type GateLandGrantParams = ({
+  "generation": (number);
+  "hostId": (string);
+  "jobId": (string);
+  "sessionEpoch": (string);
+  [key: string]: unknown;
+});
+
+/** Result of a land-grant request. */
+export type GateLandGrantResult = ({
+  "generation": (number);
+  "granted": (boolean);
+  "landingInProgress": (boolean);
+  "state"?: (string | null);
+  [key: string]: unknown;
+});
 
 /** `gate.land` params: the home host obtains a lane's verified merge commit and compare-and-swap pushes it to the project's base branch.  This is the `pushFrom: home` half of D-034: the lane host holds no push credential for the project remote, so a passing verify is landed by the host that does. For this slice the merge commit arrives by `git fetch` of `mergeRef` over `fetchRemote`; a Node RPC streaming the packfile is the better shape later, so `fetchRemote` stays the only lane-reachability input and nothing else assumes ssh. */
 export type GateLandParams = ({

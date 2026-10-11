@@ -5054,6 +5054,13 @@
           "description": "Retain the bounded run log even when the run passes (`--keep-logs`).",
           "type": "boolean"
         },
+        "landingSessionEpoch": {
+          "description": "Node session/epoch the land was granted for: binds the Landing row to\nthe carrier session whose dispatch was authorized, so a paused frame\ndelivered to a replacement session after a restart cannot land.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "laneId": {
           "description": "Pinned lane (chosen at dispatch when not given).",
           "type": [
@@ -5180,6 +5187,11 @@
           "type": "string"
         },
         {
+          "const": "landing",
+          "description": "Verify passed on the lane and the Hub granted the land; the\nirreversible push is in progress. A cancel arriving now reports\nlanding-in-progress instead of pretending to cancel.",
+          "type": "string"
+        },
+        {
           "const": "passed",
           "description": "Verify finished green; main was not advanced.",
           "type": "string"
@@ -5205,6 +5217,72 @@
           "type": "string"
         }
       ]
+    },
+    "GateLandGrantParams": {
+      "description": "`gate.landGrant` params (Node→Hub) at the verify→land boundary.",
+      "properties": {
+        "generation": {
+          "default": 0,
+          "description": "Attempt generation that verified.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hostId": {
+          "description": "Host asking for the grant.",
+          "type": "string"
+        },
+        "jobId": {
+          "description": "Job the Node is about to land.",
+          "type": "string"
+        },
+        "sessionEpoch": {
+          "default": "",
+          "description": "Node session/epoch this dispatch was authorized for: a paused frame\ndelivered to a replacement session must not match.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jobId",
+        "generation",
+        "hostId",
+        "sessionEpoch"
+      ],
+      "type": "object"
+    },
+    "GateLandGrantResult": {
+      "description": "Result of a land-grant request.",
+      "properties": {
+        "generation": {
+          "default": 0,
+          "description": "Echoed generation.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "granted": {
+          "description": "True only when the Hub transitioned Running → Landing for this exact\ntuple; false means the push must not happen.",
+          "type": "boolean"
+        },
+        "landingInProgress": {
+          "default": false,
+          "description": "True when a cancel landed but the land was already granted: the cancel\nAPI surfaces \"landing in progress\" rather than a false cancellation.",
+          "type": "boolean"
+        },
+        "state": {
+          "description": "Hub row state when refused (`canceling` / `canceled` / …).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "granted",
+        "generation",
+        "landingInProgress"
+      ],
+      "type": "object"
     },
     "GateLandParams": {
       "description": "`gate.land` params: the home host obtains a lane's verified merge commit\nand compare-and-swap pushes it to the project's base branch.\n\nThis is the `pushFrom: home` half of D-034: the lane host holds no push\ncredential for the project remote, so a passing verify is landed by the\nhost that does. For this slice the merge commit arrives by `git fetch` of\n`mergeRef` over `fetchRemote`; a Node RPC streaming the packfile is the\nbetter shape later, so `fetchRemote` stays the only lane-reachability\ninput and nothing else assumes ssh.",

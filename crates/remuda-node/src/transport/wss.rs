@@ -159,17 +159,57 @@ struct JournalJob {
     reply: oneshot::Sender<Result<Value, NodeError>>,
 }
 
+/// Host id of the runtime node in an auth frame (empty for a bare link).
+fn node_host_id(runtime: Option<&runtime_wss::RuntimeLink>) -> Value {
+    runtime
+        .map(|rt| Value::String(rt.node.host().meta.id.as_id().to_string()))
+        .unwrap_or(Value::Null)
+}
+
 /// Node→Hub `gate.authorize` request job, correlation-matched on the session.
 struct GateAuthJob {
+    method: &'static str,
     job_id: String,
     generation: u32,
+    session_epoch: Option<String>,
     reply: oneshot::Sender<Result<Value, NodeError>>,
 }
+
+/// Current connection/session epoch, shared with the gate authorizer and
+/// updated after each (re)connected hello.
+pub(crate) type SessionEpoch = std::sync::Arc<std::sync::Mutex<Option<String>>>;
 
 /// [`crate::gate::GateAuthorizer`] backed by the live outbound session.
 #[derive(Clone)]
 struct WssGateAuthorizer {
     tx: mpsc::Sender<GateAuthJob>,
+    epoch: SessionEpoch,
+}
+
+impl WssGateAuthorizer {
+    async fn call(
+        &self,
+        method: &'static str,
+        job_id: &str,
+        generation: u32,
+    ) -> Result<Value, NodeError> {
+        let session_epoch = self.epoch.lock().ok().and_then(|e| e.clone());
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(GateAuthJob {
+                method,
+                job_id: job_id.to_owned(),
+                generation,
+                session_epoch,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| NodeError::Disconnected)?;
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .map_err(|_| NodeError::Disconnected)?
+            .map_err(|_| NodeError::Disconnected)?
+    }
 }
 
 impl crate::gate::GateAuthorizer for WssGateAuthorizer {
@@ -179,22 +219,37 @@ impl crate::gate::GateAuthorizer for WssGateAuthorizer {
         generation: u32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
-            let (tx, rx) = oneshot::channel();
-            if self
-                .tx
-                .send(GateAuthJob {
-                    job_id: job_id.to_owned(),
-                    generation,
-                    reply: tx,
-                })
+            match self
+                .call(remuda_protocol::METHOD_GATE_AUTHORIZE, job_id, generation)
                 .await
-                .is_err()
             {
-                return false;
-            }
-            match rx.await {
-                Ok(Ok(value)) => value.get("authorized").and_then(Value::as_bool) == Some(true),
+                Ok(value) => value.get("authorized").and_then(Value::as_bool) == Some(true),
                 _ => false,
+            }
+        })
+    }
+
+    fn request_land_grant<'a>(
+        &'a self,
+        job_id: &'a str,
+        generation: u32,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::gate::LandGrantAnswer> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            match self
+                .call(remuda_protocol::METHOD_GATE_LAND_GRANT, job_id, generation)
+                .await
+            {
+                Ok(value) => crate::gate::LandGrantAnswer {
+                    granted: value.get("granted").and_then(Value::as_bool) == Some(true),
+                    landing_in_progress: value.get("landingInProgress").and_then(Value::as_bool)
+                        == Some(true),
+                },
+                _ => crate::gate::LandGrantAnswer {
+                    granted: false,
+                    landing_in_progress: false,
+                },
             }
         })
     }
@@ -392,6 +447,7 @@ impl WssLink {
         let host_id = config.host_id.clone();
         let (journal_tx, journal_rx) = mpsc::channel(config.journal_queue.max(1));
         let (auth_tx, auth_rx) = mpsc::channel(8);
+        let session_epoch: SessionEpoch = std::sync::Arc::new(std::sync::Mutex::new(None));
         let (hub_tx, hub_rx) = mpsc::channel(DEFAULT_HUB_QUEUE);
         let (hub_reply_tx, hub_reply_rx) = mpsc::channel(DEFAULT_HUB_QUEUE);
         let (control_tx, control_rx) = mpsc::channel(4);
@@ -411,6 +467,7 @@ impl WssLink {
             journal_rx,
             auth_tx,
             auth_rx,
+            session_epoch.clone(),
             hub_tx,
             hub_reply_tx,
             hub_reply_rx,
@@ -690,6 +747,7 @@ async fn session_task(
     mut journal_rx: mpsc::Receiver<JournalJob>,
     auth_tx: mpsc::Sender<GateAuthJob>,
     mut auth_rx: mpsc::Receiver<GateAuthJob>,
+    session_epoch: SessionEpoch,
     hub_tx: mpsc::Sender<HubRequest>,
     hub_reply_tx: mpsc::Sender<HubReply>,
     mut hub_reply_rx: mpsc::Receiver<HubReply>,
@@ -741,6 +799,7 @@ async fn session_task(
             .gate_registry()
             .set_authorizer(std::sync::Arc::new(WssGateAuthorizer {
                 tx: auth_tx.clone(),
+                epoch: session_epoch.clone(),
             }))
             .await;
     }
@@ -813,6 +872,11 @@ async fn session_task(
         .pointer("/lease/leaseId")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    // Publish the session epoch the gate land-grant carries, so a paused
+    // dispatch delivered to a replacement session cannot match.
+    if let Ok(mut epoch) = session_epoch.lock() {
+        *epoch = connection_id.clone();
+    }
     if let Some(ready) = ready {
         let _ = ready.send(Ok(hello.clone()));
     }
@@ -914,8 +978,13 @@ async fn session_task(
                 let id = format!("a-{}", ids.fetch_add(1, Ordering::Relaxed));
                 let frame = rpc_request(
                     &id,
-                    remuda_protocol::METHOD_GATE_AUTHORIZE,
-                    json!({ "jobId": auth.job_id, "generation": auth.generation }),
+                    auth.method,
+                    json!({
+                        "jobId": auth.job_id,
+                        "generation": auth.generation,
+                        "hostId": node_host_id(runtime.as_ref()),
+                        "sessionEpoch": auth.session_epoch,
+                    }),
                 );
                 match send_ws(&mut stream, &frame).await {
                     Ok(()) => {

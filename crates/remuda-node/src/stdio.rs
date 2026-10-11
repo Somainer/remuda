@@ -44,8 +44,8 @@ impl Default for StdioOptions {
     }
 }
 
-/// A Node→Hub `gate.authorize` request issued by a (detached) gate run over
-/// the bidirectional stdio carrier.
+/// A Node→Hub gate authority request (gate.authorize / gate.landGrant)
+/// issued by a (detached) gate run over the bidirectional stdio carrier.
 struct StdioAuthCall {
     id: String,
     frame: Value,
@@ -56,17 +56,58 @@ struct StdioAuthCall {
 /// arm: the run task sends an auth request through this channel; the main
 /// loop writes it to stdout and correlates the Hub's reply by id while
 /// gate.run keeps executing on its own background task.
-/// Pending gate.authorize replies keyed by JSON-RPC id.
+/// Pending gate authority replies keyed by JSON-RPC id.
 type PendingAuth =
     std::sync::Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<Result<Value, NodeError>>>>>;
 
 #[derive(Clone)]
 struct StdioGateAuthorizer {
     tx: mpsc::Sender<StdioAuthCall>,
+    /// Stable session epoch echoed on every frame.
+    epoch: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 /// Process-wide auth request sequence (the stdio loop is a single session).
 static STDIO_AUTH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl StdioGateAuthorizer {
+    async fn call(
+        &self,
+        method: &'static str,
+        job_id: &str,
+        generation: u32,
+    ) -> Result<Value, NodeError> {
+        let (tx, rx) = oneshot::channel();
+        let id = format!(
+            "auth-{}",
+            STDIO_AUTH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let epoch = self.epoch.lock().map(|e| e.clone()).unwrap_or_default();
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": {
+                "jobId": job_id,
+                "generation": generation,
+                "hostId": Value::Null,
+                "sessionEpoch": epoch,
+            },
+        });
+        self.tx
+            .send(StdioAuthCall {
+                id: id.clone(),
+                frame,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| NodeError::Disconnected)?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .map_err(|_| NodeError::Disconnected)?
+            .map_err(|_| NodeError::Disconnected)?
+    }
+}
 
 impl crate::gate::GateAuthorizer for StdioGateAuthorizer {
     fn authorize<'a>(
@@ -75,32 +116,37 @@ impl crate::gate::GateAuthorizer for StdioGateAuthorizer {
         generation: u32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
-            let (tx, rx) = oneshot::channel();
-            let id = format!(
-                "auth-{}",
-                STDIO_AUTH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            );
-            let frame = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": remuda_protocol::METHOD_GATE_AUTHORIZE,
-                "params": { "jobId": job_id, "generation": generation },
-            });
-            if self
-                .tx
-                .send(StdioAuthCall {
-                    id,
-                    frame,
-                    reply: tx,
-                })
+            match self
+                .call(remuda_protocol::METHOD_GATE_AUTHORIZE, job_id, generation)
                 .await
-                .is_err()
             {
-                return false;
-            }
-            match rx.await {
-                Ok(Ok(value)) => value.get("authorized").and_then(Value::as_bool) == Some(true),
+                Ok(value) => value.get("authorized").and_then(Value::as_bool) == Some(true),
                 _ => false,
+            }
+        })
+    }
+
+    fn request_land_grant<'a>(
+        &'a self,
+        job_id: &'a str,
+        generation: u32,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::gate::LandGrantAnswer> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            match self
+                .call(remuda_protocol::METHOD_GATE_LAND_GRANT, job_id, generation)
+                .await
+            {
+                Ok(value) => crate::gate::LandGrantAnswer {
+                    granted: value.get("granted").and_then(Value::as_bool) == Some(true),
+                    landing_in_progress: value.get("landingInProgress").and_then(Value::as_bool)
+                        == Some(true),
+                },
+                _ => crate::gate::LandGrantAnswer {
+                    granted: false,
+                    landing_in_progress: false,
+                },
             }
         })
     }
@@ -283,9 +329,15 @@ where
     // Node→Hub gate.authorize requests from detached gate runs.
     let (gate_auth_tx, mut gate_auth_rx) = mpsc::channel::<StdioAuthCall>(8);
     let pending_auth: PendingAuth = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+    // Stable session epoch for this stdio process (host-id + boot).
+    let stdio_epoch = std::sync::Arc::new(std::sync::Mutex::new(format!(
+        "stdio:{}",
+        node.host().meta.id.as_id()
+    )));
     node.gate_registry()
         .set_authorizer(std::sync::Arc::new(StdioGateAuthorizer {
             tx: gate_auth_tx,
+            epoch: stdio_epoch,
         }))
         .await;
     spawn_stdio_tty_pump(node.clone(), tty_tx);

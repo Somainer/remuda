@@ -873,6 +873,34 @@ pub(crate) async fn handle_node_method(
             .map_err(|error| HubError::Internal(error.to_string()))?;
             Ok(Some(result))
         }
+        "gate.landGrant" => {
+            // Node→Hub fence at the verify→land boundary: serializes with
+            // cancel so a cancel first wins; a granted Landing then runs to
+            // completion.
+            let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
+            let typed: remuda_protocol::GateLandGrantParams = serde_json::from_value(params)
+                .map_err(|error| {
+                    HubError::BadRequest(format!("invalid gate.landGrant params: {error}"))
+                })?;
+            let grant = state
+                .store
+                .gate_land_grant(
+                    &typed.job_id,
+                    host_id.as_str(),
+                    typed.generation,
+                    &typed.session_epoch,
+                )
+                .await
+                .map_err(crate::http::map_store)?;
+            let result = serde_json::to_value(remuda_protocol::GateLandGrantResult {
+                granted: grant.granted,
+                generation: typed.generation,
+                state: grant.state,
+                landing_in_progress: grant.landing_in_progress,
+            })
+            .map_err(|error| HubError::Internal(error.to_string()))?;
+            Ok(Some(result))
+        }
         "instance.create"
         | "instance.send"
         | "instance.configure"

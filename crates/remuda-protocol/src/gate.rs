@@ -21,6 +21,11 @@ pub const METHOD_GATE_EVENT: &str = "gate.event";
 /// Node→Hub: before a gate run does anything irreversible, the Node asks the
 /// Hub to confirm `(jobId, generation)` is still the live Running attempt.
 pub const METHOD_GATE_AUTHORIZE: &str = "gate.authorize";
+/// Node→Hub: at the verify→land boundary the Node asks the Hub to transition
+/// the row Running → Landing for exactly `(jobId, generation, host, epoch)`.
+/// A cancel that reaches the Hub before this is honored; once granted the
+/// land runs to completion and a later cancel reports landing-in-progress.
+pub const METHOD_GATE_LAND_GRANT: &str = "gate.landGrant";
 /// Hub→Node (home host): run the optional `remuda land --then` command.
 pub const METHOD_GATE_THEN: &str = "gate.then";
 /// Hub→Node (home host): fetch a lane's verified merge and CAS-push main.
@@ -166,6 +171,10 @@ pub enum GateJobState {
     Queued,
     /// A Node is running the job.
     Running,
+    /// Verify passed on the lane and the Hub granted the land; the
+    /// irreversible push is in progress. A cancel arriving now reports
+    /// landing-in-progress instead of pretending to cancel.
+    Landing,
     /// Verify finished green; main was not advanced.
     Passed,
     /// Gate or landing failed.
@@ -185,6 +194,7 @@ impl GateJobState {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
+            Self::Landing => "landing",
             Self::Passed => "passed",
             Self::Failed => "failed",
             Self::Landed => "landed",
@@ -198,6 +208,7 @@ impl GateJobState {
         match value {
             "queued" => Some(Self::Queued),
             "running" => Some(Self::Running),
+            "landing" => Some(Self::Landing),
             "passed" => Some(Self::Passed),
             "failed" => Some(Self::Failed),
             "landed" => Some(Self::Landed),
@@ -330,6 +341,11 @@ pub struct GateJob {
     /// can take minutes and its own terminal write records the honest outcome.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub home_land_in_flight: bool,
+    /// Node session/epoch the land was granted for: binds the Landing row to
+    /// the carrier session whose dispatch was authorized, so a paused frame
+    /// delivered to a replacement session after a restart cannot land.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_session_epoch: Option<String>,
     /// Base (`main`) sha the merge was verified onto.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_sha: Option<String>,
@@ -580,6 +596,42 @@ pub struct GateAuthorizeResult {
     /// Current Hub-side state when refused, for diagnostics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+}
+
+/// `gate.landGrant` params (Node→Hub) at the verify→land boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateLandGrantParams {
+    /// Job the Node is about to land.
+    pub job_id: String,
+    /// Attempt generation that verified.
+    #[serde(default)]
+    pub generation: u32,
+    /// Host asking for the grant.
+    pub host_id: String,
+    /// Node session/epoch this dispatch was authorized for: a paused frame
+    /// delivered to a replacement session must not match.
+    #[serde(default)]
+    pub session_epoch: String,
+}
+
+/// Result of a land-grant request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateLandGrantResult {
+    /// True only when the Hub transitioned Running → Landing for this exact
+    /// tuple; false means the push must not happen.
+    pub granted: bool,
+    /// Echoed generation.
+    #[serde(default)]
+    pub generation: u32,
+    /// Hub row state when refused (`canceling` / `canceled` / …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// True when a cancel landed but the land was already granted: the cancel
+    /// API surfaces "landing in progress" rather than a false cancellation.
+    #[serde(default)]
+    pub landing_in_progress: bool,
 }
 
 /// `gate.then` params: post-land command on the project's home host.

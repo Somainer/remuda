@@ -18,6 +18,10 @@ mod entity;
 mod error;
 mod files;
 mod gate;
+/// Test access to the land-grant answer type.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub use gate::LandGrantAnswer as GateLandGrantAnswer;
 mod hook_shim;
 mod identity;
 mod interactions;

@@ -214,6 +214,20 @@ impl remuda_node::GateAuthorizer for StubAuthorizer {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(std::future::ready(self.0))
     }
+
+    fn request_land_grant<'a>(
+        &'a self,
+        _job_id: &'a str,
+        _generation: u32,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = remuda_node::GateLandGrantAnswer> + Send + 'a>,
+    > {
+        // Stub grants iff it authorizes.
+        Box::pin(std::future::ready(remuda_node::GateLandGrantAnswer {
+            granted: self.0,
+            landing_in_progress: false,
+        }))
+    }
 }
 
 /// Even with NO local cancel record, the Hub fence refuses a generation the

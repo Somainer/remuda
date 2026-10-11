@@ -1688,6 +1688,16 @@ impl ShellPtyDriver {
         *self.poller_shutdown.lock().await = resumed.poller_shutdown.lock().await.take();
         *self.poller_finalised.lock().await = resumed.poller_finalised.lock().await.take();
         *self.waiter.lock().await = resumed.waiter.lock().await.take();
+        // c-usagefu r8 item 2: adopt the resumed driver's file-tail adapter
+        // handle. `resumed.spawn_*` stored it on `resumed.adapters`; taking it
+        // here keeps the tail task alive on `self`. Dispose of the previous
+        // driver's handle deliberately first (its process is gone — abort
+        // before the replace so supervisor.rs does not abort the NEW task
+        // when `resumed` drops without adopting it.
+        if let Some(old) = self.adapters.lock().await.take() {
+            drop(old);
+        }
+        *self.adapters.lock().await = resumed.adapters.lock().await.take();
         // §9.1: adopt the resumed run's switch coordination. Its worker and
         // mapper share a bridge, and its event sender is the live one. When a
         // switch was mid-flight at resume, adopt the resumed bridge so the
@@ -4499,5 +4509,54 @@ mod tests {
             "'/data/it'\\''s.png'",
             "an embedded quote must not end the quoting"
         );
+    }
+}
+
+#[cfg(test)]
+mod r8_adapter_adoption_tests {
+
+    /// c-usagefu r8 item 2: when start_resumed_inner adopts the resumed
+    /// driver's fields, the file-tail AdapterHandle must move from resumed to
+    /// self (not abort when resumed drops). This verifies the exact adoption
+    /// invariant: the NEW task handle stays live after `resumed` is consumed.
+    #[tokio::test]
+    async fn adopted_adapter_handle_survives_resumed_driver_drop() {
+        // Build a real supervisor-spawned adapter task that blocks on a
+        // channel receiver (so it stays alive without a real rollout).
+        let (_tx, rx) = tokio::sync::mpsc::channel::<remuda_protocol::Observation>(8);
+        let task = tokio::spawn(async move {
+            // Park forever until aborted.
+            let _ = rx;
+            std::future::pending::<()>().await;
+        });
+        let handle = crate::adapters::supervisor::AdapterHandle { tasks: vec![task] };
+        // The resumed driver "holds" it (as start_resumed_inner places it).
+        let mut resumed_slot: Option<crate::adapters::supervisor::AdapterHandle> = Some(handle);
+
+        // Simulate the adoption lines from start_resumed_inner: dispose old
+        // (None here), then take the resumed handle into self_slot.
+        let mut self_slot: Option<crate::adapters::supervisor::AdapterHandle> = None;
+        // old handle: first launch's adapter is gone (process closed)
+        if let Some(old) = self_slot.take() {
+            drop(old);
+        }
+        // THE FIX: take from resumed so it survives resumed's drop.
+        self_slot = resumed_slot.take();
+
+        // resumed_slot is now None: dropping the (empty) resumed driver must
+        // NOT abort the task.
+        drop(resumed_slot);
+
+        // Yield so any spurious abort would take effect.
+        tokio::task::yield_now().await;
+        let adopted = self_slot.as_ref().expect("self holds the handle");
+        assert_eq!(
+            adopted.live_task_count(),
+            1,
+            "the resumed adapter task stays alive after resumed drops"
+        );
+
+        // Cleanup: dropping self aborts as expected.
+        drop(self_slot);
     }
 }

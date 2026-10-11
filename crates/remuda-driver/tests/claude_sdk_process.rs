@@ -2157,10 +2157,6 @@ async fn cancelling_b_emits_a_settlement_at_its_ticket_position_before_c_starts(
 /// deferredSettle marker (None = ordinary settlement, Some("true") = deferred
 /// correction); returns None for non-settled results. Use this to count ALL
 /// settledRootTurn observations and inspect the deferred flag.
-
-/// deferredSettle marker (None = ordinary settlement, Some("true") = deferred
-/// correction); returns None for non-settled results. Use this to count ALL
-/// settledRootTurn observations and inspect the deferred flag.
 fn settled_marker(o: &Observation) -> Option<Option<&str>> {
     match &o.body {
         ObservationPayload::Lifecycle(p) => match p.as_ref() {
@@ -2216,10 +2212,13 @@ async fn aborting_before_the_writer_accepts_never_writes_the_prompt() {
 
     // A second, normal prompt must run: proves the cancelled reservation was
     // rolled back cleanly (one start, one settle) and the first never wrote.
-    driver
-        .send(prompt_id("the real prompt", "msg-real"))
-        .await
-        .expect("the follow-up send succeeds");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        driver.send(prompt_id("the real prompt", "msg-real")),
+    )
+    .await
+    .expect("follow-up send within 5s")
+    .expect("the follow-up send succeeds");
     let obs = collect_until(&mut handle, Duration::from_secs(5), |seen| {
         seen.iter()
             .any(|o| lifecycle_named(o) == Some("turn_started"))
@@ -2291,8 +2290,13 @@ async fn aborting_inside_the_real_writer_window_keeps_the_accepted_turn_ordered_
     gate.close();
 
     let mut send_a = Box::pin(driver.send(prompt_id("first", "msg-a")));
+    let parked = async {
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_until_parked())
+            .await
+            .expect("writer parks inside its window within 5s")
+    };
     tokio::select! {
-        _ = gate.wait_until_parked() => {}
+        _ = parked => {}
         r = &mut send_a => panic!("A should park inside the writer window, got {r:?}"),
     }
     // Caller aborts while the writer holds the accepted command.
@@ -2323,9 +2327,9 @@ async fn aborting_inside_the_real_writer_window_keeps_the_accepted_turn_ordered_
     );
 
     // A normal follow-up turn B.
-    driver
-        .send(prompt_id("second", "msg-b"))
+    tokio::time::timeout(Duration::from_secs(5), driver.send(prompt_id("second", "msg-b")))
         .await
+        .expect("B send within 5s")
         .expect("B sends");
     let b = collect_until(&mut handle, Duration::from_secs(5), |seen| {
         turn_done_count(seen) >= 1

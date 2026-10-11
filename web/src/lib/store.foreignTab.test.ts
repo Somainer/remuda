@@ -126,14 +126,14 @@ it("GATE12 item 6: two aborting load reclaims arm the tracked wakeup that delive
   const OWNER_KEY = "remuda-outbox-owner";
   const owner = "owner_g12_item6";
   sessionStorage.setItem(OWNER_KEY, owner);
-  const deadline = Date.now() + 30_000;
+  const LEASE_MS = 30_000;
   localStorage.setItem(
     OUTBOX_LS_KEY,
     JSON.stringify([
       row({
         commandId: "cmd_wake_store",
         state: "inflight",
-        lease: { owner, until: deadline },
+        lease: { owner, until: Date.now() + LEASE_MS },
       }),
     ]),
   );
@@ -163,10 +163,8 @@ it("GATE12 item 6: two aborting load reclaims arm the tracked wakeup that delive
   };
 
   const { api, hubStore } = await fresh();
-  await bootLive(api, hubStore);
-  // Both load reclaims aborted; the boot-time flush saw a fresh inflight claim
-  // and POSTed nothing.
-  expect(reclaimWrites).toBe(2);
+  // Spy installed BEFORE bootstrap so the boot-time flush (which must POST
+  // nothing — the fresh inflight claim is not deliverable) is observed too.
   const send = vi
     .spyOn(api, "instanceSend")
     .mockImplementation((async (_iid, _prompt, _att, _mode, commandId) => ({
@@ -180,12 +178,19 @@ it("GATE12 item 6: two aborting load reclaims arm the tracked wakeup that delive
         resolution: "clear",
       } as Awaited<ReturnType<Api["instanceSend"]>>["command"],
     })) as Api["instanceSend"]);
+  await bootLive(api, hubStore);
+  // Both load reclaims aborted; the boot-time flush saw a fresh inflight claim
+  // and POSTed nothing.
+  expect(reclaimWrites).toBe(2);
   expect(send).not.toHaveBeenCalled();
 
-  // At the lease deadline, with NO other trigger: the wakeup reclaims and the
-  // store wiring flushes -> exactly one POST and a durable delivered state.
-  await vi.advanceTimersByTimeAsync(31_000);
-  await vi.advanceTimersByTimeAsync(40_000); // let the drained delivery chain settle
+  // Advance EXACTLY to the lease deadline — no extra wall time. The wake fires
+  // at the deadline; drain its microtask chain (reclaim -> flush -> POST)
+  // without advancing the clock, so a late delivery cannot pass this test.
+  await vi.advanceTimersByTimeAsync(LEASE_MS);
+  for (let i = 0; i < 20 && send.mock.calls.length === 0; i += 1) {
+    await vi.advanceTimersByTimeAsync(0);
+  }
   expect(send).toHaveBeenCalledTimes(1);
   expect(send.mock.calls[0]?.[4]).toBe("cmd_wake_store");
   const stored = JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];

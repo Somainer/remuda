@@ -274,6 +274,110 @@ describe("Outbox", () => {
     }
   });
 
+  it("GATE12 item 3: dispose during a deferred deadline READ makes the wakeup return with no reclaim, no flush, zero timers", async () => {
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(300_000);
+      let releaseRead: (() => void) | null = null;
+      const readGate = new Promise<void>((r) => void (releaseRead = r));
+      class GatedRead extends MemStorage {
+        reads = 0;
+        override async all() {
+          this.reads += 1;
+          if (this.reads >= 2) await readGate; // load's own read (1) passes
+          return await super.all();
+        }
+      }
+      const store = new GatedRead();
+      const owner = "owner_disp_read";
+      const putP = store.put(
+        rec({
+          commandId: "cmd_disp_read",
+          instanceId: "ins_disp",
+          state: "inflight",
+          lease: { owner, until: Date.now() + LEASE_TTL_MS },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await putP;
+      const box = await Outbox.load(store, owner);
+      await vi.advanceTimersByTimeAsync(0);
+      const wakes = vi.fn();
+      box.onClaimWake = wakes;
+      const reclaimSpy = vi.spyOn(store, "reclaimInflight");
+
+      // Deadline fires; the durable read is suspended.
+      await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
+      expect(box.pendingClaimWakeups()).toEqual([]); // handle deleted when fire started
+      box.dispose(); // teardown while the read is in flight
+      releaseRead!();
+      await vi.advanceTimersByTimeAsync(10_000); // far past any retry/backoff
+
+      // Nothing reclaimed, nothing delivered, nothing re-armed.
+      expect(reclaimSpy).not.toHaveBeenCalled();
+      expect(store.map.get("cmd_disp_read")?.state).toBe("inflight");
+      expect(wakes).not.toHaveBeenCalled();
+      expect(box.pendingClaimWakeups()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
+  it("GATE12 item 3: dispose during a deferred deadline RECLAIM makes the wakeup return with no cache mutation, no flush, zero timers", async () => {
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(400_000);
+      let releaseReclaim: (() => void) | null = null;
+      const reclaimGate = new Promise<void>((r) => void (releaseReclaim = r));
+      class GatedReclaim extends MemStorage {
+        override async reclaimInflight(
+          id: string,
+          expected: { owner: string; until: number },
+        ): Promise<OutboxRecord | null> {
+          await reclaimGate;
+          return await super.reclaimInflight(id, expected);
+        }
+      }
+      const store = new GatedReclaim();
+      const owner = "owner_disp_reclaim";
+      const putP = store.put(
+        rec({
+          commandId: "cmd_disp_reclaim",
+          instanceId: "ins_disp",
+          state: "inflight",
+          lease: { owner, until: Date.now() + LEASE_TTL_MS },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await putP;
+      const box = await Outbox.load(store, owner);
+      await vi.advanceTimersByTimeAsync(0);
+      const wakes = vi.fn();
+      box.onClaimWake = wakes;
+
+      // Deadline: read succeeds, reclaim transaction is suspended.
+      await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
+      box.dispose(); // teardown while the reclaim is in flight
+      releaseReclaim!(); // the IDB tx itself then commits pending
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      // The durable tx may finish, but the disposed Outbox never caches,
+      // emits or triggers delivery, and arms no retry.
+      expect(store.map.get("cmd_disp_reclaim")?.state).toBe("pending");
+      expect(box.get("cmd_disp_reclaim")?.state).toBe("inflight"); // cache untouched
+      expect(wakes).not.toHaveBeenCalled();
+      expect(box.pendingClaimWakeups()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
   it("GATE12 item 2: a one-shot durable-read failure at the deadline retries bounded with the SAME snapshot and still delivers", async () => {
     // The pre-fix fire treated a rejected storage.all() like "row gone" and
     // stopped, so the only wakeup was lost (the store's own lease scheduler

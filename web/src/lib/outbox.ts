@@ -539,6 +539,13 @@ export class Outbox {
     Id,
     { instanceId: Id; snapshot: { owner: Id; until: number }; handle: ReturnType<typeof setTimeout> }
   >();
+  /**
+   * Set by {@link dispose}. A deadline callback already suspended inside
+   * storage.all()/reclaimInflight when dispose() ran can resume afterwards;
+   * it must then neither reclaim/cache nor re-arm nor fire the delivery
+   * callback (gate 12 item 3). Checked at every async boundary.
+   */
+  private disposed = false;
 
   /**
    * Store hook fired exactly once when a tracked wakeup reclaims a row: the
@@ -790,6 +797,9 @@ export class Outbox {
     snapshot: { owner: Id; until: number },
     failures = 0,
   ) {
+    // Gate 12 item 3: a suspended deadline callback that resumes after
+    // dispose must never re-arm.
+    if (this.disposed) return;
     const old = this.claimWakeups.get(commandId);
     if (old) clearTimeout(old.handle);
     // A follow-up to a failed deadline read/reclaim waits a capped
@@ -838,6 +848,9 @@ export class Outbox {
     snapshot: { owner: Id; until: number },
     failures = 0,
   ) {
+    // Gate 12 item 3: a handle can fire around the same microtask dispose
+    // clears the map; a disposed Outbox runs no deadline work at all.
+    if (this.disposed) return;
     // Read + conditional reclaim as ONE critical section under the instance
     // lock (gate 12 item 1). Gate 12 item 2: a FAILED read/reclaim is
     // distinguished from a successful read that finds the row missing or
@@ -857,6 +870,8 @@ export class Outbox {
       } catch {
         return { kind: "failure" } satisfies Outcome;
       }
+      // Gate 12 item 3: dispose while the read was suspended — never reclaim.
+      if (this.disposed) return { kind: "stop", rec: null };
       const current = durable.find((r) => r.commandId === commandId);
       // A successful read found the row missing or terminal: stop.
       if (!current || current.state !== "inflight" || !current.lease) {
@@ -875,6 +890,8 @@ export class Outbox {
       // Same exact snapshot and its deadline has passed: conditional reclaim.
       try {
         const reclaimed = await this.storage.reclaimInflight(commandId, snapshot);
+        // Gate 12 item 3: dispose while the reclaim was suspended.
+        if (this.disposed) return { kind: "stop", rec: null };
         if (!reclaimed) return { kind: "stop", rec: null };
         return reclaimed.state === "pending"
           ? { kind: "deliver", rec: reclaimed }
@@ -888,6 +905,11 @@ export class Outbox {
       // retry as a storage failure.
       outcome = { kind: "failure" };
     }
+
+    // Gate 12 item 3: teardown while the read/reclaim was suspended — drop
+    // whatever the storage layer returned: no cache write, no re-arm, no
+    // delivery trigger.
+    if (this.disposed) return;
 
     if (outcome.kind === "failure") {
       if (failures + 1 < CLAIM_WAKE_MAX_FAILURES) {
@@ -907,10 +929,19 @@ export class Outbox {
     }
   }
 
-  /** Cancel every tracked claim wakeup (page teardown / test disposal). */
+  /**
+   * Cancel every tracked claim wakeup (page teardown / logout / test
+   * disposal). Permanent for this instance: a deadline callback suspended in
+   * a storage call when dispose runs is neutralized by the `disposed` flag
+   * (no reclaim side effects, no re-arm, no delivery), and the store's
+   * delivery callback is dropped so a late wake can never flush a logged-out
+   * auth epoch (gate 12 item 3).
+   */
   dispose() {
+    this.disposed = true;
     for (const entry of this.claimWakeups.values()) clearTimeout(entry.handle);
     this.claimWakeups.clear();
+    this.onClaimWake = null;
   }
 
   isFlushing(instanceId: Id): boolean {

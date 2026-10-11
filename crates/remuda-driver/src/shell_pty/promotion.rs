@@ -976,6 +976,7 @@ pub(super) fn spawn(
                     &seq,
                     &ctx,
                     None,
+                    false,
                 )
                 .await;
                 announced = None;
@@ -990,6 +991,7 @@ pub(super) fn spawn(
                     &seq,
                     &ctx,
                     None,
+                    false,
                 )
                 .await;
                 announced = None;
@@ -1036,6 +1038,7 @@ pub(super) fn spawn(
                             &seq,
                             &ctx,
                             None,
+                            false,
                         )
                         .await;
                         announced = None;
@@ -1390,6 +1393,7 @@ pub(super) fn spawn(
                         &seq,
                         &ctx,
                         None,
+                        false,
                     )
                     .await
                 }
@@ -1418,6 +1422,7 @@ pub(super) fn spawn(
             &seq,
             &ctx,
             faults.as_ref(),
+            true,
         )
         .await;
         // Production is complete once the finalise has RETIRED the gate
@@ -1798,7 +1803,7 @@ async fn maintain_binding(
     }
 
     if bindings.degraded() {
-        finalize_hydrator(hydrator, pending, notify, events, seq, ctx, None).await;
+        finalize_hydrator(hydrator, pending, notify, events, seq, ctx, None, false).await;
         let related = bindings
             .binding()
             .map(|binding| {
@@ -1931,7 +1936,7 @@ async fn maintain_binding(
             Err(()) => {
                 // The bound file vanished: degrade, never silently rebind.
                 bindings.mark_degraded("bound transcript file vanished");
-                finalize_hydrator(hydrator, pending, notify, events, seq, ctx, None).await;
+                finalize_hydrator(hydrator, pending, notify, events, seq, ctx, None, false).await;
                 let related = BTreeMap::from([
                     ("sessionId".to_owned(), binding.session_id.clone()),
                     ("source".to_owned(), binding.source.as_wire().to_owned()),
@@ -2282,11 +2287,16 @@ fn run_terminal_finalise(
 /// Finalise and discard the current hydrator, if any, preserving the last
 /// turn's observations across an epoch boundary (c-ctxusage r4 item 2).
 ///
+/// `final_close` distinguishes the promoter's terminal shutdown from an
+/// in-life epoch boundary (demote/promote/rebind/vanish): a boundary finish
+/// drops the hydrator but keeps the gate unretired so a later bind can
+/// publish a new hydrator; the terminal finish retires it for good.
+///
 /// c-ctxusage r9 item 2: registration happens synchronously BEFORE the
-/// blocking closure is queued, and claim/park/retire are one gate
+/// blocking closure is queued, and claim/park/completion are one gate
 /// transition — an abort can never declare completion while a finalise is
-/// merely queued. An aborted task leaves the detached closure to retire the
-/// gate; the guard's identical terminal finish then finds it retired.
+/// merely queued. An aborted task leaves the detached closure to complete
+/// the gate; the guard's identical terminal finish then waits on retirement.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_hydrator(
     gate: &PromoteGate,
@@ -2296,14 +2306,22 @@ async fn finalize_hydrator(
     seq: &AtomicU64,
     ctx: &PromoteCtx,
     faults: Option<&Arc<crate::test_faults::FaultState>>,
+    final_close: bool,
 ) {
     if !gate.has_hydrator() && !gate.producer_active() {
+        if final_close {
+            // Unbound terminal shutdown: retire so the flusher can exit.
+            gate.retire_idle();
+        }
         return;
     }
     // Test-only seam: the injected skip fault makes the cooperative reading
     // finalise a no-op, so the abort test exercises ONLY the FinaliseGuard
     // (models close aborting past its bound). No file is read in production.
     if faults.is_some_and(|faults| faults.skip_cooperative_finalise()) {
+        if final_close {
+            gate.retire_idle();
+        }
         return;
     }
     // Register synchronously, before spawn_blocking enqueues the closure.
@@ -2320,8 +2338,10 @@ async fn finalize_hydrator(
         let Some(mut hydrator) = gate.claim_terminal() else {
             if gate.is_retired() {
                 gate.complete_terminal();
-            } else {
+            } else if final_close {
                 gate.retire();
+            } else {
+                gate.finish_boundary();
             }
             return;
         };
@@ -2332,7 +2352,11 @@ async fn finalize_hydrator(
         if !frames.is_empty() {
             pending.push_all_blocking(frames);
         }
-        gate.retire();
+        if final_close {
+            gate.retire();
+        } else {
+            gate.finish_boundary();
+        }
     });
     let _ = join.await;
     let _ = (events, seq, ctx);
@@ -3521,7 +3545,7 @@ mod tests {
         );
 
         // Close/exit/demotion all route through finalize_hydrator now.
-        finalize_hydrator(&hydrator, &pending, &notify, &tx, &seq, &ctx, None).await;
+        finalize_hydrator(&hydrator, &pending, &notify, &tx, &seq, &ctx, None, true).await;
         // Cooperative shutdown: release and join the streaming flusher, like
         // the production loop does, so no detached task outlives the test.
         hydrator.retire_idle();

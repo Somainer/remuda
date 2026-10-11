@@ -202,6 +202,17 @@ impl<T> ProducerGate<T> {
         self.cv.notify_all();
     }
 
+    /// Finish a TERMINAL producer at an EPOCH BOUNDARY rather than the end of
+    /// the pump: the hydrator is not returned and the registration drops, but
+    /// the epoch is not retired, so a later bind can publish a new hydrator
+    /// (demote/rebind within one promoter lifetime).
+    pub(crate) fn finish_boundary(&self) {
+        let mut state = self.lock();
+        state.hydrator = None;
+        state.count = state.count.saturating_sub(1);
+        self.cv.notify_all();
+    }
+
     /// Discard the live hydrator unread (a foreign/cwd-mismatched bind)
     /// without registering a producer.
     pub(crate) fn discard_hydrator(&self) -> Option<T> {
@@ -336,5 +347,29 @@ mod tests {
         assert_eq!(claimed, Some(42), "terminal claims the restored hydrator");
         gate.retire();
         assert!(gate.is_retired());
+    }
+
+    #[test]
+    fn an_epoch_boundary_finish_allows_a_later_rebind_but_a_close_does_not() {
+        // In-life demote/rebind finalise: the hydrator is dropped but the
+        // epoch stays alive, so a following publish binds a new hydrator.
+        let gate = ProducerGate::<u32>::new();
+        gate.publish(1);
+        assert!(gate.register_terminal());
+        let hydrator = gate.claim_terminal().expect("boundary claims");
+        assert_eq!(hydrator, 1);
+        gate.finish_boundary();
+        assert!(!gate.is_retired());
+        assert!(!gate.producer_active());
+        gate.publish(2);
+        assert!(gate.has_hydrator());
+
+        // The terminal close finish retires for good: publish is a no-op.
+        assert!(gate.register_terminal());
+        assert_eq!(gate.claim_terminal(), Some(2));
+        gate.retire();
+        gate.publish(3);
+        assert!(!gate.has_hydrator());
+        assert!(!gate.register_terminal());
     }
 }

@@ -388,9 +388,12 @@ impl CodexAdapter {
         // Usage first: the extractor is stateful (turn→model map) and must see
         // records in file order regardless of what else they map to.
         let usage_event = self.usage.on_record(&record);
-        if let Some(event) = &usage_event {
-            self.usage_totals.push(event);
-        }
+        // c-usagefu r8 item 5: only keep/emit a usage event the in-memory
+        // aggregator ACCEPTS (it rejects duplicate request ids and cumulative
+        // token_count rows). A rejected event would still carry a durable
+        // response id the Hub would dedupe, but suppressing it at the source
+        // keeps the adapter and the Hub consistent on a replay.
+        let usage_event = usage_event.filter(|event| self.usage_totals.push(event));
         let turn = turn_id(&record);
         match &record.event {
             CodexRolloutEvent::SessionMeta { session_id, .. } => {

@@ -1742,3 +1742,36 @@ fn closing_the_last_discovery_window_clears_recorded_prompts() {
     );
     assert!(late.binding().is_none());
 }
+
+// c-usagefu r8 item 5: aggregator-rejected usage is not emitted -----------
+
+#[test]
+fn a_duplicate_usage_record_emits_only_one_message_observation() {
+    // Two identical token_usage_record lines (same response id): the
+    // UsageAggregator accepts the first and rejects the second, so only one
+    // Message observation is produced.
+    let line = |ordinal: u32| {
+        format!(
+            "{{\"ordinal\":{ordinal},\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"tdup\",\"response_id\":\"rdup\",\"usage\":{{\"input_tokens\":0,\"cached_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":10000,\"reasoning_output_tokens\":0,\"total_tokens\":10000}}}}}}\n"
+        )
+    };
+    let mut adapter = CodexAdapter::new(AdapterHome {
+        home: tempfile::tempdir().unwrap().path().to_path_buf(),
+        cwd: PathBuf::from("/w"),
+        pid: None,
+        launched_at: None,
+    });
+    let first = adapter.on_line(1, &line(1));
+    let second = adapter.on_line(2, &line(2));
+    let msg_count = |v: &[AdapterObservation]| {
+        v.iter()
+            .filter(|o| matches!(&o.payload, ObservationPayload::Usage(u) if u.scope == UsageScope::Message))
+            .count()
+    };
+    assert_eq!(msg_count(&first), 1, "first record emits one Message");
+    assert_eq!(
+        msg_count(&second),
+        0,
+        "duplicate rejected by aggregator → no Message"
+    );
+}

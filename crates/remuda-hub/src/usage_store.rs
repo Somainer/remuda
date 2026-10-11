@@ -406,7 +406,14 @@ fn insert_legacy_session_point(conn: &Connection, row: &UsageEventRow) -> rusqli
 }
 
 /// Generic append (`INSERT OR IGNORE` on the `(instance_id, seq)` PK).
+/// Message rows take the upsert path (c-usagefu r8 item 5): a replayed
+/// response with the SAME durable (instance, scope, scope_id) updates the
+/// stored row when it carries better attribution (a turn_id / native
+/// timestamp the first write lacked) rather than being silently dropped.
 fn insert_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+    if row.scope == "message" && row.scope_id.is_some() {
+        return upsert_message_row(conn, row);
+    }
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO usage_events
             (instance_id, seq, profile_id, model, scope, scope_id, turn_id, mode,
@@ -437,6 +444,84 @@ fn insert_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> 
         ],
     )?;
     Ok(inserted > 0)
+}
+
+/// Insert or improve a durable Message row keyed on
+/// (instance_id, scope='message', scope_id). c-usagefu r8 item 5: a byte-0
+/// replay re-emits the same response; if the existing row lacks turn_id or a
+/// native timestamp and the incoming row carries one, update those fields
+/// (and counters/cost when the existing row had them NULL). Returns true when
+/// a row was inserted OR updated.
+fn upsert_message_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO usage_events
+            (instance_id, seq, profile_id, model, scope, scope_id, turn_id, mode,
+             metric_revision, total_tokens, input_tokens, output_tokens,
+             cache_read_tokens, cache_write_tokens, cost_usd, accounting,
+             observed_at, observed_at_source, native_context_window)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+        params![
+            row.instance_id,
+            row.seq,
+            row.profile_id,
+            row.model,
+            row.scope,
+            row.scope_id,
+            row.turn_id,
+            row.mode,
+            row.metric_revision,
+            row.total_tokens,
+            row.input_tokens,
+            row.output_tokens,
+            row.cache_read_tokens,
+            row.cache_write_tokens,
+            row.cost_usd,
+            row.accounting,
+            row.observed_at,
+            row.observed_at_source,
+            row.native_context_window,
+        ],
+    )?;
+    if inserted > 0 {
+        return Ok(true);
+    }
+    // Duplicate durable key: improve the stored row where the incoming row has
+    // a value the stored one lacks (turn_id, native timestamp/source, NULL
+    // counters/cost). Never overwrite a present value with NULL.
+    let updated = conn.execute(
+        "UPDATE usage_events SET
+             turn_id = COALESCE(turn_id, ?3),
+             total_tokens = COALESCE(total_tokens, ?4),
+             input_tokens = COALESCE(input_tokens, ?5),
+             output_tokens = COALESCE(output_tokens, ?6),
+             cache_read_tokens = COALESCE(cache_read_tokens, ?7),
+             cache_write_tokens = COALESCE(cache_write_tokens, ?8),
+             cost_usd = COALESCE(cost_usd, ?9),
+             observed_at = CASE
+                 WHEN observed_at_source = 'native' THEN observed_at
+                 WHEN ?11 = 'native' THEN ?10
+                 ELSE observed_at END,
+             observed_at_source = CASE
+                 WHEN observed_at_source = 'native' THEN 'native'
+                 ELSE ?11 END
+         WHERE instance_id = ?1 AND scope = 'message' AND scope_id = ?2
+           AND (turn_id IS NULL
+                OR (observed_at_source != 'native' AND ?11 = 'native'))",
+        params![
+            row.instance_id,        // ?1
+            row.scope_id,           // ?2
+            row.turn_id,            // ?3
+            row.total_tokens,       // ?4
+            row.input_tokens,       // ?5
+            row.output_tokens,      // ?6
+            row.cache_read_tokens,  // ?7
+            row.cache_write_tokens, // ?8
+            row.cost_usd,           // ?9
+            row.observed_at,        // ?10
+            row.observed_at_source, // ?11
+        ],
+    )?;
+    Ok(updated > 0)
 }
 
 /// Counters carried by one scoped snapshot, in fold order.
@@ -2364,6 +2449,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!(at, native_at);
+    }
+
+    #[test]
+    fn message_upsert_fills_turn_id_and_native_time_on_replay() {
+        // c-usagefu r8 item 5: the FIRST write of a response lacked turn_id
+        // and carried ingest time (older adapter build); a replayed row with
+        // the same response id supplies them and must UPDATE the stored row,
+        // not be dropped by the unique index.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // First write: no native timestamp (ingest), no turn_id.
+        let first = JournalRecord {
+            instance_id: "ins_upsert".into(),
+            seq: 1,
+            event_id: "e1".into(),
+            event: json!({
+                "kind":"usage",
+                "payload":{
+                    "scope":"message","scopeId":"r1","mode":"snapshot","metricRevision":"1",
+                    "inputTokens":{"state":"known","value":"0"},
+                    "outputTokens":{"state":"known","value":"100"},
+                    "cost":{"state":"known","value":{"amount":"0.10","currency":"USD"}},
+                    "accounting":"estimated",
+                }
+            }),
+            observed_at: "2030-01-01T00:00:00Z".into(),
+        };
+        let first_row = project_usage_event(&first, None, None).unwrap();
+        assert!(insert_row(&conn, &first_row).unwrap());
+        let (turn, source): (Option<String>, String) = conn
+            .query_row(
+                "SELECT turn_id, observed_at_source FROM usage_events WHERE scope_id='r1'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(turn, None);
+        assert_eq!(source, "ingest");
+
+        // Replay with native timestamp + turn_id (new seq).
+        let native = "2026-09-15T00:00:00.000Z";
+        let second = JournalRecord {
+            instance_id: "ins_upsert".into(),
+            seq: 2,
+            event_id: "e2".into(),
+            event: json!({
+                "kind":"usage",
+                "nativeAt":{"state":"known","value":native},
+                "source":{"nativeTurnId":{"state":"known","value":"t7"}},
+                "payload":{
+                    "scope":"message","scopeId":"r1","mode":"snapshot","metricRevision":"1",
+                    "inputTokens":{"state":"known","value":"0"},
+                    "outputTokens":{"state":"known","value":"100"},
+                    "cost":{"state":"known","value":{"amount":"0.10","currency":"USD"}},
+                    "accounting":"estimated",
+                }
+            }),
+            observed_at: "2030-01-01T00:00:00Z".into(),
+        };
+        let second_row = project_usage_event(&second, None, None).unwrap();
+        let changed = insert_row(&conn, &second_row).expect("upsert succeeds");
+        assert!(changed, "the better-attributed replay updated the row");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE scope_id='r1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "still one row");
+        let (turn, source, at): (Option<String>, String, String) = conn
+            .query_row(
+                "SELECT turn_id, observed_at_source, observed_at FROM usage_events WHERE scope_id='r1'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(turn.as_deref(), Some("t7"));
+        assert_eq!(source, "native");
+        assert_eq!(at, native);
     }
 
     #[test]

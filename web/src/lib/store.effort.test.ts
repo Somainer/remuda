@@ -338,18 +338,25 @@ it("while queued the entry shows queued until a strictly newer read-back", async
 
 it("r9 item 8: a delayed OFF lifecycle after a newer ON request leaves B's pending untouched", async () => {
   const ctx = await startFollowing("off-after-on", { state: "known", value: "idle" });
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
 
   // A flips the switch OFF at the current high tier...
   await hubStore.setUltracode(ctx.instance.id, false);
+  const idA = posts[0]?.requestId!;
   const pendingA = hubStore.effortPendingOf(ctx.instance.id);
   expect(pendingA).toMatchObject({ name: "high", ultracode: false });
   // ...then B flips it ON before A's lifecycle lands.
   await hubStore.setUltracode(ctx.instance.id, true);
+  const idB = posts[1]?.requestId!;
   expect(hubStore.effortPendingOf(ctx.instance.id)).toMatchObject({ name: "high", ultracode: true });
 
   // A's delayed OFF (both the space command form and the legacy separator
-  // form) must not clear B's pending/threshold nor select B off.
+  // form) must not clear B's pending/threshold nor select B off. The id-less
+  // edges simulate an older driver; an id-bearing A edge names A explicitly.
   for (const word of ["ultracode off", "ultracode:off"]) {
     ctx.receive(configureLifecycle(9, `effort-applied:${word}`));
     const pending = hubStore.effortPendingOf(ctx.instance.id);
@@ -358,6 +365,11 @@ it("r9 item 8: a delayed OFF lifecycle after a newer ON request leaves B's pendi
       ultracode: true,
     });
   }
+  ctx.receive(configureLifecycleFor(9, "effort-applied:ultracode off", idA));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toMatchObject({
+    name: "high",
+    ultracode: true,
+  });
 
   // A delayed OFF QUEUED edge must not stamp B's queued time or flip it queued.
   const beforeQueued = hubStore.effortPendingOf(ctx.instance.id)?.queuedObservedAt;
@@ -367,7 +379,7 @@ it("r9 item 8: a delayed OFF lifecycle after a newer ON request leaves B's pendi
   expect(after?.queuedObservedAt).toBe(beforeQueued);
 
   // B's own ON applied clears it.
-  ctx.receive(configureLifecycle(11, "effort-applied:ultracode on"));
+  ctx.receive(configureLifecycleFor(11, "effort-applied:ultracode on", idB));
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
@@ -458,7 +470,11 @@ it("r4 item 3: a decoupled tier drag with the flag on is matched by the plain le
   // degraded lifecycle carries the LEVEL word even though the pending's flag
   // is on. The pending must be matched and cleared — 切换中 must not stick.
   const ctx = await startFollowing("decoupled-drag-flag-on", { state: "known", value: "working" });
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
   const row: Instance = {
     ...ctx.instance,
     durableSeq: "99",
@@ -476,10 +492,12 @@ it("r4 item 3: a decoupled tier drag with the flag on is matched by the plain le
 
   // Drag to max with the flag still on → the driver types plain /effort max.
   await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: true });
+  const id = posts[0]?.requestId!;
   expect(hubStore.effortPendingOf(ctx.instance.id)?.commandWord).toBe("max");
 
-  // QUEUED with the LEVEL word despite flag=true.
-  ctx.receive(configureLifecycle(2, "effort-queued:max", "x", "2026-10-08T12:01:01.000Z"));
+  // QUEUED with the LEVEL word despite flag=true (the r10+ driver echoes the
+  // configure request id).
+  ctx.receive(configureLifecycleFor(2, "effort-queued:max", id, "x", "2026-10-08T12:01:01.000Z"));
   expect(hubStore.effortPendingOf(ctx.instance.id)).toMatchObject({
     name: "max",
     ultracode: true,
@@ -489,7 +507,7 @@ it("r4 item 3: a decoupled tier drag with the flag on is matched by the plain le
   // A flag REFUSAL word ("ultracode") for the same request also clears the
   // pending (the configure carried the flag even though the typed word was
   // the plain level).
-  ctx.receive(configureLifecycle(3, "effort-degraded:max:dialog-kept", "x", "2026-10-08T12:01:05.000Z"));
+  ctx.receive(configureLifecycleFor(3, "effort-degraded:max:dialog-kept", id, "x", "2026-10-08T12:01:05.000Z"));
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
@@ -497,16 +515,21 @@ it("a decoupled queued `ultracode on` edge names the flag request and keeps the 
   // The driver's decoupled command word is "ultracode on" (a space); the
   // queued/applied lifecycle must parse as the FLAG axis, not an unknown tier.
   const ctx = await startFollowing("queued-flag-word", { state: "known", value: "working" });
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
   await hubStore.setEffort(ctx.instance.id, { index: 3, name: "xhigh", kind: "claude", ultracode: false });
   await hubStore.setUltracode(ctx.instance.id, true);
-  ctx.receive(configureLifecycle(2, "effort-queued:ultracode on", "x", "2026-10-08T12:02:01.000Z"));
+  const id = posts[1]?.requestId!;
+  ctx.receive(configureLifecycleFor(2, "effort-queued:ultracode on", id, "x", "2026-10-08T12:02:01.000Z"));
   expect(hubStore.effortPendingOf(ctx.instance.id)).toMatchObject({
     name: "xhigh",
     ultracode: true,
     queued: true,
   });
-  ctx.receive(configureLifecycle(3, "effort-applied:ultracode on", "x", "2026-10-08T12:02:05.000Z"));
+  ctx.receive(configureLifecycleFor(3, "effort-applied:ultracode on", id, "x", "2026-10-08T12:02:05.000Z"));
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
@@ -536,12 +559,16 @@ it("item 3: A's degraded LEVEL word never rolls back B's in-flight ultracode req
 
 it("a rejected switch reverts and records the model-scoped refusal", async () => {
   const ctx = await startFollowing("revert");
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
   const toast = vi.spyOn(hubStore, "toast");
   ctx.instance.effortEffective = { name: "high", ultracode: false, source: "slash", observedAt: "2026-09-16T00:00:00.000Z" };
 
   await hubStore.setEffort(ctx.instance.id, effortAt("claude", 3, true));
-  ctx.receive(configureLifecycle(4, "effort-degraded:ultracode:ultracode-unavailable-for-model"));
+  ctx.receive(configureLifecycleFor(4, "effort-degraded:ultracode:ultracode-unavailable-for-model", posts[0]?.requestId!));
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
   expect(hubStore.effortOf(ctx.instance.id, "claude")).toMatchObject({ name: "high", ultracode: false });
   const refusal = hubStore.effortRefusalOf(ctx.instance.id);
@@ -1209,7 +1236,11 @@ it("r5 item 2: the command-word predictor falls back to the durable record on re
   // The r4 predictor only read effective/optimistic state and predicted
   // "high", so queued/applied/degraded ("ultracode on|off") never matched.
   const ctx = await startFollowing("predictor-durable-fallback");
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
   vi.spyOn(api, "instanceList").mockResolvedValue({ items: [] } as never);
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
   const row: Instance = {
@@ -1234,9 +1265,8 @@ it("r5 item 2: the command-word predictor falls back to the durable record on re
   })();
   expect(queuedWord).toBe("ultracode on");
   // Lifecycle matching accepts the space form (r5 item 2 separator fix).
-  // Applied (not degraded) so the applied word match path settles it.
   // Applied (not degraded) so the applied-word match path settles it.
-  ctx.receive(configureLifecycle(2, "effort-applied:ultracode on", "xhigh"));
+  ctx.receive(configureLifecycleFor(2, "effort-applied:ultracode on", posts[0]?.requestId!, "xhigh"));
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
   hubStore.logout();
 });
@@ -1884,6 +1914,11 @@ it("a stale effort poll older than the queued configure leaves the queued switch
   const t15 = "2026-09-16T00:10:30Z";
   const t2 = "2026-09-16T00:11:00Z";
   const list = vi.spyOn(api, "instanceList");
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
 
   // Baseline effective t1.
   list.mockResolvedValue({
@@ -1895,9 +1930,10 @@ it("a stale effort poll older than the queued configure leaves the queued switch
   // User queues a max switch: baseline t1.
   await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
 
-  // Live delivery: the queued configure is journaled at t2.
+  // Live delivery: the queued configure is journaled at t2 (the r10+ driver
+  // echoes the configure request id).
   const queued = {
-    ...configureLifecycle(2, "effort-queued:max", ctx.instance.id),
+    ...configureLifecycleFor(2, "effort-queued:max", posts[0]?.requestId!, ctx.instance.id),
     observedAt: t2,
   };
   ctx.receive(queued);
@@ -2248,4 +2284,76 @@ it("r11 item 2: a wire-synthesized queued no-op starts its moved axis unsettled"
     }),
   );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+it("r11 item 3: an id-less older-driver A OFF timeout while B ON is queued keeps B and never rolls back", async () => {
+  const ctx = await startFollowing("r11-item3-iddless", { state: "known", value: "working" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  ctx.receive(effortEvent(2, "high", true, "slash", "2026-10-09T00:00:00.000Z"));
+
+  // A flips OFF (older driver will journal NO request id), then B flips ON.
+  const a = hubStore.setUltracode(ctx.instance.id, false);
+  await a;
+  const idB = (await (async () => {
+    await hubStore.setUltracode(ctx.instance.id, true);
+    return posts[1]?.requestId!;
+  })());
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idB);
+  expect(hubStore.effortOf(ctx.instance.id, "claude").ultracode).toBe(true);
+
+  // A times out with an ID-LESS degraded verdict (both the read-back-window
+  // and the dialog-kept words). Command-word matching alone used to delete the
+  // newer client request B and roll its selection back.
+  ctx.receive(
+    configureLifecycle(3, "effort-degraded:ultracode off:no-readback-within-window", ctx.instance.id, "2026-10-09T00:01:00.000Z"),
+  );
+  let b = hubStore.effortPendingOf(ctx.instance.id);
+  expect(b, "B survives A's id-less no-readback verdict").not.toBeNull();
+  expect(b?.requestId).toBe(idB);
+  expect(hubStore.effortOf(ctx.instance.id, "claude").ultracode).toBe(true);
+  expect(toast, "an id-less verdict that cannot name A raises no toast").not.toHaveBeenCalled();
+
+  ctx.receive(
+    configureLifecycle(4, "effort-degraded:ultracode off:dialog-kept", ctx.instance.id, "2026-10-09T00:01:05.000Z"),
+  );
+  b = hubStore.effortPendingOf(ctx.instance.id);
+  expect(b, "B survives A's id-less dialog-kept verdict").not.toBeNull();
+  expect(b?.requestId).toBe(idB);
+  expect(hubStore.effortOf(ctx.instance.id, "claude").ultracode).toBe(true);
+  expect(toast).not.toHaveBeenCalled();
+
+  // B's own id-bearing completion settles normally.
+  ctx.receive(configureLifecycleFor(5, "effort-applied:ultracode on", idB, ctx.instance.id, "2026-10-09T00:02:00.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+it("r11 item 3: an id-less genuine model/workflow refusal is recorded as environment evidence but never deletes B", async () => {
+  const ctx = await startFollowing("r11-item3-envrefuse", { state: "known", value: "working" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+
+  await hubStore.setUltracode(ctx.instance.id, false);
+  await hubStore.setUltracode(ctx.instance.id, true);
+  const idB = posts[1]?.requestId!;
+
+  // An id-less workflows-disabled refusal (older driver, possibly A's
+  // environment) is genuine environment evidence: the switch is disabled, but
+  // the newer client request B is neither deleted nor rolled back.
+  ctx.receive(
+    configureLifecycle(3, "effort-degraded:ultracode off:ultracode-workflows-disabled", ctx.instance.id, "2026-10-10T00:01:00.000Z"),
+  );
+  expect(hubStore.effortRefusalOf(ctx.instance.id)).not.toBeNull();
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idB);
+  expect(hubStore.effortOf(ctx.instance.id, "claude").ultracode).toBe(true);
 });

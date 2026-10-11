@@ -1618,11 +1618,18 @@ class HubStore {
       typeof edgeRequestId === "string" && edgeRequestId.trim() ? edgeRequestId : null;
     const current = this.state.effortPending[instanceId];
     // Whether an edge belongs to the current pending: an id is authoritative;
-    // without one the strict word matcher decides (never a bare tier match).
-    const edgeBelongsTo = (pending: EffortPending, kind: EffortLifecycleKind): boolean =>
-      edgeId !== null
-        ? edgeId === pending.requestId
-        : effortLifecycleMatches(pending, parsed.word, kind);
+    // without one the strict word/value matcher decides — and, per
+    // c-effortread r11 item 3, an ID-LESS edge may close only a pending
+    // SYNTHESIZED FROM THE WIRE (a configure posted outside this UI). A
+    // client request's pending can be cleared/rolled back ONLY by an edge
+    // carrying its own id: an older driver's same-word degraded for a
+    // replaced request A must not delete the newer client request B.
+    const edgeBelongsTo = (pending: EffortPending, kind: EffortLifecycleKind): boolean => {
+      if (edgeId !== null) return edgeId === pending.requestId;
+      return (
+        pending.source === "lifecycle" && effortLifecycleMatches(pending, parsed.word, kind)
+      );
+    };
     // THIS request's queued edge timestamp. Parsed as an instant like every
     // other observedAt comparison (r6 same-second fix).
     const queuedThreshold =
@@ -1727,8 +1734,12 @@ class HubStore {
     const namesCurrent = current
       ? edgeId !== null
         ? edgeId === current.requestId
-        : current.source === "lifecycle" ||
-          effortLifecycleMatches(current, parsed.word, "degraded")
+        : // c-effortread r11 item 3: an id-less degraded verdict can clear a
+          // pending only when THIS tab never owned the request (a wire-owned
+          // pending). It can never delete or roll back a client request: the
+          // word alone cannot tell a replaced request A from the newer B —
+          // not even when both are ultracode toggle words.
+          current.source === "lifecycle"
       : false;
     const mutatesRequest = !current || namesCurrent;
     if (!mutatesRequest && !isUltraRefusal) return;

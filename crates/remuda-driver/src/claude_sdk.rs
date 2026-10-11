@@ -87,6 +87,19 @@ impl ClaudeSdkDriver {
     pub fn force_exit_build_to_fail(&self) {
         self.inner.force_exit_build_to_fail();
     }
+
+    /// Test-only (`test-stub`): Weak to the driver's Inner for drop-leak tests.
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub fn weak_inner(&self) -> std::sync::Weak<crate::claude_print::Inner> {
+        self.inner.weak_inner()
+    }
+
+    /// Test-only (`test-stub`): force writer call `n`+ to fail (r7 items 2/5).
+    #[cfg(feature = "test-stub")]
+    pub fn force_write_failure_from(&self, n: usize) {
+        self.inner.force_write_failure_from(n);
+    }
 }
 
 #[async_trait]

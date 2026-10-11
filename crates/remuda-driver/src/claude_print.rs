@@ -13,9 +13,9 @@ use crate::recipe::{EnvAllowlistSource, LaunchRecipe};
 use async_trait::async_trait;
 use remuda_claude_wire::{
     AssistantMessage, CanUseToolRequest, ClaudeProcess, ControlRequest, ControlRequestEnvelope,
-    ControlSuccessPayload, Inbound, InitializeRequest, Outbound, PermissionResult, ResultMessage,
-    StreamEventMessage, SystemInit, SystemMessage, TaskNotification, TaskProgress, TaskStarted,
-    TaskUpdated, UserContent, UserMessage,
+    ControlSuccessPayload, Inbound, InitializeRequest, Outbound, PermissionResult, ProcessWriter,
+    ResultMessage, StreamEventMessage, SystemInit, SystemMessage, TaskNotification, TaskProgress,
+    TaskStarted, TaskUpdated, UserContent, UserMessage,
 };
 use remuda_protocol::hubnode::AttachmentKind;
 use remuda_protocol::{
@@ -218,19 +218,19 @@ impl TurnBook {
     }
 
     /// Roll back the reservation for turn `seq` when its prompt write failed
-    /// (ma-sdk-state r6 item 1). The prompt never reached the child, so that
-    /// turn is still empty; remove it only when it is the back turn AND carries
-    /// `seq`, and clear `reserved` only when it names `seq`. Keying on the seq
-    /// means a rollback for an older/dropped reservation can never remove a
-    /// NEWER turn a concurrent send already began.
+    /// (ma-sdk-state r6 item 1; r7 item 1). The prompt never reached the child,
+    /// so that turn is still empty. Remove the entry carrying `seq` WHEREVER it
+    /// sits in the FIFO (not only the back): a write-failed turn has produced no
+    /// frames and owns no workflows, so it is always safe to pull it out, and
+    /// cancelling only a matching back entry could leave a phantom turn ahead of
+    /// a later reservation. Clear `reserved` only when it names `seq`.
     ///
     /// Returns true when removing this turn drained the last outstanding local
     /// turn and thereby RELEASED a deferred root settle (r6 item 5): an earlier
     /// completed turn's result is now owed an idle.
     fn cancel_turn(&mut self, seq: u64) -> bool {
-        if self.outstanding.back().is_some_and(|turn| turn.seq == seq)
-            && let Some(turn) = self.outstanding.pop_back()
-        {
+        if let Some(pos) = self.outstanding.iter().position(|turn| turn.seq == seq) {
+            let turn = self.outstanding.remove(pos).expect("positioned turn");
             for id in turn.open_workflows {
                 self.workflow_owner.remove(&id);
             }
@@ -323,9 +323,15 @@ impl TurnBook {
             // turn (pure replay/hydration) live in the implicit bucket; they
             // still gate settlement even when a synthetic turn is popped.
             if queued != 0 || !self.implicit_workflows.is_empty() {
-                return RootSettle::NotSettled;
-            }
-            if self.outstanding.is_empty() {
+                // r7 item 4: a native queued turn / open workflow owns the next
+                // settle — external state the book cannot track — so ALWAYS drop
+                // any local deferral here (whether or not a newer local turn is
+                // outstanding). Otherwise a later write failure would synthesise
+                // settledRootTurn while that native turn is still in flight. The
+                // native turn's own result delivers the settle in order.
+                self.deferred_settle = false;
+                RootSettle::NotSettled
+            } else if self.outstanding.is_empty() {
                 // Any prior deferral is now superseded by a real settle.
                 self.deferred_settle = false;
                 RootSettle::Settled
@@ -508,7 +514,9 @@ impl NativeIds {
     }
 }
 
-struct Inner {
+/// Shared per-launch driver state. Public only for the `test-stub`
+/// Weak-based drop-leak seam; not part of the stable driver API.
+pub struct Inner {
     live: Mutex<Option<Live>>,
     mapper: Mutex<Mapper>,
     /// D-057 OA6 r3: publication FIFO. Every stdout frame's map+emit and every
@@ -555,6 +563,15 @@ struct Inner {
     /// taken, so a test can prove the RunHandle still reaches EOF on close.
     #[cfg(feature = "test-stub")]
     exit_build_fails: std::sync::atomic::AtomicBool,
+    /// r7 items 2/5: 1-based write number from which the writer call is forced
+    /// to fail (test-stub) WITHOUT touching the live child — a deterministic
+    /// write failure the ordered cleanup/fail path runs on. usize::MAX = off.
+    #[cfg(feature = "test-stub")]
+    fail_from_write: std::sync::atomic::AtomicUsize,
+    /// Count of writer calls made by `drive_prompt_write` (test-stub), pairing
+    /// with `fail_from_write`.
+    #[cfg(feature = "test-stub")]
+    write_number: std::sync::atomic::AtomicUsize,
 }
 
 /// Native Claude print driver (`claude -p` stream-json).
@@ -607,6 +624,24 @@ impl ClaudePrintDriver {
         self.inner
             .exit_build_fails
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only (`test-stub`): force writer call number `n` (1-based) and
+    /// every later one to fail without touching the live child (r7 items 2/5).
+    #[cfg(feature = "test-stub")]
+    pub fn force_write_failure_from(&self, n: usize) {
+        self.inner
+            .fail_from_write
+            .store(n, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only (`test-stub`): a Weak to this driver's [`Inner`], so a test can
+    /// prove every Arc is released after a failed write + close (r7 item 3: no
+    /// reservation-guard leak).
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub fn weak_inner(&self) -> std::sync::Weak<Inner> {
+        std::sync::Arc::downgrade(&self.inner)
     }
 
     /// Build a driver from explicit options.
@@ -672,6 +707,10 @@ impl ClaudePrintDriver {
                 barrier: std::sync::Mutex::new(None),
                 #[cfg(feature = "test-stub")]
                 exit_build_fails: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(feature = "test-stub")]
+                fail_from_write: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                #[cfg(feature = "test-stub")]
+                write_number: std::sync::atomic::AtomicUsize::new(0),
             }),
             reader: Mutex::new(None),
             publisher: Mutex::new(None),
@@ -995,87 +1034,35 @@ impl Driver for ClaudePrintDriver {
             DriverInput::Prompt(prompt) => {
                 // ma-sdk-state r6 item 1: resolve ALL fallible prompt content
                 // (notably reading a staged image attachment) BEFORE opening the
-                // turn book or enqueuing its ticket. A `?` here must leave no
-                // reservation parked in the publication worker and no empty
-                // outstanding turn.
+                // turn book or enqueuing its ticket.
                 let content = prompt_content(&prompt.blocks)?;
-                // D-057 OA6 r3 item 5: never hold `live` across the write
-                // await. A child that stopped draining stdin blocks the pipe
-                // for as long as it likes; holding the process lock over that
-                // await made close() block acquiring `live` and kept the
-                // bounded close ladder from ever starting. Clone the cheap
-                // writer handle under the lock, DROP the lock, then await.
+                let client_message_id = prompt.native_client_message_id.clone();
+                // ma-sdk-state r7 items 1+2: drive the reservation/write to
+                // completion in a DETACHED, write_seq-serialized task. The
+                // caller awaiting (or being aborted/timed out) owns only a
+                // result oneshot — dropping it neither cancels a prompt the
+                // writer still commits nor interleaves cleanup with a later
+                // reservation, because the task holds write_seq across the whole
+                // enqueue → writer-outcome → rollback sequence.
+                let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                let inner = self.inner.clone();
                 let writer = {
-                    let live = self.inner.live.lock().await;
+                    let live = inner.live.lock().await;
                     let Some(live) = live.as_ref() else {
                         return Err(DriverError::ControlUnavailable);
                     };
                     live.process.writer()
                 };
-                // Concurrent prompts must reserve, write and start in FIFO;
-                // write_seq spans the ticket enqueue + write + commit.
-                // close/cancel never take it, so they remain reachable while a
-                // prompt is blocked.
-                let _seq = self.inner.write_seq.lock().await;
-                // ma-sdk-state r5 item 1: the turn ticket lives IN the
-                // publication ordering, not a side slot. Open the mapper book
-                // synchronously (a result the child emits while the write is
-                // in flight maps against the pre-opened turn, never early-idle)
-                // and enqueue a Reserve ticket BEFORE awaiting the write. The
-                // worker parks at that ticket's queue position until the write
-                // resolves and emits turn_started there, so every frame the
-                // turn produces — enqueued only after the child receives the
-                // prompt — is published strictly behind its start.
-                let reservation = {
-                    let mut mapper = self.inner.mapper.lock().await;
-                    let seq = mapper.begin_turn_reservation();
-                    TurnReservation::shared(seq, prompt.native_client_message_id.clone())
-                };
-                // From here on an early return (a failed ticket enqueue) or a
-                // dropped future must cancel the ticket and roll the empty book
-                // back; the guard does it on drop, keyed to this turn's seq so a
-                // newer begin is never clobbered.
-                let guard = ReservationGuard::new(self.inner.clone(), reservation.clone());
-                let publisher = self.inner.publish.lock().await.clone();
-                if let Some(publisher) = publisher.as_ref()
-                    && publisher
-                        .send(PublishJob::Reserve {
-                            reservation: reservation.clone(),
-                        })
-                        .is_err()
-                {
-                    // Publication worker gone (session closing): the guard rolls
-                    // the empty book back and unblocks any waiter.
-                    return Err(DriverError::ControlUnavailable);
-                }
-                // test-stub only: record that this turn's ticket is in the
-                // publication queue (its book was opened just above).
-                #[cfg(feature = "test-stub")]
-                test_barrier::note_reserve_enqueued(&self.inner.barrier);
-                let write = writer.send_user(content).await;
-                match write {
-                    Ok(()) => {
-                        // test-stub only: deterministically park HERE (write
-                        // acked, reservation not yet committed) so a test can
-                        // deliver the child's result behind the parked ticket.
-                        #[cfg(feature = "test-stub")]
-                        test_barrier::hold_write_commit(&self.inner.barrier).await;
-                        // Unparks the worker at the ticket; it clears the
-                        // reservation and emits turn_started in queue order.
-                        guard.commit();
-                        Ok(DriverAck::transport_written())
-                    }
-                    Err(error) => {
-                        // Roll the empty book back BEFORE resolving the parked
-                        // ticket, emitting any deferred settle the cancelled turn
-                        // blocked (r6 item 5); no turn_started is emitted for the
-                        // unwritten prompt. Frames queued behind it flow
-                        // unchanged against the rolled-back book.
-                        if let Err(settle_error) = guard.fail().await {
-                            warn!(%settle_error, "deferred settle emission failed after a failed write");
-                        }
-                        Err(map_wire(error))
-                    }
+                tokio::spawn(async move {
+                    let result =
+                        drive_prompt_write(&inner, writer, content, client_message_id).await;
+                    let _ = done_tx.send(result);
+                });
+                match done_rx.await {
+                    Ok(ack) => ack,
+                    // Completion task vanished (shutdown/panic); it alone drives
+                    // the guard, so there is nothing left to cancel here.
+                    Err(_) => Err(DriverError::ControlUnavailable),
                 }
             }
             DriverInput::Steer(_) => Err(DriverError::CapabilityUnknown("steer".into())),
@@ -1391,6 +1378,94 @@ fn signal_child_group(pgid: i32, signal: nix::sys::signal::Signal, carrier: &str
     }
 }
 
+/// Drive one prompt's reservation → write → publication completion (r7 items
+/// 1+2). Runs in a DETACHED task so it survives caller abort/timeout:
+/// reservation completion is tied to the WRITER's definitive outcome (prompt
+/// committed vs. certainly not written), never to the caller's ack waiter.
+///
+/// Holds `write_seq` for the entire sequence, serialising cleanup against the
+/// next send's reservation. The publication ticket is enqueued before the
+/// write; on a definitive write failure the book is rolled back (before the
+/// ticket resolves) and any deferred root settle is published once through the
+/// ordered FIFO.
+async fn drive_prompt_write(
+    inner: &Arc<Inner>,
+    writer: ProcessWriter,
+    content: UserContent,
+    client_message_id: String,
+) -> DriverResult<DriverAck> {
+    let _seq = inner.write_seq.lock().await;
+
+    let reservation = {
+        let mut mapper = inner.mapper.lock().await;
+        let seq = mapper.begin_turn_reservation();
+        TurnReservation::shared(seq, client_message_id)
+    };
+    let guard = ReservationGuard::new(inner.clone(), reservation.clone());
+
+    let publisher = inner.publish.lock().await.clone();
+    let Some(publisher) = publisher.as_ref() else {
+        // Publication worker gone (session closing): roll the empty book back;
+        // nothing can be published.
+        guard.fail().await;
+        return Err(DriverError::ControlUnavailable);
+    };
+    if publisher
+        .send(PublishJob::Reserve {
+            reservation: reservation.clone(),
+        })
+        .is_err()
+    {
+        guard.fail().await;
+        return Err(DriverError::ControlUnavailable);
+    }
+    // test-stub: record that this turn's ticket is in the publication queue.
+    #[cfg(feature = "test-stub")]
+    test_barrier::note_reserve_enqueued(&inner.barrier);
+
+    // test-stub (r7 item 2): park here, pre-ack, so a test can abort the
+    // CALLER while this detached task (and the writer write) is still in flight.
+    #[cfg(feature = "test-stub")]
+    test_barrier::hold_before_write_ack(&inner.barrier).await;
+
+    // test-stub (r7 item 5): a numbered forced write fault exercises the
+    // ordered fail() path on a LIVE child without relying on a racy broken pipe
+    // — the reservation is open but the write is definitively not committed.
+    #[cfg(feature = "test-stub")]
+    let forced_failure = {
+        let n = inner.write_number.fetch_add(1, Ordering::AcqRel) + 1;
+        n >= inner.fail_from_write.load(Ordering::Acquire)
+    };
+    #[cfg(not(feature = "test-stub"))]
+    let forced_failure = false;
+
+    // This await is the WRITER's definitive outcome. The caller cannot abort
+    // it: the task owns the oneshot ack and keeps running, so a prompt the
+    // writer commits is always committed and announced even if the caller gave
+    // up waiting.
+    let write_outcome: Result<(), remuda_claude_wire::Error> = if forced_failure {
+        // Definitively not written: never call the writer so the live child is
+        // untouched and no prompt reaches it.
+        Err(remuda_claude_wire::Error::StdinClosed)
+    } else {
+        writer.send_user(content).await
+    };
+    match write_outcome {
+        Ok(()) => {
+            #[cfg(feature = "test-stub")]
+            test_barrier::hold_write_commit(&inner.barrier).await;
+            guard.commit();
+            Ok(DriverAck::transport_written())
+        }
+        Err(error) => {
+            // Definitively not written: ordered rollback (emits the deferred
+            // settle through the FIFO) and ticket cancel before returning.
+            guard.fail().await;
+            Err(map_wire(error))
+        }
+    }
+}
+
 async fn map_loop(
     inner: Arc<Inner>,
     mut outbound: mpsc::Receiver<Outbound>,
@@ -1449,6 +1524,11 @@ enum PublishJob {
     Reserve { reservation: Arc<TurnReservation> },
     /// The child's stdout closed; emit exactly one `exited` (deduped).
     StdoutEof,
+    /// Emit already-built observations through the SAME FIFO path as mapped
+    /// frames. Used for the deferred root settle published when a newer turn's
+    /// write fails (r7 item 1), so the correction is ordered with the frames
+    /// around it rather than sent on a side channel.
+    Emit(Vec<Observation>),
 }
 
 /// A prompt write's turn ticket (ma-sdk-state r5 item 1).
@@ -1534,13 +1614,11 @@ impl TurnReservation {
     }
 }
 
-/// Owns one turn's [`TurnReservation`] for the lifetime of a prompt send
-/// (ma-sdk-state r6 item 1). `commit` is called only on a successful write; if
-/// the future is dropped for ANY other reason — a failed ticket enqueue, a
-/// write error, an early `return`, or a panic — `Drop` cancels the ticket
-/// synchronously (a worker parked in `wait_for_commit` is released at once and
-/// no turn_started is emitted) and rolls the empty pre-opened book back, keyed
-/// to the reservation's seq so a NEWER concurrent turn is never touched.
+/// Owns one turn's [`TurnReservation`] for the lifetime of a prompt write
+/// (ma-sdk-state r6/r7). The reservation lifecycle is driven by the detached,
+/// ordered write-completion task (not the caller's await), so an aborted caller
+/// cannot cancel a prompt the writer still writes. `commit`/`fail` are called
+/// exactly once from that task; `Drop` is only panic safety.
 struct ReservationGuard {
     inner: Arc<Inner>,
     reservation: Arc<TurnReservation>,
@@ -1556,30 +1634,43 @@ impl ReservationGuard {
         }
     }
 
-    /// The write succeeded: keep the reservation (the worker emits the start);
-    /// the matching `Drop` is then a no-op.
+    /// The writer committed the prompt: keep the reservation so the worker emits
+    /// the start; the matching `Drop` is then a no-op.
     fn commit(mut self) {
         self.resolved = true;
         self.reservation.commit();
     }
 
-    /// The write failed on a live child. Roll the book back BEFORE resolving the
-    /// ticket (r6 item 5 ordering), emitting the deferred root settle the
-    /// cancelled turn blocked, then unblock the worker. Consumes the guard so
-    /// `Drop` is a no-op.
-    async fn fail(self) -> DriverResult<()> {
+    /// The writer definitively did NOT write the prompt. Roll the book back
+    /// BEFORE resolving the ticket, and publish the deferred root settle the
+    /// cancelled turn blocked through the ORDERED publication FIFO (a queued
+    /// [`PublishJob::Emit`] behind this ticket, so it lands after the frames
+    /// already queued and before any later turn), then unblock the worker.
+    /// Consumes the guard and lets it DROP normally (r7 item 3: no
+    /// `mem::forget`, no Arc leak).
+    async fn fail(mut self) {
         let deferred = {
             let mut mapper = self.inner.mapper.lock().await;
-            mapper.cancel_turn_reservation(self.reservation.seq)?
+            match mapper.cancel_turn_reservation(self.reservation.seq) {
+                Ok(deferred) => deferred,
+                Err(error) => {
+                    warn!(%error, "turn rollback failed during reservation cleanup");
+                    None
+                }
+            }
         };
-        // Resolve the ticket only after the book is rolled back, so the worker
-        // waking on it maps subsequent frames against the rolled-back book.
-        self.reservation.cancel();
         if let Some(observation) = deferred {
-            emit_all(&self.inner, vec![observation]).await?;
+            // Enqueue while the worker is still parked on this ticket: the Emit
+            // job sits behind it (and any already-queued frames) and is drained
+            // only after the cancel wakes the worker past the ticket.
+            if let Some(publisher) = self.inner.publish.lock().await.clone() {
+                if publisher.send(PublishJob::Emit(vec![observation])).is_err() {
+                    debug!("publication gone; deferred settle dropped on close");
+                }
+            }
         }
-        std::mem::forget(self);
-        Ok(())
+        self.resolved = true;
+        self.reservation.cancel();
     }
 }
 
@@ -1588,9 +1679,10 @@ impl Drop for ReservationGuard {
         if self.resolved {
             return;
         }
-        // Safety net for an unexpected drop (panic/task cancellation): wake the
-        // parked worker immediately, then roll the book back best-effort. This
-        // path does not emit a deferred settle; the explicit `fail` does.
+        // Panic safety only (the normal completion task always calls commit or
+        // fail): wake the parked worker immediately, then roll the book back
+        // best-effort on a detached task. No deferred settle is emitted here —
+        // the ordered `fail` path owns that exactly once.
         self.reservation.cancel();
         let inner = self.inner.clone();
         let seq = self.reservation.seq;
@@ -1641,6 +1733,18 @@ pub mod test_barrier {
         /// the first turn's buffered result.
         worker_released: AtomicBool,
         worker_resume: tokio::sync::Notify,
+        /// r7 item 2: the detached write task has enqueued Reserve and is parked
+        /// immediately BEFORE awaiting the writer ack, so a test can abort the
+        /// caller while the write is still in flight.
+        write_parked: AtomicBool,
+        write_gate_open: AtomicBool,
+        write_gate: tokio::sync::Notify,
+        /// 1-based index of the writer call at/after which the pre-ack gate
+        /// parks (`MAX` = never). Lets a test let prompt A's write run but hold
+        /// prompt B's failed write until A's result has been mapped (r7 items
+        /// 2/5).
+        write_number: AtomicUsize,
+        park_from_write: AtomicUsize,
     }
 
     /// An armed write-commit barrier. Releases on drop.
@@ -1660,6 +1764,11 @@ pub mod test_barrier {
             send_release: tokio::sync::Notify::new(),
             worker_released: AtomicBool::new(false),
             worker_resume: tokio::sync::Notify::new(),
+            write_parked: AtomicBool::new(false),
+            write_gate_open: AtomicBool::new(false),
+            write_gate: tokio::sync::Notify::new(),
+            write_number: AtomicUsize::new(0),
+            park_from_write: AtomicUsize::new(usize::MAX),
         });
         *slot.lock().expect("barrier lock") = Some(state.clone());
         WriteCommitBarrier { state }
@@ -1667,6 +1776,29 @@ pub mod test_barrier {
 
     fn current(slot: &Slot) -> Option<Arc<State>> {
         slot.lock().expect("barrier lock").clone()
+    }
+
+    /// r7 item 2 hook: park the DETACHED write task AFTER the Reserve ticket is
+    /// enqueued but BEFORE it awaits the writer ack — the precise point where
+    /// the caller can be aborted while the prompt is still in flight.
+    pub(super) async fn hold_before_write_ack(slot: &Slot) {
+        let Some(state) = current(slot) else {
+            return;
+        };
+        let n = state.write_number.fetch_add(1, Ordering::AcqRel) + 1;
+        if n < state.park_from_write.load(Ordering::Acquire) {
+            // Earlier writes run straight through.
+            return;
+        }
+        state.write_parked.store(true, Ordering::Release);
+        if state.write_gate_open.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = state.write_gate.notified();
+        if state.write_gate_open.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
     }
 
     /// Send-task hook: after the write ack, block until the test releases the
@@ -1755,6 +1887,41 @@ pub mod test_barrier {
             }
         }
 
+        /// r7 item 2: park the pre-ack write gate starting at the 1-based write
+        /// number `n` (1 = the very next prompt, 2 = the second prompt, …).
+        pub fn park_from_write(&self, n: usize) {
+            self.state.park_from_write.store(n, Ordering::Release);
+        }
+
+        /// Whether the parked (thresholded) write has been reached yet.
+        pub async fn wait_until_write_parked(&self, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.write_parked.load(Ordering::Acquire)
+                    && self.state.reserve_enqueued.load(Ordering::Acquire) >= 1
+                {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "write_commit barrier: timed out waiting for the pre-ack park \
+                         (write_parked={}, enqueued={})",
+                        self.state.write_parked.load(Ordering::Acquire),
+                        self.state.reserve_enqueued.load(Ordering::Acquire)
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// r7 item 2: let the parked detached write task proceed to the writer
+        /// ack (and the write) after the caller was aborted.
+        pub fn release_write_ack(&self) {
+            if !self.state.write_gate_open.swap(true, Ordering::AcqRel) {
+                self.state.write_gate.notify_waiters();
+            }
+        }
+
         /// Block until the send parked post-write AND the worker parked at the
         /// turn's Reserve ticket, WITHOUT requiring the child's result to be
         /// queued yet — the commit-first variant releases here and lets the
@@ -1819,6 +1986,7 @@ pub mod test_barrier {
         /// Release both gates at once (send commits and the worker proceeds
         /// without an extra hold). Preserves the r4 single-gate behaviour.
         pub fn release(&self) {
+            self.release_write_ack();
             self.release_send();
             self.resume_worker();
         }
@@ -1889,6 +2057,7 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                 .await
             }
             PublishJob::StdoutEof => emit_exit(&inner, "exited").await,
+            PublishJob::Emit(observations) => emit_all(&inner, observations).await,
         };
         if let Err(error) = result {
             warn!("ordered publication failed: {error}");
@@ -5490,6 +5659,56 @@ mod turn_book_reserved_seq_tests {
         assert_eq!(book.reserved, Some(c));
         book.turn_committed(c);
         assert_eq!(book.reserved, None);
+    }
+
+    /// ma-sdk-state r7 item 1: a failed write must roll back the matching turn
+    /// WHEREVER it sits, not only the FIFO back — otherwise a reservation whose
+    /// cleanup lost the write_seq race leaves a phantom turn ahead of a later
+    /// one and shifts attribution.
+    #[test]
+    fn cancel_removes_a_matching_entry_even_when_it_is_not_the_back() {
+        let mut book = TurnBook::default();
+        let a = book.begin_turn();
+        let b = book.begin_turn();
+        let c = book.begin_turn();
+        assert!(!book.cancel_turn(b), "removing the middle settles nothing");
+        let seqs: Vec<u64> = book.outstanding.iter().map(|turn| turn.seq).collect();
+        assert_eq!(seqs, vec![a, c], "B gone, A and C intact");
+        // reserved still names C (B was not the reserved back here); clearing it
+        // is keyed to seq.
+        assert_eq!(book.reserved, Some(c));
+        // Removing C clears the C reservation; A still outstanding so no settle.
+        assert!(!book.cancel_turn(c));
+        assert_eq!(book.reserved, None);
+        assert_eq!(
+            book.outstanding.iter().map(|t| t.seq).collect::<Vec<_>>(),
+            vec![a]
+        );
+    }
+
+    /// ma-sdk-state r7 item 4: when the LAST local turn's result reports a
+    /// queued native follow-up, the deferred settle must be CLEARED — a later
+    /// failed write can never synthesise settledRootTurn while the native queue
+    /// is in flight.
+    #[test]
+    fn a_queued_last_local_result_clears_deferred_so_a_later_failure_cannot_settle() {
+        let mut book = TurnBook::default();
+        book.begin_turn(); // A
+        book.begin_turn(); // B (last local)
+        assert_eq!(book.result_settles_root(0), RootSettle::Deferred);
+        assert!(book.deferred_settle, "A is deferred behind B");
+
+        // B completes but a native follow-up turn is queued: B pops, NotSettled,
+        // and the book empties. The deferral must not survive.
+        assert_eq!(book.result_settles_root(1), RootSettle::NotSettled);
+        assert!(book.outstanding.is_empty());
+        assert!(
+            !book.deferred_settle,
+            "queued native turn owns the settle, not a later cancel"
+        );
+
+        // A later write failure (no matching entry left) releases nothing.
+        assert!(!book.cancel_turn(1));
     }
 
     /// ma-sdk-state r6 item 5: turn A completes while newer turn B is

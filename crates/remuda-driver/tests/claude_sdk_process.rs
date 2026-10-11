@@ -1524,3 +1524,172 @@ async fn a_successful_turn_then_a_failed_live_write_rolls_back_without_a_b_start
 
     driver.close().await.expect("close");
 }
+
+/// ma-sdk-state r7 item 2: aborting the CALLER after the prompt is enqueued but
+/// before the writer ack must not cancel the turn — the detached,
+/// write-ordered completion task still drives the writer write to success and
+/// the turn is announced and its result settles.
+#[tokio::test]
+async fn aborting_the_caller_after_enqueue_still_announces_and_settles_the_turn() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Park the FIRST write pre-ack (after Reserve enqueue).
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.park_from_write(1);
+    let mut send = Box::pin(driver.send(prompt("aborted after enqueue")));
+    tokio::select! {
+        _ = barrier.wait_until_write_parked(Duration::from_secs(5)) => {}
+        r = &mut send => panic!("send should be parked pre-ack, got {r:?}"),
+    }
+    // The caller gives up while the writer write is still in flight.
+    drop(send);
+
+    // The detached task proceeds: the writer still writes and commits.
+    barrier.release_write_ack();
+    drop(barrier);
+
+    let obs = collect_until(&mut handle, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .any(|o| lifecycle_named(o) == Some("turn_started"))
+            && turn_done_count(seen) >= 1
+    })
+    .await;
+    assert_eq!(
+        turn_started_count(&obs),
+        1,
+        "the written turn is announced once"
+    );
+    assert!(
+        turn_done_count(&obs) >= 1,
+        "its result is still published and settles"
+    );
+
+    driver.close().await.expect("close");
+}
+
+/// ma-sdk-state r7 item 3: a failed write must not leak the driver's Inner
+/// (the old ReservationGuard::fail used std::mem::forget). After the failed
+/// write and close, a Weak to Inner upgrades to None.
+#[tokio::test]
+async fn a_failed_write_and_close_release_the_driver_inner() {
+    let mut env = BTreeMap::new();
+    // Close stdin right after the handshake: the first prompt write fails on a
+    // live child deterministically (no fixed sleep).
+    env.insert("FAKE_CLAUDE_CLOSE_STDIN".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+    let weak = driver.weak_inner();
+    assert!(
+        weak.upgrade().is_some(),
+        "Inner is alive while the driver is"
+    );
+
+    let failed = driver.send(prompt("never written")).await;
+    assert!(
+        failed.is_err(),
+        "write against closed stdin must fail: {failed:?}"
+    );
+
+    driver.close().await.expect("close");
+    drop(handle);
+    drop(driver);
+
+    assert!(
+        weak.upgrade().is_none(),
+        "failed write + close leaked the driver Inner (forgotten ReservationGuard)"
+    );
+}
+
+/// ma-sdk-state r7 item 5: A's result is mapped DEFERRED while B's pre-opened
+/// book is open; B's write then definitively fails on the live child. The
+/// rollback publishes exactly ONE ordered correction (settledRootTurn=true,
+/// deferredSettle=true) through the publication FIFO and B never gets a
+/// turn_started.
+#[tokio::test]
+async fn a_deferred_result_publishes_one_settlement_when_b_write_fails() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = driver.arm_write_commit_barrier();
+    // Write #1 (A) passes the pre-ack gate; write #2 (B) parks pre-ack after
+    // reserving. The post-ack send gate still parks A's commit.
+    barrier.park_from_write(2);
+    // Deterministically fail B's write (write #2) without touching the child,
+    // so the ordered fail() path runs on a live process (no pipe-buffer race).
+    driver.force_write_failure_from(2);
+
+    // A's completion parks at the post-ack send gate while the worker holds A's
+    // ticket and A's result is already queued behind it.
+    let mut send_a = Box::pin(driver.send(prompt_id("first", "msg-a")));
+    tokio::select! {
+        _ = barrier.wait_until_result_parked(Duration::from_secs(5)) => {}
+        r = &mut send_a => panic!("A send should park post-write, got {r:?}"),
+    }
+
+    // Commit A: the worker publishes start_A then HOLDS at the ticket (worker
+    // gate shut), so A's buffered result is not mapped yet.
+    barrier.release_send();
+    send_a.await.expect("A writes");
+
+    // Drive B: it reserves (its write parks pre-ack, then the fault fires), then
+    // release the worker so A's result maps against the open B book (deferred),
+    // and release B's write gate so the ordered rollback emits the one
+    // settlement.
+    let b_send = std::pin::pin!(driver.send(prompt_id("second", "msg-b")));
+    let drive = async {
+        barrier
+            .wait_until_reserves_enqueued(2, Duration::from_secs(5))
+            .await;
+        barrier.resume_worker();
+        barrier.release_write_ack();
+    };
+    let (b_result, _) = tokio::join!(b_send, drive);
+    assert!(b_result.is_err(), "B's forced write must fail");
+
+    let obs = collect_until(&mut handle, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .filter_map(settled_marker)
+            .any(|deferred| deferred == "true")
+    })
+    .await;
+
+    assert_eq!(
+        turn_started_count(&obs),
+        1,
+        "only A starts; B's failed write emits no turn_started"
+    );
+    let settlements: Vec<&str> = obs.iter().filter_map(settled_marker).collect();
+    assert_eq!(
+        settlements,
+        vec!["true"],
+        "exactly one ordered deferred settlement"
+    );
+
+    // Child is still alive after B's failed write.
+    assert!(
+        !driver.process_gone().await,
+        "a failed write on the live child is not process loss"
+    );
+    driver.close().await.expect("close");
+}
+
+/// `Some("true")` only for a `result` carrying settledRootTurn=true; the value
+/// is its deferredSettle marker.
+fn settled_marker(o: &Observation) -> Option<&str> {
+    match &o.body {
+        ObservationPayload::Lifecycle(p) => match p.as_ref() {
+            LifecyclePayload::Native(n)
+                if n.native_name == "result"
+                    && n.related_ids.get("settledRootTurn").map(String::as_str) == Some("true") =>
+            {
+                n.related_ids.get("deferredSettle").map(String::as_str)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}

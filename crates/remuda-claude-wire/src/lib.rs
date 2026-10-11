@@ -13,5 +13,7 @@ pub use codec::{
     write_line,
 };
 pub use error::Error;
-pub use process::{ClaudeProcess, SettingSources, SettingsArg, SpawnMode, SpawnSpec};
+pub use process::{
+    ClaudeProcess, ProcessWriter, SettingSources, SettingsArg, SpawnMode, SpawnSpec,
+};
 pub use types::*;

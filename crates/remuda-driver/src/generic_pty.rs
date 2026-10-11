@@ -1042,18 +1042,99 @@ fn pane_exit_diagnostic(data: &serde_json::Value) -> String {
     }
 
     // The last stderr line the child produced before exiting.
-    if let Some(stderr) = str_field(&[
-        "lastStderr",
-        "last_stderr",
-        "stderr",
-        "message",
-        "error",
-        "detail",
-    ]) {
+    // c-cardsettle-fu2 r1 item 3: accept ONLY the dedicated
+    // lastStderr/last_stderr fields (not arbitrary message/error/detail
+    // objects), keep just the last non-empty line, cap its length, and
+    // redact credential-looking content — this string is journaled,
+    // projected to instances.last_error, and rendered in the session end
+    // bar, so it must be bounded and never carry a header/token verbatim.
+    if let Some(stderr) = str_field(&["lastStderr", "last_stderr"])
+        .as_deref()
+        .and_then(sanitize_exit_stderr)
+    {
         return format!("agent process exited: {stderr}");
     }
 
     FALLBACK.to_owned()
+}
+
+/// Maximum length kept from a pane's last-stderr exit diagnostic. The text is
+/// stored in the journal, `instances.last_error`, and shown in the session
+/// end bar; a few hundred chars is enough to identify the failure.
+const EXIT_STDERR_MAX_CHARS: usize = 300;
+
+/// Take the child's last stderr text, keep its final non-empty line, cap it to
+/// [`EXIT_STDERR_MAX_CHARS`], and redact credential-looking content
+/// (Authorization/Bearer headers, `token=`/`key=` query/body pairs).
+fn sanitize_exit_stderr(raw: &str) -> Option<String> {
+    let last_line = raw.lines().map(str::trim).rfind(|line| !line.is_empty())?;
+    let truncated = if last_line.chars().count() > EXIT_STDERR_MAX_CHARS {
+        let taken: String = last_line.chars().take(EXIT_STDERR_MAX_CHARS).collect();
+        format!("{taken}…")
+    } else {
+        last_line.to_owned()
+    };
+    Some(redact_secret(&truncated))
+}
+
+/// Replace credential-bearing substrings with `[redacted]`. Covers HTTP
+/// Authorization headers, Bearer tokens, and `token=`/`key=` values.
+/// Single forward byte scan over the lowercased input; output is assembled
+/// once, so it always terminates and handles overlapping/repeated markers.
+/// Byte offsets are safe because all markers and delimiters are ASCII.
+fn redact_secret(text: &str) -> String {
+    // Order matters: "bearer " is inside an "authorization: bearer …" header;
+    // scanning it first redacts the token itself (the header name then has no
+    // value left to redact). "authorization:" alone still catches headers
+    // without a Bearer scheme.
+    const MARKERS: &[(&str, &[u8])] = &[
+        ("bearer ", b" \t,;\"\n\r"),
+        ("authorization:", b" \t,;\"\n\r"),
+        ("token=", b" \t&,;\"\n\r"),
+        ("key=", b" \t&,;\"\n\r"),
+    ];
+    let lower = text.to_ascii_lowercase();
+    let lb = lower.as_bytes();
+    let tb = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(tb.len());
+    let mut cursor: usize = 0;
+    while cursor < tb.len() {
+        // Markers are checked IN ORDER (priority, not position): "bearer "
+        // must win over "authorization:" even though it sits later in the
+        // header, so the token — not the scheme word — is redacted.
+        let mut hit: Option<(usize, usize, &[u8])> = None; // (at, marker_len, delims)
+        for (marker, delims) in MARKERS {
+            let mb = marker.as_bytes();
+            if let Some(rel) = lb[cursor..].windows(mb.len()).position(|w| w == mb) {
+                hit = Some((cursor + rel, mb.len(), *delims));
+                break;
+            }
+        }
+        let Some((at, marker_len, delims)) = hit else {
+            out.extend_from_slice(&tb[cursor..]);
+            break;
+        };
+        out.extend_from_slice(&tb[cursor..at]);
+        let value_start = at + marker_len;
+        // Skip ASCII whitespace between marker and value.
+        let mut start = value_start;
+        while start < tb.len() && tb[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        let end = tb[start..]
+            .iter()
+            .position(|b| delims.contains(b))
+            .map_or(tb.len(), |r| start + r);
+        if end > start {
+            out.extend_from_slice(b"[redacted]");
+            cursor = end;
+        } else {
+            // Trailing marker, no value: keep the rest verbatim and finish.
+            out.extend_from_slice(&tb[at..]);
+            break;
+        }
+    }
+    String::from_utf8(out).expect("redaction operates on utf8 boundaries")
 }
 
 fn failure_lifecycle(
@@ -1410,5 +1491,54 @@ mod tests {
             diag(serde_json::json!({ "pane_id": "p1" })),
             "pane exited; agent process is gone"
         );
+    }
+
+    /// c-cardsettle-fu2 r1 item 3: oversized and credential-bearing stderr is
+    /// bounded to the last line / 300 chars and redacted before it reaches the
+    /// journal, instances.last_error, and the session end bar.
+    #[test]
+    fn pane_exit_stderr_is_capped_and_redacted() {
+        let data = |stderr: &str| serde_json::json!({ "pane_id": "p1", "lastStderr": stderr });
+
+        // (a) Authorization header + Bearer token.
+        let raw = "GET /v1 HTTP/1.1\n\
+                   Authorization: Bearer abc.def-ghi_123";
+        let diag = pane_exit_diagnostic(&data(raw));
+        assert!(
+            !diag.contains("abc.def-ghi_123"),
+            "bearer token leaked: {diag}"
+        );
+        assert!(
+            diag.contains("[redacted]"),
+            "redaction marker present: {diag}"
+        );
+
+        // (b) token= query/body pair (case-insensitive).
+        let raw = "POST failed token=super-secret-value&other=1";
+        let diag = pane_exit_diagnostic(&data(raw));
+        assert!(
+            !diag.contains("super-secret-value"),
+            "token= leaked: {diag}"
+        );
+        assert!(diag.contains("[redacted]"));
+
+        // (c) key= pair.
+        let raw = "error key=AKIADEADBEEF123456 done";
+        let diag = pane_exit_diagnostic(&data(raw));
+        assert!(!diag.contains("AKIADEADBEEF123456"), "key= leaked: {diag}");
+
+        // (d) Only the LAST non-empty line is kept.
+        let raw = "line one with garbage\npanic: the real failure";
+        let diag = pane_exit_diagnostic(&data(raw));
+        assert!(diag.ends_with("the real failure"));
+        assert!(!diag.contains("line one with garbage"));
+
+        // (e) Oversized: capped to 300 chars + an ellipsis.
+        let long = "x".repeat(5000);
+        let diag = pane_exit_diagnostic(&data(&long));
+        // "agent process exited: " prefix + 300 chars + ellipsis
+        let kept: String = diag.chars().skip("agent process exited: ".len()).collect();
+        assert_eq!(kept.chars().count(), 301, "300 chars + ellipsis");
+        assert!(kept.ends_with('…'));
     }
 }

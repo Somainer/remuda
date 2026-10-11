@@ -274,6 +274,64 @@ describe("Outbox", () => {
     }
   });
 
+  it("GATE12 item 2: a one-shot durable-read failure at the deadline retries bounded with the SAME snapshot and still delivers", async () => {
+    // The pre-fix fire treated a rejected storage.all() like "row gone" and
+    // stopped, so the only wakeup was lost (the store's own lease scheduler
+    // skips same-owner rows). A failed READ must retry; only a successful read
+    // that finds the row missing/terminal is allowed to stop.
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(200_000);
+      class OneShotReadFail extends MemStorage {
+        reads = 0;
+        failed = false;
+        override async all() {
+          this.reads += 1;
+          // Call 1 is Outbox.load's own snapshot read; the deadline's read is
+          // call 2 — fail exactly that one.
+          if (this.reads === 2 && !this.failed) {
+            this.failed = true;
+            throw new Error("IDB read aborted");
+          }
+          return await super.all();
+        }
+      }
+      const store = new OneShotReadFail();
+      const owner = "owner_readfail";
+      const T = Date.now() + LEASE_TTL_MS;
+      const putP = store.put(
+        rec({
+          commandId: "cmd_readfail",
+          instanceId: "ins_readfail",
+          state: "inflight",
+          lease: { owner, until: T },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await putP;
+      const box = await Outbox.load(store, owner);
+      await vi.advanceTimersByTimeAsync(0);
+      const wakes = vi.fn();
+      box.onClaimWake = wakes;
+
+      // Deadline fires: the first read aborts, the wake is NOT lost.
+      await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
+      expect(wakes).not.toHaveBeenCalled();
+      expect(box.pendingClaimWakeups()).toEqual(["cmd_readfail"]);
+
+      // The bounded retry (250 ms) reads successfully and reclaims.
+      await vi.advanceTimersByTimeAsync(250);
+      expect(wakes).toHaveBeenCalledTimes(1);
+      expect(store.map.get("cmd_readfail")?.state).toBe("pending");
+      expect(box.pendingClaimWakeups()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
   it("GATE12 item 1: a wakeup reclaims ONLY its lease snapshot after it is due — a renewed later lease re-arms for T2, then reclaims", async () => {
     // T  = lease deadline observed at load (fresh same-owner claim, Web Locks
     //      absent -> UNKNOWN ownership -> kept, wakeup armed at T).

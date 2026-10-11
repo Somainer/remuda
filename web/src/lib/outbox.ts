@@ -189,6 +189,15 @@ export interface OutboxStorage {
 
 /** Lease lifetime for a delivery; a crashed owner's lease steals after this. */
 export const LEASE_TTL_MS = 30_000;
+/**
+ * Bounded retry budget for a claim wakeup whose durable READ or conditional
+ * reclaim keeps failing (gate 12 item 2): backoff 250 ms·2^n capped at 5 s,
+ * this many failures (~≤ a few minutes) before the wake gives up — the next
+ * flush/reload still picks the row up.
+ */
+export const CLAIM_WAKE_MAX_FAILURES = 12;
+export const CLAIM_WAKE_BASE_RETRY_MS = 250;
+export const CLAIM_WAKE_MAX_RETRY_MS = 5_000;
 
 /**
  * The Web Lock name guarding delivery for ONE instance. This is the ONLY place
@@ -779,13 +788,19 @@ export class Outbox {
     commandId: Id,
     instanceId: Id,
     snapshot: { owner: Id; until: number },
+    failures = 0,
   ) {
     const old = this.claimWakeups.get(commandId);
     if (old) clearTimeout(old.handle);
-    const delay = Math.max(0, snapshot.until - Date.now());
+    // A follow-up to a failed deadline read/reclaim waits a capped
+    // exponential backoff; the first arm waits for the lease deadline.
+    const delay =
+      failures === 0
+        ? Math.max(0, snapshot.until - Date.now())
+        : Math.min(CLAIM_WAKE_MAX_RETRY_MS, CLAIM_WAKE_BASE_RETRY_MS * 2 ** (failures - 1));
     const handle = setTimeout(() => {
       this.claimWakeups.delete(commandId);
-      void this.fireClaimWakeup(commandId, instanceId, snapshot);
+      void this.fireClaimWakeup(commandId, instanceId, snapshot, failures);
     }, delay);
     this.claimWakeups.set(commandId, { instanceId, snapshot, handle });
   }
@@ -821,31 +836,71 @@ export class Outbox {
     commandId: Id,
     instanceId: Id,
     snapshot: { owner: Id; until: number },
+    failures = 0,
   ) {
     // Read + conditional reclaim as ONE critical section under the instance
-    // lock (gate 12 item 1): a live deliverer renewing/releasing its lease
-    // concurrently cannot interleave with this reclaim.
-    const reclaimed = await this.runUnderInstanceLock(instanceId, async () => {
-      const durable = await this.refreshFromStorage();
+    // lock (gate 12 item 1). Gate 12 item 2: a FAILED read/reclaim is
+    // distinguished from a successful read that finds the row missing or
+    // terminal — the former retries bounded with the SAME snapshot (the only
+    // wake must not die on a one-shot IDB error), the latter stops for real.
+    type Outcome =
+      | { kind: "failure" }
+      | { kind: "stop"; rec: OutboxRecord | null }
+      | { kind: "rearm"; lease: { owner: Id; until: number } }
+      | { kind: "deliver"; rec: OutboxRecord };
+    let outcome: Outcome;
+    try {
+      outcome = await this.runUnderInstanceLock(instanceId, async () => {
+      let durable: OutboxRecord[];
+      try {
+        durable = await this.refreshFromStorage();
+      } catch {
+        return { kind: "failure" } satisfies Outcome;
+      }
       const current = durable.find((r) => r.commandId === commandId);
-      // Missing or terminal by the time the lock was acquired: stop.
-      if (!current || current.state !== "inflight" || !current.lease) return current ?? null;
+      // A successful read found the row missing or terminal: stop.
+      if (!current || current.state !== "inflight" || !current.lease) {
+        return { kind: "stop", rec: current ?? null };
+      }
       const lease = current.lease;
       if (lease.owner !== snapshot.owner || lease.until !== snapshot.until) {
         // The live owner renewed/replaced the lease. Follow it ONLY while it
-        // is still in the future; an expired different lease is not ours to
-        // reclaim here (the ordinary foreign-lease flush owns that).
-        if (lease.until > Date.now()) {
-          this.scheduleClaimWakeup(commandId, instanceId, lease);
-        }
-        return current;
+        // is still in the future (fresh failure counter — new deadline); an
+        // expired different lease is not ours to reclaim here (the ordinary
+        // foreign-lease flush owns that).
+        return lease.until > Date.now()
+          ? { kind: "rearm", lease }
+          : { kind: "stop", rec: current };
       }
       // Same exact snapshot and its deadline has passed: conditional reclaim.
-      return await this.storage.reclaimInflight(commandId, snapshot);
+      try {
+        const reclaimed = await this.storage.reclaimInflight(commandId, snapshot);
+        if (!reclaimed) return { kind: "stop", rec: null };
+        return reclaimed.state === "pending"
+          ? { kind: "deliver", rec: reclaimed }
+          : { kind: "stop", rec: reclaimed };
+      } catch {
+        return { kind: "failure" };
+      }
     });
-    if (!reclaimed) return; // missing row: nothing to do
-    this.cache.set(commandId, reclaimed);
-    if (reclaimed.state === "pending") {
+    } catch {
+      // The lock request itself failed (deadlock/SecurityError): same bounded
+      // retry as a storage failure.
+      outcome = { kind: "failure" };
+    }
+
+    if (outcome.kind === "failure") {
+      if (failures + 1 < CLAIM_WAKE_MAX_FAILURES) {
+        this.scheduleClaimWakeup(commandId, instanceId, snapshot, failures + 1);
+      }
+      return;
+    }
+    if (outcome.kind === "rearm") {
+      this.scheduleClaimWakeup(commandId, instanceId, outcome.lease);
+      return;
+    }
+    if (outcome.rec) this.cache.set(commandId, outcome.rec);
+    if (outcome.kind === "deliver") {
       this.emit();
       // Exactly one delivery trigger for this wakeup.
       this.onClaimWake?.();

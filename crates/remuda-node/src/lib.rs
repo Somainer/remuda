@@ -18,10 +18,6 @@ mod entity;
 mod error;
 mod files;
 mod gate;
-/// Test access to the land-grant answer type.
-#[doc(hidden)]
-#[cfg(any(test, feature = "test-faults"))]
-pub use gate::LandGrantAnswer as GateLandGrantAnswer;
 mod hook_shim;
 mod identity;
 mod interactions;
@@ -140,6 +136,9 @@ pub use gate::GateAuthorizer;
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-faults"))]
 pub use gate::GateRunHold;
+/// Land-grant answer type used by the durable daemon authorizer and tests.
+#[doc(hidden)]
+pub use gate::LandGrantAnswer as GateLandGrantAnswer;
 pub use remuda_signal::hook_silence::{
     HookSilenceProbes, HookSilenceReason, classify as classify_hook_silence,
     diagnose as diagnose_hook_silence, link_fresh as hook_link_fresh,

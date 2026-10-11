@@ -22,9 +22,96 @@ use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+
+/// Per-controller-session sequence for Node→Hub gate authority requests.
+static GATE_AUTH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A Node→Hub gate authority request (gate.authorize / gate.landGrant) sent
+/// from a detached gate run through the durable daemon controller session.
+struct DaemonGateAuth {
+    method: &'static str,
+    job_id: String,
+    generation: u32,
+    reply: oneshot::Sender<Result<Value, NodeError>>,
+}
+
+/// [`crate::GateAuthorizer`] for the durable daemon: the run task sends
+/// the request over a channel; the controller read/write loop writes it and
+/// correlates the Hub reply by id. Revoked (channel closed / takeover) →
+/// refuse.
+type PendingGateAuth = Arc<StdMutex<HashMap<String, oneshot::Sender<Result<Value, NodeError>>>>>;
+
+#[derive(Clone)]
+struct DaemonGateAuthorizer {
+    tx: mpsc::Sender<DaemonGateAuth>,
+}
+
+impl DaemonGateAuthorizer {
+    async fn call(
+        &self,
+        method: &'static str,
+        job_id: &str,
+        generation: u32,
+    ) -> Result<Value, NodeError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(DaemonGateAuth {
+                method,
+                job_id: job_id.to_owned(),
+                generation,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| NodeError::Disconnected)?;
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .map_err(|_| NodeError::Disconnected)?
+            .map_err(|_| NodeError::Disconnected)?
+    }
+}
+
+impl crate::GateAuthorizer for DaemonGateAuthorizer {
+    fn authorize<'a>(
+        &'a self,
+        job_id: &'a str,
+        generation: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            matches!(
+                self.call(remuda_protocol::METHOD_GATE_AUTHORIZE, job_id, generation)
+                    .await,
+                Ok(value) if value.get("authorized").and_then(Value::as_bool) == Some(true)
+            )
+        })
+    }
+
+    fn request_land_grant<'a>(
+        &'a self,
+        job_id: &'a str,
+        generation: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::GateLandGrantAnswer> + Send + 'a>>
+    {
+        Box::pin(async move {
+            match self
+                .call(remuda_protocol::METHOD_GATE_LAND_GRANT, job_id, generation)
+                .await
+            {
+                Ok(value) => crate::GateLandGrantAnswer {
+                    granted: value.get("granted").and_then(Value::as_bool) == Some(true),
+                    landing_in_progress: value.get("landingInProgress").and_then(Value::as_bool)
+                        == Some(true),
+                },
+                _ => crate::GateLandGrantAnswer {
+                    granted: false,
+                    landing_in_progress: false,
+                },
+            }
+        })
+    }
+}
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 const MAX_FRAME: usize = 1_048_576;
@@ -630,6 +717,32 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     // hatch the rest of the design leans on. Spawn each on its own task and let
     // its encoded reply ride this channel back so only this loop writes.
     let (long_tx, mut long_rx) = tokio::sync::mpsc::channel::<Value>(128);
+    // r11 item 2: gate.authorize / gate.landGrant from detached gate runs.
+    let (gate_auth_tx, mut gate_auth_rx) = mpsc::channel::<DaemonGateAuth>(16);
+    let pending_gate_auth: PendingGateAuth = Arc::new(StdMutex::new(HashMap::new()));
+    // Fails in-flight gate authority requests when the controller ends
+    // (disconnect/takeover), so a paused dispatch delivered to the
+    // replacement session cannot proceed (r11 item 2).
+    struct GateAuthGuard {
+        pending: PendingGateAuth,
+    }
+    impl Drop for GateAuthGuard {
+        fn drop(&mut self) {
+            if let Ok(mut map) = self.pending.lock() {
+                for (_, waiter) in map.drain() {
+                    let _ = waiter.send(Err(NodeError::Disconnected));
+                }
+            }
+        }
+    }
+    let _gate_auth_guard = GateAuthGuard {
+        pending: pending_gate_auth.clone(),
+    };
+    node.gate_registry()
+        .set_authorizer(std::sync::Arc::new(DaemonGateAuthorizer {
+            tx: gate_auth_tx.clone(),
+        }))
+        .await;
     loop {
         if *changed.borrow() != generation {
             return Ok(());
@@ -667,6 +780,31 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                     }
                 }
             }
+            auth = gate_auth_rx.recv(), if ready => {
+                let Some(auth) = auth else { return Ok(()); };
+                if *changed.borrow() != generation {return Ok(());}
+                let id = format!("gateauth-{}", GATE_AUTH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                if let Ok(mut map) = pending_gate_auth.lock() {
+                    map.insert(id.clone(), auth.reply);
+                }
+                let frame = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": auth.method,
+                    "params": {
+                        "jobId": auth.job_id,
+                        "generation": auth.generation,
+                        "hostId": node.host().meta.id.as_id().to_string(),
+                        "sessionEpoch": format!("daemon:{generation}"),
+                    },
+                });
+                tokio::select! {
+                    _ = changed.changed() => return Ok(()),
+                    result = tokio::time::timeout(Duration::from_secs(30), write_frame(write, &frame)) => {
+                        result.map_err(|_|NodeError::Transport("gate auth write timed out".into()))??;
+                    }
+                }
+            }
             _ = tick.tick(), if ready => {
                 if !pending.is_empty() && last_ack.elapsed() > Duration::from_secs(30) {
                     return Err(NodeError::Transport("journal acknowledgement timed out; reconnect required".into()));
@@ -694,6 +832,25 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                     continue;
                 }
                 if frame.get("method").is_none() {
+                    // r11 item 2: correlate Node→Hub gate.authorize/landGrant replies.
+                    if let Some(id) = frame.get("id").and_then(Value::as_str)
+                        && id.starts_with("gateauth-")
+                    {
+                        if let Some(waiter) = pending_gate_auth.lock().ok().and_then(|mut m| m.remove(id)) {
+                            let result = if let Some(err) = frame.get("error") {
+                                Err(NodeError::InvalidRequest(
+                                    err.get("message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("gate authority error")
+                                        .to_owned(),
+                                ))
+                            } else {
+                                Ok(frame.get("result").cloned().unwrap_or(Value::Null))
+                            };
+                            let _ = waiter.send(result);
+                        }
+                        continue;
+                    }
                     if frame.get("id").and_then(Value::as_str) == Some("hello-1") {
                         let result = frame.get("result").ok_or_else(|| NodeError::Transport("Hub rejected daemon hello".into()))?;
                         if let Some(token) = result.get("nodeToken").and_then(Value::as_str).filter(|token|!token.is_empty()) {

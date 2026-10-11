@@ -2656,6 +2656,148 @@ mod tests {
         );
     }
 
+    /// A `/effort <word>` user record shaped exactly like claude writes it.
+    fn effort_slash_line(uuid: &str, word: &str) -> String {
+        json!({
+            "type": "user",
+            "uuid": uuid,
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "role": "user",
+                "content": format!(
+                    "<command-name>/effort</command-name>\n<command-message>effort</command-message>\n\
+                     <command-args>{word}</command-args>"
+                )
+            }
+        })
+        .to_string()
+    }
+
+    /// A `<local-command-stdout>` verdict user record.
+    fn effort_stdout_line(uuid: &str, body: &str) -> String {
+        json!({
+            "type": "user",
+            "uuid": uuid,
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {
+                "role": "user",
+                "content": format!("<local-command-stdout>{body}</local-command-stdout>")
+            }
+        })
+        .to_string()
+    }
+
+    /// c-effortread r11 item 1: each `/effort` verdict is labelled with the
+    /// request whose SLASH GENERATION asked for it, not the bridge's latest
+    /// armed request. Production sequence through the real mapper:
+    /// A executes (`ultracode off`) → A times out → B armed (`ultracode on`)
+    /// → A's delayed accepted-OFF verdict arrives. It must resolve only A's
+    /// stale generation (B stays pending) and its echo must carry A's id, not
+    /// B's; B's own later ON verdict then settles B.
+    #[tokio::test]
+    async fn r11_item1_a_delayed_verdict_carries_its_own_request_id_not_b() {
+        use crate::effort::{EffortBridge, EffortRequest};
+        use remuda_protocol::EffortAxis::Flag;
+        use remuda_protocol::EffortName::High;
+        use remuda_protocol::EffortSemantics::Decoupled;
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        let request_a = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            Some("req-a"),
+        )
+        .expect("A is the off toggle");
+        assert_eq!(request_a.command_word(), "ultracode off");
+        let gen_a = bridge.arm(request_a);
+        mapper
+            .map_line(&effort_slash_line("cmd-a", "ultracode off"))
+            .expect("map A slash");
+
+        // A's read-back window passes with no verdict: the worker gives up on
+        // exactly A's generation (pending clears), exactly as perform_switch.
+        bridge.fail(gen_a);
+
+        let request_b = EffortRequest::for_configure(
+            "high",
+            Some(true),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            Some("req-b"),
+        )
+        .expect("B is the on toggle");
+        let _gen_b = bridge.arm(request_b);
+        mapper
+            .map_line(&effort_slash_line("cmd-b", "ultracode on"))
+            .expect("map B slash");
+
+        // A's DELAYED verdict lands after B's slash: accepted OFF.
+        let out_a = mapper
+            .map_line(&effort_stdout_line(
+                "out-a",
+                "Ultracode off. Effort stays high.",
+            ))
+            .expect("map A verdict");
+        let edge_a = out_a
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("A's verdict emits an effort edge");
+        assert_eq!(
+            edge_a.request_id.as_deref(),
+            Some("req-a"),
+            "the delayed verdict echoes ITS request, not B"
+        );
+        assert_eq!(edge_a.effective.ultracode, Some(false));
+        assert!(
+            bridge.has_pending(),
+            "resolving A's stale generation must not clear B"
+        );
+        let pending_b = bridge.pending().expect("B stays armed");
+        assert_eq!(pending_b.request_id.as_deref(), Some("req-b"));
+        assert_eq!(pending_b.name, High);
+
+        // B's own ON verdict settles B.
+        let out_b = mapper
+            .map_line(&effort_stdout_line(
+                "out-b",
+                "Ultracode on (this session only): dynamic workflows on every \
+                 task. Effort stays high.",
+            ))
+            .expect("map B verdict");
+        let edge_b = out_b
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("B's verdict emits an effort edge");
+        assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
+        assert_eq!(edge_b.effective.ultracode, Some(true));
+        assert!(!bridge.has_pending(), "B's verdict settles B");
+    }
+
     /// c-r3 item 4: the claude-pty transcript pump driven through its REAL
     /// output channel (the spawned pump task + mpsc receiver), not by calling
     /// the emit helper on a hand-built observation. An effort edge read off the

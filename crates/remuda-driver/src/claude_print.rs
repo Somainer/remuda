@@ -2570,8 +2570,13 @@ pub struct TranscriptMapper {
     effort: remuda_protocol::EffortTracker,
     /// Rendezvous for Remuda-initiated switches awaiting read-back.
     effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
-    /// Generation the tracker is currently armed with.
-    effort_generation: Option<u64>,
+    /// c-effortread r11 item 1: Remuda slash generations whose verdict has not
+    /// been read yet, FIFO in transcript order, each carrying the IMMUTABLE
+    /// request metadata (generation, id, requested value) bound at its slash
+    /// record. A delayed verdict pairs with ITS OWN slash entry — never with
+    /// the bridge's latest pending, which can already name a newer request B
+    /// typed while A's verdict was outstanding.
+    effort_armed: std::collections::VecDeque<(u64, crate::effort::EffortRequest)>,
     /// §9.1 effective-model read-back state.
     model: remuda_protocol::ModelTracker,
     /// Rendezvous for Remuda-initiated `/model` switches.
@@ -2627,7 +2632,7 @@ impl TranscriptMapper {
             seen_uuids: std::collections::HashSet::new(),
             effort,
             effort_bridge: None,
-            effort_generation: None,
+            effort_armed: std::collections::VecDeque::new(),
             model: remuda_protocol::ModelTracker::new(),
             model_bridge: None,
             model_generation: None,
@@ -2740,10 +2745,10 @@ impl TranscriptMapper {
         }
         self.set_effort_current_process(false);
         // A switch armed for this process must not be settled by a record the
-        // tail can no longer attribute to it. Drop the mapper-side generation
+        // tail can no longer attribute to it. Drop every armed generation
         // WITHOUT resolving or rejecting: the bridge keeps waiting for its
         // bounded timeout and degrades, never reporting Applied (item 5).
-        self.effort_generation = None;
+        self.effort_armed.clear();
         let Some(cleared) = self.effort.read_back_unavailable() else {
             return Ok(Vec::new());
         };
@@ -3048,13 +3053,20 @@ impl TranscriptMapper {
                 && self.effort.is_current_process()
                 && let Some(bridge) = &self.effort_bridge
                 && let Some((generation, request)) = bridge.pending_with_gen()
+                && self
+                    .effort_armed
+                    .iter()
+                    .all(|(armed_gen, _)| *armed_gen != generation)
             {
-                self.effort_generation = Some(generation);
-                // A decoupled flag toggle does not move the level, so its
-                // verdict settles without a level await.
+                // c-effortread r11 item 1: bind the slash generation to ITS OWN
+                // immutable request (id, requested value). Two commands can be
+                // outstanding (A timed out, B armed) before either verdict is
+                // read; the FIFO pairs each verdict with the slash that asked
+                // for it, so A's delayed verdict can never carry B's id.
                 if let Some(name) = request.awaits_level(self.effort.semantics()) {
                     self.effort.arm_awaiting(name);
                 }
+                self.effort_armed.push_back((generation, request));
             }
             self.effort.note_slash(&args, from_remuda);
             return Ok(Vec::new());
@@ -3077,15 +3089,19 @@ impl TranscriptMapper {
         stdout: String,
         verdict: remuda_protocol::EffortStdout,
     ) -> DriverResult<Vec<Observation>> {
-        let from_remuda = self
-            .effort_bridge
-            .as_ref()
-            .and_then(|bridge| bridge.pending())
-            .is_some();
         match verdict {
             remuda_protocol::EffortStdout::Accepted(parsed) => {
+                // c-effortread r11 item 1: this verdict answers the OLDEST
+                // outstanding Remuda slash (FIFO). When A's verdict is delayed
+                // past a newer armed B, the pair is still (gen A, request A):
+                // the bridge ignores the resolve for a stale generation and the
+                // observation is stamped with A's id/requested value, never
+                // B's. An answered verdict with no armed slash is a human/
+                // terminal command (or one whose slash predates this mapper).
+                let paired = self.effort_armed.pop_front();
+                let from_remuda = paired.is_some();
                 let edge = self.effort.note_stdout(&stdout, from_remuda);
-                if let Some(generation) = self.effort_generation.take()
+                if let Some((generation, _)) = &paired
                     && let Some(bridge) = &self.effort_bridge
                 {
                     // A switch to the state already in effect is accepted too:
@@ -3093,7 +3109,7 @@ impl TranscriptMapper {
                     let settled = edge
                         .map(|(observed, _)| observed)
                         .unwrap_or(self.effort.last_observed().unwrap_or(parsed));
-                    bridge.resolve(generation, settled);
+                    bridge.resolve(*generation, settled);
                 }
                 if let Some((observed, source)) = edge {
                     return self.effort_observation(
@@ -3102,11 +3118,17 @@ impl TranscriptMapper {
                         source,
                         Some(stdout),
                         remuda_protocol::EFFORT_STDOUT_NATIVE,
+                        paired.as_ref(),
                     );
                 }
             }
             remuda_protocol::EffortStdout::Status(_) => {
                 // Observation only: it never resolves/rejects an armed switch.
+                let from_remuda = self
+                    .effort_bridge
+                    .as_ref()
+                    .and_then(|bridge| bridge.pending())
+                    .is_some();
                 if let Some((observed, source)) = self.effort.note_stdout(&stdout, from_remuda) {
                     return self.effort_observation(
                         value,
@@ -3114,6 +3136,7 @@ impl TranscriptMapper {
                         source,
                         Some(stdout),
                         remuda_protocol::EFFORT_STATUS_NATIVE,
+                        None,
                     );
                 }
             }
@@ -3123,9 +3146,12 @@ impl TranscriptMapper {
             | remuda_protocol::EffortStdout::UnavailableForModel
             | remuda_protocol::EffortStdout::EnvOverride => {
                 // Clears the awaiting attribution; refuses the armed switch
-                // (if any) with the verdict's stable reason code.
-                self.effort.note_stdout(&stdout, from_remuda);
-                if let Some(generation) = self.effort_generation.take()
+                // (if any) with the verdict's stable reason code. The refusal
+                // pairs with its own slash generation, never a newer armed
+                // request's (r11 item 1).
+                let paired = self.effort_armed.pop_front();
+                self.effort.note_stdout(&stdout, paired.is_some());
+                if let Some((generation, _)) = paired
                     && let Some(bridge) = &self.effort_bridge
                     && let Some(reason) = verdict.reject_reason()
                 {
@@ -3161,7 +3187,7 @@ impl TranscriptMapper {
             if let Some((observed, source)) = self.effort.note_ultra_attachment(enters) {
                 // The attachment type is the native-key label, exactly like
                 // the journal tailer, so both channels derive one event id.
-                return self.effort_observation(value, observed, source, None, label);
+                return self.effort_observation(value, observed, source, None, label, None);
             }
         }
         Ok(Vec::new())
@@ -3171,6 +3197,13 @@ impl TranscriptMapper {
     /// the deterministic event-id key (assistant message id vs
     /// `/effort`-stdout/status/attachment record uuid) so the live mapper and
     /// the journal tailer mint the same id for the same native edge.
+    ///
+    /// `paired` is the slash request THIS verdict answers (c-effortread r11
+    /// item 1): the echo carries THAT request's id and requested selection,
+    /// captured at its slash record — not the bridge's latest request. Non-
+    /// verdict edges (assistant records, attachments, model verdicts) pass
+    /// `None`, so they echo no request at all and settle only through the
+    /// read-back fallback.
     fn effort_observation(
         &mut self,
         value: &Value,
@@ -3178,18 +3211,16 @@ impl TranscriptMapper {
         source: remuda_protocol::EffortSource,
         raw: Option<String>,
         native_label: &str,
+        paired: Option<&(u64, crate::effort::EffortRequest)>,
     ) -> DriverResult<Vec<Observation>> {
-        let (requested, request_id) = self
-            .effort_bridge
-            .as_ref()
-            .and_then(|bridge| bridge.requested())
-            .map(|request| {
+        let (requested, request_id) = paired
+            .map(|(_, request)| {
                 (
                     Some(remuda_protocol::EffortSelection {
                         name: request.name,
                         ultracode: request.ultracode,
                     }),
-                    request.request_id,
+                    request.request_id.clone(),
                 )
             })
             .unwrap_or((None, None));
@@ -3256,7 +3287,7 @@ impl TranscriptMapper {
             .filter(|value| !value.is_empty())
             .or(per_turn.filter(|value| !value.is_empty()))
             .map(str::to_owned);
-        self.effort_observation(value, observed, source, raw, "")
+        self.effort_observation(value, observed, source, raw, "", None)
     }
 
     // ───────── §9.1 model read-back (same verdict pattern as effort) ─────────
@@ -3421,6 +3452,7 @@ impl TranscriptMapper {
                             source,
                             Some(stdout.to_owned()),
                             remuda_protocol::EFFORT_MODEL_NATIVE,
+                            None,
                         )?);
                     }
                 }

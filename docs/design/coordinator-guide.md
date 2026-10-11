@@ -221,10 +221,59 @@ If a gate fails, the branch goes back to its agent with the failing output —
 don't fix a worker's crate inside the merge. Independent branches merge in
 any order; when two agents touched one file, land the smaller diff first.
 
+### Gate queue: Landing, cancel and restart semantics
+
+The Hub gate queue owns a small explicit state machine per job:
+
+```
+queued → running → (only via gate.landGrant) → landing → landed
+                    │                              └→ failed
+                    │                              └→ queued (land CAS lost: base moved)
+                    ├→ passed   (verify job)
+                    ├→ failed
+                    └→ canceling → canceled
+```
+
+- **Canceling is not grantable.** The verify→land grant is a conditional
+  `running → landing` writer that matches *only* a `running` row at the exact
+  `(job, attempt generation, host, authenticated carrier session)`. A
+  `canceling` row never matches, so a cancel that commits first always wins
+  and nothing is pushed. After the grant the row is `landing`; a later cancel
+  returns 409 "landing in progress" and the granted push runs to completion.
+- **Session fencing.** At dispatch the Hub records the authenticated carrier
+  session (the node-link generation minted at that socket's hello) on the
+  row. Both the pre-execute `gate.authorize` fence and the `gate.landGrant`
+  (including its idempotent re-answer for an already-`landing` row) require
+  the inbound socket's own session to equal that recorded session — the Hub
+  uses the socket host/session, never a value the frame claims. A paused
+  frame delivered to a replacement session after a reconnect is refused even
+  when job/generation/host still match. On the Node, a WSS reconnect revokes
+  run authority for the whole reconnect window and rebinds it to the new
+  hello; the durable daemon bumps a controller generation on takeover and
+  includes a unique per-boot id in its session epoch. A Node with **no
+  registered carrier authorizer always refuses** — missing authority is
+  permission, at both the run fence and the land grant.
+- **Landing is in-flight, not terminal.** Until it settles, a `landing` land
+  still holds its lane checkout and the project's single land slot: the
+  scheduler counts it for lane-busy and land-serialization, and it stays in
+  the active-jobs view. A `gate.run` RPC error/timeout against a `landing`
+  row never fails it (the child's push may still finish).
+- **Restart never blindly re-runs a landing push.** A Hub restart that finds
+  a `landing` row does not dispatch a second push (that is the hazard the
+  grant exists to prevent). It sends a read-only `gate.resolveLanding` probe
+  to the lane host, which fetches and reports whether the granted merge
+  (recorded on the row at grant time) is already an ancestor of the remote
+  base: yes → settle `landed` (journal `gate.landed`, run `--then`, drop
+  pins); no/host-gone/non-ancestor → settle `failed` with an explicit
+  "landing outcome unknown after hub restart" reason. A granted land child
+  that overruns its budget has its whole process group killed and is reaped
+  before the failure verdict, so it cannot keep pushing afterward.
+
 Several agents sharing one worktree is a different situation, covered by
 [CONTRIBUTING.md](../../CONTRIBUTING.md) "Staged-content verification":
 stage only your files, then prove the *index* builds with
 `git stash push --keep-index` around the gates.
+
 
 ## Secret scan
 

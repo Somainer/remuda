@@ -116,9 +116,7 @@ impl ClaudeSdkDriver {
 
     /// Test-only (`test-stub`, r10 item 1): hold the publication mutex.
     #[cfg(feature = "test-stub")]
-    pub async fn hold_publish_mutex_for_test(
-        &self,
-    ) -> crate::claude_print::PublishMutexHold<'_> {
+    pub async fn hold_publish_mutex_for_test(&self) -> crate::claude_print::PublishMutexHold<'_> {
         self.inner.hold_publish_mutex_for_test().await
     }
 

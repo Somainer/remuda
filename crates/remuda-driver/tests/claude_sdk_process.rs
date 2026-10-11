@@ -1977,10 +1977,13 @@ async fn aborting_while_parked_on_the_publish_mutex_leaves_no_phantom_reservatio
     // C completes normally; its result (second user frame the child sees)
     // settles C itself at result index 1.
     let dc = driver.clone();
-    tokio::time::timeout(Duration::from_secs(5), dc.send(prompt_id("second", "msg-c")))
-        .await
-        .expect("C send within 5s")
-        .expect("C sends after B aborted");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        dc.send(prompt_id("second", "msg-c")),
+    )
+    .await
+    .expect("C send within 5s")
+    .expect("C sends after B aborted");
     // The send ack means WRITTEN, not answered: acknowledge C's result is
     // mapped before fencing so the fence cannot overtake C's live frames.
     barrier
@@ -2132,16 +2135,16 @@ async fn cancelling_b_emits_a_settlement_at_its_ticket_position_before_c_starts(
     // session/exited observation (a tail-appended correction could).
     drop(barrier);
     let _ = driver.close().await;
-    while let Some(obs) = tokio::time::timeout(Duration::from_secs(5), handle.recv()).await
+    while let Some(obs) = tokio::time::timeout(Duration::from_secs(5), handle.recv())
+        .await
         .ok()
         .flatten()
     {
         all.push(obs);
     }
-    let exited = first_where(
-        &all,
-        |o| lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("exited"),
-    );
+    let exited = first_where(&all, |o| {
+        lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("exited")
+    });
     assert!(
         correction < exited,
         "A's correction precedes the session exit: {all:?}"
@@ -2327,10 +2330,13 @@ async fn aborting_inside_the_real_writer_window_keeps_the_accepted_turn_ordered_
     );
 
     // A normal follow-up turn B.
-    tokio::time::timeout(Duration::from_secs(5), driver.send(prompt_id("second", "msg-b")))
-        .await
-        .expect("B send within 5s")
-        .expect("B sends");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        driver.send(prompt_id("second", "msg-b")),
+    )
+    .await
+    .expect("B send within 5s")
+    .expect("B sends");
     let b = collect_until(&mut handle, Duration::from_secs(5), |seen| {
         turn_done_count(seen) >= 1
     })

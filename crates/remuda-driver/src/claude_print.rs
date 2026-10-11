@@ -237,8 +237,7 @@ impl TurnBook {
     /// stashed result is `take`n by the first release, so it is published
     /// exactly once; later cancellations release nothing.
     fn cancel_turn(&mut self, seq: u64) -> bool {
-        let removed = if let Some(pos) = self.outstanding.iter().position(|turn| turn.seq == seq)
-        {
+        let removed = if let Some(pos) = self.outstanding.iter().position(|turn| turn.seq == seq) {
             let turn = self.outstanding.remove(pos).expect("positioned turn");
             for id in turn.open_workflows {
                 self.workflow_owner.remove(&id);
@@ -1513,7 +1512,10 @@ async fn prepare_prompt_write(
         return Err(DriverError::ControlUnavailable);
     }
     // The ticket is queued; Drop from here on only has to wake the worker.
-    guard.as_mut().expect("guard before accept").mark_ticket_queued();
+    guard
+        .as_mut()
+        .expect("guard before accept")
+        .mark_ticket_queued();
     #[cfg(feature = "test-stub")]
     test_barrier::note_reserve_enqueued(&inner.barrier);
 
@@ -1754,7 +1756,7 @@ async fn rollback_reservation_at_ticket(inner: &Arc<Inner>, seq: u64) -> DriverR
     if let Some(observation) = released {
         // Emit HERE, at the cancelled ticket's position — before the worker
         // takes the next job (C's start, a frame, StdoutEof).
-        emit_all(&inner, vec![observation]).await
+        emit_all(inner, vec![observation]).await
     } else {
         Ok(())
     }
@@ -1870,9 +1872,14 @@ impl Drop for ReservationGuard {
         let inner = self.inner.clone();
         let seq = self.reservation.seq;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let _ = handle.spawn(async move {
-                rollback_without_ticket(&inner, seq).await;
-            });
+            // Drop the JoinHandle immediately: detach the cleanup task; it only
+            // touches the mapper/publish state, both of which outlive this
+            // guard (the driver holds them).
+            drop(
+                handle.spawn(async move {
+                    rollback_without_ticket(&inner, seq).await;
+                }),
+            );
         }
         self.reservation.cancel();
     }
@@ -2128,7 +2135,9 @@ pub mod test_barrier {
         let Some(state) = current(slot) else {
             return;
         };
-        state.cancelled_ticket_reached.store(true, Ordering::Release);
+        state
+            .cancelled_ticket_reached
+            .store(true, Ordering::Release);
         if state.cancelled_gate_open.load(Ordering::Acquire) {
             return;
         }
@@ -2188,9 +2197,7 @@ pub mod test_barrier {
                     return;
                 }
                 if tokio::time::Instant::now() >= deadline {
-                    panic!(
-                        "write_commit barrier: timed out waiting for the cancelled ticket"
-                    );
+                    panic!("write_commit barrier: timed out waiting for the cancelled ticket");
                 }
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
@@ -2201,7 +2208,9 @@ pub mod test_barrier {
         /// is open by default): lets a test enqueue a later reservation behind
         /// the cancelled ticket deterministically.
         pub fn hold_cancelled_rollback(&self) {
-            self.state.cancelled_gate_open.store(false, Ordering::Release);
+            self.state
+                .cancelled_gate_open
+                .store(false, Ordering::Release);
         }
 
         /// r10 item 2: release the worker from a cancelled ticket so the

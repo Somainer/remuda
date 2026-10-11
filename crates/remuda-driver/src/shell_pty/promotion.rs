@@ -4033,6 +4033,69 @@ mod tests {
         assert!(settled.is_none(), "the switch keeps waiting, never Applied");
     }
 
+    /// c-effortread r9 item 2: a Fresh (live) tail that is demoted and then
+    /// re-promoted must keep its LIVE origin across the continuation. It used
+    /// to reopen as a resume tail, so a single ENOENT (a rotate/recreate while
+    /// the terminal is briefly demoted) marked it displaced and withdrew
+    /// read-back for the rest of the run instead of taking the live tail's
+    /// bounded retry. After the file is restored, a later effort record must
+    /// still verify.
+    #[tokio::test]
+    async fn r9_item2_repromoted_fresh_tail_survives_one_enoent_and_keeps_verifying() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let first_turn = assistant_line(Some("high"), 1);
+        let mut fx = pump_fixture(tmp.path(), &first_turn);
+        let bridge = Arc::new(crate::effort::EffortBridge::new());
+        let mut hydrator = open_hydrator(&fx, ResumeMode::Fresh, Some(&bridge));
+        pump_once(&mut hydrator, &fx).await;
+        assert!(
+            effort_rows(&drain(&mut fx))
+                .iter()
+                .any(|(name, _)| *name == Some(remuda_protocol::EffortName::High)),
+            "the Fresh first turn verifies high"
+        );
+
+        // Demote: capture the live read anchor, then re-promote THROUGH the
+        // production open path continuing that anchor.
+        let anchor = hydrator.tail.anchor().expect("a live anchor is captured");
+        let mut again = Hydrator::open(
+            &fx.ctx,
+            &fx.binding,
+            Some(&bridge),
+            None,
+            None,
+            None,
+            None,
+            ResumeMode::Fresh,
+            Some(anchor),
+            None,
+        )
+        .expect("re-promotion reopens the Fresh tail");
+
+        // The bound file vanishes for exactly one poll (rotate/recreate).
+        std::fs::remove_file(&fx.binding.path).expect("vanish");
+        pump(&mut again, &fx.tx, &fx.seq, &fx.ctx)
+            .await
+            .expect("a live tail tolerates one missing poll");
+        assert!(
+            drain(&mut fx).is_empty(),
+            "the ENOENT poll emits nothing and does not withdraw read-back"
+        );
+
+        // Restored under a NEW inode with identical content, then a later
+        // effort verdict appends. On the live tail it verifies; the displaced
+        // resume tail the old code reopened as would report it Unverified.
+        write(&fx.binding.path, &first_turn);
+        append_line(&fx.binding.path, &assistant_line(Some("low"), 2));
+        pump_once(&mut again, &fx).await;
+        let rows = effort_rows(&drain(&mut fx));
+        assert!(
+            rows.iter()
+                .any(|(name, _)| *name == Some(remuda_protocol::EffortName::Low)),
+            "the later low verdict still verifies on the restored live tail: {rows:?}"
+        );
+    }
+
     /// r5 item 3: `claude -c` / `--continue` parses as a value-less resume,
     /// so the continued transcript is tailed from current EOF unverified, not
     /// byte 0 as current. The mode derives through the production argv parser.

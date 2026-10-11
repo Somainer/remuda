@@ -739,6 +739,22 @@ pub struct TranscriptTail {
     resume: Option<ResumeState>,
 }
 
+/// Whether a [`TailAnchor`] was captured from a LIVE (Fresh, no resume
+/// boundary) tail or a RESUME tail.
+///
+/// c-effortread r9 item 2: this ORIGIN is distinct from the "current/gate
+/// open" flag — a *verified* resume also reads Current but must keep its
+/// resume boundary (and its withdraw-on-ENOENT semantics) across a
+/// re-promotion. A live tail, by contrast, reopens with NO resume state so it
+/// keeps the bounded ENOENT retry of a live tail instead of being withdrawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TailOrigin {
+    /// Fresh tail: no resume boundary (`resume: None`).
+    Live,
+    /// Following a resumed transcript (`resume: Some(..)`).
+    Resume,
+}
+
 /// r7 item 4(c): a re-openable continuation point captured from a running
 /// [`TranscriptTail`], keyed per (pid, session) by the promotion poller so a
 /// re-promotion resumes at the last read offset instead of replaying the
@@ -747,6 +763,9 @@ pub struct TranscriptTail {
 pub(crate) struct TailAnchor {
     /// File identity the offset is valid on.
     identity: FileIdentity,
+    /// Whether the captured tail was live (Fresh) or a resume tail.
+    /// c-effortread r9 item 2.
+    origin: TailOrigin,
     /// c-effortread r8 item 4(b): the first unread byte at capture AND the
     /// half-written JSONL line already buffered at that byte (the tail only
     /// hands back whole lines, so a line whose terminator arrived after the
@@ -942,6 +961,13 @@ impl TranscriptTail {
         }
         Some(TailAnchor {
             identity: tracked,
+            // c-effortread r9 item 2: remember the live/resume ORIGIN,
+            // distinct from whether the gate was open (current).
+            origin: if self.resume.is_some() {
+                TailOrigin::Resume
+            } else {
+                TailOrigin::Live
+            },
             start: self.offset,
             // Carry the held partial line (c-effortread r8 item 4b).
             partial: self.partial.clone(),
@@ -959,9 +985,15 @@ impl TranscriptTail {
     /// Reopen a tail continuing at a previously captured [`TailAnchor`].
     ///
     /// `None` when the file changed identity or shrank below the anchor; the
-    /// caller falls back to [`ResumeMode::open_tail`]. A current anchor keeps
-    /// the gate open past the offset; an unverified/displaced anchor keeps
-    /// following appends as Unverified.
+    /// caller falls back to [`ResumeMode::open_tail`].
+    ///
+    /// c-effortread r9 item 2: the anchor's ORIGIN decides what reopens. A
+    /// LIVE (Fresh) anchor continues as a live tail with NO resume state
+    /// (`resume: None`) while keeping the offset and held partial, so a later
+    /// one-poll ENOENT gets the live tail's bounded retry instead of
+    /// permanently withdrawing read-back. A RESUME anchor reopens as a resume
+    /// tail: a current anchor keeps the gate open past the offset; an
+    /// unverified/displaced anchor keeps following appends as Unverified.
     #[must_use]
     pub(crate) fn continued(path: PathBuf, anchor: TailAnchor) -> Option<Self> {
         let on_disk = FileIdentity::of(&path)?;
@@ -971,6 +1003,17 @@ impl TranscriptTail {
         let len = std::fs::metadata(&path).ok()?.len();
         if len < anchor.start {
             return None;
+        }
+        // A Fresh/live origin reopens with NO resume boundary: keep the live
+        // offset and the held partial, and let the poll's live-tail branch
+        // (bounded ENOENT retry, Current provenance) govern from here.
+        if anchor.origin == TailOrigin::Live {
+            return Some(Self {
+                path,
+                offset: anchor.start,
+                partial: anchor.partial,
+                resume: None,
+            });
         }
         // The captured head (first HEAD_PROBE bytes at capture) keeps guarding
         // replacements after the reopen; a live tail captured none, so hash

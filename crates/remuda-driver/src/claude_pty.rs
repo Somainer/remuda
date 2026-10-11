@@ -225,6 +225,11 @@ struct PtyLive {
     /// (c-ctxusage r4 item 2) before the task ends.
     transcript_shutdown: Option<watch::Sender<bool>>,
     tty_task: Option<JoinHandle<()>>,
+    /// Detached post-bind model-catalog refresh. Tracked so close aborts it:
+    /// it probes the native CLI and can settle for tens of seconds, and it
+    /// clones the event sender, so an untracked handle kept the observation
+    /// channel open long after close (c-ctxusage r9 item 6).
+    catalog_task: Option<JoinHandle<()>>,
     /// Current alt-screen mode seen by the attach relay's byte scanner.
     alt_screen: Arc<AtomicBool>,
     closed: bool,
@@ -680,7 +685,7 @@ impl ClaudePtyDriver {
         // own scoped discovery cache lands (the promotion-time answer may be
         // the operator's host fallback) and re-stamp the picker's catalog.
         model_bridge.set_own_catalog(crate::model_discovery::own_ids(&model_catalog));
-        {
+        let catalog_task = {
             let bridge = Arc::clone(&model_bridge);
             let events = tx.clone();
             let seq = Arc::clone(&self.seq);
@@ -714,8 +719,8 @@ impl ClaudePtyDriver {
                 {
                     tracing::debug!(%error, "model catalog refresh: event channel closed");
                 }
-            });
-        }
+            })
+        };
 
         *self.inner.lock().await = Some(PtyLive {
             ctx,
@@ -748,6 +753,7 @@ impl ClaudePtyDriver {
             transcript_task: Some(transcript_task),
             transcript_shutdown: Some(transcript_shutdown),
             tty_task: None,
+            catalog_task: Some(catalog_task),
             alt_screen: Arc::new(AtomicBool::new(false)),
             closed: false,
         });
@@ -1194,6 +1200,11 @@ impl Driver for ClaudePtyDriver {
             task.abort();
         }
         if let Some(task) = live.hook_task.take() {
+            task.abort();
+        }
+        // The detached catalog refresh holds an event sender; abort it so the
+        // observation channel closes with the driver (r9 item 6).
+        if let Some(task) = live.catalog_task.take() {
             task.abort();
         }
         // c-ctxusage r4 item 2: cooperative transcript shutdown — signal, let

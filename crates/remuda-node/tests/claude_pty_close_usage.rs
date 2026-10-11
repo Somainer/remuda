@@ -258,7 +258,9 @@ async fn claude_pty_close_finalises_no_stop_usage_and_projects_to_hub_row() {
         .await
         .expect("close never rescued the no-stop usage (channel closed)")
         .expect("final oneshot closed without a frame");
-    drainer.abort();
+    // r9 item 6: keep draining to channel close and prove the FINAL was
+    // delivered exactly once, instead of aborting the observer early.
+    drainer.await.expect("event drainer panicked");
     assert_eq!(
         final_count.load(AtomicOrdering::SeqCst),
         1,
@@ -461,9 +463,9 @@ async fn claude_pty_abort_mid_cooperative_finish_still_delivers_final_usage_once
         .await
         .expect("the aborted cooperative finish never delivered the FINAL usage")
         .expect("final oneshot closed without a frame");
-    // Let the flusher wind down after delivery, then it must have delivered
-    // exactly once even though two producers (finish + guard) both ran.
-    drainer.abort();
+    // r9 item 6: drain to channel close; two producers (finish + guard) ran,
+    // the FINAL must still have been delivered exactly once.
+    drainer.await.expect("event drainer panicked");
     assert_eq!(
         final_count.load(AtomicOrdering::SeqCst),
         1,

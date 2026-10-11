@@ -149,9 +149,20 @@ async fn unbound_shell_close_finishes_well_under_one_second() {
         .start(spec_for(&workspace, DriverKind::ShellPty))
         .await
         .expect("start");
-    // Let the promoter complete at least one poll (barrier-free: close itself
-    // is what must not block; a couple of runtime ticks is enough).
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Acknowledgement barrier (r9 item 6): wait for the driver's control
+    // readiness instead of a load-dependent settling sleep — by then the
+    // promoter task and its flusher/residual handshake exist, which is what
+    // close must not deadlock against.
+    let ready_deadline = Instant::now() + Duration::from_secs(25);
+    while Instant::now() < ready_deadline {
+        if Driver::wait_control(&driver).await.is_ok() {
+            break;
+        }
+    }
+    assert!(
+        Driver::wait_control(&driver).await.is_ok(),
+        "composer never became ready"
+    );
 
     let started = Instant::now();
     driver.close().await.expect("close");

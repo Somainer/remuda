@@ -74,6 +74,31 @@ class MemStorage implements OutboxStorage {
     this.writeChain = run.then(() => undefined);
     return await run;
   }
+  /** Conditional reclaim on the same serialized critical section. */
+  async reclaimInflight(
+    commandId: string,
+    expected: { owner: string; until: number },
+  ): Promise<OutboxRecord | null> {
+    const run = this.writeChain.then(async () => {
+      await new Promise((r) => setTimeout(r, 1));
+      const existing = this.map.get(commandId);
+      if (!existing) return null;
+      const lease = existing.lease;
+      if (
+        existing.state !== "inflight" ||
+        !lease ||
+        lease.owner !== expected.owner ||
+        lease.until !== expected.until
+      ) {
+        return existing;
+      }
+      const reclaimed: OutboxRecord = { ...existing, state: "pending", lease: undefined };
+      this.map.set(commandId, reclaimed);
+      return reclaimed;
+    });
+    this.writeChain = run.then(() => undefined);
+    return await run;
+  }
 }
 
 function rec(over: Partial<OutboxRecord> = {}): OutboxRecord {
@@ -222,30 +247,114 @@ describe("Outbox", () => {
         state: "inflight",
         lease: { owner: "owner_one_shot", until: Date.now() + LEASE_TTL_MS },
       });
-      // Arm the one-shot abort ONLY for the second context's reclaim merge.
-      vi.spyOn(store, "mergeUnlessDone").mockImplementation(
-        (id: string, patch: Partial<OutboxRecord>) => {
-          calls.push(id);
-          if (calls.filter((c) => c === id).length === 1) {
-            return Promise.reject(new Error("one-shot tx abort"));
-          }
-          // Retry: emulate the real merge without recursing into the spy.
-          return Promise.resolve(null).then(async () => {
-            const existing = (await store.all()).find((r) => r.commandId === id);
-            if (!existing) return null;
-            if (existing.state === "done") return existing;
-            const merged: OutboxRecord = { ...existing, ...patch };
-            (store as unknown as { map: Map<string, OutboxRecord> }).map.set(id, merged);
-            return merged;
-          });
-        },
-      );
+      // Arm the one-shot abort ONLY for the second context's reclaim.
+      vi.spyOn(store, "reclaimInflight").mockImplementation((id: string) => {
+        calls.push(id);
+        if (calls.filter((c) => c === id).length === 1) {
+          return Promise.reject(new Error("one-shot tx abort"));
+        }
+        // Retry: emulate the real conditional reclaim without recursing into
+        // the spy.
+        return Promise.resolve(null).then(async () => {
+          const existing = (await store.all()).find((r) => r.commandId === id);
+          if (!existing) return null;
+          const reclaimed: OutboxRecord = { ...existing, state: "pending", lease: undefined };
+          (store as unknown as { map: Map<string, OutboxRecord> }).map.set(id, reclaimed);
+          return reclaimed;
+        });
+      });
 
-      // A fresh context reclaims: first merge attempt aborts, retried, succeeds.
+      // A fresh context reclaims: first transaction aborts, retried, succeeds.
       const fresh = await Outbox.load(store, "owner_one_shot");
       expect(calls.filter((c) => c === "cmd_oneshot")).toHaveLength(2);
       const row = fresh.pendingFor("ins_1").find((r) => r.commandId === "cmd_oneshot");
       expect(row?.state).toBe("pending");
+    } finally {
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
+  it("GATE11 item 4: reclaim never downgrades a row another tab moved to sent before the reclaim transaction (and runs inside the real Web Lock)", async () => {
+    // B loads and observes the inflight row; its reclaim transaction is gated
+    // until A's finish write lands. Old reclaim (mergeUnlessDone with a
+    // pending patch) overwrote sent -> pending and B POSTed an answered row.
+    const originalNavigator = globalThis.navigator;
+    let entered!: () => void;
+    const enteredP = new Promise<void>((r) => void (entered = r));
+    let gate!: () => void;
+    const gateP = new Promise<void>((r) => void (gate = r));
+    let sawLockName: string | null = null;
+    class RacyStorage extends MemStorage {
+      override async mergeUnlessDone(
+        id: string,
+        patch: Partial<OutboxRecord>,
+      ): Promise<OutboxRecord | null> {
+        if (id === "cmd_race") {
+          entered();
+          await gateP;
+        }
+        return await super.mergeUnlessDone(id, patch);
+      }
+      override async reclaimInflight(
+        id: string,
+        expected: { owner: string; until: number },
+      ): Promise<OutboxRecord | null> {
+        if (id === "cmd_race") {
+          entered();
+          await gateP;
+        }
+        return await super.reclaimInflight(id, expected);
+      }
+    }
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: {
+        locks: {
+          query: async () => ({ held: [] }),
+          request: (name: string, _opts: unknown, cb: () => Promise<unknown>) => {
+            sawLockName = name;
+            return cb();
+          },
+        },
+      },
+    });
+    try {
+      const store = new RacyStorage();
+      const owner = "owner_clone_race";
+      const instanceId = "ins_race";
+      await store.put(
+        rec({
+          commandId: "cmd_race",
+          instanceId,
+          state: "inflight",
+          lease: { owner, until: Date.now() + LEASE_TTL_MS },
+        }),
+      );
+
+      // B loads (same owner, cloned sessionStorage; query says holder gone).
+      const loadP = Outbox.load(store, owner);
+      await enteredP; // B's snapshot read decided "reclaim", tx is gated
+
+      // A actually completes the POST before B's transaction runs: the
+      // terminal sent write commits independently (as A's IDB tx would).
+      await store.put(
+        rec({
+          commandId: "cmd_race",
+          instanceId,
+          state: "sent",
+          gotResponse: true,
+          lease: undefined,
+        }),
+      );
+      gate();
+      const b = await loadP;
+
+      // The sent row is untouched and B treats it as answered, not pending.
+      expect(store.map.get("cmd_race")?.state).toBe("sent");
+      expect(b.get("cmd_race")?.state).toBe("sent");
+      expect(b.pendingFor(instanceId)).toEqual([]);
+      // The reclaim was serialized under the real per-instance Web Lock name.
+      expect(sawLockName).toBe(instanceDeliveryLockName(instanceId));
     } finally {
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     }
@@ -536,6 +645,9 @@ describe("Outbox", () => {
         throw new Error("IDB transaction aborted");
       },
       mergeUnlessDone: async () => {
+        throw new Error("IDB transaction aborted");
+      },
+      reclaimInflight: async () => {
         throw new Error("IDB transaction aborted");
       },
     };

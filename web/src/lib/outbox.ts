@@ -170,6 +170,21 @@ export interface OutboxStorage {
    * row is preserved verbatim and returned; a missing row resolves null.
    */
   mergeUnlessDone(commandId: Id, patch: Partial<OutboxRecord>): Promise<OutboxRecord | null>;
+  /**
+   * Atomically reclaim (load-time) a row THIS context observed inflight with a
+   * lease snapshot `{ owner, until }`. In ONE readwrite transaction the stored
+   * row is read and written to `state: "pending", lease: undefined` ONLY when
+   * it is STILL inflight AND its lease owner AND deadline match the snapshot
+   * exactly. A row another tab meanwhile moved to sent/reconciling/held/done —
+   * or whose lease changed — is returned VERBATIM with no write (c-reconnfu
+   * gate 11 item 4: reclaim via mergeUnlessDown guarded only `done`, so a
+   * snapshot patch carrying `pending` downgraded a row already sent). Missing
+   * resolves null. A storage failure rejects.
+   */
+  reclaimInflight(
+    commandId: Id,
+    expected: { owner: Id; until: number },
+  ): Promise<OutboxRecord | null>;
 }
 
 /** Lease lifetime for a delivery; a crashed owner's lease steals after this. */
@@ -333,6 +348,48 @@ class IdbOutboxStorage implements OutboxStorage {
       t.onerror = () => reject(t.error ?? getReq.error);
     });
   }
+
+  /**
+   * Conditional load-time reclaim in ONE readwrite transaction (same
+   * serialization as {@link acquireLease}): the get, the lease comparison and
+   * the put share `t`, so a sent/reconciling/done write from another tab whose
+   * transaction is still open is already visible here. A row that no longer
+   * matches the observed inflight lease is returned verbatim with no put.
+   */
+  async reclaimInflight(
+    commandId: Id,
+    expected: { owner: Id; until: number },
+  ): Promise<OutboxRecord | null> {
+    return await new Promise<OutboxRecord | null>((resolve, reject) => {
+      const t = this.db.transaction(IDB_STORE, "readwrite");
+      const store = t.objectStore(IDB_STORE);
+      let result: OutboxRecord | null = null;
+      const getReq = store.get(commandId);
+      getReq.onsuccess = () => {
+        const existing = getReq.result as OutboxRecord | undefined;
+        if (!existing) return; // missing: null on complete
+        const lease = existing.lease;
+        if (
+          existing.state === "inflight" &&
+          lease &&
+          lease.owner === expected.owner &&
+          lease.until === expected.until
+        ) {
+          const reclaimed: OutboxRecord = { ...existing, state: "pending", lease: undefined };
+          result = reclaimed;
+          store.put(reclaimed);
+        } else {
+          // Moved on (sent/reconciling/held/done) or lease changed: leave the
+          // authoritative row exactly as stored.
+          result = existing;
+        }
+      };
+      getReq.onerror = () => reject(getReq.error);
+      t.oncomplete = () => resolve(result);
+      t.onabort = () => reject(t.error ?? getReq.error ?? new Error("IndexedDB reclaim transaction aborted"));
+      t.onerror = () => reject(t.error ?? getReq.error);
+    });
+  }
 }
 
 class LocalStorageOutboxStorage implements OutboxStorage {
@@ -395,6 +452,31 @@ class LocalStorageOutboxStorage implements OutboxStorage {
     const merged = { ...existing, ...patch };
     this.write([...recs.filter((r) => r.commandId !== commandId), merged]);
     return merged;
+  }
+
+  /**
+   * Conditional reclaim as one synchronous read-check-write turn — atomic in
+   * the supported single-tab degraded case the same way mergeUnlessDone is.
+   */
+  async reclaimInflight(
+    commandId: Id,
+    expected: { owner: Id; until: number },
+  ): Promise<OutboxRecord | null> {
+    const recs = this.read();
+    const existing = recs.find((r) => r.commandId === commandId);
+    if (!existing) return null;
+    const lease = existing.lease;
+    if (
+      existing.state !== "inflight" ||
+      !lease ||
+      lease.owner !== expected.owner ||
+      lease.until !== expected.until
+    ) {
+      return existing;
+    }
+    const reclaimed: OutboxRecord = { ...existing, state: "pending", lease: undefined };
+    this.write([...recs.filter((r) => r.commandId !== commandId), reclaimed]);
+    return reclaimed;
   }
 }
 
@@ -498,10 +580,10 @@ export class Outbox {
         locksQueryOk = false;
       }
     }
-    const requeue: Id[] = [];
+    const requeue: { id: Id; instanceId: Id; expected: { owner: Id; until: number } }[] = [];
     for (const [id, rec] of box.cache) {
-      if (rec.state !== "inflight") continue;
-      if (rec.lease?.owner === box.owner) {
+      if (rec.state !== "inflight" || !rec.lease) continue;
+      if (rec.lease.owner === box.owner) {
         const ownership: "held" | "free" | "unknown" = !locksQueryOk
           ? "unknown"
           : locksHeld.has(instanceDeliveryLockName(rec.instanceId))
@@ -512,43 +594,61 @@ export class Outbox {
           // same-owner lease stands until its deadline.
           continue;
         }
-        requeue.push(id);
-      } else if (!rec.lease || rec.lease.until <= now) {
+        requeue.push({ id, instanceId: rec.instanceId, expected: rec.lease });
+      } else if (rec.lease.until <= now) {
         // A row left inflight by another (possibly crashed) process is
         // returned to a deliverable state once its lease expires; the durable
         // lease is re-judged inside the delivery lock.
-        requeue.push(id);
+        requeue.push({ id, instanceId: rec.instanceId, expected: rec.lease });
       }
     }
-    // Persist the requeue (refreshDurable re-reads the durable store and
-    // would otherwise resurrect the inflight claim). c-reconnfu gate 10
-    // item 8: a ONE-SHOT transaction abort must not leave the row inflight
-    // with a fresh lease — retry the merge once; if that also fails, the row
-    // is still deliverable when its lease expires because load() now also
-    // schedules an expiry wakeup for inflight rows this context is not
-    // actively delivering (it has no POST in flight — the context just booted).
+    // Persist each reclaim ATOMICALLY (c-reconnfu gate 11 item 4): the
+    // transition to pending happens inside one transaction and ONLY while the
+    // durable row is still inflight with EXACTLY the lease snapshot observed
+    // here — a row another tab moved to sent/reconciling/held/done while this
+    // load was in flight is returned verbatim and never downgraded. Where the
+    // Web Lock exists the reclaim runs INSIDE it, so it is serialized against
+    // the live tab's deliverer (the callback waits until A releases, by which
+    // time the conditional sees the terminal row). Gate 10 item 8: retry a
+    // one-shot transaction abort once; a second failure leaves the row
+    // inflight and the expiry wakeup (item 5) owns the next attempt.
     await Promise.all(
-      requeue.map(async (id) => {
-        let stored: OutboxRecord | null = null;
-        for (let attempt = 0; attempt < 2; attempt += 1) {
+      requeue.map(async ({ id, instanceId, expected }) => {
+        const reclaimOnce = (): Promise<OutboxRecord | null> =>
+          storage.reclaimInflight(id, expected);
+        const reclaim = async (): Promise<OutboxRecord | null> => {
           try {
-            stored = await storage.mergeUnlessDone(id, {
-              state: "pending",
-              lease: undefined,
-            });
-            break;
+            return await reclaimOnce();
           } catch {
             // one retry on a one-shot abort; second failure falls through
+            try {
+              return await reclaimOnce();
+            } catch {
+              return null;
+            }
           }
+        };
+        const locks = (globalThis as { navigator?: Navigator & { locks?: LockManager } }).navigator?.locks;
+        let stored: OutboxRecord | null;
+        if (locksQueryOk && locks?.request) {
+          stored = await locks.request(
+            instanceDeliveryLockName(instanceId),
+            { mode: "exclusive" },
+            () => reclaim(),
+          );
+        } else {
+          stored = await reclaim();
         }
         if (stored) {
+          // Authoritative current row — either reclaimed to pending or the
+          // terminal/changed row another tab committed.
           box.cache.set(id, stored);
         } else {
           // Persist failed: the row is still (durable) inflight with a lease.
           // This context is not delivering anything yet; wake at the lease
           // deadline so an unrelated trigger is not required.
-          const until = box.cache.get(id)?.lease?.until;
-          if (typeof until === "number" && until > Date.now()) {
+          const until = expected.until;
+          if (until > Date.now()) {
             const delay = until - Date.now();
             setTimeout(() => {
               void box.refreshDurable().catch(() => undefined);

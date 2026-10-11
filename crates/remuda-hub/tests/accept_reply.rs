@@ -1,70 +1,79 @@
-//! c-acceptrace round 2 item 1: the e2e fake Node's `instance.send` reply must
-//! carry the SAME acceptance envelope the real DevNode serializes, and the Hub
-//! must mark the command accepted from that reply.
+//! c-acceptrace round 3 item 1: the e2e fake Node's `instance.send` arm and
+//! THIS regression test run ONE shared acceptance sequence
+//! (`tests/support/mod.rs`): durably `journal.append` the user message, await
+//! the matching ack, then reply through the shared accepted-envelope builder.
 //!
-//! This drives the ACTUAL Hub HTTP send path against a fake Node connected
-//! over the real WebSocket. The fake Node awaits the durable ack of a
-//! `journal.append` user message (exactly as the e2e harness does) and then
-//! answers with a chosen reply shape.
+//! Before the extraction, this test ran its OWN fake Node: reverting the
+//! harness arm in `examples/hub_e2e.rs` left every test here green. The guard
+//! now has teeth — restoring the bare reply in the shared builder turns the
+//! accepted-envelope case red.
 //!
-//! * command-envelope reply (what `DevNode::enqueue_existing` +
-//!   `accept_command` produces): the command is `accepted`, not
-//!   queued/reconciling.
-//! * legacy bare `{"ok":true}` reply: the command is NOT accepted — it rests
-//!   for journal convergence, which is the flake this guard exists to catch.
+//! The fake Node is driven against the ACTUAL Hub HTTP send path over the
+//! real WebSocket, and the test asserts BOTH:
+//! * the exact RPC result the helper sent for `instance.send`;
+//! * the settled state of the Hub's command row.
+
+mod support;
 
 use anyhow::Context;
 use futures::{SinkExt, StreamExt};
 use remuda_hub::HubConfig;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
 
-/// Which `instance.send` reply the fake Node returns.
+use support::{
+    FrameQueue, InstanceSendReply, NodeWs, append_command_user, send_instance_send_rpc, send_rpc_ok,
+};
+
+/// Reply shape under test, paired with the helper variant that produces it.
 #[derive(Clone, Copy)]
 enum ReplyShape {
-    /// `{accepted:true, command:{state:"accepted", commandId}}` — the real
-    /// DevNode envelope.
-    CommandEnvelope,
-    /// `{accepted:true}` at the result top level (also accepted by the Hub but
-    /// not what send produces).
+    /// The accepted-command envelope the real DevNode returns.
+    AcceptedCommand,
+    /// `{accepted:true}` at the result top level.
     TopLevelAccepted,
     /// The pre-fix fake-node reply.
     BareOk,
 }
 
 impl ReplyShape {
-    fn result(self, command_id: &str) -> Value {
+    fn helper(self) -> InstanceSendReply {
         match self {
-            ReplyShape::CommandEnvelope => json!({
-                "ok": true,
-                "accepted": true,
-                "command": { "state": "accepted", "commandId": command_id },
-            }),
-            ReplyShape::TopLevelAccepted => json!({ "accepted": true }),
-            ReplyShape::BareOk => json!({ "ok": true }),
+            ReplyShape::AcceptedCommand => InstanceSendReply::AcceptedCommand,
+            ReplyShape::TopLevelAccepted => InstanceSendReply::TopLevelAccepted,
+            ReplyShape::BareOk => InstanceSendReply::BareOk,
         }
     }
 }
 
-/// Connect a fake Node that enrolls, announces one workspace/host, and answers:
-/// - `instance.create` with an accepted envelope + instanceId;
-/// - `instance.send` by FIRST durably appending the user message over
-///   journal.append (awaiting the ack) and THEN replying with `shape`.
+/// What the test wants to inspect after the POST: the settled command state
+/// plus the exact `result` object the shared helper answered the send with.
+struct SendObservation {
+    state: String,
+    command_id: String,
+    send_result: Value,
+}
+
+/// Connect a fake Node that enrolls, announces one workspace/host, and runs
+/// the shared `instance.send` acceptance contract (durable append → ack →
+/// reply). The exact send result is recorded in `observed`.
 async fn spawn_fake_node(
     hub: &remuda_hub::RunningHub,
     host_id: &str,
     workspace_id: &str,
     shape: ReplyShape,
+    observed: Arc<Mutex<Option<Value>>>,
 ) -> anyhow::Result<()> {
-    let enroll = hub.mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES).await?;
+    let enroll = hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await?;
     let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {enroll}").parse()?,
-    );
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse()?);
     let (mut ws, _) = connect_async(req).await?;
     ws.send(Message::Text(
         json!({
@@ -92,115 +101,94 @@ async fn spawn_fake_node(
     let hello = recv_json(&mut ws).await?;
     assert!(hello["result"].is_object(), "hello rejected: {hello}");
 
-    // Drive the WS loop until the connection is dropped by the test end.
+    // Drive the WS loop until the connection is dropped by the test end. The
+    // frame queue mirrors the e2e harness: frames buffered while the append
+    // awaits its ack (pipelined Hub RPCs) are answered afterwards, never
+    // swallowed.
     tokio::spawn(async move {
-        while let Some(Ok(Message::Text(text))) = ws.next().await {
-            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            let Some(id) = frame.get("id").cloned() else { continue };
-            let Some(method) = frame.get("method").and_then(Value::as_str) else {
-                continue;
-            };
-            let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
-            let result = match method {
-                "instance.create" => {
-                    let iid = params["instanceId"].as_str().unwrap_or("").to_owned();
-                    json!({ "accepted": true, "instanceId": iid })
+        let mut queue: FrameQueue = std::collections::VecDeque::new();
+        let mut append_n = 0u64;
+        let _: anyhow::Result<()> = async {
+            loop {
+                if queue.is_empty() {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => queue.push_back(text.to_string()),
+                        _ => return Ok(()),
+                    }
                 }
-                "instance.send" => {
-                    // Mirror the real e2e fake Node / DevNode contract:
-                    // journal the user message durably and wait for the append
-                    // ack BEFORE replying to the send.
-                    let iid = params["instanceId"].as_str().map(str::to_string).unwrap_or_default();
-                    let command_id = params["commandId"]
-                        .as_str()
-                        .map(str::to_string)
-                        .unwrap_or_default();
-                    let node = command_id
-                        .strip_prefix("cmd_")
-                        .map_or_else(|| format!("obj_{command_id}"), |_| format!("obj_{command_id}"));
-                    ws.send(Message::Text(
-                        json!({
-                            "jsonrpc": "2.0", "id": "jappend", "method": "journal.append",
-                            "params": {
-                                "instanceId": iid,
-                                "event": {
-                                    "kind": "message",
-                                    "completeness": "structured",
-                                    "payload": {
-                                        "role": "user", "origin": "human",
-                                        "text": "acceptrace prompt", "nodeId": node,
-                                        "messageId": node, "commandId": command_id,
-                                        "revision": "1", "operation": "open",
-                                        "phase": "input", "status": "complete",
-                                    },
-                                },
-                            },
-                        })
-                        .to_string()
-                        .into(),
-                    ))
-                    .await
-                    .ok();
-                    // Read and discard the append ack; if it errors the test
-                    // send below surfaces it.
-                    let _ = next_frame_text(&mut ws).await;
-                    shape.result(&command_id)
+                while let Some(text) = queue.pop_front() {
+                    let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
+                    // A stray response (stale append ack) carries no method.
+                    let Some(method) = frame.get("method").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let id = frame.get("id").cloned().unwrap_or(Value::Null);
+                    let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
+                    match method {
+                        "instance.create" => {
+                            let iid = params["instanceId"].as_str().unwrap_or("").to_owned();
+                            send_rpc_ok(
+                                &mut ws,
+                                id,
+                                json!({ "accepted": true, "instanceId": iid }),
+                            )
+                            .await?;
+                        }
+                        "instance.send" => {
+                            let iid = params["instanceId"]
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_default();
+                            let command_id = params["commandId"]
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_default();
+                            // The SAME durable append + ack the e2e harness
+                            // runs — no test-local copy of the contract.
+                            append_n = append_command_user(
+                                &mut ws,
+                                &mut queue,
+                                &iid,
+                                append_n,
+                                "acceptrace prompt",
+                                Some(&command_id),
+                            )
+                            .await?;
+                            let result =
+                                send_instance_send_rpc(&mut ws, id, shape.helper(), &command_id)
+                                    .await?;
+                            *observed.lock().await = Some(result);
+                        }
+                        _ => {
+                            send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        }
+                    }
                 }
-                _ => json!({ "ok": true }),
-            };
-            if ws
-                .send(Message::Text(
-                    json!({ "jsonrpc": "2.0", "id": id, "result": result })
-                        .to_string()
-                        .into(),
-                ))
-                .await
-                .is_err()
-            {
-                break;
             }
         }
+        .await;
     });
     Ok(())
 }
 
-async fn next_frame_text(
-    ws: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<TcpStream>,
-    >,
-) -> anyhow::Result<Value> {
-    let msg = ws
-        .next()
-        .await
-        .context("frame")?
-        .context("ws closed")?;
-    Ok(serde_json::from_str(msg.to_text()?)?)
-}
-
-async fn recv_json(
-    ws: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<TcpStream>,
-    >,
-) -> anyhow::Result<Value> {
-    let msg = ws
-        .next()
-        .await
-        .context("frame")?
-        .context("ws closed")?;
+async fn recv_json(ws: &mut NodeWs) -> anyhow::Result<Value> {
+    let msg = ws.next().await.context("frame")?.context("ws closed")?;
     Ok(serde_json::from_str(msg.to_text()?)?)
 }
 
 /// Boot hub, enroll a fake node with the given send reply, create an instance
-/// and POST one instance.send, then read back the command state.
-async fn send_and_state(shape: ReplyShape) -> anyhow::Result<String> {
+/// and POST one instance.send, then read back the command state and the reply
+/// the helper actually sent.
+async fn send_and_observe(shape: ReplyShape) -> anyhow::Result<SendObservation> {
     let dir = tempfile::tempdir()?;
     let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("hub"))).await?;
     let human = hub.mint_device_token("acceptrace-human").await?;
     let host_id = "hst_acceptrace";
     let workspace_id = "wsp_acceptrace";
-    spawn_fake_node(&hub, host_id, workspace_id, shape).await?;
+    let observed = Arc::new(Mutex::new(None));
+    spawn_fake_node(&hub, host_id, workspace_id, shape, observed.clone()).await?;
     // Give the node.hello reconciliation a moment to register the host.
     tokio::time::sleep(Duration::from_millis(150)).await;
     let http = reqwest::Client::new();
@@ -282,16 +270,54 @@ async fn send_and_state(shape: ReplyShape) -> anyhow::Result<String> {
     })
     .await
     .context("command state never settled")?;
-    Ok(state)
+
+    // The fake node answers strictly after the durable append ack; by the time
+    // the row settled the captured reply is present.
+    let send_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(result) = observed.lock().await.clone() {
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("fake node never answered instance.send")?;
+
+    Ok(SendObservation {
+        state,
+        command_id,
+        send_result,
+    })
 }
 
-/// The real DevNode command envelope accepts the command directly.
+/// The shared accepted-command envelope accepts the command directly, and the
+/// result the helper actually sent carries that envelope for THIS command.
 #[tokio::test]
-async fn instance_send_with_the_real_command_envelope_is_accepted() -> anyhow::Result<()> {
-    let state = send_and_state(ReplyShape::CommandEnvelope).await?;
+async fn instance_send_with_the_shared_accepted_envelope_is_accepted() -> anyhow::Result<()> {
+    let obs = send_and_observe(ReplyShape::AcceptedCommand).await?;
     assert_eq!(
-        state, "accepted",
-        "a real-Node-shaped accepted reply must mark the command accepted; got {state}"
+        obs.state, "accepted",
+        "the shared accepted envelope must mark the command accepted; got {}",
+        obs.state
+    );
+    assert_eq!(
+        obs.send_result["accepted"],
+        json!(true),
+        "reply: {}",
+        obs.send_result
+    );
+    assert_eq!(
+        obs.send_result["command"]["state"],
+        json!("accepted"),
+        "reply: {}",
+        obs.send_result
+    );
+    assert_eq!(
+        obs.send_result["command"]["commandId"],
+        json!(obs.command_id),
+        "reply: {}",
+        obs.send_result
     );
     Ok(())
 }
@@ -300,20 +326,26 @@ async fn instance_send_with_the_real_command_envelope_is_accepted() -> anyhow::R
 /// accepted too — guards the predicate's alternative.
 #[tokio::test]
 async fn instance_send_with_top_level_accepted_is_accepted() -> anyhow::Result<()> {
-    let state = send_and_state(ReplyShape::TopLevelAccepted).await?;
-    assert_eq!(state, "accepted", "got {state}");
+    let obs = send_and_observe(ReplyShape::TopLevelAccepted).await?;
+    assert_eq!(obs.state, "accepted", "got {}", obs.state);
+    assert_eq!(obs.send_result["accepted"], json!(true));
     Ok(())
 }
 
 /// The pre-fix fake Node replied a bare `{ok:true}`; that is NOT a durable
-/// acceptance and the row must not be marked accepted from it. This test FAILS
-/// if the fake Node's bare reply is restored without the accepted envelope.
+/// acceptance and the row must not be marked accepted from it.
 #[tokio::test]
 async fn instance_send_with_bare_ok_is_not_accepted() -> anyhow::Result<()> {
-    let state = send_and_state(ReplyShape::BareOk).await?;
+    let obs = send_and_observe(ReplyShape::BareOk).await?;
     assert_ne!(
-        state, "accepted",
-        "a bare {{ok:true}} reply must never be treated as a durable acceptance; got {state}"
+        obs.state, "accepted",
+        "a bare {{ok:true}} reply must never be treated as a durable acceptance; got {}",
+        obs.state
+    );
+    assert!(
+        obs.send_result.get("accepted").is_none(),
+        "reply: {}",
+        obs.send_result
     );
     Ok(())
 }

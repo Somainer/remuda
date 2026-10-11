@@ -15,8 +15,8 @@ use remuda_driver::{
 use remuda_protocol::{AgentKind, InstanceSpec, ObservationPayload};
 use remuda_testing::ensure_workspace_bin;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const FINAL_MSG_ID: &str = "msg_close_final_usage";
@@ -258,7 +258,10 @@ async fn bound_shell_close_finishes_well_under_one_second_and_delivers_final_usa
     while !bound.load(Ordering::SeqCst) && Instant::now() < bind_deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(bound.load(Ordering::SeqCst), "the seeded replay never bound");
+    assert!(
+        bound.load(Ordering::SeqCst),
+        "the seeded replay never bound"
+    );
     assert_eq!(
         final_count.load(Ordering::SeqCst),
         0,

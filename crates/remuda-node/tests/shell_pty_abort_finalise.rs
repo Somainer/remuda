@@ -31,8 +31,8 @@ use remuda_protocol::{AgentKind, InstanceSpec, Observation};
 use remuda_testing::ensure_workspace_bin;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const FINAL_MSG_ID: &str = "msg_abort_final_usage";
 /// The fake harness's fixed session id (`remuda_testing::paths::FIXTURE`).
@@ -308,13 +308,10 @@ async fn abort_past_the_finalise_bound_still_rescues_the_last_usage_run() {
 
     // Wait on the rescued USAGE event (event-delivered, generous bound for a
     // loaded box; the gate made the abort deterministic, so it is fast).
-    let rescued = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        final_rx,
-    )
-    .await
-    .expect("timed out waiting for the aborted close to rescue the FINAL run")
-    .expect("final oneshot closed without a frame");
+    let rescued = tokio::time::timeout(std::time::Duration::from_secs(60), final_rx)
+        .await
+        .expect("timed out waiting for the aborted close to rescue the FINAL run")
+        .expect("final oneshot closed without a frame");
     drainer.abort();
     assert_eq!(
         final_count.load(Ordering::SeqCst),

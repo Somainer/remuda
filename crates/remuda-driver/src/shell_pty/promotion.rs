@@ -2189,6 +2189,7 @@ struct Hydrator {
 
 impl Hydrator {
     /// Start replay at byte 0 of the bound transcript.
+    #[allow(clippy::too_many_arguments)]
     fn open(
         ctx: &PromoteCtx,
         binding: &TranscriptBinding,
@@ -2374,6 +2375,7 @@ where
 /// the un-sent frames (and, if collection had not finished, the hydrator
 /// itself — blocking collection runs detached to completion) for the
 /// [`FinaliseGuard`] to deliver.
+#[allow(clippy::too_many_arguments)]
 async fn finalize_hydrator(
     slot: &HydratorSlot,
     pending: &PendingEmissions,
@@ -3570,7 +3572,10 @@ mod tests {
         );
 
         // Close/exit/demotion all route through finalize_hydrator now.
-        finalize_hydrator(&hydrator, &pending, &notify, &in_flight, &tx, &seq, &ctx, None).await;
+        finalize_hydrator(
+            &hydrator, &pending, &notify, &in_flight, &tx, &seq, &ctx, None,
+        )
+        .await;
         // Cooperative shutdown: release and join the streaming flusher, like
         // the production loop does, so no detached task outlives the test.
         flush_done.store(true, Ordering::SeqCst);

@@ -510,8 +510,7 @@ pub struct ShellPtyDriver {
     seq: Arc<AtomicU64>,
     /// Test-only close/abort fault injection (c-ctxusage r8 item 6); injected
     /// before `start`, always `None` in production.
-    test_faults:
-        std::sync::Mutex<Option<Arc<crate::test_faults::FaultState>>>,
+    test_faults: std::sync::Mutex<Option<Arc<crate::test_faults::FaultState>>>,
 }
 
 impl ShellPtyDriver {

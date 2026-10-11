@@ -801,6 +801,7 @@ pub(super) fn spawn(
     // that is done, so close never aborts a first-bind pump mid-`finish()`.
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     finalised: tokio::sync::oneshot::Sender<()>,
+    faults: Option<Arc<crate::test_faults::FaultState>>,
 ) -> tokio::task::JoinHandle<()> {
     // Abort-path safety net: even if the task is aborted while a first-bind
     // pump is still mapping a large transcript, the guard's Drop runs the
@@ -843,6 +844,7 @@ pub(super) fn spawn(
         flush_notify: Arc::clone(&flush_notify),
         collect_in_flight: Arc::clone(&collect_in_flight),
         residual_done: Arc::clone(&residual_done),
+        faults: faults.clone(),
         done: false,
     };
     tokio::spawn(async move {
@@ -979,6 +981,7 @@ pub(super) fn spawn(
                     &events,
                     &seq,
                     &ctx,
+                    None,
                 )
                 .await;
                 announced = None;
@@ -993,6 +996,7 @@ pub(super) fn spawn(
                     &events,
                     &seq,
                     &ctx,
+                    None,
                 )
                 .await;
                 announced = None;
@@ -1039,6 +1043,7 @@ pub(super) fn spawn(
                             &events,
                             &seq,
                             &ctx,
+                            None,
                         )
                         .await;
                         announced = None;
@@ -1381,6 +1386,7 @@ pub(super) fn spawn(
                         model.as_ref(),
                         permission_bridge.as_ref(),
                         launch_permission,
+                        faults.as_ref(),
                     )
                     .await;
                 }
@@ -1393,6 +1399,7 @@ pub(super) fn spawn(
                         &events,
                         &seq,
                         &ctx,
+                        None,
                     )
                     .await
                 }
@@ -1421,6 +1428,7 @@ pub(super) fn spawn(
             &events,
             &seq,
             &ctx,
+            faults.as_ref(),
         )
         .await;
         // Every frame (the finalise included) is parked in the shared queue;
@@ -1536,6 +1544,9 @@ struct FinaliseGuard {
     /// final frames (or found no hydrator). The flusher waits for this before
     /// honoring `flush_stop`, so an abort never strands the final usage.
     residual_done: Arc<AtomicBool>,
+    /// Test-only abort acknowledgement (c-ctxusage r8 item 6); `None` in
+    /// production.
+    faults: Option<Arc<crate::test_faults::FaultState>>,
     done: bool,
 }
 
@@ -1565,7 +1576,13 @@ impl Drop for FinaliseGuard {
         let notify = Arc::clone(&self.flush_notify);
         let in_flight = Arc::clone(&self.collect_in_flight);
         let residual_done = Arc::clone(&self.residual_done);
+        let faults = self.faults.clone();
         std::thread::spawn(move || {
+            // Acknowledge the abort-residual path so a test can prove the
+            // timeout-driven abort (not the cooperative path) ran.
+            if let Some(faults) = &faults {
+                faults.note_abort_residual();
+            }
             // Wait (off-runtime) only while a collect is actually running and
             // owning the hydrator; an unbound close falls through immediately.
             for _ in 0..24_000 {
@@ -1798,6 +1815,7 @@ async fn maintain_binding(
     model: Option<&ModelSync>,
     permission_bridge: Option<&Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
+    faults: Option<&Arc<crate::test_faults::FaultState>>,
 ) {
     // Deterministic channels get first crack at an unbound, healthy epoch.
     if bindings.binding().is_none() && !bindings.degraded() {
@@ -1832,6 +1850,7 @@ async fn maintain_binding(
             events,
             seq,
             ctx,
+            None,
         )
         .await;
         let related = bindings
@@ -1936,6 +1955,7 @@ async fn maintain_binding(
             model,
             permission_bridge,
             launch_permission,
+            faults.cloned(),
         );
         if let Some(opened) = opened {
             *slot_lock(hydrator) = Some(opened);
@@ -1983,6 +2003,7 @@ async fn maintain_binding(
                     events,
                     seq,
                     ctx,
+                    None,
                 )
                 .await;
                 let related = BTreeMap::from([
@@ -2146,10 +2167,9 @@ struct Hydrator {
     mapper: TranscriptMapper,
     /// Launch-time observations (model snapshot) emitted on the first pump.
     pending: Vec<Observation>,
-    /// Test-only abort seam: when present next to the transcript, the first
-    /// blocking `collect_pump` parks (before tail.poll) until this file is
-    /// removed. `None` in production.
-    test_collect_gate: Option<PathBuf>,
+    /// Test-only close/abort fault seam (c-ctxusage r8 item 6); `None` in
+    /// every production run.
+    faults: Option<Arc<crate::test_faults::FaultState>>,
 }
 
 impl Hydrator {
@@ -2162,6 +2182,7 @@ impl Hydrator {
         model: Option<&ModelSync>,
         permission_bridge: Option<&Arc<crate::permission::PermissionBridge>>,
         launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
+        faults: Option<Arc<crate::test_faults::FaultState>>,
     ) -> Option<Self> {
         tracing::info!(
             instance_id = %ctx.instance_id.as_id(),
@@ -2197,16 +2218,11 @@ impl Hydrator {
         if let Some(bridge) = permission_bridge {
             mapper = mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
         }
-        // Test-only seam: gate file lives next to the transcript.
-        let test_collect_gate = {
-            let candidate = binding.path.with_file_name(".remuda-test-collect-gate");
-            candidate.exists().then_some(candidate)
-        };
         Some(Self {
             mapper,
             tail: binding.tail(),
             pending,
-            test_collect_gate,
+            faults,
         })
     }
 
@@ -2239,17 +2255,11 @@ impl Hydrator {
         parked: &PendingEmissions,
         notify: &Notify,
     ) -> std::io::Result<Vec<Observation>> {
-        // Test-only abort seam: park the first-bind blocking collect (before
-        // tail.poll) until the test removes the gate file. The collect has
-        // already taken the hydrator and set collect_in_flight, so close()
-        // deterministically aborts the promoter task inside the map.
-        if let Some(gate) = self.test_collect_gate.take() {
-            for _ in 0..120_000 {
-                if !gate.exists() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+        // Test-only seam (c-ctxusage r8 item 6): a test parks the first
+        // blocking collect INSIDE the blocking operation via the injected
+        // fault handle; production runs carry no handle and pass through.
+        if let Some(faults) = &self.faults {
+            faults.pump_collect_entered();
         }
         let launch = std::mem::take(&mut self.pending);
         let lines = self.tail.poll()?;
@@ -2357,29 +2367,22 @@ async fn finalize_hydrator(
     events: &mpsc::Sender<Observation>,
     seq: &AtomicU64,
     ctx: &PromoteCtx,
+    faults: Option<&Arc<crate::test_faults::FaultState>>,
 ) {
     if slot_lock(slot).is_none() {
         return;
     }
-    // Test-only seam: a `.remuda-test-skip-coop-finalise` sibling makes the
-    // cooperative reading finalise a no-op, so the abort test exercises ONLY
-    // the FinaliseGuard (models close aborting past its bound).
-    let skip_coop = {
-        let guard = slot_lock(slot);
-        guard
-            .as_ref()
-            .map(|h| {
-                h.tail
-                    .path()
-                    .with_file_name(".remuda-test-skip-coop-finalise")
-                    .exists()
-            })
-            .unwrap_or(false)
-    };
-    if skip_coop {
+    // Test-only seam: the injected skip fault makes the cooperative reading
+    // finalise a no-op, so the abort test exercises ONLY the FinaliseGuard
+    // (models close aborting past its bound). No file is read in production.
+    if faults.is_some_and(|faults| faults.skip_cooperative_finalise()) {
         return;
     }
-    let collected = blocking_collect(Arc::clone(slot), Arc::clone(in_flight), |hydrator| {
+    let finish_faults = faults.cloned();
+    let collected = blocking_collect(Arc::clone(slot), Arc::clone(in_flight), move |hydrator| {
+        if let Some(faults) = &finish_faults {
+            faults.cooperative_finish_entered();
+        }
         hydrator.finish_collect().map_err(std::io::Error::other)
     })
     .await
@@ -3008,6 +3011,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -3097,6 +3101,7 @@ mod tests {
             &mut announced,
             &tx,
             &seq_arc,
+            None,
             None,
             None,
             None,
@@ -3521,7 +3526,7 @@ mod tests {
         };
         let ctx = ctx_in(&cwd);
         let hydrator: HydratorSlot = Arc::new(Mutex::new(Some(
-            Hydrator::open(&ctx, &binding, None, None, None, None, None)
+            Hydrator::open(&ctx, &binding, None, None, None, None, None, None)
                 .expect("hydrator binds the seeded transcript"),
         )));
         let pending: PendingEmissions = Arc::new(Mutex::new(std::collections::VecDeque::new()));
@@ -3550,7 +3555,7 @@ mod tests {
         );
 
         // Close/exit/demotion all route through finalize_hydrator now.
-        finalize_hydrator(&hydrator, &pending, &notify, &in_flight, &tx, &seq, &ctx).await;
+        finalize_hydrator(&hydrator, &pending, &notify, &in_flight, &tx, &seq, &ctx, None).await;
         // Cooperative shutdown: release and join the streaming flusher, like
         // the production loop does, so no detached task outlives the test.
         flush_done.store(true, Ordering::SeqCst);
@@ -3627,7 +3632,7 @@ mod tests {
         };
         let ctx = ctx_in(&cwd);
         let slot: HydratorSlot = Arc::new(Mutex::new(Some(
-            Hydrator::open(&ctx, &binding, None, None, None, None, None).unwrap(),
+            Hydrator::open(&ctx, &binding, None, None, None, None, None, None).unwrap(),
         )));
         let pending: PendingEmissions = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let notify = Arc::new(Notify::new());
@@ -3663,6 +3668,7 @@ mod tests {
             flush_notify: Arc::clone(&notify),
             collect_in_flight: Arc::clone(&in_flight),
             residual_done: Arc::clone(&residual_done),
+            faults: None,
             done: false,
         };
         drop(guard);

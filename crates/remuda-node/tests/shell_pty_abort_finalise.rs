@@ -31,8 +31,8 @@ use remuda_protocol::{AgentKind, InstanceSpec, Observation};
 use remuda_testing::ensure_workspace_bin;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 const FINAL_MSG_ID: &str = "msg_abort_final_usage";
 /// The fake harness's fixed session id (`remuda_testing::paths::FIXTURE`).
@@ -181,23 +181,22 @@ async fn abort_past_the_finalise_bound_still_rescues_the_last_usage_run() {
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
     let events_path = root.join("harness-events.jsonl");
 
-    // Pre-seed before the harness launches: the first-bind replay is the long
-    // pump close aborts into.
+    // Pre-seed before the harness launches: the first-bind replay is the pump
+    // close aborts into. The injected fault gate parks the FIRST blocking
+    // collect inside the blocking operation (before tail.poll), so backlog
+    // size is irrelevant — a handful of closed-turn records suffices.
     let transcript = remuda_driver::claude_transcript::project_dir(&native_home, &workspace)
         .join(format!("{SESSION_ID}.jsonl"));
-    // The abort gate makes backlog size irrelevant: a handful of closed-turn
-    // records is enough (the collect parks before reading them regardless).
     seed_transcript(&transcript, 20);
-    // Test-only file-backed seams live next to the transcript (found by file
-    // name, not process env): the collect gate parks the first-bind pump
-    // before it reads the tail, and the skip marker makes close's cooperative
-    // finalise a no-op so ONLY the abort guard rescues the buffered run.
-    // Created before the driver starts; the gate is removed only after
-    // close() aborts the mid-map promoter task.
-    let transcript_gate = transcript.with_file_name(".remuda-test-collect-gate");
-    let transcript_skip = transcript.with_file_name(".remuda-test-skip-coop-finalise");
-    std::fs::write(&transcript_gate, b"hold").unwrap();
-    std::fs::write(&transcript_skip, b"skip").unwrap();
+
+    // Deterministic fault injection (c-ctxusage r8 item 6): arm the pump gate
+    // and shorten close's bound so close() times out and ABORTS the promoter
+    // while the first collect is parked — no wall-clock sleeps, no files in
+    // production code paths.
+    use remuda_driver::test_faults::TranscriptFaults;
+    let faults = TranscriptFaults::new();
+    faults.arm_pump_gate();
+    faults.arm_close_timeout(std::time::Duration::from_millis(500));
 
     let mut options = ShellPtyOptions::agent(
         workspace.clone(),
@@ -230,33 +229,30 @@ async fn abort_past_the_finalise_bound_still_rescues_the_last_usage_run() {
         tui: remuda_driver::TuiMode::Default,
     });
     let driver = ShellPtyDriver::new(options);
+    // Injected BEFORE start; release builds cannot construct the handle.
+    driver.set_test_faults(faults.clone());
 
-    // Drain observations from the moment the runhandle exists. A file-backed
-    // test gate parks the first-bind blocking collect until the test removes
-    // it, so close() deterministically aborts the promoter task WHILE the map
-    // is in flight — no reliance on backlog size or wall-clock timing. Keep
-    // only the rescued run, by scope id.
+    // Drain observations from the moment the runhandle exists. The first
+    // blocking collect is parked on the injected gate, so close() crosses its
+    // (shortened) bound and ABORTS the promoter task while the map is in
+    // flight — no reliance on backlog size or wall-clock timing. The FINAL
+    // run is forwarded once through a oneshot and counted for the
+    // delivered-exactly-once assertion.
     let handle = driver.start(spec_for(&workspace)).await.expect("start");
     let mut events_rx = handle.into_events();
-    let rescued = Arc::new(Mutex::new(None::<Observation>));
-    let drainer_rescued = Arc::clone(&rescued);
-    // Set once the pump's blocking collect is parked on the gate — i.e. the
-    // hydrator is OUT of the slot and map_in_flight is true, exactly the state
-    // close() must abort into.
-    let pump_parked = Arc::new(AtomicBool::new(false));
-    let drainer_parked = Arc::clone(&pump_parked);
+    let (final_tx, final_rx) = tokio::sync::oneshot::channel();
+    let final_tx = std::sync::Mutex::new(Some(final_tx));
+    let final_count = Arc::new(AtomicU32::new(0));
+    let drainer_count = Arc::clone(&final_count);
     let drainer = tokio::spawn(async move {
         while let Some(observation) = events_rx.recv().await {
-            if let remuda_protocol::ObservationPayload::Lifecycle(lc) = &observation.body
-                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
-                && native.native_name == "transcript_bound"
-            {
-                drainer_parked.store(true, Ordering::SeqCst);
-            }
             if let remuda_protocol::ObservationPayload::Usage(payload) = &observation.body
                 && payload.scope_id == FINAL_MSG_ID
             {
-                *drainer_rescued.lock().unwrap() = Some(observation);
+                drainer_count.fetch_add(1, Ordering::SeqCst);
+                if let Some(tx) = final_tx.lock().unwrap().take() {
+                    let _ = tx.send(observation);
+                }
             }
         }
     });
@@ -273,56 +269,58 @@ async fn abort_past_the_finalise_bound_still_rescues_the_last_usage_run() {
     }
     assert!(ready, "composer never became ready");
 
-    // Wait for the bind; the collect gate then keeps the FIRST-bind map
-    // parked (no user prompt is sent, so nothing appends to or supersedes the
-    // seeded FINAL run — its only publisher is the abort-path finish).
-    let pump_ready = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        while !pump_parked.load(Ordering::SeqCst) {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    })
-    .await;
-    assert!(pump_ready.is_ok(), "the seeded replay never bound");
-    // Give the blocking collect a beat to reach its gate after the bind.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Barrier: the first blocking collect has entered and is parked BEFORE
+    // tail.poll with the hydrator out of the slot and collect_in_flight set —
+    // exactly the state close() must abort into.
+    assert!(
+        faults.wait_pump_entered(),
+        "the seeded replay never entered its first collect"
+    );
 
     // The no-stop FINAL usage must NOT be present before close: the gate has
     // parked the collect before tail.poll, so flush/finish have never run and
-    // the run is buffered in the mapper. Drain the channel and assert.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(
-        rescued.lock().unwrap().is_none(),
+    // the run is buffered in the mapper.
+    assert_eq!(
+        final_count.load(Ordering::SeqCst),
+        0,
         "FINAL usage published before close — the test no longer exercises the abort path"
     );
 
-    // Close while the collect is parked on the gate: close aborts the
-    // promoter task mid-map. Cooperative finalise cannot run; the abort guard
-    // must finish the buffered run after the gate releases.
+    // Close while the collect is parked on the gate: close crosses its bound,
+    // aborts the promoter task mid-map, and the abort guard's residual thread
+    // acknowledges it. Cooperative finalise never ran.
     driver.close().await.expect("close");
-    // Release the detached blocking collect. It completes, parks the hydrator
-    // back; the guard's blocking thread (waiting on collect_in_flight) then
-    // finishes the retained no-stop run.
-    std::fs::remove_file(&transcript_gate).unwrap();
-    std::fs::remove_file(&transcript_skip).ok();
+    assert!(
+        faults.wait_abort_residual(),
+        "close returned but the abort residual never ran — no timeout-driven abort happened"
+    );
+    assert_eq!(
+        final_count.load(Ordering::SeqCst),
+        0,
+        "FINAL usage published before the parked collect was released"
+    );
 
-    // Wait on the rescued USAGE event (event-synced, generous bound for a
-    // loaded box; the gate made the abort deterministic, so this is fast).
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        loop {
-            if let Some(observation) = rescued.lock().unwrap().take() {
-                break observation;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    })
-    .await;
+    // Release the detached blocking collect. It maps the tail, parks the
+    // hydrator back; the guard's blocking thread (waiting on collect_in_flight)
+    // then finishes the retained no-stop run and parks the FINAL frames for
+    // the single flusher.
+    faults.release();
+
+    // Wait on the rescued USAGE event (event-delivered, generous bound for a
+    // loaded box; the gate made the abort deterministic, so it is fast).
+    let rescued = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        final_rx,
+    )
+    .await
+    .expect("timed out waiting for the aborted close to rescue the FINAL run")
+    .expect("final oneshot closed without a frame");
     drainer.abort();
-    let Ok(rescued) = outcome else {
-        panic!(
-            "the aborted close did not finalise the buffered last run \
-             ({FINAL_MSG_ID} missing from emitted usage)"
-        )
-    };
+    assert_eq!(
+        final_count.load(Ordering::SeqCst),
+        1,
+        "the rescued FINAL run must be delivered exactly once"
+    );
 
     // Project the rescued driver observation through the REAL Hub projection
     // + insertion path and assert the durable row, exactly as the Hub's

@@ -14,6 +14,9 @@ workspace = true
 default = []
 # In-process FakeDriver for Node/Web loopback. Not installed in release images.
 test-stub = []
+# Deterministic close/abort fault injection for integration tests. Never
+# enabled by release binaries; dev-dependencies only.
+test-faults = []
 # macOS `security` CLI keychain backend. Tests are `#[ignore]`.
 keychain = []
 

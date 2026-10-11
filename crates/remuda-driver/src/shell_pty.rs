@@ -508,6 +508,10 @@ pub struct ShellPtyDriver {
     interrupt_pid: Arc<AtomicI32>,
     interrupt_screen_markers: Arc<std::sync::Mutex<promotion::InterruptBaseline>>,
     seq: Arc<AtomicU64>,
+    /// Test-only close/abort fault injection (c-ctxusage r8 item 6); injected
+    /// before `start`, always `None` in production.
+    test_faults:
+        std::sync::Mutex<Option<Arc<crate::test_faults::FaultState>>>,
 }
 
 impl ShellPtyDriver {
@@ -515,6 +519,17 @@ impl ShellPtyDriver {
     #[must_use]
     pub fn new(options: ShellPtyOptions) -> Self {
         Self::with_process_table(options, Arc::new(SystemProcessTable))
+    }
+
+    /// Inject deterministic close/abort faults before `start`. Test builds
+    /// only (`test-faults` feature); release binaries cannot construct the
+    /// handle.
+    #[cfg(feature = "test-faults")]
+    pub fn set_test_faults(&self, faults: crate::test_faults::TranscriptFaults) {
+        *self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(faults.inner);
     }
 
     /// Build a driver whose promotion detection reads `table` instead of the
@@ -555,6 +570,7 @@ impl ShellPtyDriver {
                 promotion::InterruptBaseline::default(),
             )),
             seq: Arc::new(AtomicU64::new(0)),
+            test_faults: std::sync::Mutex::new(None),
         }
     }
 
@@ -1295,6 +1311,13 @@ impl ShellPtyDriver {
             // c-ctxusage r5 item 6: cooperative poller shutdown.
             let (poller_tx, poller_rx) = tokio::sync::watch::channel(false);
             let (finalised_tx, finalised_rx) = tokio::sync::oneshot::channel();
+            // Clone the test-only fault handle BEFORE any await so the std
+            // mutex guard never crosses an await point.
+            let test_faults = self
+                .test_faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             *self.poller_shutdown.lock().await = Some(poller_tx);
             *self.poller_finalised.lock().await = Some(finalised_rx);
             *self.poller.lock().await = Some(promotion::spawn(
@@ -1334,6 +1357,7 @@ impl ShellPtyDriver {
                 silence_paths,
                 poller_rx,
                 finalised_tx,
+                test_faults,
             ));
             // A login shell has no agent at spawn; once promotion identifies a
             // hand-typed codex/grok, start its file adapter against the native
@@ -2697,13 +2721,20 @@ impl Driver for ShellPtyDriver {
             // than aborting on a fixed 2 s deadline while `finish()` is running.
             // 15 s only bounds a genuinely wedged pump; on timeout the abort is
             // covered by the FinaliseGuard's synchronous best-effort finish.
-            const PROMOTER_FINALISE_TIMEOUT: std::time::Duration =
-                std::time::Duration::from_secs(15);
+            // (c-ctxusage r8 item 6: a test-only fault handle may shorten the
+            // bound so abort tests stay deterministic and fast.)
+            let promoter_timeout = self
+                .test_faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_deref()
+                .and_then(crate::test_faults::FaultState::close_timeout)
+                .unwrap_or_else(|| std::time::Duration::from_secs(15));
             let finalised = self.poller_finalised.lock().await.take();
             let mut poller = poller;
             let finished = if let Some(finalised) = finalised {
                 tokio::pin!(finalised);
-                tokio::time::timeout(PROMOTER_FINALISE_TIMEOUT, async {
+                tokio::time::timeout(promoter_timeout, async {
                     // The finalise signal wins; task completion covers the
                     // no-hydrator / already-finished paths.
                     tokio::select! {
@@ -2714,7 +2745,7 @@ impl Driver for ShellPtyDriver {
                 .await
                 .is_ok()
             } else {
-                tokio::time::timeout(PROMOTER_FINALISE_TIMEOUT, &mut poller)
+                tokio::time::timeout(promoter_timeout, &mut poller)
                     .await
                     .is_ok()
             };

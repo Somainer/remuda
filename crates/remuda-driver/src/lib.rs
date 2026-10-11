@@ -44,6 +44,8 @@ pub mod shell_pty;
 pub mod tty;
 pub mod usage;
 
+pub mod test_faults;
+
 #[cfg(any(test, feature = "test-stub"))]
 mod fake;
 

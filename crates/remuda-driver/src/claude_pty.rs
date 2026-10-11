@@ -252,6 +252,9 @@ pub struct ClaudePtyDriver {
     last_spec: Mutex<Option<InstanceSpec>>,
     closed: AtomicBool,
     seq: Arc<AtomicU64>,
+    /// Test-only close/abort fault injection (c-ctxusage r8 item 6); injected
+    /// before `start`, always `None` in production.
+    test_faults: std::sync::Mutex<Option<Arc<crate::test_faults::FaultState>>>,
 }
 
 impl ClaudePtyDriver {
@@ -265,7 +268,19 @@ impl ClaudePtyDriver {
             last_spec: Mutex::new(None),
             closed: AtomicBool::new(false),
             seq: Arc::new(AtomicU64::new(0)),
+            test_faults: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Inject deterministic close/abort faults before `start`. Test builds
+    /// only (`test-faults` feature); release binaries cannot construct the
+    /// handle.
+    #[cfg(feature = "test-faults")]
+    pub fn set_test_faults(&self, faults: crate::test_faults::TranscriptFaults) {
+        *self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(faults.inner);
     }
 
     /// Seed the scoped config dir so the native first-run flow never starts.
@@ -627,6 +642,10 @@ impl ClaudePtyDriver {
             Some(Arc::clone(&permission_bridge)),
             launch_permission,
             self.options.media_stager.clone(),
+            self.test_faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
         );
         let effort_io: Arc<dyn crate::effort::EffortSwitchIo> = Arc::new(HerdrEffortIo {
             client: client.clone(),
@@ -1196,10 +1215,17 @@ impl Driver for ClaudePtyDriver {
             let _ = shutdown.send(true);
         }
         if let Some(task) = live.transcript_task.take() {
-            const TRANSCRIPT_SHUTDOWN_TIMEOUT: std::time::Duration =
-                std::time::Duration::from_secs(2);
+            // c-ctxusage r8 item 6: a test-only fault handle may shorten the
+            // bound so abort tests stay deterministic and fast.
+            let transcript_timeout = self
+                .test_faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_deref()
+                .and_then(crate::test_faults::FaultState::close_timeout)
+                .unwrap_or_else(|| std::time::Duration::from_secs(2));
             let mut task = task;
-            if tokio::time::timeout(TRANSCRIPT_SHUTDOWN_TIMEOUT, &mut task)
+            if tokio::time::timeout(transcript_timeout, &mut task)
                 .await
                 .is_err()
             {
@@ -1419,6 +1445,7 @@ fn spawn_transcript_pump(
     permission_bridge: Option<Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
     media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
+    faults: Option<Arc<crate::test_faults::FaultState>>,
 ) -> JoinHandle<()> {
     // Shared state between the pump task, the detached streaming flusher, and
     // the abort guard that runs in the pump task's Drop on task abort.
@@ -1473,6 +1500,7 @@ fn spawn_transcript_pump(
     let guard_notify = Arc::clone(&flush_notify);
     let guard_stop = Arc::clone(&flush_stop);
     let guard_in_flight = Arc::clone(&map_in_flight);
+    let guard_faults = faults.clone();
     tokio::spawn(async move {
         let _guard = AbortTranscriptGuard {
             slot: guard_slot,
@@ -1480,6 +1508,7 @@ fn spawn_transcript_pump(
             notify: guard_notify,
             stop: guard_stop,
             map_in_flight: guard_in_flight,
+            faults: guard_faults,
             disarmed: false,
         };
         // The launch model snapshot (carrying the discovered catalog) is
@@ -1602,11 +1631,17 @@ fn spawn_transcript_pump(
                 let pending = Arc::clone(&pending);
                 let notify = Arc::clone(&flush_notify);
                 let in_flight = Arc::clone(&map_in_flight);
+                let collect_faults = faults.clone();
                 move || {
                     let Some(mut hydrated) = transcript_slot_lock(&slot).take() else {
                         return;
                     };
                     in_flight.store(true, Ordering::SeqCst);
+                    // Test-only seam (c-ctxusage r8 item 6): park the first
+                    // collect INSIDE the blocking operation; inert in prod.
+                    if let Some(faults) = &collect_faults {
+                        faults.pump_collect_entered();
+                    }
                     let lines = hydrated.tail.poll().unwrap_or_default();
                     let mut chunk: Vec<Observation> = Vec::with_capacity(TRANSCRIPT_EMIT_CHUNK);
                     let park = |frames: &mut Vec<Observation>| {
@@ -1652,6 +1687,7 @@ fn spawn_transcript_pump(
                             &pending,
                             &flush_notify,
                             &map_in_flight,
+                            faults.as_ref(),
                         )
                         .await;
                         flush_stop.store(true, Ordering::SeqCst);
@@ -1704,11 +1740,13 @@ async fn final_finish_blocking(
     pending: &TranscriptPending,
     notify: &Arc<Notify>,
     in_flight: &Arc<AtomicBool>,
+    faults: Option<&Arc<crate::test_faults::FaultState>>,
 ) {
     let slot = Arc::clone(slot);
     let pending = Arc::clone(pending);
     let notify = Arc::clone(notify);
     let in_flight = Arc::clone(in_flight);
+    let finish_faults = faults.cloned();
     let join = tokio::task::spawn_blocking(move || {
         // A detached collect (from an aborted previous tick) may still own the
         // hydrator; park the blocking thread — never a runtime worker — until
@@ -1719,6 +1757,11 @@ async fn final_finish_blocking(
         let Some(mut hydrated) = transcript_slot_lock(&slot).take() else {
             return;
         };
+        // Test-only seam (c-ctxusage r8 item 6 / item 2): park the cooperative
+        // finish INSIDE the blocking finish while it owns the hydrator.
+        if let Some(faults) = &finish_faults {
+            faults.cooperative_finish_entered();
+        }
         let lines = hydrated.tail.poll().unwrap_or_default();
         let mut frames = Vec::new();
         for line in &lines {
@@ -1753,6 +1796,9 @@ struct AbortTranscriptGuard {
     notify: Arc<Notify>,
     stop: Arc<AtomicBool>,
     map_in_flight: Arc<AtomicBool>,
+    /// Test-only abort acknowledgement (c-ctxusage r8 item 6); `None` in
+    /// production.
+    faults: Option<Arc<crate::test_faults::FaultState>>,
     disarmed: bool,
 }
 
@@ -1778,7 +1824,13 @@ impl Drop for AbortTranscriptGuard {
         let in_flight = Arc::clone(&self.map_in_flight);
         let stop = Arc::clone(&self.stop);
         let stop_notify = Arc::clone(&self.notify);
+        let faults = self.faults.clone();
         std::thread::spawn(move || {
+            // Acknowledge the abort-residual path so a test can prove the
+            // timeout-driven abort (not the cooperative path) ran.
+            if let Some(faults) = &faults {
+                faults.note_abort_residual();
+            }
             // Bounded: only wait for a collect that is actually running; an
             // unbound pump exits immediately.
             for _ in 0..24_000 {
@@ -2766,6 +2818,7 @@ mod tests {
             ctx,
             seq,
             shutdown_rx,
+            None,
             None,
             None,
             None,

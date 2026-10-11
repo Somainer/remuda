@@ -134,6 +134,12 @@ pub struct AppState {
     /// irreversible delete operation; never armed in production.
     #[cfg(any(test, feature = "test-faults"))]
     operation_parks: crate::ws::OperationParks,
+    /// c-cardsettle-fu2 r4 item 3: test-only per-interaction count of
+    /// settlement notices actually put on the bus. Lets a test prove a
+    /// parked delete has NOT broadcast without reading the follower socket
+    /// during the park window (cancelled WS reads starve the next poll).
+    #[cfg(any(test, feature = "test-faults"))]
+    test_settlement_counts: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
     tty: crate::ws::TtyRelay,
     /// D-048 relay stream registry (per-Hub-process).
     api_relay: crate::api_relay::ApiRelay,
@@ -230,8 +236,26 @@ impl AppState {
                 reason: settled.reason.clone(),
                 seq: settled.seq,
             });
+            // r4 item 3: record a broadcast the bus actually accepted; keyed
+            // by interaction id so unrelated background settles cannot move
+            // a test's counter.
+            self.note_test_settlement_broadcast(&settled.interaction_id);
         }
     }
+
+    /// r4 item 3 test seam: count a broadcast per interaction id.
+    #[cfg(any(test, feature = "test-faults"))]
+    fn note_test_settlement_broadcast(&self, interaction_id: &str) {
+        *self
+            .test_settlement_counts
+            .lock()
+            .unwrap()
+            .entry(interaction_id.to_owned())
+            .or_insert(0) += 1;
+    }
+
+    #[cfg(not(any(test, feature = "test-faults")))]
+    fn note_test_settlement_broadcast(&self, _interaction_id: &str) {}
 
     /// Raw per-chunk cap for D-048 relay streams, from the D-048 protocol
     /// default (`TransportLimits.apiChunkBytes`, 64 KiB).
@@ -942,6 +966,23 @@ impl RunningHub {
             .await
     }
 
+    /// c-cardsettle-fu2 r4 item 3: number of settlement notices
+    /// `broadcast_settlement` has actually put on the bus for
+    /// `interaction_id`. A parked post-delete must keep this at 0 until the
+    /// park is released; keyed by interaction so unrelated background
+    /// settles (host sweeps, daemons) do not move the count.
+    #[cfg(any(test, feature = "test-faults"))]
+    #[doc(hidden)]
+    pub fn test_settlement_notice_count(&self, interaction_id: &str) -> u64 {
+        self.state
+            .test_settlement_counts
+            .lock()
+            .unwrap()
+            .get(interaction_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Mint a scoped device token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/login`, for components composed into
@@ -1272,6 +1313,8 @@ async fn spawn_inner(
         follow_parks: crate::ws::FollowParks::default(),
         #[cfg(any(test, feature = "test-faults"))]
         operation_parks: crate::ws::OperationParks::default(),
+        #[cfg(any(test, feature = "test-faults"))]
+        test_settlement_counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         tty: crate::ws::TtyRelay::default(),
         api_relay: crate::api_relay::ApiRelay::new(),
         push,

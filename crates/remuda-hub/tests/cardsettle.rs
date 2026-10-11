@@ -2509,6 +2509,20 @@ async fn disconnecting_right_after_delete_still_publishes_and_audits() -> Result
         "the post-delete park must be reached after the DB delete committed"
     );
 
+    // c-cardsettle-fu2 r4 item 3: WHILE the delete is parked (delete
+    // committed, still inside publish_settlement holding the publication
+    // lock, broadcast not yet run) the settlement for this card MUST NOT
+    // exist. A broadcast COUNTER keyed by interaction id proves it without a
+    // cancelled WebSocket read (repeated timeout-cancelled reads starve the
+    // follower's next poll). If the park were moved back AFTER
+    // publish_settlement, the bus send would already have happened here.
+    let notices = || hub.test_settlement_notice_count(&interaction_id);
+    assert_eq!(
+        notices(),
+        0,
+        "no settlement notice may be broadcast while the delete is parked"
+    );
+
     // Abort the request connection with RST while the operation is parked:
     // hyper drops the handler future (and its JoinHandle await). Pre-fix the
     // delete/publish/tail were all owned by that future and would be cancelled.
@@ -2530,21 +2544,32 @@ async fn disconnecting_right_after_delete_still_publishes_and_audits() -> Result
     // operation is still parked.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Release the park: the DETACHED task proceeds; the cancelled handler
-    // cannot abort it.
-    // (0) The frame has NOT been published yet: the park is inside
-    // publish_settlement after the delete committed but before the broadcast.
-    // The park is INSIDE publish_settlement (after the delete committed,
-    // before broadcast), so no settlement frame can have been published yet.
-    // Do NOT read from the follow socket during the RST window — repeated
-    // tokio-timeout cancellation of WebSocket reads can starve the next poll;
-    // the post-release read below is the first and only post-arm read.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Still parked at this point (release has not been sent): the RST and
+    // the full RST-observation window must not have produced a broadcast.
+    assert_eq!(
+        notices(),
+        0,
+        "dropping the handler during the RST window must not publish the frame"
+    );
 
     // Release: publish + cleanup tail proceed in the detached task.
+    // The park is INSIDE publish_settlement (after the delete committed,
+    // before broadcast), so the first follower read happens only after
+    // release.
     delete_release
         .send(())
         .expect("releasing the parked delete");
+
+    // (0) The broadcast counter moves exactly once for this interaction.
+    let count_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while notices() == 0 && tokio::time::Instant::now() < count_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        notices(),
+        1,
+        "the detached delete broadcasts exactly one settlement after release"
+    );
 
     // (1) The settlement frame reaches the follower ONLY after release.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);

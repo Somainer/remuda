@@ -1702,30 +1702,23 @@ async fn a_deferred_result_emits_exactly_one_ordered_settlement_when_b_real_writ
     // A is deferred; stdin is closed. Release B's pre-accept gate: its REAL
     // write fails (EPIPE), so the ordered rollback emits the one correction.
     barrier.release_write_ack();
-    let b_result = sends.await.expect("sends task");
+    let b_result = tokio::time::timeout(Duration::from_secs(5), sends)
+        .await
+        .expect("sends task within 5s")
+        .expect("sends task joined");
     assert!(
         b_result.is_err(),
         "B's real write fails on the closed stdin"
     );
 
-    // ACKNOWLEDGED PUBLICATION FENCE (r9 item 4): enqueue after B's rollback;
-    // it resolves only once every earlier job — including the deferred-settle
-    // Emit — has been published. No quiet-period polling, and the whole
-    // sequence is complete (a delayed duplicate cannot slip past the drain).
+    // ACKNOWLEDGED PUBLICATION FENCE (r9 item 4; r10 item 4): enqueue AFTER B's
+    // rollback and drain in one overall timeout. The fence resolves only once
+    // every earlier job — INCLUDING the deferred-settle correction emitted at
+    // B's cancelled ticket position — is published, so counting ALL starts and
+    // settledRootTurn observations in the drained sequence needs no quiet
+    // period and a delayed correction cannot slip past.
     let fence = driver.publication_fence().await;
-    tokio::time::timeout(Duration::from_secs(5), fence)
-        .await
-        .expect("publication fence within 5s")
-        .expect("fence sender alive");
-
-    // Every observation is already emitted; read them without any timeout wait.
-    let mut all = Vec::new();
-    while let Ok(obs) = tokio::time::timeout(Duration::from_millis(200), handle.recv()).await {
-        match obs {
-            Some(obs) => all.push(obs),
-            None => break,
-        }
-    }
+    let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
 
     assert_eq!(
         turn_started_count(&all),
@@ -1765,7 +1758,11 @@ async fn cancelling_a_pre_accept_b_publishes_a_deferred_a_settle() {
         .wait_until_result_parked(Duration::from_secs(5))
         .await;
     barrier.release_send();
-    send_a.await.expect("send_a").expect("A acked");
+    tokio::time::timeout(Duration::from_secs(5), send_a)
+        .await
+        .expect("send_a task within 5s")
+        .expect("send_a joined")
+        .expect("A acked");
 
     // B reserves, then parks pre-accept (writer has not accepted it).
     let db = driver.clone();
@@ -1779,23 +1776,17 @@ async fn cancelling_a_pre_accept_b_publishes_a_deferred_a_settle() {
         .wait_until_results_mapped(1, Duration::from_secs(5))
         .await;
 
-    // Abort B BEFORE the writer accepts its prompt. Its pre-accept Drop cleanup
-    // must publish A's deferred settle in order.
+    // Abort B BEFORE the writer accepts its prompt. Its cancelled ticket is
+    // rolled back at its queue position, releasing A's deferred settle.
     send_b.abort();
     barrier.release_write_ack();
 
-    // Fence-drain the full sequence.
-    let mut all = Vec::new();
-    let mut quiet = 0u32;
-    while quiet < 10 {
-        match tokio::time::timeout(Duration::from_millis(50), handle.recv()).await {
-            Ok(Some(obs)) => {
-                all.push(obs);
-                quiet = 0;
-            }
-            Ok(None) | Err(_) => quiet += 1,
-        }
-    }
+    // ACKNOWLEDGED FENCE DRAIN (r10 item 4): the fence sits behind B's
+    // cancelled ticket, so it resolves only after the rollback-generated
+    // correction is published. One overall timeout, no quiet period; count ALL
+    // starts and settlements in the complete sequence.
+    let fence = driver.publication_fence().await;
+    let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
 
     assert_eq!(
         turn_started_count(&all),

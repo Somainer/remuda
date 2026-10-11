@@ -32,6 +32,7 @@ import { fileURLToPath } from "node:url";
 
 import { expect, test, type Page } from "@playwright/test";
 
+import { resolveBuiltBinary, type BuiltBinary } from "../../cargo-artifacts";
 import { login } from "./hub-auth";
 
 const root = path.resolve(
@@ -41,26 +42,43 @@ const root = path.resolve(
 const target = process.env.CARGO_TARGET_DIR
   ? path.resolve(process.env.CARGO_TARGET_DIR)
   : path.resolve(root, "target");
-const remuda =
-  process.env.HUB_E2E_REMUDA_BIN ?? path.join(target, "debug/remuda");
-const harness =
-  process.env.HUB_E2E_FAKE_HARNESS_BIN ??
-  path.join(target, "debug/fake-harness");
-const nativeNode =
-  process.env.HUB_E2E_NATIVE_NODE_BIN ??
-  path.join(target, "debug/examples/native_hub_e2e");
+
+/** Binaries the hook builds itself vs. operator-supplied overrides. The two
+ * sets are resolved differently (r10 item 6): a built-but-missing artifact is
+ * a hook failure; only an external override may ENOENT-skip. */
+const BIN_SPECS: {
+  binary: BuiltBinary;
+  override: string | undefined;
+}[] = [
+  { binary: { label: "remuda", relPath: "remuda" }, override: process.env.HUB_E2E_REMUDA_BIN },
+  {
+    binary: { label: "fake-harness", relPath: "fake-harness" },
+    override: process.env.HUB_E2E_FAKE_HARNESS_BIN,
+  },
+  {
+    binary: { label: "native node", relPath: path.join("examples", "native_hub_e2e") },
+    override: process.env.HUB_E2E_NATIVE_NODE_BIN,
+  },
+];
+
+// Resolved after beforeAll; consumed by the scenarios below.
+const bins: Record<string, string> = {};
 
 // Refresh the three executables so a standalone gate run uses this tree.
 test.beforeAll(async () => {
   test.setTimeout(600_000);
   const args = ["build", "--locked"];
-  if (!process.env.HUB_E2E_REMUDA_BIN)
-    args.push("-p", "remuda", "--bin", "remuda");
-  if (!process.env.HUB_E2E_FAKE_HARNESS_BIN) {
-    args.push("-p", "remuda-testing", "--bin", "fake-harness");
-  }
-  if (!process.env.HUB_E2E_NATIVE_NODE_BIN) {
-    args.push("-p", "remuda-node", "--example", "native_hub_e2e");
+  for (const spec of BIN_SPECS) {
+    if (spec.override) {
+      continue;
+    }
+    if (spec.binary.relPath === "remuda") {
+      args.push("-p", "remuda", "--bin", "remuda");
+    } else if (spec.binary.relPath === "fake-harness") {
+      args.push("-p", "remuda-testing", "--bin", "fake-harness");
+    } else {
+      args.push("-p", "remuda-node", "--example", "native_hub_e2e");
+    }
   }
   if (args.length > 2) {
     await promisify(execFile)("cargo", args, {
@@ -70,35 +88,44 @@ test.beforeAll(async () => {
       maxBuffer: 8 * 1024 * 1024,
     });
   }
-  // Runs AFTER the build: on a fixture-less host binaries genuinely do not
-  // exist, so this is a real missing-prerequisite SKIP rather than a failing
-  // hook (a raw access() rejection failed beforeAll and failed the file).
-  // c-ctxusage r9 item 7: only ENOENT (a binary the build did not produce)
-  // skips; every other access failure (EACCES, ENOTDIR, …) is a real error
-  // and must surface, not masquerade as a missing prerequisite.
-  const checks = await Promise.allSettled([
-    access(remuda),
-    access(harness),
-    access(nativeNode),
-  ]);
-  const names = ["remuda", "fake-harness", "native node"];
+  // Runs AFTER the build. A binary the hook did NOT just build (an operator
+  // override env var) may legitimately be absent on a fixture-less host: ENOENT
+  // on that path is the real missing-prerequisite SKIP; every other access
+  // error still surfaces. A binary the hook DID just build is resolved through
+  // cargo's real output layout (including a target-triple subdir) and a miss
+  // there THROWS — a failed build or wrong path resolution must fail the hook,
+  // never masquerade as a skip (c-ctxusage r10 item 6).
   const missing: string[] = [];
-  checks.forEach((check, index) => {
-    if (check.status !== "rejected") {
-      return;
-    }
-    const code = (check.reason as NodeJS.ErrnoException | undefined)?.code;
-    if (code === "ENOENT") {
-      missing.push(names[index]);
+  for (const spec of BIN_SPECS) {
+    if (spec.override) {
+      try {
+        await access(spec.override);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+          missing.push(spec.binary.label);
+          continue;
+        }
+        throw error;
+      }
+      bins[spec.binary.label] = spec.override;
     } else {
-      throw check.reason;
+      bins[spec.binary.label] = resolveBuiltBinary(root, target, spec.binary);
     }
-  });
+  }
   test.skip(
     missing.length > 0,
-    `native usage e2e binaries missing after build: ${missing.join(", ")}`,
+    `native usage e2e binaries missing (operator override paths): ${missing.join(", ")}`,
   );
 });
+
+/** Resolved remuda/fake-harness/native-node paths for the spawned processes. */
+function builtBin(label: "remuda" | "fake-harness" | "native node"): string {
+  const resolved = bins[label];
+  if (!resolved) {
+    throw new Error(`${label} binary was not resolved before the test ran`);
+  }
+  return resolved;
+}
 
 // 3_000 + 94_000 + (2_000 5m + 1_000 1h) = 100_000 of the 200k fallback
 // window → the chip reads exactly 50%.
@@ -201,7 +228,7 @@ test("native transcript usage drives the context chip through the real promoted 
 
   try {
     await Promise.all([mkdir(bin), mkdir(workspace), mkdir(claudeHome)]);
-    await copyFile(harness, path.join(bin, "claude"));
+    await copyFile(builtBin("fake-harness"), path.join(bin, "claude"));
     await chmod(path.join(bin, "claude"), 0o700);
     await writeFile(
       shell,
@@ -231,7 +258,7 @@ test("native transcript usage drives the context chip through the real promoted 
     );
     hub.protocol = hub.protocol === "https:" ? "wss:" : "ws:";
     hub.pathname = "/v1/node";
-    node = spawn(nativeNode, [], {
+    node = spawn(builtBin("native node"), [], {
       cwd: dir,
       stdio: ["ignore", "pipe", "pipe"],
       env: {
@@ -241,7 +268,7 @@ test("native transcript usage drives the context chip through the real promoted 
         HUB_E2E_NODE_TOKEN_FILE: tokenFile,
         HUB_E2E_NODE_WORKSPACE: workspace,
         HUB_E2E_NODE_DATA_DIR: dataPath,
-        HUB_E2E_REMUDA_BIN: remuda,
+        HUB_E2E_REMUDA_BIN: builtBin("remuda"),
         REMUDA_CLAUDE_BIN: path.join(bin, "claude"),
         REMUDA_CLAUDE_CONFIG_DIR: claudeHome,
         CLAUDE_CONFIG_DIR: claudeHome,

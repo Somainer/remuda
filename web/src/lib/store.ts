@@ -1717,8 +1717,10 @@ class HubStore {
     //    they are recorded and disable the switch regardless, but mutate the
     //    pending ONLY when they are this request's verdict.
     const namesCurrent = current
-      ? current.source === "lifecycle" ||
-        effortLifecycleMatches(current, parsed.word, "degraded")
+      ? edgeId !== null
+        ? edgeId === current.requestId
+        : current.source === "lifecycle" ||
+          effortLifecycleMatches(current, parsed.word, "degraded")
       : false;
     const mutatesRequest = !current || namesCurrent;
     if (!mutatesRequest && !isUltraRefusal) return;

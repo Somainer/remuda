@@ -2023,3 +2023,79 @@ it("r10 item 2: request A OFF's executing read-back (echo id A) vetoes queued re
   );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
+
+it("r10 item 3: request A's timeout/degraded verdict never deletes or rolls back newer request B", async () => {
+  const ctx = await startFollowing("r10-item3", { state: "known", value: "working" });
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  ctx.receive(effortEvent(2, "high", true, "slash", "2026-10-03T00:00:00.000Z"));
+  const a = hubStore.setUltracode(ctx.instance.id, false);
+  const idA = posts[0]?.requestId!;
+  await a;
+  await hubStore.setUltracode(ctx.instance.id, true);
+  const idB = posts[1]?.requestId!;
+  expect(idA).not.toBe(idB);
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idB);
+  expect(hubStore.effortOf(ctx.instance.id, "claude").ultracode).toBe(true);
+
+  // A times out with no read-back: its degraded verdict carries id A.
+  ctx.receive(
+    configureLifecycleFor(3, "effort-degraded:ultracode off:no-readback-within-window", idA, ctx.instance.id, "2026-10-03T00:01:00.000Z"),
+  );
+  const bSurvives = hubStore.effortPendingOf(ctx.instance.id);
+  expect(bSurvives?.requestId).toBe(idB);
+  expect(hubStore.effortOf(ctx.instance.id, "claude").ultracode).toBe(true);
+  expect(toast).not.toHaveBeenCalled();
+
+  // A dialog-kept cancellation of A likewise never touches B.
+  ctx.receive(
+    configureLifecycleFor(4, "effort-degraded:ultracode off:dialog-kept", idA, ctx.instance.id, "2026-10-03T00:01:05.000Z"),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idB);
+  expect(hubStore.effortOf(ctx.instance.id, "claude").ultracode).toBe(true);
+  expect(toast).not.toHaveBeenCalled();
+
+  // B's own timeout DOES end B (exact id binding) and rolls its selection
+  // back to the observed OFF state A left behind.
+  ctx.receive(
+    effortEvent(5, "high", false, "remuda", "2026-10-03T00:01:10.000Z"),
+  );
+  ctx.receive(
+    configureLifecycleFor(6, "effort-degraded:ultracode on:no-readback-within-window", idB, ctx.instance.id, "2026-10-03T00:02:00.000Z"),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.effortOf(ctx.instance.id, "claude").ultracode).toBe(false);
+  expect(toast).toHaveBeenCalledTimes(1);
+});
+
+it("r10 item 3: a genuine model/workflow refusal for A is recorded but never deletes B", async () => {
+  const ctx = await startFollowing("r10-item3-refusal", { state: "known", value: "working" });
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  await hubStore.setUltracode(ctx.instance.id, false);
+  const idA = posts[0]?.requestId!;
+  await hubStore.setUltracode(ctx.instance.id, true);
+  const idB = posts[1]?.requestId!;
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idB);
+
+  // A's model refusal is process/model environment evidence: recorded (the
+  // switch is disabled for this environment) but B's optimistic selection and
+  // indicator are NOT rolled back by A's verdict.
+  ctx.receive(
+    configureLifecycleFor(3, "effort-degraded:ultracode off:ultracode-unavailable-for-model", idA, ctx.instance.id, "2026-10-04T00:01:00.000Z"),
+  );
+  expect(hubStore.effortRefusalOf(ctx.instance.id)).not.toBeNull();
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idB);
+  expect(hubStore.effortOf(ctx.instance.id, "claude").ultracode).toBe(true);
+  void toast;
+});

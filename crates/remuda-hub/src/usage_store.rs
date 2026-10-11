@@ -124,30 +124,61 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
          WHERE observed_at_source IS NULL OR observed_at_source = ''",
         [],
     )?;
+    // c-ctxusage r10 item 2: the obsolete shared unique index
+    // (`instance_id, scope, scope_id` WHERE scope_id IS NOT NULL) MUST be
+    // dropped BEFORE the retained-journal backfill stamps NULL-scope rows —
+    // two legacy rows proving one session would otherwise violate it mid-
+    // migration and the Hub database could never open (every retry failed at
+    // this statement). Drop → backfill → collapse identical rows that the
+    // stamp makes duplicates → create the scope-specific index, all in ONE
+    // transaction so an interruption never leaves the schema half-migrated.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("DROP INDEX IF EXISTS usage_events_scope_dedupe;")?;
     // c-ctxusage r9 item 5: rows written in the pre-scopeId world have a NULL
     // scope_id, but the matching retained journal payload (keyed by
     // (instance_id, seq)) can still PROVE which session the cumulative stock
-    // belonged to. Without this backfill the legacy stock silently drops out
-    // of the totals the moment the first scoped session point arrives, since
-    // rollups sum scoped sessions and otherwise fall back to a single legacy
-    // row. Provenance comes ONLY from our own journal — never guessed.
-    backfill_legacy_scope_ids(conn)?;
-    // Now the columns exist on both a fresh CREATE and an upgraded DB.
-    //
-    // Dedupe indexes are scope-specific (c-ctxusage r4 item 3):
+    // belonged to. Provenance comes ONLY from our own journal — never guessed.
+    backfill_legacy_scope_ids(&tx)?;
+    consolidate_identical_scoped_rows(&tx)?;
+    // Dedupe index is scope-specific (c-ctxusage r4 item 3):
     // - Turn rows (Claude message id): one revision-replaced row per message.
     // - Session rows (cumulative Grok/Codex stock): append-only GROWTH POINTS,
     //   never collapsed — rate windows need their history. Duplicate/historical
     //   replay points are frozen in Rust by their cumulative counters, not by a
-    //   one-row unique index. The old shared index collapsed both scopes, so it
-    //   is dropped on every prior schema.
-    conn.execute_batch(
-        "DROP INDEX IF EXISTS usage_events_scope_dedupe;
-         CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
+    //   one-row unique index.
+    tx.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
              ON usage_events(instance_id, scope, scope_id)
              WHERE scope = 'turn' AND scope_id IS NOT NULL;",
     )?;
+    tx.commit()?;
     Ok(())
+}
+
+/// Collapse rows that became exact duplicates after the retained-journal
+/// scope-id backfill: same `(instance_id, scope, scope_id)` AND identical
+/// counters in every bucket are the same cumulative point replayed at another
+/// journal seq, so keeping both would double-count a stock and violate a
+/// unique index. The oldest durable identity (smallest rowid) wins; its
+/// `observed_at` is retained. Runs inside [`migrate`]'s transaction
+/// (c-ctxusage r10 item 2).
+fn consolidate_identical_scoped_rows(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM usage_events
+         WHERE scope_id IS NOT NULL
+           AND rowid NOT IN (
+               SELECT MIN(rowid)
+               FROM usage_events
+               WHERE scope_id IS NOT NULL
+               GROUP BY instance_id, scope, scope_id,
+                        COALESCE(total_tokens, -1),
+                        COALESCE(input_tokens, -1),
+                        COALESCE(output_tokens, -1),
+                        COALESCE(cache_read_tokens, -1),
+                        COALESCE(cache_write_tokens, -1)
+           )",
+        [],
+    )
 }
 
 /// Backfill pre-`scopeId` NULL-scope session rows from the matching retained
@@ -3730,5 +3761,136 @@ mod tests {
         assert_eq!(rollup.session_output_tokens, Some(15));
         assert_eq!(rollup.tpm_in_60s, Some(7));
         assert_eq!(rollup.tpm_out_60s, Some(2));
+    }
+
+    /// RFC3339 UTC millisecond stamp `delta` seconds from now (negative for
+    /// the past, positive for the future), byte-comparable with the stamps
+    /// `Store::append_journal` writes.
+    fn stamp_rel(delta: i64) -> String {
+        let t = time::OffsetDateTime::now_utc() + time::Duration::seconds(delta);
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            t.year(),
+            u8::from(t.month()),
+            t.day(),
+            t.hour(),
+            t.minute(),
+            t.second(),
+            t.millisecond()
+        )
+    }
+
+    /// c-ctxusage r10 item 3: a buffered NATIVE point (native ts 12:04:50,
+    /// accepted last) must diff against the last ACCEPTED predecessor (the
+    /// 50 accepted at ingest 12:05:01), not the point with the adjacent
+    /// native time, and the current stock is the last accepted 150 — never
+    /// the newest-clock ingest row 50.
+    #[test]
+    fn late_accepted_native_point_chains_in_acceptance_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Accepted order: ingest(10, now+10s), ingest(50, now+11s), then the
+        // buffered native point (150, now-2s). Mixed clocks.
+        let mut first = scoped_record(1, "ins_o3", "session", Some("s1"), 1, 10, 1, 0, 0, None);
+        first.observed_at = stamp_rel(10);
+        assert!(insert(&conn, &first));
+        let mut second = scoped_record(2, "ins_o3", "session", Some("s1"), 2, 50, 5, 0, 0, None);
+        second.observed_at = stamp_rel(11);
+        assert!(insert(&conn, &second));
+        let native_at = stamp_rel(-2);
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                3,
+                "ins_o3",
+                "session",
+                Some("s1"),
+                3,
+                150,
+                15,
+                0,
+                0,
+                Some(&native_at)
+            )
+        ));
+
+        let increments = session_stock_increments(&conn, "ins_o3").unwrap();
+        // One native-ended interval: 150 - its ACCEPTED predecessor 50 = 100.
+        assert_eq!(increments.len(), 1);
+        assert_eq!(increments[0].input, Some(100), "150-50, not 150-10");
+        assert_eq!(increments[0].output, Some(10));
+        assert_eq!(increments[0].end_at, native_at);
+
+        let rollup = rollup_instance(&conn, "ins_o3", "grok", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(150),
+            "current stock is the last ACCEPTED point, not the newest-clock ingest 50"
+        );
+        assert_eq!(rollup.session_output_tokens, Some(15));
+        // The native end time is 2 s ago: inside the 60 s rate window.
+        assert_eq!(rollup.tpm_in_60s, Some(100));
+        assert_eq!(rollup.tpm_out_60s, Some(10));
+        assert_eq!(rollup.last_turn_at.as_deref(), Some(native_at.as_str()));
+    }
+
+    /// c-ctxusage r10 item 4: an UNKNOWN predecessor counter is not zero.
+    /// input unknown→150 leaves the interval unknown; output 10→15 is 5.
+    #[test]
+    fn an_unknown_predecessor_counter_stays_unknown_for_that_bucket() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let t1 = stamp_rel(-3);
+        let t2 = stamp_rel(-1);
+        // First native point reports output only: input is genuinely unknown.
+        let mut first = scoped_record(
+            1,
+            "ins_o4",
+            "session",
+            Some("s1"),
+            1,
+            0,
+            10,
+            0,
+            0,
+            Some(&t1),
+        );
+        first.event["payload"]["inputTokens"] =
+            json!({ "state": "unknown", "reason": "unreported" });
+        assert!(insert(&conn, &first));
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                2,
+                "ins_o4",
+                "session",
+                Some("s1"),
+                2,
+                150,
+                15,
+                0,
+                0,
+                Some(&t2)
+            )
+        ));
+
+        let increments = session_stock_increments(&conn, "ins_o4").unwrap();
+        assert_eq!(increments.len(), 1);
+        assert_eq!(
+            increments[0].input, None,
+            "unknown→150 is unknown, not a 150 increment"
+        );
+        assert_eq!(increments[0].output, Some(5));
+
+        let rollup = rollup_instance(&conn, "ins_o4", "grok", None)
+            .unwrap()
+            .unwrap();
+        // The cumulative stock itself is still reported at 150.
+        assert_eq!(rollup.session_input_tokens, Some(150));
+        assert_eq!(rollup.session_output_tokens, Some(15));
+        assert_eq!(rollup.tpm_in_60s, None);
+        assert_eq!(rollup.tpm_out_60s, Some(5));
     }
 }

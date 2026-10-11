@@ -1482,10 +1482,22 @@ async fn a_failing_exit_observation_build_still_closes_the_run_handle_to_eof() {
 /// and close cleanly.
 #[tokio::test]
 async fn a_successful_turn_then_a_failed_live_write_rolls_back_without_a_b_start() {
+    let closed_marker = std::env::temp_dir().join(format!(
+        "remuda-r9-afterturn-closed-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     let mut env = BTreeMap::new();
     env.insert(
         "FAKE_CLAUDE_CLOSE_STDIN_AFTER_TURNS".to_owned(),
         "1".to_owned(),
+    );
+    env.insert(
+        "FAKE_CLAUDE_STDIN_CLOSED_FILE".to_owned(),
+        closed_marker.to_string_lossy().into_owned(),
     );
     let (_tmp, driver, spec) = driver_with_env(ScriptKind::TwoTurn, env);
     let mut handle = driver.start(spec).await.expect("start");
@@ -1501,11 +1513,15 @@ async fn a_successful_turn_then_a_failed_live_write_rolls_back_without_a_b_start
     })
     .await;
 
-    // Give the child a beat to close its stdin after turn A.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Acknowledge the child closed stdin after turn A (bounded, no sleep).
+    await_marker(&closed_marker).await;
 
-    // Turn B's write fails on the live child.
-    let b = driver.send(prompt_id("second", "msg-r5-live-b")).await;
+    // Turn B's write fails on the live child. B's prompt is large enough to
+    // exceed the 64 KiB pipe buffer, so with no reader it cannot be absorbed
+    // and the write fails for real (a small write could still be buffered once
+    // even after the read end closed).
+    let big_b = "y".repeat(256 * 1024);
+    let b = driver.send(prompt_id(&big_b, "msg-r5-live-b")).await;
     assert!(b.is_err(), "B's write must fail on the closed stdin: {b:?}");
     assert!(
         !driver.process_gone().await,
@@ -1899,11 +1915,21 @@ async fn aborting_before_the_writer_accepts_never_writes_the_prompt() {
     );
     assert!(turn_done_count(&obs) >= 1, "the real turn settles");
 
-    // Give the child a beat to flush its stdin marker, then read it: the
-    // aborted prompt's `user` frame never reached the child.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let recorded = std::fs::read_to_string(&stdin_file).unwrap_or_default();
-    let user_frames = recorded.lines().filter(|l| l.trim() == "user").count();
+    // Wait (bounded) until the child has recorded the real prompt's user frame
+    // on its stdin marker — the aborted prompt's frame never reached it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let user_frames = loop {
+        let recorded = std::fs::read_to_string(&stdin_file).unwrap_or_default();
+        let count = recorded.lines().filter(|l| l.trim() == "user").count();
+        if count == 1 {
+            break count;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected exactly 1 recorded user frame"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
     assert_eq!(
         user_frames, 1,
         "exactly one user frame (the real prompt) reached the child; aborted one was cancelled"

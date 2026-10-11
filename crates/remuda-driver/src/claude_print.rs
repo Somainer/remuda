@@ -1875,11 +1875,9 @@ impl Drop for ReservationGuard {
             // Drop the JoinHandle immediately: detach the cleanup task; it only
             // touches the mapper/publish state, both of which outlive this
             // guard (the driver holds them).
-            drop(
-                handle.spawn(async move {
-                    rollback_without_ticket(&inner, seq).await;
-                }),
-            );
+            drop(handle.spawn(async move {
+                rollback_without_ticket(&inner, seq).await;
+            }));
         }
         self.reservation.cancel();
     }

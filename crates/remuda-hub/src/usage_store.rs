@@ -513,9 +513,10 @@ struct StoredSnapshot {
 ///
 /// A later record of the same message carries the message's FINAL counters
 /// (c-ctxusage r3 item 1): accept when any reported counter grows without one
-/// decreasing. Independently, a NATIVE timestamp repairs a stored ingest-
-/// fallback `observed_at` even when counters are identical; an ingest fallback
-/// never overwrites a native time (c-ctxusage r4 item 5).
+/// decreasing. Independently, a NATIVE observation repairs a stored ingest-
+/// fallback provenance even when counters are identical AND the timestamp
+/// string equals the fallback (r11 item 5); an ingest fallback never
+/// overwrites a native time (c-ctxusage r4 item 5).
 fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
     let stored: Option<StoredSnapshot> = conn
         .query_row(
@@ -547,9 +548,13 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
     let incoming = SnapshotCounters::of(row);
     let (grew, decreased) = incoming.growth_against(&stored.counters);
     let counters_change = grew && !decreased;
-    let time_repair = row.observed_at_source == "native"
-        && stored.observed_at_source != "native"
-        && row.observed_at != stored.observed_at;
+    // Independently, a NATIVE observation repairs a stored ingest-fallback
+    // PROVENANCE even when the counters and timestamp string are unchanged:
+    // the native source carrying the exact fallback string still proves the
+    // time was native rather than assumed, so the inequality of the strings
+    // is not required (c-ctxusage r11 item 5). An ingest fallback never
+    // overwrites a native time.
+    let time_repair = row.observed_at_source == "native" && stored.observed_at_source != "native";
 
     if !counters_change && !time_repair {
         return Ok(false);
@@ -2813,6 +2818,93 @@ mod tests {
             "historical tokens leave the current rate window"
         );
         assert_eq!(rollup.session_input_tokens, Some(250), "counters unchanged");
+    }
+
+    /// c-ctxusage r11 item 5: a native replay with identical counters whose
+    /// native timestamp string is EQUAL to the stored ingest timestamp must
+    /// still repair provenance - the source changes ingest -> native. The old
+    /// inequality requirement meant a native observation carrying exactly the
+    /// fallback string left the row falsely marked ingest.
+    #[test]
+    fn an_equal_timestamp_native_replay_still_repairs_provenance() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // First delivery carries no nativeAt: observed_at is the ingest
+        // fallback, stamped with the helper's ingest string.
+        let ingested = scoped_record(
+            1,
+            "ins_r11t5",
+            "turn",
+            Some("msg-eq"),
+            1,
+            250,
+            0,
+            0,
+            0,
+            None,
+        );
+        assert!(insert(&conn, &ingested));
+        let source_before: String = conn
+            .query_row(
+                "SELECT observed_at_source FROM usage_events
+                 WHERE instance_id='ins_r11t5' AND scope_id='msg-eq'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_before, "ingest");
+
+        // Native replay: identical counters, native timestamp EQUAL to the
+        // stored ingest fallback string.
+        let at = "2026-09-15T00:00:00.000Z";
+        let repaired = scoped_record(
+            2,
+            "ins_r11t5",
+            "turn",
+            Some("msg-eq"),
+            1,
+            250,
+            0,
+            0,
+            0,
+            Some(at),
+        );
+        assert!(
+            insert(&conn, &repaired),
+            "an equal-timestamp native replay is a provenance repair, not a freeze"
+        );
+        let (observed, source, seq): (String, String, i64) = conn
+            .query_row(
+                "SELECT observed_at, observed_at_source, seq FROM usage_events
+                 WHERE instance_id='ins_r11t5' AND scope_id='msg-eq'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(observed, at);
+        assert_eq!(
+            source, "native",
+            "provenance repaired despite equal strings"
+        );
+        assert_eq!(seq, 2, "the repair adopts the replay's seq");
+
+        // A subsequent identical NATIVE replay is a genuine no-op.
+        let again = scoped_record(
+            3,
+            "ins_r11t5",
+            "turn",
+            Some("msg-eq"),
+            1,
+            250,
+            0,
+            0,
+            0,
+            Some(at),
+        );
+        assert!(
+            !insert(&conn, &again),
+            "native -> native with identical counters/time changes nothing"
+        );
     }
     /// r4 item 7b: the REAL 2.1.289 fixture replayed by a fresh mapper into a
     /// real migrated store TWICE must converge durably: the same 24 turn rows

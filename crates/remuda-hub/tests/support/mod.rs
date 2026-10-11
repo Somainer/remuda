@@ -10,6 +10,11 @@
 //! copy, so reverting the harness arm left the test green. Both call sites now
 //! build the reply and wait for the ack through this one module.
 
+// This file is compiled as part of TWO binaries (the hub_e2e example and the
+// accept_reply integration test), each of which uses a different subset of
+// the fake-Node helpers; items unused in one are live in the other.
+#![allow(dead_code)]
+
 use anyhow::{Context, Result, anyhow};
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -49,6 +54,24 @@ pub(crate) async fn send_rpc_ok(ws: &mut NodeWs, id: Value, result: Value) -> Re
     Ok(())
 }
 
+/// Answer a Hub RPC with a JSON-RPC error. The fake Node uses this when the
+/// durable intent (journal.append) failed: the real Node never answers
+/// `accepted` after a rejected durable write.
+pub(crate) async fn send_rpc_error(
+    ws: &mut NodeWs,
+    id: Value,
+    code: i64,
+    message: &str,
+) -> Result<()> {
+    ws.send(Message::Text(
+        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+            .to_string()
+            .into(),
+    ))
+    .await?;
+    Ok(())
+}
+
 /// Classify a frame against the wanted append-ack id.
 ///
 /// - `Some(Ok(()))`  — a matching SUCCESS response (object `result`, no error)
@@ -73,6 +96,17 @@ pub(crate) fn classify_ack_frame(value: &Value, want: &str) -> Option<Result<()>
     Some(Ok(()))
 }
 
+/// Terminal classification of an id-matched append ack.
+pub(crate) enum AckFrame {
+    /// Matching SUCCESS response; carries the result object so the caller can
+    /// validate the durable ack (`seq` / `eventId` / `durableSeq`).
+    Accepted(Value),
+    /// Matching response carrying an `error` object. The Hub returns seq-gap
+    /// rejections this way WITHOUT closing the socket (ws.rs journal.append
+    /// error arm), so a fake Node that ignores this still has a live link.
+    Rejected(Value),
+}
+
 /// Read frames until the Hub acknowledges the journal append with id `want`.
 ///
 /// Uses ONE absolute deadline ([`FRAME_ACK_TIMEOUT`] from the first call),
@@ -83,12 +117,13 @@ pub(crate) fn classify_ack_frame(value: &Value, want: &str) -> Option<Result<()>
 /// Every other frame — a stale fire-and-forget append ack or an unrelated Hub
 /// RPC like the web poll's interaction.list — is stashed in `queue` for the
 /// main loop to process, so waiting on durability can never swallow an RPC.
-/// A missing ack, an `error` ack, or an over-capacity queue is a loud error.
-pub(crate) async fn wait_frame_ack(
+/// A missing ack or an over-capacity queue is a loud error; an id-matched
+/// response is handed back as [`AckFrame`] for the caller to act on.
+pub(crate) async fn await_ack_frame(
     ws: &mut NodeWs,
     queue: &mut FrameQueue,
     want: &str,
-) -> Result<()> {
+) -> Result<AckFrame> {
     let deadline = Instant::now() + FRAME_ACK_TIMEOUT;
     loop {
         // 1. Already-buffered match (the ack may be queued ahead of RPCs).
@@ -99,8 +134,7 @@ pub(crate) async fn wait_frame_ack(
         }) {
             let frame = queue.remove(pos).context("frame queue position vanished")?;
             let value: Value = serde_json::from_str(&frame)?;
-            classify_ack_frame(&value, want).expect("frame just matched")?;
-            return Ok(());
+            return Ok(classify_matched_ack(value, want));
         }
         // 2. Block for the REMAINING time only — the deadline never extends.
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -123,18 +157,46 @@ pub(crate) async fn wait_frame_ack(
             }
         };
         let value: Value = serde_json::from_str(&frame)?;
-        match classify_ack_frame(&value, want) {
-            Some(Ok(())) => return Ok(()),
-            Some(Err(reason)) => return Err(reason),
-            None => {
-                if queue.len() >= PENDING_FRAME_QUEUE_CAP {
-                    anyhow::bail!(
-                        "pending frame queue overflow (>{PENDING_FRAME_QUEUE_CAP}) waiting for append ack {want}"
-                    );
-                }
-                queue.push_back(frame.to_string());
+        if classify_ack_frame(&value, want).is_none() {
+            if queue.len() >= PENDING_FRAME_QUEUE_CAP {
+                anyhow::bail!(
+                    "pending frame queue overflow (>{PENDING_FRAME_QUEUE_CAP}) waiting for append ack {want}"
+                );
             }
+            queue.push_back(frame.to_string());
+            continue;
         }
+        return Ok(classify_matched_ack(value, want));
+    }
+}
+
+/// Split an already id-matched ack frame into success/error, handing the
+/// caller the result or error object instead of stringifying it.
+fn classify_matched_ack(value: Value, want: &str) -> AckFrame {
+    match classify_ack_frame(&value, want).expect("frame just matched") {
+        Ok(()) => AckFrame::Accepted(
+            value
+                .get("result")
+                .cloned()
+                .expect("classify_ack_frame required an object result"),
+        ),
+        Err(_) => AckFrame::Rejected(value),
+    }
+}
+
+/// Await the matching append ack and treat an `error` response as a loud
+/// error (the e2e harness contract).
+pub(crate) async fn wait_frame_ack(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    want: &str,
+) -> Result<()> {
+    match await_ack_frame(ws, queue, want).await? {
+        AckFrame::Accepted(_) => Ok(()),
+        AckFrame::Rejected(value) => Err(anyhow!(
+            "append ack {want} was an RPC error: {}",
+            value.get("error").unwrap_or(&value)
+        )),
     }
 }
 
@@ -163,6 +225,22 @@ pub(crate) async fn send_user_message_frame(
     command_id: Option<&str>,
     node: &str,
 ) -> Result<u64> {
+    send_user_message_frame_with_seq(ws, instance_id, n, text, command_id, node, None).await
+}
+
+/// Like [`send_user_message_frame`] but pins the frame's `seq` hint. A hint
+/// past the durable cursor makes the Hub reject the append with a journal-gap
+/// RPC error (store.rs append_loaded_event) WITHOUT closing the socket — the
+/// fault the item-3 regression drives.
+pub(crate) async fn send_user_message_frame_with_seq(
+    ws: &mut NodeWs,
+    instance_id: &str,
+    n: u64,
+    text: &str,
+    command_id: Option<&str>,
+    node: &str,
+    seq_hint: Option<i64>,
+) -> Result<u64> {
     let seq = n + 1;
     let mut payload = json!({
         "nodeId": node,
@@ -181,19 +259,23 @@ pub(crate) async fn send_user_message_frame(
     if let Some(command_id) = command_id {
         payload["commandId"] = json!(command_id);
     }
+    let mut params = json!({
+        "instanceId": instance_id,
+        "event": {
+            "kind": "message",
+            "completeness": "structured",
+            "payload": payload,
+        }
+    });
+    if let Some(hint) = seq_hint {
+        params["seq"] = json!(hint);
+    }
     ws.send(Message::Text(
         json!({
             "jsonrpc": "2.0",
             "id": format!("j{seq}"),
             "method": "journal.append",
-            "params": {
-                "instanceId": instance_id,
-                "event": {
-                    "kind": "message",
-                    "completeness": "structured",
-                    "payload": payload,
-                }
-            }
+            "params": params,
         })
         .to_string()
         .into(),
@@ -228,6 +310,63 @@ pub(crate) async fn append_command_user(
 ) -> Result<u64> {
     let node = command_user_node(command_id, n);
     append_user_message(ws, queue, instance_id, n, text, command_id, &node).await
+}
+
+/// The durable half of the fake Node's `instance.send` contract: append the
+/// command's user message, await the MATCHING `j{seq}` response id, FAIL on an
+/// RPC error, and validate the success ack's durable fields. Returns the
+/// validated ack result object (`seq` / `eventId` / `durableSeq`) and the
+/// frame seq, so a caller can correlate the durable journal message.
+///
+/// A caller that gets `Err` here must answer `instance.send` with an RPC
+/// error, never an accepted envelope — the intent was not durable.
+pub(crate) async fn durable_command_append(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    instance_id: &str,
+    n: u64,
+    text: &str,
+    command_id: Option<&str>,
+    seq_hint: Option<i64>,
+) -> Result<(u64, Value)> {
+    let node = command_user_node(command_id, n);
+    let seq =
+        send_user_message_frame_with_seq(ws, instance_id, n, text, command_id, &node, seq_hint)
+            .await?;
+    let want = format!("j{seq}");
+    let ack = match await_ack_frame(ws, queue, &want).await? {
+        AckFrame::Accepted(result) => result,
+        AckFrame::Rejected(response) => {
+            let message = response
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown journal.append error");
+            anyhow::bail!("journal.append {want} rejected: {message}");
+        }
+    };
+    // Validate the durable ack: a fresh append names its seq and event id, and
+    // the durable cursor is at least that far.
+    let ack_seq = ack
+        .get("seq")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<i64>().ok())
+        .with_context(|| format!("append ack {want} carried no numeric seq: {ack}"))?;
+    let durable = ack
+        .get("durableSeq")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<i64>().ok())
+        .with_context(|| format!("append ack {want} carried no numeric durableSeq: {ack}"))?;
+    if ack
+        .get("eventId")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        anyhow::bail!("append ack {want} carried no eventId: {ack}");
+    }
+    if durable < ack_seq {
+        anyhow::bail!("append ack {want} regressed: durableSeq {durable} < seq {ack_seq}: {ack}");
+    }
+    Ok((seq, ack))
 }
 
 /// The accepted-command envelope the fake Node returns for `instance.send`

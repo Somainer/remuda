@@ -1,17 +1,17 @@
-//! c-acceptrace round 3 item 1: the e2e fake Node's `instance.send` arm and
-//! THIS regression test run ONE shared acceptance sequence
-//! (`tests/support/mod.rs`): durably `journal.append` the user message, await
-//! the matching ack, then reply through the shared accepted-envelope builder.
+//! c-acceptrace round 3: the fake Node acceptance sequence for
+//! `instance.send` is shared with the e2e harness (`tests/support/mod.rs`).
 //!
-//! Before the extraction, this test ran its OWN fake Node: reverting the
-//! harness arm in `examples/hub_e2e.rs` left every test here green. The guard
-//! now has teeth — restoring the bare reply in the shared builder turns the
-//! accepted-envelope case red.
-//!
-//! The fake Node is driven against the ACTUAL Hub HTTP send path over the
-//! real WebSocket, and the test asserts BOTH:
-//! * the exact RPC result the helper sent for `instance.send`;
-//! * the settled state of the Hub's command row.
+//! * item 1 — the accepted reply comes from the SAME arm the harness runs
+//!   (`durable_command_append` + the shared envelope builders), so reverting
+//!   that arm reddens this file.
+//! * item 2 — the primary acceptance case is a REAL typed `CommandResult`
+//!   (`{command, relatedCommandIds}`, no top-level accepted/ok); a bare
+//!   top-level `accepted:true` is kept as a separate case.
+//! * item 3 — the fake Node waits for the MATCHING `jappend` response id: an
+//!   RPC error (journal seq gap) makes it answer `instance.send` with an RPC
+//!   error instead of a fake acceptance; the success ack's durable fields and
+//!   the durable journal message are both asserted. Unrelated frames arriving
+//!   while waiting for the ack are queued, never swallowed.
 
 mod support;
 
@@ -21,53 +21,85 @@ use remuda_hub::HubConfig;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
+use tokio_tungstenite::{accept_async, connect_async, tungstenite::client::IntoClientRequest};
 
 use support::{
-    FrameQueue, InstanceSendReply, NodeWs, append_command_user, send_instance_send_rpc, send_rpc_ok,
+    AckFrame, FrameQueue, InstanceSendReply, NodeWs, await_ack_frame, durable_command_append,
+    send_instance_send_rpc, send_rpc_error, send_rpc_ok,
 };
 
-/// Reply shape under test, paired with the helper variant that produces it.
+const PROMPT: &str = "acceptrace prompt";
+/// Seq hint safely past the durable cursor on a fresh instance, so the Hub
+/// rejects the append with a journal gap (store.rs append_loaded_event).
+const GAP_SEQ: i64 = 50;
+
+/// How the fake Node plays the one `instance.send` in a scenario.
 #[derive(Clone, Copy)]
-enum ReplyShape {
-    /// A real typed `CommandResult` (accepted command + relatedCommandIds),
-    /// with NO top-level accepted/ok — exactly what the DevNode sends.
-    RealCommandResult,
-    /// `{accepted:true}` at the result top level.
-    TopLevelAccepted,
-    /// The pre-fix fake-node reply.
-    BareOk,
+enum FakeBehavior {
+    /// Durable append succeeds; answer with this result shape.
+    Reply(InstanceSendReply),
+    /// Force a seq-gap append error. A contract-correct Node maps that to an
+    /// RPC error for the send; one that ignores the append error would instead
+    /// answer accepted — the false acceptance this scenario guards.
+    GapRejectsSend,
 }
 
-impl ReplyShape {
-    fn helper(self) -> InstanceSendReply {
+impl FakeBehavior {
+    /// Seq hint carried on the append frame.
+    fn seq_hint(self) -> Option<i64> {
         match self {
-            ReplyShape::RealCommandResult => InstanceSendReply::RealCommandResult,
-            ReplyShape::TopLevelAccepted => InstanceSendReply::TopLevelAccepted,
-            ReplyShape::BareOk => InstanceSendReply::BareOk,
+            FakeBehavior::Reply(_) => None,
+            FakeBehavior::GapRejectsSend => Some(GAP_SEQ),
+        }
+    }
+
+    /// Envelope used for the send reply when the durable append SUCCEEDS.
+    fn accepted_shape(self) -> InstanceSendReply {
+        match self {
+            FakeBehavior::Reply(shape) => shape,
+            FakeBehavior::GapRejectsSend => InstanceSendReply::RealCommandResult,
         }
     }
 }
 
-/// What the test wants to inspect after the POST: the settled command state
-/// plus the exact `result` object the shared helper answered the send with.
+/// Everything the test inspects after the POST.
 struct SendObservation {
-    state: String,
     command_id: String,
-    send_result: Value,
+    /// Raw POST `/commands` response body.
+    post: Value,
+    /// Settled row state from GET `.../commands`.
+    state: String,
+    /// Settlement projection from GET `.../commands` (absent unless settled).
+    settlement: Value,
+    /// Result object the fake Node answered instance.send with.
+    send_result: Option<Value>,
+    /// The validated durable append ack (success scenarios only).
+    append_ack: Option<Value>,
+    /// The journal.append rejection message (gap scenario only).
+    append_error: Option<String>,
+    /// GET `.../journal` response body.
+    journal: Value,
+}
+
+/// Mutable record the spawned fake Node writes the test reads.
+#[derive(Default)]
+struct FakeRecord {
+    send_result: Option<Value>,
+    append_ack: Option<Value>,
+    append_error: Option<String>,
 }
 
 /// Connect a fake Node that enrolls, announces one workspace/host, and runs
-/// the shared `instance.send` acceptance contract (durable append → ack →
-/// reply). The exact send result is recorded in `observed`.
+/// the shared `instance.send` contract from `support`.
 async fn spawn_fake_node(
     hub: &remuda_hub::RunningHub,
     host_id: &str,
     workspace_id: &str,
-    shape: ReplyShape,
-    observed: Arc<Mutex<Option<Value>>>,
+    behavior: FakeBehavior,
+    record: Arc<Mutex<FakeRecord>>,
 ) -> anyhow::Result<()> {
     let enroll = hub
         .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
@@ -102,10 +134,9 @@ async fn spawn_fake_node(
     let hello = recv_json(&mut ws).await?;
     assert!(hello["result"].is_object(), "hello rejected: {hello}");
 
-    // Drive the WS loop until the connection is dropped by the test end. The
-    // frame queue mirrors the e2e harness: frames buffered while the append
-    // awaits its ack (pipelined Hub RPCs) are answered afterwards, never
-    // swallowed.
+    // The frame queue mirrors the e2e harness: frames buffered while the
+    // append awaits its ack (pipelined Hub RPCs) are answered afterwards,
+    // never swallowed.
     tokio::spawn(async move {
         let mut queue: FrameQueue = std::collections::VecDeque::new();
         let mut append_n = 0u64;
@@ -146,21 +177,47 @@ async fn spawn_fake_node(
                                 .as_str()
                                 .map(str::to_string)
                                 .unwrap_or_default();
-                            // The SAME durable append + ack the e2e harness
-                            // runs — no test-local copy of the contract.
-                            append_n = append_command_user(
+                            // Shared durable contract: append the user message,
+                            // wait for the MATCHING ack and validate it. A
+                            // rejected append (seq gap) is carried to the send
+                            // RPC as an error — the Node never claims
+                            // acceptance after a failed durable write.
+                            match durable_command_append(
                                 &mut ws,
                                 &mut queue,
                                 &iid,
                                 append_n,
-                                "acceptrace prompt",
+                                PROMPT,
                                 Some(&command_id),
+                                behavior.seq_hint(),
                             )
-                            .await?;
-                            let result =
-                                send_instance_send_rpc(&mut ws, id, shape.helper(), &command_id)
+                            .await
+                            {
+                                Ok((new_n, ack)) => {
+                                    append_n = new_n;
+                                    let result = send_instance_send_rpc(
+                                        &mut ws,
+                                        id,
+                                        behavior.accepted_shape(),
+                                        &command_id,
+                                    )
                                     .await?;
-                            *observed.lock().await = Some(result);
+                                    let mut rec = record.lock().await;
+                                    rec.append_ack = Some(ack);
+                                    rec.send_result = Some(result);
+                                }
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    send_rpc_error(
+                                        &mut ws,
+                                        id,
+                                        -32000,
+                                        &format!("node did not accept instance.send: {message}"),
+                                    )
+                                    .await?;
+                                    record.lock().await.append_error = Some(message);
+                                }
+                            }
                         }
                         _ => {
                             send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
@@ -179,17 +236,30 @@ async fn recv_json(ws: &mut NodeWs) -> anyhow::Result<Value> {
     Ok(serde_json::from_str(msg.to_text()?)?)
 }
 
-/// Boot hub, enroll a fake node with the given send reply, create an instance
-/// and POST one instance.send, then read back the command state and the reply
-/// the helper actually sent.
-async fn send_and_observe(shape: ReplyShape) -> anyhow::Result<SendObservation> {
+/// Find the message event journaled for `command_id`, if any. GET journal
+/// rows nest the wire event under `event` alongside the stored seq/eventId.
+fn journal_command_message<'a>(journal: &'a Value, command_id: &str) -> Option<&'a Value> {
+    journal["events"]
+        .as_array()?
+        .iter()
+        .map(|row| row.get("event").unwrap_or(row))
+        .find(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("message")
+                && event.pointer("/payload/commandId").and_then(Value::as_str) == Some(command_id)
+        })
+}
+
+/// Boot hub, enroll a fake node with the given behavior, create an instance,
+/// POST one instance.send, settle the row, and capture the reply, ack, row and
+/// journal.
+async fn run_scenario(behavior: FakeBehavior) -> anyhow::Result<SendObservation> {
     let dir = tempfile::tempdir()?;
     let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("hub"))).await?;
     let human = hub.mint_device_token("acceptrace-human").await?;
     let host_id = "hst_acceptrace";
     let workspace_id = "wsp_acceptrace";
-    let observed = Arc::new(Mutex::new(None));
-    spawn_fake_node(&hub, host_id, workspace_id, shape, observed.clone()).await?;
+    let record = Arc::new(Mutex::new(FakeRecord::default()));
+    spawn_fake_node(&hub, host_id, workspace_id, behavior, record.clone()).await?;
     // Give the node.hello reconciliation a moment to register the host.
     tokio::time::sleep(Duration::from_millis(150)).await;
     let http = reqwest::Client::new();
@@ -215,7 +285,7 @@ async fn send_and_observe(shape: ReplyShape) -> anyhow::Result<SendObservation> 
         .context("instanceId")?
         .to_owned();
 
-    let send: Value = http
+    let post: Value = http
         .post(format!(
             "http://{}/v1/instances/{instance_id}/commands",
             hub.addr
@@ -223,22 +293,21 @@ async fn send_and_observe(shape: ReplyShape) -> anyhow::Result<SendObservation> 
         .bearer_auth(&human)
         .json(&json!({
             "operation": "instance.send",
-            "payload": { "input": { "type": "prompt", "text": "acceptrace prompt" } },
+            "payload": { "input": { "type": "prompt", "text": PROMPT } },
         }))
         .send()
         .await?
         .error_for_status()?
         .json()
         .await?;
-    let command_id = send["command"]["commandId"]
+    let command_id = post["command"]["commandId"]
         .as_str()
-        .or_else(|| send["command"]["id"].as_str())
+        .or_else(|| post["command"]["id"].as_str())
         .context("response commandId")?
         .to_owned();
 
-    // The reply and the journal append are awaited inside the Hub send, so the
-    // state is settled when the POST returns; a short settle covers the bus.
-    let state = tokio::time::timeout(Duration::from_secs(5), async {
+    // Wait for the row to reach a terminal progress state.
+    let (state, settlement) = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let list: Value = http
                 .get(format!(
@@ -252,19 +321,19 @@ async fn send_and_observe(shape: ReplyShape) -> anyhow::Result<SendObservation> 
                 .json()
                 .await
                 .unwrap();
-            let st = list["commands"]
-                .as_array()
-                .and_then(|rows| {
-                    rows.iter().find(|r| {
-                        r["id"].as_str() == Some(command_id.as_str())
-                            || r["commandId"].as_str() == Some(command_id.as_str())
-                    })
+            if let Some(row) = list["commands"].as_array().and_then(|rows| {
+                rows.iter().find(|r| {
+                    r["id"].as_str() == Some(command_id.as_str())
+                        || r["commandId"].as_str() == Some(command_id.as_str())
                 })
-                .and_then(|r| r["state"].as_str())
-                .unwrap_or("")
-                .to_owned();
-            if st == "accepted" || st == "queued" || st == "reconciling" || st == "settled" {
-                return st;
+            }) {
+                let st = row["state"].as_str().unwrap_or("").to_owned();
+                // `queued`/`reconciling` are terminal FOR THIS OBSERVATION: a
+                // bare-ok reply deliberately leaves the row resting for
+                // journal convergence rather than marking it accepted.
+                if st == "accepted" || st == "queued" || st == "reconciling" || st == "settled" {
+                    return (st, row.get("settlement").cloned().unwrap_or(Value::Null));
+                }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -272,102 +341,241 @@ async fn send_and_observe(shape: ReplyShape) -> anyhow::Result<SendObservation> 
     .await
     .context("command state never settled")?;
 
-    // The fake node answers strictly after the durable append ack; by the time
-    // the row settled the captured reply is present.
-    let send_result = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Some(result) = observed.lock().await.clone() {
-                return result;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .context("fake node never answered instance.send")?;
+    let journal: Value = http
+        .get(format!(
+            "http://{}/v1/instances/{instance_id}/journal",
+            hub.addr
+        ))
+        .bearer_auth(&human)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
 
+    let rec = record.lock().await;
     Ok(SendObservation {
-        state,
         command_id,
-        send_result,
+        post,
+        state,
+        settlement,
+        send_result: rec.send_result.clone(),
+        append_ack: rec.append_ack.clone(),
+        append_error: rec.append_error.clone(),
+        journal,
     })
+}
+
+/// Assert the durable append ack and the durable journal message for the
+/// command agree (success scenarios).
+fn assert_durable_message(obs: &SendObservation) {
+    let ack = obs
+        .append_ack
+        .as_ref()
+        .expect("a successful send records the durable append ack");
+    assert!(
+        ack.get("seq")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
+        "append ack names a seq: {ack}"
+    );
+    assert!(
+        ack.get("eventId")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
+        "append ack names an eventId: {ack}"
+    );
+    let message = journal_command_message(&obs.journal, &obs.command_id).unwrap_or_else(|| {
+        panic!(
+            "the acked user message must be durable in the journal: {}",
+            obs.journal
+        )
+    });
+    assert_eq!(
+        message["eventId"], ack["eventId"],
+        "journal event: {message}"
+    );
+    assert_eq!(message["seq"], ack["seq"], "journal event: {message}");
+    assert_eq!(
+        message.pointer("/payload/role").and_then(Value::as_str),
+        Some("user"),
+        "journal event: {message}"
+    );
 }
 
 /// A real DevNode `instance.send` result is a typed `CommandResult` —
 /// `{command, relatedCommandIds}` with NO top-level `accepted`/`ok`. The Hub
-/// must mark the row accepted from `/command/state` alone. This guards the
-/// command-state arm of `node_accepted`: dropping it reddens THIS case while
-/// the top-level case below stays green.
+/// must accept from `/command/state` alone (dropping that arm reddens only
+/// this case), and the user message is durable with the acked event id.
 #[tokio::test]
 async fn instance_send_with_a_real_command_result_is_accepted() -> anyhow::Result<()> {
-    let obs = send_and_observe(ReplyShape::RealCommandResult).await?;
+    let obs = run_scenario(FakeBehavior::Reply(InstanceSendReply::RealCommandResult)).await?;
     assert_eq!(
         obs.state, "accepted",
         "a real CommandResult with command.state=accepted must accept; got {}",
         obs.state
     );
-    // The real Node never sends either top-level shortcut.
-    assert!(
-        obs.send_result.get("accepted").is_none(),
-        "real CommandResult carries no top-level accepted: {}",
-        obs.send_result
-    );
-    assert!(
-        obs.send_result.get("ok").is_none(),
-        "real CommandResult carries no top-level ok: {}",
-        obs.send_result
-    );
-    // It IS the typed CommandResult shape: the accepted command and its
-    // related commands.
-    assert!(
-        obs.send_result["relatedCommandIds"].is_array(),
-        "reply must be a CommandResult: {}",
-        obs.send_result
-    );
-    assert_eq!(
-        obs.send_result["command"]["state"],
-        json!("accepted"),
-        "reply: {}",
-        obs.send_result
-    );
-    assert_eq!(
-        obs.send_result["command"]["commandId"],
-        json!(obs.command_id),
-        "reply: {}",
-        obs.send_result
-    );
-    assert_eq!(
-        obs.send_result["command"]["operation"],
-        json!("instance.send"),
-        "reply: {}",
-        obs.send_result
-    );
+    assert_eq!(obs.post["command"]["state"], json!("accepted"));
+    let result = obs.send_result.as_ref().expect("send result captured");
+    assert!(result.get("accepted").is_none(), "reply: {result}");
+    assert!(result.get("ok").is_none(), "reply: {result}");
+    assert!(result["relatedCommandIds"].is_array(), "reply: {result}");
+    assert_eq!(result["command"]["state"], json!("accepted"));
+    assert_eq!(result["command"]["commandId"], json!(obs.command_id));
+    assert_eq!(result["command"]["operation"], json!("instance.send"));
+    assert_durable_message(&obs);
     Ok(())
 }
 
-/// A top-level `accepted:true` (also produced by other Node operations) is
-/// accepted too — guards the predicate's alternative.
+/// A top-level `accepted:true` (produced by other Node operations) is
+/// accepted too — guards the predicate's alternative; the durable contract
+/// is identical.
 #[tokio::test]
 async fn instance_send_with_top_level_accepted_is_accepted() -> anyhow::Result<()> {
-    let obs = send_and_observe(ReplyShape::TopLevelAccepted).await?;
+    let obs = run_scenario(FakeBehavior::Reply(InstanceSendReply::TopLevelAccepted)).await?;
     assert_eq!(obs.state, "accepted", "got {}", obs.state);
-    assert_eq!(obs.send_result["accepted"], json!(true));
+    assert_eq!(
+        obs.send_result.as_ref().expect("send result captured")["accepted"],
+        json!(true)
+    );
+    assert_durable_message(&obs);
     Ok(())
 }
 
 /// The pre-fix fake Node replied a bare `{ok:true}`; that is NOT a durable
-/// acceptance and the row must not be marked accepted from it.
+/// acceptance. The user message is still durable (the append happened), but
+/// the RPC alone must not mark the row accepted.
 #[tokio::test]
 async fn instance_send_with_bare_ok_is_not_accepted() -> anyhow::Result<()> {
-    let obs = send_and_observe(ReplyShape::BareOk).await?;
+    let obs = run_scenario(FakeBehavior::Reply(InstanceSendReply::BareOk)).await?;
     assert_ne!(
         obs.state, "accepted",
-        "a bare {{ok:true}} reply must never be treated as a durable acceptance; got {}",
+        "a bare {{ok:true}} reply must never be treated as acceptance; got {}",
         obs.state
     );
+    let result = obs.send_result.as_ref().expect("send result captured");
+    assert!(result.get("accepted").is_none(), "reply: {result}");
+    assert_durable_message(&obs);
+    Ok(())
+}
+
+/// When the durable append is rejected (journal seq gap), the Node must carry
+/// that failure to the instance.send RPC instead of answering accepted: the
+/// command settles rejected, the failed message is NOT in the journal, and the
+/// rejection message names the gap. Ignoring the jappend error and replying
+/// "accepted" anyway (the pre-fix behavior) fails this test.
+#[tokio::test]
+async fn instance_send_after_a_rejected_append_settles_rejected() -> anyhow::Result<()> {
+    let obs = run_scenario(FakeBehavior::GapRejectsSend).await?;
+    // The row must settle rejected — never be marked accepted from an
+    // instance.send reply that ignored the failed append.
+    assert_eq!(
+        obs.post["command"]["state"],
+        json!("settled"),
+        "POST row: {}",
+        obs.post
+    );
+    assert_eq!(obs.state, "settled", "commands GET state: {}", obs.state);
+    assert_eq!(
+        obs.settlement["outcome"],
+        json!("rejected"),
+        "settlement: {}",
+        obs.settlement
+    );
+    let error = obs
+        .append_error
+        .as_ref()
+        .expect("the fake node must record the append rejection");
     assert!(
-        obs.send_result.get("accepted").is_none(),
-        "reply: {}",
+        error.contains("journal gap"),
+        "expected a journal-gap rejection, got: {error}"
+    );
+    assert!(
+        obs.send_result.is_none(),
+        "no accepted result may be sent after a rejected append: {:?}",
         obs.send_result
     );
+    assert!(
+        journal_command_message(&obs.journal, &obs.command_id).is_none(),
+        "a rejected append must leave no durable user message: {}",
+        obs.journal
+    );
+    Ok(())
+}
+
+/// Tiny loopback WebSocket server that sends `frames` to the one connecting
+/// client, then parks with the socket open.
+async fn frame_server(frames: Vec<Value>) -> anyhow::Result<NodeWs> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(mut server) = accept_async(stream).await
+        {
+            for frame in frames {
+                if server
+                    .send(Message::Text(frame.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            // Park so buffered frames finish draining; ends when the client
+            // drops at test teardown.
+            let _ = server.next().await;
+        }
+    });
+    let (ws, _) = connect_async(format!("ws://{addr}")).await?;
+    Ok(ws)
+}
+
+/// Waiting for an append ack matches by JSON-RPC id and QUEUES unrelated
+/// frames (a pipelined Hub RPC) instead of swallowing or mistaking them for
+/// the ack.
+#[tokio::test]
+async fn ack_wait_matches_by_id_and_keeps_unrelated_frames() -> anyhow::Result<()> {
+    let mut ws = frame_server(vec![
+        json!({"id": "rpc-42", "method": "interaction.list", "params": {}}),
+        json!({
+            "id": "j1",
+            "result": {"seq": "1", "eventId": "evt_1", "durableSeq": "1"}
+        }),
+    ])
+    .await?;
+    let mut queue: FrameQueue = std::collections::VecDeque::new();
+    match await_ack_frame(&mut ws, &mut queue, "j1").await? {
+        AckFrame::Accepted(result) => {
+            assert_eq!(result["seq"], json!("1"));
+        }
+        AckFrame::Rejected(value) => panic!("expected success ack, got error: {value}"),
+    }
+    assert_eq!(queue.len(), 1, "the unrelated RPC must stay queued");
+    let kept: Value = serde_json::from_str(queue.front().expect("queued frame"))?;
+    assert_eq!(kept["id"], json!("rpc-42"));
+    assert_eq!(kept["method"], json!("interaction.list"));
+    Ok(())
+}
+
+/// An id-matched `error` response is surfaced as a rejection, not a success.
+#[tokio::test]
+async fn ack_wait_surfaces_an_rpc_error() -> anyhow::Result<()> {
+    let mut ws = frame_server(vec![json!({
+        "id": "j7",
+        "error": {"code": -32000, "message": "journal gap: expected 1, got 50"}
+    })])
+    .await?;
+    let mut queue: FrameQueue = std::collections::VecDeque::new();
+    match await_ack_frame(&mut ws, &mut queue, "j7").await? {
+        AckFrame::Rejected(value) => {
+            let message = value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap();
+            assert!(message.contains("journal gap"), "message: {message}");
+        }
+        AckFrame::Accepted(value) => panic!("expected error ack, got success: {value}"),
+    }
+    assert!(queue.is_empty());
     Ok(())
 }

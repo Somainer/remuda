@@ -147,6 +147,8 @@ pub fn schema_document() -> Value {
         ForkBoundary,
         ForkBoundaryType,
         ForwardIntent,
+        GateAuthorizeParams,
+        GateAuthorizeResult,
         GateCancelParams,
         GateEventKind,
         GateEventParams,

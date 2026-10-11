@@ -4714,16 +4714,73 @@
       ],
       "type": "object"
     },
+    "GateAuthorizeParams": {
+      "description": "`gate.authorize` params (Node→Hub): asked by the lane Node before a\nclaimed dispatch starts executing, so a canceled/stale generation can\nnever reach `git fetch` / `--land`.",
+      "properties": {
+        "generation": {
+          "default": 0,
+          "description": "Dispatch generation carried on the `gate.run` frame.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "jobId": {
+          "description": "Job the Node was asked to run.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jobId",
+        "generation"
+      ],
+      "type": "object"
+    },
+    "GateAuthorizeResult": {
+      "description": "`gate.authorize` result.",
+      "properties": {
+        "authorized": {
+          "description": "True only while the Hub row is Running at exactly this generation.",
+          "type": "boolean"
+        },
+        "generation": {
+          "default": 0,
+          "description": "Echoed generation.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "description": "Current Hub-side state when refused, for diagnostics.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "authorized",
+        "generation"
+      ],
+      "type": "object"
+    },
     "GateCancelParams": {
       "description": "`gate.cancel` params.",
       "properties": {
+        "generation": {
+          "default": 0,
+          "description": "Dispatch generation (the job's attempt ordinal) being canceled. A\n`gate.run` whose generation is at or below this is refused even if\nits frame is delayed past any delivery window; only a strictly\nnewer generation for the same job is allowed to run.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "jobId": {
           "description": "Job to cancel.",
           "type": "string"
         }
       },
       "required": [
-        "jobId"
+        "jobId",
+        "generation"
       ],
       "type": "object"
     },
@@ -5385,6 +5442,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "generation": {
+          "default": 0,
+          "description": "Dispatch generation: the job's attempt ordinal at claim. The Node\nrecords it when `gate.cancel` is acked and refuses a run whose\ngeneration is at or below a canceled generation for the same job —\nhowever delayed that run frame is. Elapsed time never authorizes a\nstale dispatch; only a strictly newer generation supersedes a cancel.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "initiator": {
           "anyOf": [
             {
@@ -5488,7 +5552,8 @@
         "gateTimeoutSecs",
         "push",
         "pushFrom",
-        "keepLogs"
+        "keepLogs",
+        "generation"
       ],
       "type": "object"
     },
@@ -5522,6 +5587,13 @@
             "string",
             "null"
           ]
+        },
+        "generation": {
+          "default": 0,
+          "description": "Attempt generation this verdict belongs to. The Hub rejects a verdict\nwhose generation is not the persisted row's attempts, so a delayed\nreply from an old attempt can never change a newer running attempt.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
         },
         "headSha": {
           "description": "Branch tip sha.",
@@ -5581,6 +5653,7 @@
       },
       "required": [
         "jobId",
+        "generation",
         "status",
         "steps"
       ],

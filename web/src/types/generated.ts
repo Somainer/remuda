@@ -984,8 +984,24 @@ export type ForwardIntent = ({
   [key: string]: unknown;
 });
 
+/** `gate.authorize` params (Node→Hub): asked by the lane Node before a claimed dispatch starts executing, so a canceled/stale generation can never reach `git fetch` / `--land`. */
+export type GateAuthorizeParams = ({
+  "generation": (number);
+  "jobId": (string);
+  [key: string]: unknown;
+});
+
+/** `gate.authorize` result. */
+export type GateAuthorizeResult = ({
+  "authorized": (boolean);
+  "generation": (number);
+  "state"?: (string | null);
+  [key: string]: unknown;
+});
+
 /** `gate.cancel` params. */
 export type GateCancelParams = ({
+  "generation": (number);
   "jobId": (string);
   [key: string]: unknown;
 });
@@ -1124,6 +1140,7 @@ export type GateRunParams = ({
   [key: string]: (string);
 });
   "gateTimeoutSecs": (number);
+  "generation": (number);
   "initiator"?: (Initiator | (null));
   "jobId": (string);
   "keepLogs": (boolean);
@@ -1150,6 +1167,7 @@ export type GateRunResult = ({
   "currentMainSha"?: (string | null);
   "error"?: (string | null);
   "failedStep"?: (string | null);
+  "generation": (number);
   "headSha"?: (string | null);
   "jobId": (string);
   "mergeRef"?: (string | null);

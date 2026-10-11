@@ -122,6 +122,15 @@ pub(crate) fn claim_key_for(path: &Path) -> PathBuf {
     canonical(path)
 }
 
+/// Test-only: whether the claim map contains ANY owner for the exact key.
+#[cfg(test)]
+pub(crate) fn claim_is_present_any_owner(key: &Path) -> bool {
+    CLAIMED_ROLLOUTS
+        .lock()
+        .expect("claimed codex rollouts")
+        .contains_key(key)
+}
+
 /// Test-only: whether the claim map still contains an entry owned by
 /// `owner` for the exact key (no re-canonicalization).
 #[cfg(test)]

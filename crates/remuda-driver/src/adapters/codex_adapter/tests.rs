@@ -1248,6 +1248,68 @@ fn an_identical_prompt_sent_minutes_apart_refreshes_and_each_turn_binds() {
 // c-usagefu r6 item 7 ---------------------------------------------------------
 
 #[test]
+fn promoted_adapter_drop_releases_claim_after_unlink_with_exact_key() {
+    // r7 item 6: the promoted adapter's Drop must release using the exact
+    // PathBuf recorded at bind time, driven by dropping AFTER the file and
+    // symlink are gone. A release that re-canonicalizes the stored
+    // main_file path post-unlink cannot find the canonical key and leaks.
+    use std::os::unix::fs::symlink;
+
+    let real_home = tempfile::tempdir().unwrap();
+    let link_dir = tempfile::tempdir().unwrap();
+    let link = link_dir.path().join("codex-link");
+    symlink(real_home.path(), &link).unwrap();
+    let session_dir = link.join("sessions/2026/09/14");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let rollout = session_dir.join("rollout-drop-sym.jsonl");
+    std::fs::write(
+        &rollout,
+        "{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"id\":\"drop-s\",\"session_id\":\"drop-s\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(link.join("session_index.jsonl"), "{\"id\":\"drop-s\"}\n").unwrap();
+
+    // Promoted adapter (no instance key): binds via the name index.
+    let home_path: std::path::PathBuf = link.clone();
+    let adapter = CodexAdapter::new(AdapterHome {
+        home: home_path.clone(),
+        cwd: home_path.clone(),
+        pid: None,
+        launched_at: None,
+    });
+    let mut adapter = adapter;
+    assert!(adapter.discover().unwrap());
+    let exact_key = adapter.claim_key.clone().expect("bind stored a claim key");
+    assert!(
+        crate::adapters::codex_discovery::is_claim_present_exact(
+            &exact_key,
+            &adapter.lifecycle_owner
+        ),
+        "claim is live before unlink"
+    );
+
+    // Remove the rollout file AND the symlink BEFORE dropping the adapter.
+    std::fs::remove_file(&rollout).unwrap();
+    std::fs::remove_file(&link).unwrap();
+    drop(adapter);
+
+    assert!(
+        !crate::adapters::codex_discovery::is_claim_present_exact(
+            &exact_key,
+            // owner is random per adapter; re-query isn't possible post-drop,
+            // so check the key is absent for ANY owner by trying to reclaim.
+            "anyone"
+        ),
+        "sanity placeholder"
+    );
+    // Stronger check: the exact key maps to no owner at all after Drop.
+    assert!(
+        !crate::adapters::codex_discovery::claim_is_present_any_owner(&exact_key),
+        "post-unlink Drop released the exact claim key (no ghost)"
+    );
+}
+
+#[test]
 fn claim_release_uses_the_exact_key_not_a_re_canonicalized_path() {
     // r6 item 7: a promoted adapter releases with the exact key recorded at
     // claim time. A release call using any OTHER path string — e.g. the

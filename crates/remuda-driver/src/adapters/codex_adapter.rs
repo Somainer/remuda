@@ -66,6 +66,9 @@ pub struct CodexAdapter {
     discovered: Option<String>,
     /// Bound session + its rollout tail.
     binding: Option<AdapterBinding>,
+    /// Exact claim key recorded at bind for promoted adapters (r7 item 6):
+    /// released verbatim on Drop even when the file/symlink is gone.
+    claim_key: Option<PathBuf>,
     tail: Option<RolloutTail>,
     /// Native id → journal node id (messages, thoughts, tool calls).
     nodes: HashMap<String, Id>,
@@ -112,6 +115,7 @@ impl CodexAdapter {
             confirmed: None,
             discovered: None,
             binding: None,
+            claim_key: None,
             tail: None,
             nodes: HashMap::new(),
             announced_tools: HashSet::new(),
@@ -221,11 +225,14 @@ impl CodexAdapter {
             RolloutTail::new_at_end(path.clone()).unwrap_or_else(|_| RolloutTail::new(path.clone()))
         };
         self.tail = Some(tail);
+        // Remember the exact key claim_session inserted (r7 item 6).
+        let exact_claim_key = crate::adapters::codex_discovery::claim_key_for(&path);
         self.binding = Some(AdapterBinding {
             session_id: session_id.clone(),
             directory: path.parent().map(std::path::Path::to_path_buf),
             main_file: Some(path),
         });
+        self.claim_key = Some(exact_claim_key);
         // Bound: stop counting against later launches in this cwd.
         if let Some(mut window) = self.window.take() {
             window.release();
@@ -681,9 +688,12 @@ impl Drop for CodexAdapter {
         // symlinked file leaves no ghost.
         if self.instance_key.is_none()
             && let Some(binding) = self.binding.take()
-            && let Some(path) = binding.main_file
+            && let Some(key) = self.claim_key.take()
         {
-            let key = crate::adapters::codex_discovery::claim_key_for(&path);
+            let _ = binding;
+            // Release the EXACT key stored at bind time (r7 item 6) — never
+            // re-canonicalize: a removed symlink/file would resolve to a
+            // different (or fallback lexical) key and leak the claim.
             crate::adapters::codex_discovery::release_claim_key(&key, &self.lifecycle_owner);
         }
     }

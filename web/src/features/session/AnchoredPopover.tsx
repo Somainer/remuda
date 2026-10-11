@@ -151,10 +151,11 @@ export function computeAnchored(
   if (placement === "up" && blockedUpByCard && 0 < cap && cap < DOWN_USABLE) {
     cap = Math.min(vhCap, roomAbove);
   }
-  if (placement === "up" && !blockedUpByCard && 0 < cap && cap < DOWN_USABLE) {
-    // Plain (no card) short strip: grow to the usable minimum.
-    cap = Math.min(vhCap, DOWN_USABLE);
-  }
+  // c-effortui r6 item 12: a plain (no-card) up panel must never GROW beyond
+  // the room above the trigger — a usable-min floor here painted a 120px panel
+  // over a 40px strip, covering the trigger itself. The panel shrinks and its
+  // inner region scrolls instead. (The card-blocked lesser-evil fallback above
+  // is deliberate: a fully parked card is dismissible, the trigger is not.)
   if (cap <= 0) {
     cap = Math.min(vhCap, placement === "up" ? roomAbove : vhCap);
   }
@@ -177,11 +178,11 @@ export function computeAnchored(
     placement === "up"
       ? triggerRect.top - gap - panelHeight
       : triggerRect.bottom + gap;
-  // c-effortui r5 item 5: a usable-min floor on a trigger sitting LOW
-  // (top < DOWN_USABLE) can put the panel's first rows off the top of the
-  // viewport. Clamp to the margin when there is no usable room below either;
-  // if below IS usable the placement logic above would have flipped down, so
-  // this only trims an unavoidable up panel.
+  // c-effortui r5 item 5: an unavoidable up panel whose content exceeds the
+  // room above can still compute a negative top (no cap, or a capped panel
+  // taller than the strip after rounding). Clamp to the margin; when below IS
+  // usable the placement logic above would have flipped down, so this only
+  // trims a panel that cannot go anywhere else.
   if (placement === "up" && top < margin) {
     top = margin;
   }

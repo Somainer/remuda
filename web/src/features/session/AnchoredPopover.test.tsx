@@ -135,10 +135,11 @@ describe("computeAnchored placement math", () => {
     expect(measured.maxHeight).toBe(540); // min(841 plain above-room, 60vh)
   });
 
-  it("item 5(a): a tiny plain (no-card) up strip grows to the usable minimum", () => {
+  it("r9 item 12: a tiny plain (no-card) up strip shrinks to the room and clears the trigger", () => {
     // Dock near the bottom (dodging DOWN is not an option) in a short viewport
-    // with NO parked card: plain above-room is only ~40px → stay up, but the
-    // cap reaches the usable 120px floor so the menu rows are scrollable.
+    // with NO parked card: plain above-room is only ~40px. The panel must
+    // SHRINK to that room (never grow to a usable floor that covers the
+    // trigger); its bottom edge stays above the trigger top.
     const measured = computeAnchored(
       { top: 56, bottom: 86, left: 100, right: 200, width: 100 },
       { preferredHeight: 300, width: 300 },
@@ -146,12 +147,30 @@ describe("computeAnchored placement math", () => {
       OPTS,
     );
     expect(measured.placement).toBe("up");
-    expect(measured.maxHeight).toBe(60); // floor 120 bounded by 60vh of 100
+    expect(measured.maxHeight).toBe(40); // trigger.top − gap − margin
+    const panelHeight = Math.min(300, measured.maxHeight ?? 300);
+    expect(measured.top + panelHeight).toBeLessThanOrEqual(56);
   });
 
-  it("item 5(a): the usable floor applies when the plain strip is 40–120px with room to grow", () => {
-    // Trigger low in a tall viewport with below unusable (12px): the plain
-    // above-room is 100px — under the 120 floor but plenty of room to grow.
+  it("r9 item 12: a sub-120 plain strip in a tall viewport also stays bounded by the room", () => {
+    // Dock near the bottom of a 900px viewport (below ~5px, unusable): the
+    // plain above-room is 100px. The panel caps to 100px and its bottom edge
+    // clears the trigger rather than growing to a 120px floor over it.
+    const measured = computeAnchored(
+      { top: 116, bottom: 892, left: 100, right: 200, width: 100 },
+      { preferredHeight: 300, width: 300 },
+      { width: 1440, height: 900 },
+      OPTS,
+    );
+    expect(measured.placement).toBe("up");
+    expect(measured.maxHeight).toBe(100);
+    const panelHeight = Math.min(300, measured.maxHeight ?? 300);
+    expect(measured.top + panelHeight).toBeLessThanOrEqual(116);
+  });
+
+  it("item 5(a): a 40–120px plain strip is bounded by the 60vh cap when smaller", () => {
+    // Trigger low with below unusable (12px): the plain above-room is 100px;
+    // the 60vh cap (99px in a 166px viewport) is the binding bound.
     const measured = computeAnchored(
       { top: 116, bottom: 146, left: 100, right: 200, width: 100 },
       { preferredHeight: 300, width: 300 },
@@ -159,13 +178,13 @@ describe("computeAnchored placement math", () => {
       OPTS,
     );
     expect(measured.placement).toBe("up");
-    expect(measured.maxHeight).toBe(99); // 60vh of 166 = 99, below the floor
+    expect(measured.maxHeight).toBe(99); // 60vh of 166 = 99
   });
 
-  it("r5 item 5: a usable floor that would push the panel above the viewport is clamped to the margin", () => {
-    // Trigger top BELOW 136 (the floor needs more room than exists above) and
-    // below unusable (only 5px) so it cannot flip down: the unclamped up top
-    // would be negative, hiding the first rows. Top must clamp to the margin.
+  it("r5 item 5: a short up panel is bounded within the above room and stays on-screen", () => {
+    // Trigger top BELOW 136 and below unusable (only 5px) so it cannot flip
+    // down: the panel shrinks to the above room; its top stays at/above the
+    // margin and it never covers the trigger.
     const measured = computeAnchored(
       { top: 100, bottom: 130, left: 100, right: 200, width: 100 },
       { preferredHeight: 300, width: 300 },
@@ -174,6 +193,8 @@ describe("computeAnchored placement math", () => {
     );
     expect(measured.placement).toBe("up");
     expect(measured.top).toBeGreaterThanOrEqual(8);
+    const panelHeight = Math.min(300, measured.maxHeight ?? 300);
+    expect(measured.top + panelHeight).toBeLessThanOrEqual(100);
   });
 
   it("r5 item 5: a trigger with room below flips down instead of clamping an off-screen up panel", () => {
@@ -186,19 +207,6 @@ describe("computeAnchored placement math", () => {
       OPTS,
     );
     expect(measured.placement).toBe("down");
-  });
-
-  it("item 5(a): the usable floor grows a sub-120 strip in a tall viewport", () => {
-    // Dock near the bottom of a 900px viewport (below ~5px, unusable): the
-    // plain above-room is 100px; the floor grows it to 120.
-    const measured = computeAnchored(
-      { top: 116, bottom: 892, left: 100, right: 200, width: 100 },
-      { preferredHeight: 300, width: 300 },
-      { width: 1440, height: 900 },
-      OPTS,
-    );
-    expect(measured.placement).toBe("up");
-    expect(measured.maxHeight).toBe(120);
   });
 
   it("item 5(a): a sub-minimum card-cleared strip falls back to plain above-room", () => {

@@ -288,3 +288,165 @@ async fn bound_shell_close_finishes_well_under_one_second_and_delivers_final_usa
         "cooperative close must deliver the FINAL no-stop usage exactly once"
     );
 }
+
+/// c-ctxusage r9 item 2: close aborts the promoter while the FIRST blocking
+/// collect is merely QUEUED — registered in the producer gate but parked
+/// BEFORE it claims the hydrator. The old loose atomics let the abort guard
+/// read "no producer, empty slot" in that gap, declare completion on a ~120 s
+/// budget, and let the flusher exit before the queued collect (and the final
+/// finish) parked their frames. The unified gate makes the queued closure
+/// Active before it runs; the terminal finish waits on actual retirement. The
+/// FINAL no-stop usage must still be delivered exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abort_before_a_queued_collect_claims_still_delivers_final_usage_once() {
+    use remuda_driver::test_faults::TranscriptFaults;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let workspace = root.join("workspace");
+    let native_home = root.join("home");
+    let instance_dir = root.join("instance");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&native_home).unwrap();
+    let install = root.join("opt/bin");
+    std::fs::create_dir_all(&install).unwrap();
+    let binary = install.join("claude");
+    std::fs::copy(ensure_workspace_bin("fake-harness"), &binary).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let events_path = root.join("harness-events.jsonl");
+
+    let transcript = remuda_driver::claude_transcript::project_dir(&native_home, &workspace)
+        .join(format!("{SESSION_ID}.jsonl"));
+    seed_transcript(&transcript, 20);
+
+    let mut options = ShellPtyOptions::agent(
+        workspace.clone(),
+        AgentKind::Claude,
+        AgentLaunch {
+            profile: Box::new(profile()),
+            launch_dir: instance_dir.join("launch"),
+            native_home: native_home.clone(),
+            binary: Some(binary),
+            origin: LaunchOrigin::Human,
+            native_home_managed: true,
+            settings_overlay: None,
+        },
+    );
+    options.emulator = true;
+    options.pin_native_home = true;
+    options.claude_home = Some(native_home.clone());
+    options
+        .extra_env
+        .insert("FAKE_HARNESS_DIALECT_VERSION".into(), "modern".into());
+    options.extra_env.insert(
+        "FAKE_HARNESS_EVENTS_OUT".into(),
+        events_path.to_string_lossy().into_owned(),
+    );
+    options.hooks = Some(HookConfig {
+        instance_dir,
+        relay_binary: relay_bin(),
+        tui: remuda_driver::TuiMode::Default,
+    });
+    let driver = ShellPtyDriver::new(options);
+
+    // Park the first blocking collect the moment its closure runs, BEFORE it
+    // claims the hydrator; shorten close's bound so the abort is deterministic.
+    let faults = TranscriptFaults::new();
+    faults.arm_queued_gate();
+    faults.arm_close_timeout(Duration::from_millis(500));
+    driver.set_test_faults(faults.clone());
+
+    let handle = driver
+        .start(spec_for(&workspace, DriverKind::ShellPty))
+        .await
+        .expect("start");
+    let mut events_rx = handle.into_events();
+    let final_count = Arc::new(AtomicUsize::new(0));
+    let bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drainer_count = Arc::clone(&final_count);
+    let drainer_bound = Arc::clone(&bound);
+    let drainer = tokio::spawn(async move {
+        while let Some(observation) = events_rx.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+                && native.native_name == "transcript_bound"
+            {
+                drainer_bound.store(true, Ordering::SeqCst);
+            }
+            if let ObservationPayload::Usage(payload) = &observation.body
+                && payload.scope_id == FINAL_MSG_ID
+            {
+                drainer_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+
+    let ready_deadline = Instant::now() + Duration::from_secs(25);
+    while Instant::now() < ready_deadline {
+        if Driver::wait_control(&driver).await.is_ok() {
+            break;
+        }
+    }
+    let bind_deadline = Instant::now() + Duration::from_secs(20);
+    while !bound.load(Ordering::SeqCst) && Instant::now() < bind_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        bound.load(Ordering::SeqCst),
+        "the seeded replay never bound"
+    );
+
+    // Barrier: the first collect closure is queued and parked BEFORE its
+    // claim — the producer is registered but the hydrator is unclaimed.
+    assert!(
+        faults.wait_queued_entered(),
+        "the queued blocking collect never reached its pre-claim barrier"
+    );
+
+    // Close crosses its shortened bound and aborts the promoter.
+    driver.close().await.expect("close");
+    assert!(
+        faults.wait_abort_residual(),
+        "close returned without the abort residual running"
+    );
+
+    // The terminal finish is YIELDING to the parked collector: nothing may
+    // be finished, the flusher must not retire while the queued producer is
+    // active.
+    assert!(
+        !faults.wait_flusher_exit_for(Duration::from_millis(500)),
+        "the flusher retired while the queued collect was still registered"
+    );
+    assert_eq!(
+        final_count.load(Ordering::SeqCst),
+        0,
+        "FINAL usage delivered while the queued collect was parked"
+    );
+
+    // Release: the collector claims, maps the replay and restores; the
+    // waiting terminal finish then claims, finishes the buffered run and
+    // retires; the flusher delivers the FINAL usage exactly once.
+    faults.release();
+    let delivered_deadline = Instant::now() + Duration::from_secs(30);
+    while final_count.load(Ordering::SeqCst) < 1 && Instant::now() < delivered_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        final_count.load(Ordering::SeqCst),
+        1,
+        "the queued collect + abort finish must deliver the FINAL usage exactly once"
+    );
+    // Let the flusher wind down, then prove exactly-once even though both a
+    // collector and the abort terminal finish ran.
+    assert!(
+        faults.wait_flusher_exit_for(Duration::from_secs(30)),
+        "the flusher never retired after the queued collect drained"
+    );
+    drainer.abort();
+    assert_eq!(
+        final_count.load(Ordering::SeqCst),
+        1,
+        "the queued collect + abort finish must deliver the FINAL usage exactly once"
+    );
+}

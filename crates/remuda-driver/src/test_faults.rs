@@ -29,16 +29,22 @@ enum Phase {
     Pump,
     /// The cooperative finalise (`finish_collect` / final `finish()`).
     Finish,
+    /// A blocking closure that is QUEUED/running but has not yet claimed the
+    /// hydrator (c-ctxusage r9 item 2).
+    Queued,
 }
 
 /// Inert-by-default fault state held by the transcript pumps.
 pub(crate) struct FaultState {
     pump_armed: AtomicBool,
     finish_armed: AtomicBool,
+    queued_armed: AtomicBool,
     pump_entered: Mutex<bool>,
     pump_entered_cv: Condvar,
     finish_entered: Mutex<bool>,
     finish_entered_cv: Condvar,
+    queued_entered: Mutex<bool>,
+    queued_entered_cv: Condvar,
     gate_open: Mutex<bool>,
     gate_cv: Condvar,
     abort_residual: Mutex<bool>,
@@ -70,10 +76,13 @@ impl FaultState {
         Arc::new(Self {
             pump_armed: AtomicBool::new(false),
             finish_armed: AtomicBool::new(false),
+            queued_armed: AtomicBool::new(false),
             pump_entered: Mutex::new(false),
             pump_entered_cv: Condvar::new(),
             finish_entered: Mutex::new(false),
             finish_entered_cv: Condvar::new(),
+            queued_entered: Mutex::new(false),
+            queued_entered_cv: Condvar::new(),
             gate_open: Mutex::new(false),
             gate_cv: Condvar::new(),
             abort_residual: Mutex::new(false),
@@ -98,6 +107,11 @@ impl FaultState {
                 &self.finish_armed,
                 &self.finish_entered,
                 &self.finish_entered_cv,
+            ),
+            Phase::Queued => (
+                &self.queued_armed,
+                &self.queued_entered,
+                &self.queued_entered_cv,
             ),
         };
         if !armed.load(Ordering::SeqCst) {
@@ -133,6 +147,13 @@ impl FaultState {
     /// Park the cooperative finalise before it runs `finish()`.
     pub(crate) fn cooperative_finish_entered(&self) {
         self.enter(Phase::Finish);
+    }
+
+    /// Park a blocking closure the moment it starts, BEFORE it claims the
+    /// hydrator (c-ctxusage r9 item 2). Registration already happened, so the
+    /// abort decision must see an active producer.
+    pub(crate) fn blocking_closure_queued(&self) {
+        self.enter(Phase::Queued);
     }
 
     /// When true, the cooperative reading finalise is a no-op so the abort
@@ -228,6 +249,11 @@ impl TranscriptFaults {
         self.inner.finish_armed.store(true, Ordering::SeqCst);
     }
 
+    /// Arm the gate that parks a blocking closure before it claims.
+    pub fn arm_queued_gate(&self) {
+        self.inner.queued_armed.store(true, Ordering::SeqCst);
+    }
+
     /// Make the cooperative reading finalise a no-op.
     pub fn set_skip_cooperative_finalise(&self, value: bool) {
         self.inner
@@ -276,6 +302,15 @@ impl TranscriptFaults {
         Self::wait_true(
             &self.inner.finish_entered,
             &self.inner.finish_entered_cv,
+            Duration::from_secs(60),
+        )
+    }
+
+    /// Block until the queued blocking closure signals it entered (bounded).
+    pub fn wait_queued_entered(&self) -> bool {
+        Self::wait_true(
+            &self.inner.queued_entered,
+            &self.inner.queued_entered_cv,
             Duration::from_secs(60),
         )
     }

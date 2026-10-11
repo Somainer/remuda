@@ -35,7 +35,6 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, mpsc, watch};
@@ -43,11 +42,17 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 /// The hydrator the claude-pty transcript pump works from, shared with its
-/// abort guard (c-ctxusage r6 item 4c). The blocking map holds the hydrator
-/// only while it owns this lock; a task aborted past close's bound detaches
-/// the map (it finishes and parks the hydrator back), and the guard's Drop
-/// waits for it, then synchronously `finish()`es the buffered run.
-type TranscriptSlot = Arc<StdMutex<Option<TranscriptHydrator>>>;
+/// abort guard (c-ctxusage r6 item 4c). Its slot ownership is ONE state with
+/// producer registration and the completion (retirement) decision:
+/// [`crate::producer_gate::ProducerGate`] (c-ctxusage r9 item 2).
+struct TranscriptHydrator {
+    tail: crate::claude_transcript::TranscriptTail,
+    mapper: TranscriptMapper,
+}
+
+/// One synchronized producer/hydrator/retirement state for the pump, its
+/// blocking closures, its abort guard and the flusher (r9 item 2).
+type TranscriptGate = Arc<crate::producer_gate::ProducerGate<TranscriptHydrator>>;
 /// Mapped frames waiting for confirmed delivery (c-ctxusage r6 item 3/4c).
 /// Bounded since r8 item 5: blocking producers wait for capacity instead of
 /// growing without limit when the flusher is stalled.
@@ -57,18 +62,6 @@ const TRANSCRIPT_EMIT_CHUNK: usize = 2_048;
 /// Max queued frames between the blocking producers and the streaming
 /// flusher (see [`crate::transcript_queue::BoundedPending`]).
 const TRANSCRIPT_PENDING_CAPACITY: usize = 4 * TRANSCRIPT_EMIT_CHUNK;
-
-struct TranscriptHydrator {
-    tail: crate::claude_transcript::TranscriptTail,
-    mapper: TranscriptMapper,
-}
-
-fn transcript_slot_lock(
-    slot: &TranscriptSlot,
-) -> std::sync::MutexGuard<'_, Option<TranscriptHydrator>> {
-    slot.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 const HOOK_SCRIPT: &str = r#"#!/bin/sh
 set -eu
@@ -1450,7 +1443,7 @@ fn spawn_transcript_pump(
     // flusher confirm-sends each one (fresh seq/envelope, preserved
     // native_at) and pops only after a successful send, so no frame is ever
     // duplicated or lost between the async flusher and the abort path.
-    let slot: TranscriptSlot = Arc::new(StdMutex::new(None));
+    let gate: TranscriptGate = Arc::new(crate::producer_gate::ProducerGate::new());
     let flush_notify = Arc::new(Notify::new());
     // Test-only shrink (c-ctxusage r9 item 1): a normal replay batch then
     // exceeds the capacity and exercises the notify-before-park ordering.
@@ -1463,11 +1456,6 @@ fn spawn_transcript_pump(
         Arc::clone(&flush_notify),
     ));
     let flush_stop = Arc::new(AtomicBool::new(false));
-    // Set by a blocking collect closure while it owns the hydrator (it has
-    // taken it out of `slot`). The abort guard waits on this, never on a
-    // blindly-polled slot: when unbound no map is in flight and there is
-    // nothing to finish.
-    let map_in_flight = Arc::new(AtomicBool::new(false));
     // Detached streaming flusher: unlike the pump task it is NOT aborted with
     // it. The pump's abort guard parks + finishes frames and then sets the
     // stop flag; this task drains everything first and exits, so frames
@@ -1478,7 +1466,7 @@ fn spawn_transcript_pump(
     let flusher_pending = Arc::clone(&pending);
     let flusher_notify = Arc::clone(&flush_notify);
     let flusher_stop = Arc::clone(&flush_stop);
-    let flusher_in_flight = Arc::clone(&map_in_flight);
+    let flusher_gate = Arc::clone(&gate);
     let flusher_faults = faults.clone();
     let flusher_handle = tokio::spawn(async move {
         // Dropped on every flusher exit (including cancellation): tests use
@@ -1486,13 +1474,14 @@ fn spawn_transcript_pump(
         // frames were still pending.
         let _exit_ack = FlusherExitAck(flusher_faults.clone());
         loop {
-            // c-ctxusage r9 item 1: stop + empty queue is not retirement
-            // while a producer still owns the hydrator (its next push may
-            // land after the drain) or is parked holding the residual batch.
+            // c-ctxusage r9 items 1+2: stop + empty queue is not retirement
+            // while a producer is parked or the gate has not actually
+            // retired. A queued closure is Active before it claims, and
+            // retire happens only after its frames are parked.
             if flusher_stop.load(Ordering::SeqCst)
                 && flusher_pending.is_empty()
                 && !flusher_pending.producer_parked()
-                && !flusher_in_flight.load(Ordering::SeqCst)
+                && flusher_gate.is_retired()
             {
                 return;
             }
@@ -1520,19 +1509,17 @@ fn spawn_transcript_pump(
             }
         }
     });
-    let guard_slot = Arc::clone(&slot);
+    let guard_gate = Arc::clone(&gate);
     let guard_pending = Arc::clone(&pending);
     let guard_notify = Arc::clone(&flush_notify);
     let guard_stop = Arc::clone(&flush_stop);
-    let guard_in_flight = Arc::clone(&map_in_flight);
     let guard_faults = faults.clone();
     tokio::spawn(async move {
         let _guard = AbortTranscriptGuard {
-            slot: guard_slot,
+            gate: guard_gate,
             pending: guard_pending,
             notify: guard_notify,
             stop: guard_stop,
-            map_in_flight: guard_in_flight,
             faults: guard_faults,
             disarmed: false,
         };
@@ -1540,7 +1527,7 @@ fn spawn_transcript_pump(
         // emitted once when the pump first binds the transcript.
         let mut launch_snapshot = model.as_ref().and_then(|m| m.launch.clone());
         while !tx.is_closed() {
-            if transcript_slot_lock(&slot).is_none() {
+            if !gate.has_hydrator() {
                 let path = transcript_slot
                     .lock()
                     .ok()
@@ -1607,7 +1594,7 @@ fn spawn_transcript_pump(
                         mapper =
                             mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
                     }
-                    *transcript_slot_lock(&slot) = Some(TranscriptHydrator {
+                    gate.publish(TranscriptHydrator {
                         tail: crate::claude_transcript::TranscriptTail::new(path),
                         mapper,
                     });
@@ -1646,40 +1633,43 @@ fn spawn_transcript_pump(
             }
             // c-ctxusage r8 item 10: no hydrator (unbound this tick) means no
             // collection — do not pay a spawn_blocking per ~75 ms poll just to
-            // return NotFound. The slot is populated above once a transcript
-            // binds; when present, collect as before.
-            if transcript_slot_lock(&slot).is_none() {
+            // return NotFound. The gate is published once a transcript binds.
+            if !gate.has_hydrator() {
                 tokio::select! {
                     () = tokio::time::sleep(TRANSCRIPT_POLL) => {}
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
                             // Cooperative shutdown with no hydrator: nothing to
-                            // finalise; let the guard/flusher wind down below.
+                            // finalise; retire so the flusher can wind down.
+                            gate.retire_idle();
                             break;
                         }
                     }
                 }
                 continue;
             }
-            // Blocking collection. The hydrator moves out of the shared slot
-            // for the closure and is parked back once the map completes; task
-            // abort only DETACHES the closure, so it finishes detached and the
-            // abort guard hands its residual finish to the blocking pool.
-            // Mapped frames are parked in chunks for the single streaming
-            // flusher. `map_in_flight` marks the window during which the
-            // hydrator is OUT of the slot.
+            // Blocking collection. Registration happens SYNCHRONOUSLY here,
+            // before spawn_blocking enqueues the closure (c-ctxusage r9
+            // item 2): a closure merely queued on the blocking pool is
+            // already Active in the gate, so an abort landing in that gap
+            // waits for its real retirement instead of declaring completion.
+            // Task abort only DETACHES the closure; it finishes detached and
+            // the abort guard's residual is queued behind it in the gate.
+            gate.register();
             let collect = tokio::task::spawn_blocking({
-                let slot = Arc::clone(&slot);
+                let gate = Arc::clone(&gate);
                 let pending = Arc::clone(&pending);
-                let in_flight = Arc::clone(&map_in_flight);
                 let collect_faults = faults.clone();
                 move || {
-                    // Take the hydrator and mark a producer in flight inside
-                    // the SAME critical section (c-ctxusage r8 item 2): the
-                    // abort guard waits on this flag and then takes the slot,
-                    // so it must never observe "not in flight" while the
-                    // hydrator is already out of the slot.
-                    let Some(mut hydrated) = claim_transcript_hydrator(&slot, &in_flight) else {
+                    // Test-only seam (r9 item 2): park a QUEUED closure
+                    // before it claims the hydrator; inert in prod.
+                    if let Some(faults) = &collect_faults {
+                        faults.blocking_closure_queued();
+                    }
+                    // Claim inside the gate: blocks (off-runtime) if another
+                    // registered producer owns the hydrator.
+                    let Some(mut hydrated) = gate.claim() else {
+                        gate.complete_empty();
                         return;
                     };
                     // Test-only seam (c-ctxusage r8 item 6): park the first
@@ -1716,12 +1706,12 @@ fn spawn_transcript_pump(
                         chunk.extend(batch);
                     }
                     park(&mut chunk);
-                    restore_transcript_hydrator(&slot, &in_flight, hydrated);
+                    gate.restore(hydrated);
                 }
             });
             // Normal path awaits the poll map; on abort the JoinHandle future
-            // is dropped but the detached closure keeps running (and clears
-            // map_in_flight itself).
+            // is dropped but the detached closure keeps running (it completes
+            // its own gate registration).
             if !*shutdown.borrow() {
                 let _ = collect.await;
             }
@@ -1735,9 +1725,8 @@ fn spawn_transcript_pump(
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         final_finish_blocking(
-                            &slot,
+                            &gate,
                             &pending,
-                            &map_in_flight,
                             faults.as_ref(),
                         )
                         .await;
@@ -1751,8 +1740,8 @@ fn spawn_transcript_pump(
             }
         }
         // Normal task end with the channel gone (no abort): nothing can be
-        // delivered, so release the flusher and disarm the abort path without
-        // blocking.
+        // delivered, so retire and release the flusher without blocking.
+        gate.retire_idle();
         flush_stop.store(true, Ordering::SeqCst);
         flush_notify.notify_one();
         _guard.disarm();
@@ -1785,84 +1774,76 @@ async fn drain_pending(
     }
 }
 
-/// Cooperative-shutdown finalise: poll new lines and `finish()` the buffered
-/// run, entirely on the blocking pool, parking frames for the flusher. Waits
-/// for any in-flight collect (which owns the hydrator) first, also off the
-/// runtime thread.
-async fn final_finish_blocking(
-    slot: &TranscriptSlot,
-    pending: &TranscriptPending,
-    in_flight: &Arc<AtomicBool>,
-    faults: Option<&Arc<crate::test_faults::FaultState>>,
-) {
-    let slot = Arc::clone(slot);
-    let pending = Arc::clone(pending);
-    let in_flight = Arc::clone(in_flight);
-    let finish_faults = faults.cloned();
-    let join = tokio::task::spawn_blocking(move || {
-        // A detached collect (from an aborted previous tick) may still own the
-        // hydrator; park the blocking thread — never a runtime worker — until
-        // it returns the slot.
-        while in_flight.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        // c-ctxusage r8 item 2: the cooperative finish is part of the SAME
-        // shared in-flight state as a collect. Claim the hydrator and mark the
-        // flag atomically, and only clear the flag AFTER its final frames are
-        // parked — an abort landing while this closure is detached (close's
-        // deadline fired) leaves the guard correctly waiting on the flag, and
-        // once the frames are queued the single flusher drains them.
-        let Some(mut hydrated) = claim_transcript_hydrator(&slot, &in_flight) else {
-            return;
-        };
-        // Test-only seam (c-ctxusage r8 item 6 / item 2): park the cooperative
-        // finish INSIDE the blocking finish while it owns the hydrator.
-        if let Some(faults) = &finish_faults {
-            faults.cooperative_finish_entered();
-        }
-        let lines = hydrated.tail.poll().unwrap_or_default();
-        let mut frames = Vec::new();
-        for line in &lines {
-            if let Ok(batch) = hydrated.mapper.map_line(line) {
-                frames.extend(batch);
-            }
-        }
-        if let Ok(batch) = hydrated.mapper.finish() {
+/// Finish one claimed hydrator: poll the tail, map the remainder and the
+/// buffered run's final usage. Shared by the cooperative finalise and the
+/// abort residual so neither produces different frames.
+fn finish_hydrator(hydrated: &mut TranscriptHydrator) -> Vec<Observation> {
+    let lines = hydrated.tail.poll().unwrap_or_default();
+    let mut frames = Vec::new();
+    for line in &lines {
+        if let Ok(batch) = hydrated.mapper.map_line(line) {
             frames.extend(batch);
         }
-        // Park before clearing the flag: the guard reads "no producer" only
-        // after the final frames are safely in the flusher's queue. The
-        // hydrator stays retired (slot stays None) on the close path. The
-        // queue itself wakes the flusher, before any capacity wait.
-        if !frames.is_empty() {
-            pending.push_all_blocking(frames);
+    }
+    if let Ok(batch) = hydrated.mapper.finish() {
+        frames.extend(batch);
+    }
+    frames
+}
+
+/// Register a terminal producer, claim the hydrator through the gate and
+/// retire. Shared body of the cooperative finalise and the abort residual:
+/// the gate hands the hydrator to exactly ONE of them, and retirement is the
+/// single completion the flusher waits for (c-ctxusage r9 item 2).
+fn run_terminal_finish(
+    gate: &TranscriptGate,
+    pending: &TranscriptPending,
+    faults: Option<&Arc<crate::test_faults::FaultState>>,
+) {
+    if !gate.register_terminal() {
+        // The epoch retired racing this registration; nothing left to do.
+        return;
+    }
+    // claim blocks off-runtime while a registered collector (even one merely
+    // queued) or an earlier terminal owns the hydrator — a condvar wait,
+    // never a polled sleep or an elapsed budget.
+    let Some(mut hydrated) = gate.claim_terminal() else {
+        if gate.is_retired() {
+            gate.complete_terminal();
+        } else {
+            // Unbound epoch: the residual still retires so the flusher exits.
+            gate.retire();
         }
-        in_flight.store(false, Ordering::SeqCst);
+        return;
+    };
+    // Test-only seam: park the terminal finish while it owns the hydrator.
+    if let Some(faults) = &faults {
+        faults.cooperative_finish_entered();
+    }
+    let frames = finish_hydrator(&mut hydrated);
+    // Park BEFORE retiring: retirement is the flusher's completion signal,
+    // and the queue wakes the flusher before any capacity wait (r9 item 1).
+    if !frames.is_empty() {
+        pending.push_all_blocking(frames);
+    }
+    gate.retire();
+}
+
+/// Cooperative-shutdown finalise: poll new lines and `finish()` the buffered
+/// run, entirely on the blocking pool, parking frames for the flusher. Any
+/// in-flight collect is serialised through the gate, off the runtime thread.
+async fn final_finish_blocking(
+    gate: &TranscriptGate,
+    pending: &TranscriptPending,
+    faults: Option<&Arc<crate::test_faults::FaultState>>,
+) {
+    let gate = Arc::clone(gate);
+    let pending = Arc::clone(pending);
+    let finish_faults = faults.cloned();
+    let join = tokio::task::spawn_blocking(move || {
+        run_terminal_finish(&gate, &pending, finish_faults.as_ref());
     });
     let _ = join.await;
-}
-
-/// Take the hydrator out of its slot and mark a producer in flight in the
-/// SAME critical section. An abort-path waiter can therefore never observe a
-/// clear flag while the hydrator is already gone (c-ctxusage r8 item 2).
-fn claim_transcript_hydrator(
-    slot: &TranscriptSlot,
-    in_flight: &Arc<AtomicBool>,
-) -> Option<TranscriptHydrator> {
-    let mut guard = transcript_slot_lock(slot);
-    let hydrated = guard.take()?;
-    in_flight.store(true, Ordering::SeqCst);
-    Some(hydrated)
-}
-
-/// Return a hydrator after a collect and clear the in-flight flag together.
-fn restore_transcript_hydrator(
-    slot: &TranscriptSlot,
-    in_flight: &Arc<AtomicBool>,
-    hydrated: TranscriptHydrator,
-) {
-    *transcript_slot_lock(slot) = Some(hydrated);
-    in_flight.store(false, Ordering::SeqCst);
 }
 
 /// Acknowledges flusher termination on any exit path, including cancellation
@@ -1881,18 +1862,16 @@ impl Drop for FlusherExitAck {
 /// pump task, so task abort runs its Drop.
 ///
 /// It NEVER blocks a runtime thread and it NEVER sends frames itself (the
-/// detached flusher is the single queue consumer). On abort it hands the
-/// residual finish to the blocking pool (which waits for any in-flight
-/// collect, finishes the hydrator, and parks frames), then releases the
-/// flusher. On a normal cooperative return [`AbortTranscriptGuard::disarm`]
-/// suppresses it entirely — the caller has already finalised and joined the
-/// flusher.
+/// detached flusher is the single queue consumer). On abort a detached thread
+/// runs the SAME gate-serialized terminal finish as the cooperative path,
+/// waits for actual producer retirement (an elapsed budget is never
+/// completion), and only then releases the flusher. A normal cooperative
+/// return disarms it.
 struct AbortTranscriptGuard {
-    slot: TranscriptSlot,
+    gate: TranscriptGate,
     pending: TranscriptPending,
     notify: Arc<Notify>,
     stop: Arc<AtomicBool>,
-    map_in_flight: Arc<AtomicBool>,
     /// Test-only abort acknowledgement (c-ctxusage r8 item 6); `None` in
     /// production.
     faults: Option<Arc<crate::test_faults::FaultState>>,
@@ -1911,14 +1890,11 @@ impl Drop for AbortTranscriptGuard {
             // Cooperative shutdown already finalised and drained.
             return;
         }
-        // Run the residual finish on the blocking pool. We are inside the
-        // runtime's task-abort machinery: do not await (we are not in an async
-        // context), and do not park a runtime worker. A detached blocking
-        // thread does the bounded wait for an in-flight collect plus the
-        // mapper finish, then parks the frames.
-        let slot = Arc::clone(&self.slot);
+        // Inside task-abort machinery: do not await, do not park a runtime
+        // worker. A detached thread serialises through the gate, finishes any
+        // hydrator a queued/in-flight closure leaves, and retires.
+        let gate = Arc::clone(&self.gate);
         let pending = Arc::clone(&self.pending);
-        let in_flight = Arc::clone(&self.map_in_flight);
         let stop = Arc::clone(&self.stop);
         let stop_notify = Arc::clone(&self.notify);
         let faults = self.faults.clone();
@@ -1928,30 +1904,11 @@ impl Drop for AbortTranscriptGuard {
             if let Some(faults) = &faults {
                 faults.note_abort_residual();
             }
-            // Bounded: only wait for a collect that is actually running; an
-            // unbound pump exits immediately.
-            for _ in 0..24_000 {
-                if !in_flight.load(Ordering::SeqCst) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            if let Some(mut hydrated) = transcript_slot_lock(&slot).take() {
-                let lines = hydrated.tail.poll().unwrap_or_default();
-                let mut frames = Vec::new();
-                for line in &lines {
-                    if let Ok(batch) = hydrated.mapper.map_line(line) {
-                        frames.extend(batch);
-                    }
-                }
-                if let Ok(batch) = hydrated.mapper.finish() {
-                    frames.extend(batch);
-                }
-                if !frames.is_empty() {
-                    pending.push_all_blocking(frames);
-                }
-            }
-            // Release the flusher once the residual frames are queued.
+            run_terminal_finish(&gate, &pending, faults.as_ref());
+            // The flusher terminates only after ACTUAL retirement: wait for
+            // every registered producer (e.g. a closure still queued on the
+            // blocking pool) instead of treating an elapsed budget as done.
+            gate.wait_retired();
             stop.store(true, Ordering::SeqCst);
             stop_notify.notify_one();
         });

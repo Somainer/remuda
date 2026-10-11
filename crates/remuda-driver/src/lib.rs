@@ -44,6 +44,7 @@ pub mod shell_pty;
 pub mod tty;
 pub mod usage;
 
+mod producer_gate;
 pub mod test_faults;
 mod transcript_queue;
 

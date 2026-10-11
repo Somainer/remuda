@@ -405,9 +405,8 @@ impl EffortRequest {
                 // is typed and the configure returns an honest rejection.
                 Some(remuda_protocol::EffortAxis::Flag) => {
                     let name = target_name?;
-                    let Some(flag) = ultracode else {
-                        return None;
-                    };
+                    // An explicit boolean is mandatory for a flag operation.
+                    let flag = ultracode?;
                     return Some(
                         Self {
                             name,

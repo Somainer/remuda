@@ -107,6 +107,12 @@ impl ClaudeSdkDriver {
     pub async fn write_window(&self) -> remuda_claude_wire::write_gate::WriteGate {
         self.inner.write_window().await
     }
+
+    /// Test-only (`test-stub`, r9 item 4): ordered publication fence receiver.
+    #[cfg(feature = "test-stub")]
+    pub async fn publication_fence(&self) -> tokio::sync::oneshot::Receiver<()> {
+        self.inner.publication_fence().await
+    }
 }
 
 #[async_trait]

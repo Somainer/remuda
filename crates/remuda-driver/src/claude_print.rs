@@ -628,6 +628,18 @@ impl ClaudePrintDriver {
             .write_gate_for_test()
     }
 
+    /// Test-only (`test-stub`, r9 item 4): enqueue an ordered publication fence
+    /// and return its receiver, which resolves once every earlier publication
+    /// (including a deferred settle enqueued ahead of the fence) is drained.
+    #[cfg(feature = "test-stub")]
+    pub async fn publication_fence(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Some(publisher) = self.inner.publish.lock().await.clone() {
+            let _ = publisher.send(PublishJob::Fence(tx));
+        }
+        rx
+    }
+
     /// Test-only (`test-stub`): make the terminal exit observation build fail
     /// inside `emit_exit` (after the reserved channel permit was taken), to
     /// prove the RunHandle still reaches EOF after close (ma-sdk-state r6 item
@@ -1556,6 +1568,11 @@ enum PublishJob {
     /// write fails (r7 item 1), so the correction is ordered with the frames
     /// around it rather than sent on a side channel.
     Emit(Vec<Observation>),
+    /// Ordered publication fence (ma-sdk-state r9 item 4): when the single worker
+    /// drains this job (i.e. every job enqueued before it has been published),
+    /// it signals the oneshot. A test enqueues it after a rollback and awaits
+    /// it under a timeout instead of polling with a quiet-period loop.
+    Fence(tokio::sync::oneshot::Sender<()>),
 }
 
 /// A prompt write's turn ticket (ma-sdk-state r5 item 1).
@@ -2141,6 +2158,11 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                 .await
             }
             PublishJob::StdoutEof => emit_exit(&inner, "exited").await,
+            PublishJob::Fence(signal) => {
+                // Everything enqueued before this fence has now been published.
+                let _ = signal.send(());
+                Ok(())
+            }
             PublishJob::Emit(observations) => emit_all(&inner, observations).await,
         };
         if let Err(error) = result {

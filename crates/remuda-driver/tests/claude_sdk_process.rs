@@ -1621,17 +1621,22 @@ async fn a_deferred_result_emits_exactly_one_ordered_settlement_when_b_real_writ
         "B's real write fails on the closed stdin"
     );
 
-    // PUBLICATION FENCE: drain a quiet window so EVERY publication (the
-    // correction plus any spurious duplicate) is observed.
+    // ACKNOWLEDGED PUBLICATION FENCE (r9 item 4): enqueue after B's rollback;
+    // it resolves only once every earlier job — including the deferred-settle
+    // Emit — has been published. No quiet-period polling, and the whole
+    // sequence is complete (a delayed duplicate cannot slip past the drain).
+    let fence = driver.publication_fence().await;
+    tokio::time::timeout(Duration::from_secs(5), fence)
+        .await
+        .expect("publication fence within 5s")
+        .expect("fence sender alive");
+
+    // Every observation is already emitted; read them without any timeout wait.
     let mut all = Vec::new();
-    let mut quiet = 0u32;
-    while quiet < 10 {
-        match tokio::time::timeout(Duration::from_millis(50), handle.recv()).await {
-            Ok(Some(obs)) => {
-                all.push(obs);
-                quiet = 0;
-            }
-            Ok(None) | Err(_) => quiet += 1,
+    while let Ok(obs) = tokio::time::timeout(Duration::from_millis(200), handle.recv()).await {
+        match obs {
+            Some(obs) => all.push(obs),
+            None => break,
         }
     }
 

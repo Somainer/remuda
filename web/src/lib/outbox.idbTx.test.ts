@@ -28,21 +28,35 @@ class FakeTransaction {
   onerror: ((ev: unknown) => void) | null = null;
   /** Resolved when the db grants this tx its serialized start. */
   readonly started: Promise<void>;
+  /** Resolved when this transaction ends (committed or aborted). */
+  readonly done: Promise<void>;
   private startedResolve!: () => void;
+  private doneResolve!: () => void;
+  /** Monotonic creation order (conflict precedence). */
+  readonly createdAt: number;
   error: Error | null = null;
   readonly db: FakeDb;
   readonly mode: IDBTransactionMode;
   aborted = false;
   private settled = false;
   private pending = 0;
-  private readonly onEnd: () => void;
+  private readonly onEnd: (tx: FakeTransaction) => void;
 
-  constructor(db: FakeDb, mode: IDBTransactionMode, onEnd: () => void) {
+  constructor(
+    db: FakeDb,
+    mode: IDBTransactionMode,
+    onEnd: (tx: FakeTransaction) => void,
+    createdAt: number,
+  ) {
     this.db = db;
     this.mode = mode;
     this.onEnd = onEnd;
+    this.createdAt = createdAt;
     this.started = new Promise<void>((r) => {
       this.startedResolve = r;
+    });
+    this.done = new Promise<void>((r) => {
+      this.doneResolve = r;
     });
   }
 
@@ -67,8 +81,9 @@ class FakeTransaction {
       queueMicrotask(() => this.oncomplete?.({ target: this }));
     }
     // All requests settled and the tx ended (committed or aborted) — release
-    // the db readwrite slot so a queued transaction can start.
-    this.onEnd();
+    // the db serialization slot so a queued transaction can start.
+    this.onEnd(this);
+    this.doneResolve();
   }
 
   abort = () => {
@@ -178,13 +193,18 @@ class FakeDb {
   readonly rows = new Map<string, OutboxRecord>();
   private readonly names = new Set<string>();
   /**
-   * Real IndexedDB serializes overlapping readwrite transactions on one
-   * database: a new readwrite transaction does NOT begin until prior
-   * readwrite transactions finish. This pending queue models that, so a
-   * contended lease tx starts only after the holder's deliverer releases.
+   * Creation-order conflict scheduling like real IndexedDB:
+   *  - a READONLY transaction starts once the last earlier READWRITE has
+   *    finished (it runs concurrently with other readers);
+   *  - a READWRITE transaction starts only after ALL earlier transactions
+   *    (readers and writers) have finished.
+   * The old counter model started a queued writer when a READER ended even
+   * though an earlier writer was still active (gate 16 item 3).
    */
-  private pendingStart: (() => void)[] = [];
-  private activeReadwrite = 0;
+  private outstanding = new Set<FakeTransaction>();
+  private pendingStart: FakeTransaction[] = [];
+  /** Monotonic transaction creation sequence. */
+  private creationSeq = 0;
   /** Test switch: abort the NEXT transaction after its request succeeds. */
   abortNextAfterRequest = false;
   /** Recorded proof the request succeeded before the abort arrived. */
@@ -208,28 +228,65 @@ class FakeDb {
     return { contains: (n: string) => names.has(n) };
   }
 
-  private waitForSerialStart(mode: IDBTransactionMode): Promise<void> {
-    if (mode === "readonly" || this.activeReadwrite === 0) {
-      this.activeReadwrite += 1;
-      return Promise.resolve();
+  private enqueueTransactionStart(tx: FakeTransaction, mode: IDBTransactionMode) {
+    // Compute the set of EARLIER transactions this one conflicts with.
+    const prerequisites: FakeTransaction[] = [];
+    if (mode === "readonly") {
+      const lastWriter = [...this.outstanding].reverse().find((t) => t.mode === "readwrite");
+      if (lastWriter) prerequisites.push(lastWriter);
+    } else {
+      prerequisites.push(...this.outstanding);
     }
-    return new Promise<void>((resolve) => {
-      this.pendingStart.push(() => {
-        this.activeReadwrite += 1;
-        resolve();
-      });
+    this.outstanding.add(tx);
+    if (prerequisites.length === 0) {
+      queueMicrotask(() => tx.grantStart());
+      return;
+    }
+    this.pendingStart.push(tx);
+    void Promise.all(prerequisites.map((t) => t.done)).then(() => {
+      // Start only when still queued (it may have been pumped already — the
+      // queue pump re-checks prerequisites each time any transaction ends).
+      if (this.pendingStart.includes(tx)) {
+        this.pumpPendingStarts();
+      }
     });
   }
 
-  endTransaction() {
-    this.activeReadwrite -= 1;
-    this.pendingStart.shift()?.();
+  private pumpPendingStarts() {
+    // Walk the queue in creation order; start each tx whose conflicting
+    // predecessors are done. A started writer itself blocks later tx, so stop
+    // the walk after granting a writer.
+    for (const tx of [...this.pendingStart]) {
+      if (this.isBlocked(tx)) continue;
+      this.pendingStart.splice(this.pendingStart.indexOf(tx), 1);
+      tx.grantStart();
+      if (tx.mode === "readwrite") break;
+    }
+  }
+
+  /** True while an earlier outstanding transaction conflicts with `tx`. */
+  private isBlocked(tx: FakeTransaction): boolean {
+    const earlier = (t: FakeTransaction) => t.createdAt < tx.createdAt;
+    if (tx.mode === "readonly") {
+      return [...this.outstanding].some((t) => earlier(t) && t.mode === "readwrite");
+    }
+    return [...this.outstanding].some((t) => earlier(t));
+  }
+
+  endTransaction(tx: FakeTransaction) {
+    this.outstanding.delete(tx);
+    this.pumpPendingStarts();
   }
 
   transaction(name: string | string[], mode: IDBTransactionMode) {
     void name;
-    const tx = new FakeTransaction(this, mode, () => this.endTransaction()) as unknown as FakeTransaction;
-    void this.waitForSerialStart(mode).then(() => tx.grantStart());
+    const tx = new FakeTransaction(
+      this,
+      mode,
+      (ended) => this.endTransaction(ended),
+      this.creationSeq++,
+    ) as unknown as FakeTransaction;
+    this.enqueueTransactionStart(tx, mode);
     return tx as unknown as IDBTransaction;
   }
 }
@@ -400,6 +457,46 @@ it("GATE15 item 2: a same-owner inflight claim appearing AFTER load gets an expi
     vi.useRealTimers();
     Object.defineProperty(globalThis.navigator, "locks", { value: originalLocks, configurable: true });
   }
+});
+
+it("GATE16 item 3: a queued writer waits for ALL earlier transactions — reader and writer — and starts in creation order", async () => {
+  // Real IndexedDB conflict order: writer1, reader (getAll), writer2. While
+  // writer1's commit is held open the reader and writer2 BOTH queue (the
+  // reader does NOT run, and writer2 must not run). When writer1 ends the
+  // reader goes first; writer2 starts only after the reader also ends. The
+  // old counter fake released a queued writer on a reader's end while an
+  // earlier writer was still active.
+  const db = installFakeIndexedDB();
+  const opened = await openOutboxStorage();
+  const storage = opened.storage;
+
+  let releaseW1: (() => void) | null = null;
+  db.commitGate = new Promise<void>((r) => void (releaseW1 = r));
+  const w1 = storage.put(probeRecord("cmd_w1"));
+  const order: string[] = [];
+  // Reader queues behind writer1.
+  const reader = storage.all().then((rows) => {
+    order.push("reader");
+    return rows;
+  });
+  // writer2 queues behind writer1 AND the reader.
+  const w2 = storage.put(probeRecord("cmd_w2")).then(() => order.push("writer2"));
+  await Promise.resolve();
+  await Promise.resolve();
+  // Neither queued tx ran while writer1 is open.
+  expect(db.rows.get("cmd_w2")).toBeUndefined();
+  expect(order).toEqual([]);
+
+  releaseW1!();
+  await w1;
+  // Reader is ahead of writer2 in creation order and is a prerequisite of it:
+  // the read settles before writer2's commit.
+  await reader;
+  expect(order).toEqual(["reader"]);
+  await Promise.resolve();
+  expect(order).toEqual(["reader"]); // writer2 not yet
+  await w2;
+  expect(order).toEqual(["reader", "writer2"]);
 });
 
 it("GATE15 item 1: two cloned-owner documents without Web Locks are mutually excluded by the instance lease — exactly one POST", async () => {

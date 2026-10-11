@@ -1695,7 +1695,15 @@ impl SessionModeTable {
             .session_id
             .as_deref()
             .is_some_and(|argv_id| argv_id != session_id);
-        let first_for_pid = self.first_pid.insert(pid) && !argv_names_other_session;
+        // c-effortread r9 item 4: only CLAIM the pid's launch slot here; do
+        // not `insert` a record that loses on argv (a hook-raced switch). The
+        // old insert-then-discard consumed the slot, so the real launch-id the
+        // argv named landed later as a rebound and lost pre_resume_mode.
+        let slot_unclaimed = !self.first_pid.contains(&pid);
+        let first_for_pid = slot_unclaimed && !argv_names_other_session;
+        if first_for_pid {
+            self.first_pid.insert(pid);
+        }
         let (mode, rebound) = if first_for_pid {
             // The launched process's own FIRST reported session. A pre-spawn
             // capture (a Remuda-launched resume) wins. Without one the mode
@@ -4333,6 +4341,51 @@ mod tests {
         // Lookup.
         assert!(table.mode_for(7, LATE_STARTER).is_some());
         assert!(table.mode_for(8, LATE_STARTER).is_none());
+    }
+
+    /// c-effortread r9 item 4: a hook-raced FIRST record for a switched-id
+    /// (argv still names the real launch session) must not CONSUME the pid's
+    /// launch slot. When the real launch-id is recorded afterward it is the
+    /// launch session: non-rebound and keeping `pre_resume_mode`. The old code
+    /// ran `first_pid.insert(pid)` even for the losing record, so the launch-id
+    /// later landed as a rebound and lost its pre-spawn resume mode.
+    #[test]
+    fn r9_item4_a_raced_switch_record_does_not_consume_the_launch_slot() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cwd = dir.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let launched = slug_session(dir.path(), &cwd, "launch-id", "{}\n");
+        let switched = slug_session(dir.path(), &cwd, "switched-id", "{}\n");
+        let mut table = SessionModeTable::default();
+        // argv proves the launch session is launch-id throughout.
+        let argv_found = detected_claude(9, Some("launch-id"));
+
+        // The hook for switched-id wins the race to the first record.
+        let raced = table.record(9, "switched-id", Some(&switched), None, None, &argv_found);
+        assert!(raced.rebound, "argv names a different session -> rebound");
+
+        // The real launch-id is recorded next on the SAME table with a
+        // pre-spawn resume capture. It must still own the launch slot.
+        let launch = table.record(
+            9,
+            "launch-id",
+            Some(&launched),
+            Some(ResumeMode::Unverified),
+            None,
+            &detected_claude(9, Some("launch-id")),
+        );
+        assert!(
+            !launch.rebound,
+            "the launch-id keeps the launch slot after a raced switch record"
+        );
+        assert!(
+            matches!(
+                launch.mode,
+                ResumeMode::Unverified | ResumeMode::Boundary(_)
+            ),
+            "the launch-id keeps its pre-spawn resume mode, not rebound sizing: {:?}",
+            launch.mode
+        );
     }
 
     /// c-effortread r8 item 4(a): the pid's first RECORDED session is assumed

@@ -1678,12 +1678,14 @@ it("an identical poll still settles queued effort left by a historical onPrepend
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(newerAt);
 });
 
-it("loadEarlier onPrepend replay leaves queued effort that an identical poll then settles (c-perffu r4-2)", async () => {
-  // Drives the REAL path and ONLY that path: the follow seed carries just
-  // the latest effective observation (floor seq 5); the queued configure
-  // lifecycle exists ONLY in the older load-earlier page. The earlier r3
-  // version of this test put the queued row in the seed, so it passed with
-  // onPrepend's effort replay deleted.
+it("a load-earlier replay hydrates observations but never queues; a live queued switch survives it and settles on a current poll (c-perffu r4-2 merge)", async () => {
+  // Merge of c-perffu r4-2 onto the c-effortread r8 replay rule: history rows
+  // (onPrepend) hydrate the effective map but are NEVER treated as live
+  // frames — a historical queued configure in the older page cannot surface a
+  // 切换中 indicator. This still drives the REAL load-earlier path (floor
+  // descriptor, beforeSeq paging, monotonic effective guard) and then proves
+  // poll settlement (stale t00:05 below the request; equal-instant t00:14 with
+  // the matching level name settles) for a genuinely live queued switch.
   const id = "ins_effort_prepend";
   const journalId = "obj_effort_prepend";
   const instance: Instance = {
@@ -1699,8 +1701,17 @@ it("loadEarlier onPrepend replay leaves queued effort that an identical poll the
   vi.spyOn(api, "instanceGet").mockResolvedValue(instance);
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  let deliverLive!: (observation: Observation) => void;
   vi.spyOn(api, "eventsSubscribe").mockImplementation(async (_j, _a, onBatch) => {
-    void onBatch;
+    deliverLive = (observation) =>
+      onBatch({
+        subscriptionId: `sub_${id}`,
+        journalId,
+        fromSeq: observation.seq,
+        toSeq: observation.seq,
+        durableSeq: observation.seq,
+        events: [observation],
+      });
     return subscription(instance);
   });
 
@@ -1711,8 +1722,8 @@ it("loadEarlier onPrepend replay leaves queued effort that an identical poll the
   const olderEvents = [
     // The older launch level (monotonic guard must not roll effective back)…
     { ...effortEvent(1, "high", null, "launch") },
-    // …and the historical queued configure row, journaled after it. This is
-    // the ONLY source of the queued state in this test.
+    // …and a historical queued configure row. Under the r8 replay rule this is
+    // HISTORY and must NOT queue an indicator.
     configureLifecycle(4, "effort-queued:max", id),
   ];
   const olderRequests: unknown[] = [];
@@ -1739,8 +1750,7 @@ it("loadEarlier onPrepend replay leaves queued effort that an identical poll the
   });
 
   await hubStore.follow(id);
-  expect(hubStore.effortEffectiveOf(id)?.observedAt).toBe("2026-09-16T00:05:00Z");
-  // The queued lifecycle has not been replayed yet.
+  expect(hubStore.effortEffectiveOf(id)?.observedAt).toBe("2026-09-16T00:05:00.000Z");
   expect(hubStore.effortPendingOf(id)).toBeNull();
 
   // Real load-earlier: floor 5 -> beforeSeq must be "4". loadEarlier returns
@@ -1752,16 +1762,18 @@ it("loadEarlier onPrepend replay leaves queued effort that an identical poll the
   expect(olderRequests).toHaveLength(1);
   expect((olderRequests[0] as { beforeSeq?: string }).beforeSeq).toBe("4");
 
-  // The older launch edge never rolls effective back; the replayed queued
-  // lifecycle now marks the push-down as queued via onPrepend.
+  // The older launch edge never rolls effective back, and the REPLAYED queued
+  // lifecycle is ignored: no pending indicator appears from history.
   expect(hubStore.effortEffectiveOf(id)?.name).toBe("xhigh");
-  expect(hubStore.effortEffectiveOf(id)?.observedAt).toBe("2026-09-16T00:05:00Z");
+  expect(hubStore.effortEffectiveOf(id)?.observedAt).toBe("2026-09-16T00:05:00.000Z");
+  expect(hubStore.effortPendingOf(id)).toBeNull();
+
+  // The genuinely in-flight request arrives LIVE and queues.
+  deliverLive(configureLifecycle(6, "effort-queued:max", id, "2026-09-16T00:14:00.000Z"));
   expect(hubStore.effortPendingOf(id)?.queued).toBe(true);
 
-  // A stale poll carrying a read-back OLDER than the queued configure
-  // (00:05 < the seq-4 queued request at 00:14) must NOT clear the switch
-  // (c-perffu r7: settlement needs an observation at least as new as the
-  // queued request).
+  // A stale poll carrying a read-back OLDER than the queued request
+  // (00:05 < 00:14) must NOT clear the switch.
   vi.spyOn(api, "instanceList").mockResolvedValue({
     items: [
       {
@@ -1778,7 +1790,8 @@ it("loadEarlier onPrepend replay leaves queued effort that an identical poll the
   await hubStore.refresh();
   expect(hubStore.effortPendingOf(id)?.queued).toBe(true);
 
-  // A current read-back at/after the queued request (00:14) settles it.
+  // A read-back at the SAME parsed instant as the queued request (the durable
+  // record truncates milliseconds) names the requested level and settles it.
   vi.spyOn(api, "instanceList").mockResolvedValue({
     items: [
       {
@@ -1795,6 +1808,7 @@ it("loadEarlier onPrepend replay leaves queued effort that an identical poll the
   await hubStore.refresh();
   expect(hubStore.effortPendingOf(id)).toBeNull();
 });
+
 
 it("a stale effort poll older than the queued configure leaves the queued switch pending (c-perffu r7-3)", async () => {
   // Same fixture shape, isolated: baseline read-back t1, queued configure

@@ -1032,11 +1032,17 @@ class HubStore {
     // A verdict is this request's when it echoes it, names its level, or (no
     // echo available) is a post-threshold/cold-start remuda read-back. An
     // echoed-but-mismatched remuda edge is the replaced request's verdict.
+    const identifiesRequest = echoesRequest || namesLevel;
     const ours =
-      echoesRequest ||
-      namesLevel ||
+      identifiesRequest ||
       (remuda && requestedEcho === undefined && (threshold == null || postThreshold));
-    const newer = threshold != null ? postThreshold : ours;
+    // Merge of c-perffu r7: a read-back at the SAME parsed instant as the
+    // queued request (millisecond-truncated spellings differ) still settles
+    // WHEN it identifies THIS request — the level name or echo matches. The
+    // echo-less remuda fallback stays strictly post-threshold, so request A's
+    // equal-instant verdict (which names A's level) can never settle request
+    // B's pending.
+    const newer = threshold != null ? postThreshold || identifiesRequest : ours;
     let { levelSettled, flagSettled } = pending;
     if (newer && !levelSettled && ours) {
       levelSettled = true;

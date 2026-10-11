@@ -29,6 +29,7 @@ class FakeTransaction {
   error: Error | null = null;
   readonly db: FakeDb;
   readonly mode: IDBTransactionMode;
+  aborted = false;
 
   constructor(db: FakeDb, mode: IDBTransactionMode) {
     this.db = db;
@@ -40,6 +41,8 @@ class FakeTransaction {
   }
 
   abort = () => {
+    if (this.aborted) return;
+    this.aborted = true;
     queueMicrotask(() => this.onabort?.({ target: this }));
   };
 }
@@ -58,14 +61,25 @@ class FakeObjectStore {
     // transaction outcome — exactly the window the write must not trust.
     queueMicrotask(() => {
       prepare();
-      req.onsuccess?.({ target: req });
+      try {
+        req.onsuccess?.({ target: req });
+      } catch (err) {
+        // Real IndexedDB aborts the transaction when an event handler throws.
+        queueMicrotask(() => {
+          this.tx.error = err instanceof Error ? err : new Error(String(err));
+          this.tx.abort();
+        });
+        return;
+      }
       queueMicrotask(() => {
+        if (this.tx.aborted) return; // external signal abort won the race
         if (this.db.abortNextAfterRequest) {
           this.db.abortNextAfterRequest = false;
           this.db.requestSucceededBeforeAbort = true;
           this.tx.abort();
           return;
         }
+        if (this.db.commitGate) return; // held open for disposal-window tests
         commit();
         this.tx.oncomplete?.({ target: this.tx });
       });
@@ -75,12 +89,14 @@ class FakeObjectStore {
   put(rec: OutboxRecord) {
     const req = new FakeRequest();
     req.result = rec.commandId;
+    this.db.requestsIssued.push("put");
     this.finish(req, () => {}, () => this.db.rows.set(rec.commandId, rec));
     return req as unknown as IDBRequest;
   }
 
   getAll() {
     const req = new FakeRequest();
+    this.db.requestsIssued.push("getAll");
     this.finish(
       req,
       () => {
@@ -93,6 +109,7 @@ class FakeObjectStore {
 
   get(key: string) {
     const req = new FakeRequest();
+    this.db.requestsIssued.push("get");
     this.finish(
       req,
       () => {
@@ -105,6 +122,7 @@ class FakeObjectStore {
 
   delete(key: string) {
     const req = new FakeRequest();
+    this.db.requestsIssued.push("delete");
     this.finish(req, () => {}, () => {
       this.db.rows.delete(key);
     });
@@ -119,6 +137,10 @@ class FakeDb {
   abortNextAfterRequest = false;
   /** Recorded proof the request succeeded before the abort arrived. */
   requestSucceededBeforeAbort = false;
+  /** When truthy, requests hold their commit microtask open (disposal tests). */
+  commitGate = false;
+  /** Every object-store request issued (get/put/getAll/delete), in order. */
+  readonly requestsIssued: string[] = [];
 
   createObjectStore(name: string) {
     this.names.add(name);
@@ -190,6 +212,24 @@ it("a write whose request succeeds but whose transaction aborts afterwards is no
   // A follow-up transaction in a new attempt commits normally.
   await storage.put(probeRecord("cmd_retry_ok"));
   expect((await storage.all()).map((r) => r.commandId)).toContain("cmd_retry_ok");
+});
+
+it("GATE14 item 2: a requireExpired reclaim whose row completed to sent (lease undefined) returns the terminal row instead of throwing", async () => {
+  const db = installFakeIndexedDB();
+  const opened = await openOutboxStorage();
+  const storage = opened.storage;
+  const until = Date.now() - 1_000;
+  // The wake read an inflight claim with this lease; between that read and the
+  // conditional reclaim the delivery completed to sent with NO lease.
+  await storage.put({ ...probeRecord("cmd_terminal"), state: "sent", gotResponse: true });
+  // Must return the authoritative sent row, not reject on lease!.until.
+  const got = await storage.reclaimInflight(
+    "cmd_terminal",
+    { owner: "owner_term", until },
+    { requireExpired: true },
+  );
+  expect(got?.state).toBe("sent");
+  expect(db.rows.get("cmd_terminal")?.state).toBe("sent");
 });
 
 it("Outbox.enqueue rejects and keeps the row out of its cache on a post-success abort, then succeeds on retry", async () => {

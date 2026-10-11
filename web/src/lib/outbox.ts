@@ -409,17 +409,22 @@ class IdbOutboxStorage implements OutboxStorage {
           return;
         }
         const lease = existing.lease;
-        // Gate 13 item 2: the expiry test is evaluated INSIDE the
-        // transaction, so a clock rolled back between the timer firing and the
-        // claim cannot reclaim a fresh lease.
-        const expired = !opts?.requireExpired || lease!.until <= Date.now();
         if (
           existing.state === "inflight" &&
           lease &&
           lease.owner === expected.owner &&
-          lease.until === expected.until &&
-          expired
+          lease.until === expected.until
         ) {
+          // Gate 13 item 2: the expiry test belongs INSIDE the matching
+          // inflight branch — a concurrent completion (sent/done with lease
+          // undefined) must return the authoritative terminal row, not throw
+          // on a missing lease and abort/retry the transaction.
+          const expired = !opts?.requireExpired || lease.until <= Date.now();
+          if (!expired) {
+            // Still fresh after a clock rollback: leave the row as stored.
+            result = existing;
+            return;
+          }
           if (opts?.signal?.aborted) {
             t.abort();
             return;
@@ -428,8 +433,9 @@ class IdbOutboxStorage implements OutboxStorage {
           result = reclaimed;
           store.put(reclaimed);
         } else {
-          // Moved on (sent/reconciling/held/done), lease changed or still
-          // fresh after rollback: leave the authoritative row as stored.
+          // Moved on (sent/reconciling/held/done with lease undefined), lease
+          // changed or missing entirely: leave the authoritative row as
+          // stored, even with requireExpired.
           result = existing;
         }
       };

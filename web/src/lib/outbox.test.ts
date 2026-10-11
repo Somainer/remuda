@@ -86,16 +86,19 @@ class MemStorage implements OutboxStorage {
       const existing = this.map.get(commandId);
       if (!existing) return null;
       const lease = existing.lease;
-      const expired = !opts?.requireExpired || (!!lease && lease.until <= Date.now());
       if (
         existing.state !== "inflight" ||
         !lease ||
         lease.owner !== expected.owner ||
-        lease.until !== expected.until ||
-        !expired
+        lease.until !== expected.until
       ) {
         return existing;
       }
+      // Mirrors the production IDB backend: expiry is evaluated only for the
+      // MATCHING inflight lease (no null-safe masking — a terminal row above
+      // already returned).
+      const expired = !opts?.requireExpired || lease.until <= Date.now();
+      if (!expired) return existing;
       if (opts?.signal?.aborted) throw new DOMException("reclaim aborted", "AbortError");
       const reclaimed: OutboxRecord = { ...existing, state: "pending", lease: undefined };
       this.map.set(commandId, reclaimed);

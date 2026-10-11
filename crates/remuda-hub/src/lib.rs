@@ -537,11 +537,78 @@ pub struct RunningHub {
     state: AppState,
 }
 
+/// Test-only `'static` handle to a running Hub's state.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct HubTestHandle {
+    state: AppState,
+}
+
+impl HubTestHandle {
+    /// Mount a synthetic Node transport (see
+    /// [`RunningHub::test_set_node_transport`]).
+    pub async fn test_set_node_transport(
+        &self,
+        host_id: &str,
+        transport: std::sync::Arc<dyn crate::transport::NodeTransport>,
+    ) {
+        self.state.nodes.insert(host_id.to_owned(), transport).await;
+    }
+
+    /// Arm the forward_if_online pre-send barrier.
+    pub fn test_arm_forward_send_barrier(
+        &self,
+        host_id: &str,
+        command_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached: std::sync::Arc<tokio::sync::Notify> =
+            std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::ForwardSend,
+            (host_id.to_owned(), command_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
+    /// Run one queued command through the real `forward_if_online` send path.
+    pub async fn test_forward_command_online(
+        &self,
+        command_id: &str,
+    ) -> anyhow::Result<crate::store::CommandRecord> {
+        let command = self
+            .state
+            .store
+            .get_command(command_id.to_owned())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown command {command_id}"))?;
+        Ok(crate::http::forward_if_online(&self.state, command, true).await?)
+    }
+}
+
 impl RunningHub {
     /// Borrow this Hub's store (audit queries, support tooling, tests).
     #[must_use]
     pub fn store(&self) -> Option<&Store> {
         self.store.as_ref()
+    }
+
+    /// Test helper: an owned (`'static` + `Clone`) handle to the Hub state so
+    /// tests can drive a handler from a spawned task while orchestrating link
+    /// swaps on the main task.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_handle(&self) -> HubTestHandle {
+        HubTestHandle {
+            state: self.state.clone(),
+        }
     }
 
     /// Test helper: insert an online host row directly (no WS enroll).
@@ -621,6 +688,23 @@ impl RunningHub {
         transport: std::sync::Arc<dyn crate::transport::NodeTransport>,
     ) {
         self.state.nodes.insert(host_id.to_owned(), transport).await;
+    }
+
+    /// Test helper (c-dirpicker r11 item 2): mount a synthetic transport AS a
+    /// specific durable link generation — exactly what the `node.hello` arm
+    /// does after `bump_host_link_generation`. Lets interleave tests model the
+    /// bump→insert window with the previous session still registered.
+    #[doc(hidden)]
+    pub async fn test_set_node_transport_with_generation(
+        &self,
+        host_id: &str,
+        transport: std::sync::Arc<dyn crate::transport::NodeTransport>,
+        link_generation: i64,
+    ) {
+        self.state
+            .nodes
+            .insert_with_generation(host_id.to_owned(), transport, link_generation)
+            .await;
     }
 
     /// Test helper: block every Node-registry lookup (`kind_of`, `call`,
@@ -705,17 +789,14 @@ impl RunningHub {
 
     /// Test helper: run the node.hello unregister reconciliation (c-dirpicker
     /// r7 item 1) — aborts every still-unsettled workspace.unregister command
-    /// on `host_id` created before the current instant (r9 item 2: commands a
-    /// live new-link DELETE just created are excluded).
+    /// on `host_id` stamped by a link older than the host's current link
+    /// generation (r10 item 1; a test modeling a reconnect bumps the
+    /// generation first, exactly as an adopting node.hello does).
     #[doc(hidden)]
     pub async fn test_reconcile_unsettled_unregisters(&self, host_id: &str) {
-        crate::workspaces::abort_unsettled_unregisters_on_reconnect(
-            &self.state,
-            host_id,
-            &crate::config::now_rfc3339(),
-        )
-        .await
-        .expect("reconcile unsettled unregisters");
+        crate::workspaces::abort_unsettled_unregisters_on_reconnect(&self.state, host_id)
+            .await
+            .expect("reconcile unsettled unregisters");
     }
 
     /// Test helper (round 6 item 3): arm a one-shot park point in the REAL
@@ -743,6 +824,89 @@ impl RunningHub {
         };
         self.state.race_barriers.insert(
             phase,
+            (host_id.to_owned(), workspace_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
+    /// Test helper (c-dirpicker r11 item 2): arm the park point between the
+    /// forward-intent stamp and the prepare send of the REAL unregister DELETE
+    /// handler — after the handler pinned its transport. A test parks the
+    /// DELETE there, runs the next hello (generation bump + new transport
+    /// insert), releases, and asserts the prepare/commit stayed on the pinned
+    /// link.
+    #[doc(hidden)]
+    pub fn test_arm_forward_marked_barrier(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::ForwardMarked,
+            (host_id.to_owned(), workspace_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
+    /// Test helper (c-dirpicker r12 item 1): arm the park point between the
+    /// command INSERT and `mark_forward_intent` in the REAL unregister DELETE
+    /// handler — after the handler pinned the (L1, generation) pair. A test
+    /// parks the DELETE there, bumps the durable host generation (as the next
+    /// hello would), and asserts the post-hello sweep still selects the row
+    /// stamped with the pinned generation.
+    #[doc(hidden)]
+    pub fn test_arm_forward_queued_barrier(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached: std::sync::Arc<tokio::sync::Notify> =
+            std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::ForwardQueued,
+            (host_id.to_owned(), workspace_id.to_owned()),
+            crate::workspaces::BarrierSlot {
+                reached: reached.clone(),
+                release: release_rx,
+            },
+        );
+        (reached, release_tx)
+    }
+
+    /// Test helper (c-dirpicker r12 item 1): arm the park point between the
+    /// transport pin and the command INSERT in the REAL unregister DELETE
+    /// handler.
+    #[doc(hidden)]
+    pub fn test_arm_forward_pinned_barrier(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let reached: std::sync::Arc<tokio::sync::Notify> =
+            std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.state.race_barriers.insert(
+            crate::workspaces::RacePhase::ForwardPinned,
             (host_id.to_owned(), workspace_id.to_owned()),
             crate::workspaces::BarrierSlot {
                 reached: reached.clone(),

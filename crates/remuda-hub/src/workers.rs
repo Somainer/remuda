@@ -646,6 +646,7 @@ pub(crate) async fn dispatch_core(
                 "instance.send".into(),
                 send_payload,
                 None,
+                None,
             )
             .await
             .map_err(map_store)?;
@@ -1360,6 +1361,7 @@ pub(crate) async fn retire_core(
                 "instance.close".into(),
                 json!({ "instanceId": instance_id.as_id() }),
                 None,
+                None,
             )
             .await
             .map_err(map_store)?;
@@ -1569,6 +1571,7 @@ async fn send_worker_brief(
             worker.host_id.as_id().to_string(),
             "instance.send".into(),
             payload,
+            None,
             None,
         )
         .await

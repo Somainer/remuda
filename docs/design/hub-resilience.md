@@ -466,7 +466,7 @@ hello 在单 writer 前排成一串，尾延迟 ≈ N × 单 hello 串行时间�
   REST 已恢复的链路上线即离线、亚秒级重连风暴）。一次真实 frame 重新认证 live
   后该截止清零。
 
-### 5.2.1 定时器归属表（c-reconnfu gate 10 item 0；gate 11 items 1/6/7、gate 12 item 8 校订）
+### 5.2.1 定时器归属表（c-reconnfu gate 10 item 0；gate 11 items 1/6/7、gate 12 item 8、gate 13 item 5 校订）
 
 客户端状态机的每个命名定时器只有一个 owner；`setTimer(name, ms, fn)` 在写入
 新 handle 前总是先 `clearTimer(name)`，所以旧 job 绝不会在后来的状态 episode 里
@@ -491,11 +491,21 @@ stale episode 的 30 s 墙钟截止，由 `offline` 定时器兑现；**`reconne
 | **offline** | — | — | —（`goOffline` 已 clear；offline 自身不持有 episode 截止） | 非 rebind `followBound` 且 state=offline → 立即 `beginResume`（不 arm 延迟 bind） | arm：`beginResume`/`resume`/`online` 事件→`armResumeAttempt`（安装后即转入 recovering） | arm：**`scheduleReconnect`**（由 `setStateOffline` 与每次 `goOfflineAndSchedule` 调用）；fire：frame-live 则认证 live，否则 `beginResume`；clear：resume 启动、frame 认证 | 0 |
 
 `dispose()` clear 全部六个命名定时器。Outbox 自己另有按 commandId 跟踪的租约到期
-wakeup：它记住租约快照、租约续约时 re-arm、行送达/删除/refresh 显示终态时
-cancel、dispose 后永不复活（gate 12 items 1–5，outbox 交付语义见 §5.4 的
-D-055）。浏览器 `offline` 事件 clear bind/stale/probe/offline/watchdog 并 retire
-当前 attempt（`retireInFlightForOffline`，不带 offline flag，其迟到 completion 被
-attempt id 丢弃），但**不动 `reconnect`**；随后的 `online` 事件立即启动新 attempt。
+wakeup：它记住租约快照、租约续约（含已经过期的替换租约）时 adopt 并 re-arm、墙钟
+回退不误 reclaim、行送达/删除/refresh 显示终态时 cancel、dispose 的 abort signal
+让在飞 reclaim 事务提交前回滚（gate 13 items 1–3，outbox 交付语义见 §5.4 的
+D-055）。
+
+两种 offline 退休语义相反，不要混淆（gate 13 item 5 校订）：
+
+* **浏览器 `offline` 事件** → `retireInFlightForOffline`：clear
+  bind/stale/probe/offline/watchdog，并把 `resumeRetiredOffline` **置 true**——
+  旧 attempt 的迟到 completion 照常被 attempt id 丢弃，该 flag 让随后的 `online`
+  事件可以立即启动新 attempt；`reconnect` 定时器不动。
+* **episode 截止 fire**（`offline` 定时器 → `goOffline`）→ `goOffline` 把
+  `resumeRetiredOffline` **置 false（清掉）**后退休在飞的 quiet attempt；因此该
+  attempt 的迟到 completion 因 attempt id 不匹配被忽略，恢复只由随后
+  `goOfflineAndSchedule` → `scheduleReconnect` 的 reconnect 时钟接管。
 
 ### 5.3 最高优先级规则：绝不把旧数据当新数据
 

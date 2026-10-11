@@ -140,6 +140,13 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // belonged to. Provenance comes ONLY from our own journal — never guessed.
     backfill_legacy_scope_ids(&tx)?;
     consolidate_identical_scoped_rows(&tx)?;
+    // c-ctxusage r11 item 1: rows imported by the backfill (and any scoped
+    // chains last written by pre-acceptance-rule code) were never run through
+    // the cumulative-growth rule, so a stale historical replay can sit at a
+    // HIGHER rowid than the valid high-water stock. Replay the same rule live
+    // inserts use, in acceptance (rowid) order, before rowid order is allowed
+    // to mean "accepted history" for current-stock selection and floors.
+    normalise_scoped_session_chains(&tx)?;
     // Dedupe index is scope-specific (c-ctxusage r4 item 3):
     // - Turn rows (Claude message id): one revision-replaced row per message.
     // - Session rows (cumulative Grok/Codex stock): append-only GROWTH POINTS,
@@ -179,6 +186,63 @@ fn consolidate_identical_scoped_rows(conn: &Connection) -> rusqlite::Result<usiz
            )",
         [],
     )
+}
+
+/// Replay the cumulative-growth acceptance rule over every proven scoped
+/// session chain and drop points the rule would have rejected at insert.
+///
+/// Imported legacy rows (and rows written before the content-ordered rule
+/// existed) can land out of cumulative order: a high-water 200/20 row at a
+/// small rowid followed by a stale historical replay 100/10 at a larger one
+/// leaves raw rowid order disagreeing with the floors — current-stock
+/// selection would show 100/10 while the retained 200/20 still freezes later
+/// points. Walking each `(instance_id, scope_id)` chain in rowid order with
+/// the live [`freezes_against`] rule removes exactly those points, so rowid
+/// order is once more a true accepted-history order. Idempotent: an already
+/// normalised chain deletes nothing (c-ctxusage r11 item 1).
+fn normalise_scoped_session_chains(conn: &Connection) -> rusqlite::Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT rowid, instance_id, scope_id, total_tokens, input_tokens,
+                output_tokens, cache_read_tokens, cache_write_tokens
+         FROM usage_events
+         WHERE scope = 'session' AND scope_id IS NOT NULL
+         ORDER BY instance_id ASC, scope_id ASC, rowid ASC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let rowid: i64 = r.get(0)?;
+        let instance_id: String = r.get(1)?;
+        let scope_id: String = r.get(2)?;
+        let counters = SnapshotCounters {
+            total: r.get(3)?,
+            input: r.get(4)?,
+            output: r.get(5)?,
+            cache_read: r.get(6)?,
+            cache_write: r.get(7)?,
+        };
+        Ok((rowid, instance_id, scope_id, counters))
+    })?;
+    let mut current_key: Option<(String, String)> = None;
+    let mut accepted: Vec<SnapshotCounters> = Vec::new();
+    let mut stale_rowids: Vec<i64> = Vec::new();
+    for entry in rows {
+        let (rowid, instance_id, scope_id, counters) = entry?;
+        let key = Some((instance_id, scope_id));
+        if key != current_key {
+            current_key = key;
+            accepted.clear();
+        }
+        if freezes_against(&counters, &accepted) {
+            stale_rowids.push(rowid);
+        } else {
+            accepted.push(counters);
+        }
+    }
+    drop(stmt);
+    let mut removed = 0;
+    for rowid in stale_rowids {
+        removed += conn.execute("DELETE FROM usage_events WHERE rowid = ?1", params![rowid])?;
+    }
+    Ok(removed)
 }
 
 /// Backfill pre-`scopeId` NULL-scope session rows from the matching retained
@@ -3460,6 +3524,132 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows_again, 3);
+    }
+
+    /// c-ctxusage r11 item 1: old-schema NULL rows can land OUT of cumulative
+    /// order under the old observed-at acceptance — the high-water 200/20 row
+    /// is inserted first and a stale historical replay 100/10 later, both
+    /// proven by the retained journal to belong to session s1. Exact-counter
+    /// consolidation keeps both, so raw rowid order would present the stale
+    /// 100/10 as the current stock while the retained 200/20 still floors new
+    /// points. The migration replays the cumulative-growth acceptance rule in
+    /// rowid order and drops the point that rule would have rejected, leaving
+    /// one coherent accepted-history chain.
+    #[test]
+    fn old_schema_later_smaller_replay_is_normalised_to_the_high_water_stock() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                scope_id TEXT,
+                mode TEXT NOT NULL,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (instance_id, seq)
+             );
+             CREATE UNIQUE INDEX usage_events_scope_dedupe
+                 ON usage_events(instance_id, scope, scope_id)
+                 WHERE scope_id IS NOT NULL;",
+        )
+        .unwrap();
+        // The high-water stock lands first; a smaller HISTORICAL replay lands
+        // afterwards at a higher seq/rowid (the old code inserted both).
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, mode, total_tokens,
+                 input_tokens, output_tokens, accounting, observed_at)
+             VALUES ('ins_r11', 1, 'session', NULL, 'snapshot',
+                     220, 200, 20, 'estimated', '2020-01-01T00:00:20.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, mode, total_tokens,
+                 input_tokens, output_tokens, accounting, observed_at)
+             VALUES ('ins_r11', 2, 'session', NULL, 'snapshot',
+                     110, 100, 10, 'estimated', '2020-01-01T00:00:10.000Z')",
+            [],
+        )
+        .unwrap();
+        create_journal_table(&conn);
+        insert_journal_raw(
+            &conn,
+            &scoped_record(1, "ins_r11", "session", Some("s1"), 1, 200, 20, 0, 0, None),
+        );
+        insert_journal_raw(
+            &conn,
+            &scoped_record(2, "ins_r11", "session", Some("s1"), 1, 100, 10, 0, 0, None),
+        );
+
+        migrate(&conn).unwrap();
+
+        // Both rows backfill to s1, then the backwards 100/10 replay is
+        // rejected by the replayed acceptance rule: only 200/20 survives.
+        let remaining: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT input_tokens, output_tokens FROM usage_events
+                 WHERE instance_id = 'ins_r11' AND scope = 'session'
+                 ORDER BY rowid ASC",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![(200, 20)],
+            "the stale smaller replay is normalised away; the high-water stays"
+        );
+        let rollup = rollup_instance(&conn, "ins_r11", "codex", Some("codex"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.session_input_tokens,
+            Some(200),
+            "current stock is the proven high-water point, not the last rowid"
+        );
+        assert_eq!(rollup.session_output_tokens, Some(20));
+
+        // Floors and current stock now agree: 150/15 is a backwards point in
+        // the SAME proven session and stays frozen; genuine growth is accepted.
+        assert!(
+            !insert(
+                &conn,
+                &scoped_record(3, "ins_r11", "session", Some("s1"), 1, 150, 15, 0, 0, None)
+            ),
+            "a backwards live point is still frozen by the retained high-water"
+        );
+        assert!(insert(
+            &conn,
+            &scoped_record(4, "ins_r11", "session", Some("s1"), 1, 250, 25, 0, 0, None)
+        ));
+        let rollup = rollup_instance(&conn, "ins_r11", "codex", Some("codex"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_input_tokens, Some(250));
+        assert_eq!(rollup.session_output_tokens, Some(25));
+
+        // Idempotent: a second open neither revives nor deletes anything.
+        migrate(&conn).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events
+                 WHERE instance_id = 'ins_r11' AND scope = 'session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2, "200/20 high-water plus the accepted 250/25 growth");
     }
 
     /// r8 item 8 regression: the legacy NULL-scope row is a different,

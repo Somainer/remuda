@@ -33,6 +33,7 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 
 const FINAL_MSG_ID: &str = "msg_abort_final_usage";
 /// The fake harness's fixed session id (`remuda_testing::paths::FIXTURE`).
@@ -342,4 +343,147 @@ async fn abort_past_the_finalise_bound_still_rescues_the_last_usage_run() {
         Some(7_777 + 9_999 + 66),
         "next-request context = input + cache read + cache creation"
     );
+}
+
+/// c-ctxusage r8 item 3: cancellation during the COOPERATIVE FINALISE (not the
+/// ordinary pump). The finish closure is parked by the injected barrier AFTER
+/// the first pump already completed; close crosses its shortened bound and
+/// aborts the task while the finish owns the hydrator. The finish must park
+/// its frames and retire inside the blocking operation, so the detached
+/// closure delivers the FINAL once and the guard never runs a second (empty)
+/// finish_collect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abort_during_cooperative_finalise_parks_frames_before_retiring() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let workspace = root.join("workspace");
+    let native_home = root.join("home");
+    let instance_dir = root.join("instance");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&native_home).unwrap();
+    let install = root.join("opt/bin");
+    std::fs::create_dir_all(&install).unwrap();
+    let binary = install.join("claude");
+    std::fs::copy(ensure_workspace_bin("fake-harness"), &binary).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let events_path = root.join("harness-events.jsonl");
+
+    let transcript = remuda_driver::claude_transcript::project_dir(&native_home, &workspace)
+        .join(format!("{SESSION_ID}.jsonl"));
+    seed_transcript(&transcript, 20);
+
+    use remuda_driver::test_faults::TranscriptFaults;
+    let faults = TranscriptFaults::new();
+    // Only the FINISH is gated — the first pump completes normally.
+    faults.arm_finish_gate();
+    faults.arm_close_timeout(std::time::Duration::from_millis(500));
+
+    let mut options = ShellPtyOptions::agent(
+        workspace.clone(),
+        AgentKind::Claude,
+        AgentLaunch {
+            profile: Box::new(profile()),
+            launch_dir: instance_dir.join("launch"),
+            native_home: native_home.clone(),
+            binary: Some(binary),
+            origin: LaunchOrigin::Human,
+            native_home_managed: true,
+            settings_overlay: None,
+        },
+    );
+    options.emulator = true;
+    options.pin_native_home = true;
+    options.claude_home = Some(native_home.clone());
+    options
+        .extra_env
+        .insert("FAKE_HARNESS_DIALECT_VERSION".into(), "modern".into());
+    options.extra_env.insert(
+        "FAKE_HARNESS_EVENTS_OUT".into(),
+        events_path.to_string_lossy().into_owned(),
+    );
+    options.hooks = Some(HookConfig {
+        instance_dir,
+        relay_binary: relay_bin(),
+        tui: remuda_driver::TuiMode::Default,
+    });
+    let driver = ShellPtyDriver::new(options);
+    driver.set_test_faults(faults.clone());
+
+    let handle = driver.start(spec_for(&workspace)).await.expect("start");
+    let mut events_rx = handle.into_events();
+    let final_count = Arc::new(AtomicU32::new(0));
+    let bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (final_tx, final_rx) = tokio::sync::oneshot::channel();
+    let final_tx = std::sync::Mutex::new(Some(final_tx));
+    let drainer_count = Arc::clone(&final_count);
+    let drainer_bound = Arc::clone(&bound);
+    let drainer = tokio::spawn(async move {
+        while let Some(observation) = events_rx.recv().await {
+            if let remuda_protocol::ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+                && native.native_name == "transcript_bound"
+            {
+                drainer_bound.store(true, Ordering::SeqCst);
+            }
+            if let remuda_protocol::ObservationPayload::Usage(payload) = &observation.body
+                && payload.scope_id == FINAL_MSG_ID
+            {
+                drainer_count.fetch_add(1, Ordering::SeqCst);
+                if let Some(tx) = final_tx.lock().unwrap().take() {
+                    let _ = tx.send(observation);
+                }
+            }
+        }
+    });
+
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    while Instant::now() < ready_deadline && Driver::wait_control(&driver).await.is_err() {}
+    let bind_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !bound.load(Ordering::SeqCst) && std::time::Instant::now() < bind_deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(bound.load(Ordering::SeqCst), "the seeded replay never bound");
+    // Settle the first (ungated) pump; it must not publish the no-stop FINAL.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(final_count.load(Ordering::SeqCst), 0);
+
+    driver.close().await.expect("close");
+    assert!(
+        faults.wait_finish_entered(),
+        "the cooperative finalise never entered its barrier"
+    );
+    assert!(
+        faults.wait_abort_residual(),
+        "no timeout-driven abort happened during the cooperative finalise"
+    );
+    assert_eq!(
+        final_count.load(Ordering::SeqCst),
+        0,
+        "FINAL usage delivered while the finish was still parked"
+    );
+
+    faults.release();
+    let rescued = tokio::time::timeout(std::time::Duration::from_secs(60), final_rx)
+        .await
+        .expect("the aborted finalise never delivered the FINAL run")
+        .expect("final oneshot closed without a frame");
+    drainer.abort();
+    assert_eq!(
+        final_count.load(Ordering::SeqCst),
+        1,
+        "the FINAL run must be delivered exactly once after finalise abort"
+    );
+
+    // The rescued row survives the real Hub pipeline.
+    let conn = Connection::open_in_memory().expect("sqlite");
+    migrate(&conn).expect("migrate");
+    let record = to_journal_record(&rescued);
+    let row = project_usage_event(&record, None, None).expect("projects usage");
+    assert!(insert_usage_event(&conn, &row).expect("insert usage row"));
+    assert_eq!(row.scope_id.as_deref(), Some(FINAL_MSG_ID));
+    assert_eq!(row.input_tokens, Some(7_777));
+    assert_eq!(row.output_tokens, Some(88));
+    assert_eq!(row.cache_read_tokens, Some(9_999));
+    assert_eq!(row.cache_write_tokens, Some(66));
 }

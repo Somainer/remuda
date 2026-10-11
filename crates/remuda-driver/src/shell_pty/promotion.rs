@@ -2396,23 +2396,47 @@ async fn finalize_hydrator(
         return;
     }
     let finish_faults = faults.cloned();
-    let collected = blocking_collect(Arc::clone(slot), Arc::clone(in_flight), move |hydrator| {
+    // c-ctxusage r8 item 3: the finish, the frame parking and the hydrator
+    // retirement are ONE blocking operation. Parking the returned Vec only
+    // after the await dropped the frames when close aborted the task during
+    // the await, and the abort guard's second finish_collect published nothing
+    // because the mapper's take_usage had already advanced. The closure now
+    // claims the hydrator (take + in-flight in the same critical section),
+    // finishes it, parks the frames and leaves the slot empty BEFORE clearing
+    // the flag; an aborted task leaves the detached closure to finish all of
+    // that, and the guard finds a retired slot instead of a half-finished one.
+    let parked = Arc::clone(pending);
+    let pinged = Arc::clone(notify);
+    let retire_slot = Arc::clone(slot);
+    let retire_in_flight = Arc::clone(in_flight);
+    let join = tokio::task::spawn_blocking(move || {
+        let claimed = {
+            let mut guard = slot_lock(&retire_slot);
+            match guard.take() {
+                Some(hydrator) => {
+                    retire_in_flight.store(true, Ordering::SeqCst);
+                    Some(hydrator)
+                }
+                None => None,
+            }
+        };
+        let Some(mut hydrator) = claimed else {
+            return;
+        };
         if let Some(faults) = &finish_faults {
             faults.cooperative_finish_entered();
         }
-        hydrator.finish_collect().map_err(std::io::Error::other)
-    })
-    .await
-    .unwrap_or_default();
-    // The finalise completed synchronously; park its frames for the streaming
-    // flusher and retire the hydrator — an epoch boundary must reopen fresh.
-    let mut guard = pending
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.extend(collected);
-    drop(guard);
-    notify.notify_one();
-    slot_lock(slot).take();
+        let frames = hydrator.finish_collect().unwrap_or_default();
+        if !frames.is_empty() {
+            parked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(frames);
+            pinged.notify_one();
+        }
+        retire_in_flight.store(false, Ordering::SeqCst);
+    });
+    let _ = join.await;
     let _ = (events, seq, ctx);
 }
 

@@ -187,6 +187,18 @@ async fn drain_fence(
     out
 }
 
+/// Assert a bounded wait FAILED with tokio's elapsed timeout (r11 item 5
+/// bound proofs). `T` needs no Debug: only the error is displayed.
+fn assert_elapsed<T>(r: Result<T, tokio::time::error::Elapsed>, what: &str) {
+    match r {
+        Err(error) => assert!(
+            error.to_string().contains("elapsed"),
+            "{what} failed with a non-elapsed error: {error}"
+        ),
+        Ok(_) => panic!("{what} did not time out — the bound did not fire"),
+    }
+}
+
 fn lifecycle_status(obs: &Observation) -> Option<&str> {
     match &obs.body {
         ObservationPayload::Lifecycle(payload) => match payload.as_ref() {
@@ -2637,6 +2649,172 @@ async fn aborting_inside_the_real_writer_window_keeps_the_accepted_turn_ordered_
         Some(("1", true)),
         "B settles, index 1"
     );
+
+    driver.close().await.expect("close");
+}
+
+/// ma-sdk-state r11 item 5 — bound proof, class SPAWNED-TASK JOIN.
+///
+/// A send parked forever at the pre-ack gate makes the bounded JoinHandle
+/// join (`timeout(..).expect("… within 5s")` at every `send_*` join site)
+/// fail Elapsed FAST with a named bound; without the wrap the binary hangs
+/// until the outer harness timeout. The gate is released only afterwards, so
+/// the parked send then completes cleanly and close reaps the child.
+#[tokio::test]
+async fn bound_proof_a_parked_spawned_task_join_fails_fast_with_a_named_bound() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let driver = std::sync::Arc::new(driver);
+    let handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Gate shut from write #1: the send parks pre-accept and never releases.
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.park_from_write(1);
+    let d = driver.clone();
+    let parked = tokio::spawn(async move { d.send(prompt("parked forever")).await });
+    barrier
+        .wait_until_write_parked(Duration::from_secs(5))
+        .await;
+
+    let joined = tokio::time::timeout(Duration::from_millis(300), parked).await;
+    assert_elapsed(joined, "the parked spawned-task join");
+
+    drop(barrier);
+    drop(handle);
+    let _ = driver.close().await;
+}
+
+/// ma-sdk-state r11 item 5 — bound proof, class BARRIER WAIT (internal
+/// deadline). A count that cannot be reached makes the helper panic FAST with
+/// its named deadline message; with the deadline removed the helper loops
+/// forever and the outer harness timeout kills the binary.
+#[tokio::test]
+async fn bound_proof_a_barrier_wait_fails_fast_with_its_named_deadline_message() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let driver = std::sync::Arc::new(driver);
+    let handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = driver.arm_write_commit_barrier();
+    // No reservation is ever enqueued, so count 99 is unreachable; the helper
+    // must panic AT its 300 ms internal deadline with the named message.
+    let waiter = tokio::spawn(async move {
+        barrier
+            .wait_until_reserves_enqueued(99, Duration::from_millis(300))
+            .await;
+    });
+    let join = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the barrier waiter finishes (panicking) within 5s");
+    let panic = join.expect_err("the internal deadline must panic, not return");
+    let payload = panic.into_panic();
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+        .unwrap_or("");
+    assert!(
+        message.contains("timed out waiting for 99 reservations"),
+        "named barrier deadline message: {message}"
+    );
+
+    drop(handle);
+    let _ = driver.close().await;
+}
+
+/// ma-sdk-state r11 item 5 — bound proof, class GATE WAIT IN SELECT.
+/// The real writer gate is closed but no write is ever issued, so
+/// `wait_until_parked` never resolves; the bound around it fails Elapsed FAST.
+#[tokio::test]
+async fn bound_proof_the_writer_gate_park_wait_fails_fast_when_no_write_arrives() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let gate = driver.write_window().await;
+    gate.close();
+    let parked = tokio::time::timeout(Duration::from_millis(300), gate.wait_until_parked()).await;
+    assert_elapsed(parked, "the writer gate wait_until_parked");
+
+    drop(handle);
+    let _ = driver.close().await;
+}
+
+/// ma-sdk-state r11 item 5 — bound proof, class MUTEX/FENCE ACQUISITION
+/// (r11 item 4d). With the publish mutex held by a parked task, both the
+/// mutex-hold helper and the fence enqueue fail their bounds Elapsed FAST.
+#[tokio::test]
+async fn bound_proof_contended_mutex_and_fence_acquisitions_fail_fast_with_named_bounds() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let driver = std::sync::Arc::new(driver);
+    let handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Holder acquires the publish mutex and parks; acknowledge acquisition so
+    // the contention is established, not hoped for.
+    let (acq_tx, acq_rx) = tokio::sync::oneshot::channel();
+    let d = driver.clone();
+    let holder = tokio::spawn(async move {
+        let _hold = d.hold_publish_mutex_for_test().await;
+        acq_tx
+            .send(())
+            .expect("acknowledge holder acquired the mutex");
+        std::future::pending::<()>().await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), acq_rx)
+        .await
+        .expect("holder acquisition within 5s")
+        .expect("oneshot");
+
+    let hold = tokio::time::timeout(
+        Duration::from_millis(300),
+        driver.hold_publish_mutex_for_test(),
+    )
+    .await;
+    assert_elapsed(hold, "the contended publish-mutex acquisition");
+    let fence = tokio::time::timeout(Duration::from_millis(300), driver.publication_fence()).await;
+    assert_elapsed(fence, "the contended fence acquisition");
+
+    holder.abort();
+    drop(handle);
+    let _ = driver.close().await;
+}
+
+/// ma-sdk-state r11 item 5 — bound proof, class OVERALL recv-NONE DRAIN
+/// (r11 item 4c). The one-turn fake exits naturally (so `exited` arrives), but
+/// close is WITHHELD, so recv never returns None. The drain-to-None wrapped in
+/// ONE overall timeout must fail Elapsed FAST with its named bound — a
+/// per-recv quiet loop would instead return silently and read "no tail" as
+/// EOF.
+#[tokio::test]
+async fn bound_proof_the_recv_none_drain_fails_fast_when_close_is_withheld() {
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_EXIT_WHEN_SCRIPT_DONE".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // One ordinary prompt: the one-turn fake answers and then exits naturally.
+    tokio::time::timeout(Duration::from_secs(5), driver.send(prompt("the only turn")))
+        .await
+        .expect("prompt send within 5s")
+        .expect("the prompt is written");
+
+    // The natural exited observation arrives (its own acknowledged wait).
+    let before = collect_until(&mut handle, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .any(|o| lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("exited"))
+    })
+    .await;
+    assert!(before.iter().any(|o| {
+        lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("exited")
+    }));
+
+    // close WITHHELD: the channel is never sealed, so this recv-until-None
+    // drain must hit its ONE overall bound rather than ending quietly.
+    let drain_to_none = async { while handle.recv().await.is_some() {} };
+    let drained = tokio::time::timeout(Duration::from_millis(300), drain_to_none).await;
+    assert_elapsed(drained, "the recv-None drain with close withheld");
 
     driver.close().await.expect("close");
 }

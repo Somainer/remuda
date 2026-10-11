@@ -759,10 +759,17 @@ pub enum BudgetStatus {
 /// - per-call (`turn`/`message`) rows therefore count for exactly the
 ///   instances not in the stock-eligible set.
 ///
+/// r7 item 4: pre-r6 databases hold BOTH a Message and a Turn row per priced
+/// codex call. The two are alternative billable streams for the SAME calls,
+/// not additive: when an instance has any Message rows, tokens and non-session
+/// cost come from Message rows ONLY; Turn rows are used only for instances (or
+/// calls) with no Message coverage.
+///
 /// `r5_` CTEs: `r5_scoped_instances` (instances with any scoped session
 /// row), `r5_eligible_stock` (newest point per scoped partition, plus the
 /// legacy NULL chain where no scoped row exists), `r5_stock_instances`
-/// (instances whose every newest point is priced). Pricing decisions are
+/// (instances whose every newest point is priced), `r7_message_instances`
+/// (instances with at least one message-scope row). Pricing decisions are
 /// precomputed once per statement; the flow subquery joins the CTEs rather
 /// than running a correlated NOT EXISTS per row.
 fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate: &str) -> String {
@@ -770,6 +777,10 @@ fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate:
         "WITH r5_scoped_instances AS (
             SELECT DISTINCT instance_id FROM usage_events
             WHERE {stock_predicate} AND scope = 'session' AND scope_id IS NOT NULL
+         ),
+         r7_message_instances AS (
+            SELECT DISTINCT instance_id FROM usage_events
+            WHERE {stock_predicate} AND scope = 'message'
          ),
          r5_eligible_stock AS (
             SELECT instance_id, scope_id, cost FROM (
@@ -805,9 +816,24 @@ fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate:
             SELECT instance_id FROM r5_stock_instances
          )
          SELECT COUNT(*),
-                COALESCE(SUM(total_tokens), 0),
-                COALESCE(SUM(input_tokens), 0),
-                COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(CASE
+                    WHEN scope = 'session' THEN total_tokens
+                    WHEN scope = 'message' THEN total_tokens
+                    WHEN instance_id NOT IN (SELECT instance_id FROM r7_message_instances)
+                         THEN total_tokens
+                END), 0),
+                COALESCE(SUM(CASE
+                    WHEN scope = 'session' THEN input_tokens
+                    WHEN scope = 'message' THEN input_tokens
+                    WHEN instance_id NOT IN (SELECT instance_id FROM r7_message_instances)
+                         THEN input_tokens
+                END), 0),
+                COALESCE(SUM(CASE
+                    WHEN scope = 'session' THEN output_tokens
+                    WHEN scope = 'message' THEN output_tokens
+                    WHEN instance_id NOT IN (SELECT instance_id FROM r7_message_instances)
+                         THEN output_tokens
+                END), 0),
                 (SELECT COALESCE(SUM(cost), 0.0) FROM r5_eligible_stock
                  WHERE instance_id IN (SELECT instance_id FROM r5_stock_instances))
                 +
@@ -815,7 +841,15 @@ fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate:
                  FROM usage_events flow
                  JOIN r5_flow_instances
                    ON r5_flow_instances.instance_id = flow.instance_id
-                 WHERE {flow_predicate} AND flow.scope != 'session')
+                 WHERE {flow_predicate}
+                   AND flow.scope != 'session'
+                   -- r7 item 4: message and turn are alternative streams.
+                   AND (
+                       flow.scope = 'message'
+                       OR flow.instance_id NOT IN (
+                           SELECT instance_id FROM r7_message_instances
+                       )
+                   ))
          FROM usage_events WHERE {outer_predicate}"
     )
 }
@@ -2017,6 +2051,109 @@ mod tests {
             None => json!({ "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] }),
         };
         rec
+    }
+
+    #[test]
+    fn pre_r6_dual_scope_rows_bill_once_from_message_stream() {
+        // c-usagefu r7 item 4: databases written BEFORE r6 hold BOTH a Message
+        // and a Turn row per priced codex call (the old adapter emitted both).
+        // Token sums must not double and the priced/unpriced/priced cost must
+        // be 0.30 (Message flow), not 0.60 (Message + Turn) and not frozen.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let project =
+            |seq: i64, scope: &str, scope_id: &str, turn_id: Option<&str>, cost: Option<&str>| {
+                let mut event = json!({
+                    "kind": "usage",
+                    "source": { "nativeTurnId": turn_id.map(|t| json!({
+                        "state": "known", "value": t })) },
+                    "payload": {
+                        "scope": scope,
+                        "scopeId": scope_id,
+                        "mode": "snapshot",
+                        "metricRevision": "1",
+                        "inputTokens": { "state": "known", "value": "0" },
+                        "outputTokens": { "state": "known", "value": "10000" },
+                        "cost": if let Some(amount) = cost {
+                            json!({ "state": "known",
+                                     "value": { "amount": amount, "currency": "USD" } })
+                        } else {
+                            json!({ "state": "unknown", "reason": "unpriced-model-or-no-usage",
+                                     "evidenceEventIds": [] })
+                        },
+                        "accounting": "estimated",
+                        "nativeAt": { "state": "known",
+                                       "value": "2026-09-15T00:00:00.000Z" },
+                    }
+                });
+                if turn_id.is_none() {
+                    event["source"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("nativeTurnId");
+                }
+                let rec = JournalRecord {
+                    instance_id: "ins_dual".into(),
+                    seq,
+                    event_id: format!("evt_dual_{seq}"),
+                    event,
+                    observed_at: "2026-09-15T00:00:00.000Z".into(),
+                };
+                project_usage_event(&rec, Some("pvp_dual"), Some("gpt-5.4")).unwrap()
+            };
+        let s1 = |seq: i64, revision: i64, cost: Option<&str>| {
+            let rec = tokenless_session_record_for("ins_dual", seq, "s1", revision, cost);
+            project_usage_event(&rec, Some("pvp_dual"), Some("gpt-5.4")).unwrap()
+        };
+        // Turn 1: Message r1 ($0.10) AND Turn t1 ($0.10).
+        let mut seq = 1i64;
+        insert_row(
+            &conn,
+            &project(seq, "message", "r1", Some("t1"), Some("0.10")),
+        )
+        .unwrap();
+        seq += 1;
+        insert_row(&conn, &project(seq, "turn", "t1", Some("t1"), Some("0.10"))).unwrap();
+        seq += 1;
+        // Session cumulative point priced $0.10.
+        insert_usage_event(&conn, &s1(seq, 1, Some("0.10"))).unwrap();
+        seq += 1;
+        // Turn 2 unpriced: Message + Turn both unknown cost; session NULL.
+        insert_row(&conn, &project(seq, "message", "r2", Some("t2"), None)).unwrap();
+        seq += 1;
+        insert_row(&conn, &project(seq, "turn", "t2", Some("t2"), None)).unwrap();
+        seq += 1;
+        insert_usage_event(&conn, &s1(seq, 2, None)).unwrap();
+        seq += 1;
+        // Turn 3 priced $0.20: Message + Turn + session.
+        insert_row(
+            &conn,
+            &project(seq, "message", "r3", Some("t3"), Some("0.20")),
+        )
+        .unwrap();
+        seq += 1;
+        insert_row(&conn, &project(seq, "turn", "t3", Some("t3"), Some("0.20"))).unwrap();
+        seq += 1;
+        insert_usage_event(&conn, &s1(seq, 3, None)).unwrap();
+
+        let instance = aggregate_instance(&conn, "ins_dual").unwrap();
+        assert!(
+            (instance.cost_usd - 0.30).abs() < 1e-9,
+            "dual-scope rows bill once (Message stream): 0.30, got {}",
+            instance.cost_usd
+        );
+        // Output tokens: 3 Message rows x 10000 = 30000, NOT 60000.
+        assert_eq!(
+            instance.output_tokens, 30_000,
+            "tokens are not doubled across Message+Turn"
+        );
+        let supply = aggregate_supply(&conn, "pvp_dual", "gpt-5.4").unwrap();
+        assert!(
+            (supply.cost_usd - 0.30).abs() < 1e-9,
+            "supply also unduplicated, got {}",
+            supply.cost_usd
+        );
+        assert_eq!(supply.output_tokens, 30_000);
     }
 
     #[test]

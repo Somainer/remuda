@@ -598,6 +598,11 @@ pub struct Inner {
     /// with `fail_from_write`.
     #[cfg(feature = "test-stub")]
     write_number: std::sync::atomic::AtomicUsize,
+    /// r11 item 3 (test-stub): make the Reserve ticket send fail WITHOUT a
+    /// closed channel, driving prepare_prompt_write into fail_without_ticket
+    /// deterministically while the live child stays up.
+    #[cfg(feature = "test-stub")]
+    reserve_send_fails: std::sync::atomic::AtomicBool,
 }
 
 /// Native Claude print driver (`claude -p` stream-json).
@@ -632,6 +637,14 @@ pub struct PublishMutexHold<'a>(
 #[must_use = "holding the guard is the point; drop it to release the lock"]
 #[allow(dead_code)]
 pub struct WriteSeqHold<'a>(tokio::sync::MutexGuard<'a, ()>);
+
+/// Test-only (`test-stub`): held mapper-lock guard (r11 item 3). The field
+/// exists solely to keep the mapper lock held so a no-ticket rollback parks
+/// on it while a test aborts the cancelling caller.
+#[cfg(feature = "test-stub")]
+#[must_use = "holding the guard is the point; drop it to release the lock"]
+#[allow(dead_code)]
+pub struct MapperMutexHold<'a>(tokio::sync::MutexGuard<'a, Mapper>);
 
 impl ClaudePrintDriver {
     /// Test-only (`test-stub`): true when the bounded observation channel is
@@ -698,6 +711,28 @@ impl ClaudePrintDriver {
         WriteSeqHold(self.inner.write_seq.lock().await)
     }
 
+    /// Test-only (`test-stub`, r11 item 3): hold the mapper lock directly, so a
+    /// fail_without_ticket rollback parks deterministically on its lock await
+    /// and a test can abort the caller there. Drop the hold to release.
+    #[cfg(feature = "test-stub")]
+    pub async fn hold_mapper_for_test(&self) -> MapperMutexHold<'_> {
+        MapperMutexHold(self.inner.mapper.lock().await)
+    }
+
+    /// Test-only (`test-stub`, r11 item 3): the seqs of the turns the mapper
+    /// book currently holds outstanding. A cleanup that orphaned a reservation
+    /// leaves its turn here forever.
+    #[cfg(feature = "test-stub")]
+    pub async fn outstanding_turn_seqs_for_test(&self) -> Vec<u64> {
+        let mapper = self.inner.mapper.lock().await;
+        mapper
+            .turns
+            .outstanding
+            .iter()
+            .map(|turn| turn.seq)
+            .collect()
+    }
+
     /// Test-only (`test-stub`, r10 item 3): wait until `n` Result frames have
     /// been mapped by the publication worker, using the armed barrier slot
     /// directly (for spawned tasks that do not own the [`WriteCommitBarrier`]).
@@ -724,6 +759,17 @@ impl ClaudePrintDriver {
         self.inner
             .fail_from_write
             .store(n, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only (`test-stub`, r11 item 3): make the NEXT reservation's ticket
+    /// send fail while the publisher stays open, driving fail_without_ticket
+    /// against a live child. The just-opened book entry must be rolled back
+    /// even if the caller is aborted while that rollback waits on the mapper.
+    #[cfg(feature = "test-stub")]
+    pub fn force_reserve_send_failure_for_test(&self) {
+        self.inner
+            .reserve_send_fails
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Test-only (`test-stub`): a Weak to this driver's [`Inner`], so a test can
@@ -802,6 +848,8 @@ impl ClaudePrintDriver {
                 fail_from_write: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 #[cfg(feature = "test-stub")]
                 write_number: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(feature = "test-stub")]
+                reserve_send_fails: std::sync::atomic::AtomicBool::new(false),
             }),
             reader: Mutex::new(None),
             publisher: Mutex::new(None),
@@ -1507,7 +1555,7 @@ async fn prepare_prompt_write(
     // this section.
     #[cfg(feature = "test-stub")]
     test_barrier::note_publish_lock_wait(&inner.barrier);
-    let mut admission = inner.publish.lock().await;
+    let admission = inner.publish.lock().await;
     if inner.closed.load(Ordering::SeqCst) {
         return Err(DriverError::ControlUnavailable);
     }
@@ -1530,13 +1578,32 @@ async fn prepare_prompt_write(
     // move into the detached completion task.
     let mut guard = Some(ReservationGuard::new(inner.clone(), reservation.clone()));
 
-    let send_failed = admission
-        .as_ref()
-        .expect("admission checked above")
-        .send(PublishJob::Reserve {
-            reservation: reservation.clone(),
-        })
-        .is_err();
+    // test-stub (r11 item 3): force the ticket send to fail with the channel
+    // still open, driving fail_without_ticket against a live, well child.
+    #[cfg(feature = "test-stub")]
+    let force_send_failure = inner.reserve_send_fails.load(Ordering::Acquire);
+    let send_failed = {
+        #[cfg(feature = "test-stub")]
+        if force_send_failure {
+            true
+        } else {
+            admission
+                .as_ref()
+                .expect("admission checked above")
+                .send(PublishJob::Reserve {
+                    reservation: reservation.clone(),
+                })
+                .is_err()
+        }
+        #[cfg(not(feature = "test-stub"))]
+        admission
+            .as_ref()
+            .expect("admission checked above")
+            .send(PublishJob::Reserve {
+                reservation: reservation.clone(),
+            })
+            .is_err()
+    };
     // Admission is decided: release the gate before the (mapper-locked)
     // rollback so a sealed/closed channel never parks the EOF sealer or close
     // behind this caller's cleanup. The ticket was never inserted, so ordering
@@ -1667,7 +1734,7 @@ async fn map_loop(
     // EOF in publication order, or the reservation is rejected having opened
     // nothing. `closed` is set here, not only by explicit close: a prompt sent
     // after the child's natural exit can never start a turn.
-    let mut gate = inner.publish.lock().await;
+    let gate = inner.publish.lock().await;
     inner.closed.store(true, Ordering::SeqCst);
     if let Some(publisher) = gate.as_ref() {
         let _ = publisher.send(PublishJob::StdoutEof);
@@ -1831,6 +1898,11 @@ async fn rollback_reservation_at_ticket(inner: &Arc<Inner>, seq: u64) -> DriverR
 /// Does NOT take `write_seq`: a caller can drop the guard while still parked
 /// on `write_seq` itself, so re-acquiring it here could deadlock.
 async fn rollback_without_ticket(inner: &Arc<Inner>, seq: u64) {
+    // test-stub (r11 item 3): acknowledge a caller parked on the mapper lock
+    // inside this rollback, so a test can abort it there and prove the
+    // reservation is still cleaned up.
+    #[cfg(feature = "test-stub")]
+    test_barrier::note_rollback_without_ticket_wait(&inner.barrier);
     let released = {
         let mut mapper = inner.mapper.lock().await;
         match mapper.cancel_turn_reservation(seq) {
@@ -1844,6 +1916,8 @@ async fn rollback_without_ticket(inner: &Arc<Inner>, seq: u64) {
     if released.is_some() {
         debug!("publication gone; released deferred settle dropped on close");
     }
+    #[cfg(feature = "test-stub")]
+    test_barrier::note_rollback_without_ticket_done(&inner.barrier);
 }
 
 /// Owns one turn's [`TurnReservation`] for the lifetime of a prompt write
@@ -1898,9 +1972,21 @@ impl ReservationGuard {
     /// The Reserve send failed (publisher closed) — no ticket exists for the
     /// just-opened book entry, so roll it back directly and discard any
     /// released settle. Consumes the guard.
+    ///
+    /// ma-sdk-state r11 item 3: `resolved` is marked ONLY after the rollback
+    /// completes, never before its mapper-lock await. A caller cancelled while
+    /// parked on that lock drops this guard with `resolved == false`, so the
+    /// `Drop` no-ticket cleanup stays armed across the await and hands the
+    /// rollback to a cancellation-independent detached task; marking resolved
+    /// first made that Drop a no-op and orphaned the open book entry.
     async fn fail_without_ticket(mut self) {
-        self.resolved = true;
+        // test-stub: park here, just before the rollback, so a test can hold
+        // the mapper lock and deterministically abort the caller inside the
+        // rollback's lock wait. Open by default; no-op without an armed barrier.
+        #[cfg(feature = "test-stub")]
+        test_barrier::hold_before_rollback_without_ticket(&self.inner.barrier).await;
         rollback_without_ticket(&self.inner, self.reservation.seq).await;
+        self.resolved = true;
         self.reservation.cancel();
     }
 }
@@ -2017,6 +2103,19 @@ pub mod test_barrier {
         /// section. A send attempted only after this is set must lose the
         /// admission race deterministically.
         stdout_eof_queued: AtomicBool,
+        /// r11 item 3: a fail_without_ticket caller reached the rollback (set
+        /// right before its mapper-lock await). With the mapper externally
+        /// held, count n acknowledges n callers parked in that wait.
+        rollback_wait_count: AtomicUsize,
+        /// r11 item 3: a rollback_without_ticket completed (book rolled back),
+        /// including one spawned by the cancellation-independent Drop cleanup.
+        rollback_done_count: AtomicUsize,
+        /// r11 item 3: fail_without_ticket parks here BEFORE its rollback while
+        /// the gate is shut, so a test can first grab the mapper lock and then
+        /// release the caller INTO the contended mapper-lock wait.
+        rollback_parked: AtomicBool,
+        rollback_gate_open: AtomicBool,
+        rollback_gate: tokio::sync::Notify,
     }
 
     /// An armed write-commit barrier. Releases on drop.
@@ -2051,6 +2150,11 @@ pub mod test_barrier {
             cancelled_gate_open: AtomicBool::new(true),
             cancelled_gate: tokio::sync::Notify::new(),
             stdout_eof_queued: AtomicBool::new(false),
+            rollback_wait_count: AtomicUsize::new(0),
+            rollback_done_count: AtomicUsize::new(0),
+            rollback_parked: AtomicBool::new(false),
+            rollback_gate_open: AtomicBool::new(true),
+            rollback_gate: tokio::sync::Notify::new(),
         });
         *slot.lock().expect("barrier lock") = Some(state.clone());
         WriteCommitBarrier { state }
@@ -2149,6 +2253,39 @@ pub mod test_barrier {
         if let Some(state) = current(slot) {
             state.stdout_eof_queued.store(true, Ordering::Release);
         }
+    }
+
+    /// r11 item 3 hook: fail_without_ticket reached its rollback and is about
+    /// to await the mapper lock.
+    pub(super) fn note_rollback_without_ticket_wait(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state.rollback_wait_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// r11 item 3 hook: a rollback_without_ticket call finished rolling the
+    /// book back (fired after the mapper-lock critical section).
+    pub(super) fn note_rollback_without_ticket_done(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state.rollback_done_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// r11 item 3 gate: park fail_without_ticket immediately BEFORE its
+    /// rollback while the test gate is shut (open by default).
+    pub(super) async fn hold_before_rollback_without_ticket(slot: &Slot) {
+        let Some(state) = current(slot) else {
+            return;
+        };
+        state.rollback_parked.store(true, Ordering::Release);
+        if state.rollback_gate_open.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = state.rollback_gate.notified();
+        if state.rollback_gate_open.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
     }
 
     /// r8 item 3 worker hook: a Result frame has been mapped by the worker.
@@ -2307,6 +2444,75 @@ pub mod test_barrier {
             }
         }
 
+        /// r11 item 3: SHUT the pre-rollback gate so fail_without_ticket parks
+        /// after the forced send failure but BEFORE its mapper-lock rollback.
+        pub fn hold_rollback_without_ticket(&self) {
+            self.state
+                .rollback_gate_open
+                .store(false, Ordering::Release);
+        }
+
+        /// r11 item 3: release a caller parked before its rollback.
+        pub fn release_rollback_without_ticket(&self) {
+            if !self.state.rollback_gate_open.swap(true, Ordering::AcqRel) {
+                self.state.rollback_gate.notify_waiters();
+            }
+        }
+
+        /// r11 item 3: wait until a fail_without_ticket caller is parked at the
+        /// pre-rollback gate.
+        pub async fn wait_until_rollback_parked(&self, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.rollback_parked.load(Ordering::Acquire) {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("write_commit barrier: timed out waiting for the rollback park");
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// r11 item 3: wait until `n` callers reached the rollback's
+        /// mapper-lock await (the nth is parked on it while the test holds the
+        /// mapper).
+        pub async fn wait_until_rollback_lock_waits(&self, n: usize, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.rollback_wait_count.load(Ordering::Acquire) >= n {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "write_commit barrier: timed out waiting for {n} rollback lock waits \
+                         (reached={})",
+                        self.state.rollback_wait_count.load(Ordering::Acquire)
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// r11 item 3: wait until `n` no-ticket rollbacks have COMPLETED,
+        /// including one the cancellation-independent Drop cleanup detached.
+        pub async fn wait_until_rollbacks_done(&self, n: usize, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.rollback_done_count.load(Ordering::Acquire) >= n {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "write_commit barrier: timed out waiting for {n} rollbacks to complete \
+                         (done={})",
+                        self.state.rollback_done_count.load(Ordering::Acquire)
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
         /// r8 item 3: wait until `n` Result frames have been MAPPED by the
         /// publication worker (after the mapper lock, before/with emit).
         pub async fn wait_until_results_mapped(&self, n: usize, timeout: Duration) {
@@ -2453,6 +2659,7 @@ pub mod test_barrier {
             self.release_send();
             self.resume_worker();
             self.release_cancelled_ticket();
+            self.release_rollback_without_ticket();
         }
     }
 

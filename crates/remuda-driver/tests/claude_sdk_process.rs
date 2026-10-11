@@ -2345,6 +2345,58 @@ async fn natural_stdout_eof_seals_reservation_admission_and_emits_nothing_after_
     let _ = driver.close().await;
 }
 
+/// ma-sdk-state r11 item 3: fail_without_ticket used to mark the guard
+/// resolved BEFORE awaiting its rollback, so a caller aborted while parked on
+/// the mapper lock left the just-opened reservation orphaned. Resolved is now
+/// set only after the rollback completes: Drop stays armed across the await
+/// and hands the rollback to a cancellation-independent detached task.
+#[tokio::test]
+async fn aborting_during_fail_without_ticket_rollback_does_not_orphan_the_reservation() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let driver = std::sync::Arc::new(driver);
+    let handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = driver.arm_write_commit_barrier();
+    // Park B before its rollback, and force its Reserve ticket send to fail
+    // (publisher stays open; the live child is untouched).
+    barrier.hold_rollback_without_ticket();
+    driver.force_reserve_send_failure_for_test();
+
+    let db = driver.clone();
+    let send_b = tokio::spawn(async move { db.send(prompt("orphan check")).await });
+    barrier
+        .wait_until_rollback_parked(Duration::from_secs(5))
+        .await;
+
+    // Hold the mapper, then release B INTO the rollback: it parks on the
+    // mapper-lock wait. ACKNOWLEDGE that exact wait before aborting B.
+    let mapper_hold = driver.hold_mapper_for_test().await;
+    barrier.release_rollback_without_ticket();
+    barrier
+        .wait_until_rollback_lock_waits(1, Duration::from_secs(5))
+        .await;
+
+    // Cancel B WHILE it waits on the mapper lock. The fixed guard is still
+    // unresolved, so its Drop detaches the rollback instead of no-opping.
+    send_b.abort();
+    drop(mapper_hold);
+
+    // The cancellation-independent cleanup finishes the rollback: after the
+    // fence, no outstanding turn remains (the old code leaked B forever).
+    barrier
+        .wait_until_rollbacks_done(1, Duration::from_secs(5))
+        .await;
+    assert!(
+        driver.outstanding_turn_seqs_for_test().await.is_empty(),
+        "the aborted caller's reservation is rolled back, not orphaned"
+    );
+
+    drop(barrier);
+    drop(handle);
+    let _ = driver.close().await;
+}
+
 /// deferredSettle marker (None = ordinary settlement, Some("true") = deferred
 /// correction); returns None for non-settled results. Use this to count ALL
 /// settledRootTurn observations and inspect the deferred flag.

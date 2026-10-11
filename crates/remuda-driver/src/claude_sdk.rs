@@ -132,6 +132,25 @@ impl ClaudeSdkDriver {
     pub async fn test_wait_results_mapped(&self, n: usize, timeout: std::time::Duration) {
         self.inner.test_wait_results_mapped(n, timeout).await;
     }
+
+    /// Test-only (`test-stub`, r11 item 3): force the next Reserve ticket send
+    /// to fail while the publisher stays open (drives fail_without_ticket).
+    #[cfg(feature = "test-stub")]
+    pub fn force_reserve_send_failure_for_test(&self) {
+        self.inner.force_reserve_send_failure_for_test();
+    }
+
+    /// Test-only (`test-stub`, r11 item 3): hold the mapper lock.
+    #[cfg(feature = "test-stub")]
+    pub async fn hold_mapper_for_test(&self) -> crate::claude_print::MapperMutexHold<'_> {
+        self.inner.hold_mapper_for_test().await
+    }
+
+    /// Test-only (`test-stub`, r11 item 3): outstanding turn seqs in the book.
+    #[cfg(feature = "test-stub")]
+    pub async fn outstanding_turn_seqs_for_test(&self) -> Vec<u64> {
+        self.inner.outstanding_turn_seqs_for_test().await
+    }
 }
 
 #[async_trait]

@@ -807,6 +807,29 @@ it("a replaced request's late HTTP SUCCESS does not overwrite the newer choice",
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
 });
 
+it("a null baseline with no queued stamp: only a matching value settles the cold request", async () => {
+  const ctx = await startFollowing("null-threshold");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // No effective state exists yet (baseline null, queued stamp not yet seen).
+  // Cold flag-ON request at the default high tier.
+  await hubStore.setUltracode(ctx.instance.id, true);
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.baselineObservedAt).toBeNull();
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queuedObservedAt).toBeNull();
+
+  // A terminal-side observation reporting the flag OFF is someone/something
+  // else's state, not our request — even with no time stamps it must settle
+  // nothing (matching tier alone never confirms the flag, r10 item 2).
+  ctx.receive(effortEvent(2, "high", false, "slash"));
+  const pending = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pending).not.toBeNull();
+  expect(pending?.flagSettled).toBe(false);
+
+  // A matching positive ON read-back settles the flag.
+  ctx.receive(effortEvent(3, "high", true, "remuda"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+
 it("a degraded lifecycle for replaced request A never reverts/clears request B", async () => {
   const ctx = await startFollowing("degraded-after-replace");
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
@@ -1946,5 +1969,57 @@ it("r10 item 1: an unchanged older poll cannot settle a queued ON (baseline and 
     items: [{ ...ctx.instance, effortEffective: { name: "high", ultracode: true, source: "remuda", observedAt: t2 } }],
   } as never);
   await hubStore.refresh();
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+it("r10 item 2: request A OFF's executing read-back (echo id A) vetoes queued request B ON", async () => {
+  const ctx = await startFollowing("r10-item2", { state: "known", value: "working" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+
+  // Observed baseline: high with the flag ON.
+  ctx.receive(effortEvent(2, "high", true, "slash", "2026-10-02T00:00:00.000Z"));
+
+  // A flips OFF, then before it runs B flips ON again.
+  const a = hubStore.setUltracode(ctx.instance.id, false);
+  const idA = posts[0]?.requestId;
+  const b = hubStore.setUltracode(ctx.instance.id, true);
+  const idB = posts[1]?.requestId;
+  expect(idA).toBeTruthy();
+  expect(idB).toBeTruthy();
+  expect(idA).not.toBe(idB);
+  await Promise.all([a, b]);
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idB);
+
+  // A's queued/applied edges (id A) arrive late: dropped, B untouched.
+  ctx.receive(configureLifecycleFor(3, "effort-queued:ultracode off", idA!, ctx.instance.id, "2026-10-02T00:01:00.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idB);
+  ctx.receive(configureLifecycleFor(4, "effort-applied:ultracode off", idA!, ctx.instance.id, "2026-10-02T00:01:05.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idB);
+
+  // A EXECUTES: its read-back echoes request id A with the flag now OFF.
+  // Matching tier ("high") must never confirm B's flag operation.
+  ctx.receive(
+    effortEvent(5, "high", false, "remuda", "2026-10-02T00:01:10.000Z", {
+      requested: { name: "high", ultracode: false },
+      requestId: idA,
+    }),
+  );
+  const pendingAfterA = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pendingAfterA?.requestId).toBe(idB);
+  expect(pendingAfterA?.flagSettled).toBe(false);
+  expect(hubStore.effortOf(ctx.instance.id, "claude").ultracode).toBe(true);
+
+  // B's own ON read-back settles.
+  ctx.receive(
+    effortEvent(6, "high", true, "remuda", "2026-10-02T00:02:00.000Z", {
+      requested: { name: "high", ultracode: true },
+      requestId: idB,
+    }),
+  );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });

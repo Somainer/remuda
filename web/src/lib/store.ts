@@ -1059,15 +1059,21 @@ class HubStore {
     // Rule 1: a verdict that explicitly names ANOTHER request is never ours.
     const namesOtherRequest = echoId !== null && echoId !== pending.requestId;
     const echoNamesThisRequest = echoId !== null && echoId === pending.requestId;
-    // (r10 item 2 later tightens this: an explicit mismatch on a moved axis
-    // vetoes settlement even when the tier name happens to match.)
+    // Rule 2: an id-less legacy echo confirms this request only when it
+    // EXPLICITLY names every axis the request moves with the matching value.
+    // Matching the tier alone can never confirm a flag operation, and a
+    // mismatching echo (A OFF arriving over queued B ON) is a veto even though
+    // its tier happens to match.
     const movesBothEcho = pending.commandWord === "ultracode";
     const echoMovesLevel = movesBothEcho || pending.axis !== "flag";
     const echoMovesFlag = movesBothEcho || pending.axis === "flag";
     const echoLevelMatch =
       !echoMovesLevel ||
       (requestedEcho?.name !== undefined && requestedEcho.name === pending.name);
-    const echoFlagMatch = !echoMovesFlag || requestedEcho?.ultracode !== undefined;
+    const echoFlagMatch =
+      !echoMovesFlag ||
+      (requestedEcho?.ultracode !== undefined &&
+        requestedEcho.ultracode === pending.ultracode);
     const legacyEchoMatches =
       echoId === null && requestedEcho !== undefined && echoLevelMatch && echoFlagMatch;
 
@@ -1110,7 +1116,8 @@ class HubStore {
       // A definitive flag value from our own verdict settles (an opposite
       // value is the delivered refusal); the fallback needs an exact match.
       const definitive = effortFlagSettles(view.ultracode);
-      if (movesFlag && definitive && (authoritativeEcho || inWindow)) {
+      const flagMatches = view.ultracode === pending.ultracode;
+      if (movesFlag && definitive && (authoritativeEcho || flagMatches)) {
         flagSettled = true;
       }
     }

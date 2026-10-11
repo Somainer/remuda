@@ -78,8 +78,6 @@ pub struct CodexAdapter {
     started_turns: HashSet<String>,
     /// Turns already announced as ended (complete or aborted).
     ended_turns: HashSet<String>,
-    /// Per-turn usage snapshot revisions (§5.5: snapshot replaces).
-    usage_revisions: HashMap<String, u64>,
     session_usage_revision: u64,
     /// Additive usage extractor + aggregator (refuses cumulative snapshots).
     usage: CodexUsage,
@@ -120,7 +118,6 @@ impl CodexAdapter {
             results: HashSet::new(),
             started_turns: HashSet::new(),
             ended_turns: HashSet::new(),
-            usage_revisions: HashMap::new(),
             session_usage_revision: 0,
             usage: CodexUsage::new(),
             usage_totals: UsageAggregator::new(),
@@ -625,23 +622,17 @@ impl CodexAdapter {
             }
         }
         out.push(AdapterObservation::structured(turn_lifecycle(name, "idle")).with_turn(turn_id));
-        // Per-turn usage snapshot (replaces prior revisions for the turn).
-        if let Some(totals) = self.usage_totals.turn(turn_id)
-            && totals.events > 0
-        {
-            let revision = {
-                let entry = self.usage_revisions.entry(turn_id.to_owned()).or_insert(0);
-                *entry += 1;
-                *entry
-            };
-            let payload = to_usage_payload(UsageScope::Turn, turn_id.to_owned(), revision, totals);
-            out.push(
-                AdapterObservation::structured(ObservationPayload::Usage(Box::new(payload)))
-                    .with_turn(turn_id)
-                    .with_native_at(native_at.clone()),
-            );
-        }
-        // Session snapshot each turn end as well (monotonic revision).
+        // c-usagefu r6 item 5: codex emits each priced call as a Message
+        // usage observation (on_record, see on_line). It must NOT also emit a
+        // Turn snapshot of the same totals: the Hub cost rollup treats Message
+        // and Turn rows as two billable streams and would double-count
+        // (0.10 + 0.20 read as 0.60 on priced/unpriced/priced turns). The
+        // composer context basket does not need the Turn row — its turn
+        // coverage rule already falls back to Message-scope sums when no Turn
+        // rows exist.
+        //
+        // Session snapshot at turn end (cumulative; cost semantics decided by
+        // the Hub rollup).
         self.session_usage_revision += 1;
         let payload = to_usage_payload(
             UsageScope::Session,

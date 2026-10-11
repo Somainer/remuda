@@ -241,47 +241,38 @@ fn usage_events_produce_turn_and_session_snapshots_at_turn_end() {
         .iter()
         .filter(|o| matches!(o.payload, ObservationPayload::Usage(_)))
         .collect();
-    // c-usagefu (b): one per-response Message snapshot, then the end-of-turn
-    // Turn snapshot and the cumulative Session snapshot.
-    assert_eq!(usages.len(), 3);
+    // c-usagefu r6 item 5: codex emits ONE billable stream — the per-response
+    // Message snapshot — followed by the cumulative Session snapshot. The
+    // Turn snapshot was removed because the Hub summed Message and Turn as
+    // two billable streams and double-counted priced/unpriced/priced turns.
+    assert_eq!(usages.len(), 2);
     let message = match &usages[0].payload {
         ObservationPayload::Usage(usage) => usage,
         _ => unreachable!(),
     };
-    let turn = match &usages[1].payload {
-        ObservationPayload::Usage(usage) => usage,
-        _ => unreachable!(),
-    };
-    let session = match &usages[2].payload {
+    let session = match &usages[1].payload {
         ObservationPayload::Usage(usage) => usage,
         _ => unreachable!(),
     };
     assert_eq!(message.scope, remuda_protocol::UsageScope::Message);
-    assert_eq!(turn.scope, remuda_protocol::UsageScope::Turn);
     assert_eq!(session.scope, remuda_protocol::UsageScope::Session);
     // The Message row is keyed on the native response id.
     assert_eq!(message.scope_id, "r1");
-    // Turn and Session rows carry the per-turn / cumulative counters; the
-    // per-request Message row is the context basket source.
-    assert_eq!(turn.scope_id, "t1");
-    // c-ctxusage r5 item 7: the Turn/Session rows carry the rollout record's
-    // own timestamp, so a byte-0 replay is historical evidence, not
+    // c-ctxusage r5 item 7: the Session row carries the rollout record's own
+    // timestamp, so a byte-0 replay is historical evidence, not
     // ingest-time throughput. The task_complete record stamps ...:45.380Z.
-    for observation in &usages[1..] {
-        let value = observation
-            .native_at
-            .as_ref()
-            .expect("usage carries the rollout record timestamp");
-        assert_eq!(
-            String::from(value.clone()),
-            "2026-09-13T18:21:45.380Z",
-            "native_at is the task_complete record time"
-        );
-    }
-    // Both estimated; cumulative token_count did not double the tokens.
-    for payload in [turn, session] {
-        assert_eq!(payload.accounting, remuda_protocol::Accounting::Estimated);
-    }
+    assert_eq!(
+        String::from(
+            usages[1]
+                .native_at
+                .as_ref()
+                .expect("usage carries native_at")
+                .clone()
+        ),
+        "2026-09-13T18:21:45.380Z",
+        "native_at is the task_complete record time"
+    );
+    assert_eq!(session.accounting, remuda_protocol::Accounting::Estimated);
     // Total spans every bucket: 90 uncached input + 10 cache read + 20 output
     // (the same definition usage::tests locks in).
     assert_eq!(

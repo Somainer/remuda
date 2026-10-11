@@ -1534,6 +1534,7 @@ pub async fn observe_journal(state: &AppState, record: &JournalRecord) {
 mod tests {
     use super::*;
     use crate::store::JournalRecord;
+    use remuda_driver::adapters::FileSignalAdapter;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -1778,6 +1779,140 @@ mod tests {
         );
         let agg = aggregate_instance(&conn, "ins_test").unwrap();
         assert!((agg.cost_usd - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn real_codex_adapter_priced_unpriced_priced_bills_0_30_not_0_60() {
+        // c-usagefu r6 item 5: drive a REAL CodexAdapter over a rollout file
+        // (one Message usage per priced call + cumulative Session snapshots,
+        // NO Turn rows since r6 item 5), project every usage observation, then
+        // assert both aggregates report the Message flow sum 0.10 + 0.20 =
+        // 0.30 — not the r4 double-stream 0.60 (Message+Turn), nor frozen 0.10.
+        use remuda_driver::adapters::{AdapterHome, CodexAdapter};
+        use remuda_protocol::ObservationPayload;
+        use std::io::Write;
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let session_dir = home_dir.path().join(".codex/sessions/2026/09/15");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let rollout = session_dir.join("rollout-codex-e2e.jsonl");
+        // Header first.
+        std::fs::write(
+            &rollout,
+            r#"{"ordinal":0,"type":"session_meta","payload":{"id":"codex-e2e","session_id":"codex-e2e","cwd":"/w","timestamp":"2026-09-15T00:00:00.000Z"}}
+"#,
+        )
+        .unwrap();
+
+        let mut adapter = CodexAdapter::new(AdapterHome {
+            home: home_dir.path().join(".codex"),
+            cwd: "/w".into(),
+            pid: None,
+            launched_at: None,
+        });
+        adapter.bind_rollout("codex-e2e", rollout.clone());
+
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let mut seq = 0i64;
+        let drain = |adapter: &mut CodexAdapter, conn: &Connection, seq: &mut i64| {
+            for observed in adapter.poll().unwrap() {
+                let ObservationPayload::Usage(payload) = observed.payload else {
+                    continue;
+                };
+                let rec = JournalRecord {
+                    instance_id: "ins_codex_e2e".into(),
+                    seq: *seq,
+                    event_id: format!("evt_codex_e2e_{}", *seq),
+                    event: json!({
+                        "kind": "usage",
+                        "payload": serde_json::to_value(&payload).unwrap(),
+                    }),
+                    observed_at: "2026-09-15T00:00:00.000Z".into(),
+                };
+                let row = project_usage_event(&rec, Some("pvp_codex"), Some("gpt-5.4")).unwrap();
+                insert_row(conn, &row).expect("codex usage row projects");
+                *seq += 1;
+            }
+        };
+
+        let append_turn = |turn: &str,
+                           response: &str,
+                           model: &str,
+                           tokens: (u64, u64, u64, u64),
+                           at: &str| {
+            let (input, cached, write, output) = tokens;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&rollout)
+                .unwrap();
+            writeln!(
+                file,
+                "{{\"ordinal\":1,\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"{turn}\",\"model\":\"{model}\"}}}}"
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "{{\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"{turn}\"}}}}"
+            )
+            .unwrap();
+            {
+                let total = input + cached + write + output;
+                writeln!(
+                    file,
+                    "{{\"ordinal\":3,\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"{turn}\",\"response_id\":\"{response}\",\"usage\":{{\"input_tokens\":{input},\"cached_input_tokens\":{cached},\"cache_write_input_tokens\":{write},\"output_tokens\":{output},\"reasoning_output_tokens\":0,\"total_tokens\":{total}}}}}}}"
+                )
+                .unwrap();
+            }
+            writeln!(
+                file,
+                "{{\"ordinal\":4,\"timestamp\":\"{at}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"{turn}\"}}}}"
+            )
+            .unwrap();
+        };
+
+        // Turn 1: priced gpt-5.4 (1000 in / 100 out).
+        append_turn(
+            "t1",
+            "r1",
+            "gpt-5.4",
+            (0, 0, 0, 10_000),
+            "2026-09-15T00:00:01.000Z",
+        );
+        drain(&mut adapter, &conn, &mut seq);
+
+        // Turn 2: unknown model -> sticky-Unknown priced cost.
+        append_turn(
+            "t2",
+            "r2",
+            "some-internal-model",
+            (1000, 0, 0, 100),
+            "2026-09-15T00:00:02.000Z",
+        );
+        drain(&mut adapter, &conn, &mut seq);
+
+        // Turn 3: priced again (2000 in / 200 out).
+        append_turn(
+            "t3",
+            "r3",
+            "gpt-5.4",
+            (0, 0, 0, 20_000),
+            "2026-09-15T00:00:03.000Z",
+        );
+        drain(&mut adapter, &conn, &mut seq);
+
+        let instance = aggregate_instance(&conn, "ins_codex_e2e").unwrap();
+        assert!(
+            (instance.cost_usd - 0.30).abs() < 1e-9,
+            "real codex Message-stream sequence: 0.10 + 0.20 = 0.30, got {}",
+            instance.cost_usd
+        );
+        let supply = aggregate_supply(&conn, "pvp_codex", "gpt-5.4").unwrap();
+        assert!(
+            (supply.cost_usd - 0.30).abs() < 1e-9,
+            "supply matches the flow bill, got {}",
+            supply.cost_usd
+        );
     }
 
     #[test]

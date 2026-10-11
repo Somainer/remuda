@@ -881,6 +881,15 @@ class HubStore {
   private journals = new Map<Id, JournalClient>();
   private subs = new Map<Id, Id>();
   /**
+   * c-effortread r9 e2e seam only: instanceId → resolvers notified once the
+   * follow socket has delivered at least one contiguous live batch PAST the
+   * bounded seed cursor (so a configure posted afterwards cannot be absorbed
+   * into the snapshot as replay). Populated solely by
+   * `waitForFollowCaughtUpForTest`, which no-ops unless the e2e marker is set.
+   */
+  private followCaughtUp = new Map<Id, Set<(seq: string) => void>>();
+  private followCaughtUpSeq = new Map<Id, string>();
+  /**
    * §9.1: instanceId → effective `observedAt` of a push-down the durable Hub
    * projection settled before its live follow frame arrived. The matching live
    * observation must STILL be treated as our own push-down (leave the slider
@@ -2647,12 +2656,15 @@ class HubStore {
         stopPoll: () => void;
         settlementCount: () => number;
         interactionState: (id: string) => string | undefined;
+        waitFollowCaughtUp: (id: string, timeoutMs?: number) => Promise<string>;
       };
     }).__remudaHub = {
       stopPoll: () => this.stopPoll(),
       settlementCount: () => this.settlementCount,
       interactionState: (id: string) =>
         this.state.interactions.find((row) => row.id === id)?.state,
+      waitFollowCaughtUp: (id: string, timeoutMs?: number) =>
+        this.waitForFollowCaughtUpForTest(id, timeoutMs),
     };
   }
 
@@ -3240,6 +3252,14 @@ class HubStore {
       // client's existing window floor.
       const seedHistory = seedFloor ?? (sub.windowFromSeq === null ? null : sub.snapshot.history);
       if (seedHistory) client.applySnapshot({ ...sub.snapshot, history: seedHistory });
+      // c-effortread r9 e2e seam: the server subscribes to the live bus BEFORE
+      // reading this snapshot (closing the seed/subscribe window), so once the
+      // snapshot is applied over an open socket, every event PUBLISHED
+      // AFTERWARDS is delivered as a genuine live frame and can never be
+      // absorbed into the seed as replay. Resolve the caught-up waiter here.
+      if (sub.getReadyState() === 1) {
+        this.resolveFollowCaughtUp(instance.id, sub.snapshot.asOfSeq);
+      }
     }
     const tail = mockGappedTail(instance.journalId);
     if (tail) {
@@ -4641,6 +4661,38 @@ class HubStore {
   setUsageRollupForTest(instanceId: Id, rollup: UsageRollup) {
     if (!e2eSeamsEnabled()) return;
     this.emit({ usageRollup: { ...this.state.usageRollup, [instanceId]: rollup } });
+  }
+
+  /** c-effortread r9 e2e seam: resolve (now if already live) when the follow
+   *  socket for `instanceId` has delivered its first contiguous live batch past
+   *  the seed cursor. Returns the acked seq. Inert without the e2e marker. */
+  waitForFollowCaughtUpForTest(instanceId: Id, timeoutMs = 10_000): Promise<string> {
+    if (!e2eSeamsEnabled()) return Promise.resolve("");
+    const already = this.followCaughtUpSeq.get(instanceId);
+    if (already !== undefined) return Promise.resolve(already);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`follow not caught up for ${instanceId}`)),
+        timeoutMs,
+      );
+      const set = this.followCaughtUp.get(instanceId) ?? new Set();
+      set.add((seq) => {
+        clearTimeout(timer);
+        resolve(seq);
+      });
+      this.followCaughtUp.set(instanceId, set);
+    });
+  }
+
+  /** Internal: fire and remember the caught-up seam for an instance. */
+  private resolveFollowCaughtUp(instanceId: Id, seq: string) {
+    if (!e2eSeamsEnabled()) return;
+    if (!this.followCaughtUpSeq.has(instanceId)) {
+      this.followCaughtUpSeq.set(instanceId, seq);
+      const waiters = this.followCaughtUp.get(instanceId);
+      this.followCaughtUp.delete(instanceId);
+      for (const resolve of waiters ?? []) resolve(seq);
+    }
   }
 
   /** The word the slider last requested for this instance (wire spelling). */

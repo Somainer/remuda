@@ -1280,6 +1280,12 @@ async fn fake_node(
                             }),
                         )
                         .await?;
+                        // A freshly launched claude-pty is at its prompt: the
+                        // real driver reports Turn agent_status idle, which is
+                        // what the composer reads to send an Enter prompt
+                        // immediately (busy/blocked would queue it as held).
+                        append_n =
+                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                         send_rpc_ok(&mut ws, id, create_result(spec, &instance_id)).await?;
                         continue;
                     }

@@ -181,6 +181,16 @@ async function clearApprovals(page: Page, instanceId: string) {
   // Node→Hub uplink can lag create, and answering a not-yet-persisted request
   // would be resurrected when its late journal event lands.
   await page.evaluate(async (id) => {
+    // The fake Node's claude-pty create arm (hub_e2e) raises NO create-time
+    // approval — it early-continues after the ready/model launch frames — so
+    // there is nothing to clear and the card wait must not burn its full
+    // deadline (c-effortread r9 gate: the dead wait added ~10 s per spec and
+    // starved the later terminal /effort read-back past its 15 s timeout).
+    // The default shell-pty arm is the one that parks a pending approval.
+    const detail = await (
+      await fetch(`/v1/instances/${id}`, { credentials: "include" })
+    ).json();
+    if (detail?.driver === "claude-pty") return;
     const listPending = async () => {
       const body = await (await fetch("/v1/interactions", { credentials: "include" })).json();
       return (body.items ?? []).filter(
@@ -269,6 +279,15 @@ async function postEffortConfigure(
 ) {
   await page.evaluate(
     async ({ id, effort }) => {
+      // The fake node's answer to an instance.configure is a native lifecycle
+      // over the follow socket (the queued/degraded sentinels emit NO effort
+      // observation). Lifecycle frames in the bounded REST seed are history and
+      // are deliberately never applied, so wait until THIS instance's follow
+      // socket has caught up past its snapshot before posting — otherwise the
+      // configure can land inside the follow-attach window and be absorbed
+      // into the seed as replay (c-effortread r9).
+      await (window as unknown as { __remudaHub?: { waitFollowCaughtUp: (id: string) => Promise<string> } })
+        .__remudaHub?.waitFollowCaughtUp(id);
       const res = await fetch(`/v1/instances/${id}/commands`, {
         method: "POST",
         credentials: "include",

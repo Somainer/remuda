@@ -1633,6 +1633,36 @@ impl TurnReservation {
     }
 }
 
+/// Roll a cancelled turn's book back and publish any root settle it released
+/// (ma-sdk-state r9 item 1). One ordered operation shared by the write-failure
+/// path (`ReservationGuard::fail`) and caller-cancellation (`Drop`), so an A
+/// result mapped DEFERRED behind a cancelled B can never have its correction
+/// silently discarded: it is released through the same ordered publication
+/// path (`PublishJob::Emit`, drained in FIFO by the single publication worker).
+///
+/// Does NOT take `write_seq`: the caller holds it (`fail`, which runs under
+/// `prepare_prompt_write`) or a spawned cleanup task has already acquired it.
+async fn rollback_and_publish(inner: &Arc<Inner>, seq: u64) {
+    let deferred = {
+        let mut mapper = inner.mapper.lock().await;
+        match mapper.cancel_turn_reservation(seq) {
+            Ok(deferred) => deferred,
+            Err(error) => {
+                warn!(%error, "turn rollback failed during reservation cleanup");
+                None
+            }
+        }
+    };
+    if let Some(observation) = deferred
+        && let Some(publisher) = inner.publish.lock().await.clone()
+        // Enqueue behind the cancelled ticket (and any frames already queued);
+        // the single worker drains them in order after the ticket resolves.
+        && publisher.send(PublishJob::Emit(vec![observation])).is_err()
+    {
+        debug!("publication gone; deferred settle dropped on close");
+    }
+}
+
 /// Owns one turn's [`TurnReservation`] for the lifetime of a prompt write
 /// (ma-sdk-state r6/r7). The reservation lifecycle is driven by the detached,
 /// ordered write-completion task (not the caller's await), so an aborted caller
@@ -1668,26 +1698,9 @@ impl ReservationGuard {
     /// Consumes the guard and lets it DROP normally (r7 item 3: no
     /// `mem::forget`, no Arc leak).
     async fn fail(mut self) {
-        let deferred = {
-            let mut mapper = self.inner.mapper.lock().await;
-            match mapper.cancel_turn_reservation(self.reservation.seq) {
-                Ok(deferred) => deferred,
-                Err(error) => {
-                    warn!(%error, "turn rollback failed during reservation cleanup");
-                    None
-                }
-            }
-        };
-        if let Some(observation) = deferred {
-            // Enqueue while the worker is still parked on this ticket: the Emit
-            // job sits behind it (and any already-queued frames) and is drained
-            // only after the cancel wakes the worker past the ticket.
-            if let Some(publisher) = self.inner.publish.lock().await.clone()
-                && publisher.send(PublishJob::Emit(vec![observation])).is_err()
-            {
-                debug!("publication gone; deferred settle dropped on close");
-            }
-        }
+        // Runs under prepare_prompt_write's write_seq guard; release the
+        // deferred settle through the ordered publication path (r9 item 1).
+        rollback_and_publish(&self.inner, self.reservation.seq).await;
         self.resolved = true;
         self.reservation.cancel();
     }
@@ -1698,19 +1711,18 @@ impl Drop for ReservationGuard {
         if self.resolved {
             return;
         }
-        // Pre-accept cancellation safety (r8 item 1) and panic safety: wake the
-        // parked worker immediately, then roll the book back on a detached task
-        // that RE-ACQUIRES write_seq, so a reservation whose caller was aborted
-        // before the writer accepted UserWrite is undone in order relative to
-        // the next send (which waits on write_seq to begin). No deferred settle
-        // is emitted here — the ordered `fail` path owns that exactly once.
+        // Pre-accept cancellation (r8 item 1) / panic safety: wake the parked
+        // worker immediately, then run the SAME ordered rollback-and-publish
+        // `fail` uses on a detached task that holds write_seq, so the
+        // reservation is undone in order relative to the next send AND a
+        // deferred settle it blocked is still published (r9 item 1).
         self.reservation.cancel();
         let inner = self.inner.clone();
         let seq = self.reservation.seq;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let _seq = inner.write_seq.lock().await;
-                let _ = inner.mapper.lock().await.cancel_turn_reservation(seq);
+                rollback_and_publish(&inner, seq).await;
             });
         }
     }

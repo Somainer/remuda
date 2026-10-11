@@ -1651,6 +1651,76 @@ async fn a_deferred_result_emits_exactly_one_ordered_settlement_when_b_real_writ
     let _ = driver.close().await;
 }
 
+/// ma-sdk-state r9 item 1: A's result is mapped DEFERRED while B is reserved
+/// and parked PRE-accept (its prompt not yet accepted by the writer). Aborting
+/// B there must roll B back AND still publish A's saved settle through the
+/// ordered path — exactly one settledRootTurn=true (deferredSettle=true), no B
+/// start. (Pre-fix the pre-accept Drop discarded the released observation.)
+#[tokio::test]
+async fn cancelling_a_pre_accept_b_publishes_a_deferred_a_settle() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = driver.arm_write_commit_barrier();
+    // A (#1) runs through; B (#2) parks PRE-accept.
+    barrier.park_from_write(2);
+
+    let d = driver.clone();
+    let send_a = tokio::spawn(async move { d.send(prompt_id("first", "msg-a")).await });
+    barrier
+        .wait_until_result_parked(Duration::from_secs(5))
+        .await;
+    barrier.release_send();
+    send_a.await.expect("send_a").expect("A acked");
+
+    // B reserves, then parks pre-accept (writer has not accepted it).
+    let db = driver.clone();
+    let send_b = tokio::spawn(async move { db.send(prompt_id("second", "msg-b")).await });
+    barrier
+        .wait_until_reserves_enqueued(2, Duration::from_secs(5))
+        .await;
+    // Map A's result against B's open book (deferred), wait for that mapping.
+    barrier.resume_worker();
+    barrier
+        .wait_until_results_mapped(1, Duration::from_secs(5))
+        .await;
+
+    // Abort B BEFORE the writer accepts its prompt. Its pre-accept Drop cleanup
+    // must publish A's deferred settle in order.
+    send_b.abort();
+    barrier.release_write_ack();
+
+    // Fence-drain the full sequence.
+    let mut all = Vec::new();
+    let mut quiet = 0u32;
+    while quiet < 10 {
+        match tokio::time::timeout(Duration::from_millis(50), handle.recv()).await {
+            Ok(Some(obs)) => {
+                all.push(obs);
+                quiet = 0;
+            }
+            Ok(None) | Err(_) => quiet += 1,
+        }
+    }
+
+    assert_eq!(
+        turn_started_count(&all),
+        1,
+        "only A starts; cancelled pre-accept B emits no start: {all:?}"
+    );
+    let settled: Vec<Option<&str>> = all.iter().filter_map(settled_marker).collect();
+    assert_eq!(
+        settled,
+        vec![Some("true")],
+        "B's cancellation still publishes A's deferred settle, exactly once"
+    );
+
+    drop(barrier);
+    let _ = driver.close().await;
+}
+
 /// For a `result` carrying settledRootTurn=true, returns Some with its
 /// deferredSettle marker (None = ordinary settlement, Some("true") = deferred
 /// correction); returns None for non-settled results. Use this to count ALL

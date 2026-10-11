@@ -443,7 +443,10 @@ async fn abort_during_cooperative_finalise_parks_frames_before_retiring() {
     while !bound.load(Ordering::SeqCst) && std::time::Instant::now() < bind_deadline {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert!(bound.load(Ordering::SeqCst), "the seeded replay never bound");
+    assert!(
+        bound.load(Ordering::SeqCst),
+        "the seeded replay never bound"
+    );
     // Settle the first (ungated) pump; it must not publish the no-stop FINAL.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(final_count.load(Ordering::SeqCst), 0);

@@ -151,7 +151,10 @@ mod tests {
         while !queue.producer_waiting() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(queue.producer_waiting(), "producer never parked for capacity");
+        assert!(
+            queue.producer_waiting(),
+            "producer never parked for capacity"
+        );
         // Let the observed parked state settle (the waiting counter is set
         // just before the predicate re-check).
         std::thread::sleep(Duration::from_millis(50));

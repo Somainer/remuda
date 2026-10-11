@@ -811,10 +811,9 @@ pub(super) fn spawn(
     // loop-local would be None in Drop, so an abort after the bounded wait
     // lost the buffered last run. The variable is read only by its Drop impl.
     let hydrator_slot: HydratorSlot = Arc::new(Mutex::new(None));
-    let pending_emissions: PendingEmissions =
-        Arc::new(crate::transcript_queue::BoundedPending::new(
-            PENDING_CAPACITY,
-        ));
+    let pending_emissions: PendingEmissions = Arc::new(
+        crate::transcript_queue::BoundedPending::new(PENDING_CAPACITY),
+    );
     let flush_notify = Arc::new(Notify::new());
     let flush_done = Arc::new(AtomicBool::new(false));
     // Set while a blocking collect owns the hydrator (it has taken it out of
@@ -2504,9 +2503,7 @@ async fn emission_flusher(
         // finish has parked its frames AND the queue is fully drained. A
         // short tick covers the residual-finish thread parking without a
         // Notify permit (it notifies anyway, but the tick closes any gap).
-        if done.load(Ordering::SeqCst)
-            && residual_done.load(Ordering::SeqCst)
-            && pending.is_empty()
+        if done.load(Ordering::SeqCst) && residual_done.load(Ordering::SeqCst) && pending.is_empty()
         {
             return;
         }
@@ -3007,8 +3004,9 @@ mod tests {
         let found = detected_claude(42, Some(session));
         let (tx, mut rx) = mpsc::channel::<Observation>(128);
         let hydrator: HydratorSlot = Arc::new(Mutex::new(None));
-        let pending: PendingEmissions =
-            Arc::new(crate::transcript_queue::BoundedPending::new(PENDING_CAPACITY));
+        let pending: PendingEmissions = Arc::new(crate::transcript_queue::BoundedPending::new(
+            PENDING_CAPACITY,
+        ));
         let notify = Arc::new(Notify::new());
         let in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // A real flusher drains parked frames: without it the "no foreign
@@ -3558,8 +3556,9 @@ mod tests {
             Hydrator::open(&ctx, &binding, None, None, None, None, None, None)
                 .expect("hydrator binds the seeded transcript"),
         )));
-        let pending: PendingEmissions =
-            Arc::new(crate::transcript_queue::BoundedPending::new(PENDING_CAPACITY));
+        let pending: PendingEmissions = Arc::new(crate::transcript_queue::BoundedPending::new(
+            PENDING_CAPACITY,
+        ));
         let notify = Arc::new(Notify::new());
         let in_flight = Arc::new(AtomicBool::new(false));
         let seq = Arc::new(AtomicU64::new(0));
@@ -3667,8 +3666,9 @@ mod tests {
         let slot: HydratorSlot = Arc::new(Mutex::new(Some(
             Hydrator::open(&ctx, &binding, None, None, None, None, None, None).unwrap(),
         )));
-        let pending: PendingEmissions =
-            Arc::new(crate::transcript_queue::BoundedPending::new(PENDING_CAPACITY));
+        let pending: PendingEmissions = Arc::new(crate::transcript_queue::BoundedPending::new(
+            PENDING_CAPACITY,
+        ));
         let notify = Arc::new(Notify::new());
         let in_flight = Arc::new(AtomicBool::new(false));
         let seq = Arc::new(AtomicU64::new(0));
@@ -3765,8 +3765,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = ctx_in(dir.path());
         let (tx, mut rx) = mpsc::channel(1);
-        let pending: PendingEmissions =
-            Arc::new(crate::transcript_queue::BoundedPending::new(PENDING_CAPACITY));
+        let pending: PendingEmissions = Arc::new(crate::transcript_queue::BoundedPending::new(
+            PENDING_CAPACITY,
+        ));
         let _notify = Arc::new(Notify::new());
         let marker_obs = |text: &'static str| {
             build(
@@ -3787,13 +3788,7 @@ mod tests {
         let flusher_pending = Arc::clone(&pending);
         let flusher_ctx = ctx.clone();
         let handle = tokio::spawn(async move {
-            flush_pending(
-                &flusher_pending,
-                &tx,
-                &AtomicU64::new(0),
-                &flusher_ctx,
-            )
-            .await
+            flush_pending(&flusher_pending, &tx, &AtomicU64::new(0), &flusher_ctx).await
         });
         // Wait for the flusher to park sending SECOND into the full buffer.
         // With pop-before-send the queue is empty at that point (the frame is
@@ -3814,7 +3809,9 @@ mod tests {
         // Old code: the post-send pop_front discarded the prepended snapshot.
         let first = rx.recv().await.expect("first frame");
         assert!(
-            serde_json::to_string(&first).unwrap_or_default().contains("FIRST"),
+            serde_json::to_string(&first)
+                .unwrap_or_default()
+                .contains("FIRST"),
             "FIFO order broken on the first frame"
         );
         let second = rx.recv().await.expect("second frame");
@@ -3905,15 +3902,17 @@ mod tests {
             faults: None,
         };
         // Prior epoch backlog the flusher has not sent yet.
-        let pending: PendingEmissions =
-            Arc::new(crate::transcript_queue::BoundedPending::new(PENDING_CAPACITY));
+        let pending: PendingEmissions = Arc::new(crate::transcript_queue::BoundedPending::new(
+            PENDING_CAPACITY,
+        ));
         pending.push_all_blocking([marker_obs("BACKLOG_B")]);
         let notify = Arc::new(Notify::new());
-        hydrator
-            .collect_pump(&pending, &notify)
-            .expect("collect");
+        hydrator.collect_pump(&pending, &notify).expect("collect");
         let queued = pending.len();
-        assert!(queued >= 3, "backlog + snapshot + replay queued, got {queued}");
+        assert!(
+            queued >= 3,
+            "backlog + snapshot + replay queued, got {queued}"
+        );
 
         // Drain through the production flusher and capture delivered order.
         let (tx, mut rx) = mpsc::channel::<Observation>(128);

@@ -130,8 +130,8 @@ fn to_journal_record(observation: &Observation) -> JournalRecord {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn claude_pty_close_finalises_no_stop_usage_and_projects_to_hub_row() {
     use remuda_driver::test_faults::TranscriptFaults;
-    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket_root = ShortTempDir::new().unwrap();

@@ -3293,7 +3293,18 @@ mod tests {
         let native_old = "2026-09-14T12:00:00.000Z";
         assert!(insert(
             &conn,
-            &scoped_record(1, "ins_9", "session", Some("g1"), 1, 100, 10, 0, 0, Some(native_old))
+            &scoped_record(
+                1,
+                "ins_9",
+                "session",
+                Some("g1"),
+                1,
+                100,
+                10,
+                0,
+                0,
+                Some(native_old)
+            )
         ));
         // Two timestamp-free replay growth points (would be within any window
         // if their ingest time counted) — including a fresh larger stock.
@@ -3326,7 +3337,18 @@ mod tests {
         // stock is the rate.
         assert!(insert(
             &conn,
-            &scoped_record(12, "ins_9", "session", Some("g1"), 4, 150, 15, 0, 0, Some(&now))
+            &scoped_record(
+                12,
+                "ins_9",
+                "session",
+                Some("g1"),
+                4,
+                150,
+                15,
+                0,
+                0,
+                Some(&now)
+            )
         ));
         let rollup = rollup_instance(&conn, "ins_9", "grok", None)
             .unwrap()

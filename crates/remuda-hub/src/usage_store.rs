@@ -824,6 +824,20 @@ fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate:
             SELECT DISTINCT instance_id FROM usage_events
             WHERE {stock_predicate} AND scope = 'message'
          ),
+         r8_turn_instances AS (
+            -- Instances with non-legacy Turn flow rows (c-usagefu r8 item 4).
+            SELECT DISTINCT instance_id FROM usage_events
+            WHERE {stock_predicate} AND scope = 'turn' AND scope_id IS NOT NULL
+         ),
+         r8_flow_only_stock_instances AS (
+            -- Session STOCK counts only for instances with NEITHER message nor
+            -- modern turn rows: otherwise it is cumulative history that must
+            -- never be added to the per-call flow.
+            SELECT DISTINCT instance_id FROM usage_events
+            WHERE {stock_predicate} AND scope = 'session'
+              AND instance_id NOT IN (SELECT instance_id FROM r7_message_instances)
+              AND instance_id NOT IN (SELECT instance_id FROM r8_turn_instances)
+         ),
          r5_eligible_stock AS (
             SELECT instance_id, scope_id, cost FROM (
                 SELECT instance_id, scope_id,
@@ -858,22 +872,36 @@ fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate:
             SELECT instance_id FROM r5_stock_instances
          )
          SELECT COUNT(*),
+                -- r8 item 4: ONE token representation per call.
+                --  - message rows for message instances;
+                --  - turn rows for instances with no message coverage;
+                --  - session stock ONLY for instances with neither flow kind.
+                -- Cumulative Session history is never summed onto flow.
                 COALESCE(SUM(CASE
-                    WHEN scope = 'session' THEN total_tokens
                     WHEN scope = 'message' THEN total_tokens
-                    WHEN instance_id NOT IN (SELECT instance_id FROM r7_message_instances)
+                    WHEN scope = 'turn'
+                         AND instance_id NOT IN (SELECT instance_id FROM r7_message_instances)
+                         THEN total_tokens
+                    WHEN scope = 'session'
+                         AND instance_id IN (SELECT instance_id FROM r8_flow_only_stock_instances)
                          THEN total_tokens
                 END), 0),
                 COALESCE(SUM(CASE
-                    WHEN scope = 'session' THEN input_tokens
                     WHEN scope = 'message' THEN input_tokens
-                    WHEN instance_id NOT IN (SELECT instance_id FROM r7_message_instances)
+                    WHEN scope = 'turn'
+                         AND instance_id NOT IN (SELECT instance_id FROM r7_message_instances)
+                         THEN input_tokens
+                    WHEN scope = 'session'
+                         AND instance_id IN (SELECT instance_id FROM r8_flow_only_stock_instances)
                          THEN input_tokens
                 END), 0),
                 COALESCE(SUM(CASE
-                    WHEN scope = 'session' THEN output_tokens
                     WHEN scope = 'message' THEN output_tokens
-                    WHEN instance_id NOT IN (SELECT instance_id FROM r7_message_instances)
+                    WHEN scope = 'turn'
+                         AND instance_id NOT IN (SELECT instance_id FROM r7_message_instances)
+                         THEN output_tokens
+                    WHEN scope = 'session'
+                         AND instance_id IN (SELECT instance_id FROM r8_flow_only_stock_instances)
                          THEN output_tokens
                 END), 0),
                 (SELECT COALESCE(SUM(cost), 0.0) FROM r5_eligible_stock
@@ -1020,11 +1048,22 @@ fn sum_turn_tokens_since(
     instance_id: &str,
     since: &str,
 ) -> rusqlite::Result<(Option<i64>, Option<i64>)> {
+    // r8 item 4: one flow representation per call — Message rows when the
+    // instance has any, else Turn rows. Never both; never Session stock.
     conn.query_row(
         "SELECT SUM(input_tokens), SUM(output_tokens)
          FROM usage_events
-         WHERE instance_id = ?1 AND scope IN ('turn','message') AND observed_at >= ?2
-           AND observed_at_source = 'native'",
+         WHERE instance_id = ?1 AND observed_at >= ?2
+           AND observed_at_source = 'native'
+           AND (
+               (scope = 'message')
+               OR (scope = 'turn'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM usage_events m
+                       WHERE m.instance_id = usage_events.instance_id
+                         AND m.scope = 'message'
+                   ))
+           )",
         params![instance_id, since],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
@@ -1481,20 +1520,40 @@ pub fn rollup_instance(
     // turn rows, turn_id (stamped on every adapter observation) for messages.
     // Legacy pre-scopeId Turn rows (NULL scope_id, one per seq) are counted by
     // seq fallback so upgraded instances do not report zero turns (r7 item 8).
+    // r8 item 4: ONE token representation per call in the FLOW sums. Message
+    // rows when the instance emits any; otherwise Turn rows. Cumulative
+    // Session stock is NEVER added here — the use_turn/latest_session_stock
+    // decision below supplies stock as the fallback for flow-less/partial
+    // instances.
+    let has_message: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM usage_events WHERE instance_id=?1 AND scope='message')",
+        params![instance_id],
+        |row| row.get(0),
+    )?;
+    // Per-call tokens: message when present, otherwise turn (modern+legacy).
+    let flow_scope = if has_message { "message" } else { "turn" };
+    let flow_pred =
+        |col: &str| -> String { format!("SUM(CASE WHEN scope='{flow_scope}' THEN {col} END)") };
     let totals = conn.query_row(
-        "SELECT
+        &format!(
+            "SELECT
             COUNT(DISTINCT CASE WHEN scope='turn' AND scope_id IS NOT NULL THEN scope_id
                                 WHEN scope='message' THEN turn_id
                                 WHEN scope='workflow-member' THEN scope_id END)
             + COUNT(CASE WHEN scope='turn' AND scope_id IS NULL THEN 1 END),
-            SUM(CASE WHEN scope IN ('turn','message') THEN input_tokens END),
-            SUM(CASE WHEN scope IN ('turn','message') THEN output_tokens END),
-            SUM(CASE WHEN scope IN ('turn','message') THEN cache_read_tokens END),
-            SUM(CASE WHEN scope IN ('turn','message') THEN cache_write_tokens END),
+            {flow_input},
+            {flow_output},
+            {flow_cache_read},
+            {flow_cache_write},
             COUNT(CASE WHEN scope='session' THEN 1 END),
             COUNT(*),
             MAX(CASE WHEN scope IN ('turn','message') AND observed_at_source='native' THEN observed_at END)
          FROM usage_events WHERE instance_id = ?1",
+            flow_input = flow_pred("input_tokens"),
+            flow_output = flow_pred("output_tokens"),
+            flow_cache_read = flow_pred("cache_read_tokens"),
+            flow_cache_write = flow_pred("cache_write_tokens"),
+        ),
         params![instance_id],
         |row| {
             let turns: i64 = row.get(0)?;
@@ -2363,6 +2422,127 @@ mod tests {
             (agg.cost_usd - 0.20).abs() < 1e-9,
             "two responses at 0.10, replay not billed: {}",
             agg.cost_usd
+        );
+    }
+
+    #[test]
+    fn message_and_session_cumulative_history_are_never_added() {
+        // c-usagefu r8 item 4: Message per-call rows AND cumulative Session
+        // snapshots describe the SAME calls. Message 10 + Session 10 +
+        // Message 20 + Session 30 must yield 30 (latest flow), not 70.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let at = "2026-09-15T00:00:00.000Z";
+        let project = |seq: i64,
+                       scope: &str,
+                       scope_id: &str,
+                       out: Option<i64>,
+                       cost: Option<&str>| {
+            let cost_json = if let Some(c) = cost {
+                json!({"state":"known","value":{"amount":c,"currency":"USD"}})
+            } else {
+                json!({"state":"unknown","reason":"x","evidenceEventIds":[]})
+            };
+            let rec = JournalRecord {
+                instance_id: "ins_mix".into(),
+                seq,
+                event_id: format!("e{seq}"),
+                event: json!({
+                    "kind":"usage",
+                    "source":{"nativeTurnId":{"state":"known","value":"t1"}},
+                    "payload":{
+                        "scope":scope,"scopeId":scope_id,"mode":"snapshot","metricRevision":"1",
+                        "inputTokens":{"state":"known","value":"0"},
+                        "outputTokens": out.map(|n| json!({"state":"known","value":n.to_string()}))
+                            .unwrap_or_else(|| json!({"state":"unknown","reason":"x","evidenceEventIds":[]})),
+                        "cost": cost_json, "accounting":"estimated",
+                        "nativeAt":{"state":"known","value":at},
+                    }
+                }),
+                observed_at: at.into(),
+            };
+            project_usage_event(&rec, Some("pvp_mix"), Some("gpt-5.4")).unwrap()
+        };
+        // Turn 1: Message 10 + cumulative Session 10.
+        insert_row(&conn, &project(1, "message", "r1", Some(10), Some("0.10"))).unwrap();
+        let s1a = tokenless_session_record_for("ins_mix", 2, "s1", 1, Some("0.10"));
+        insert_row(
+            &conn,
+            &project_usage_event(&s1a, Some("pvp_mix"), Some("gpt-5.4")).unwrap(),
+        )
+        .unwrap();
+        // Turn 2: Message 20 + cumulative Session 30.
+        insert_row(&conn, &project(3, "message", "r2", Some(20), Some("0.20"))).unwrap();
+        let s1b = tokenless_session_record_for("ins_mix", 4, "s1", 2, None);
+        insert_row(
+            &conn,
+            &project_usage_event(&s1b, Some("pvp_mix"), Some("gpt-5.4")).unwrap(),
+        )
+        .unwrap();
+
+        let agg = aggregate_instance(&conn, "ins_mix").unwrap();
+        assert_eq!(
+            agg.output_tokens, 30,
+            "10+20 Message, Session cumulative never added"
+        );
+        assert!((agg.cost_usd - 0.30).abs() < 1e-9);
+        let rollup = rollup_fold(&conn, "ins_mix", "codex", Some("gpt-5.4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_output_tokens, Some(30));
+    }
+
+    #[test]
+    fn upgraded_dual_message_and_turn_rows_count_once() {
+        // c-usagefu r8 item 4: an upgraded pre-r6 DB has BOTH a Message and a
+        // Turn row (100 output each) per call. The rollup, instance
+        // aggregate, and supply aggregate must all read 100, not 200.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let at = ago(2); // recent enough for the 60 s / 5 min rate windows
+        let at = at.as_str();
+        let project = |seq: i64, scope: &str, scope_id: &str| {
+            let rec = JournalRecord {
+                instance_id: "ins_up".into(),
+                seq,
+                event_id: format!("e{seq}"),
+                event: json!({
+                    "kind":"usage",
+                    "nativeAt":{"state":"known","value":at},
+                    "source":{"nativeTurnId":{"state":"known","value":"t1"}},
+                    "payload":{
+                        "scope":scope,"scopeId":scope_id,"mode":"snapshot","metricRevision":"1",
+                        "inputTokens":{"state":"known","value":"0"},
+                        "outputTokens":{"state":"known","value":"100"},
+                        "cost":{"state":"known","value":{"amount":"0.10","currency":"USD"}},
+                        "accounting":"estimated",
+                    }
+                }),
+                observed_at: at.into(),
+            };
+            project_usage_event(&rec, Some("pvp_up"), Some("gpt-5.4")).unwrap()
+        };
+        insert_row(&conn, &project(1, "message", "r1")).unwrap();
+        insert_row(&conn, &project(2, "turn", "t1")).unwrap();
+
+        assert_eq!(
+            aggregate_instance(&conn, "ins_up").unwrap().output_tokens,
+            100
+        );
+        assert_eq!(
+            aggregate_supply(&conn, "pvp_up", "gpt-5.4")
+                .unwrap()
+                .output_tokens,
+            100
+        );
+        let rollup = rollup_fold(&conn, "ins_up", "codex", Some("gpt-5.4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_output_tokens, Some(100));
+        assert_eq!(
+            rollup.tpm_out_60s,
+            Some(100),
+            "rate window also reads one stream"
         );
     }
 

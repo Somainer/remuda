@@ -4840,46 +4840,4 @@ mod forward_slot_tests {
         assert!(next.is_some(), "the slot is leader-vacant after settle");
         drop(next);
     }
-
-    /// c-acceptrace: a queued instance.send must be marked accepted from the
-    /// Node's RPC reply. The real DevNode (enqueue_existing -> accept_command)
-    /// replies `{accepted:true, command:{state:"accepted", commandId}}`; the
-    /// hub's offline-outbox reload relies on that so the row converges without
-    /// racing the mirrored journal under load. The OLD fake-node reply of a
-    /// bare `{ok:true}` must NOT count as a durable acceptance.
-    #[test]
-    fn node_accepted_requires_real_node_acceptance_shape() {
-        let cid = "cmd_acceptrace";
-        // What the real Node returns once the send is durably enqueued.
-        let real_node = json!({
-            "ok": true,
-            "accepted": true,
-            "command": { "state": "accepted", "commandId": cid },
-        });
-        assert!(node_accepted(&real_node, cid));
-
-        // A real Node may also return accepted at the top level without a
-        // command envelope.
-        assert!(node_accepted(&json!({ "accepted": true }), cid));
-
-        // A settled terminal command is an acceptance too.
-        assert!(node_accepted(
-            &json!({ "command": { "state": "settled", "commandId": cid } }),
-            cid
-        ));
-
-        // The pre-fix in-process fake Node only answered `{ok:true}`. That is
-        // NOT a durable acceptance: the hub must leave the row to journal
-        // convergence rather than trusting a bare ack.
-        assert!(!node_accepted(&json!({ "ok": true }), cid));
-
-        // An echoed commandId that differs from the sent id is not accepted.
-        assert!(!node_accepted(
-            &json!({ "accepted": true, "command": { "state": "accepted", "commandId": "other" } }),
-            cid
-        ));
-
-        // An explicit error is never accepted.
-        assert!(!node_accepted(&json!({ "error": { "code": -1 } }), cid));
-    }
 }

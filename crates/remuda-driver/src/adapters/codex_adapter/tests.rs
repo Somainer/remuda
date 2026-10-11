@@ -1149,12 +1149,12 @@ fn two_prompted_panes_each_bind_their_own_file() {
 
 #[test]
 fn a_claim_loser_keeps_discovering_and_never_takes_the_winners_file() {
-    // Two adapters scanning the same candidate: A wins the claim, B's bind
-    // returns false. B must NOT remember the id (which would shortcut tier 1
-    // with strict=true) and must later bind its OWN rollout — never A's file
-    // even after A drops.
+    // r7 item 9: BOTH adapters must complete their scan of the SAME unclaimed
+    // file before either claims it (a deterministic interleaving). The loser
+    // must have confirmed AND discovered empty at that point, lose the claim,
+    // and then bind its own later rollout — never the winner's.
     let home = tempfile::tempdir().unwrap();
-    let cwd = "/projects/r6-loser";
+    let cwd = "/projects/r7-loser";
     let now = OffsetDateTime::now_utc();
     let floor = now - time::Duration::seconds(5);
     let rfc = now.format(&Rfc3339).unwrap();
@@ -1163,30 +1163,42 @@ fn a_claim_loser_keeps_discovering_and_never_takes_the_winners_file() {
     send_fixture_prompt(Path::new(cwd), INST_B, "loser words", now);
     write_rollout_prompt_at(home.path(), "W", cwd, &rfc, "winner words");
 
-    // A claims first.
+    // Both adapters exist and are unbound BEFORE any discover() call — this
+    // is the "scans complete before either claim" ordering the review asks
+    // for. The file W matches A's prompt, not B's, but we drive the claim
+    // race directly.
     let mut a = launch_adapter_keyed(home.path(), cwd, floor, INST_A);
-    assert!(a.discover().unwrap());
-    assert_eq!(a.binding().unwrap().session_id, "W");
-
-    // B sees the SAME file in a scan; the locator's exclude check actually
-    // removes it (owned by A), so verify the residual loser path directly:
-    // hand the winner's path to bind with B's identity -> claim refused.
     let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+    assert!(a.confirmed.is_none() && a.discovered.is_none() && a.binding().is_none());
+    assert!(b.confirmed.is_none() && b.discovered.is_none() && b.binding().is_none());
+
+    // The shared unclaimed candidate both would scan.
     let winner_path = home
         .path()
         .join("sessions/2026/09/14")
         .join("rollout-W.jsonl");
-    let tier1_snapshot = b.confirmed.is_none() && b.binding().is_none();
-    assert!(tier1_snapshot, "fresh B has no remembered identity");
-    // Direct bind call: B must lose the claim and stay unbound.
-    let bound = b.bind_for_test("W".into(), winner_path.clone(), false);
-    assert!(!bound, "B loses the claim");
-    assert!(b.binding().is_none(), "lost claim must not bind");
 
-    // After A closes B still cannot take A's file (claim outlives A).
-    drop(a);
+    // A claims first; B attempts the SAME still-unclaimed-by-B candidate.
+    assert!(
+        a.bind_for_test("W".into(), winner_path.clone(), false),
+        "A wins"
+    );
+    let b_bound = b.bind_for_test("W".into(), winner_path.clone(), false);
+    assert!(!b_bound, "B loses the race on the same candidate");
+    // The loser has NOT recorded a discovered/confirmed identity: a later
+    // poll must not shortcut into tier 1 on "W".
+    assert!(b.confirmed.is_none(), "loser confirmed stays empty");
+    assert!(b.discovered.is_none(), "loser discovered stays empty");
+    assert!(b.binding().is_none(), "loser never bound W");
+
+    // B's normal discovery also cannot take A's file (excluded as claimed).
     assert!(!b.discover().unwrap());
     assert!(b.binding().is_none());
+
+    // After A closes B still cannot take A's file (driver-launch claim
+    // outlives A).
+    drop(a);
+    assert!(!b.discover().unwrap());
 
     // B's own rollout appears and binds.
     write_rollout_prompt_at(home.path(), "L", cwd, &rfc, "loser words");

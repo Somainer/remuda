@@ -833,9 +833,45 @@ pub(crate) async fn handle_node_method(
             // Batch 6 co-lanes: streamed lane-runner events. The frame rides
             // the Node's authenticated session; the queue re-checks that the
             // job's lane host matches.
-            let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
-            crate::gatequeue::on_event(state, host_id.as_str(), params).await?;
+            //
+            // A NOTIFICATION: apply off the socket read loop so a long/barriered
+            // apply_result never blocks the pump from reading the gate.run RPC
+            // reply (or other frames) that share this one socket. The same
+            // on_event entry point and host check still run; only the verdict
+            // application is detached. Ack immediately.
+            let state = state.clone();
+            let host = host_id.as_ref().ok_or(HubError::Unauthenticated)?.clone();
+            tokio::spawn(async move {
+                if let Err(error) = crate::gatequeue::on_event(&state, host.as_str(), params).await
+                {
+                    tracing::warn!(%error, "gate.event apply failed");
+                }
+            });
             Ok(Some(json!({ "ok": true })))
+        }
+        "gate.authorize" => {
+            // Node→Hub fencing check before a claimed dispatch executes:
+            // the Hub is the authority on whether this (job, generation) is
+            // still the live Running attempt. Any non-Running or mismatched
+            // generation is refused; force-with-lease only guards the git
+            // ref, not cancel authority.
+            let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
+            let typed: remuda_protocol::GateAuthorizeParams = serde_json::from_value(params)
+                .map_err(|error| {
+                    HubError::BadRequest(format!("invalid gate.authorize params: {error}"))
+                })?;
+            let auth = state
+                .store
+                .gate_dispatch_authorized(&typed.job_id, host_id.as_str(), typed.generation)
+                .await
+                .map_err(crate::http::map_store)?;
+            let result = serde_json::to_value(remuda_protocol::GateAuthorizeResult {
+                authorized: auth.authorized,
+                generation: typed.generation,
+                state: auth.state,
+            })
+            .map_err(|error| HubError::Internal(error.to_string()))?;
+            Ok(Some(result))
         }
         "instance.create"
         | "instance.send"

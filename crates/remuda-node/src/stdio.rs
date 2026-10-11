@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const MAX_STDIO_FRAME_BYTES: usize = 1_048_576;
@@ -41,6 +41,68 @@ impl Default for StdioOptions {
             transport: "ssh-stdio".into(),
             data_dir: enroll::default_data_dir(),
         }
+    }
+}
+
+/// A Node→Hub `gate.authorize` request issued by a (detached) gate run over
+/// the bidirectional stdio carrier.
+struct StdioAuthCall {
+    id: String,
+    frame: Value,
+    reply: oneshot::Sender<Result<Value, NodeError>>,
+}
+
+/// [`crate::gate::GateAuthorizer`] backed by the stdio carrier's free input
+/// arm: the run task sends an auth request through this channel; the main
+/// loop writes it to stdout and correlates the Hub's reply by id while
+/// gate.run keeps executing on its own background task.
+/// Pending gate.authorize replies keyed by JSON-RPC id.
+type PendingAuth =
+    std::sync::Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<Result<Value, NodeError>>>>>;
+
+#[derive(Clone)]
+struct StdioGateAuthorizer {
+    tx: mpsc::Sender<StdioAuthCall>,
+}
+
+/// Process-wide auth request sequence (the stdio loop is a single session).
+static STDIO_AUTH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl crate::gate::GateAuthorizer for StdioGateAuthorizer {
+    fn authorize<'a>(
+        &'a self,
+        job_id: &'a str,
+        generation: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let (tx, rx) = oneshot::channel();
+            let id = format!(
+                "auth-{}",
+                STDIO_AUTH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            let frame = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": remuda_protocol::METHOD_GATE_AUTHORIZE,
+                "params": { "jobId": job_id, "generation": generation },
+            });
+            if self
+                .tx
+                .send(StdioAuthCall {
+                    id,
+                    frame,
+                    reply: tx,
+                })
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            match rx.await {
+                Ok(Ok(value)) => value.get("authorized").and_then(Value::as_bool) == Some(true),
+                _ => false,
+            }
+        })
     }
 }
 
@@ -218,6 +280,14 @@ where
     // and journal frames in any order. gate.cancel and every cheap read stay
     // inline so the cancel escape hatch fires at once.
     let (long_tx, mut long_rx) = mpsc::channel::<FrameOutcome>(JOURNAL_QUEUE_CAPACITY);
+    // Node→Hub gate.authorize requests from detached gate runs.
+    let (gate_auth_tx, mut gate_auth_rx) = mpsc::channel::<StdioAuthCall>(8);
+    let pending_auth: PendingAuth = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+    node.gate_registry()
+        .set_authorizer(std::sync::Arc::new(StdioGateAuthorizer {
+            tx: gate_auth_tx,
+        }))
+        .await;
     spawn_stdio_tty_pump(node.clone(), tty_tx);
     spawn_stdio_gate_pump(node.clone(), gate_tx);
     let mut pumps = HashMap::<InstanceId, JoinHandle<()>>::new();
@@ -257,6 +327,11 @@ where
                     }
                 }
             }
+            auth = gate_auth_rx.recv() => {
+                let Some(call) = auth else { break; };
+                pending_auth.lock().expect("pending auth").insert(call.id.clone(), call.reply);
+                write_ndjson(&mut output, &call.frame).await?;
+            }
             line = input.next_line() => {
                 let Some(line) = line? else {
                     break;
@@ -290,6 +365,26 @@ where
                         continue;
                     }
                 };
+                // A reply to a Node→Hub gate.authorize request (no method,
+                // id matches a pending auth call): resolve it off the RPC
+                // dispatch path.
+                if frame.get("method").is_none()
+                    && let Some(id) = frame.get("id").and_then(Value::as_str)
+                    && let Some(waiter) = pending_auth.lock().expect("pending auth").remove(id)
+                {
+                    let result = if let Some(err) = frame.get("error") {
+                        Err(NodeError::InvalidRequest(
+                            err.get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("gate.authorize error")
+                                .to_owned(),
+                        ))
+                    } else {
+                        Ok(frame.get("result").cloned().unwrap_or(Value::Null))
+                    };
+                    let _ = waiter.send(result);
+                    continue;
+                }
                 // object.pull replies and object.chunk notifications complete
                 // attachment fetches; they never become instance RPCs.
                 if object_broker.handle_frame(&frame) {
@@ -367,6 +462,14 @@ where
     }
     stop_pumps(pumps).await;
     object_broker.fail_all(NodeError::Disconnected);
+    // Carrier ending: fail any in-flight gate authorize and make subsequent
+    // runs fail closed rather than authorize against a dead link.
+    if let Ok(mut pending) = pending_auth.lock() {
+        for (_, waiter) in pending.drain() {
+            let _ = waiter.send(Err(NodeError::Disconnected));
+        }
+    }
+    node.gate_registry().clear_authorizer().await;
     Ok(())
 }
 

@@ -201,6 +201,10 @@ pub mod store_test_support {
     #[cfg(any(test, feature = "test-faults"))]
     pub use crate::gatequeue::TestGateFinishBeforeWrite;
 
+    /// Test-only apply_result boundary barrier.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub use crate::gatequeue::GateApplyBarrier;
+
     /// Test-only fault guard: arm failures on ONE store (per-Store flags,
     /// `test-faults` feature only) and clear them on drop, so a failed
     /// assertion can never leave a fault armed and other Stores are never

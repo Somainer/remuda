@@ -159,6 +159,47 @@ struct JournalJob {
     reply: oneshot::Sender<Result<Value, NodeError>>,
 }
 
+/// Node→Hub `gate.authorize` request job, correlation-matched on the session.
+struct GateAuthJob {
+    job_id: String,
+    generation: u32,
+    reply: oneshot::Sender<Result<Value, NodeError>>,
+}
+
+/// [`crate::gate::GateAuthorizer`] backed by the live outbound session.
+#[derive(Clone)]
+struct WssGateAuthorizer {
+    tx: mpsc::Sender<GateAuthJob>,
+}
+
+impl crate::gate::GateAuthorizer for WssGateAuthorizer {
+    fn authorize<'a>(
+        &'a self,
+        job_id: &'a str,
+        generation: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let (tx, rx) = oneshot::channel();
+            if self
+                .tx
+                .send(GateAuthJob {
+                    job_id: job_id.to_owned(),
+                    generation,
+                    reply: tx,
+                })
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            match rx.await {
+                Ok(Ok(value)) => value.get("authorized").and_then(Value::as_bool) == Some(true),
+                _ => false,
+            }
+        })
+    }
+}
+
 /// Bounded sender for `journal.append`. `append` waits when the queue is full.
 #[derive(Clone)]
 pub struct JournalSender {
@@ -350,6 +391,7 @@ impl WssLink {
         let token = config.token.clone();
         let host_id = config.host_id.clone();
         let (journal_tx, journal_rx) = mpsc::channel(config.journal_queue.max(1));
+        let (auth_tx, auth_rx) = mpsc::channel(8);
         let (hub_tx, hub_rx) = mpsc::channel(DEFAULT_HUB_QUEUE);
         let (hub_reply_tx, hub_reply_rx) = mpsc::channel(DEFAULT_HUB_QUEUE);
         let (control_tx, control_rx) = mpsc::channel(4);
@@ -367,6 +409,8 @@ impl WssLink {
             controller,
             journal.clone(),
             journal_rx,
+            auth_tx,
+            auth_rx,
             hub_tx,
             hub_reply_tx,
             hub_reply_rx,
@@ -644,6 +688,8 @@ async fn session_task(
     controller: Option<RuntimeController>,
     journal: JournalSender,
     mut journal_rx: mpsc::Receiver<JournalJob>,
+    auth_tx: mpsc::Sender<GateAuthJob>,
+    mut auth_rx: mpsc::Receiver<GateAuthJob>,
     hub_tx: mpsc::Sender<HubRequest>,
     hub_reply_tx: mpsc::Sender<HubReply>,
     mut hub_reply_rx: mpsc::Receiver<HubReply>,
@@ -653,6 +699,8 @@ async fn session_task(
 ) {
     let ids = AtomicU64::new(1);
     let mut pending: HashMap<String, PendingAppend> = HashMap::new();
+    let mut auth_pending: HashMap<String, oneshot::Sender<Result<Value, NodeError>>> =
+        HashMap::new();
     let mut attempt = 0_u32;
     let watermarks = Arc::new(Mutex::new(HashMap::new()));
     let pumps = Arc::new(Mutex::new(HashSet::new()));
@@ -685,6 +733,17 @@ async fn session_task(
             crate::journal_flush::FlushCursor::new(),
         )),
     });
+    // Register the Hub-authority hook on the runtime's gate registry. On
+    // disconnect the authorize frame fails (send/reply error) so the run
+    // fails closed; on internal reconnect the same channels survive.
+    if let Some(rt) = runtime.as_ref() {
+        rt.node
+            .gate_registry()
+            .set_authorizer(std::sync::Arc::new(WssGateAuthorizer {
+                tx: auth_tx.clone(),
+            }))
+            .await;
+    }
     // object.pull rides this socket whenever the Hub HTTP origin is
     // unreachable; pending pulls are failed on every reconnect below.
     let (carrier_tx, mut carrier_rx) = mpsc::channel(16);
@@ -850,6 +909,26 @@ async fn session_task(
                     break;
                 }
             }
+            auth = auth_rx.recv() => {
+                let Some(auth) = auth else { break; };
+                let id = format!("a-{}", ids.fetch_add(1, Ordering::Relaxed));
+                let frame = rpc_request(
+                    &id,
+                    remuda_protocol::METHOD_GATE_AUTHORIZE,
+                    json!({ "jobId": auth.job_id, "generation": auth.generation }),
+                );
+                match send_ws(&mut stream, &frame).await {
+                    Ok(()) => {
+                        auth_pending.insert(id, auth.reply);
+                    }
+                    Err(_) => {
+                        let _ = auth.reply.send(Err(NodeError::Disconnected));
+                        if reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics, &object_broker, api_broker.as_ref()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
             pull = carrier_rx.recv() => {
                 let Some(frame) = pull else { break; };
                 if send_ws(&mut stream, &frame).await.is_err()
@@ -874,7 +953,7 @@ async fn session_task(
             incoming = recv_ws(&mut stream) => {
                 match incoming {
                     Ok(Some(frame)) => {
-                        handle_incoming(frame, &mut pending, &hub_tx, &hub_reply_tx, runtime.as_ref(), &watermarks, &mut stream, &metrics, &object_broker, api_broker.as_ref()).await;
+                        handle_incoming(frame, &mut pending, &mut auth_pending, &hub_tx, &hub_reply_tx, runtime.as_ref(), &watermarks, &mut stream, &metrics, &object_broker, api_broker.as_ref()).await;
                     }
                     Ok(None) | Err(_) => {
                         if reconnect(&mut stream, &mut config, &mut token, &node_epoch, &watermarks, &ids, &mut attempt, &mut connection_id, &mut lease_id, &mut pending, runtime.as_ref(), &metrics, &object_broker, api_broker.as_ref()).await.is_err() {
@@ -901,6 +980,14 @@ async fn session_task(
         }
     }
     fail_pending(&mut pending, NodeError::Disconnected, &metrics);
+    for (_, waiter) in auth_pending.drain() {
+        let _ = waiter.send(Err(NodeError::Disconnected));
+    }
+    // The link is gone: until a new session registers a hook, a gate run must
+    // fail closed instead of authorizing against a stale/replacement session.
+    if let Some(rt) = runtime.as_ref() {
+        rt.node.gate_registry().clear_authorizer().await;
+    }
 }
 
 fn spawn_wss_tty_pump(node: crate::DevNode, tx: mpsc::Sender<TtyWire>) {
@@ -1011,6 +1098,7 @@ fn spawn_wss_gate_pump(node: crate::DevNode, tx: mpsc::Sender<TtyWire>) {
 async fn handle_incoming(
     frame: Value,
     pending: &mut HashMap<String, PendingAppend>,
+    auth_pending: &mut HashMap<String, oneshot::Sender<Result<Value, NodeError>>>,
     hub_tx: &mpsc::Sender<HubRequest>,
     hub_reply_tx: &mpsc::Sender<HubReply>,
     runtime: Option<&runtime_wss::RuntimeLink>,
@@ -1077,6 +1165,16 @@ async fn handle_incoming(
     }) else {
         return;
     };
+    // Node→Hub gate.authorize replies correlate on a separate waiter map.
+    if let Some(waiter) = auth_pending.remove(&id) {
+        let reply = if let Some(err) = take_rpc_error(&frame) {
+            Err(err)
+        } else {
+            Ok(frame.get("result").cloned().unwrap_or(Value::Null))
+        };
+        let _ = waiter.send(reply);
+        return;
+    }
     let Some(waiter) = pending.remove(&id) else {
         return;
     };

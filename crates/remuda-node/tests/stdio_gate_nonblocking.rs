@@ -248,11 +248,27 @@ fn start_gate(home: &std::path::Path, fixture: &Fixture) -> Node {
         .expect("stdio Node sent its node.hello");
     assert_eq!(hello["method"], "node.hello");
 
+    // r10: the gate runs on the Node's detached long-task, so its
+    // Node→Hub `gate.authorize` request reaches the input arm while the run
+    // executes. Answer it; the run proceeds. (The fake CLI IS the Hub here.)
     node.send(&json!({
         "jsonrpc": "2.0",
         "id": "gate-run-1",
         "method": "gate.run",
         "params": gate_run_params(fixture),
+    }));
+    let authorize = node
+        .wait_for(Instant::now() + Duration::from_secs(5), |frame| {
+            frame["method"] == json!("gate.authorize")
+        })
+        .expect("the Node must ask gate.authorize before running");
+    node.send(&json!({
+        "jsonrpc": "2.0",
+        "id": authorize["id"].clone(),
+        "result": {
+            "authorized": true,
+            "generation": authorize["params"]["generation"].clone(),
+        },
     }));
     node
 }

@@ -514,11 +514,9 @@ fn current_step(trace: &Arc<std::sync::Mutex<RunTrace>>) -> Option<String> {
 
 /// Hard cap on remembered canceled dispatches. This is a MEMORY bound, not
 /// an authorization window: a record never expires on its own, so elapsed
-/// time can never authorize a stale dispatch. 4096 gate jobs is far above
-/// any number one Node process could have outstanding; if a process ever
-/// saw that many canceled jobs the oldest record is evicted (its row on the
-/// Hub is terminal anyway, and the Hub's terminal-state guard plus the
-/// land's force-with-lease CAS remain the backstops).
+/// time can never authorize a stale dispatch. When a NEW job would exceed the
+/// cap the cancel is refused (backpressure) rather than silently dropping an
+/// older job's authority; an already-tracked job always updates in place.
 const MAX_CANCELED_RECORDS: usize = 4096;
 
 /// One generation recorded as canceled for a job.
@@ -526,9 +524,6 @@ const MAX_CANCELED_RECORDS: usize = 4096;
 struct CanceledDispatch {
     /// Highest canceled dispatch generation for the job.
     generation: u32,
-    /// When the cancel was recorded; used ONLY to pick a victim under the
-    /// hard job-count cap, never to decide whether a run is stale.
-    recorded_at: Instant,
 }
 
 /// Live runs and canceled-dispatch records, behind ONE lock: the "is this
@@ -542,7 +537,7 @@ pub(crate) struct GateRunTable {
     /// jobId -> the highest dispatch generation recorded canceled. A run at
     /// the same or an older generation refuses however late its frame
     /// arrives; a strictly newer generation supersedes (and clears) the
-    /// record. Keyed by job count, not age.
+    /// record. Keyed by job count, never by age.
     canceled: BTreeMap<String, CanceledDispatch>,
 }
 
@@ -555,31 +550,20 @@ impl GateRunTable {
     }
 
     /// Record `generation` as canceled for `job`. Supersedes an older
-    /// generation; keeps the highest. Enforces the job-count memory cap.
-    fn record_cancel(&mut self, job_id: &str, generation: u32, now: Instant) {
-        let supersede = self
-            .canceled
-            .get(job_id)
-            .map_or(generation, |existing| existing.generation.max(generation));
-        self.canceled.insert(
-            job_id.to_owned(),
-            CanceledDispatch {
-                generation: supersede,
-                recorded_at: now,
-            },
-        );
-        if self.canceled.len() > MAX_CANCELED_RECORDS {
-            // Evict the single oldest recorded job. Scan (rare: only once the
-            // process has seen >4096 canceled gate jobs).
-            if let Some(oldest) = self
-                .canceled
-                .iter()
-                .min_by_key(|(_, record)| record.recorded_at)
-                .map(|(job_id, _)| job_id.clone())
-            {
-                self.canceled.remove(&oldest);
-            }
+    /// generation; keeps the highest. Returns false (and records nothing)
+    /// when a NEW job would exceed the job-count cap — the caller must then
+    /// refuse/backpressure instead of silently evicting authority.
+    fn record_cancel(&mut self, job_id: &str, generation: u32) -> bool {
+        if let Some(existing) = self.canceled.get_mut(job_id) {
+            existing.generation = existing.generation.max(generation);
+            return true;
         }
+        if self.canceled.len() >= MAX_CANCELED_RECORDS {
+            return false;
+        }
+        self.canceled
+            .insert(job_id.to_owned(), CanceledDispatch { generation });
+        true
     }
 
     /// True when `run_generation` is at or below the canceled generation for
@@ -606,14 +590,29 @@ impl GateRunTable {
     }
 }
 
+/// Outbound authority check a lane run asks before executing. Registered by
+/// the live carrier session; absent on carrier-less/direct callers (tests,
+/// foreground stdio), where the Node-local floor alone applies and the Hub
+/// still guards the terminal result.
+pub trait GateAuthorizer: Send + Sync {
+    /// Ask the Hub whether `(job_id, generation)` is still the live Running
+    /// attempt. Any error/timeout/missing link must be treated as false.
+    fn authorize<'a>(
+        &'a self,
+        job_id: &'a str,
+        generation: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+}
+
 /// Build the verdict for a `gate.run` whose generation is at or below the
 /// canceled generation, and publish its terminal `finished` event so the Hub
 /// converges even if this RPC reply is lost (the same dual verdict a
 /// finished run carries).
-fn canceled_before_run(registry: &GateRegistry, job_id: &str, _generation: u32) -> GateRunResult {
+fn canceled_before_run(registry: &GateRegistry, job_id: &str, generation: u32) -> GateRunResult {
     let why = "canceled before the run registered";
     let result = GateRunResult {
         job_id: job_id.to_owned(),
+        generation,
         status: "canceled".into(),
         error: Some(why.to_owned()),
         reason: Some(why.to_owned()),
@@ -634,11 +633,14 @@ pub(crate) struct GateRegistry {
     lanes: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     /// Live runs plus canceled-dispatch records (one lock).
     runs: Mutex<GateRunTable>,
-    /// Test-only clock warp added to every `Instant::now()` read used for
-    /// record timestamps. Authz never reads time, so this only proves that a
-    /// record stays authoritative however much wall time has passed.
-    #[cfg(any(test, feature = "test-faults"))]
-    clock_warp: std::sync::Mutex<Duration>,
+    /// Live-carrier hook the run calls to ask the Hub for authority before
+    /// executing. Replaced per session.
+    authorizer: tokio::sync::RwLock<Option<std::sync::Arc<dyn GateAuthorizer>>>,
+    /// True once ANY carrier session attached. Distinguishes a carrier-less
+    /// direct/dev caller (never attached → Node-local floor is the only
+    /// available authority) from a carrier that ATTACHED and then went away
+    /// (must fail closed: no stale/replacement-session authorization).
+    carrier_attached: std::sync::atomic::AtomicBool,
     /// Test-only holds that park the NEXT gate.run handler at its entry (the
     /// cancel-beats-run race needs the run frame to be in flight, before the
     /// registry and lane are touched, when gate.cancel arrives). One-shot:
@@ -654,35 +656,47 @@ impl GateRegistry {
         Self {
             lanes: Mutex::new(BTreeMap::new()),
             runs: Mutex::new(GateRunTable::new()),
-            #[cfg(any(test, feature = "test-faults"))]
-            clock_warp: std::sync::Mutex::new(Duration::ZERO),
+            authorizer: tokio::sync::RwLock::new(None),
+            carrier_attached: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-faults"))]
             run_holds: Mutex::new(Vec::new()),
             events,
         }
     }
 
-    /// Timestamp used for cancel records: real clock plus any test warp.
-    fn now(&self) -> Instant {
-        #[cfg(any(test, feature = "test-faults"))]
-        {
-            let warp = self.clock_warp.lock().expect("clock warp").to_owned();
-            Instant::now() + warp
+    /// Register the live session's Hub-authority hook (called on connect).
+    pub(crate) async fn set_authorizer(&self, authorizer: std::sync::Arc<dyn GateAuthorizer>) {
+        self.carrier_attached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *self.authorizer.write().await = Some(authorizer);
+    }
+
+    /// Clear the hook when its session ends: with no link the run must fail
+    /// closed rather than authorize against a stale/replacement session.
+    pub(crate) async fn clear_authorizer(&self) {
+        *self.authorizer.write().await = None;
+    }
+
+    /// Ask the Hub whether the dispatch may execute. A live session that lost
+    /// its link, a transport error or a bounded timeout all mean NO. A node
+    /// that NEVER had a carrier (direct/dev caller) falls back to the
+    /// Node-local floor.
+    async fn hub_authorizes(&self, job_id: &str, generation: u32) -> bool {
+        let authorizer = self.authorizer.read().await.clone();
+        match authorizer {
+            Some(authorizer) => tokio::time::timeout(
+                Duration::from_secs(5),
+                authorizer.authorize(job_id, generation),
+            )
+            .await
+            .unwrap_or(false),
+            None => !self
+                .carrier_attached
+                .load(std::sync::atomic::Ordering::Acquire),
         }
-        #[cfg(not(any(test, feature = "test-faults")))]
-        Instant::now()
     }
 
-    /// Test-only: shift the record clock forward by `delta` so a test can
-    /// prove a canceled dispatch stays refused long past any old TTL without
-    /// sleeping.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-faults"))]
-    pub fn gate_test_warp_clock(&self, delta: Duration) {
-        *self.clock_warp.lock().expect("clock warp") += delta;
-    }
-
-    /// Test-only: the recorded canceled generation for a job, if any.
+    /// Test-only: recorded canceled generation for a job, if any.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-faults"))]
     pub async fn gate_test_canceled_generation(&self, job_id: &str) -> Option<u32> {
@@ -692,6 +706,14 @@ impl GateRegistry {
             .canceled
             .get(job_id)
             .map(|record| record.generation)
+    }
+
+    /// Test-only: drop all local canceled records, simulating a Node process
+    /// restart that begins with an empty registry.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_reset_cancel_records(&self) {
+        self.runs.lock().await.canceled.clear();
     }
 
     /// Test-only: park the next `gate.run` at the handler entry on this hold.
@@ -791,15 +813,6 @@ impl GateRunHold {
 }
 
 impl DevNode {
-    /// Test-only: shift the canceled-record clock forward by `delta`, proving
-    /// a canceled dispatch stays refused however late its frame arrives
-    /// without sleeping.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-faults"))]
-    pub fn gate_test_warp_clock(&self, delta: Duration) {
-        self.gate_registry().gate_test_warp_clock(delta);
-    }
-
     /// Test-only: recorded canceled generation for a job, if any.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-faults"))]
@@ -807,6 +820,28 @@ impl DevNode {
         self.gate_registry()
             .gate_test_canceled_generation(job_id)
             .await
+    }
+
+    /// Test-only: install a Hub-authority hook directly (drives the pre-run
+    /// gate.authorize check without a live carrier).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_set_authorizer(&self, authorizer: std::sync::Arc<dyn GateAuthorizer>) {
+        self.gate_registry().set_authorizer(authorizer).await;
+    }
+
+    /// Test-only: drop the Hub-authority hook (simulates a missing/dead link).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_clear_authorizer(&self) {
+        self.gate_registry().clear_authorizer().await;
+    }
+
+    /// Test-only: drop all local canceled records (simulates a Node restart).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_reset_cancel_records(&self) {
+        self.gate_registry().gate_test_reset_cancel_records().await;
     }
 
     /// Test-only: arm a hold that parks the NEXT Hub-dispatched `gate.run`
@@ -869,10 +904,17 @@ impl DevNode {
         // Record the canceled generation whether or not the run is registered
         // yet: if the frame is still in flight this is the tombstone; if it is
         // already running this also blocks any duplicate/late same-generation
-        // dispatch. Keyed by generation, never by age.
-        let now = registry.now();
-        table.record_cancel(&request.job_id, request.generation, now);
+        // dispatch. Keyed by generation, never by age. At the hard job-count
+        // cap a NEW job cannot be recorded: refuse (backpressure) instead of
+        // evicting an older job's authority.
+        let recorded = table.record_cancel(&request.job_id, request.generation);
         drop(table);
+        if !recorded {
+            return Err(NodeError::InvalidRequest(format!(
+                "gate.cancel: too many canceled gate jobs ({MAX_CANCELED_RECORDS}); \
+                 refusing rather than evicting cancel authority"
+            )));
+        }
         Ok(serde_json::json!({
             "ok": true,
             "jobId": request.job_id,
@@ -988,6 +1030,7 @@ impl DevNode {
             Err(_) => {
                 return Ok(GateRunResult {
                     job_id: request.job_id.clone(),
+                    generation: request.generation,
                     status: "lane-busy".into(),
                     error: Some(format!(
                         "lane {} already has a running job",
@@ -1030,6 +1073,29 @@ impl DevNode {
             table.runs.insert(request.job_id.clone(), live.clone());
         }
 
+        // HUB AUTHORITY (before any fetch/push): the local floor only knows
+        // what this Node has seen; a record eviction, a Node restart that lost
+        // the registry, or a paused frame delivered to a replacement session
+        // all defeat it. Ask the Hub — the single writer of the job row —
+        // whether this generation is still the live Running attempt. Any
+        // non-authorized answer, timeout or missing link stops here, before
+        // execute_gate touches git.
+        if !registry
+            .hub_authorizes(&request.job_id, request.generation)
+            .await
+        {
+            {
+                let mut table = registry.runs.lock().await;
+                table.runs.remove(&request.job_id);
+            }
+            drop(lane_guard);
+            return Ok(canceled_before_run(
+                registry,
+                &request.job_id,
+                request.generation,
+            ));
+        }
+
         let outcome = self.execute_gate(&request, live.clone(), cancel_rx).await;
 
         {
@@ -1056,6 +1122,7 @@ impl DevNode {
     ) -> GateRunResult {
         let mut result = GateRunResult {
             job_id: request.job_id.clone(),
+            generation: request.generation,
             status: "failed".into(),
             ..Default::default()
         };

@@ -319,6 +319,9 @@ pub struct Store {
     /// atomic transaction rolls the delete back.
     #[cfg(any(test, feature = "test-faults"))]
     gate_log_insert_fault: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only barriers at the apply_result boundaries (r10 item 5).
+    #[cfg(any(test, feature = "test-faults"))]
+    gate_apply_barrier: Arc<crate::gatequeue::GateApplyBarrier>,
     /// Per-Store test fault flags (`test-faults` feature only). Shared via
     /// [`Arc`] so every clone of the store arms the SAME flags.
     #[cfg(any(test, feature = "test-faults"))]
@@ -2414,6 +2417,8 @@ impl Store {
             #[cfg(any(test, feature = "test-faults"))]
             gate_log_insert_fault: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-faults"))]
+            gate_apply_barrier: Arc::new(crate::gatequeue::GateApplyBarrier::new()),
+            #[cfg(any(test, feature = "test-faults"))]
             faults: Arc::new(test_faults::FaultFlags::default()),
         })
     }
@@ -2641,6 +2646,13 @@ impl Store {
     pub fn test_arm_gate_log_insert_fault(&self) {
         self.gate_log_insert_fault
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only access to the apply_result boundary barrier.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn gate_apply_barrier(&self) -> &crate::gatequeue::GateApplyBarrier {
+        &self.gate_apply_barrier
     }
 
     /// Test-only: consume (and clear) the armed insert fault.

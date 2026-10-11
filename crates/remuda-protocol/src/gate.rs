@@ -18,6 +18,9 @@ pub const METHOD_GATE_RUN: &str = "gate.run";
 pub const METHOD_GATE_CANCEL: &str = "gate.cancel";
 /// Node→Hub: one streamed job event (a finished step, a phase, log output …).
 pub const METHOD_GATE_EVENT: &str = "gate.event";
+/// Node→Hub: before a gate run does anything irreversible, the Node asks the
+/// Hub to confirm `(jobId, generation)` is still the live Running attempt.
+pub const METHOD_GATE_AUTHORIZE: &str = "gate.authorize";
 /// Hub→Node (home host): run the optional `remuda land --then` command.
 pub const METHOD_GATE_THEN: &str = "gate.then";
 /// Hub→Node (home host): fetch a lane's verified merge and CAS-push main.
@@ -497,6 +500,11 @@ fn default_base_branch() -> String {
 pub struct GateRunResult {
     /// Job id echoed back.
     pub job_id: String,
+    /// Attempt generation this verdict belongs to. The Hub rejects a verdict
+    /// whose generation is not the persisted row's attempts, so a delayed
+    /// reply from an old attempt can never change a newer running attempt.
+    #[serde(default)]
+    pub generation: u32,
     /// `passed` | `landed` | `failed` | `canceled` | `base-moved` | `stale-tip` | `lane-busy`.
     pub status: String,
     /// Step results.
@@ -545,6 +553,33 @@ pub struct GateCancelParams {
     /// newer generation for the same job is allowed to run.
     #[serde(default)]
     pub generation: u32,
+}
+
+/// `gate.authorize` params (Node→Hub): asked by the lane Node before a
+/// claimed dispatch starts executing, so a canceled/stale generation can
+/// never reach `git fetch` / `--land`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateAuthorizeParams {
+    /// Job the Node was asked to run.
+    pub job_id: String,
+    /// Dispatch generation carried on the `gate.run` frame.
+    #[serde(default)]
+    pub generation: u32,
+}
+
+/// `gate.authorize` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateAuthorizeResult {
+    /// True only while the Hub row is Running at exactly this generation.
+    pub authorized: bool,
+    /// Echoed generation.
+    #[serde(default)]
+    pub generation: u32,
+    /// Current Hub-side state when refused, for diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
 }
 
 /// `gate.then` params: post-land command on the project's home host.

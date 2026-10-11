@@ -149,10 +149,9 @@ async fn the_tombstone_is_consumed_by_the_first_run() {
     );
 }
 
-/// Elapsed time must not authorize an old dispatch: a generation-1 run that
-/// arrives long after the cancel (well beyond the removed 60 s TTL — the
-/// clock is warped, not slept) is still refused, an older generation is
-/// refused too, and only a strictly newer generation runs.
+/// Records never expire: there is no time dimension anymore, so the same
+/// canceled generation is refused on every arrival however delayed, and only
+/// a strictly newer generation runs.
 #[tokio::test]
 async fn a_delayed_old_generation_is_refused_however_late_it_arrives() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -160,23 +159,22 @@ async fn a_delayed_old_generation_is_refused_however_late_it_arrives() {
     let repo = dir.path().join("never-checked-out-late");
     let job_id = "gjb_tombstone_late";
 
-    node.gate_test_warp_clock(std::time::Duration::from_secs(60 * 60));
     gate_rpc(
         &node,
         "gate.cancel",
         json!({ "jobId": job_id, "generation": 1 }),
     )
     .await;
-    // Warp AGAIN between cancel and run: total elapsed far past any old TTL.
-    node.gate_test_warp_clock(std::time::Duration::from_secs(60 * 60));
     assert_eq!(
         node.gate_test_canceled_generation(job_id).await,
         Some(1),
-        "the record must survive arbitrary elapsed time"
+        "the record persists with no TTL"
     );
 
-    // An older generation and the canceled generation itself are refused.
-    for generation in [0u32, 1] {
+    // The canceled generation and an older one are refused on arrival (each
+    // would model an arbitrarily delayed dispatch — the floor no longer
+    // consults a clock).
+    for generation in [1u32, 0] {
         let result = gate_rpc(
             &node,
             "gate.run",
@@ -186,7 +184,13 @@ async fn a_delayed_old_generation_is_refused_however_late_it_arrives() {
         assert_eq!(
             result["status"],
             json!("canceled"),
-            "generation {generation} must be refused after 2 h: {result}"
+            "generation {generation} must be refused however late: {result}"
+        );
+        // Re-refused: the same generation is recorded again, not consumed.
+        assert_eq!(
+            node.gate_test_canceled_generation(job_id).await,
+            Some(1),
+            "the canceled generation is not one-shot"
         );
     }
 
@@ -197,4 +201,184 @@ async fn a_delayed_old_generation_is_refused_however_late_it_arrives() {
         json!("canceled"),
         "only a newer generation may run: {fresh}"
     );
+}
+
+/// Test authorizer standing in for the Hub fence.
+struct StubAuthorizer(bool);
+
+impl remuda_node::GateAuthorizer for StubAuthorizer {
+    fn authorize<'a>(
+        &'a self,
+        _job_id: &'a str,
+        _generation: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(std::future::ready(self.0))
+    }
+}
+
+/// Even with NO local cancel record, the Hub fence refuses a generation the
+/// Hub no longer considers live (restart lost the registry, or a record was
+/// never recorded): the run answers canceled before touching git.
+#[tokio::test]
+async fn the_hub_authority_fence_refuses_a_run_the_hub_does_not_authorize() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+    let repo = dir.path().join("never-authorized");
+    let job_id = "gjb_hub_fence_refuse";
+
+    node.gate_test_set_authorizer(std::sync::Arc::new(StubAuthorizer(false)))
+        .await;
+    let result = gate_rpc(
+        &node,
+        "gate.run",
+        run_params(job_id, "lane-fence-refuse", &repo, 1),
+    )
+    .await;
+    assert_eq!(
+        result["status"],
+        json!("canceled"),
+        "a Hub-refused dispatch must not execute: {result}"
+    );
+    // Nothing executed: the missing checkout was never created.
+    assert!(!repo.exists(), "the refused run entered the checkout");
+}
+
+/// With the Hub fence AUTHORIZED, a run proceeds (and fails on the missing
+/// checkout rather than refusing).
+#[tokio::test]
+async fn the_hub_authority_fence_allows_an_authorized_run() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+    let repo = dir.path().join("never-authorized-ok");
+    let job_id = "gjb_hub_fence_allow";
+
+    node.gate_test_set_authorizer(std::sync::Arc::new(StubAuthorizer(true)))
+        .await;
+    let result = gate_rpc(
+        &node,
+        "gate.run",
+        run_params(job_id, "lane-fence-allow", &repo, 1),
+    )
+    .await;
+    assert_ne!(
+        result["status"],
+        json!("canceled"),
+        "an authorized dispatch must run: {result}"
+    );
+}
+
+/// With no authorizer registered (missing/dead link simulation after
+/// clearing), the run fails closed: canceled, no git.
+#[tokio::test]
+async fn a_missing_hub_link_fails_closed() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+    let repo = dir.path().join("never-no-link");
+    let job_id = "gjb_hub_fence_no_link";
+
+    node.gate_test_set_authorizer(std::sync::Arc::new(StubAuthorizer(true)))
+        .await;
+    node.gate_test_clear_authorizer().await;
+    let result = gate_rpc(
+        &node,
+        "gate.run",
+        run_params(job_id, "lane-no-link", &repo, 1),
+    )
+    .await;
+    assert_eq!(
+        result["status"],
+        json!("canceled"),
+        "with no Hub link the run must fail closed: {result}"
+    );
+}
+
+/// (r10 1a) At the job-count cap a NEW job's cancel is REFUSED (no silent
+/// eviction of an older job's authority); an already-tracked job still
+/// records a higher generation in place.
+#[tokio::test]
+async fn at_capacity_a_new_cancel_is_refused_not_evicted() {
+    let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+    // Fill to capacity with distinct jobs (no run is ever sent).
+    for i in 0..4096u32 {
+        let job = format!("gjb_cap_{i}");
+        gate_rpc(
+            &node,
+            "gate.cancel",
+            json!({ "jobId": job, "generation": 1 }),
+        )
+        .await;
+    }
+    // A tracked job updates in place and still succeeds.
+    gate_rpc(
+        &node,
+        "gate.cancel",
+        json!({ "jobId": "gjb_cap_0", "generation": 2 }),
+    )
+    .await;
+    assert_eq!(
+        node.gate_test_canceled_generation("gjb_cap_0").await,
+        Some(2)
+    );
+    // A NEW job over the cap must be refused, not silently evict anyone.
+    let overflow = node
+        .dispatch_gate_rpc(
+            "gate.cancel",
+            &json!({ "jobId": "gjb_cap_overflow", "generation": 1 }),
+        )
+        .await;
+    assert!(
+        overflow.is_err(),
+        "an over-capacity cancel must error: {overflow:?}"
+    );
+    // The oldest tracked authority is intact (nothing evicted).
+    assert_eq!(
+        node.gate_test_canceled_generation("gjb_cap_0").await,
+        Some(2),
+        "cancel authority must never be evicted"
+    );
+    assert_eq!(
+        node.gate_test_canceled_generation("gjb_cap_4095").await,
+        Some(1)
+    );
+}
+
+/// (r10 1b) If the Node loses its local canceled record (process restart),
+/// the Hub fence is what stops the run: with an empty local floor but a
+/// refusing Hub the run is canceled before git; with an authorizing Hub it
+/// proceeds.
+#[tokio::test]
+async fn after_local_state_is_lost_the_hub_fence_still_refuses() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let node = DevNode::new(&DevServerConfig::loopback(0)).expect("node");
+    let repo = dir.path().join("never-after-restart");
+    let job_id = "gjb_restart_fence";
+
+    // A cancel was recorded before the restart.
+    gate_rpc(
+        &node,
+        "gate.cancel",
+        json!({ "jobId": job_id, "generation": 1 }),
+    )
+    .await;
+    assert_eq!(node.gate_test_canceled_generation(job_id).await, Some(1));
+
+    // Simulate the process restart: a fresh registry has no local record,
+    // and the carrier attaches fresh (Hub still says this gen is canceled).
+    node.gate_test_reset_cancel_records().await;
+    assert_eq!(node.gate_test_canceled_generation(job_id).await, None);
+    node.gate_test_set_authorizer(std::sync::Arc::new(StubAuthorizer(false)))
+        .await;
+
+    let result = gate_rpc(
+        &node,
+        "gate.run",
+        run_params(job_id, "lane-restart", &repo, 1),
+    )
+    .await;
+    assert_eq!(
+        result["status"],
+        json!("canceled"),
+        "the Hub fence must refuse after local state was lost: {result}"
+    );
+    assert!(!repo.exists(), "no git after Hub refusal");
 }

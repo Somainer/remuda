@@ -168,6 +168,15 @@ async fn enroll(
             };
             let params = frame.get("params").cloned().unwrap_or(json!({}));
             let result = match method {
+                // r10: the lane Node must answer the Hub's pre-run
+                // gate.authorize fence (the WssGateAuthorizer asks over this
+                // same socket before execute). A scripted lane always speaks
+                // for its own dispatch here; the dedicated cancel tests use
+                // real/carrier-level seams for the refused paths.
+                "gate.authorize" => json!({
+                    "authorized": true,
+                    "generation": params["generation"].clone(),
+                }),
                 "gate.run" => {
                     script.arrivals.lock().unwrap().push(params.clone());
                     run_one_inline(&script, &params, &mut node).await
@@ -225,9 +234,12 @@ async fn enroll(
     })
 }
 
-fn result_json(job_id: &str, spec: &RunSpec) -> Value {
+fn result_json(job_id: &str, spec: &RunSpec, generation: u32) -> Value {
     let mut result = json!({
         "jobId": job_id,
+        // r10: echo the generation of the attempt that produced this verdict,
+        // so a requeued attempt-2 reply matches the current row.
+        "generation": generation,
         "status": spec.status,
         "baseSha": spec.base_sha,
         "mergeSha": spec.merge_sha,
@@ -318,6 +330,17 @@ async fn run_one_inline(script: &Arc<ScriptState>, params: &Value, node: &mut La
                             if spec.wait_cancel {
                                 break;
                             }
+                        } else if method == "gate.authorize" {
+                            // The Hub fence can arrive while the (already
+                            // running) scripted gate.run drains the socket.
+                            let reply = json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "result": {
+                                    "authorized": true,
+                                    "generation": in_params["generation"].clone(),
+                                },
+                            });
+                            let _ = node.send(Message::Text(reply.to_string().into())).await;
                         } else {
                             let reply = json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}});
                             let _ = node.send(Message::Text(reply.to_string().into())).await;
@@ -328,7 +351,14 @@ async fn run_one_inline(script: &Arc<ScriptState>, params: &Value, node: &mut La
             }
         }
     }
-    result_json(&job_id, &spec)
+    result_json(
+        &job_id,
+        &spec,
+        params
+            .get("generation")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
+    )
 }
 
 // ── test harness ───────────────────────────────────────────────────────────

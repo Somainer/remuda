@@ -111,6 +111,91 @@ pub fn routes() -> Router<AppState> {
 
 // ── request shapes ─────────────────────────────────────────────────────────
 
+/// Test-only apply_result pre-read barrier. Every arrival parks AFTER its
+/// state/generation pre-read (while the row is still live) until the test
+/// releases it, so two real arrivals can be forced to both observe Running.
+/// Latching Notify: a release before the park is not lost; every wait is
+/// bounded.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub struct GateApplyBarrier {
+    /// When false arrivals pass straight through (every other test).
+    armed: std::sync::atomic::AtomicBool,
+    parked: std::sync::atomic::AtomicUsize,
+    fired: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+impl GateApplyBarrier {
+    pub(crate) fn new() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            parked: std::sync::atomic::AtomicUsize::new(0),
+            fired: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Start gating arrivals (resets counters/fire).
+    pub fn arm(&self) {
+        self.parked.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.fired.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Release all arrivals parked at the boundary.
+    pub fn release(&self) {
+        if self
+            .fired
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Wait until `n` arrivals have parked at the pre-read boundary.
+    pub async fn wait_parked(&self, n: usize) {
+        for _ in 0..1000 {
+            if self.parked.load(std::sync::atomic::Ordering::SeqCst) >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "only {} arrivals parked (wanted {n})",
+            self.parked.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    /// Park until released. The notified future is created BEFORE the flag
+    /// read, so a release that landed first is observed.
+    pub async fn wait(&self) {
+        // Not armed: this test does not use the barrier.
+        if !self.armed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        self.parked
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let notified = self.notify.notified();
+        if self.fired.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        if tokio::time::timeout(Duration::from_secs(10), notified)
+            .await
+            .is_err()
+        {
+            panic!("gate apply barrier never released");
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EnqueueBody {
@@ -912,6 +997,10 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
     ) {
         return;
     }
+    // Test-only pre-read barrier: park here (row confirmed live + generation
+    // matched) so two real arrivals can be held simultaneously.
+    #[cfg(any(test, feature = "test-faults"))]
+    state.store.gate_apply_barrier().wait().await;
     // Persist the bounded evidence out-of-band first; the job row keeps only
     // the `obj_…` reference. A persistence failure must not lose the verdict.
     let mut log_object_id: Option<String> = None;
@@ -2159,6 +2248,12 @@ pub(crate) enum GateJobClaim {
 
 // ── gate log objects ───────────────────────────────────────────────────────
 
+/// Result of the Hub-side `gate.authorize` fence.
+pub(crate) struct GateDispatchAuth {
+    pub(crate) authorized: bool,
+    pub(crate) state: Option<String>,
+}
+
 /// One persisted bounded gate log (`obj_…`); bytes are the JSON-serialized
 /// `GateRunLog`. Separate from attachment objects: no instance binding, a
 /// project-scoped reader, and a 30-day TTL.
@@ -2273,6 +2368,44 @@ impl Store {
             }
             tx.commit()?;
             Ok(object_id)
+        })
+        .await
+    }
+
+    /// Hub-side fence for the Node's pre-execution `gate.authorize` check.
+    /// Authorized only while the row is Running at EXACTLY the requested
+    /// generation and assigned to the asking host.
+    pub(crate) async fn gate_dispatch_authorized(
+        &self,
+        job_id: &str,
+        host_id: &str,
+        generation: u32,
+    ) -> Result<GateDispatchAuth, crate::store::StoreError> {
+        let job_id = job_id.to_owned();
+        let host_id = host_id.to_owned();
+        self.run_named("gate_dispatch_authorized", move |conn| {
+            // Compare against the persisted doc directly: Running at exactly
+            // this generation, assigned to the asking host.
+            let authorized: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM gate_jobs
+                  WHERE id = ?1
+                    AND json_extract(doc_json, '$.state') = 'running'
+                    AND json_extract(doc_json, '$.attempts') = ?2
+                    AND json_extract(doc_json, '$.hostId') = ?3",
+                params![job_id, generation, host_id],
+                |row| row.get(0),
+            )?;
+            let state: Option<String> = conn
+                .query_row(
+                    "SELECT json_extract(doc_json, '$.state') FROM gate_jobs WHERE id = ?1",
+                    params![job_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(GateDispatchAuth {
+                authorized: authorized > 0,
+                state,
+            })
         })
         .await
     }

@@ -1241,11 +1241,17 @@ export class Outbox {
       // immediately (delay max(0, until-now)), failure count reset.
       this.scheduleClaimWakeup(id, entry.instanceId, lease, 0);
     }
-    // Discover inactive claims with no wake yet — including same-owner rows
-    // another context created after our load (gate 15 item 2). Our own live
-    // deliveries never need a wake.
+    // Discover NEWLY APPEARED inactive SAME-OWNER claims with no wake yet —
+    // inflight rows another document with the persisted recovery owner
+    // created AFTER our load and then crashed (gate 15 item 2). FOREIGN
+    // owners are intentionally excluded: the store's own lease-expiry
+    // scheduler owns their recovery, and arming both double-delivered. Our
+    // own live POST (a cloned-document sibling shares the persisted owner)
+    // is suppressed via activeDeliveries; the per-document instance mutex
+    // (leaseToken) serializes any actual reclaim attempt.
     for (const rec of durable) {
       if (rec.state !== "inflight" || !rec.lease) continue;
+      if (rec.lease.owner !== this.owner) continue;
       if (this.activeDeliveries.has(rec.commandId)) continue;
       if (this.claimWakeups.has(rec.commandId)) continue;
       if (!commandIdFromKey(rec.commandId)) continue;

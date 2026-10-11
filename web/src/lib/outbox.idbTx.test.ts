@@ -363,7 +363,6 @@ it("GATE15 item 1: two cloned-owner documents without Web Locks are mutually exc
       instanceId: "ins_mutex",
       prompt: "once",
       createdAt: 1_000,
-      attempts: 0,
       state: "pending",
     });
 
@@ -417,7 +416,7 @@ it("GATE15 item 1: two cloned-owner documents without Web Locks are mutually exc
 });
 
 it("GATE15 item 1: releaseLease deletes only the matching owner's mutex row", async () => {
-  const db = installFakeIndexedDB();
+  installFakeIndexedDB();
   const opened = await openOutboxStorage();
   const storage = opened.storage;
   const now = Date.now();

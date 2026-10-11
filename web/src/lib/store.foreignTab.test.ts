@@ -229,7 +229,7 @@ it("GATE15 item 3: navigating away from mounted A (deferred REST catch-up owed) 
     events: [],
     windowFromSeq: "1",
     durableSeq: "0",
-    reachedAfterSeq: "0",
+    reachedAfterSeq: true,
   } as Awaited<ReturnType<Api["eventsRead"]>>);
   vi.spyOn(api, "eventsSubscribe").mockImplementation(async () =>
     ({
@@ -265,7 +265,7 @@ it("GATE15 item 3: navigating away from mounted A (deferred REST catch-up owed) 
       events: [],
       windowFromSeq: "1",
       durableSeq: "0",
-      reachedAfterSeq: "0",
+      reachedAfterSeq: true,
     } as Awaited<ReturnType<Api["eventsRead"]>>;
   });
   await hubStore.follow(INSTANCE_B);

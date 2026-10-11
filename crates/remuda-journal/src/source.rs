@@ -183,6 +183,42 @@ impl FileTail {
         self.offset
     }
 
+    /// Whether the still-unread tail contains a complete `started` journal
+    /// record whose `agentId` is `agent_id` (or whose `key` is, for records
+    /// that omit `agentId`). Does NOT advance the cursor: the caller is
+    /// deciding whether a live hook event arrived ahead of this record's
+    /// fold.
+    pub fn unread_starts_agent(&self, agent_id: &str) -> Result<bool, Error> {
+        let mut file = match File::open(&self.path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+            Ok(file) => file,
+        };
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut rest = Vec::new();
+        file.read_to_end(&mut rest)?;
+        for line in rest.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+                continue;
+            };
+            if value.get("type").and_then(serde_json::Value::as_str) != Some("started") {
+                continue;
+            }
+            let named = value
+                .get("agentId")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| value.get("key").and_then(serde_json::Value::as_str))
+                .is_some_and(|id| id == agent_id);
+            if named {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Persistable cursor.
     pub fn resume(&self) -> SourceResume {
         SourceResume {

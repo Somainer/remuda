@@ -93,6 +93,12 @@ pub struct WorkflowJournalTailer {
     /// order). When the run later registers (or the member starts), the member
     /// is marked Failed immediately.
     pending_failed: HashSet<String>,
+    /// c-cardsettle-fu2 r5 item 2: agent ids whose live StopFailure arrived
+    /// while their RETRY's own journal `started` was already written but not
+    /// yet folded. Armed on the member(s) for the duration of the next poll's
+    /// journal fold so that start cannot resurrect the failure; consumed
+    /// (drained) after that run's lines have folded.
+    failure_ahead_agents: HashSet<String>,
     /// Main session transcript path. Every run adopts an end-anchored tail at
     /// registration, so a run launched minutes after the SessionStart bind
     /// never re-reads pre-launch transcript bytes.
@@ -153,6 +159,14 @@ struct MemberState {
     /// counter was already bumped by ANOTHER agent must only resurrect when
     /// THIS member previously consumed a start.
     consumed_journal_start: bool,
+    /// c-cardsettle-fu2 r5 item 2: a live StopFailure for a RETRY arrived
+    /// while that retry's own journal `started` was already written but not
+    /// yet folded. The start folding in the current poll is bound to THAT
+    /// failure (not evidence the member is running again), so it must not
+    /// resurrect the member; the flag is armed for the duration of one poll
+    /// by the tailer (which can see both the hook failure and the unread
+    /// journal tail) and cleared after the run's lines are folded.
+    failure_ahead: bool,
     state: WorkflowState,
     label: Option<String>,
     phase: Option<String>,
@@ -201,6 +215,7 @@ impl WorkflowJournalTailer {
             ids,
             runs: Vec::new(),
             pending_failed: HashSet::new(),
+            failure_ahead_agents: HashSet::new(),
             main_transcript_path: None,
             main_transcript_scan: false,
         }
@@ -371,6 +386,20 @@ impl WorkflowJournalTailer {
             .position(|run| run.native_id == run_id)
             .expect("run registered above");
         self.runs[index].agent_failed(agent_id, agent_transcript_path);
+        // c-cardsettle-fu2 r5 item 2: if a journal `started` for this agent is
+        // already on disk but unread, this StopFailure settles THAT attempt
+        // (a failed RETRY whose start record the poll has not folded yet).
+        // Arm the one-poll marker so the start cannot resurrect the member at
+        // the next fold; only a start appended AFTER this poll is a genuine
+        // retry.
+        let journal_path = self.runs[index].dir.join("journal.jsonl");
+        let start_ahead = self
+            .tails
+            .get(&journal_path)
+            .is_some_and(|tail| tail.unread_starts_agent(agent_id).unwrap_or(false));
+        if start_ahead {
+            self.failure_ahead_agents.insert(agent_id.to_owned());
+        }
         self.emit_snapshots()
     }
 
@@ -443,6 +472,21 @@ impl WorkflowJournalTailer {
         // Journal lines are native transitions: fold one at a time and emit the
         // snapshot each line changes, preserving transition order on catch-up.
         for index in 0..self.runs.len() {
+            // r5 item 2: arm the members whose live StopFailure arrived ahead
+            // of their (already-written, unread) retry start, for the duration
+            // of this run's fold below.
+            let armed: Vec<String> = self
+                .failure_ahead_agents
+                .iter()
+                .filter(|agent_id| {
+                    self.runs[index]
+                        .members
+                        .iter()
+                        .any(|member| member.agent_id == **agent_id)
+                })
+                .cloned()
+                .collect();
+            self.runs[index].arm_failure_ahead(&armed);
             let journal_path = self.runs[index].dir.join("journal.jsonl");
             let lines = match self.tails.get_mut(&journal_path) {
                 Some(tail) => tail.poll()?,
@@ -457,6 +501,16 @@ impl WorkflowJournalTailer {
                 // real transition even if a later line completes it).
                 self.runs[index].recompute_phases();
                 out.extend(self.run_envelopes(index)?);
+            }
+            // All unread lines the failure was ahead of are now folded: the
+            // member held terminal for every one of them; consume the markers
+            // (a genuinely NEWER start appended after this poll resurrects
+            // through the normal retry rule).
+            if !armed.is_empty() {
+                self.runs[index].clear_failure_ahead();
+                for agent_id in armed {
+                    self.failure_ahead_agents.remove(&agent_id);
+                }
             }
         }
 
@@ -1308,9 +1362,14 @@ impl RunState {
                 //   different agent id already bumped (started(k,a0) then
                 //   started(k,a1) counts the key to 2, but a1 never consumed
                 //   a start).
+                // r5 item 2: it also must not fire when a live StopFailure
+                // for THIS attempt is already known but its failure record
+                // has not folded yet (failure_ahead): the start being folded
+                // is the settled attempt's own start, not a newer retry.
                 // Same-attempt folds and the placeholder's own first start
                 // never downgrade a terminal outcome.
-                let genuine_retry = is_newer_attempt && member.consumed_journal_start;
+                let genuine_retry =
+                    is_newer_attempt && member.consumed_journal_start && !member.failure_ahead;
                 member.key = Some(key.clone());
                 member.attempt = attempt;
                 if !terminal || genuine_retry {
@@ -1393,6 +1452,26 @@ impl RunState {
             .find(|member| member.agent_id == agent_id)
         {
             member.phase = Some(phase);
+        }
+    }
+
+    /// r5 item 2: arm [`MemberState::failure_ahead`] on the named members for
+    /// the duration of one journal fold.
+    fn arm_failure_ahead(&mut self, agent_ids: &[String]) {
+        for member in &mut self.members {
+            if agent_ids
+                .iter()
+                .any(|agent_id| agent_id == &member.agent_id)
+            {
+                member.failure_ahead = true;
+            }
+        }
+    }
+
+    /// Clear all one-poll failure-ahead markers in this run.
+    fn clear_failure_ahead(&mut self) {
+        for member in &mut self.members {
+            member.failure_ahead = false;
         }
     }
 
@@ -1702,6 +1781,7 @@ impl MemberState {
             jsonl: None,
             meta_read: false,
             stopped: false,
+            failure_ahead: false,
         }
     }
 }

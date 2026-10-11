@@ -806,6 +806,11 @@ fn session_stock_increments(
 type SessionPointRow = (Option<i64>, Option<i64>, String, Option<String>);
 
 /// Ordered session points; scoped or legacy NULL-scope only.
+/// Ordered session points; scoped or legacy NULL-scope only. Rate windows
+/// (c-ctxusage r8 item 9) may use NATIVE timestamps only: a timestamp-free
+/// historical replay is stamped with the ingest time and would otherwise look
+/// like current throughput. Legacy rows are conservatively 'ingest' and
+/// therefore produce no trustworthy increments.
 fn session_point_rows(
     conn: &Connection,
     instance_id: &str,
@@ -820,6 +825,7 @@ fn session_point_rows(
         "SELECT input_tokens, output_tokens, observed_at, scope_id
          FROM usage_events
          WHERE instance_id = ?1 AND scope = 'session' AND {predicate}
+           AND observed_at_source = 'native'
          ORDER BY scope_id ASC, observed_at ASC, seq ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -889,19 +895,23 @@ fn sum_session_increments_since(
     Ok((input, output))
 }
 
-/// One session's latest cumulative point: the four counters and its native
+/// One session's latest cumulative point: the four counters and its observed
 /// time, one row per scope id.
 type LatestStockPoint = (Option<i64>, Option<i64>, Option<i64>, Option<i64>, String);
 
-/// The summed current cumulative stock across session ids, plus its newest
-/// native time.
+/// The summed current cumulative stock across session ids. Timekeeping is
+/// split: `native_observed_at` is the newest NATIVE session time and is the
+/// only value allowed to drive lastTurnAt / rate windows (c-ctxusage r8
+/// item 9); `latest_observed_at` may be an ingest fallback and is used only
+/// for ordering/display that cannot trust freshness.
 #[derive(Debug, Default, Clone)]
 struct SessionStock {
     input: Option<i64>,
     output: Option<i64>,
     cache_read: Option<i64>,
     cache_write: Option<i64>,
-    observed_at: Option<String>,
+    native_observed_at: Option<String>,
+    latest_observed_at: Option<String>,
 }
 
 /// The latest cumulative session growth point for EACH scope id (c-ctxusage
@@ -915,7 +925,10 @@ fn latest_session_stock(
     conn: &Connection,
     instance_id: &str,
 ) -> rusqlite::Result<(SessionStock, bool)> {
-    // Newest point per scoped session id, in native time / seq order.
+    // Newest point per scoped session id for counters, in observed time / seq
+    // order. The timestamp source travels with the point so an ingest
+    // fallback can never be mistaken for a native session time (c-ctxusage r8
+    // item 9).
     let mut stmt = conn.prepare(
         "WITH ranked AS (
             SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
@@ -943,13 +956,26 @@ fn latest_session_stock(
             stock.output = add_optional(stock.output, *output);
             stock.cache_read = add_optional(stock.cache_read, *cache_read);
             stock.cache_write = add_optional(stock.cache_write, *cache_write);
-            stock.observed_at = Some(observed_at.clone());
+            if stock.latest_observed_at.as_deref() < Some(observed_at.as_str()) {
+                stock.latest_observed_at = Some(observed_at.clone());
+            }
         }
-        // observed_at is the newest of the per-scope latest points.
-        stock.observed_at = points.into_iter().map(|(_, _, _, _, at)| at).max();
+        // Trustworthy freshness signal, independent of the newest-by-any-time
+        // counters point: the newest NATIVE session time across sessions.
+        stock.native_observed_at = conn
+            .query_row(
+                "SELECT MAX(observed_at) FROM usage_events
+                 WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NOT NULL
+                   AND observed_at_source = 'native'",
+                params![instance_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap_or(None);
         return Ok((stock, true));
     }
-    // Legacy fallback: the newest NULL-scope row.
+    // Legacy fallback: the newest NULL-scope row. Legacy rows predate source
+    // tracking and are conservatively 'ingest', so native_observed_at stays
+    // None — a legacy cumulative total cannot author a lastTurnAt.
     let stock = conn
         .query_row(
             "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, observed_at
@@ -963,7 +989,8 @@ fn latest_session_stock(
                     output: r.get(1)?,
                     cache_read: r.get(2)?,
                     cache_write: r.get(3)?,
-                    observed_at: r.get(4)?,
+                    native_observed_at: None,
+                    latest_observed_at: Some(r.get(4)?),
                 })
             },
         )
@@ -1139,7 +1166,9 @@ pub fn rollup_instance(
     let per_minute_5m =
         |total: Option<i64>| -> Option<i64> { total.map(|n| (n as f64 / 5.0).round() as i64) };
 
-    let last_turn_at = totals.last_turn_at.or(stock.observed_at);
+    // c-ctxusage r8 item 9: only a NATIVE session time may author lastTurnAt;
+    // an ingest fallback stamped at replay time is not session activity.
+    let last_turn_at = totals.last_turn_at.or(stock.native_observed_at);
 
     Ok(Some(InstanceUsageRollup {
         context_used_tokens,
@@ -3233,5 +3262,85 @@ mod tests {
             Some(receipt.as_str()),
             "lastTurnAt follows the live receipt time"
         );
+    }
+
+    /// c-ctxusage r8 item 9: the Codex adapter emits BOTH a Turn snapshot
+    /// (native time) and a Session snapshot (no nativeAt → ingest fallback)
+    /// per turn end. A timestamp-free historical Session replay must not
+    /// restore the ingest time as lastTurnAt or leak into session rates;
+    /// trustworthy timing comes only from NATIVE timestamps.
+    #[test]
+    fn ingest_session_replay_does_not_author_last_turn_at_or_rates() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let now = {
+            let t = time::OffsetDateTime::now_utc();
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                t.year(),
+                u8::from(t.month()),
+                t.day(),
+                t.hour(),
+                t.minute(),
+                t.second(),
+                t.millisecond()
+            )
+        };
+
+        // Session-only harness (e.g. Grok): one live NATIVE stock, then a
+        // restart replay of historical Session rows WITHOUT nativeAt (ingest
+        // fallback at 2026-09-15 — "now" per the test helper's observed_at).
+        let native_old = "2026-09-14T12:00:00.000Z";
+        assert!(insert(
+            &conn,
+            &scoped_record(1, "ins_9", "session", Some("g1"), 1, 100, 10, 0, 0, Some(native_old))
+        ));
+        // Two timestamp-free replay growth points (would be within any window
+        // if their ingest time counted) — including a fresh larger stock.
+        assert!(insert(
+            &conn,
+            &scoped_record(10, "ins_9", "session", Some("g1"), 2, 120, 12, 0, 0, None)
+        ));
+        assert!(insert(
+            &conn,
+            &scoped_record(11, "ins_9", "session", Some("g1"), 3, 140, 14, 0, 0, None)
+        ));
+
+        let rollup = rollup_instance(&conn, "ins_9", "grok", None)
+            .unwrap()
+            .unwrap();
+        // lastTurnAt tracks the native time, never the ingest fallback.
+        assert_eq!(
+            rollup.last_turn_at.as_deref(),
+            Some(native_old),
+            "ingest-fallback session rows must not restore the ingest time"
+        );
+        // Rates key off native-timestamped points only; the replay increments
+        // (100 -> 120 -> 140 at ingest "now") must not read as throughput.
+        // The single native point has no predecessor, so the rate is unknown.
+        assert_eq!(rollup.tpm_in_60s, None, "ingest replay is not throughput");
+        assert_eq!(rollup.tpm_out_60s, None);
+
+        // A fresh LIVE session point with a native time "now" takes over both
+        // lastTurnAt and the windows: its increment vs the previous NATIVE
+        // stock is the rate.
+        assert!(insert(
+            &conn,
+            &scoped_record(12, "ins_9", "session", Some("g1"), 4, 150, 15, 0, 0, Some(&now))
+        ));
+        let rollup = rollup_instance(&conn, "ins_9", "grok", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.last_turn_at.as_deref(),
+            Some(now.as_str()),
+            "a new native point updates lastTurnAt"
+        );
+        assert_eq!(
+            rollup.tpm_in_60s,
+            Some(50),
+            "increment between native stocks 100 -> 150, replay points ignored"
+        );
+        assert_eq!(rollup.tpm_out_60s, Some(5));
     }
 }

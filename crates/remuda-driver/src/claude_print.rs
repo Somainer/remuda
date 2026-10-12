@@ -3638,18 +3638,21 @@ impl TranscriptMapper {
     fn map_effort_assistant(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
         let effort = value.get("effort").and_then(Value::as_str);
         let per_turn = value.get("perTurnEffort").and_then(Value::as_str);
-        // r19 item 2 ruling B: an assistant record carrying a parseable level
-        // is an authoritative effective-state read-back and clears the
-        // suppressed-acceptance slot unconditionally — even a same-value
-        // record that produces no edge. A record with no level (the common
-        // case) reaches neither observe_level nor this invalidation.
-        let raw_level = [effort, per_turn]
-            .into_iter()
-            .flatten()
-            .find(|raw| !raw.trim().is_empty());
-        let level_read = raw_level.is_some_and(|raw| {
-            remuda_protocol::EffortTracker::parse_level(raw, self.effort.semantics()).is_some()
-        });
+        // r19 item 2 ruling B: a CURRENT-process assistant record carrying a
+        // parseable level is an authoritative effective-state read-back and
+        // clears the suppressed-acceptance slot unconditionally — even a
+        // same-value record that produces no edge. Replayed pre-launch
+        // records (and a record with no level) reach neither observe_level
+        // nor this invalidation.
+        let level_read = self.effort.is_current_process()
+            && [effort, per_turn]
+                .into_iter()
+                .flatten()
+                .find(|raw| !raw.trim().is_empty())
+                .is_some_and(|raw| {
+                    remuda_protocol::EffortTracker::parse_level(raw, self.effort.semantics())
+                        .is_some()
+                });
         let Some((observed, source)) = self.effort.observe(effort, per_turn) else {
             if level_read {
                 self.invalidate_deferred_effort();

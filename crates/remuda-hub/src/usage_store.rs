@@ -1014,28 +1014,31 @@ pub enum BudgetStatus {
     Stop,
 }
 
-/// c-usagefu r11 Ruling B1 (replaces the r10 timestamp-window rule): ONE
-/// shared eligible-FLOW relation by CALL identity, used by the rollup, both
+/// c-usagefu r11 Ruling B1, made EXACT by r12 item 4 (Ruling B2'): ONE shared
+/// eligible-FLOW relation by CALL identity, used by the rollup, both
 /// aggregates and the TPM windows.
 ///
 /// Each native turn is counted EITHER from its Turn row OR from its Message
 /// rows, never both.
 ///
-/// * A MODERN Message (`turn_id` present) is counted only when either there is
-///   no Turn row for that turn, or those Messages PROVABLY cover the whole
-///   turn (see [`turn_fully_covered_sql`]). When coverage is partial — e.g. a
-///   pre-fix accepted usage record without a response id was never emitted as
-///   a Message — the Turn is counted and that turn's Messages are dropped.
+/// * A MODERN Message (`turn_id` present) is counted only when either:
+///   * the turn has a Turn row AND its Messages PROVABLY cover the whole turn
+///     — EVERY counted record of the turn carries a persisted DURABLE identity
+///     (the `v2` (rollout file, byte offset) marker) and the per-bucket sums
+///     equal the Turn ([`turn_fully_covered_sql`]); or
+///   * the turn has NO Turn row and its coverage does NOT MIX legacy
+///     identities (pre-r12 fallback / native response_id) with durable ones.
+///     A turn that mixes after an upgrade byte-0 replay can never be proven
+///     to avoid double counting, so its Messages are dropped (B2'); a purely
+///     legacy turn keeps counting as before, a purely durable one normally.
 /// * A LEGACY Message has no `turn_id` (pre-r6 codex emitted a Turn for EVERY
 ///   call alongside the attribution-less Message). B1 needs NO clocks: when
 ///   the instance has ANY Turn row at all, every legacy Message is dropped;
 ///   when the instance has NO Turn rows whatsoever, its legacy Messages are
-///   all counted. There is no timestamp window and no cross-clock comparison,
-///   so an unrelated legacy Message is never kept (turns exist) or dropped
-///   (no turns) because of how far apart the clocks are.
-/// * A Turn row is counted only when its modern Messages do NOT provably cover
-///   it completely. A legacy-covered turn therefore always counts (its
-///   Messages are the link-less legacy kind).
+///   all counted. There is no timestamp window and no cross-clock comparison.
+/// * A Turn row is counted only when its Messages do NOT provably cover it
+///   completely with durable identities. A legacy-covered, partially-covered
+///   or identity-mixed turn therefore always counts from its Turn row.
 fn eligible_flow_predicate(outer: &str) -> String {
     let cover_linked =
         turn_fully_covered_sql(&format!("{outer}.instance_id"), &format!("{outer}.turn_id"));
@@ -1043,15 +1046,18 @@ fn eligible_flow_predicate(outer: &str) -> String {
         &format!("{outer}.instance_id"),
         &format!("{outer}.scope_id"),
     );
+    let mixed_without_turn =
+        turn_identity_mixed_sql(&format!("{outer}.instance_id"), &format!("{outer}.turn_id"));
     format!(
         "(({outer}.scope = 'message' AND {outer}.turn_id IS NOT NULL
             AND (
-                NOT EXISTS (
+                (NOT EXISTS (
                     SELECT 1 FROM usage_events _ef_t
                     WHERE _ef_t.instance_id = {outer}.instance_id
                       AND _ef_t.scope = 'turn'
                       AND _ef_t.scope_id = {outer}.turn_id
-                )
+                 )
+                 AND NOT ({mixed_without_turn}))
                 OR ({cover_linked})
             )
          )
@@ -1066,21 +1072,79 @@ fn eligible_flow_predicate(outer: &str) -> String {
     )
 }
 
+/// SQL boolean: the linked Message rows of turn `(inst, tid)` include BOTH a
+/// record with the durable (rollout file, byte offset) identity AND one
+/// without it (a pre-r12 fallback/native response_id identity, or a missing
+/// scope id). Ruling B2' (c-usagefu r12 item 4): such a turn mixes eras after
+/// an upgrade byte-0 replay and cannot be counted from Messages without
+/// risking a double count.
+fn turn_identity_mixed_sql(inst: &str, tid: &str) -> String {
+    format!(
+        "({has_durable} AND {has_legacy})",
+        has_durable = turn_has_durable_message_sql(inst, tid, "_mix_d"),
+        has_legacy = turn_has_nondurable_message_sql(inst, tid, "_mix_l"),
+    )
+}
+
+/// SQL boolean: at least one linked Message of `(inst, tid)` carries the
+/// persisted durable identity marker. `alias` must be unique per use inside
+/// one enclosing statement (SQLite forbids duplicate correlation aliases).
+fn turn_has_durable_message_sql(inst: &str, tid: &str, alias: &str) -> String {
+    let marker = remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX;
+    format!(
+        "EXISTS (
+            SELECT 1 FROM usage_events {alias}
+            WHERE {alias}.instance_id = {inst}
+              AND {alias}.scope = 'message'
+              AND {alias}.turn_id = {tid}
+              AND substr({alias}.scope_id, 1, {len}) = '{marker}'
+        )",
+        len = marker.len(),
+    )
+}
+
+/// SQL boolean: at least one linked Message of `(inst, tid)` LACKS the durable
+/// identity marker — a native response_id scope, a pre-r11 fallback id, or a
+/// missing scope id. Such a record cannot be proven replay-stable against the
+/// r12 adapter's (file, offset) identity.
+fn turn_has_nondurable_message_sql(inst: &str, tid: &str, alias: &str) -> String {
+    let marker = remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX;
+    format!(
+        "EXISTS (
+            SELECT 1 FROM usage_events {alias}
+            WHERE {alias}.instance_id = {inst}
+              AND {alias}.scope = 'message'
+              AND {alias}.turn_id = {tid}
+              AND ({alias}.scope_id IS NULL
+                   OR substr({alias}.scope_id, 1, {len}) != '{marker}')
+        )",
+        len = marker.len(),
+    )
+}
+
 /// True when the Messages linked to turn `(inst, tid)` PROVABLY cover the whole
-/// turn (Ruling B item 5):
+/// turn (Ruling B item 5; c-usagefu r12 item 4 makes Ruling B2' exact):
 ///
-/// - at least one linked Message carries a persisted response-level identity
-///   (`scope_id`, a real response id or the durable fallback id the adapter
-///   mints for a record without one);
-/// - for every TOKEN bucket the Turn row actually reports, the linked Messages'
-///   sum EQUALS it. A bucket the Turn leaves NULL (a sparse historical Turn
-///   never carried total/cache-write) cannot disprove coverage and is not
-///   compared; the Messages may additionally report buckets the Turn omitted.
-///   When a response record was not persisted the bucket sum falls short of the
-///   Turn and the Turn is billed instead. Cost is deliberately NOT part of the
-///   proof: it is a priced projection that may legitimately differ from a
-///   historical Turn, and item 6 makes cost follow the SAME eligible-flow
-///   selection (covered → Message cost; uncovered → Turn cost).
+/// - EVERY counted record linked to the turn carries a persisted DURABLE
+///   response-level identity — the r12 `v2` (rollout file identity, byte
+///   offset) marker the adapter now mints for every token_usage_record. A
+///   single linked Message under a legacy identity (a native response_id
+///   scope, a pre-r11 fallback id, or a missing scope id) makes coverage
+///   unprovable: the turn could mix eras after an upgrade replay, so the
+///   Turn is billed and its Messages dropped. "At least one durable Message
+///   plus matching sums" is NOT sufficient (r11's looser rule suppressed
+///   Turns whose identity set could double count on replay) — existence of
+///   any durable linked Message is implied by this test;
+/// - for every TOKEN bucket the Turn row actually reports, the linked
+///   Messages' sum EQUALS it. A bucket the Turn leaves NULL (a sparse
+///   historical Turn never carried total/cache-write) cannot disprove
+///   coverage and is not compared; the Messages may additionally report
+///   buckets the Turn omitted. When a response record was not persisted the
+///   bucket sum falls short of the Turn and the Turn is billed instead.
+///   Cost is deliberately NOT part of the proof: it is a priced projection
+///   that may legitimately differ from a historical Turn, and item 6 makes
+///   cost follow the SAME eligible-flow selection (covered → Message cost;
+///   uncovered → Turn cost).
 fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
     let buckets = [
         "total_tokens",
@@ -1089,15 +1153,15 @@ fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
         "cache_read_tokens",
         "cache_write_tokens",
     ];
-    let mut conds = vec![format!(
-        "EXISTS (
-            SELECT 1 FROM usage_events _fc_e
-            WHERE _fc_e.instance_id = {inst}
-              AND _fc_e.scope = 'message'
-              AND _fc_e.turn_id = {tid}
-              AND _fc_e.scope_id IS NOT NULL
-        )"
-    )];
+    // Every linked counted record must be durable: at least one durable
+    // linked Message AND none lacking the durable marker.
+    let mut conds = vec![
+        turn_has_durable_message_sql(inst, tid, "_fc_d"),
+        format!(
+            "NOT {}",
+            turn_has_nondurable_message_sql(inst, tid, "_fc_l")
+        ),
+    ];
     for bucket in buckets {
         // Each condition is a full OR and MUST be parenthesized: the list is
         // joined with AND, and a bare `A IS NULL OR B = C` would let AND bind
@@ -2572,18 +2636,23 @@ mod tests {
 
     #[test]
     fn partially_covered_turn_bills_the_turn_and_a_fully_covered_one_bills_messages() {
-        // c-usagefu r10 item 5 (Ruling B): a Turn is suppressed in favour of
-        // its Messages only when they PROVABLY cover the whole turn.
-        //   t1: Turn 120 / $0.12 with ONE linked Message r1 = 100 / $0.10 —
-        //       the other accepted record (20, no response_id) was never
-        //       emitted as a Message, so coverage is incomplete -> count the
-        //       Turn 120 and drop r1 (never 100, never 220).
-        //   t2: Turn 120 / $0.12 fully covered by r2a = 100 plus r2b = 20
-        //       persisted under the adapter's DURABLE FALLBACK response id —
-        //       sums equal the Turn -> bill the two Messages, drop the Turn.
+        // c-usagefu r10 item 5 (Ruling B), exact identity rule from r12 item 4
+        // (Ruling B2'): a Turn is suppressed in favour of its Messages only
+        // when EVERY counted record of the turn carries the persisted durable
+        // (rollout file, byte offset) identity and the sums cover the Turn.
+        //   t1: Turn 120 / $0.12 with ONE linked Message r1 = 100 / $0.10
+        //       under a LEGACY response_id identity (the other accepted 20
+        //       record was never emitted as a Message) -> coverage unprovable,
+        //       count the Turn 120 and drop r1 (never 100, never 220).
+        //   t2: Turn 120 / $0.12 fully covered by r2a = 100 plus r2b = 20,
+        //       BOTH persisted under the r12 durable v2 identity -> bill the
+        //       two Messages, drop the Turn.
         // Both turns contribute 120 -> 240 output, $0.24.
+        use remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX as M;
+        let r2a = format!("{M}100:rollout-partial");
+        let r2b = format!("{M}260:rollout-partial");
         let conn = open_old_dual_schema();
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "INSERT INTO usage_events
                 (instance_id, seq, scope, scope_id, turn_id, mode,
                  output_tokens, cost_usd, observed_at, observed_at_source,
@@ -2595,19 +2664,41 @@ mod tests {
                 ('ins_partial', 2, 'turn', 't1', 't1', 'snapshot',
                  120, '0.12', '2030-01-01T00:00:01.000Z', 'native',
                  'pvp_partial', 'gpt-5.4'),
-                ('ins_partial', 3, 'message', 'r2a', 't2', 'snapshot',
+                ('ins_partial', 3, 'message', '{r2a}', 't2', 'snapshot',
                  100, '0.10', '2030-01-01T00:00:04.000Z', 'native',
                  'pvp_partial', 'gpt-5.4'),
-                ('ins_partial', 4, 'message',
-                 '_remuda_codex_response:t2:7', 't2', 'snapshot',
+                ('ins_partial', 4, 'message', '{r2b}', 't2', 'snapshot',
                  20, '0.02', '2030-01-01T00:00:04.500Z', 'native',
                  'pvp_partial', 'gpt-5.4'),
                 ('ins_partial', 5, 'turn', 't2', 't2', 'snapshot',
                  120, '0.12', '2030-01-01T00:00:05.000Z', 'native',
                  'pvp_partial', 'gpt-5.4');",
-        )
+        ))
         .unwrap();
         migrate(&conn).unwrap();
+
+        // Per-row eligibility — the totals alone cannot tell a covered Turn
+        // from a billed one (120 == 100 + 20 either way): t1's Turn counts
+        // and its legacy Message drops; t2's Turn drops and BOTH durable
+        // Messages count.
+        let eligible = |scope: &str, scope_id: &str| -> bool {
+            conn.query_row(
+                &format!(
+                    "SELECT ({pred}) FROM usage_events
+                     WHERE instance_id='ins_partial' AND scope=?1 AND scope_id=?2",
+                    pred = eligible_flow_predicate("usage_events")
+                ),
+                params![scope, scope_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                == 1
+        };
+        assert!(eligible("turn", "t1"), "t1 Turn is billed");
+        assert!(!eligible("message", "r1"), "t1's legacy Message is dropped");
+        assert!(!eligible("turn", "t2"), "t2 Turn is suppressed");
+        assert!(eligible("message", &r2a), "t2 durable Message a counts");
+        assert!(eligible("message", &r2b), "t2 durable Message b counts");
 
         let agg = aggregate_instance(&conn, "ins_partial").unwrap();
         assert_eq!(
@@ -2622,6 +2713,117 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(rollup.session_output_tokens, Some(240));
+    }
+
+    #[test]
+    fn a_turn_is_suppressed_only_when_every_counted_record_has_a_durable_identity() {
+        // c-usagefu r12 item 4 (Ruling B2'): "at least one Message plus
+        // matching sums" never suppresses a Turn — EVERY counted record of
+        // the turn must carry the persisted durable (rollout file, byte
+        // offset) identity. Actual old-schema database, migrated, five turns:
+        //
+        //  t1 Turn 120 + linked Messages: a LEGACY response_id record 100
+        //     (stale-priced 0.99) and a DURABLE record 20 (0.02) — sums match
+        //     but identities MIX -> bill the Turn 120 / 0.12, drop both.
+        //  t2 Turn 120 + two DURABLE Messages 100+20 (0.10+0.02) -> fully
+        //     covered, suppress the Turn, bill the Messages.
+        //  t3 NO Turn row: LEGACY 50 + DURABLE 50 (an upgrade byte-0 replay
+        //     duplicated the call under a new identity) -> MIXED: drop the
+        //     Messages, count nothing (never 100).
+        //  t4 NO Turn row, one LEGACY Message 30 -> pure-legacy turn counts.
+        //  t5 NO Turn row, one DURABLE Message 70 -> modern turn counts.
+        //
+        // Output: 120 + 120 + 0 + 30 + 70 = 340. The r11 rule suppressed t1
+        // on sums alone (billing the stale 0.99) and counted t3 twice:
+        // 120 (msgs 1.01) + 120 + 100 + 30 + 70 = 440 / $1.15.
+        use remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX as M;
+        let d = |off: u64| format!("{M}{off}:rollout-r12-item4");
+        let conn = open_old_dual_schema();
+        conn.execute_batch(&format!(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode,
+                 output_tokens, cost_usd, observed_at, observed_at_source,
+                 profile_id, model)
+             VALUES
+                ('ins_durable', 1, 'message', 'legacy-r1', 't1', 'snapshot',
+                 100, '0.99', '2030-01-01T00:00:00.000Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 2, 'message', '{d1b}', 't1', 'snapshot',
+                 20, '0.02', '2030-01-01T00:00:00.200Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 3, 'turn', 't1', 't1', 'snapshot',
+                 120, '0.12', '2030-01-01T00:00:01.000Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 4, 'message', '{d2a}', 't2', 'snapshot',
+                 100, '0.10', '2030-01-01T00:00:02.000Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 5, 'message', '{d2b}', 't2', 'snapshot',
+                 20, '0.02', '2030-01-01T00:00:02.200Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 6, 'turn', 't2', 't2', 'snapshot',
+                 120, '0.12', '2030-01-01T00:00:03.000Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 7, 'message', 'legacy-r3', 't3', 'snapshot',
+                 50, '0.05', '2030-01-01T00:00:04.000Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 8, 'message', '{d3b}', 't3', 'snapshot',
+                 50, '0.05', '2030-01-01T00:00:04.200Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 9, 'message', 'legacy-r4', 't4', 'snapshot',
+                 30, '0.03', '2030-01-01T00:00:05.000Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 10, 'message', '{d5}', 't5', 'snapshot',
+                 70, '0.07', '2030-01-01T00:00:06.000Z', 'native',
+                 'pvp_d', 'gpt-5.4');",
+            d1b = d(300),
+            d2a = d(400),
+            d2b = d(520),
+            d3b = d(640),
+            d5 = d(760),
+        ))
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        let eligible = |scope: &str, scope_id: &str| -> bool {
+            conn.query_row(
+                &format!(
+                    "SELECT ({pred}) FROM usage_events
+                     WHERE instance_id='ins_durable' AND scope=?1 AND scope_id=?2",
+                    pred = eligible_flow_predicate("usage_events")
+                ),
+                params![scope, scope_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                == 1
+        };
+        // t1: the mixed turn bills its Turn and drops both Messages.
+        assert!(eligible("turn", "t1"), "mixed-identity t1 bills the Turn");
+        assert!(!eligible("message", "legacy-r1"));
+        assert!(!eligible("message", &d(300)));
+        // t2: every record durable -> Messages bill, Turn suppresses.
+        assert!(!eligible("turn", "t2"), "fully durable t2 suppresses Turn");
+        assert!(eligible("message", &d(400)));
+        assert!(eligible("message", &d(520)));
+        // t3: no Turn, mixed identities -> nothing counts.
+        assert!(
+            !eligible("message", "legacy-r3"),
+            "mixed no-Turn turn drops"
+        );
+        assert!(!eligible("message", &d(640)));
+        // t4/t5: unmixed no-Turn turns count.
+        assert!(eligible("message", "legacy-r4"), "pure-legacy turn counts");
+        assert!(eligible("message", &d(760)), "pure-durable turn counts");
+
+        let agg = aggregate_instance(&conn, "ins_durable").unwrap();
+        assert_eq!(
+            agg.output_tokens, 340,
+            "120 t1 Turn + 120 t2 Messages + 0 t3 mixed + 30 + 70"
+        );
+        assert!(
+            (agg.cost_usd - 0.34).abs() < 1e-9,
+            "0.12 + 0.12 + 0 + 0.03 + 0.07"
+        );
     }
 
     #[test]

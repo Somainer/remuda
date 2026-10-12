@@ -39,7 +39,10 @@ struct ReplyHold {
 
 impl ReplyHold {
     async fn wait_arrived(&self) {
-        self.arrived.notified().await;
+        // Bounded: a missed arm/frame must fail the test, never hang it.
+        tokio::time::timeout(Duration::from_secs(10), self.arrived.notified())
+            .await
+            .expect("held RPC frame never arrived within the bounded wait");
     }
 
     fn release(&self) {
@@ -181,8 +184,15 @@ async fn service_inbound(
         .and_then(|op_id| holds.lock().expect("holds").get(op_id).cloned());
     if let Some(hold) = hold {
         hold.arrived.notify_waiters();
-        while !hold.released.load(Ordering::SeqCst) {
-            hold.release.notified().await;
+        // r13 item 9: arm the notified() BEFORE checking the flag so a release
+        // that lands between the load and the await cannot be missed (a missed
+        // notify_waiters permit hung this loop forever).
+        loop {
+            let notified = hold.release.notified();
+            if hold.released.load(Ordering::SeqCst) {
+                break;
+            }
+            notified.await;
         }
     }
     if frame.get("id").is_none() {
@@ -199,8 +209,14 @@ async fn service_inbound(
         // frames (a node->Hub gate.event) while this RPC is held.
         let out = out.clone();
         tokio::spawn(async move {
-            while !hook.released.load(Ordering::SeqCst) {
-                hook.release.notified().await;
+            // Arm notified() before the flag read so an immediate release is
+            // not missed (r13 item 9).
+            loop {
+                let notified = hook.release.notified();
+                if hook.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                notified.await;
             }
             let rpc_id = frame["id"].clone();
             let mut sink = out.lock().await;

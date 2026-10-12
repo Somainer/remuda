@@ -861,6 +861,12 @@ pub struct GateRunHold {
 
 #[cfg(any(test, feature = "test-faults"))]
 impl GateRunHold {
+    /// Bounded wait for a test-only gate hold to resolve. A parked gate.run
+    /// parks for minutes legitimately, but a TEST must never block forever on
+    /// a missed arm/arrival: fail loudly instead of hanging the harness.
+    #[cfg(any(test, feature = "test-faults"))]
+    const HOLD_WAIT: Duration = Duration::from_secs(30);
+
     /// Called by the run handler: publish arrival, then park until released.
     /// Both happen through oneshot channels, so a release that precedes the
     /// park is already stored and the await returns at once.
@@ -869,7 +875,9 @@ impl GateRunHold {
             let _ = tx.send((job_id.to_owned(), generation));
         }
         if let Some(rx) = self.release_rx.lock().await.take() {
-            let _ = rx.await;
+            let _ = tokio::time::timeout(Self::HOLD_WAIT, rx)
+                .await
+                .expect("gate run hold never released within the bounded wait");
         }
     }
 
@@ -896,7 +904,10 @@ impl GateRunHold {
             .await
             .take()
             .expect("arrival awaited once");
-        rx.await.expect("gate run hold arrival sender dropped")
+        tokio::time::timeout(Self::HOLD_WAIT, rx)
+            .await
+            .expect("gate run never arrived within the bounded wait")
+            .expect("gate run hold arrival sender dropped")
     }
 
     /// Release the parked gate.run so its handler proceeds. Safe to call

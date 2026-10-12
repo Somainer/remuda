@@ -132,6 +132,10 @@ if [ "$mode" = "gate" ]; then
   base=$(git rev-parse "$onto")
   head=$(git rev-parse "origin/$branch")
   git merge -q --no-ff "origin/$branch" -m "gate merge $branch"
+  if [ "${CASE:-block_then_push}" = "verify_block" ]; then
+    echo verifying >> "$GATE_DIR/verify-state.log"
+    wait_proceed
+  fi
   merged=$(git rev-parse HEAD)
   printf '{"exitCode":0,"status":"verified","branch":"%s","base":"%s","head":"%s","merged":"%s","steps":[{"name":"cargo-test","status":"ok","durationMs":5}]}\n' "$branch" "$base" "$head" "$merged"
 else
@@ -579,4 +583,330 @@ async fn landing_still_pushing_keeps_occupancy_until_established_after_restart()
         push_count, 1,
         "settled by the one granted push, never re-pushed"
     );
+}
+
+/// r13 item 2: the Node loses the carrier (and thus its gate.run reply) AFTER
+/// the land grant, while the granted push has already reached the remote and the
+/// land process is still alive. The Hub stays UP. The Landing row must not be
+/// failed optimistically and must keep its lane while the carrier is gone; when
+/// a fresh carrier session reconnects, the bounded reconciliation probes the
+/// exact granted merge and settles landed exactly once (never re-pushed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn carrier_drop_after_grant_keeps_landing_until_reconnect_probe_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate_dir = dir.path().join("gatedir");
+    std::fs::create_dir_all(&gate_dir).unwrap();
+    let origin = build_origin(dir.path());
+    let bin = write_merge_cli(dir.path());
+
+    let data_dir = dir.path().join("hub-data");
+    let port = free_port();
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+
+    let node = DevNode::new(
+        &DevServerConfig::loopback(0)
+            .with_workspace_root(dir.path().to_path_buf())
+            .with_workspace_roots(remuda_testing::test_workspace_roots!()),
+    )
+    .expect("dev node");
+    node.gate_test_set_merge_bin(bin).await;
+    let host_id = node.host().meta.id.as_id().as_str().to_owned();
+    let workspace_id = node
+        .workspaces()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .meta
+        .id
+        .as_id()
+        .as_str()
+        .to_owned();
+
+    // The Hub stays RUNNING for the whole test (no restart).
+    let mut config = HubConfig::for_test(data_dir);
+    config.listen = addr;
+    let hub = remuda_hub::spawn(config).await.unwrap();
+    let dev_token = hub.mint_device_token("h").await.unwrap();
+    let enroll = hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await
+        .unwrap();
+    let link = WssLink::connect_runtime(
+        WssConfig::loopback(addr, enroll, host_id.clone()),
+        node.clone(),
+    )
+    .await
+    .unwrap();
+    wait_host_online(addr, &dev_token, &host_id).await;
+    let node_token = link.node_token.clone().unwrap();
+
+    let body = json!({
+        "name": "gate-carrier-drop",
+        "members": [{"hostId": host_id, "workspaceId": workspace_id, "role": "build"}],
+        "hosts": [{"hostId": host_id, "maxInstances": 8}],
+        "gate": {
+            "affected": true, "web": "never", "landSerialization": "global-cas",
+            "lanes": [{
+                "id": "lane1", "hostId": host_id,
+                "repoPath": origin.lane.to_string_lossy(),
+                "targetDir": dir.path().join("target").to_string_lossy(),
+                "ports": "58630-58639",
+                "env": {"GATE_DIR": gate_dir.to_string_lossy(), "CASE": "push_then_block",
+                        "PATH": std::env::var("PATH").unwrap_or_default()},
+                "lockPath": dir.path().join("gate.lock").to_string_lossy(),
+                "pwEndpoint": "ws://127.0.0.1:0/"
+            }]
+        }
+    });
+    let (status, created) = http(addr, "POST", "/v1/projects", &dev_token, Some(body)).await;
+    assert_eq!(status, 200, "{created}");
+    let project_id = created["id"].as_str().unwrap().to_owned();
+
+    let (status, enqueued) = http(
+        addr,
+        "POST",
+        &format!("/v1/projects/{project_id}/gate"),
+        &dev_token,
+        Some(json!({"branch": "wt/land/restart", "mode": "land"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{enqueued}");
+    let job_id = enqueued["id"].as_str().unwrap().to_owned();
+
+    wait_state(&hub, &job_id, &["landing"]).await;
+    let pushes = gate_dir.join("pushes.log");
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while !pushes.exists() {
+        assert!(tokio::time::Instant::now() < deadline, "land never pushed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let remote_after_push = git(&origin.origin, &["rev-parse", "main"]);
+    assert_ne!(remote_after_push, origin.base_main);
+
+    // A second land job is held out by the Landing occupancy.
+    let (status, second) = http(
+        addr,
+        "POST",
+        &format!("/v1/projects/{project_id}/gate"),
+        &dev_token,
+        Some(json!({"branch": "wt/land/restart", "mode": "land"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{second}");
+    let second_id = second["id"].as_str().unwrap().to_owned();
+
+    // Drop the carrier AFTER the grant (the granted land child survives in its
+    // own process group). The gate.run reply is lost; the host goes offline.
+    link.shutdown().await;
+    let offline_deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let (_, hosts) = http(addr, "GET", "/v1/hosts", &dev_token, None).await;
+        let online = hosts["items"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|i| i["id"] == json!(host_id) && i["online"] == json!(true))
+        });
+        if !online {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < offline_deadline,
+            "host never went offline"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // While the carrier is gone the outcome is uncertain: the row STAYS Landing
+    // and keeps the lane; the second job stays queued; main does not move.
+    let window = tokio::time::Instant::now() + Duration::from_millis(2000);
+    while tokio::time::Instant::now() < window {
+        assert_eq!(
+            job_of(&hub, &job_id).await["state"],
+            json!("landing"),
+            "must not fail a Landing whose reply was lost"
+        );
+        assert_eq!(
+            job_of(&hub, &second_id).await["state"],
+            json!("queued"),
+            "lane stays held"
+        );
+        assert_eq!(
+            git(&origin.origin, &["rev-parse", "main"]),
+            remote_after_push
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Cancel the queued second job while the first is Landing: it must never run.
+    let (cancel_status, cancel_body) = http(
+        addr,
+        "POST",
+        &format!("/v1/projects/{project_id}/gate/jobs/{second_id}/cancel"),
+        &dev_token,
+        Some(json!({})),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&cancel_status),
+        "{cancel_status} {cancel_body}"
+    );
+    wait_state(&hub, &second_id, &["canceled"]).await;
+
+    // A fresh carrier session reconnects (same DevNode, persistent token). The
+    // bounded post-reconnect probe establishes the exact granted merge is on
+    // remote main and settles landed — with no re-run/re-push.
+    let _link2 =
+        WssLink::connect_runtime(WssConfig::loopback(addr, node_token, host_id), node.clone())
+            .await
+            .unwrap();
+    let settled = wait_state(&hub, &job_id, &["landed"]).await;
+    assert_eq!(settled["state"], "landed", "{settled}");
+    assert_eq!(
+        std::fs::read_to_string(&pushes).unwrap().lines().count(),
+        1,
+        "the granted push is never re-sent"
+    );
+    assert_eq!(
+        git(&origin.origin, &["rev-parse", "main"]),
+        remote_after_push
+    );
+    let actions = hub.test_gate_audit_actions(&job_id).await.unwrap();
+    assert_eq!(
+        actions.iter().filter(|a| *a == "gate.landed").count(),
+        1,
+        "{actions:?}"
+    );
+
+    // Let the orphaned blocked land child exit cleanly (it pushed before block).
+    std::fs::write(gate_dir.join("proceed"), b"go").unwrap();
+}
+
+/// r13 item 9(a) real path: a cancel that reaches the REAL DevNode during the
+/// REAL verify child (a merge CLI blocked mid-gate) kills the run, settles the
+/// job canceled, and — because the verify never completed — never takes the
+/// land grant and never pushes. The cancel decision and the kill run through
+/// production Hub + WSS + Node code, not a stub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_cancel_during_verify_kills_the_run_and_never_grants_or_pushes() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate_dir = dir.path().join("gatedir");
+    std::fs::create_dir_all(&gate_dir).unwrap();
+    let origin = build_origin(dir.path());
+    let bin = write_merge_cli(dir.path());
+
+    let data_dir = dir.path().join("hub-data");
+    let port = free_port();
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+
+    let node = DevNode::new(
+        &DevServerConfig::loopback(0)
+            .with_workspace_root(dir.path().to_path_buf())
+            .with_workspace_roots(remuda_testing::test_workspace_roots!()),
+    )
+    .expect("dev node");
+    node.gate_test_set_merge_bin(bin).await;
+    let host_id = node.host().meta.id.as_id().as_str().to_owned();
+    let workspace_id = node
+        .workspaces()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .meta
+        .id
+        .as_id()
+        .as_str()
+        .to_owned();
+
+    let mut config = HubConfig::for_test(data_dir);
+    config.listen = addr;
+    let hub = remuda_hub::spawn(config).await.unwrap();
+    let dev_token = hub.mint_device_token("h").await.unwrap();
+    let enroll = hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await
+        .unwrap();
+    let _link = WssLink::connect_runtime(
+        WssConfig::loopback(addr, enroll, host_id.clone()),
+        node.clone(),
+    )
+    .await
+    .unwrap();
+    wait_host_online(addr, &dev_token, &host_id).await;
+
+    let body = json!({
+        "name": "gate-cancel-verify",
+        "members": [{"hostId": host_id, "workspaceId": workspace_id, "role": "build"}],
+        "hosts": [{"hostId": host_id, "maxInstances": 8}],
+        "gate": {
+            "affected": true, "web": "never", "landSerialization": "global-cas",
+            "lanes": [{
+                "id": "lane1", "hostId": host_id,
+                "repoPath": origin.lane.to_string_lossy(),
+                "targetDir": dir.path().join("target").to_string_lossy(),
+                "ports": "58640-58649",
+                "env": {"GATE_DIR": gate_dir.to_string_lossy(), "CASE": "verify_block",
+                        "PATH": std::env::var("PATH").unwrap_or_default()},
+                "lockPath": dir.path().join("gate.lock").to_string_lossy(),
+                "pwEndpoint": "ws://127.0.0.1:0/"
+            }]
+        }
+    });
+    let (status, created) = http(addr, "POST", "/v1/projects", &dev_token, Some(body)).await;
+    assert_eq!(status, 200, "{created}");
+    let project_id = created["id"].as_str().unwrap().to_owned();
+
+    let (status, enqueued) = http(
+        addr,
+        "POST",
+        &format!("/v1/projects/{project_id}/gate"),
+        &dev_token,
+        Some(json!({"branch": "wt/land/restart", "mode": "land"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{enqueued}");
+    let job_id = enqueued["id"].as_str().unwrap().to_owned();
+    wait_state(&hub, &job_id, &["running"]).await;
+
+    // Wait until the REAL verify child has actually reached its blocking point.
+    let verifying = gate_dir.join("verify-state.log");
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while !verifying.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "verify child never blocked"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Cancel through the real HTTP route; the grant was never taken.
+    let (status, cancel_body) = http(
+        addr,
+        "POST",
+        &format!("/v1/projects/{project_id}/gate/jobs/{job_id}/cancel"),
+        &dev_token,
+        Some(json!({})),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "cancel during running: {status} {cancel_body}"
+    );
+    let done = wait_state(&hub, &job_id, &["canceled"]).await;
+    assert_eq!(done["state"], json!("canceled"), "{done}");
+
+    // The land phase never ran (no grant/push), and origin main is unchanged.
+    assert!(
+        !gate_dir.join("pushes.log").exists(),
+        "a canceled verify must never push"
+    );
+    assert_eq!(
+        git(&origin.origin, &["rev-parse", "main"]),
+        origin.base_main
+    );
+
+    // Releasing the blocked verify now must be harmless: the process group was
+    // already killed at cancel (the marker file simply never proceeds).
+    std::fs::write(gate_dir.join("proceed"), b"go").unwrap();
 }

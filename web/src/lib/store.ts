@@ -86,6 +86,17 @@ const RECONCILE_GET_INTERVAL_MS = 1_000;
 /** Bounded backoff for Hub-held (Node offline) same-id re-POSTs. */
 const HELD_RETRY_BASE_MS = 2_000;
 const HELD_RETRY_MAX_MS = 30_000;
+/**
+ * Bounded backoff for the foreign-lease timer's authoritative durable READ
+ * when IndexedDB transiently rejects (c-reconnfu gate 19 item 4): the timer
+ * wrapper has already removed the firing entry, so giving up on a one-shot
+ * read failure lost the row's only recovery clock. Retries cap at the same
+ * shape as the Outbox's own claim-wake read retries (~under a minute); a
+ * later flush/unload rearm/reload picks the row up if they are exhausted.
+ */
+const LEASE_WAKE_READ_BASE_MS = 250;
+const LEASE_WAKE_READ_MAX_RETRY_MS = 5_000;
+const LEASE_WAKE_READ_MAX_FAILURES = 7;
 import { liveSummary } from "../features/session/liveSummary";
 import { HubHttpError, isUnauthorized } from "./httpError";
 import { e2eSeamsEnabled } from "./e2eSeams";
@@ -1565,6 +1576,8 @@ class HubStore {
       for (const [, t] of this.leaseWakeupTimer) clearTimeout(t);
       this.leaseWakeupTimer.clear();
       this.leaseWakeupUntil.clear();
+      for (const [, t] of this.leaseWakeupReadRetry) clearTimeout(t);
+      this.leaseWakeupReadRetry.clear();
       if (this.unloadClearTimer) {
         clearTimeout(this.unloadClearTimer);
         this.unloadClearTimer = null;
@@ -1581,6 +1594,8 @@ class HubStore {
     for (const [, t] of this.leaseWakeupTimer) clearTimeout(t);
     this.leaseWakeupTimer.clear();
     this.leaseWakeupUntil.clear();
+    for (const [, t] of this.leaseWakeupReadRetry) clearTimeout(t);
+    this.leaseWakeupReadRetry.clear();
     // The reset runs at setTimeout(0): in Chromium it measurably fires ~0.1
     // ms BEFORE pagehide during a real reload, so pagehide marks
     // unloadProceeded but cannot cancel this task in time. The task
@@ -2625,6 +2640,8 @@ class HubStore {
     for (const [, t] of this.leaseWakeupTimer) clearTimeout(t);
     this.leaseWakeupTimer.clear();
     this.leaseWakeupUntil.clear();
+    for (const [, t] of this.leaseWakeupReadRetry) clearTimeout(t);
+    this.leaseWakeupReadRetry.clear();
     // Drop the outbox INSTANCE (durable rows stay in storage): cancel its
     // tracked lease-expiry claim wakeups so none fires a flush into the
     // logged-out auth epoch; the next bootstrap re-runs Outbox.load and
@@ -3901,6 +3918,15 @@ class HubStore {
   /** Expiry the per-instance wakeup is currently armed for (move-earlier). */
   private leaseWakeupUntil = new Map<Id, number>();
   /**
+   * Bounded READ-RETRY armed when a fired lease wakeup's authoritative
+   * refreshDurable() rejected (transient IndexedDB failure). The timer
+   * wrapper already deleted the wake entry by then, so this retry IS the
+   * row's recovery responsibility until a read succeeds. Tracked separately
+   * from {@link leaseWakeupTimer} so logout/pagehide/beforeunload cancel it
+   * with the other timers (c-reconnfu gate 19 item 4).
+   */
+  private leaseWakeupReadRetry = new Map<Id, ReturnType<typeof setTimeout>>();
+  /**
    * In-flight/outbox-keyed conversion of a held bubble, keyed by
    * clientRequestId. A held prompt gets exactly ONE commandId for its
    * lifetime: a turn-end `flushHeld` racing a `steerHeld` of the same row
@@ -4046,12 +4072,37 @@ class HubStore {
    * other armed timer; a flush runs only when a foreign lease for THIS
    * instance is genuinely stealable now.
    */
-  private async leaseWakeupFired(instanceId: Id, expectedUntil: number) {
+  private async leaseWakeupFired(instanceId: Id, expectedUntil: number, readFailures = 0) {
     if (this.pageIsUnloading) return;
     const box = this.outbox;
     if (!box) return;
     const durable = await box.refreshDurable().catch(() => null);
-    if (!durable || this.pageIsUnloading) return;
+    if (!durable) {
+      // Gate 19 item 4: the firing wrapper has ALREADY removed this
+      // instance's wake entry, so a one-shot rejected read used to leave the
+      // (possibly crashed-owner) row with no recovery clock at all. Retain
+      // recovery responsibility with a bounded read retry: exponential
+      // backoff capped at 5 s, a handful of attempts; the handle lives in
+      // leaseWakeupReadRetry so logout/pagehide/beforeunload cancel it, and
+      // a teardown/unload that lands while the failed read was suspended is
+      // re-checked before arming. Exhausted retries stop here — a later
+      // flush, unload-cancelled rearm or reload reads the row again.
+      if (this.pageIsUnloading || !this.outbox) return;
+      if (readFailures + 1 >= LEASE_WAKE_READ_MAX_FAILURES) return;
+      const delay = Math.min(
+        LEASE_WAKE_READ_MAX_RETRY_MS,
+        LEASE_WAKE_READ_BASE_MS * 2 ** readFailures,
+      );
+      const old = this.leaseWakeupReadRetry.get(instanceId);
+      if (old) clearTimeout(old);
+      const handle = setTimeout(() => {
+        this.leaseWakeupReadRetry.delete(instanceId);
+        void this.leaseWakeupFired(instanceId, expectedUntil, readFailures + 1);
+      }, delay);
+      this.leaseWakeupReadRetry.set(instanceId, handle);
+      return;
+    }
+    if (this.pageIsUnloading) return;
     const now = Date.now();
     // A timer firing is not proof the wall deadline passed: the system clock
     // can roll back after arming. Wait out the remaining time instead of

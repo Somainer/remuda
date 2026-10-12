@@ -1837,6 +1837,197 @@ it("GATE19 item 3: a clock rollback both re-arms the fresh snapshot's future rep
   }
 });
 
+it("GATE19 item 4: one transient refreshDurable failure when the sole lease timer fires is retried bounded and the overdue row is delivered", async () => {
+  // The firing wrapper removes the wake entry BEFORE the authoritative read;
+  // a single transient IndexedDB rejection on that read used to return with
+  // no retry and no timer, so a crashed owner's overdue row stayed inflight
+  // forever. The read must retry with bounded backoff; one failure followed
+  // by a success delivers the row exactly once.
+  vi.useFakeTimers();
+  const owner = "owner_g19_i4";
+  const foreign = "owner_g19_i4_crashed_b";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks: { query: async () => ({ held: [] }) } },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  sessionStorage.setItem("remuda-outbox-owner", owner);
+  try {
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    const send = vi
+      .spyOn(api, "instanceSend")
+      .mockImplementation((async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) => ({
+        relatedCommandIds: [],
+        command: {
+          commandId,
+          id: commandId,
+          state: "accepted",
+          revision: "1",
+          dispatch: "native-acknowledged",
+          resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"]);
+    await bootLive(api, hubStore);
+    const internal = hubStore as unknown as {
+      ensureOutbox: () => Promise<boolean>;
+      flushAllOutbox: () => Promise<void>;
+      leaseWakeupReadRetry: Map<string, unknown>;
+      outbox: { refreshDurable: () => Promise<OutboxRecord[]> };
+    };
+    expect(await internal.ensureOutbox()).toBe(true);
+    await internal.flushAllOutbox();
+
+    const cmd = "cmd_g19_i4_overdue";
+    const T = Date.now() + 10_000;
+    localStorage.setItem(
+      OUTBOX_LS_KEY,
+      JSON.stringify([
+        {
+          commandId: cmd,
+          clientRequestId: "local_g19_i4",
+          instanceId: INSTANCE,
+          journalId: JOURNAL,
+          prompt: "crashed owner",
+          createdAt: Date.now() - 1_000,
+          attempts: 1,
+          state: "inflight",
+          lease: { owner: foreign, until: T },
+        } satisfies OutboxRecord,
+      ]),
+    );
+    await internal.flushAllOutbox();
+    expect(send).not.toHaveBeenCalled();
+
+    // The FIRST post-fire read rejects once; every later read is the real
+    // authoritative read.
+    const box = internal.outbox;
+    const realRefresh = box.refreshDurable.bind(box);
+    vi.spyOn(box, "refreshDurable")
+      .mockRejectedValueOnce(new Error("transient IndexedDB failure"))
+      .mockImplementation(() => realRefresh());
+
+    // T fires: read #1 fails, a bounded retry is armed.
+    await vi.advanceTimersByTimeAsync(10_000);
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    expect((internal.leaseWakeupReadRetry ?? new Map<string, unknown>()).has(INSTANCE)).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+
+    // The retry read succeeds (250 ms base backoff) and delivers.
+    await vi.advanceTimersByTimeAsync(250);
+    const stored = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    for (let i = 0; i < 40; i += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+      if (stored().find((r) => r.commandId === cmd)?.state === "sent") break;
+    }
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBe(cmd);
+    expect(stored().find((r) => r.commandId === cmd)?.state).toBe("sent");
+    expect((internal.leaseWakeupReadRetry ?? new Map<string, unknown>()).has(INSTANCE)).toBe(false);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE19 item 4: a read-retry armed by a failed lease-wake read is cancelled by pagehide — no POST into teardown", async () => {
+  // The bounded retry respects unload/lifetime: a genuine pagehide while the
+  // backoff is pending clears the handle and the (possibly stale) callback
+  // must never flush into a tearing-down page.
+  vi.useFakeTimers();
+  const owner = "owner_g19_i4_unload";
+  const foreign = "owner_g19_i4_unload_crashed_b";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks: { query: async () => ({ held: [] }) } },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  sessionStorage.setItem("remuda-outbox-owner", owner);
+  try {
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    const send = vi.spyOn(api, "instanceSend").mockResolvedValue({
+      relatedCommandIds: [],
+      command: {
+        commandId: "cmd_g19_i4_unload_row",
+        id: "cmd_g19_i4_unload_row",
+        state: "accepted",
+        revision: "1",
+        dispatch: "native-acknowledged",
+        resolution: "clear",
+      } as Awaited<ReturnType<Api["instanceSend"]>>["command"],
+    });
+    await bootLive(api, hubStore);
+    const internal = hubStore as unknown as {
+      ensureOutbox: () => Promise<boolean>;
+      flushAllOutbox: () => Promise<void>;
+      leaseWakeupReadRetry: Map<string, unknown>;
+      outbox: { refreshDurable: () => Promise<OutboxRecord[]> };
+    };
+    expect(await internal.ensureOutbox()).toBe(true);
+    await internal.flushAllOutbox();
+
+    localStorage.setItem(
+      OUTBOX_LS_KEY,
+      JSON.stringify([
+        {
+          commandId: "cmd_g19_i4_unload_row",
+          clientRequestId: "local_g19_i4_unload",
+          instanceId: INSTANCE,
+          journalId: JOURNAL,
+          prompt: "crashed owner",
+          createdAt: Date.now() - 1_000,
+          attempts: 1,
+          state: "inflight",
+          lease: { owner: foreign, until: Date.now() + 10_000 },
+        } satisfies OutboxRecord,
+      ]),
+    );
+    await internal.flushAllOutbox();
+    const box = internal.outbox;
+    const realRefresh = box.refreshDurable.bind(box);
+    vi.spyOn(box, "refreshDurable")
+      .mockRejectedValueOnce(new Error("transient IndexedDB failure"))
+      .mockImplementation(() => realRefresh());
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    expect((internal.leaseWakeupReadRetry ?? new Map<string, unknown>()).has(INSTANCE)).toBe(true);
+
+    // Real pagehide while the read-retry is pending.
+    window.dispatchEvent(new Event("pagehide"));
+    expect((internal.leaseWakeupReadRetry ?? new Map<string, unknown>()).has(INSTANCE)).toBe(false);
+    await vi.advanceTimersByTimeAsync(120_000);
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    expect(send).not.toHaveBeenCalled();
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
 it("GATE17 item 2: the Outbox wake is what FIRST discovers the foreign replacement — it hands T2 to the store, which POSTs exactly once at T2", async () => {
   // A's tracked SAME-OWNER wake (a cloned sibling's inactive claim, T1) fires
   // and only THEN discovers B's FOREIGN replacement lease (T2, B crashed).

@@ -2337,6 +2337,32 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    /// Test-only GateAuthorizer that always authorizes and grants, so the
+    /// in-module runner tests reach execute_gate without a live carrier.
+    /// Exists only under cfg(test); a production DevNode has no such default.
+    struct TestAllowAuthorizer;
+    impl GateAuthorizer for TestAllowAuthorizer {
+        fn authorize<'a>(
+            &'a self,
+            _job_id: &'a str,
+            _generation: u32,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(std::future::ready(true))
+        }
+        fn request_land_grant<'a>(
+            &'a self,
+            _job_id: &'a str,
+            _generation: u32,
+            _merge_sha: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = LandGrantAnswer> + Send + 'a>>
+        {
+            Box::pin(std::future::ready(LandGrantAnswer {
+                granted: true,
+                landing_in_progress: false,
+            }))
+        }
+    }
+
     /// At most [`MAX_IN_FLIGHT_LONG_METHODS`] long methods run at once.
     ///
     /// This is the property that keeps a burst of long methods from parking
@@ -2533,6 +2559,12 @@ mod tests {
             .with_workspace_roots(vec![dir.path().to_path_buf()])
             .with_workspace_registry(dir.path().to_path_buf());
         let node = DevNode::new(&config).unwrap();
+        // r12 item 5: production fails closed with no carrier authorizer, so
+        // the in-module runner tests must install an explicit test-only
+        // allow authorizer (unreachable from a production DevNode) to reach
+        // execute_gate at all.
+        *node.gate_registry().authorizer.try_write().unwrap() =
+            Some(std::sync::Arc::new(TestAllowAuthorizer));
         Fixture {
             node,
             lane,

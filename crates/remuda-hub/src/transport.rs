@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -468,19 +468,48 @@ pub(crate) struct InsertedSession {
 }
 
 /// Connected Node transports, keyed by host id.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ConnectedNodes {
     inner: Arc<Mutex<HashMap<String, NodeSlot>>>,
-    /// Process-wide monotonic session identity. Deliberately NOT keyed by host:
-    /// a per-host counter restarted at 1 after a removal would hand a brand-new
-    /// socket the same identity a superseded socket used, so a paused frame on
-    /// the old socket would match the persisted dispatch/grant identity again.
-    /// A globally unique id makes every session distinct for the life of this
-    /// Hub process.
-    next_session: Arc<AtomicU64>,
+    /// Boot epoch minted in the Hub DB and incremented at EVERY Hub boot. A
+    /// session identity is `(boot_epoch << 32) | per-boot counter`, so an id
+    /// handed out by a previous Hub process can NEVER be minted again after a
+    /// restart (r14 R3): the in-memory counter resetting to 1 used to hand a
+    /// new socket the same identity a superseded socket persisted on a Landing.
+    boot_epoch: u64,
+    next_session: Arc<AtomicU32>,
 }
 
 impl ConnectedNodes {
+    /// Boot identity: allocate the next persisted boot epoch (monotonic across
+    /// Hub restarts on the same data dir) and start this process's per-boot
+    /// session counter at zero.
+    pub(crate) async fn boot(store: &crate::store::Store) -> Self {
+        let boot_epoch = store
+            .next_gate_session_boot_epoch()
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "could not persist the gate session boot epoch; using 1");
+                1
+            });
+        tracing::info!(boot_epoch, "gate carrier session boot epoch allocated");
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            boot_epoch,
+            next_session: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    /// Test-only: an empty registry with a fixed boot epoch.
+    #[cfg(test)]
+    fn for_tests(boot_epoch: u64) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            boot_epoch,
+            next_session: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
     /// Call a JSON-RPC method on a connected Node. `Ok(None)` = not connected.
     pub async fn call(
         &self,
@@ -531,7 +560,10 @@ impl ConnectedNodes {
         link: Arc<dyn NodeTransport>,
     ) -> InsertedSession {
         let mut inner = self.inner.lock().await;
-        let generation = self.next_session.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        let counter = self.next_session.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        // Pack the persisted boot epoch and this boot's monotonic counter so the
+        // id is unique across Hub restarts as well as within one boot (r14 R3).
+        let generation = self.boot_epoch << 32 | u64::from(counter);
         inner.insert(host_id, NodeSlot { generation, link });
         InsertedSession { generation }
     }
@@ -616,13 +648,13 @@ mod session_tests {
         Arc::new(ScriptedTransport::new(None))
     }
 
-    /// r13 item 3: session identities are process-wide monotonic and are NEVER
-    /// reused after a host fully disconnects. The old per-host counter reset to
-    /// 1 once the slot was removed, so a fresh socket inherited the exact
-    /// identity a superseded socket used and could match a persisted grant.
+    /// r13 item 3: session identities are per-boot monotonic and are NEVER
+    /// reused after a host fully disconnects. r14 R3 packs a PERSISTED boot
+    /// epoch into the high bits, so identities cannot repeat across Hub restarts
+    /// either (covered end to end by the restart integration test).
     #[tokio::test]
     async fn session_identities_are_never_reused_after_removal() {
-        let nodes = ConnectedNodes::default();
+        let nodes = ConnectedNodes::for_tests(1);
         let a = nodes.insert("h".into(), dead_link()).await.generation;
         assert!(nodes.is_current_session("h", a).await);
 

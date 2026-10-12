@@ -1190,7 +1190,7 @@ async fn spawn_inner(
         config: Arc::new(config.clone()),
         store: store.clone(),
         secrets: Arc::new(secrets),
-        nodes: crate::transport::ConnectedNodes::default(),
+        nodes: crate::transport::ConnectedNodes::boot(&store).await,
         bus: Bus::with_capacity(config.follow_buffer_events),
         settlement_bus: {
             // Settlements are rare control notices; a small capacity is plenty

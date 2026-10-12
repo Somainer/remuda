@@ -106,7 +106,48 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     crate::store::ensure_column(conn, "gate_jobs", "landing_at", "TEXT")?;
     // r13 item 1: last read-only remote probe of a Landing row (throttle).
     crate::store::ensure_column(conn, "gate_jobs", "landing_probed_at", "TEXT")?;
+    // r14 R3: monotonic Hub BOOT epoch backing the never-repeating carrier
+    // session identity. One row, allocated atomically at every boot; the value
+    // packs into the session id's high 32 bits.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS hub_kv (
+            key TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        )",
+        [],
+    )?;
     Ok(())
+}
+
+impl Store {
+    /// r14 R3: atomically allocate this Hub process's boot epoch, monotonic
+    /// across restarts on the same data dir. The first boot reads/inserts 1;
+    /// every later boot takes `max(stored, 1) + 1`, so a downgraded/cloned
+    /// data dir can never roll the counter back and mint a session id a previous
+    /// Hub process already handed out.
+    pub(crate) async fn next_gate_session_boot_epoch(
+        &self,
+    ) -> Result<u64, crate::store::StoreError> {
+        self.run_named("next_gate_session_boot_epoch", |conn| {
+            let current: Option<i64> = conn
+                .query_row(
+                    "SELECT value FROM hub_kv WHERE key = 'gate_session_boot_epoch'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            // Rust computes the successor from the stored (locked read in
+            // SQLite's single writer) value; the UPSERT just claims it.
+            let next = current.unwrap_or(0).max(0) as u64 + 1;
+            conn.execute(
+                "INSERT INTO hub_kv(key, value) VALUES ('gate_session_boot_epoch', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![next as i64],
+            )?;
+            Ok(next)
+        })
+        .await
+    }
 }
 
 /// Routes for the project gate queue.

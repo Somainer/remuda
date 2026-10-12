@@ -1511,6 +1511,148 @@ async fn aborting_the_triggering_send_mid_overflow_shutdown_still_kills_and_publ
         .expect("the RunHandle reaches recv=None after close");
 }
 
+/// ma-sdk-state r18 item 1 (RULING): the overflow ownership decision — latch
+/// swap, closed check, and registration of the tracked shutdown task — runs
+/// SYNCHRONOUSLY under the publication guard the reservation path already
+/// holds, with no await between detecting the overflow and the registration.
+///
+/// The pre-fix code dropped that guard and re-acquired it asynchronously in
+/// the spawn function; a cooperative-budget yield at the re-entry let an
+/// aborted send discard the whole overflow (latch unset, no tracked task, the
+/// live child kept running without the publication_backlog_overflow
+/// terminal). This regression aborts the triggering send at a gate parked at
+/// that EXACT yield point: under the fix the decision already completed (the
+/// registration ack fired, the send parks still HOLDING the gate), so the
+/// abort only drops the gate — the registered task seals, kills the captured
+/// child and emits the single overflow terminal. The r16 cancellation
+/// regression parks LATER (after the spawn returned) and therefore misses
+/// this window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_the_triggering_send_at_the_prespawn_point_keeps_the_overflow_registered() {
+    const ITEM_CAP: usize = 256;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_SILENT_PROMPTS".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+    let pid = handle
+        .ack()
+        .native_ids
+        .get("pid")
+        .expect("pid on the launch ack")
+        .clone();
+
+    // Open the write/commit gates; SHUT the overflow-spawn gate (the send
+    // parks there AFTER the synchronous decision, holding the admission
+    // gate) and the shutdown's pre-kill gate.
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.release();
+    barrier.hold_overflow_spawn();
+    barrier.hold_overflow_kill();
+
+    // Flood reservation tickets on a task on the OTHER worker.
+    let d = driver.clone();
+    let mut flooder = tokio::spawn(async move {
+        for n in 0..4_000usize {
+            let id = format!("msg-r18-1-{n}");
+            if d.send(prompt_id("silent turn", &id)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // The decision ran SYNCHRONOUSLY before the send reached the (relocated)
+    // park point: the latch is set and the shutdown task is tracked on the
+    // launch. Reverting the fix parks the send BEFORE deciding, so this
+    // acknowledgement times out with the overflow discarded.
+    barrier
+        .wait_until_overflow_registered(1, Duration::from_secs(20))
+        .await;
+    barrier
+        .wait_until_overflow_spawn_parked(1, Duration::from_secs(20))
+        .await;
+
+    // The registered task cannot seal while the parked send still holds the
+    // admission gate, so no kill has landed: the child stays alive.
+    assert!(
+        process_alive(&pid),
+        "the child is not killed while the parked triggering send holds the admission gate"
+    );
+
+    // ABORT the send at the old pre-spawn yield point. The cancellation lands
+    // on a genuinely in-flight send; dropping its future releases the gate,
+    // nothing else.
+    flooder.abort();
+    let join = wait_bounded(&mut flooder, Duration::from_secs(5), "the aborted flooder")
+        .await
+        .expect("the bounded join itself completed")
+        .expect_err("the flooder task was aborted, so its inner result is a JoinError");
+    assert!(
+        join.is_cancelled(),
+        "the abort landed on the in-flight triggering send: {join:?}"
+    );
+
+    // The tracked task survived the abort, sealed as the gate dropped, and is
+    // now parked at its pre-kill gate.
+    barrier
+        .wait_until_overflow_kill_gate_parked(Duration::from_secs(20))
+        .await;
+    assert!(
+        process_alive(&pid),
+        "the child stays alive while the tracked shutdown parks at its pre-kill gate"
+    );
+
+    // Release the task: it reaches the captured pid directly and publishes
+    // the overflow terminal.
+    barrier.release_overflow_spawn();
+    barrier.release_overflow_kill();
+    wait_child_gone_or_zombie(&pid, Duration::from_secs(15)).await;
+    barrier
+        .wait_until_backlog_overflow(Duration::from_secs(20))
+        .await;
+
+    let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+        seen.iter().any(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+    })
+    .await;
+    let terminals = all
+        .iter()
+        .filter(|o| {
+            lifecycle_named(o) == Some("session")
+                && matches!(lifecycle_status(o), Some("exited") | Some("failed"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "exactly one session terminal, the overflow one: {all:?}"
+    );
+    assert_eq!(lifecycle_status(terminals[0]), Some("failed"));
+
+    drop(barrier);
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close after the pre-spawn abort proof",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close")
+    .expect("close ack");
+    let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+}
+
 /// ma-sdk-state r15 item 1: the overflow shutdown is LAUNCH-SCOPED.
 ///
 /// Park launch A's spawned overflow shutdown at its pre-kill gate, close A
@@ -1918,22 +2060,21 @@ async fn a_genuine_eof_while_the_overflow_shutdown_is_paused_leaves_it_the_one_t
         .expect("the RunHandle reaches recv=None after close");
 }
 
-/// ma-sdk-state r17 item 1: the overflow spawn's latch swap/closed check and
-/// the natural-EOF reader's latch load/seal must be ONE atomic decision on the
-/// publish gate. The reader parks AFTER its latch load but BEFORE the seal
-/// decision while holding the gate; an overflowing reservation is parked at
-/// the ENTRY of the spawn's (formerly gate-free) decision section. Releasing
-/// the spawn first and then the reader must keep ONE terminal owner: the EOF
-/// seals first, the spawn takes the gate, sees `closed` and stands down
-/// WITHOUT spawning a shutdown — no publication_backlog_overflow, the ordinary
-/// `exited` is the only terminal.
+/// ma-sdk-state r17 item 1 race regression, kept under the ma-sdk-state r18
+/// item 1 synchronous ownership decision.
 ///
-/// The pre-fix spawn swapped its latch and checked `closed` WITHOUT the gate,
-/// so on the multi-thread runtime it could spawn the shutdown (which still
-/// kills the child) while the parked reader sealed a stale EOF: the ordinary
-/// exited won the once-guard and the overflow terminal was lost.
+/// The breaching RESERVATION decides ownership WHILE holding the publish
+/// admission gate (latch swap, closed check, task registration one
+/// synchronous section) and then parks at its relocated post-decision gate
+/// STILL HOLDING the gate. A genuine reader EOF therefore cannot enter its
+/// seal section until the send releases; when it does it loads the already-
+/// set latch and SUPPRESSES the ordinary StdoutEof, leaving the registered
+/// overflow shutdown to deliver the single
+/// publication_backlog_overflow terminal. (r18 item 2 strengthens this
+/// regression with a named bounded handshake proving the EOF reader is
+/// blocked on the guard before either release.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_overflow_spawn_racing_a_parked_eof_seal_stands_down_and_keeps_one_terminal() {
+async fn an_overflow_decided_under_the_admission_gate_suppresses_a_later_genuine_eof() {
     const ITEM_CAP: usize = 256;
     const BYTE_CAP: usize = 256 * 1024;
 
@@ -1951,7 +2092,9 @@ async fn an_overflow_spawn_racing_a_parked_eof_seal_stands_down_and_keeps_one_te
 
     let barrier = driver.arm_write_commit_barrier();
     // Open every default-shut write/worker gate (the flood needs the commit
-    // path), then shut ONLY the two r17 admission gates.
+    // path), then shut the overflow-send gate (the send parks there AFTER its
+    // synchronous decision, holding the admission gate) and the EOF
+    // seal-decision gate.
     barrier.release();
     barrier.hold_overflow_spawn();
     barrier.hold_eof_seal_decision();
@@ -1959,19 +2102,23 @@ async fn an_overflow_spawn_racing_a_parked_eof_seal_stands_down_and_keeps_one_te
     let d = driver.clone();
     let flooder = tokio::spawn(async move {
         for n in 0..4_000usize {
-            let id = format!("msg-r17-1-{n}");
+            let id = format!("msg-r18-1-race-{n}");
             if d.send(prompt_id("silent turn", &id)).await.is_err() {
                 break;
             }
         }
     });
+    // The decision completed synchronously and the send is parked holding
+    // the gate.
+    barrier
+        .wait_until_overflow_registered(1, Duration::from_secs(20))
+        .await;
     barrier
         .wait_until_overflow_spawn_parked(1, Duration::from_secs(20))
         .await;
 
-    // Genuine receiver EOF (the child's stdout really closes) while the
-    // overflow spawn is parked outside the gate: the reader takes the gate,
-    // loads the still-clear latch, and parks before deciding.
+    // Genuine receiver EOF while the send holds the gate: the reader cannot
+    // enter its seal section until the send releases.
     wait_bounded(
         driver.kill(),
         Duration::from_secs(10),
@@ -1980,46 +2127,33 @@ async fn an_overflow_spawn_racing_a_parked_eof_seal_stands_down_and_keeps_one_te
     .await
     .expect("bounded test wait timed out: waiting for kill")
     .expect("kill acks");
+
+    // Release the send FIRST: it drops the admission gate and returns its
+    // refusal. The reader then enters, loads the set latch and parks before
+    // deciding.
+    barrier.release_overflow_spawn();
     barrier
         .wait_until_eof_seal_decision_parked(Duration::from_secs(10))
         .await;
-
-    // Release the overflow spawn FIRST: under the fix it can only queue on
-    // the gate the reader still holds. Then release the reader: the EOF seals
-    // (closed set, StdoutEof queued) and the spawn, once admitted, finds the
-    // launch sealed and stands down.
-    barrier.release_overflow_spawn();
     barrier.release_eof_seal_decision();
 
-    // ACKNOWLEDGE the single owner through two NAMED bounded
-    // acknowledgements: the fixed code records the standdown; the pre-fix
-    // spawn ran its shutdown (child already killed) and reaches the
-    // publication_backlog_overflow terminal note — the select names the
-    // defect at once instead of waiting on a missing standdown.
-    tokio::select! {
-        () = barrier.wait_until_overflow_spawn_standdowns(1, Duration::from_secs(10)) => {}
-        () = barrier.wait_until_backlog_overflow(Duration::from_secs(10)) => {
-            panic!("the overflow spawn swapped its latch past the parked EOF reader: \
-                    a shutdown killed the child and raced its sealed ordinary EOF terminal");
-        }
-    }
+    // The genuine EOF was suppressed in favour of the overflow terminal.
+    barrier
+        .wait_until_eof_suppressed_after_overflow(Duration::from_secs(10))
+        .await;
     join_bounded(
         flooder,
         Duration::from_secs(10),
-        "the flood after the standdown",
+        "the flood after the EOF suppression",
     )
     .await;
-    barrier
-        .wait_until_stdout_eof_queued(Duration::from_secs(10))
-        .await;
 
-    // The ordinary EOF terminal is the ONLY session terminal: status
-    // `exited`, never the overflow `failed`, and no observation carries the
-    // overflow reason.
+    // The overflow terminal is the ONLY session terminal.
     let head = collect_until(&mut handle, Duration::from_secs(10), |seen| {
         seen.iter().any(|o| {
-            lifecycle_named(o) == Some("session")
-                && matches!(lifecycle_status(o), Some("exited") | Some("failed"))
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
         })
     })
     .await;
@@ -2033,46 +2167,28 @@ async fn an_overflow_spawn_racing_a_parked_eof_seal_stands_down_and_keeps_one_te
     assert_eq!(
         terminals.len(),
         1,
-        "exactly one session terminal, the ordinary EOF one: {head:?}"
+        "exactly one session terminal, the overflow one: {head:?}"
     );
-    assert_eq!(lifecycle_status(terminals[0]), Some("exited"));
-    assert!(
-        !head.iter().any(|o| {
-            session_terminal_related(o)
-                .and_then(|r| r.get("reason"))
-                .is_some_and(|reason| reason == "publication_backlog_overflow")
-        }),
-        "no publication_backlog_overflow diagnostic follows the sealed EOF: {head:?}"
-    );
+    assert_eq!(lifecycle_status(terminals[0]), Some("failed"));
 
-    // A publication fence proves no terminal (or anything else) jumps the
-    // queue afterwards — the spawn stood down, so it never enqueued a kill or
-    // a terminal.
+    // A publication fence proves no ordinary exited (or anything else
+    // terminal) follows the suppressed EOF.
     let fence = driver
         .bounded_publication_fence(Duration::from_secs(5))
         .await;
     let drained = drain_fence(&mut handle, fence, Duration::from_secs(20)).await;
     assert!(
         !drained.iter().any(|o| {
-            lifecycle_named(o) == Some("session")
-                && matches!(lifecycle_status(o), Some("exited") | Some("failed"))
+            lifecycle_named(o) == Some("session") && matches!(lifecycle_status(o), Some("exited"))
         }),
-        "no second session terminal follows the ordinary EOF one: {drained:?}"
-    );
-    assert!(
-        !drained.iter().any(|o| {
-            session_terminal_related(o)
-                .and_then(|r| r.get("reason"))
-                .is_some_and(|reason| reason == "publication_backlog_overflow")
-        }),
-        "no overflow diagnostic is published after the fence: {drained:?}"
+        "no ordinary EOF terminal follows the overflow one: {drained:?}"
     );
 
     drop(barrier);
     wait_bounded(
         driver.close(),
         Duration::from_secs(20),
-        "close after the overflow/EOF ownership proof",
+        "close after the decided-under-gate/EOF suppression proof",
     )
     .await
     .expect("bounded test wait timed out: waiting for close")

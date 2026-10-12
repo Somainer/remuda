@@ -1969,18 +1969,22 @@ async fn prepare_prompt_write(
             bytes,
             frame_bytes,
         }) => {
-            // The shutdown re-takes the publish gate itself (r17 item 1: its
-            // latch swap and closed check run inside that one critical
-            // section); release the gate first, then SPAWN the shutdown
-            // (never await the shutdown TASK — the triggering send must not
-            // own its lifetime; close owns it through the launch's tracked
-            // handle instead).
-            drop(admission);
-            // Detached from the send: the send rejects and does not await the
-            // shutdown; its kill and terminal delivery survive the caller
-            // being aborted. The task is attached to THIS LAUNCH, though:
-            // close finishes it and it can only touch launch A.
-            let _shutdown = spawn_backlog_overflow_shutdown(
+            // ma-sdk-state r18 item 1 (RULING): the overflow ownership
+            // decision — the latch swap, the closed check, AND the
+            // registration of the tracked shutdown task — happens HERE,
+            // SYNCHRONOUSLY under the publication gate this admission path
+            // has held continuously since it entered the section. There is
+            // no await and no drop/re-acquire between detecting the overflow
+            // and registering the shutdown: the pre-fix code dropped the gate
+            // and re-entered it asynchronously, so a send aborted while parked
+            // at that re-entry discarded the whole overflow (latch unset, no
+            // tracked task, the live child kept running without the
+            // publication_backlog_overflow terminal). The spawned task does
+            // every one of its awaited steps (its own seal, the kill, the
+            // terminal emit) only AFTER this caller releases the gate; the
+            // send never awaits it and close owns it through the launch
+            // handle.
+            let _registered = admit_backlog_overflow_shutdown(
                 inner,
                 launch,
                 &budget,
@@ -1988,8 +1992,18 @@ async fn prepare_prompt_write(
                 bytes,
                 frame_bytes,
                 carrier,
-            )
-            .await;
+            );
+            // test-stub: park at the EXACT point the pre-fix code yielded — it
+            // dropped the gate and awaited the spawn function's gate
+            // re-entry. The latch swap, the closed check and the tracked task
+            // registration all completed ABOVE while the gate stayed held, so
+            // aborting the triggering send parked here can no longer discard
+            // the overflow: the future's drop releases the gate, and the
+            // registered task still seals, kills the captured child and emits
+            // the terminal. Open by default.
+            #[cfg(feature = "test-stub")]
+            test_barrier::hold_overflow_spawn_admission(&inner.barrier).await;
+            drop(admission);
             // ma-sdk-state r15 item 6 (test-stub): park the triggering send
             // HERE, with the spawned shutdown known to be in progress, so a
             // test can abort THIS future mid-shutdown (on a multi-thread
@@ -2215,16 +2229,24 @@ async fn map_loop(
                 },
                 _,
             )) => {
-                // SPAWN the cancellation-independent shutdown BEFORE any await
-                // (directive (c)): the reader going away (or being aborted by
-                // close) must not take the kill or the terminal delivery with
-                // it. The rejected frame owns nothing and drops here.
+                // SPAWN the cancellation-independent shutdown SYNCHRONOUSLY,
+                // before any await (directive (c); ma-sdk-state r18 item 1):
+                // the reader going away (or being aborted by close) must not
+                // take the kill or the terminal delivery with it. The latch
+                // decision is gate-free HERE because the natural-EOF seal
+                // runs on THIS SAME task after the loop (it is skipped via
+                // `refused` below), so it can never interleave with this
+                // swap; a reservation sender inside its publish section
+                // neither seals nor reads the latch, a second overflow loses
+                // the CAS, and the close race keeps its own recheck under the
+                // shutdown mutex. The rejected frame owns nothing and drops
+                // here.
                 let budget = publisher.budget_clone();
                 // Detached from the reader but attached to THIS LAUNCH: the
                 // kill and terminal do not depend on the reader staying alive,
                 // while close claims the tracked task and it can only touch
                 // launch A's captured process/emission state (r15 item 1).
-                let _shutdown = spawn_backlog_overflow_shutdown(
+                let _registered = admit_backlog_overflow_shutdown(
                     &inner,
                     &launch,
                     &budget,
@@ -2232,8 +2254,7 @@ async fn map_loop(
                     bytes,
                     frame_bytes,
                     carrier,
-                )
-                .await;
+                );
                 // The spawned shutdown owns the terminal: do NOT fall through
                 // to the stdout-EOF seal.
                 #[cfg(feature = "test-stub")]
@@ -2284,20 +2305,21 @@ async fn map_loop(
         let overflow_owns_terminal;
         {
             let gate = launch.publish.lock().await;
-            // The latch is set synchronously by the spawner BEFORE the
-            // shutdown task seals under this same mutex, so observing it here
-            // means the overflow terminal is already owned (its seal either
-            // happened first and `closed` is set, or it happens next once this
-            // critical section releases).
+            // The reservation overflow decision sets the latch synchronously
+            // inside ITS held admission section (r18 item 1), so observing it
+            // here means the overflow terminal is already owned (its seal
+            // either happened first and `closed` is set, or it happens next
+            // once this critical section releases).
             overflow_owns_terminal = gate
                 .as_ref()
                 .is_some_and(|publisher| publisher.budget().overflowed.load(Ordering::Acquire));
             // ma-sdk-state r17 item 1 (test-stub): park on this exact spot —
             // latch loaded, seal decision not yet made, gate still held. The
-            // overflow spawn's swap and closed check run inside the SAME gate,
-            // so after a release this loaded value can never be stale: either
-            // the spawn waits for this section and the EOF seals (no shutdown
-            // is spawned) or the spawn already won and this load saw it.
+            // overflow decision's swap and the EOF seal are one atomic
+            // ordering on this gate: either the decision waited for this
+            // section and the EOF seals (no shutdown is registered) or the
+            // decision already won under its own held gate and this load saw
+            // it.
             #[cfg(feature = "test-stub")]
             test_barrier::hold_eof_seal_decision(&inner.barrier).await;
             if !overflow_owns_terminal {
@@ -2325,22 +2347,46 @@ async fn map_loop(
     }
 }
 
-/// ma-sdk-state r14 item 1 (directive (c)); r15 item 1: spawn the overflow
-/// session shutdown as its OWN task, attached to the overflowing LAUNCH.
+/// Decide publication-backlog overflow ownership and REGISTER the tracked
+/// shutdown task SYNCHRONOUSLY (ma-sdk-state r18 item 1).
 ///
-/// The spawn happens synchronously at the admission-failure site BEFORE any
-/// await, so cancelling the triggering future (a prompt send aborted while
-/// the shutdown parks at its pre-kill gate, a reader aborted by close) cannot
-/// cancel the kill or the terminal publication: the task owns its
-/// [`Arc<Launch>`] and the send does not own its lifetime. It IS tracked on
-/// the launch, though — `close` finishes it before its kill ladder and a
-/// relaunch — and it signals only the launch's captured child pid, so it can
-/// never reach a relaunched process through the driver's current live slot.
-/// Exactly one shutdown per launch wins the budget's CAS latch; a spawn that
-/// loses the race with the natural-EOF seal or with close (the launch already
-/// sealed) is dropped, leaving the ordinary EOF terminal or close's own ladder
-/// in charge.
-async fn spawn_backlog_overflow_shutdown(
+/// Returns `true` when this call registered the single launch-scoped
+/// shutdown task, `false` when the latch was already set (a second overflow
+/// loses) or the launch was already sealed (natural EOF or close won).
+///
+/// ## Synchronization contract
+///
+/// The reservation overflow caller invokes this WHILE HOLDING the launch's
+/// `publish` admission gate — the same gate it took before `reserve_charge`,
+/// and the same gate the natural-EOF reader (`map_loop`) holds across its
+/// latch load, `closed` store and `StdoutEof` enqueue. The latch swap, the
+/// closed check and the registration therefore happen as ONE synchronous
+/// critical section relative to the EOF seal: there is no await (and no
+/// drop/re-acquire) between detecting the overflow and storing the task
+/// handle, so aborting the triggering send at any await from the reservation
+/// site can no longer discard the overflow — no latch, no tracked task, a
+/// live child with no terminal (the r17 shape dropped the gate and re-entered
+/// it asynchronously, which parked exactly there). The spawned task does ALL
+/// of its awaited work — re-taking this gate for its own seal, the pre-kill
+/// gate, the kill, the terminal emit — only after the caller released the
+/// gate.
+///
+/// The frame-reader site (`map_loop`) is the single exception and calls this
+/// gate-free: the natural-EOF seal runs on that SAME task immediately after
+/// the loop sets `refused`, so it cannot interleave with this swap; a
+/// reservation sender inside its gate neither seals nor reads the latch; a
+/// second overflow loses the CAS; and the close race keeps its independent
+/// recheck under the shutdown mutex below.
+///
+/// Either way the registration is SYNCHRONOUS (directive (c)): a reader or
+/// sender that goes away before the next await still leaves a tracked,
+/// launch-scoped task. The task owns its [`Arc<Launch>`]; `close` finishes it
+/// before its kill ladder and a relaunch, and it signals only the launch's
+/// captured child pid, so it can never reach a relaunched process through the
+/// driver's current live slot. A caller that loses the race with the natural
+/// EOF seal or with close (the launch already sealed) registers nothing,
+/// leaving the ordinary EOF terminal or close's own ladder in charge.
+fn admit_backlog_overflow_shutdown(
     inner: &Arc<Inner>,
     launch: &Arc<Launch>,
     budget: &Arc<BacklogBudget>,
@@ -2349,45 +2395,33 @@ async fn spawn_backlog_overflow_shutdown(
     frame_bytes: usize,
     carrier: &'static str,
 ) -> bool {
-    // ma-sdk-state r17 item 1: the latch swap AND the closed check happen in
-    // the SAME publish critical section the natural-EOF path uses for its
-    // latch load and its seal store. Deciding outside this gate let the reader
-    // load `overflowed == false` under it and then — on another worker — have
-    // this swap land and read `closed == false` before the reader stored and
-    // queued StdoutEof: an ordinary `exited` won the once-guard while the
-    // spawned shutdown still killed the child and lost its
-    // publication_backlog_overflow terminal. The spawned shutdown TASK takes
-    // this gate again for its own seal, after this caller released it.
-    #[cfg(feature = "test-stub")]
-    test_barrier::hold_overflow_spawn_admission(&inner.barrier).await;
-    {
-        let _admission = launch.publish.lock().await;
-        // Exactly one shutdown per LAUNCH (the latch lives on the per-launch
-        // budget); a second overflowing frame or ticket loses and does
-        // nothing.
-        if budget.overflowed.swap(true, Ordering::AcqRel) {
-            return false;
-        }
-        if launch.closed.load(Ordering::Acquire) {
-            // Natural EOF sealed first (its load and store are one section on
-            // this same gate): the ordinary StdoutEof owns the terminal. Do
-            // NOT spawn — a kill must not follow an exit already being
-            // published. The latch stays set; no second shutdown can spawn.
-            #[cfg(feature = "test-stub")]
-            test_barrier::note_overflow_spawn_stood_down(&inner.barrier);
-            return false;
-        }
+    // Exactly one shutdown per LAUNCH (the latch lives on the per-launch
+    // budget); a second overflowing frame or ticket loses and does nothing.
+    if budget.overflowed.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    if launch.closed.load(Ordering::Acquire) {
+        // Natural EOF sealed first (its load and store are one section on the
+        // publish gate): the ordinary StdoutEof owns the terminal. Do NOT
+        // spawn — a kill must not follow an exit already being published. The
+        // latch stays set; no second shutdown can spawn.
+        #[cfg(feature = "test-stub")]
+        test_barrier::note_overflow_spawn_stood_down(&inner.barrier);
+        return false;
     }
     // Register under the launch's shutdown mutex with the seal rechecked:
     // either close has NOT claimed the launch (we spawn and store the handle
     // for close to finish) or it has (sealed; no spawn — close owns the kill).
     // close seals on THIS mutex rather than the publish gate, so its race has
-    // its own recheck here; the gate section above only made the decision
+    // its own recheck here; the latch section above only made the decision
     // atomic against natural EOF.
     let mut slot = launch.shutdown.lock().expect("overflow shutdown slot");
     if launch.closed.load(Ordering::Acquire) {
         return false;
     }
+    // Capture the barrier slot before the Arcs move into the spawned task.
+    #[cfg(feature = "test-stub")]
+    let barrier_slot = Arc::clone(&inner.barrier);
     let launch = Arc::clone(launch);
     let inner = Arc::clone(inner);
     let budget = Arc::clone(budget);
@@ -2396,6 +2430,14 @@ async fn spawn_backlog_overflow_shutdown(
             .await;
     });
     *slot = Some(handle);
+    drop(slot);
+    // ma-sdk-state r18 item 1 (test-stub): the task handle is now stored in
+    // the launch slot SYNCHRONOUSLY at the decision site — before the caller
+    // reaches any await it could be aborted at. The acknowledgement is the
+    // observable half of the cancellation ruling ("the latch is set AND the
+    // tracked shutdown is registered").
+    #[cfg(feature = "test-stub")]
+    test_barrier::note_overflow_shutdown_registered(&barrier_slot);
     true
 }
 
@@ -3282,16 +3324,26 @@ pub mod test_barrier {
         eof_seal_decision_parked: AtomicBool,
         eof_seal_decision_open: AtomicBool,
         eof_seal_decision_gate: tokio::sync::Notify,
-        /// ma-sdk-state r17 item 1: number of overflow spawns parked at the
-        /// ENTRY of their publish-gate admission section (the latch swap +
-        /// closed check that r17 moved inside the gate).
+        /// ma-sdk-state r17 item 1; relocated by ma-sdk-state r18 item 1:
+        /// number of triggering overflow sends parked in the reservation
+        /// admission section AFTER the synchronous latch swap/closed check
+        /// and the tracked-task registration, still HOLDING the publish gate
+        /// — the exact point the pre-fix code dropped the gate and re-entered
+        /// it asynchronously.
         overflow_spawn_parked_count: AtomicUsize,
         overflow_spawn_gate_open: AtomicBool,
         overflow_spawn_gate: tokio::sync::Notify,
-        /// ma-sdk-state r17 item 1: number of overflow spawns that reached the
-        /// gate and found the launch ALREADY sealed (natural EOF won), so they
-        /// stood down without spawning a shutdown.
+        /// ma-sdk-state r17 item 1: number of overflow decisions that reached
+        /// the latch/closed check and found the launch ALREADY sealed (natural
+        /// EOF won), so they stood down without registering a shutdown.
         overflow_spawn_standdowns: AtomicUsize,
+        /// ma-sdk-state r18 item 1: number of overflow shutdown tasks
+        /// REGISTERED synchronously at the overflow decision site (the handle
+        /// is stored in the launch slot before the decision section returns).
+        /// With the send parked at `overflow_spawn_gate` this is already 1,
+        /// which is how a regression proves aborting the parked send cannot
+        /// discard the latch or the tracked task.
+        overflow_shutdown_registered: AtomicUsize,
     }
 
     /// An armed write-commit barrier. Releases on drop.
@@ -3363,6 +3415,8 @@ pub mod test_barrier {
             overflow_spawn_gate_open: AtomicBool::new(true),
             overflow_spawn_gate: tokio::sync::Notify::new(),
             overflow_spawn_standdowns: AtomicUsize::new(0),
+            // r18 item 1: the registration counter starts clean per arm.
+            overflow_shutdown_registered: AtomicUsize::new(0),
         });
         *slot.lock().expect("barrier lock") = Some(state.clone());
         WriteCommitBarrier { state }
@@ -3620,9 +3674,13 @@ pub mod test_barrier {
         notified.await;
     }
 
-    /// ma-sdk-state r17 item 1 gate: park an overflow spawn at the ENTRY of
-    /// its publish-gate admission section — before the latch swap/closed check
-    /// the fix moved inside that gate. Open by default.
+    /// ma-sdk-state r17 item 1 gate; relocated by ma-sdk-state r18 item 1:
+    /// park the triggering overflow send in the reservation admission section
+    /// AFTER the synchronous latch swap/closed check and the tracked-task
+    /// registration, while it is STILL HOLDING the publish gate — the exact
+    /// point the pre-fix code dropped the gate and awaited an asynchronous
+    /// re-entry. Aborting the send parked here must leave the latch set and
+    /// the registered task delivering the overflow terminal. Open by default.
     pub(super) async fn hold_overflow_spawn_admission(slot: &Slot) {
         let Some(state) = current(slot) else {
             return;
@@ -3641,13 +3699,25 @@ pub mod test_barrier {
         notified.await;
     }
 
-    /// ma-sdk-state r17 item 1 hook: an overflow spawn took the publish gate
-    /// and found the launch already sealed (the natural EOF won), so it stood
-    /// down without spawning a shutdown.
+    /// ma-sdk-state r17 item 1 hook: an overflow decision ran the latch/closed
+    /// check and found the launch already sealed (the natural EOF won), so it
+    /// stood down without registering a shutdown.
     pub(super) fn note_overflow_spawn_stood_down(slot: &Slot) {
         if let Some(state) = current(slot) {
             state
                 .overflow_spawn_standdowns
+                .fetch_add(1, Ordering::AcqRel);
+            state.state_changed.notify_waiters();
+        }
+    }
+
+    /// ma-sdk-state r18 item 1 hook: the overflow shutdown task handle was
+    /// stored in the launch's tracked slot SYNCHRONOUSLY at the decision site
+    /// (latch swapped, `closed` clear, registration complete).
+    pub(super) fn note_overflow_shutdown_registered(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state
+                .overflow_shutdown_registered
                 .fetch_add(1, Ordering::AcqRel);
             state.state_changed.notify_waiters();
         }
@@ -4116,8 +4186,9 @@ pub mod test_barrier {
             }
         }
 
-        /// Wait until `n` overflow spawns are parked at the shut admission
-        /// gate (latch not yet swapped, closed not yet checked).
+        /// Wait until `n` triggering overflow sends are parked at the shut
+        /// admission gate, AFTER the synchronous decision and the tracked-task
+        /// registration, while still holding the publish gate.
         pub async fn wait_until_overflow_spawn_parked(&self, n: usize, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
             wait_until_with(
@@ -4128,17 +4199,17 @@ pub mod test_barrier {
                         && !state.overflow_spawn_gate_open.load(Ordering::Acquire)
                 },
                 || {
-                    "write_commit barrier: timed out waiting for the overflow spawn to park \
-                     before its publish-gate admission"
+                    "write_commit barrier: timed out waiting for the overflow send to park \
+                     after registering the tracked shutdown"
                         .to_owned()
                 },
             )
             .await;
         }
 
-        /// ma-sdk-state r17 item 1: wait until `n` overflow spawns took the
-        /// publish gate, found the launch already sealed by the natural EOF,
-        /// and stood down WITHOUT spawning a shutdown.
+        /// ma-sdk-state r17 item 1: wait until `n` overflow decisions ran the
+        /// latch/closed check, found the launch already sealed by the natural
+        /// EOF, and stood down WITHOUT registering a shutdown.
         pub async fn wait_until_overflow_spawn_standdowns(&self, n: usize, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
             wait_until_with(
@@ -4150,6 +4221,28 @@ pub mod test_barrier {
                         "write_commit barrier: timed out waiting for {n} overflow spawns to \
                          stand down for the sealed EOF (stood down={})",
                         self.state.overflow_spawn_standdowns.load(Ordering::Acquire)
+                    )
+                },
+            )
+            .await;
+        }
+
+        /// ma-sdk-state r18 item 1: wait until `n` overflow shutdown tasks are
+        /// registered synchronously at the decision site (the handle stored
+        /// in the launch slot before the decision section returns).
+        pub async fn wait_until_overflow_registered(&self, n: usize, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            wait_until_with(
+                &self.state,
+                deadline,
+                move |state| state.overflow_shutdown_registered.load(Ordering::Acquire) >= n,
+                || {
+                    format!(
+                        "write_commit barrier: timed out waiting for {n} overflow shutdown \
+                         registrations (registered={})",
+                        self.state
+                            .overflow_shutdown_registered
+                            .load(Ordering::Acquire)
                     )
                 },
             )

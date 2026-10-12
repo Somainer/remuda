@@ -2714,6 +2714,12 @@ pub mod test_barrier {
     pub(super) type Slot = Mutex<Option<Arc<State>>>;
 
     pub(super) struct State {
+        /// ma-sdk-state r13 item 5: signalled AFTER every hook below updates one
+        /// of the acknowledgement counters/flags, so `wait_until_*` helpers park
+        /// on this instead of polling the atomics on a 2 ms timer. Waiters always
+        /// re-check their predicate after waking, so notify_waiters' lack of a
+        /// stored permit is harmless (no predicate is ever lost).
+        state_changed: tokio::sync::Notify,
         write_reached: AtomicBool,
         /// The worker dequeued the turn's Reserve ticket and is parked on the
         /// not-yet-committed write.
@@ -2814,6 +2820,7 @@ pub mod test_barrier {
     #[must_use]
     pub(super) fn arm(slot: &Slot) -> WriteCommitBarrier {
         let state = Arc::new(State {
+            state_changed: tokio::sync::Notify::new(),
             write_reached: AtomicBool::new(false),
             reserve_parked: AtomicBool::new(false),
             result_queued: AtomicBool::new(false),
@@ -2858,6 +2865,31 @@ pub mod test_barrier {
         slot.lock().expect("barrier lock").clone()
     }
 
+    /// ma-sdk-state r13 item 5: notification-driven predicate wait shared by
+    /// every acknowledgement helper. The predicate is checked first; the waiter
+    /// then registers on `state_changed` and re-checks it (a hook always stores
+    /// before signalling, so no wakeup is lost), awaiting at most until
+    /// `deadline`. On timeout it panics with `timeout_message()`: each helper's
+    /// NAMED bound stays the terminator (the r12 bound proofs prove those
+    /// bounds), with no polling sleeps.
+    async fn wait_until_with(
+        state: &State,
+        deadline: tokio::time::Instant,
+        pred: impl Fn(&State) -> bool,
+        timeout_message: impl Fn() -> String,
+    ) {
+        while !pred(state) {
+            let notified = state.state_changed.notified();
+            if pred(state) {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+                panic!("{}", timeout_message());
+            }
+        }
+    }
+
     /// r7 item 2 hook: park the DETACHED write task AFTER the Reserve ticket is
     /// enqueued but BEFORE it awaits the writer ack — the precise point where
     /// the caller can be aborted while the prompt is still in flight.
@@ -2871,6 +2903,7 @@ pub mod test_barrier {
             return;
         }
         state.write_parked.store(true, Ordering::Release);
+        state.state_changed.notify_waiters();
         if state.write_gate_open.load(Ordering::Acquire) {
             return;
         }
@@ -2888,6 +2921,7 @@ pub mod test_barrier {
             return;
         };
         state.write_reached.store(true, Ordering::Release);
+        state.state_changed.notify_waiters();
         if state.send_released.load(Ordering::Acquire) {
             return;
         }
@@ -2903,6 +2937,7 @@ pub mod test_barrier {
     pub(super) fn note_reserve_enqueued(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.reserve_enqueued.fetch_add(1, Ordering::AcqRel);
+            state.state_changed.notify_waiters();
         }
     }
 
@@ -2911,6 +2946,7 @@ pub mod test_barrier {
     pub(super) fn note_reserve_parked(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.reserve_parked.store(true, Ordering::Release);
+            state.state_changed.notify_waiters();
         }
     }
 
@@ -2939,6 +2975,7 @@ pub mod test_barrier {
         if let Some(state) = current(slot) {
             state.result_queued.store(true, Ordering::Release);
             state.result_enqueued_count.fetch_add(1, Ordering::AcqRel);
+            state.state_changed.notify_waiters();
         }
     }
 
@@ -2955,6 +2992,7 @@ pub mod test_barrier {
             return;
         };
         state.result_enqueue_parked.store(true, Ordering::Release);
+        state.state_changed.notify_waiters();
         if state.result_enqueue_open.load(Ordering::Acquire) {
             return;
         }
@@ -2971,6 +3009,7 @@ pub mod test_barrier {
     pub(super) fn note_cancelled_rollback_done(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.cancelled_rollback_done.fetch_add(1, Ordering::AcqRel);
+            state.state_changed.notify_waiters();
         }
     }
 
@@ -2979,6 +3018,7 @@ pub mod test_barrier {
     pub(super) fn note_stdout_eof_queued(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.stdout_eof_queued.store(true, Ordering::Release);
+            state.state_changed.notify_waiters();
         }
     }
 
@@ -2986,6 +3026,7 @@ pub mod test_barrier {
     pub(super) fn note_backlog_overflow(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.backlog_overflowed.store(true, Ordering::Release);
+            state.state_changed.notify_waiters();
         }
     }
 
@@ -2995,6 +3036,7 @@ pub mod test_barrier {
     pub(super) fn note_overflow_kill_waiting(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.overflow_kill_waiting.store(true, Ordering::Release);
+            state.state_changed.notify_waiters();
         }
     }
 
@@ -3003,6 +3045,7 @@ pub mod test_barrier {
     pub(super) fn note_rollback_without_ticket_wait(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.rollback_wait_count.fetch_add(1, Ordering::AcqRel);
+            state.state_changed.notify_waiters();
         }
     }
 
@@ -3011,6 +3054,7 @@ pub mod test_barrier {
     pub(super) fn note_rollback_without_ticket_done(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.rollback_done_count.fetch_add(1, Ordering::AcqRel);
+            state.state_changed.notify_waiters();
         }
     }
 
@@ -3021,6 +3065,7 @@ pub mod test_barrier {
             return;
         };
         state.rollback_parked.store(true, Ordering::Release);
+        state.state_changed.notify_waiters();
         if state.rollback_gate_open.load(Ordering::Acquire) {
             return;
         }
@@ -3035,6 +3080,7 @@ pub mod test_barrier {
     pub(super) fn note_result_mapped(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.result_mapped_count.fetch_add(1, Ordering::AcqRel);
+            state.state_changed.notify_waiters();
         }
     }
 
@@ -3043,20 +3089,25 @@ pub mod test_barrier {
     /// lock-holding task).
     pub(super) async fn wait_results_mapped(slot: &Slot, n: usize, timeout: Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let mapped = current(slot)
-                .map(|state| state.result_mapped_count.load(Ordering::Acquire))
-                .unwrap_or(0);
-            if mapped >= n {
-                return;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!(
-                    "write_commit barrier: timed out waiting for {n} mapped results (mapped={mapped})"
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        let Some(state) = current(slot) else {
+            // Callers always arm a barrier first; without one the count never
+            // moves — surface the same named failure instead of parking.
+            panic!(
+                "write_commit barrier: timed out waiting for {n} mapped results (no barrier armed)"
+            );
+        };
+        wait_until_with(
+            &state,
+            deadline,
+            |state| state.result_mapped_count.load(Ordering::Acquire) >= n,
+            || {
+                format!(
+                    "write_commit barrier: timed out waiting for {n} mapped results (mapped={})",
+                    state.result_mapped_count.load(Ordering::Acquire)
+                )
+            },
+        )
+        .await;
     }
 
     /// r10 item 1 send hook: a caller is about to await the `write_seq` lock.
@@ -3065,6 +3116,7 @@ pub mod test_barrier {
     pub(super) fn note_write_seq_wait(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.write_seq_wait_count.fetch_add(1, Ordering::AcqRel);
+            state.state_changed.notify_waiters();
         }
     }
 
@@ -3075,6 +3127,7 @@ pub mod test_barrier {
     pub(super) fn note_publish_lock_wait(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.publish_lock_wait_count.fetch_add(1, Ordering::AcqRel);
+            state.state_changed.notify_waiters();
         }
     }
 
@@ -3089,6 +3142,7 @@ pub mod test_barrier {
         state
             .cancelled_ticket_reached
             .store(true, Ordering::Release);
+        state.state_changed.notify_waiters();
         if state.cancelled_gate_open.load(Ordering::Acquire) {
             return;
         }
@@ -3105,53 +3159,51 @@ pub mod test_barrier {
         /// caller is suspended holding it).
         pub async fn wait_until_write_seq_waits(&self, n: usize, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.write_seq_wait_count.load(Ordering::Acquire) >= n {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.write_seq_wait_count.load(Ordering::Acquire) >= n,
+                || {
+                    format!(
                         "write_commit barrier: timed out waiting for {n} write_seq waiters \
                          (reached={})",
                         self.state.write_seq_wait_count.load(Ordering::Acquire)
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+                    )
+                },
+            )
+            .await;
         }
 
         /// r10 item 1: wait until `n` send callers have reached the
         /// publish-mutex lock await.
         pub async fn wait_until_publish_lock_waits(&self, n: usize, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.publish_lock_wait_count.load(Ordering::Acquire) >= n {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.publish_lock_wait_count.load(Ordering::Acquire) >= n,
+                || {
+                    format!(
                         "write_commit barrier: timed out waiting for {n} publish-lock waiters \
                          (reached={})",
                         self.state.publish_lock_wait_count.load(Ordering::Acquire)
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+                    )
+                },
+            )
+            .await;
         }
 
         /// r10 item 2: wait until the worker reaches a cancelled ticket's
         /// position and parks before the at-position rollback.
         pub async fn wait_until_cancelled_ticket_reached(&self, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.cancelled_ticket_reached.load(Ordering::Acquire) {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!("write_commit barrier: timed out waiting for the cancelled ticket");
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.cancelled_ticket_reached.load(Ordering::Acquire),
+                || "write_commit barrier: timed out waiting for the cancelled ticket".to_owned(),
+            )
+            .await;
         }
 
         /// r10 item 2: SHUT the cancelled-ticket rollback gate so the worker
@@ -3176,19 +3228,19 @@ pub mod test_barrier {
         /// back AT THEIR TICKET POSITIONS (not merely reached by the worker).
         pub async fn wait_until_cancelled_rollbacks_done(&self, n: usize, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.cancelled_rollback_done.load(Ordering::Acquire) >= n {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.cancelled_rollback_done.load(Ordering::Acquire) >= n,
+                || {
+                    format!(
                         "write_commit barrier: timed out waiting for {n} cancelled-ticket \
                          rollbacks to complete (done={})",
                         self.state.cancelled_rollback_done.load(Ordering::Acquire)
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+                    )
+                },
+            )
+            .await;
         }
 
         /// r12 item 2: SHUT the reader result-enqueue gate so the next turn
@@ -3217,53 +3269,42 @@ pub mod test_barrier {
         /// parked on the shut enqueue gate — the result is provably withheld.
         pub async fn wait_until_result_enqueue_parked(&self, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.result_enqueue_parked.load(Ordering::Acquire)
-                    && !self.state.result_enqueue_open.load(Ordering::Acquire)
-                {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
-                        "write_commit barrier: timed out waiting for the reader to park on \
-                         the shut result-enqueue gate"
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| {
+                    state.result_enqueue_parked.load(Ordering::Acquire)
+                        && !state.result_enqueue_open.load(Ordering::Acquire)
+                },
+                || "write_commit barrier: timed out waiting for the reader to park on                     the shut result-enqueue gate".to_owned(),
+            )
+            .await;
         }
 
         /// r11 item 2: wait until the reader observed natural stdout EOF and
         /// queued StdoutEof under the admission seal.
         pub async fn wait_until_stdout_eof_queued(&self, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.stdout_eof_queued.load(Ordering::Acquire) {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!("write_commit barrier: timed out waiting for stdout EOF to be queued");
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.stdout_eof_queued.load(Ordering::Acquire),
+                || "write_commit barrier: timed out waiting for stdout EOF to be queued".to_owned(),
+            )
+            .await;
         }
 
         /// r12 item 1: wait until the bounded publication backlog tripped and
         /// the overflow session-shutdown fired (terminal diagnostic emitted).
         pub async fn wait_until_backlog_overflow(&self, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.backlog_overflowed.load(Ordering::Acquire) {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
-                        "write_commit barrier: timed out waiting for the publication \
-                         backlog overflow"
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.backlog_overflowed.load(Ordering::Acquire),
+                || "write_commit barrier: timed out waiting for the publication                     backlog overflow".to_owned(),
+            )
+            .await;
         }
 
         /// r13 item 3: wait until the overflow shutdown sealed admission and is
@@ -3271,18 +3312,13 @@ pub mod test_barrier {
         /// guaranteed kill.
         pub async fn wait_until_overflow_kill_waiting(&self, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.overflow_kill_waiting.load(Ordering::Acquire) {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
-                        "write_commit barrier: timed out waiting for the overflow kill to \
-                         contend on the live handle"
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.overflow_kill_waiting.load(Ordering::Acquire),
+                || "write_commit barrier: timed out waiting for the overflow kill to                     contend on the live handle".to_owned(),
+            )
+            .await;
         }
 
         /// r11 item 4(a): wait until the READER has enqueued `n` Result frames
@@ -3290,19 +3326,19 @@ pub mod test_barrier {
         /// this is provably queued behind those results, not ahead of them.
         pub async fn wait_until_results_enqueued(&self, n: usize, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.result_enqueued_count.load(Ordering::Acquire) >= n {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.result_enqueued_count.load(Ordering::Acquire) >= n,
+                || {
+                    format!(
                         "write_commit barrier: timed out waiting for {n} results to be enqueued \
                          (enqueued={})",
                         self.state.result_enqueued_count.load(Ordering::Acquire)
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+                    )
+                },
+            )
+            .await;
         }
 
         /// r11 item 3: SHUT the pre-rollback gate so fail_without_ticket parks
@@ -3324,15 +3360,13 @@ pub mod test_barrier {
         /// pre-rollback gate.
         pub async fn wait_until_rollback_parked(&self, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.rollback_parked.load(Ordering::Acquire) {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!("write_commit barrier: timed out waiting for the rollback park");
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.rollback_parked.load(Ordering::Acquire),
+                || "write_commit barrier: timed out waiting for the rollback park".to_owned(),
+            )
+            .await;
         }
 
         /// r11 item 3: wait until `n` callers reached the rollback's
@@ -3340,57 +3374,57 @@ pub mod test_barrier {
         /// mapper).
         pub async fn wait_until_rollback_lock_waits(&self, n: usize, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.rollback_wait_count.load(Ordering::Acquire) >= n {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.rollback_wait_count.load(Ordering::Acquire) >= n,
+                || {
+                    format!(
                         "write_commit barrier: timed out waiting for {n} rollback lock waits \
                          (reached={})",
                         self.state.rollback_wait_count.load(Ordering::Acquire)
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+                    )
+                },
+            )
+            .await;
         }
 
         /// r11 item 3: wait until `n` no-ticket rollbacks have COMPLETED,
         /// including one the cancellation-independent Drop cleanup detached.
         pub async fn wait_until_rollbacks_done(&self, n: usize, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.rollback_done_count.load(Ordering::Acquire) >= n {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.rollback_done_count.load(Ordering::Acquire) >= n,
+                || {
+                    format!(
                         "write_commit barrier: timed out waiting for {n} rollbacks to complete \
                          (done={})",
                         self.state.rollback_done_count.load(Ordering::Acquire)
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+                    )
+                },
+            )
+            .await;
         }
 
         /// r8 item 3: wait until `n` Result frames have been MAPPED by the
         /// publication worker (after the mapper lock, before/with emit).
         pub async fn wait_until_results_mapped(&self, n: usize, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.result_mapped_count.load(Ordering::Acquire) >= n {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.result_mapped_count.load(Ordering::Acquire) >= n,
+                || {
+                    format!(
                         "write_commit barrier: timed out waiting for {n} mapped results \
                          (mapped={})",
                         self.state.result_mapped_count.load(Ordering::Acquire)
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+                    )
+                },
+            )
+            .await;
         }
 
         /// Block until the send has parked post-write, the worker is parked at
@@ -3398,24 +3432,25 @@ pub mod test_barrier {
         /// behind it — i.e. the race window is provably occupied.
         pub async fn wait_until_result_parked(&self, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.write_reached.load(Ordering::Acquire)
-                    && self.state.reserve_parked.load(Ordering::Acquire)
-                    && self.state.result_queued.load(Ordering::Acquire)
-                {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| {
+                    state.write_reached.load(Ordering::Acquire)
+                        && state.reserve_parked.load(Ordering::Acquire)
+                        && state.result_queued.load(Ordering::Acquire)
+                },
+                || {
+                    format!(
                         "write_commit barrier: timed out waiting for the race \
                          (write_reached={}, reserve_parked={}, result_queued={})",
                         self.state.write_reached.load(Ordering::Acquire),
                         self.state.reserve_parked.load(Ordering::Acquire),
                         self.state.result_queued.load(Ordering::Acquire)
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+                    )
+                },
+            )
+            .await;
         }
 
         /// r7 item 2: park the pre-ack write gate starting at the 1-based write
@@ -3426,22 +3461,23 @@ pub mod test_barrier {
         /// Whether the parked (thresholded) write has been reached yet.
         pub async fn wait_until_write_parked(&self, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.write_parked.load(Ordering::Acquire)
-                    && self.state.reserve_enqueued.load(Ordering::Acquire) >= 1
-                {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| {
+                    state.write_parked.load(Ordering::Acquire)
+                        && state.reserve_enqueued.load(Ordering::Acquire) >= 1
+                },
+                || {
+                    format!(
                         "write_commit barrier: timed out waiting for the pre-ack park \
                          (write_parked={}, enqueued={})",
                         self.state.write_parked.load(Ordering::Acquire),
                         self.state.reserve_enqueued.load(Ordering::Acquire)
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+                    )
+                },
+            )
+            .await;
         }
 
         /// r7 item 2: let the parked detached write task proceed to the writer
@@ -3458,22 +3494,23 @@ pub mod test_barrier {
         /// worker map the result after the write committed.
         pub async fn wait_until_reserve_parked(&self, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.write_reached.load(Ordering::Acquire)
-                    && self.state.reserve_parked.load(Ordering::Acquire)
-                {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| {
+                    state.write_reached.load(Ordering::Acquire)
+                        && state.reserve_parked.load(Ordering::Acquire)
+                },
+                || {
+                    format!(
                         "write_commit barrier: timed out waiting for the ticket \
                          (write_reached={}, reserve_parked={})",
                         self.state.write_reached.load(Ordering::Acquire),
                         self.state.reserve_parked.load(Ordering::Acquire)
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+                    )
+                },
+            )
+            .await;
         }
 
         /// Block until `n` Reserve tickets have been enqueued — i.e. the send
@@ -3481,19 +3518,19 @@ pub mod test_barrier {
         /// is registered before the parked worker maps the first result.
         pub async fn wait_until_reserves_enqueued(&self, n: usize, timeout: Duration) {
             let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                if self.state.reserve_enqueued.load(Ordering::Acquire) >= n {
-                    return;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    panic!(
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.reserve_enqueued.load(Ordering::Acquire) >= n,
+                || {
+                    format!(
                         "write_commit barrier: timed out waiting for {n} reservations \
                          (enqueued={})",
                         self.state.reserve_enqueued.load(Ordering::Acquire)
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
+                    )
+                },
+            )
+            .await;
         }
 
         /// Release ONLY the send gate: the write commits and the parked worker
@@ -7251,14 +7288,15 @@ mod turn_reservation_wakeup_tests {
         assert!(!committed, "a cancel resolves the ticket as not-committed");
     }
 
-    /// A normal commit resolves a waiting ticket as committed.
+    /// A normal commit resolves a waiting ticket as committed. The commit may
+    /// land before the waiter registers its `notified()`: `wait_for_commit`
+    /// reads the resolved flag first and resolves without a sleep-driven race
+    /// (the parked-notify ordering is exercised by every scheduling test).
     #[tokio::test]
     async fn commit_resolves_a_waiting_ticket_as_committed() {
         let reservation = TurnReservation::shared(0, "msg-commit".to_string());
         let ticket = reservation.clone();
         let waiter = tokio::spawn(async move { ticket.wait_for_commit().await });
-        // Let the waiter register its notified() before committing.
-        tokio::time::sleep(Duration::from_millis(20)).await;
         reservation.commit();
         let committed = tokio::time::timeout(Duration::from_secs(2), waiter)
             .await

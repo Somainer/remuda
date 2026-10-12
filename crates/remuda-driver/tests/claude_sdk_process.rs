@@ -1044,7 +1044,10 @@ async fn a_publication_backlog_overflow_shuts_the_session_down_bounded_with_a_di
     // byte cap, so the ITEM limit is the one proven here.
     driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
     let driver = std::sync::Arc::new(driver);
-    let mut handle = driver.start(spec).await.expect("start");
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
 
     let barrier = driver.arm_write_commit_barrier();
 
@@ -3304,7 +3307,13 @@ async fn bound_proof_a_parked_send_join_fails_fast_at_the_named_bound_then_compl
     );
 
     drop(handle);
-    let _ = driver.close().await;
+    let _ = wait_bounded(
+        driver.close(),
+        Duration::from_secs(10),
+        "close after the parked-send proof",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close after the parked-send proof");
 }
 
 /// ma-sdk-state r11 item 5 / r12 item 4 — bound proof, class BARRIER WAIT.
@@ -3348,7 +3357,13 @@ async fn bound_proof_a_barrier_count_wait_fails_at_its_named_deadline_then_retur
 
     drop(barrier);
     drop(handle);
-    let _ = driver.close().await;
+    let _ = wait_bounded(
+        driver.close(),
+        Duration::from_secs(10),
+        "close after the barrier-count proof",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close after the barrier-count proof");
 }
 
 /// ma-sdk-state r11 item 5 / r12 item 4 — bound proof, class WRITER GATE WAIT.
@@ -3506,7 +3521,14 @@ async fn bound_proof_the_recv_none_drain_fails_named_then_completes_after_close(
     );
 
     // RELEASE: close seals the channel; the same drain completes.
-    driver.close().await.expect("close");
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(10),
+        "close for the recv-None proof",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close for the recv-None proof")
+    .expect("close");
     let tail = drain_until_closed(&mut handle, Duration::from_secs(5))
         .await
         .expect("the recv-None drain completes after close");

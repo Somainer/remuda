@@ -180,6 +180,17 @@ impl ClaudeSdkDriver {
             .await
     }
 
+    /// Test-only (`test-stub`, r13 item 3): hold the `live` process handle
+    /// lock under a named bounded wait, so an overflow kill provably contends
+    /// with a holder and still lands.
+    #[cfg(feature = "test-stub")]
+    pub async fn bounded_hold_live_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> crate::claude_print::LiveMutexHold<'_> {
+        self.inner.bounded_hold_live_for_test(timeout).await
+    }
+
     /// Test-only (`test-stub`, r12 item 1): shrink the publication backlog
     /// caps so a regression can flood past the bound deterministically.
     #[cfg(feature = "test-stub")]

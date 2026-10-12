@@ -113,6 +113,24 @@ fn process_alive(pid: &str) -> bool {
     remuda_driver::shell_pty::lifecycle::group_alive(pid)
 }
 
+/// Whether the direct child has received its fatal signal: its `/proc` entry is
+/// gone (reaped) or its state is zombie/dead (ma-sdk-state r13 item 3). Signal-0
+/// liveness answers yes for an unreaped zombie, which is exactly the state a
+/// SIGKILLed child sits in before `close` reaps it, so inspect `/proc` directly.
+fn child_gone_or_zombie(pid: &str) -> bool {
+    let Ok(pid) = pid.parse::<i32>() else {
+        return false;
+    };
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    // `/proc/<pid>/stat`: "<comm in parens>) <state> ..."; the comm itself can
+    // contain spaces/parens, so split at the LAST ')'.
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| matches!(state, "Z" | "X" | "x"))
+}
+
 fn prompt(text: &str) -> DriverInput {
     prompt_id(text, "msg-1")
 }
@@ -1267,6 +1285,104 @@ async fn a_silent_prompt_flood_is_bounded_by_reservation_admission() {
     .await
     .expect("bounded test wait timed out: waiting for close after the reservation overflow")
     .expect("close ack");
+    let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+}
+
+/// ma-sdk-state r13 item 3: when the overflow shutdown's kill contends with a
+/// held `live` process handle, it must WAIT for the handle and still kill the
+/// flooding child — the old `try_lock` skipped the signals permanently on
+/// contention.
+#[tokio::test]
+async fn an_overflow_kill_contending_on_live_still_reaps_the_child() {
+    const ITEM_CAP: usize = 32;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_STOP_READING".into(), "1".into());
+    env.insert("FAKE_CLAUDE_STDOUT_FLOOD".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+    let pid = handle
+        .ack()
+        .native_ids
+        .get("pid")
+        .expect("pid on the launch ack")
+        .clone();
+
+    let barrier = driver.arm_write_commit_barrier();
+
+    // Hold the live process handle BEFORE the flood trips: the overflow kill
+    // must park on this lock rather than skip the child.
+    let live_hold = driver
+        .bounded_hold_live_for_test(Duration::from_secs(5))
+        .await;
+
+    // ACKNOWLEDGED: the shutdown sealed admission and reached the kill step
+    // while the handle is held.
+    barrier
+        .wait_until_overflow_kill_waiting(Duration::from_secs(10))
+        .await;
+    assert!(
+        process_alive(&pid),
+        "the flooding child is still alive while the guaranteed kill waits for the handle"
+    );
+
+    // Release the handle: the kill lands and the terminal is delivered.
+    drop(live_hold);
+    barrier
+        .wait_until_backlog_overflow(Duration::from_secs(10))
+        .await;
+
+    // The SIGKILL landed even though close has not reaped yet: the direct
+    // child is therefore GONE or a zombie (/proc state Z), which
+    // group_alive (signal 0) cannot distinguish from a live process. This is
+    // the pre-close evidence — close's own ladder would otherwise mask a
+    // skipped overflow kill. Polled under a bound like the close tests' reap
+    // waits (external kernel state, not a driver acknowledgement).
+    let reap_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !child_gone_or_zombie(&pid) {
+        assert!(
+            std::time::Instant::now() < reap_deadline,
+            "the contended overflow kill delivered SIGKILL to the flooding child"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The terminal diagnostic rides the reserved permit.
+    let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+        seen.iter().any(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+    })
+    .await;
+    assert!(all.iter().any(|o| {
+        session_terminal_related(o)
+            .and_then(|r| r.get("reason"))
+            .is_some_and(|reason| reason == "publication_backlog_overflow")
+    }));
+
+    drop(barrier);
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close after the contended overflow kill",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close after the contended overflow kill")
+    .expect("close ack");
+    assert!(
+        !process_alive(&pid),
+        "close reaps the SIGKILLed group the contended overflow already killed"
+    );
     let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
         .await
         .expect("the RunHandle reaches recv=None after close");

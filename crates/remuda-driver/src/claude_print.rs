@@ -659,6 +659,14 @@ pub struct WriteSeqHold<'a>(tokio::sync::MutexGuard<'a, ()>);
 #[allow(dead_code)]
 pub struct MapperMutexHold<'a>(tokio::sync::MutexGuard<'a, Mapper>);
 
+/// Test-only (`test-stub`): held `live` process handle guard (r13 item 3).
+/// Keeps the process lock held so the overflow shutdown's GUARANTEED kill
+/// contends with the test holder; dropping the handle lets that kill proceed.
+#[cfg(feature = "test-stub")]
+#[must_use = "holding the guard is the point; drop it to release the lock"]
+#[allow(dead_code)]
+pub struct LiveMutexHold<'a>(tokio::sync::MutexGuard<'a, Option<Live>>);
+
 impl ClaudePrintDriver {
     /// Test-only (`test-stub`): true when the bounded observation channel is
     /// full and the publication worker is parked — the close-under-pressure
@@ -775,6 +783,19 @@ impl ClaudePrintDriver {
         })
         .await
         .expect("bounded test wait timed out: acquiring the mapper lock hold")
+    }
+
+    /// Test-only (`test-stub`, r13 item 3): hold the `live` process handle
+    /// lock, so an overflow shutdown provably contends with a holder and must
+    /// still guarantee the kill after the holder drops. Bounded by a NAMED
+    /// wait. Drop the returned hold to release.
+    #[cfg(feature = "test-stub")]
+    pub async fn bounded_hold_live_for_test(&self, timeout: Duration) -> LiveMutexHold<'_> {
+        tokio::time::timeout(timeout, async {
+            LiveMutexHold(self.inner.live.lock().await)
+        })
+        .await
+        .expect("bounded test wait timed out: acquiring the live process hold")
     }
 
     /// Test-only (`test-stub`, r11 item 3; r12 item 3): the seqs of the turns
@@ -1946,15 +1967,28 @@ async fn shutdown_for_backlog_overflow(
     }
     // Kill the flooding child NOW, without the writer channel or the close
     // ladder: SIGKILL to the whole group plus the direct kill are synchronous
-    // and cannot block on a child that stopped draining stdin. If `close`
-    // already owns `live` it is running its own ladder against this same
-    // child, so skipping the signals is safe.
-    if let Ok(mut live) = inner.live.try_lock()
-        && let Some(live) = live.as_mut()
+    // and cannot block on a child that stopped draining stdin.
+    //
+    // ma-sdk-state r13 item 3: ACQUIRE the handle and guarantee the signals.
+    // The old `try_lock` skipped the kill whenever `live` was transiently held
+    // (a prompt writer lookup, a permission-response pending mutation, a
+    // Host-policy insert) and nothing retried, so ordinary contention could
+    // leave the flooding child alive for the rest of the session. Awaiting the
+    // lock only DELAYS under such a holder; it cannot deadlock: no lock this
+    // routine still needs is held across this await, and `close` — the only
+    // long holder — runs its own ladder against this same child and then reaps
+    // it to None (its reader abort means a parked overflow call cannot pin
+    // close), so reaching a None/absent handle means the child is already
+    // removed/reaped and there is nothing to kill.
+    #[cfg(feature = "test-stub")]
+    test_barrier::note_overflow_kill_waiting(&inner.barrier);
     {
-        let pgid = live.process.id().and_then(|pid| i32::try_from(pid).ok());
-        kill_group(pgid, carrier);
-        let _ = live.process.kill();
+        let mut live = inner.live.lock().await;
+        if let Some(live) = live.as_mut() {
+            let pgid = live.process.id().and_then(|pid| i32::try_from(pid).ok());
+            kill_group(pgid, carrier);
+            let _ = live.process.kill();
+        }
     }
     error!(
         carrier,
@@ -2740,6 +2774,11 @@ pub mod test_barrier {
         /// r12 item 1: the bounded publication backlog tripped and the
         /// overflow session-shutdown fired (terminal diagnostic emitted).
         backlog_overflowed: AtomicBool,
+        /// r13 item 3: the overflow shutdown sealed admission and is ABOUT TO
+        /// acquire the (contended) `live` handle for its guaranteed kill, so a
+        /// test holding that handle can acknowledge the kill waiting without
+        /// racing it.
+        overflow_kill_waiting: AtomicBool,
         /// r11 item 3: a fail_without_ticket caller reached the rollback (set
         /// right before its mapper-lock await). With the mapper externally
         /// held, count n acknowledges n callers parked in that wait.
@@ -2793,6 +2832,7 @@ pub mod test_barrier {
             result_enqueue_gate: tokio::sync::Notify::new(),
             stdout_eof_queued: AtomicBool::new(false),
             backlog_overflowed: AtomicBool::new(false),
+            overflow_kill_waiting: AtomicBool::new(false),
             rollback_wait_count: AtomicUsize::new(0),
             rollback_done_count: AtomicUsize::new(0),
             rollback_parked: AtomicBool::new(false),
@@ -2935,6 +2975,15 @@ pub mod test_barrier {
     pub(super) fn note_backlog_overflow(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.backlog_overflowed.store(true, Ordering::Release);
+        }
+    }
+
+    /// r13 item 3 hook: the overflow shutdown sealed admission and is about to
+    /// await the `live` handle for its guaranteed kill — while a test holds
+    /// that handle, this acknowledges the kill step parked on the contention.
+    pub(super) fn note_overflow_kill_waiting(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state.overflow_kill_waiting.store(true, Ordering::Release);
         }
     }
 
@@ -3200,6 +3249,25 @@ pub mod test_barrier {
                     panic!(
                         "write_commit barrier: timed out waiting for the publication \
                          backlog overflow"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// r13 item 3: wait until the overflow shutdown sealed admission and is
+        /// parked about to acquire the (test-held) `live` handle for its
+        /// guaranteed kill.
+        pub async fn wait_until_overflow_kill_waiting(&self, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.overflow_kill_waiting.load(Ordering::Acquire) {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "write_commit barrier: timed out waiting for the overflow kill to \
+                         contend on the live handle"
                     );
                 }
                 tokio::time::sleep(Duration::from_millis(2)).await;

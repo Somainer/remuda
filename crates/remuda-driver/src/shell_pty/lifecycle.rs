@@ -1762,13 +1762,28 @@ mod tests {
             handle.join().expect("the waiter thread returns")
         }
 
+        /// r17 item 3: the test-only SIGUSR1 registration must not survive
+        /// the test. The explicit assertions below cover the normal return;
+        /// this guard covers the unwind path (a failed assertion) so the
+        /// process-wide handler is removed either way.
+        struct SigIdGuard(Option<signal_hook::SigId>);
+
+        impl Drop for SigIdGuard {
+            fn drop(&mut self) {
+                if let Some(id) = self.0.take() {
+                    let _ = signal_hook::low_level::unregister(id);
+                }
+            }
+        }
+
         // Install the empty handler BEFORE the waiter exists. process-wide,
         // but SIGUSR1 is only ever sent thread-directed at the waiter below, so
         // no other test observes it; the flag additionally records delivery.
         // r17 item 3 unregisters this SigId before the test returns.
         let caught = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        signal_hook::flag::register(nix::libc::SIGUSR1, Arc::clone(&caught))
+        let sig_id = signal_hook::flag::register(nix::libc::SIGUSR1, Arc::clone(&caught))
             .expect("register the safe SIGUSR1 handler");
+        let mut sig_guard = SigIdGuard(Some(sig_id));
 
         let mut live = std::process::Command::new("/bin/sh")
             .args(["-c", "exec sleep 30"])
@@ -1838,6 +1853,21 @@ mod tests {
         );
         let _ = live.kill();
         let _ = live.wait();
+
+        // r17 item 3: the process-wide SIGUSR1 handler is removed BEFORE the
+        // normal return. `unregister` reports whether the SigId was still
+        // registered (true here), and a second removal finds nothing — the
+        // observable proof that the handler does not leak into the rest of
+        // the binary.
+        let id = sig_guard.0.take().expect("the guard still owns the SigId");
+        assert!(
+            signal_hook::low_level::unregister(id),
+            "the test unregisters its SIGUSR1 SigId before returning"
+        );
+        assert!(
+            !signal_hook::low_level::unregister(id),
+            "the removed SIGUSR1 SigId is not registered a second time"
+        );
     }
 }
 

@@ -8,11 +8,17 @@
 //! behind a trait so tests inject a deterministic probe instead of poking
 //! real `/proc` entries.
 
+// c-usagefu r9 item 9: gate imports by the cfgs that actually use them.
+// `Path` backs the always-compiled trait and `Arc` backs the always-compiled
+// platform_probe; the collection types belong to the Linux /proc probe (and
+// the test fakes), PathBuf only to the test fakes. Unconditional imports
+// failed clippy --all-targets -D warnings on macOS where the linux module is
+// compiled out.
+#[cfg(any(test, target_os = "linux"))]
 use std::collections::{HashMap, HashSet};
-#[cfg(not(test))]
 use std::path::Path;
 #[cfg(test)]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Probe that decides file ownership from live process state.

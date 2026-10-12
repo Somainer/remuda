@@ -227,13 +227,15 @@ fn replay_stable_positions_survive_fresh_mapper_batching_and_admit_a_new_downwar
     assert_eq!(stored(&conn), (4, Some(5)), "D survives the stale replay");
 }
 
-/// c-ctxusage r15 item 4: positions are SESSION-QUALIFIED. Two native sessions
-/// can both contain an assistant message with the SAME id (the Hub dedupes
-/// turn rows on the bare message id), and every transcript starts at record
-/// position 1. A snapshot from a DIFFERENT session must not be frozen against
-/// the prior session's high position, while the strict watermark still holds
-/// WITHIN each session. The native session id travels on the usage payload and
-/// is persisted next to the watermark.
+/// c-ctxusage r15 item 4 / r16 item 3 (T1'): positions are SESSION-QUALIFIED
+/// and the watermark is kept PER LINEAGE. Two native sessions can both contain
+/// an assistant message with the SAME id (the Hub keeps one
+/// revision-replaced row per `(message id, source session id)`), and every
+/// transcript starts at record position 1. A snapshot from a DIFFERENT session
+/// must not be frozen against the prior session's high position — accepting it
+/// inserts its own row and never erases the other lineage's mark — while the
+/// strict watermark still holds WITHIN each session. The native session id
+/// travels on the usage payload and is persisted next to the watermark.
 #[test]
 fn two_sessions_with_overlapping_message_ids_keep_independent_position_watermarks() {
     fn session_mapper(session: &str) -> TranscriptMapper {
@@ -284,16 +286,18 @@ fn two_sessions_with_overlapping_message_ids_keep_independent_position_watermark
         let row = project_usage_event(&rec, None, None).expect("projects");
         insert_usage_event(conn, &row).expect("insert")
     };
-    let stored = |conn: &rusqlite::Connection| -> (i64, Option<String>, Option<i64>) {
-        conn.query_row(
-            "SELECT metric_revision, source_session_id, output_tokens FROM usage_events
+    let stored =
+        |conn: &rusqlite::Connection, session: &str| -> (i64, Option<String>, Option<i64>) {
+            conn.query_row(
+                "SELECT metric_revision, source_session_id, output_tokens FROM usage_events
              WHERE instance_id = 'ins_two_sessions'
-               AND scope = 'turn' AND scope_id = 'msg_shared_across_sessions'",
-            [],
-            |r| Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap())),
-        )
-        .expect("the scoped row exists")
-    };
+               AND scope = 'turn' AND scope_id = 'msg_shared_across_sessions'
+               AND source_session_id = ?1",
+                [session],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap())),
+            )
+            .expect("the scoped row exists")
+        };
 
     let conn = rusqlite::Connection::open_in_memory().expect("sqlite");
     migrate(&conn).expect("migrate");
@@ -312,7 +316,10 @@ fn two_sessions_with_overlapping_message_ids_keep_independent_position_watermark
     .expect("alpha finalises");
     assert_eq!(session_of(&alpha_3).as_deref(), Some("sess-alpha"));
     assert!(apply(&conn, &alpha_3));
-    assert_eq!(stored(&conn), (3, Some("sess-alpha".into()), Some(20)));
+    assert_eq!(
+        stored(&conn, "sess-alpha"),
+        (3, Some("sess-alpha".into()), Some(20))
+    );
 
     // Session beta is a DIFFERENT transcript with the same message id,
     // replayed from position 1. Its low revision is a different lineage, so
@@ -324,7 +331,16 @@ fn two_sessions_with_overlapping_message_ids_keep_independent_position_watermark
         apply(&conn, &beta_1),
         "a different session at a low position is a different authority"
     );
-    assert_eq!(stored(&conn), (1, Some("sess-beta".into()), Some(9)));
+    assert_eq!(
+        stored(&conn, "sess-beta"),
+        (1, Some("sess-beta".into()), Some(9))
+    );
+    // beta's acceptance never erased alpha's own mark.
+    assert_eq!(
+        stored(&conn, "sess-alpha"),
+        (3, Some("sess-alpha".into()), Some(20)),
+        "accepting another lineage never erases a mark (T1')"
+    );
 
     // WITHIN beta the strict watermark still holds: re-delivering rev 1 with a
     // growth changes nothing...
@@ -332,22 +348,21 @@ fn two_sessions_with_overlapping_message_ids_keep_independent_position_watermark
         !apply(&conn, &beta_1),
         "an equal-position replay within the same session changes nothing"
     );
-    assert_eq!(stored(&conn), (1, Some("sess-beta".into()), Some(9)));
+    assert_eq!(
+        stored(&conn, "sess-beta"),
+        (1, Some("sess-beta".into()), Some(9))
+    );
     // ...and beta rev 2 applies.
     let beta_2 = poll_batch(&mut beta, &[(1, shared_record(1, 12))]).expect("beta rev2");
     assert!(apply(&conn, &beta_2), "beta rev 2 is newer within beta");
-    assert_eq!(stored(&conn), (2, Some("sess-beta".into()), Some(12)));
+    assert_eq!(
+        stored(&conn, "sess-beta"),
+        (2, Some("sess-beta".into()), Some(12))
+    );
 
     // An alpha frame at revision 2 is STALE within alpha (alpha already
-    // reached 3): once the row lineage is alpha again it must not roll
-    // backwards. First a newer alpha frame legitimately takes the row back...
-    let alpha_4 = poll_batch(&mut alpha, &[(3, shared_record(3, 18))]).expect("alpha rev4");
-    assert!(
-        apply(&conn, &alpha_4),
-        "alpha rev 4 is a different lineage, accepted"
-    );
-    assert_eq!(stored(&conn), (4, Some("sess-alpha".into()), Some(18)));
-    // ...then the older alpha rev 2 is rejected within the alpha lineage.
+    // reached 3): it must not roll backwards against alpha's OWN mark, even
+    // while beta holds its separate row.
     let alpha_2 = poll_batch(
         &mut session_mapper("sess-alpha"),
         &[(0, shared_record(0, 30)), (1, shared_record(1, 99))],
@@ -355,12 +370,27 @@ fn two_sessions_with_overlapping_message_ids_keep_independent_position_watermark
     .expect("alpha rev2 replay");
     assert!(
         !apply(&conn, &alpha_2),
-        "alpha rev 2 is stale against alpha's own watermark 4"
+        "alpha rev 2 is stale against alpha's own watermark 3 — beta never erased it"
     );
     assert_eq!(
-        stored(&conn),
-        (4, Some("sess-alpha".into()), Some(18)),
+        stored(&conn, "sess-alpha"),
+        (3, Some("sess-alpha".into()), Some(20)),
         "the stale alpha frame never writes 99"
+    );
+    // A genuinely newer alpha frame (rev 4) still advances its own lineage.
+    let alpha_4 = poll_batch(&mut alpha, &[(3, shared_record(3, 18))]).expect("alpha rev4");
+    assert!(
+        apply(&conn, &alpha_4),
+        "alpha rev 4 advances the alpha lineage"
+    );
+    assert_eq!(
+        stored(&conn, "sess-alpha"),
+        (4, Some("sess-alpha".into()), Some(18))
+    );
+    assert_eq!(
+        stored(&conn, "sess-beta"),
+        (2, Some("sess-beta".into()), Some(12)),
+        "the beta lineage survives untouched"
     );
 }
 

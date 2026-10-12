@@ -161,28 +161,57 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // inserts use, in acceptance (rowid) order, before rowid order is allowed
     // to mean "accepted history" for current-stock selection and floors.
     normalise_scoped_session_chains(&tx)?;
-    // Dedupe index is scope-specific (c-ctxusage r4 item 3):
-    // - Turn rows (Claude message id): one revision-replaced row per message.
-    // - Session rows (cumulative Grok/Codex stock): append-only GROWTH POINTS,
-    //   never collapsed — rate windows need their history. Duplicate/historical
-    //   replay points are frozen in Rust by their cumulative counters, not by a
-    //   one-row unique index.
+    // c-ctxusage r16 item 3 (T1'): the turn authority watermark is kept PER
+    // LINEAGE `(scope_id, source_session_id)` — NULL (the unqualified legacy
+    // lineage) and every qualified native session id each hold their own mark
+    // and their own revision-replaced row. The old index allowed only one turn
+    // row per scope_id, so accepting one lineage erased another lineage's
+    // watermark. Drop it, collapse only WITHIN a lineage (kept distinct by
+    // COALESCE — NULL and a real id can never share a key, since empty ids are
+    // normalised to NULL at projection), and recreate the unique index over
+    // the lineage key.
+    tx.execute_batch("DROP INDEX IF EXISTS usage_events_turn_dedupe;")?;
+    collapse_duplicate_turn_lineage_rows(&tx)?;
     tx.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
-             ON usage_events(instance_id, scope, scope_id)
+             ON usage_events(
+                 instance_id, scope, scope_id,
+                 COALESCE(source_session_id, '')
+             )
              WHERE scope = 'turn' AND scope_id IS NOT NULL;",
     )?;
     tx.commit()?;
     Ok(())
 }
 
+/// Within one turn lineage `(instance, scope_id, COALESCE(source_session_id,
+/// ''))` keep the oldest durable row (smallest rowid); rows in DIFFERENT
+/// lineages for the same scope id are retained — each lineage owns its
+/// revision-replaced row (c-ctxusage r16 item 3).
+fn collapse_duplicate_turn_lineage_rows(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM usage_events
+         WHERE scope = 'turn'
+           AND scope_id IS NOT NULL
+           AND rowid NOT IN (
+               SELECT MIN(rowid)
+               FROM usage_events
+               WHERE scope = 'turn' AND scope_id IS NOT NULL
+               GROUP BY instance_id, scope_id,
+                        COALESCE(source_session_id, '')
+           )",
+        [],
+    )
+}
+
 /// Collapse rows that became exact duplicates after the retained-journal
 /// scope-id backfill: same `(instance_id, scope, scope_id)` AND identical
 /// counters in every bucket are the same cumulative point replayed at another
-/// journal seq, so keeping both would double-count a stock and violate a
-/// unique index. The oldest durable identity (smallest rowid) wins; its
-/// `observed_at` is retained. Runs inside [`migrate`]'s transaction
-/// (c-ctxusage r10 item 2).
+/// journal seq, so keeping both would double-count a stock. Turn rows in
+/// DIFFERENT native-session lineages are never duplicates even with matching
+/// counters — each lineage keeps its own row (c-ctxusage r16 item 3). The
+/// oldest durable identity (smallest rowid) wins; its `observed_at` is
+/// retained. Runs inside [`migrate`]'s transaction (c-ctxusage r10 item 2).
 fn consolidate_identical_scoped_rows(conn: &Connection) -> rusqlite::Result<usize> {
     conn.execute(
         "DELETE FROM usage_events
@@ -192,6 +221,9 @@ fn consolidate_identical_scoped_rows(conn: &Connection) -> rusqlite::Result<usiz
                FROM usage_events
                WHERE scope_id IS NOT NULL
                GROUP BY instance_id, scope, scope_id,
+                        CASE WHEN scope = 'turn'
+                             THEN COALESCE(source_session_id, '')
+                             ELSE '' END,
                         COALESCE(total_tokens, -1),
                         COALESCE(input_tokens, -1),
                         COALESCE(output_tokens, -1),
@@ -554,60 +586,48 @@ impl SnapshotCounters {
 
 /// The stored state a scoped upsert conflicts with.
 struct StoredSnapshot {
+    /// Durable row id the update must target, so a frame never rewrites
+    /// ANOTHER lineage's revision-replaced row (c-ctxusage r16 item 3).
+    rowid: i64,
     counters: SnapshotCounters,
     revision: i64,
-    /// Native session lineage the stored watermark belongs to.
-    source_session_id: Option<String>,
     cost_usd: Option<String>,
     observed_at: String,
     observed_at_source: String,
 }
 
-/// Turn authority gate (c-ctxusage r15 items 2-4): is `(session, position)`
-/// equal or older than the stored watermark?
+/// Turn authority gate (c-ctxusage r16 item 3, T1'): is `position` equal or
+/// older than THIS lineage's stored watermark?
 ///
-/// Positions are record indices WITHIN a native session transcript, so the
-/// numeric comparison applies only inside one proven lineage:
-/// * both frames carry the SAME qualified session id — the strict watermark;
-/// * NEITHER carries one (legacy unqualified producers) — one implicit
-///   lineage, the numeric watermark still applies;
-/// * the ids differ, or exactly one side is qualified — the frames are
-///   different authorities over the colliding scope id, so the incoming
-///   frame is accepted and its lineage becomes the stored one. A resumed /
-///   re-bound session replaying a fresh transcript from position 1 must not
-///   be frozen by the previous session's high-water mark.
-fn turn_position_is_stale(
-    incoming_session: Option<&str>,
-    incoming_position: i64,
-    stored: &StoredSnapshot,
-) -> bool {
-    match (incoming_session, stored.source_session_id.as_deref()) {
-        (Some(incoming), Some(stored_session)) => {
-            incoming == stored_session && incoming_position <= stored.revision
-        }
-        (None, None) => incoming_position <= stored.revision,
-        // Different provenance, or a qualified frame over a legacy row (and
-        // vice versa): independent lineages.
-        _ => false,
-    }
+/// The watermark is kept PER LINEAGE `(scope_id, source_session_id)` — the
+/// caller looks up ONLY the row belonging to the incoming frame's lineage
+/// (NULL is the unqualified legacy lineage, a distinct key from every
+/// qualified session id), so the comparison is always within one proven
+/// lineage: another lineage's acceptance never erases the mark and a frame
+/// from a different lineage reaches the insert branch with a row of its own.
+fn turn_position_is_stale(incoming_position: i64, stored_revision: i64) -> bool {
+    incoming_position <= stored_revision
 }
 
-/// Insert or revise a Turn-scoped snapshot (one revision-replaced row per
-/// assistant message id).
+/// Insert or revise a Turn-scoped snapshot.
+///
+/// One REVISION-REPLACED ROW PER LINEAGE (c-ctxusage r16 item 3): the
+/// authority watermark is keyed by `(scope_id, source_session_id)`, with NULL
+/// (the unqualified legacy lineage) as its own lineage.
 ///
 /// Turn authority — replay-stable source positions (c-ctxusage r14 items 2-4):
 /// `metric_revision` carries the source's REPLAY-STABLE position of the record
 /// that produced the snapshot (a session-qualified transcript record index),
 /// never a per-mapper publication counter. The Hub treats it as an authority
-/// WATERMARK per `(instance, turn scope, scope_id)`:
+/// WATERMARK per `(instance, turn scope, scope_id, lineage)`:
 ///
-/// * a snapshot at a STRICTLY NEWER position is applied wholesale — every
-///   bucket it explicitly reports replaces the stored one, a smaller value
-///   allowed; buckets it does not report are retained; the derived total is
-///   recomputed; a reported cost replaces the stored bill while an unreported
-///   cost keeps it; the turn clock moves with the newer snapshot (an ingest
-///   fallback still never overwrites a native time). The watermark is
-///   persisted EVEN when every value is unchanged;
+/// * a snapshot at a STRICTLY NEWER position within its OWN lineage is applied
+///   wholesale — every bucket it explicitly reports replaces the stored one,
+///   a smaller value allowed; buckets it does not report are retained; the
+///   derived total is recomputed; a reported cost replaces the stored bill
+///   while an unreported cost keeps it; the turn clock moves with the newer
+///   snapshot (an ingest fallback still never overwrites a native time). The
+///   watermark is persisted EVEN when every value is unchanged;
 /// * an EQUAL- or OLDER-position snapshot changes NOTHING — no counters, no
 ///   equal-position growth or bucket fill, no cost, no clock
 ///   (c-ctxusage r15 item 2). The gate runs BEFORE the cost-only branch, so a
@@ -617,56 +637,75 @@ fn turn_position_is_stale(
 ///   (an unreported bill keeps the stored one) and the watermark advances, so
 ///   a later counter snapshot at an older position is then rejected;
 ///   counters it did not come with and the turn clock are kept
-///   (c-ctxusage r15 item 3).
+///   (c-ctxusage r15 item 3);
+/// * a frame from a DIFFERENT lineage finds no row of its own and is inserted
+///   as a separate revision-replaced row: accepting it never erases another
+///   lineage's mark, and an unqualified frame never rewrites a qualified
+///   row's identity (no COALESCE onto a retained qualified id). Read models
+///   fold one winning row per scope id (c-ctxusage r16 item 3).
 ///
 /// Cumulative SESSION snapshots have their own monotone acceptance path and
 /// are not governed here.
 fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
-    let stored: Option<StoredSnapshot> = conn
-        .query_row(
-            "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens,
-                    cache_write_tokens, metric_revision, source_session_id,
+    // Look up ONLY the incoming lineage's own revision-replaced row. NULL is
+    // matched with IS NULL; a qualified id with equality. Either way the
+    // stored row's lineage IS the incoming lineage.
+    let stored: Option<StoredSnapshot> = {
+        let map_row = |r: &rusqlite::Row<'_>| {
+            Ok(StoredSnapshot {
+                rowid: r.get(0)?,
+                counters: SnapshotCounters {
+                    total: r.get(1)?,
+                    input: r.get(2)?,
+                    output: r.get(3)?,
+                    cache_read: r.get(4)?,
+                    cache_write: r.get(5)?,
+                },
+                revision: r.get(6)?,
+                cost_usd: r.get(7)?,
+                observed_at: r.get(8)?,
+                observed_at_source: r.get(9)?,
+            })
+        };
+        const STORED_SELECT: &str = "SELECT rowid, total_tokens, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, metric_revision,
                     cost_usd, observed_at, observed_at_source
              FROM usage_events
-             WHERE instance_id = ?1 AND scope = 'turn' AND scope_id = ?2",
-            params![row.instance_id, row.scope_id],
-            |r| {
-                Ok(StoredSnapshot {
-                    counters: SnapshotCounters {
-                        total: r.get(0)?,
-                        input: r.get(1)?,
-                        output: r.get(2)?,
-                        cache_read: r.get(3)?,
-                        cache_write: r.get(4)?,
-                    },
-                    revision: r.get(5)?,
-                    source_session_id: r.get(6)?,
-                    cost_usd: r.get(7)?,
-                    observed_at: r.get(8)?,
-                    observed_at_source: r.get(9)?,
-                })
-            },
-        )
-        .ok();
+             WHERE instance_id = ?1 AND scope = 'turn' AND scope_id = ?2
+               AND source_session_id {predicate}";
+        match row.source_session_id.as_deref() {
+            // Bind only the placeholders the SQL actually contains.
+            Some(session) => conn
+                .query_row(
+                    &STORED_SELECT.replace("{predicate}", "= ?3"),
+                    params![row.instance_id, row.scope_id, session],
+                    map_row,
+                )
+                .ok(),
+            None => conn
+                .query_row(
+                    &STORED_SELECT.replace("{predicate}", "IS NULL"),
+                    params![row.instance_id, row.scope_id],
+                    map_row,
+                )
+                .ok(),
+        }
+    };
 
     let Some(stored) = stored else {
+        // First frame of this lineage for the scope id: its own row, leaving
+        // every other lineage's row and watermark untouched.
         return insert_row(conn, row);
     };
 
     // The authority gate runs BEFORE any field branch — including the
     // cost-only billing channel (c-ctxusage r15 item 3). An equal or older
-    // position WITHIN THE SAME session lineage touches nothing: no counters,
-    // no equal-position growth or bucket fill, no bill correction, no clock.
-    // Two frames at one position are one source record however often
-    // re-delivered and whichever channels each delivery used; fills and
-    // corrections arrive only with a strictly newer position. A different
-    // native session is a different transcript lineage and is not gated
-    // (c-ctxusage r15 item 4).
-    if turn_position_is_stale(
-        row.source_session_id.as_deref(),
-        row.metric_revision,
-        &stored,
-    ) {
+    // position within THIS lineage touches nothing: no counters, no
+    // equal-position growth or bucket fill, no bill correction, no clock. Two
+    // frames at one position are one source record however often re-delivered
+    // and whichever channels each delivery used; fills and corrections arrive
+    // only with a strictly newer position.
+    if turn_position_is_stale(row.metric_revision, stored.revision) {
         return Ok(false);
     }
 
@@ -677,22 +716,24 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
     // channel. The bill alone is corrected (an unreported bill keeps the
     // stored one); the watermark and ingestion seq advance so a later
     // counter snapshot at an older position is rejected; counters it did not
-    // come with and the turn clock are kept exactly as stored.
+    // come with and the turn clock are kept exactly as stored. The update is
+    // scoped to THIS lineage's row id and writes the lineage explicitly
+    // (never COALESCE: an unqualified update targets the NULL row and stays
+    // NULL, and can never inherit a retained qualified id).
     if !reports_counters {
         conn.execute(
             "UPDATE usage_events
              SET seq = ?1,
                  metric_revision = ?2,
-                 source_session_id = COALESCE(?3, source_session_id),
+                 source_session_id = ?3,
                  cost_usd = COALESCE(?4, cost_usd)
-             WHERE instance_id = ?5 AND scope = 'turn' AND scope_id = ?6",
+             WHERE rowid = ?5",
             params![
                 row.seq,
                 row.metric_revision,
                 row.source_session_id,
                 row.cost_usd,
-                row.instance_id,
-                row.scope_id,
+                stored.rowid,
             ],
         )?;
         return Ok(true);
@@ -725,7 +766,7 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
             model = ?3,
             mode = ?4,
             metric_revision = ?5,
-            source_session_id = COALESCE(?6, source_session_id),
+            source_session_id = ?6,
             total_tokens = ?7,
             input_tokens = ?8,
             output_tokens = ?9,
@@ -735,7 +776,7 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
             accounting = ?13,
             observed_at = ?14,
             observed_at_source = ?15
-         WHERE instance_id = ?16 AND scope = 'turn' AND scope_id = ?17",
+         WHERE rowid = ?16",
         params![
             row.seq,
             row.profile_id,
@@ -752,8 +793,7 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
             row.accounting,
             observed_at,
             observed_at_source,
-            row.instance_id,
-            row.scope_id,
+            stored.rowid,
         ],
     )?;
     Ok(true)
@@ -915,17 +955,31 @@ pub enum BudgetStatus {
 }
 
 /// Aggregate all persisted events for one instance.
+///
+/// Turn rows are folded to one winner per scope id before summing so that
+/// several native-session lineages proving one message id never double-count
+/// the turn (c-ctxusage r16 item 3); every other row (session growth points,
+/// legacy NULL-scope events) is summed as before.
 pub fn aggregate_instance(
     conn: &Connection,
     instance_id: &str,
 ) -> rusqlite::Result<UsageAggregate> {
     conn.query_row(
-        "SELECT COUNT(*),
-                COALESCE(SUM(total_tokens), 0),
-                COALESCE(SUM(input_tokens), 0),
-                COALESCE(SUM(output_tokens), 0),
-                COALESCE(SUM(CAST(cost_usd AS REAL)), 0.0)
-         FROM usage_events WHERE instance_id = ?1",
+        &format!(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(total_tokens), 0),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(CAST(cost_usd AS REAL)), 0.0)
+             FROM (
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM ({WINNING_TURN_ROWS_SQL})
+                 UNION ALL
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM usage_events
+                 WHERE instance_id = ?1 AND scope <> 'turn'
+             )"
+        ),
         params![instance_id],
         |row| {
             Ok(UsageAggregate {
@@ -939,19 +993,44 @@ pub fn aggregate_instance(
     )
 }
 
-/// Aggregate persisted events for one `(profile, model)`.
+/// Aggregate persisted events for one `(profile, model)`. Same per-scope
+/// turn-lineage fold as [`aggregate_instance`] (c-ctxusage r16 item 3).
 pub fn aggregate_supply(
     conn: &Connection,
     profile_id: &str,
     model: &str,
 ) -> rusqlite::Result<UsageAggregate> {
     conn.query_row(
-        "SELECT COUNT(*),
+        "WITH winning_turns AS (
+            SELECT total_tokens, input_tokens, output_tokens, cost_usd FROM (
+                SELECT total_tokens, input_tokens, output_tokens, cost_usd,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY instance_id, scope_id
+                           ORDER BY seq DESC, rowid DESC
+                       ) AS rn
+                FROM usage_events
+                WHERE scope = 'turn' AND scope_id IS NOT NULL
+                  AND profile_id = ?1 AND model = ?2
+            ) WHERE rn = 1
+            UNION ALL
+            SELECT total_tokens, input_tokens, output_tokens, cost_usd
+            FROM usage_events
+            WHERE scope = 'turn' AND scope_id IS NULL
+              AND profile_id = ?1 AND model = ?2
+         )
+         SELECT COUNT(*),
                 COALESCE(SUM(total_tokens), 0),
                 COALESCE(SUM(input_tokens), 0),
                 COALESCE(SUM(output_tokens), 0),
                 COALESCE(SUM(CAST(cost_usd AS REAL)), 0.0)
-         FROM usage_events WHERE profile_id = ?1 AND model = ?2",
+         FROM (
+             SELECT total_tokens, input_tokens, output_tokens, cost_usd
+             FROM winning_turns
+             UNION ALL
+             SELECT total_tokens, input_tokens, output_tokens, cost_usd
+             FROM usage_events
+             WHERE profile_id = ?1 AND model = ?2 AND scope <> 'turn'
+         )",
         params![profile_id, model],
         |row| {
             Ok(UsageAggregate {
@@ -1048,21 +1127,58 @@ fn threshold_rfc3339(seconds: i64) -> String {
     )
 }
 
+/// Winning revision-replaced turn row per scope id after folding every
+/// native-session lineage: the most recently ACCEPTED frame for the message
+/// id (highest ingest `seq`, deterministic `rowid` tiebreak). One assistant
+/// message id may carry a separate revision-replaced row per lineage
+/// (`source_session_id`, NULL the unqualified legacy lineage), but every
+/// additive read model must count the logical turn ONCE
+/// (c-ctxusage r16 item 3). Binds `?1` to the instance id.
+const WINNING_TURN_ROWS_SQL: &str = "SELECT * FROM (
+        SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY scope_id ORDER BY seq DESC, rowid DESC
+        ) AS turn_lineage_rn
+        FROM usage_events
+        WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NOT NULL
+     ) WHERE turn_lineage_rn = 1
+     UNION ALL
+     SELECT *, NULL AS turn_lineage_rn
+     FROM usage_events
+     WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NULL";
+
 /// Sum the per-call (scope='turn') token flow within a rate window. Session
 /// snapshots are a CUMULATIVE STOCK replaced in place, never a per-window flow,
 /// so they are excluded here; the caller substitutes timestamped stock
 /// increments only when the harness emits no turn rows at all (Grok) —
 /// c-ctxusage r3 item 6 / r4 item 6.
+///
+/// Turn rows are folded to one WINNER per scope id first (c-ctxusage r16
+/// item 3): frames of one message id replayed under different native-session
+/// lineages share the same native turn time, so the window never counts the
+/// same model call twice.
 fn sum_turn_tokens_since(
     conn: &Connection,
     instance_id: &str,
     since: &str,
 ) -> rusqlite::Result<(Option<i64>, Option<i64>)> {
     conn.query_row(
-        "SELECT SUM(input_tokens), SUM(output_tokens)
-         FROM usage_events
-         WHERE instance_id = ?1 AND scope = 'turn' AND observed_at >= ?2
-           AND observed_at_source = 'native'",
+        "WITH ranked AS (
+            SELECT input_tokens, output_tokens,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY scope_id ORDER BY seq DESC, rowid DESC
+                   ) AS rn
+            FROM usage_events
+            WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NOT NULL
+              AND observed_at >= ?2 AND observed_at_source = 'native'
+         )
+         SELECT SUM(input_tokens), SUM(output_tokens)
+         FROM (
+             SELECT input_tokens, output_tokens FROM ranked WHERE rn = 1
+             UNION ALL
+             SELECT input_tokens, output_tokens FROM usage_events
+             WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NULL
+               AND observed_at >= ?2 AND observed_at_source = 'native'
+         )",
         params![instance_id, since],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
@@ -1407,17 +1523,23 @@ pub fn rollup_instance(
     kind: &str,
     model: Option<&str>,
 ) -> rusqlite::Result<Option<InstanceUsageRollup>> {
+    // Turn totals come from the WINNING row per scope id: one logical turn
+    // even when several native-session lineages hold revision-replaced rows
+    // for the same assistant message id (c-ctxusage r16 item 3). Session
+    // growth points are counted separately (only their presence matters here;
+    // their stock is read via latest_session_stock).
     let totals = conn.query_row(
-        "SELECT
-            COUNT(CASE WHEN scope='turn' THEN 1 END) AS turns,
-            SUM(CASE WHEN scope='turn' THEN input_tokens END),
-            SUM(CASE WHEN scope='turn' THEN output_tokens END),
-            SUM(CASE WHEN scope='turn' THEN cache_read_tokens END),
-            SUM(CASE WHEN scope='turn' THEN cache_write_tokens END),
-            COUNT(CASE WHEN scope='session' THEN 1 END),
-            COUNT(*),
-            MAX(CASE WHEN scope='turn' AND observed_at_source='native' THEN observed_at END)
-         FROM usage_events WHERE instance_id = ?1",
+        &format!(
+            "WITH winning_turns AS ({WINNING_TURN_ROWS_SQL})
+             SELECT
+                 (SELECT COUNT(*) FROM winning_turns),
+                 (SELECT SUM(input_tokens) FROM winning_turns),
+                 (SELECT SUM(output_tokens) FROM winning_turns),
+                 (SELECT SUM(cache_read_tokens) FROM winning_turns),
+                 (SELECT SUM(cache_write_tokens) FROM winning_turns),
+                 (SELECT MAX(observed_at) FROM winning_turns
+                  WHERE observed_at_source = 'native')"
+        ),
         params![instance_id],
         |row| {
             let turns: i64 = row.get(0)?;
@@ -1428,11 +1550,23 @@ pub fn rollup_instance(
                 turn_cache_read: row.get(3)?,
                 turn_cache_write: row.get(4)?,
                 has_turn: turns > 0,
-                has_session: row.get::<_, i64>(5)? > 0,
-                last_turn_at: row.get(7)?,
+                has_session: false,
+                last_turn_at: row.get(5)?,
             })
         },
     )?;
+    let has_session: bool = conn.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM usage_events
+            WHERE instance_id = ?1 AND scope = 'session'
+        )",
+        params![instance_id],
+        |row| row.get(0),
+    )?;
+    let totals = RollupTotals {
+        has_session,
+        ..totals
+    };
     if !totals.has_turn && !totals.has_session {
         return Ok(None);
     }
@@ -2642,10 +2776,16 @@ mod tests {
         }
         assert!(usage_rows >= 3, "the mapper emitted the expected turns");
 
-        // Exactly one durable row per plain message id, with FINAL counters.
+        // The WINNING (most recently accepted) durable row per plain message
+        // id holds the FINAL counters. The legacy round-one row is the
+        // unqualified lineage; the real mapper's qualified frames are their
+        // own lineages, so msg-rev physically keeps both rows — but reads fold
+        // the winner (c-ctxusage r16 item 3).
         let input_of = |id: &str| -> Option<i64> {
             conn.query_row(
-                "SELECT input_tokens FROM usage_events WHERE scope_id=?1 AND scope='turn'",
+                "SELECT input_tokens FROM usage_events
+                 WHERE scope_id=?1 AND scope='turn'
+                 ORDER BY seq DESC, rowid DESC LIMIT 1",
                 params![id],
                 |row| row.get(0),
             )
@@ -2655,7 +2795,7 @@ mod tests {
         assert_eq!(
             input_of("msg-rev"),
             Some(250),
-            "revised final counters replace legacy/provisional"
+            "revised final counters win over legacy/provisional across lineages"
         );
         assert_eq!(input_of("msg-int"), Some(333), "interrupted turn finalised");
         assert_eq!(input_of("msg-a"), Some(111), "superseded turn finalised");
@@ -2664,6 +2804,22 @@ mod tests {
             Some(222),
             "end-of-stream finalises the last turn"
         );
+        // One winning turn row per message id …
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM (
+                     SELECT 1 FROM usage_events WHERE scope='turn'
+                     GROUP BY scope_id
+                 )",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            4,
+            "one logical turn per message id across lineages"
+        );
+        // … while the legacy unqualified row for msg-rev survives physically
+        // in its own lineage (the NULL mark must not be erased).
         assert_eq!(
             conn.query_row::<i64, _, _>(
                 "SELECT COUNT(*) FROM usage_events WHERE scope='turn'",
@@ -2671,8 +2827,19 @@ mod tests {
                 |row| row.get(0)
             )
             .unwrap(),
-            4,
-            "one turn row per message id — requestId namespacing/legacy not duplicated"
+            5,
+            "msg-rev keeps both its NULL-lineage legacy row and the qualified row"
+        );
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT metric_revision FROM usage_events
+                 WHERE scope_id='msg-rev' AND source_session_id IS NULL",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            1,
+            "the unqualified lineage keeps its own watermark"
         );
 
         // Item 5: everything is historical → totals rise but the rate window is
@@ -3415,10 +3582,12 @@ mod tests {
         );
     }
 
-    /// c-ctxusage r15 item 4: existing rows migrate into the UNQUALIFIED
-    /// lineage (`source_session_id IS NULL`), and two unqualified frames keep
-    /// the numeric watermark. A qualified frame over a legacy NULL lineage is
-    /// an independent authority and is not numerically frozen.
+    /// c-ctxusage r15 item 4 (refined by r16 item 3 / T1'): existing rows
+    /// migrate into the UNQUALIFIED lineage (`source_session_id IS NULL`),
+    /// and two unqualified frames keep the numeric watermark. A qualified
+    /// frame over the legacy NULL lineage is an independent authority and is
+    /// not numerically frozen — it gets its OWN revision-replaced row;
+    /// accepting it never erases the NULL lineage's mark or identity.
     #[test]
     fn session_qualified_watermark_migrates_legacy_rows_to_the_null_lineage() {
         let conn = Connection::open_in_memory().unwrap();
@@ -3471,8 +3640,7 @@ mod tests {
         );
 
         // A qualified frame for a real session at rev 1 is a DIFFERENT
-        // authority over the same message id: accepted, and its lineage is
-        // persisted.
+        // lineage over the same message id: accepted into its OWN row.
         let mut qualified = scoped_record(
             3,
             "ins_r15i4",
@@ -3490,10 +3658,23 @@ mod tests {
             insert(&conn, &qualified),
             "a qualified frame over the legacy NULL lineage is not numerically frozen"
         );
+
+        // Two physical rows, one per lineage: the qualified acceptance did
+        // NOT erase the NULL mark or rewrite its identity (T1').
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events
+                 WHERE instance_id='ins_r15i4' AND scope_id='msg-legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 2, "each lineage keeps its own revision row");
         let (revision, lineage, output): (i64, Option<String>, Option<i64>) = conn
             .query_row(
                 "SELECT metric_revision, source_session_id, output_tokens FROM usage_events
-                 WHERE instance_id='ins_r15i4' AND scope_id='msg-legacy'",
+                 WHERE instance_id='ins_r15i4' AND scope_id='msg-legacy'
+                   AND source_session_id = 'sess-rebound'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -3501,6 +3682,226 @@ mod tests {
         assert_eq!(revision, 1);
         assert_eq!(lineage.as_deref(), Some("sess-rebound"));
         assert_eq!(output, Some(9));
+        let null_revision: i64 = conn
+            .query_row(
+                "SELECT metric_revision FROM usage_events
+                 WHERE instance_id='ins_r15i4' AND scope_id='msg-legacy'
+                   AND source_session_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_revision, 3, "the NULL lineage keeps its own mark");
+    }
+
+    /// Build a qualified turn record in a specific native-session lineage.
+    fn qualified_record(
+        seq: i64,
+        instance: &str,
+        scope_id: &str,
+        session: &str,
+        revision: i64,
+        input: i64,
+        output: i64,
+    ) -> JournalRecord {
+        let mut record = scoped_record(
+            seq,
+            instance,
+            "turn",
+            Some(scope_id),
+            revision,
+            input,
+            output,
+            0,
+            0,
+            Some("2026-10-10T00:00:00.000Z"),
+        );
+        record.event["payload"]["sourceSessionId"] = json!(session);
+        record
+    }
+
+    /// c-ctxusage r16 item 3 (T1'), regression 1: alpha at position 3, then a
+    /// beta-lineage frame at position 1, then alpha at position 2 — the beta
+    /// acceptance must not erase alpha's mark, so the older alpha frame is
+    /// rejected within its own lineage.
+    #[test]
+    fn accepting_another_lineage_never_erases_the_first_lineages_watermark() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(insert(
+            &conn,
+            &qualified_record(1, "ins_t1p_a", "msg-1", "sess-alpha", 3, 100, 30)
+        ));
+        assert!(insert(
+            &conn,
+            &qualified_record(2, "ins_t1p_a", "msg-1", "sess-beta", 1, 50, 5)
+        ));
+        assert!(
+            !insert(
+                &conn,
+                &qualified_record(3, "ins_t1p_a", "msg-1", "sess-alpha", 2, 90, 25)
+            ),
+            "alpha position 2 is stale against alpha's OWN mark 3, beta never erased it"
+        );
+        let marks = conn
+            .prepare(
+                "SELECT source_session_id, metric_revision, output_tokens
+                 FROM usage_events
+                 WHERE instance_id='ins_t1p_a' AND scope_id='msg-1'
+                 ORDER BY source_session_id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            marks,
+            vec![
+                ("sess-alpha".to_string(), 3, Some(30)),
+                ("sess-beta".to_string(), 1, Some(5)),
+            ],
+            "both lineages keep their own marks and counters"
+        );
+    }
+
+    /// c-ctxusage r16 item 3 (T1'), regression 2: a qualified alpha frame at
+    /// position 3 followed by an UNQUALIFIED frame at position 1 — the
+    /// unqualified frame lands in the NULL lineage and never rewrites the
+    /// qualified row's identity.
+    #[test]
+    fn an_unqualified_frame_never_rewrites_a_qualified_rows_identity() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(insert(
+            &conn,
+            &qualified_record(1, "ins_t1p_b", "msg-2", "sess-alpha", 3, 100, 30)
+        ));
+        assert!(
+            insert(
+                &conn,
+                &scoped_record(
+                    2,
+                    "ins_t1p_b",
+                    "turn",
+                    Some("msg-2"),
+                    1,
+                    40,
+                    4,
+                    0,
+                    0,
+                    Some("2026-10-10T00:00:00.000Z")
+                )
+            ),
+            "the unqualified lineage is independent of the qualified row"
+        );
+        let identity: (Option<String>, i64) = conn
+            .query_row(
+                "SELECT source_session_id, metric_revision FROM usage_events
+                 WHERE instance_id='ins_t1p_b' AND scope_id='msg-2'
+                   AND source_session_id = 'sess-alpha'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(identity, (Some("sess-alpha".to_string()), 3));
+        let null_identity: (Option<String>, i64) = conn
+            .query_row(
+                "SELECT source_session_id, metric_revision FROM usage_events
+                 WHERE instance_id='ins_t1p_b' AND scope_id='msg-2'
+                   AND source_session_id IS NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(null_identity, (None, 1), "the NULL row stays unqualified");
+
+        // A later qualified alpha position 4 is still accepted against its
+        // OWN mark (the NULL-lineage frame never gated it).
+        assert!(
+            insert(
+                &conn,
+                &qualified_record(3, "ins_t1p_b", "msg-2", "sess-alpha", 4, 110, 31)
+            ),
+            "the NULL lineage's position 1 does not block a later alpha frame"
+        );
+        let alpha_revision: i64 = conn
+            .query_row(
+                "SELECT metric_revision FROM usage_events
+                 WHERE instance_id='ins_t1p_b' AND scope_id='msg-2'
+                   AND source_session_id = 'sess-alpha'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alpha_revision, 4);
+    }
+
+    /// c-ctxusage r16 item 3 (T1'), regression 3: a high-position
+    /// UNQUALIFIED frame never blocks later valid frames of a qualified
+    /// lineage that starts its record positions over from 1 (a resumed /
+    /// re-bound session).
+    #[test]
+    fn a_high_unqualified_mark_does_not_block_a_fresh_qualified_lineage() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(
+            insert(
+                &conn,
+                &scoped_record(
+                    1,
+                    "ins_t1p_c",
+                    "turn",
+                    Some("msg-3"),
+                    9,
+                    100,
+                    20,
+                    0,
+                    0,
+                    Some("2026-10-10T00:00:00.000Z")
+                )
+            ),
+            "an unqualified frame sits at a high position"
+        );
+        assert!(
+            insert(
+                &conn,
+                &qualified_record(2, "ins_t1p_c", "msg-3", "sess-alpha", 1, 60, 6)
+            ),
+            "the qualified lineage starts fresh at position 1 and is not frozen"
+        );
+        assert!(
+            insert(
+                &conn,
+                &qualified_record(3, "ins_t1p_c", "msg-3", "sess-alpha", 2, 70, 7)
+            ),
+            "the qualified lineage advances from its own position 1"
+        );
+        // … while the NULL lineage still gates on its own high mark.
+        assert!(
+            !insert(
+                &conn,
+                &scoped_record(
+                    4,
+                    "ins_t1p_c",
+                    "turn",
+                    Some("msg-3"),
+                    8,
+                    99,
+                    19,
+                    0,
+                    0,
+                    Some("2026-10-10T00:00:00.000Z")
+                )
+            ),
+            "the unqualified lineage keeps the numeric gate at 9"
+        );
     }
 
     /// r4 item 7b: the REAL 2.1.289 fixture replayed by a fresh mapper into a

@@ -2748,13 +2748,26 @@ fn native_exit(observation: &remuda_protocol::Observation) -> Option<NativeExit>
         ProcessEndKind::Exited => "exited",
         ProcessEndKind::Failed => "failed",
     };
+    // c-cardsettle-fu2 r1 item 2: pick the REAL diagnostic in order —
+    // related_ids["reason"] (what generic_pty's failure_lifecycle stamps),
+    // then related_ids["lastError"], then a non-empty prose status; fall back
+    // to the literal state ("failed") only when none carries detail.
+    let status_value = match &native.status {
+        Knowledge::Known { value } if !value.trim().is_empty() => Some(value.as_str()),
+        _ => None,
+    };
+    let reason = native
+        .related_ids
+        .get("reason")
+        .or_else(|| native.related_ids.get("lastError"))
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or(status_value)
+        .unwrap_or(state)
+        .to_owned();
     Some(NativeExit {
         state: state.to_string(),
-        reason: native
-            .related_ids
-            .get("reason")
-            .cloned()
-            .unwrap_or_else(|| state.to_string()),
+        reason,
     })
 }
 
@@ -6081,6 +6094,42 @@ mod tests {
             assert!(!gate.settled);
         }
     }
+
+    /// c-cardsettle-fu2 r1 item 2 fallback chain: without a reason field,
+    /// lastError is used; with neither, a non-empty prose status is used; only
+    /// a completely empty diagnostic falls back to "failed".
+    #[test]
+    fn native_exit_reason_falls_through_last_error_status() {
+        let mk = |related: &[(&str, &str)], status: &str| {
+            native_lifecycle_full(
+                remuda_protocol::LifecycleTopic::Session,
+                "exit",
+                "agent-02",
+                related,
+                remuda_protocol::Severity::Error,
+                true,
+                status,
+            )
+        };
+        // lastError used when reason absent.
+        let exit = native_exit(&mk(
+            &[
+                ("paneId", "p"),
+                ("lastError", "agent process killed by signal 9"),
+            ],
+            "pane exited",
+        ))
+        .unwrap();
+        assert_eq!(exit.reason, "agent process killed by signal 9");
+
+        // Non-empty prose status used when neither related field present.
+        let exit = native_exit(&mk(&[("paneId", "p")], "boom in stderr")).unwrap();
+        assert_eq!(exit.reason, "boom in stderr");
+
+        // Empty everything falls back to "failed".
+        let exit = native_exit(&mk(&[("paneId", "p")], "")).unwrap();
+        assert_eq!(exit.reason, "failed");
+    }
 }
 
 #[cfg(test)]
@@ -6960,6 +7009,254 @@ mod api_relay_launch_test {
             })
             .await;
             node2.shutdown().await.expect("shutdown");
+        }
+    }
+
+    /// c-cardsettle-fu2 r4 item 1: a generic-PTY pane exit built through the
+    /// DRIVER's failure_lifecycle + pane_exit_diagnostic flows through the
+    /// REAL observation pump into the Node store AND the Hub projection.
+    ///
+    /// Covers all three diagnostic shapes:
+    /// - exit code 42 → "agent process exited with code 42";
+    /// - signal 9 → "agent process killed by signal KILL (9)";
+    /// - a pane carrying ONLY lastStderr full of credential-looking text →
+    ///   the fixed fallback, and NO substring of that stderr appears in the
+    ///   committed journal observation or in the serialized Hub row (the leak
+    ///   CLASS is removed: the redactor is gone and stderr is never rendered).
+    #[tokio::test]
+    async fn generic_pty_structured_exit_flows_through_pump_to_node_and_hub() {
+        use remuda_driver::generic_pty::{failure_lifecycle, pane_exit_diagnostic};
+
+        struct ExitCase {
+            name: &'static str,
+            data: serde_json::Value,
+            expected: String,
+            /// Fragments carried by the event's stderr that must appear
+            /// NOWHERE persisted (journal payload or Hub row). Empty for the
+            /// structured cases.
+            leak_fragments: &'static [&'static str],
+        }
+        let stderr = "Authorization decoy Bearer abc123xyz-leak \
+--token secretvalue-9931-leak {\"password\":\"hunter2-secret-leak\"} \
+escaped \\\"Authorization: Bearer tok-live-AA:BB:CC\\\" end";
+        let mut cases: Vec<ExitCase> = vec![
+            ExitCase {
+                name: "stderr-only",
+                data: serde_json::json!({ "lastStderr": stderr }),
+                expected: "pane exited; agent process is gone".to_owned(),
+                leak_fragments: &[
+                    "abc123xyz-leak",
+                    "secretvalue-9931-leak",
+                    "hunter2-secret-leak",
+                    "tok-live-AA:BB:CC",
+                    "Bearer",
+                    "password",
+                ],
+            },
+            ExitCase {
+                name: "exit-code-42",
+                data: serde_json::json!({ "exitCode": 42 }),
+                expected: "agent process exited with code 42".to_owned(),
+                leak_fragments: &[],
+            },
+            // r5 item 1: a numeric signal the platform does not recognize is
+            // not signal evidence — the exit code alongside it renders.
+            ExitCase {
+                name: "signal-200-falls-through-to-code",
+                data: serde_json::json!({ "signal": 200, "exitCode": 42 }),
+                expected: "agent process exited with code 42".to_owned(),
+                leak_fragments: &[],
+            },
+        ];
+        // r5 item 1: the signal number/name are derived from the PLATFORM's
+        // nix definitions (9/KILL on both Linux and macOS, but BUS/USR1
+        // differ) — never a hard-coded number.
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::Signal;
+            let kill = Signal::SIGKILL;
+            cases.push(ExitCase {
+                name: "signal-kill",
+                data: serde_json::json!({ "signal": i64::from(kill as i32) }),
+                expected: format!(
+                    "agent process killed by signal {} ({})",
+                    kill.as_str().strip_prefix("SIG").unwrap(),
+                    kill as i32
+                ),
+                leak_fragments: &[],
+            });
+        }
+
+        for case in cases {
+            // Build the observation exactly the way the generic_pty status
+            // pump does when a pane exits.
+            let diagnostic = pane_exit_diagnostic(&case.data);
+            assert_eq!(
+                diagnostic, case.expected,
+                "[{}] diagnostic must be the fixed structured text",
+                case.name
+            );
+            let payload: remuda_protocol::Observation = remuda_protocol::Observation {
+                schema_version: remuda_protocol::SchemaVersion,
+                event_id: remuda_protocol::EventId::new(),
+                journal_id: Id::new("obj").expect("journal id"),
+                instance_id: InstanceId::new(),
+                run_id: None,
+                host_id: HostId::new(),
+                process_generation: U64(1),
+                run_generation: None,
+                seq: U64(1),
+                observed_at: timestamp_now().expect("now"),
+                native_at: unknown("test"),
+                source: crate::driver::runtime_source(
+                    &fixture_instance(
+                        InstanceId::new(),
+                        HostId::new(),
+                        WorkspaceId::new(),
+                        DriverKind::ShellPty,
+                    )
+                    .expect("fixture"),
+                    U64(1),
+                ),
+                completeness: Completeness::ScreenDerived,
+                raw_ref: None,
+                evidence_event_ids: Vec::new(),
+                body: failure_lifecycle("exit", "agent-x", "pane-x", &diagnostic),
+            };
+            let instance_id = payload.instance_id.clone();
+
+            // The DRIVER's producer contract: failure_lifecycle must stamp the
+            // diagnostic into related_ids["reason"] (the field the Node's
+            // classifier reads first), and that stamp itself must carry none
+            // of the stderr fragments.
+            let ObservationPayload::Lifecycle(box_lc) = &payload.body else {
+                panic!("[{}] expected a lifecycle payload", case.name);
+            };
+            let LifecyclePayload::Native(native) = box_lc.as_ref() else {
+                panic!("[{}] expected a native lifecycle", case.name);
+            };
+            assert_eq!(
+                native.related_ids.get("reason").map(String::as_str),
+                Some(case.expected.as_str()),
+                "[{}] failure_lifecycle must stamp related_ids.reason",
+                case.name
+            );
+            let stamped_wire =
+                serde_json::to_string(&native.related_ids).expect("related ids serialize");
+            for fragment in case.leak_fragments {
+                assert!(
+                    !stamped_wire.contains(fragment),
+                    "[{}] stamped related_ids leak {fragment}: {stamped_wire}",
+                    case.name
+                );
+            }
+
+            // ── Node side: seed a live row, deliver through the REAL pump. ──
+            let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
+            store
+                .insert_instance(
+                    fixture_instance(
+                        instance_id.clone(),
+                        HostId::new(),
+                        WorkspaceId::new(),
+                        DriverKind::ShellPty,
+                    )
+                    .expect("fixture"),
+                )
+                .expect("seed");
+            let interactions = InteractionRuntime::spawn(Arc::clone(&store)).unwrap();
+            let (tx, rx) = mpsc::channel(16);
+            let pump = spawn_observation_pump(
+                Arc::clone(&store),
+                interactions,
+                instance_id.clone(),
+                rx,
+                Arc::new(FakeDriver::default()),
+                Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
+            );
+            tx.send(payload).await.expect("send pane-exit observation");
+            drop(tx);
+            pump.await.unwrap();
+
+            // Node-stored failure carries exactly the structured text.
+            let node_row = store.get_instance(&instance_id).expect("node instance");
+            assert_eq!(node_row.lifecycle, InstanceLifecycle::Failed);
+            assert_eq!(
+                node_row.last_error.as_deref(),
+                Some(case.expected.as_str()),
+                "[{}] the Node store must persist the structured text",
+                case.name
+            );
+
+            // Re-read the observation from the Node journal (what the uplink
+            // would send); it must carry no stderr fragment either.
+            let committed = store
+                .read_events(
+                    &store.get_instance(&instance_id).unwrap().journal_id,
+                    None,
+                    64,
+                )
+                .expect("node events")
+                .events;
+            assert!(!committed.is_empty(), "the pump committed the observation");
+            let mut journal_wire = String::new();
+
+            // ── Hub side: replay the committed observations through a real
+            // Hub Store, mirroring the uplink conversion. ──
+            let hub_dir = tempfile::tempdir().unwrap();
+            let hub_store =
+                remuda_hub::store_test_support::Store::open(hub_dir.path()).expect("hub store");
+            let hub_host = HostId::new().as_id().to_string();
+            let hub_instance = instance_id.clone().as_id().to_string();
+            hub_store
+                .ensure_instance(hub_host.clone(), hub_instance.clone())
+                .await
+                .unwrap();
+            for event in committed {
+                journal_wire.push_str(&serde_json::to_string(&event).expect("event wire"));
+                // Only the Instance variant carries a pump observation; the
+                // uplink converts it to hub journal wire JSON.
+                let remuda_protocol::JournalEvent::Instance(observation) = event else {
+                    continue;
+                };
+                let mut value = serde_json::to_value(*observation).expect("observation wire json");
+                value["instance_id"] = serde_json::json!(hub_instance);
+                hub_store
+                    .append_journal(hub_host.clone(), hub_instance.clone(), None, value)
+                    .await
+                    .expect("hub append");
+            }
+            for fragment in case.leak_fragments {
+                assert!(
+                    !journal_wire.contains(fragment),
+                    "[{}] the Node journal leaks stderr fragment {fragment}",
+                    case.name
+                );
+            }
+
+            let hub_row = hub_store
+                .get_instance(hub_instance.clone())
+                .await
+                .unwrap()
+                .expect("hub row");
+            assert_eq!(hub_row.lifecycle, "failed");
+            assert_eq!(
+                hub_row.last_error.as_deref(),
+                Some(case.expected.as_str()),
+                "[{}] the Hub projection must persist the structured text",
+                case.name
+            );
+            // Assert on the SERIALIZED ROW: no stderr substring survives into
+            // any projected field.
+            let row_wire = serde_json::to_string(&hub_row).expect("hub row serializes");
+            for fragment in case.leak_fragments {
+                assert!(
+                    !row_wire.contains(fragment),
+                    "[{}] the serialized Hub row leaks stderr fragment {fragment}: {row_wire}",
+                    case.name
+                );
+            }
+            hub_store.close().await;
         }
     }
 }

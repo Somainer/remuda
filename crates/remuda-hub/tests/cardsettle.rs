@@ -1453,8 +1453,21 @@ async fn follower_lag_never_replays_pre_subscribe_history() -> Result<()> {
     // Backdate the pre-populated settlements OUTSIDE the 5-minute connect
     // replay window, so the only way they could reach this follower is the
     // (cursed) None-cursor history walk. The seeded cursor must exclude them.
-    hub.test_backdate_interactions(old_cards.clone(), "2000-01-01T00:00:00.000Z")
+    // c-cardsettle-fu r1 item 4: assert the UPDATE rows-affected so a silent
+    // no-op backdate (typo'd id) cannot leave the rows inside the window.
+    let (backdated_rows, backdated_events) = hub
+        .test_backdate_interactions(old_cards.clone(), "2000-01-01T00:00:00.000Z")
         .await?;
+    assert_eq!(
+        backdated_rows,
+        old_cards.len(),
+        "every pre-populated interaction row is backdated"
+    );
+    assert_eq!(
+        backdated_events,
+        old_cards.len(),
+        "every pre-populated settlement_events row is backdated"
+    );
 
     // A NEW instance with its own pending cards, the post-subscribe sweep.
     let (new_instance, new_cards) =
@@ -1983,8 +1996,20 @@ async fn follower_parked_after_kth_live_notice_drains_the_tail_of_a_then_b_in_se
     // the two cursor orders coincide, so the test would prove nothing against
     // the old cursor (the r10 item-2 failure shape).
     const BACKDATED_BEFORE_TEST: &str = "2000-01-01T00:00:00.000Z";
-    hub.test_backdate_interactions(cards_b.clone(), BACKDATED_BEFORE_TEST)
+    // c-cardsettle-fu r1 item 4: assert rows-affected for BOTH tables so the
+    // backdate is observed (a silent no-op UPDATE would let the test pass
+    // without B actually being older than A).
+    let (b_rows_backdated, b_events_backdated) = hub
+        .test_backdate_interactions(cards_b.clone(), BACKDATED_BEFORE_TEST)
         .await?;
+    assert_eq!(
+        b_rows_backdated, 120,
+        "all 120 B interactions are backdated"
+    );
+    assert_eq!(
+        b_events_backdated, 120,
+        "all 120 B settlement_events are backdated"
+    );
 
     // Release the park: the pump's next bus poll observes Lagged and drains.
     release
@@ -2412,6 +2437,185 @@ async fn follower_receives_the_delete_transaction_settlement_frame_after_sweep()
     assert!(
         got,
         "the follower received the frame for the card settled INSIDE the delete transaction"
+    );
+
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// r12-fu item 2: a client that disconnects right after the DELETE request is
+/// sent must not cancel the irreversible operation — the delete commits, its
+/// settlement frame is published, and the post-commit audit row is written.
+/// Previously the delete+publish awaited inline (cancellable on drop) and the
+/// cleanup/audit tail was only spawned afterwards, so an early disconnect
+/// skipped both.
+#[tokio::test]
+async fn disconnecting_right_after_delete_still_publishes_and_audits() -> Result<()> {
+    let r12fu_tmp = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(r12fu_tmp.path().join("data"))).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let enroll = enroll_token(addr, &cookie).await?;
+    let (node, host_id) = FakeNode::spawn(addr, &enroll).await?;
+    let (instance_id, interaction_id) =
+        seed_live_card(addr, &cookie, &node, &host_id, "r12fu disconnect delete").await?;
+    let store = hub.store().expect("in-process store");
+
+    // Sweep to a pseudo-terminal so a PLAIN delete skips stop_before_delete;
+    // the card is settled only inside the delete transaction.
+    store
+        .mark_host_offline(host_id.as_id().as_str().to_string())
+        .await?;
+    let (swept, sweep_settlement) = store.expire_lost_hosts(0).await?;
+    assert_eq!(swept, 1);
+    assert!(sweep_settlement.interactions.is_empty());
+
+    // Follower on its own sentinel host, proven seeded.
+    let (mut follow, _sentinel) =
+        connect_follower_proven_seeded(addr, &cookie, "r12fu-disconnect").await?;
+
+    // Arm the POST-delete park BEFORE the request. The detached task commits
+    // the delete, then parks; the request future is RST-aborted while parked,
+    // then the park is released — the detached task must still publish and
+    // audit. c-cardsettle-fu2 r1 item 4: this is the window AFTER the DB job
+    // is enqueued/committed (the fu1 pre-DB seam is no longer used here).
+    let (mut delete_reached, delete_release) = hub.test_arm_post_delete_park(&instance_id).await;
+
+    // Fire the DELETE over a raw socket WITHOUT reading the response.
+    let mut sock = tokio::net::TcpStream::connect(addr).await?;
+    {
+        use tokio::io::AsyncWriteExt;
+        sock.write_all(
+            format!(
+                "DELETE /v1/instances/{instance_id} HTTP/1.1\r\n\
+                 Host: {addr}\r\nCookie: {cookie}\r\nConnection: close\r\n\
+                 Content-Length: 0\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+        sock.flush().await?;
+    }
+
+    // Wait until the detached task reaches its post-delete park: the delete
+    // transaction is committed but publication/cleanup have not run.
+    tokio::time::timeout(Duration::from_secs(10), &mut delete_reached)
+        .await
+        .expect("the delete operation never reached its post-delete park")
+        .expect("post-delete park channel closed");
+
+    // The deletion is durable at this park.
+    assert!(
+        store.get_instance(instance_id.clone()).await?.is_none(),
+        "the post-delete park must be reached after the DB delete committed"
+    );
+
+    // c-cardsettle-fu2 r4 item 3: WHILE the delete is parked (delete
+    // committed, still inside publish_settlement holding the publication
+    // lock, broadcast not yet run) the settlement for this card MUST NOT
+    // exist. A broadcast COUNTER keyed by interaction id proves it without a
+    // cancelled WebSocket read (repeated timeout-cancelled reads starve the
+    // follower's next poll). If the park were moved back AFTER
+    // publish_settlement, the bus send would already have happened here.
+    let notices = || hub.test_settlement_notice_count(&interaction_id);
+    assert_eq!(
+        notices(),
+        0,
+        "no settlement notice may be broadcast while the delete is parked"
+    );
+
+    // Abort the request connection with RST while the operation is parked:
+    // hyper drops the handler future (and its JoinHandle await). Pre-fix the
+    // delete/publish/tail were all owned by that future and would be cancelled.
+    use nix::sys::socket::{setsockopt, sockopt};
+    use std::os::fd::AsRawFd;
+    let std_sock = sock.into_std()?;
+    setsockopt(
+        &std_sock,
+        sockopt::Linger,
+        &nix::libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        },
+    )
+    .expect("setsockopt SO_LINGER");
+    assert!(std_sock.as_raw_fd() >= 0);
+    drop(std_sock);
+    // Give hyper a moment to observe the RST and drop the handler while the
+    // operation is still parked.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Still parked at this point (release has not been sent): the RST and
+    // the full RST-observation window must not have produced a broadcast.
+    assert_eq!(
+        notices(),
+        0,
+        "dropping the handler during the RST window must not publish the frame"
+    );
+
+    // Release: publish + cleanup tail proceed in the detached task.
+    // The park is INSIDE publish_settlement (after the delete committed,
+    // before broadcast), so the first follower read happens only after
+    // release.
+    delete_release
+        .send(())
+        .expect("releasing the parked delete");
+
+    // (0) The broadcast counter moves exactly once for this interaction.
+    let count_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while notices() == 0 && tokio::time::Instant::now() < count_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        notices(),
+        1,
+        "the detached delete broadcasts exactly one settlement after release"
+    );
+
+    // (1) The settlement frame reaches the follower ONLY after release.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut frame_seen = false;
+    while tokio::time::Instant::now() < deadline {
+        let Some(Ok(msg)) = tokio::time::timeout_at(deadline, follow.next())
+            .await
+            .ok()
+            .flatten()
+        else {
+            break;
+        };
+        let Message::Text(text) = msg else { continue };
+        let frame: Value = serde_json::from_str(&text)?;
+        if frame.get("type") == Some(&json!("settlement"))
+            && frame["interactionId"] == json!(interaction_id)
+        {
+            assert_eq!(frame["reason"], json!("generation-ended"));
+            frame_seen = true;
+            break;
+        }
+    }
+    assert!(
+        frame_seen,
+        "the detached delete published its settlement frame after release"
+    );
+
+    // (2) The durable audit row is written by the detached tail.
+    let mut audit: Vec<Value> = Vec::new();
+    let audit_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < audit_deadline {
+        audit = store.audit_for(instance_id.clone()).await?;
+        if audit
+            .iter()
+            .any(|a| a["action"] == json!("instance.delete"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        audit
+            .iter()
+            .any(|a| a["action"] == json!("instance.delete")),
+        "the detached delete tail wrote its audit row after the handler was aborted: {audit:?}"
     );
 
     hub.shutdown().await;

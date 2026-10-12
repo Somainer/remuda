@@ -130,6 +130,16 @@ pub struct AppState {
     /// settlement pump; always present but never armed in production.
     #[cfg(any(test, feature = "test-faults"))]
     follow_parks: crate::ws::FollowParks,
+    /// c-cardsettle-fu r1 item 2: test-only park seam for the detached
+    /// irreversible delete operation; never armed in production.
+    #[cfg(any(test, feature = "test-faults"))]
+    operation_parks: crate::ws::OperationParks,
+    /// c-cardsettle-fu2 r4 item 3: test-only per-interaction count of
+    /// settlement notices actually put on the bus. Lets a test prove a
+    /// parked delete has NOT broadcast without reading the follower socket
+    /// during the park window (cancelled WS reads starve the next poll).
+    #[cfg(any(test, feature = "test-faults"))]
+    test_settlement_counts: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
     tty: crate::ws::TtyRelay,
     /// D-048 relay stream registry (per-Hub-process).
     api_relay: crate::api_relay::ApiRelay,
@@ -226,8 +236,26 @@ impl AppState {
                 reason: settled.reason.clone(),
                 seq: settled.seq,
             });
+            // r4 item 3: record a broadcast the bus actually accepted; keyed
+            // by interaction id so unrelated background settles cannot move
+            // a test's counter.
+            self.note_test_settlement_broadcast(&settled.interaction_id);
         }
     }
+
+    /// r4 item 3 test seam: count a broadcast per interaction id.
+    #[cfg(any(test, feature = "test-faults"))]
+    fn note_test_settlement_broadcast(&self, interaction_id: &str) {
+        *self
+            .test_settlement_counts
+            .lock()
+            .unwrap()
+            .entry(interaction_id.to_owned())
+            .or_insert(0) += 1;
+    }
+
+    #[cfg(not(any(test, feature = "test-faults")))]
+    fn note_test_settlement_broadcast(&self, _interaction_id: &str) {}
 
     /// Raw per-chunk cap for D-048 relay streams, from the D-048 protocol
     /// default (`TransportLimits.apiChunkBytes`, 64 KiB).
@@ -761,28 +789,36 @@ impl RunningHub {
     /// 5-minute connect-replay window and prove the follower lag drain seeds
     /// at the durable max seq instead of walking the whole history.
     #[doc(hidden)]
+    /// Backdate `interaction_ids` to `rfc3339` in BOTH tables and return the
+    /// number of rows changed in EACH table, in order
+    /// `(interactions, settlement_events)`. c-cardsettle-fu r1 item 4: callers
+    /// assert the counts so a typo'd id / silent no-op UPDATE fails the test
+    /// instead of leaving the backdate unobserved.
+    #[doc(hidden)]
     pub async fn test_backdate_interactions(
         &self,
         interaction_ids: Vec<String>,
         rfc3339: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<(usize, usize)> {
         let Some(store) = self.store.as_ref() else {
             anyhow::bail!("hub store already closed");
         };
         let ts = rfc3339.to_string();
         store
             .run_named("test_backdate_interactions", move |conn| {
+                let mut interactions = 0usize;
+                let mut settlement_events = 0usize;
                 for id in &interaction_ids {
-                    conn.execute(
+                    interactions += conn.execute(
                         "UPDATE interactions SET updated_at = ?1 WHERE id = ?2",
                         rusqlite::params![ts, id],
                     )?;
-                    conn.execute(
+                    settlement_events += conn.execute(
                         "UPDATE settlement_events SET created_at = ?1 WHERE interaction_id = ?2",
                         rusqlite::params![ts, id],
                     )?;
                 }
-                Ok(())
+                Ok((interactions, settlement_events))
             })
             .await
             .map_err(Into::into)
@@ -932,6 +968,40 @@ impl RunningHub {
         tokio::sync::oneshot::Sender<()>,
     ) {
         self.state.follow_parks.arm(after_seq).await
+    }
+
+    /// c-cardsettle-fu2 r1 item 4: arm the park AFTER the delete DB job
+    /// commits (before publication/cleanup).
+    #[cfg(any(test, feature = "test-faults"))]
+    #[doc(hidden)]
+    pub async fn test_arm_post_delete_park(
+        &self,
+        instance_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.state
+            .operation_parks
+            .arm_post_delete(instance_id)
+            .await
+    }
+
+    /// c-cardsettle-fu2 r4 item 3: number of settlement notices
+    /// `broadcast_settlement` has actually put on the bus for
+    /// `interaction_id`. A parked post-delete must keep this at 0 until the
+    /// park is released; keyed by interaction so unrelated background
+    /// settles (host sweeps, daemons) do not move the count.
+    #[cfg(any(test, feature = "test-faults"))]
+    #[doc(hidden)]
+    pub fn test_settlement_notice_count(&self, interaction_id: &str) -> u64 {
+        self.state
+            .test_settlement_counts
+            .lock()
+            .unwrap()
+            .get(interaction_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Mint a scoped device token against this Hub's store (D-018).
@@ -1262,6 +1332,10 @@ async fn spawn_inner(
         settlement_publish: Arc::new(tokio::sync::Mutex::const_new(())),
         #[cfg(any(test, feature = "test-faults"))]
         follow_parks: crate::ws::FollowParks::default(),
+        #[cfg(any(test, feature = "test-faults"))]
+        operation_parks: crate::ws::OperationParks::default(),
+        #[cfg(any(test, feature = "test-faults"))]
+        test_settlement_counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         tty: crate::ws::TtyRelay::default(),
         api_relay: crate::api_relay::ApiRelay::new(),
         push,

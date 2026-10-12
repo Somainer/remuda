@@ -9,6 +9,7 @@
 
 mod blob;
 mod claude;
+mod cover;
 mod envelope;
 mod error;
 mod projection;

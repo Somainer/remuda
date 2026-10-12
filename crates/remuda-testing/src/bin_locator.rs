@@ -187,12 +187,20 @@ fn paths_match(a: &Path, b: &Path) -> bool {
 fn cargo_build_testing_bin(name: &str, target_dir: &Path) {
     std::fs::create_dir_all(target_dir)
         .unwrap_or_else(|err| panic!("create cargo target dir {}: {err}", target_dir.display()));
+    // Most fixtures (fake-claude/fake-herdr) live in THIS crate, but the
+    // parity test builds the real `remuda` binary, which lives in the
+    // `remuda` package; `-p remuda-testing --bin remuda` does not exist.
+    let package = if name == "remuda" {
+        "remuda"
+    } else {
+        "remuda-testing"
+    };
     let status = Command::new(env!("CARGO"))
         .current_dir(workspace_root())
         .args([
             "build",
             "-p",
-            "remuda-testing",
+            package,
             "--bin",
             name,
             "--quiet",

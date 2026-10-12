@@ -4559,9 +4559,22 @@ mod tests {
             driver.promoted.lock().unwrap().is_none(),
             "demotion published"
         );
+        // The guard drop runs immediately after the slot write in the same
+        // poller iteration (the close FOLLOWS publication — Ruling A2). Allow
+        // a few ms for the poller task to reach it on a loaded box; the hard
+        // guarantee being tested is that the close is well before the watch's
+        // next 800 ms tick and never before publication.
+        let mut closed_after_publish = false;
+        for _ in 0..200 {
+            if !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner) {
+                closed_after_publish = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
         assert!(
-            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
-            "the interval closes once demotion is published, before the watch's next tick"
+            closed_after_publish,
+            "the interval closes right after demotion publishes, before the watch's next tick"
         );
         assert!(
             census_present(),

@@ -665,10 +665,12 @@ impl EffortBridge {
 
     /// Arm a new Remuda switch with no transcript submission floor; returns
     /// its generation token. Production switch typing goes through
-    /// [`Self::arm_with_floor`] with the pre-submit EOF position.
+    /// [`Self::arm_with_floor`] with the pre-submit EOF position. This seam is
+    /// retained for tests and the test-stub fake binary.
     ///
     /// Records the attempt as the latest `requested` for the payload echo but
     /// never overwrites the valid LAUNCH provenance (c-effortread r15 item 5).
+    #[cfg(any(test, feature = "test-stub"))]
     pub(crate) fn arm(&self, request: EffortRequest) -> u64 {
         self.arm_with_floor(request, None)
     }

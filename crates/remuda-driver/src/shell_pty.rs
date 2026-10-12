@@ -4798,6 +4798,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_fresh_rollout_created_while_the_stop_ladder_runs_is_refused_before_closure() {
+        // c-usagefu r13 item 4: the r12 promoted-close regression built and
+        // rejected its rollout BEFORE close() even started. The live window
+        // that actually matters is WHILE THE REAL STOP LADDER IS RUNNING with
+        // the promoted process still alive: a rollout freshly created there and
+        // a competitor's FIRST discovery in that window must be refused, and
+        // only after termination is confirmed does the promoted interval close.
+        //
+        // Moving the lifetime close to the START of close() makes this test
+        // bind: the competitor's launch floor is sampled inside close (after
+        // the early close), so the already-closed unknown-boundary interval no
+        // longer overlaps its [launch, creation] window and it becomes the sole
+        // live instance.
+        use crate::adapters::FileSignalAdapter as _;
+        struct Item4Table {
+            codex: Arc<AtomicBool>,
+        }
+        impl crate::promote::ProcessTable for Item4Table {
+            fn process_group(&self, pgid: i32) -> Vec<crate::promote::ProcessRow> {
+                if pgid > 0 && self.codex.load(Ordering::SeqCst) {
+                    vec![crate::promote::ProcessRow {
+                        pid: pgid,
+                        args: "codex".into(),
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let codex = Arc::new(AtomicBool::new(true));
+        let table = Arc::new(Item4Table {
+            codex: Arc::clone(&codex),
+        });
+        // Ignores SIGINT/SIGHUP like every agent TUI: the group stays alive
+        // through the interrupt and hangup graces (~4 s window) and is reaped
+        // only by SIGKILL.
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap '' INT HUP TERM; exec sleep 60".into(),
+        ];
+        options.promote = true;
+        let driver = ShellPtyDriver::with_process_table(
+            options,
+            table as Arc<dyn crate::promote::ProcessTable>,
+        );
+        let _events = driver.spawn().await.unwrap().into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        let owner = format!("promoted-codex-{pgid}");
+
+        for _ in 0..3000 {
+            if driver
+                .promoted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|found| found.kind == AgentKind::Codex)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(crate::adapters::codex_discovery::census_contains(
+            &cwd, &owner
+        ));
+
+        // close() runs concurrently with this test future (borrowed, not
+        // 'static): the promoted process is genuinely alive throughout the
+        // ladder graces. The gate future finishes its in-flight discovery while
+        // close keeps advancing, and join waits for termination to complete.
+        let (close_result, mut competitor) = tokio::join!(Driver::close(&driver), async {
+            // Gate on being INSIDE close teardown (the promoted slot is
+            // cleared before the ladder) while the process group is still
+            // live.
+            let gate_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let in_teardown = driver.promoted.lock().unwrap().is_none();
+                let alive = lifecycle::group_has_live_member(pgid);
+                if in_teardown && alive {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < gate_deadline,
+                    "never observed close teardown while the group was alive"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+                "the promoted interval is LIVE while the ladder is running"
+            );
+
+            // The competitor launches NOW — floor strictly inside close —
+            // and a FRESH rollout carrying its prompt is created in the
+            // same window.
+            let competitor_home = tempfile::tempdir().unwrap();
+            let floor = time::OffsetDateTime::now_utc();
+            let competitor_owner = "r13-item4-competitor";
+            let mut competitor = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+                home: competitor_home.path().to_path_buf(),
+                cwd: cwd.clone(),
+                pid: None,
+                launched_at: Some(floor),
+            })
+            .with_instance_key(Some(competitor_owner.to_owned()));
+            let prompt = "r13 item 4 rollout born during close";
+            crate::adapters::codex_discovery::record_input(&cwd, competitor_owner, prompt);
+            let started = time::OffsetDateTime::now_utc();
+            assert!(
+                started >= floor,
+                "the rollout is created after the competitor launch"
+            );
+            let date_dir = format!(
+                "{:04}/{:02}/{:02}",
+                started.year(),
+                u8::from(started.month()),
+                started.day()
+            );
+            let month_dir = competitor_home.path().join("sessions").join(date_dir);
+            std::fs::create_dir_all(&month_dir).unwrap();
+            let started_rfc = started
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            std::fs::write(
+                    month_dir.join("rollout-r13item4.jsonl"),
+                    format!(
+                        "{{\"timestamp\":\"{started_rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"r13item4\",\"session_id\":\"r13item4\",\"cwd\":\"{}\",\"timestamp\":\"{started_rfc}\"}}}}\n\
+                         {{\"timestamp\":\"{started_rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
+                        cwd.display()
+                    ),
+                )
+                .unwrap();
+
+            // FIRST discovery, still while the process is alive in the
+            // ladder: the LIVE unknown-boundary interval overlaps the
+            // competitor's whole window — refused, and the rejection
+            // sticks.
+            assert!(
+                lifecycle::group_has_live_member(pgid),
+                "rollout + first discovery genuinely precede termination"
+            );
+            let observed = competitor.poll().unwrap();
+            assert!(
+                observed.is_empty(),
+                "a rollout born while the promoted process is alive is refused"
+            );
+            assert!(
+                competitor.binding().is_none(),
+                "the competitor must not bind a rollout the live promoted instance owns"
+            );
+            competitor
+        });
+        close_result.unwrap();
+
+        // Termination finished inside join: the interval closed only AFTER it,
+        // and stays retained while the competitor decision window is open.
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "closed only after the stop ladder confirmed termination"
+        );
+        assert!(
+            crate::adapters::codex_discovery::census_contains(&cwd, &owner),
+            "retained for the still-open competitor decision"
+        );
+        // A1: the in-window refusal is permanent; the cleaner census after
+        // close does not reverse it.
+        let observed = competitor.poll().unwrap();
+        assert!(observed.is_empty(), "still refused after confirmed closure");
+        assert!(competitor.binding().is_none());
+    }
+
+    #[tokio::test]
     async fn the_codex_census_interval_stays_live_until_the_process_has_stopped() {
         // c-usagefu r11 item 3 (Ruling A2): the lifetime interval closes only
         // AFTER the agent process has stopped, not when close() begins. r10

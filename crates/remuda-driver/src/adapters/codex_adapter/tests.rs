@@ -263,8 +263,13 @@ fn usage_events_produce_turn_and_session_snapshots_at_turn_end() {
     };
     assert_eq!(message.scope, remuda_protocol::UsageScope::Message);
     assert_eq!(session.scope, remuda_protocol::UsageScope::Session);
-    // The Message row is keyed on the native response id.
-    assert_eq!(message.scope_id, "r1");
+    // r12 item 3 (Ruling B2'): even a record WITH a native response id is
+    // keyed on the durable (rollout file identity, byte offset) pair.
+    let offset = lines.find(r#"{"ordinal":3"#).unwrap() as u64;
+    assert_eq!(
+        message.scope_id,
+        super::durable_response_scope_id("feed-fixture", offset)
+    );
     // c-ctxusage r5 item 7: the Session row carries the rollout record's own
     // timestamp, so a byte-0 replay is historical evidence, not
     // ingest-time throughput. The task_complete record stamps ...:45.380Z.
@@ -2882,11 +2887,12 @@ fn a_duplicate_usage_record_emits_only_one_message_observation() {
 }
 
 #[test]
-fn a_usage_record_without_response_id_emits_a_durable_fallback_message() {
-    // c-usagefu r11 item 7 (Ruling B2): a per-response token_usage_record that
-    // reports NO response_id is still a counted call, emitted as a Message
-    // under a durable fallback scope id = (rollout file identity, byte offset
-    // of the record). The id never uses a per-poll counter.
+fn a_usage_record_without_response_id_emits_a_durable_message_identity() {
+    // c-usagefu r11 item 7 (Ruling B2), tightened by r12 item 3 (B2'): a
+    // per-response token_usage_record that reports NO response_id is still a
+    // counted call, emitted as a Message under the durable scope id = (rollout
+    // file identity, byte offset of the record) — the SAME identity every
+    // counted record now carries, never a per-poll counter.
     let line = |ordinal: u32, turn: &str| {
         format!(
             "{{\"ordinal\":{ordinal},\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"{turn}\",\"usage\":{{\"input_tokens\":0,\"cached_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":20,\"reasoning_output_tokens\":0,\"total_tokens\":20}}}}}}\n"
@@ -2909,7 +2915,7 @@ fn a_usage_record_without_response_id_emits_a_durable_fallback_message() {
         .expect("the no-response-id record still emits a Message");
     assert_eq!(
         message.scope_id,
-        super::fallback_response_scope_id("rollout-F", 412),
+        super::durable_response_scope_id("rollout-F", 412),
         "the durable fallback scope id is file identity + byte offset"
     );
 
@@ -2938,12 +2944,12 @@ fn a_usage_record_without_response_id_emits_a_durable_fallback_message() {
 }
 
 #[test]
-fn a_byte_zero_replay_of_a_real_rollout_keeps_fallback_response_identities() {
-    // c-usagefu r11 item 7 (Ruling B2) production-path regression: two no-id
-    // token_usage_record lines arrive in SEPARATE tail polls of a real rollout
-    // file. A fresh adapter then re-tails the SAME file from byte zero (a
-    // restart/replay). The fallback Message scope ids must be identical in
-    // both passes — the identity is (file identity, byte offset), so neither
+fn a_byte_zero_replay_of_a_real_rollout_keeps_durable_response_identities() {
+    // c-usagefu r11 item 7 (Ruling B2; r12 item 3 makes it the identity of
+    // EVERY record) production-path regression: two no-id token_usage_record
+    // lines arrive in SEPARATE tail polls of a real rollout file. A fresh
+    // adapter then re-tails the SAME file from byte zero (a restart/replay).
+    // The durable Message scope ids must be identical in both passes — the identity is (file identity, byte offset), so neither
     // poll boundaries nor a fresh tail change it. The old per-poll counter
     // restarted at 1 on every poll and on every adapter, emitting different
     // ids on replay, so the Hub could not dedupe and double counted.

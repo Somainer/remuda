@@ -3021,6 +3021,168 @@ mod tests {
     }
 
     #[test]
+    fn an_upgraded_old_database_counts_once_after_a_real_adapter_byte_zero_replay() {
+        // c-usagefu r12 item 3 (Rulings B1/B2'): an ACTUAL old-schema
+        // (pre-r6) codex database holds one Turn row per call alongside a
+        // link-less Message, keyed on the native response_id era. After
+        // migration a REAL CodexAdapter re-tails the same rollout byte zero
+        // (a restart that reclaims the file) and re-emits every record under
+        // the new durable (rollout file identity, byte offset) identities.
+        // The aggregates must count each call EXACTLY ONCE: the per-turn
+        // pairing drops the legacy link-less Messages and the Turn rows, and
+        // the durable unique index makes a second byte-0 replay a no-op.
+        use remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX;
+        use remuda_driver::adapters::{AdapterHome, CodexAdapter, FileSignalAdapter as _};
+        use remuda_protocol::{ObservationPayload, UsageScope};
+        use std::io::Write;
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let codex_home = home_dir.path().join(".codex");
+        let session_dir = codex_home.join("sessions/2026/10/13");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let rollout = session_dir.join("rollout-r12-upgrade.jsonl");
+        std::fs::write(
+            &rollout,
+            r#"{"ordinal":0,"type":"session_meta","payload":{"id":"r12-upgrade","session_id":"r12-upgrade","cwd":"/w","timestamp":"2026-10-13T00:00:00.000Z"}}
+"#,
+        )
+        .unwrap();
+        // Two calls: t1's record CARRIES a native response_id, t2's carries
+        // none. Both must get the durable (file, offset) identity.
+        let append_turn = |turn: &str, response: Option<&str>, output: u64| {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&rollout)
+                .unwrap();
+            writeln!(
+                file,
+                "{{\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"{turn}\"}}}}"
+            )
+            .unwrap();
+            let id_field = response
+                .map(|id| format!(r#","response_id":"{id}""#))
+                .unwrap_or_default();
+            writeln!(
+                file,
+                "{{\"ordinal\":2,\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"{turn}\"{id_field},\"usage\":{{\"input_tokens\":0,\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":{output},\"reasoning_output_tokens\":0,\"total_tokens\":{output}}}}}}}"
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "{{\"ordinal\":3,\"timestamp\":\"2026-10-13T00:00:0{}.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"{turn}\"}}}}",
+                output
+            )
+            .unwrap();
+        };
+        append_turn("t1", Some("legacy-response-r1"), 100);
+        append_turn("t2", None, 20);
+
+        // The OLD database: actual old-schema table, populated pre-migration
+        // with the pre-r6 shape — a Turn row AND a link-less Message per call.
+        let conn = open_old_dual_schema();
+        conn.execute_batch(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode,
+                 total_tokens, output_tokens, cost_usd, observed_at,
+                 observed_at_source, profile_id, model)
+             VALUES
+                ('ins_upgrade', 1, 'turn', 't1', 't1', 'snapshot',
+                 100, 100, '0.10', '2026-10-13T00:00:01.000Z', 'native',
+                 'pvp_upgrade', 'gpt-5.4'),
+                ('ins_upgrade', 2, 'message', 'legacy-response-r1', NULL,
+                 'snapshot', 100, 100, '0.10',
+                 '2026-10-13T00:00:01.100Z', 'native', 'pvp_upgrade',
+                 'gpt-5.4'),
+                ('ins_upgrade', 3, 'turn', 't2', 't2', 'snapshot',
+                 20, 20, '0.02', '2026-10-13T00:00:02.000Z', 'native',
+                 'pvp_upgrade', 'gpt-5.4'),
+                ('ins_upgrade', 4, 'message', 'legacy-response-r2', NULL,
+                 'snapshot', 20, 20, '0.02',
+                 '2026-10-13T00:00:02.100Z', 'native', 'pvp_upgrade',
+                 'gpt-5.4');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        // Real adapter byte-zero replay (the restart/reclaim path), draining
+        // through the PUBLIC ingest functions so the durable unique index
+        // participates — not a test insert bypass.
+        let mut seq = 100i64;
+        let drain = |seq: &mut i64| {
+            let mut adapter = CodexAdapter::new(AdapterHome {
+                home: codex_home.clone(),
+                cwd: "/w".into(),
+                pid: None,
+                launched_at: None,
+            })
+            .with_instance_key(Some("r12-upgrade-instance".to_owned()));
+            adapter.bind_rollout("r12-upgrade", rollout.clone());
+            let mut emitted = Vec::new();
+            for observed in adapter.poll().unwrap() {
+                let turn_id = observed.turn_id.clone();
+                let ObservationPayload::Usage(payload) = observed.payload else {
+                    continue;
+                };
+                if payload.scope != UsageScope::Message {
+                    continue;
+                }
+                emitted.push(payload.scope_id.clone());
+                let rec = JournalRecord {
+                    instance_id: "ins_upgrade".into(),
+                    seq: *seq,
+                    event_id: format!("evt_upgrade_{seq}"),
+                    event: json!({
+                        "kind": "usage",
+                        "payload": serde_json::to_value(&payload).unwrap(),
+                        "source": turn_id
+                            .map(|t| json!({"nativeTurnId": {"value": t}}))
+                            .unwrap_or_else(|| json!({})),
+                    }),
+                    observed_at: "2026-10-13T00:00:03.000Z".into(),
+                };
+                let row = project_usage_event(&rec, None, None).unwrap();
+                insert_usage_event(&conn, &row).unwrap();
+                *seq += 1;
+            }
+            emitted
+        };
+
+        let first_ids = drain(&mut seq);
+        assert_eq!(first_ids.len(), 2, "both calls re-emit one Message each");
+        for id in &first_ids {
+            assert!(
+                id.starts_with(CODEX_DURABLE_RESPONSE_SCOPE_PREFIX),
+                "B2': every counted record — response_id or not — uses the \
+                 durable (file, offset) identity, got {id}"
+            );
+        }
+        let second_ids = drain(&mut seq);
+        assert!(
+            second_ids.len() == 2,
+            "the adapter emits the records again on a second byte-0 replay"
+        );
+        let rows_after_replay: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events
+                 WHERE instance_id='ins_upgrade' AND scope='message'
+                   AND scope_id LIKE ?1",
+                [format!("{CODEX_DURABLE_RESPONSE_SCOPE_PREFIX}%")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows_after_replay, 2,
+            "both byte-0 replays persist the SAME two durable rows, not four"
+        );
+
+        let agg = aggregate_instance(&conn, "ins_upgrade").unwrap();
+        assert_eq!(
+            agg.output_tokens, 120,
+            "100 + 20 counted once: no Turn+Message pair, no replay duplicate"
+        );
+    }
+
+    #[test]
     fn a_token_growing_point_with_a_reset_lower_cost_is_accepted_without_the_stale_cost() {
         // r4 item 4: priced turn (session stock 0.50, tokens 1000) -> an
         // UNPRICED model turn emits no cost (sticky None) -> the next PRICED

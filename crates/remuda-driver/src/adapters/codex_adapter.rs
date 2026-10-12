@@ -579,17 +579,16 @@ impl CodexAdapter {
                     return Vec::new();
                 };
                 let effective_turn = event.turn_id.clone().or_else(|| turn_id(&record));
-                // c-usagefu r11 item 7 (Ruling B2): a per-response usage
-                // record without a native response_id is still a counted call.
-                // Emit it under a DURABLE fallback scope id that is stable
-                // across a byte-0 replay: the ROLLOUT FILE IDENTITY plus the
-                // record's first-byte OFFSET in that file. A per-poll line
-                // counter restarted at 1 on every tail poll (and on every
-                // restart) was neither file-scoped nor replay-stable.
-                let response_id = event
-                    .request_id
-                    .clone()
-                    .unwrap_or_else(|| fallback_response_scope_id(file_identity, byte_offset));
+                // c-usagefu r12 item 3 (Ruling B2'): EVERY counted record's
+                // coverage identity is the ROLLOUT FILE IDENTITY plus the
+                // record's first-byte OFFSET in that file — including records
+                // that carry a native response_id. The response_id stays an
+                // in-memory attribute the additive aggregator dedupes with,
+                // but it is never the durable identity: the Hub's complete-
+                // coverage proof keys entirely on this marker, so a turn that
+                // mixes pre-r12 response_id identities with these new ones
+                // falls back to counting its Turn row instead.
+                let response_id = durable_response_scope_id(file_identity, byte_offset);
                 let mut totals = crate::usage::UsageTotals::default();
                 totals.add(event);
                 // Stamp the native turn id so the Hub rollup can count
@@ -849,25 +848,38 @@ fn turn_id(record: &crate::codex_rollout::CodexRolloutRecord) -> Option<String> 
     }
 }
 
-/// Durable identity of a rollout FILE for the fallback scope id
-/// (c-usagefu r11 item 7, Ruling B2): the canonical path verbatim. It is
-/// replay-stable (a byte-0 replay tails the same file) and distinguishes two
-/// rollouts within one instance.
+/// Durable identity of a rollout FILE for the per-response scope id
+/// (c-usagefu r11 item 7; r12 item 3 Ruling B2'): the canonical path
+/// verbatim. It is replay-stable (a byte-0 replay tails the same file) and
+/// distinguishes two rollouts within one instance.
 fn rollout_file_identity(path: &Path) -> String {
     crate::adapters::codex_discovery::canonical_claim_key(path)
         .to_string_lossy()
         .into_owned()
 }
 
-/// Durable synthetic per-response scope id for a codex `token_usage_record`
-/// that carries no native `response_id` (Ruling B2). It is the exact pair the
+/// Marker prefix for a codex per-response usage Message whose durable
+/// coverage identity is the rollout file identity + record byte offset
+/// (c-usagefu r12 item 3, Ruling B2'). The Hub's complete-coverage proof
+/// recognizes this prefix: EVERY counted record of a turn must carry it
+/// before the Turn may be suppressed in favour of the Messages.
+///
+/// r11 minted these ids only for records WITHOUT a native response_id; r12
+/// makes the pair the identity of EVERY counted record. The versioned prefix
+/// (`:v2:`) is what lets the Hub tell a pre-r12 response_id identity apart
+/// from a durable one on an upgraded database.
+pub const CODEX_DURABLE_RESPONSE_SCOPE_PREFIX: &str = "_remuda_codex_response:v2:";
+
+/// Durable synthetic per-response scope id for EVERY codex
+/// `token_usage_record` (Ruling B2', r12 item 3). It is the exact pair the
 /// ruling names — the rollout FILE IDENTITY and the record's first-byte
 /// OFFSET in that file. Both halves are replay-stable: an incremental tail
 /// across many poll cycles and a fresh byte-0 re-tail produce the same id, so
 /// the Hub dedupes the replay instead of double counting. The distinct prefix
-/// keeps a fallback id from ever colliding with a real native response id.
-fn fallback_response_scope_id(file_identity: &str, byte_offset: u64) -> String {
-    format!("_remuda_codex_response:v2:{byte_offset}:{file_identity}")
+/// keeps a durable id from ever colliding with a real native response id (and
+/// marks the persisted row as carrying the durable identity).
+fn durable_response_scope_id(file_identity: &str, byte_offset: u64) -> String {
+    format!("{CODEX_DURABLE_RESPONSE_SCOPE_PREFIX}{byte_offset}:{file_identity}")
 }
 
 /// Extract text from a message item, joining its content blocks.

@@ -35,12 +35,19 @@ fn adapter_with_rollout(dir: &Path, session_id: &str) -> CodexAdapter {
 
 fn feed(adapter: &mut CodexAdapter, lines: &str) -> Vec<AdapterObservation> {
     let mut out = Vec::new();
-    for (ordinal, line) in lines
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .enumerate()
-    {
-        out.extend(adapter.on_line(ordinal as u64, line));
+    // Compute each record's first-byte offset within the fixture string, as a
+    // real RolloutTail would (Ruling B2).
+    let mut ordinal = 0u64;
+    let mut cursor = 0usize;
+    for raw in lines.split_inclusive('\n') {
+        let start = cursor;
+        cursor += raw.len();
+        let line = raw.trim_end_matches(['\n', '\r']);
+        if line.trim().is_empty() {
+            continue;
+        }
+        ordinal += 1;
+        out.extend(adapter.on_line(ordinal, "feed-fixture", start as u64, line));
     }
     out
 }
@@ -2655,8 +2662,8 @@ fn a_duplicate_usage_record_emits_only_one_message_observation() {
         pid: None,
         launched_at: None,
     });
-    let first = adapter.on_line(1, &line(1));
-    let second = adapter.on_line(2, &line(2));
+    let first = adapter.on_line(1, "dup-fixture", 0, &line(1));
+    let second = adapter.on_line(2, "dup-fixture", 120, &line(2));
     let msg_count = |v: &[AdapterObservation]| {
         v.iter()
             .filter(|o| matches!(&o.payload, ObservationPayload::Usage(u) if u.scope == UsageScope::Message))
@@ -2672,12 +2679,10 @@ fn a_duplicate_usage_record_emits_only_one_message_observation() {
 
 #[test]
 fn a_usage_record_without_response_id_emits_a_durable_fallback_message() {
-    // c-usagefu r10 item 5 (Ruling B): a per-response token_usage_record that
-    // reports NO response_id is still a counted call. It must be emitted as a
-    // Message under a durable fallback scope id (stable across a byte-0 replay
-    // because it is keyed on the rollout line ordinal) so response-level
-    // coverage is persisted for every record. Previously it was dropped,
-    // leaving the turn only partially covered.
+    // c-usagefu r11 item 7 (Ruling B2): a per-response token_usage_record that
+    // reports NO response_id is still a counted call, emitted as a Message
+    // under a durable fallback scope id = (rollout file identity, byte offset
+    // of the record). The id never uses a per-poll counter.
     let line = |ordinal: u32, turn: &str| {
         format!(
             "{{\"ordinal\":{ordinal},\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"{turn}\",\"usage\":{{\"input_tokens\":0,\"cached_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":20,\"reasoning_output_tokens\":0,\"total_tokens\":20}}}}}}\n"
@@ -2690,7 +2695,7 @@ fn a_usage_record_without_response_id_emits_a_durable_fallback_message() {
         launched_at: None,
     });
 
-    let obs = adapter.on_line(7, &line(7, "t1"));
+    let obs = adapter.on_line(7, "rollout-F", 412, &line(7, "t1"));
     let message = obs
         .iter()
         .find_map(|o| match &o.payload {
@@ -2700,27 +2705,24 @@ fn a_usage_record_without_response_id_emits_a_durable_fallback_message() {
         .expect("the no-response-id record still emits a Message");
     assert_eq!(
         message.scope_id,
-        super::fallback_response_scope_id(Some("t1"), 7),
-        "durable turn+ordinal fallback scope id"
+        super::fallback_response_scope_id("rollout-F", 412),
+        "the durable fallback scope id is file identity + byte offset"
     );
 
-    // A turn-less record falls back to the ordinal alone.
-    let turnless = adapter.on_line(8, &line(8, ""));
-    let turnless = turnless
+    // A different offset on the same file is a distinct response identity.
+    let other = adapter.on_line(8, "rollout-F", 540, &line(8, "t2"));
+    let other = other
         .iter()
         .find_map(|o| match &o.payload {
             ObservationPayload::Usage(u) if u.scope == UsageScope::Message => Some(u),
             _ => None,
         })
-        .expect("a turn-less no-id record emits a Message too");
-    assert_eq!(
-        turnless.scope_id,
-        super::fallback_response_scope_id(None, 8)
-    );
+        .expect("a second no-id record emits a Message too");
+    assert_ne!(other.scope_id, message.scope_id);
 
-    // Re-tailing the same byte at the same ordinal emits the SAME fallback id,
-    // so the Hub dedupes the replay.
-    let replayed = adapter.on_line(7, &line(7, "t1"));
+    // Re-tailing the same byte emits the SAME fallback id, so the Hub dedupes
+    // the replay.
+    let replayed = adapter.on_line(7, "rollout-F", 412, &line(7, "t1"));
     let replayed = replayed
         .iter()
         .find_map(|o| match &o.payload {
@@ -2729,4 +2731,94 @@ fn a_usage_record_without_response_id_emits_a_durable_fallback_message() {
         })
         .expect("replay re-emits through on_line (Hub dedupes by scope id)");
     assert_eq!(replayed.scope_id, message.scope_id, "stable across replay");
+}
+
+#[test]
+fn a_byte_zero_replay_of_a_real_rollout_keeps_fallback_response_identities() {
+    // c-usagefu r11 item 7 (Ruling B2) production-path regression: two no-id
+    // token_usage_record lines arrive in SEPARATE tail polls of a real rollout
+    // file. A fresh adapter then re-tails the SAME file from byte zero (a
+    // restart/replay). The fallback Message scope ids must be identical in
+    // both passes — the identity is (file identity, byte offset), so neither
+    // poll boundaries nor a fresh tail change it. The old per-poll counter
+    // restarted at 1 on every poll and on every adapter, emitting different
+    // ids on replay, so the Hub could not dedupe and double counted.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollout-byteoffset.jsonl");
+    let record = |ordinal: u32, turn: &str, output: u32| {
+        format!(
+            "{{\"ordinal\":{ordinal},\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"{turn}\",\"usage\":{{\"input_tokens\":0,\"cached_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":{output},\"reasoning_output_tokens\":0,\"total_tokens\":{output}}}}}}}\n"
+        )
+    };
+    let header = "{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"id\":\"s-bo\",\"session_id\":\"s-bo\"}}\n";
+    // Blank lines deliberately vary byte offsets away from line numbers.
+    let batch_one = format!("{header}\n{}", record(1, "t1", 20));
+    let batch_two = format!("\n{}\n", record(3, "t2", 30));
+
+    // A restart re-spawns the adapter with the SAME stable instance key (r7
+    // item 3), which is what lets both passes re-claim the same rollout; a
+    // launch floor makes the bind byte-zero.
+    let bind = |home: &Path| {
+        let mut adapter = CodexAdapter::new(AdapterHome {
+            home: home.to_path_buf(),
+            cwd: home.to_path_buf(),
+            pid: None,
+            launched_at: Some(OffsetDateTime::now_utc()),
+        })
+        .with_instance_key(Some("replay-instance".to_owned()));
+        adapter.bind_rollout("s-bo", path.clone());
+        adapter
+    };
+    let message_ids = |v: Vec<AdapterObservation>| {
+        v.into_iter()
+            .filter_map(|o| match o.payload {
+                ObservationPayload::Usage(u) if u.scope == UsageScope::Message => Some(u.scope_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // Byte offsets of the two records in the file (computed before the bytes
+    // are moved into fs::write).
+    let offset_of_t1 = batch_one.len() - record(1, "t1", 20).len();
+    let offset_of_t2 = batch_one.len() + "\n".len();
+
+    // Incremental tailing: records land in two separate polls.
+    std::fs::write(&path, batch_one).unwrap();
+    let mut live = bind(dir.path());
+    let first = message_ids(live.poll().unwrap());
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(batch_two.as_bytes())
+        .unwrap();
+    let second = message_ids(live.poll().unwrap());
+    let incremental_ids = {
+        let mut ids = first.clone();
+        ids.extend(second);
+        ids
+    };
+    assert_eq!(
+        incremental_ids.len(),
+        2,
+        "both no-id records emitted Messages"
+    );
+
+    // Byte-0 replay through a fresh adapter: identical identities in order.
+    let mut replay = bind(dir.path());
+    let replayed_ids = message_ids(replay.poll().unwrap());
+    assert_eq!(
+        replayed_ids, incremental_ids,
+        "byte-0 replay reproduces the exact (file, offset) fallback ids"
+    );
+    // And the offsets are genuinely the file positions, not poll ordinals.
+    assert!(
+        replayed_ids[0].contains(&format!(":v2:{offset_of_t1}:")),
+        "t1 id {replayed_ids:?} carries byte offset {offset_of_t1}"
+    );
+    assert!(
+        replayed_ids[1].contains(&format!(":v2:{offset_of_t2}:")),
+        "t2 id {replayed_ids:?} carries byte offset {offset_of_t2}"
+    );
 }

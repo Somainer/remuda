@@ -398,7 +398,15 @@ impl RolloutTail {
 
     /// Read appended whole lines, omitting empty lines and trimming CRLF.
     /// Invalid UTF-8 in a complete line is replaced with the replacement char.
-    pub fn poll(&mut self) -> std::io::Result<Vec<String>> {
+    ///
+    /// Each returned pair is `(byte offset, line)` where the offset is the
+    /// position of the line's FIRST byte in the file. Byte offsets are
+    /// replay-stable: re-tailing the same append-only file from byte zero
+    /// yields the same offset for the same record, which is why they — never a
+    /// per-poll running counter — are the durable record identity
+    /// (c-usagefu r11 item 7, Ruling B2). Empty lines advance the offset like
+    /// every other byte but produce no entry.
+    pub fn poll(&mut self) -> std::io::Result<Vec<(u64, String)>> {
         let mut file = std::fs::File::open(&self.path)?;
         if file.metadata()?.len() < self.offset {
             self.offset = 0;
@@ -408,6 +416,8 @@ impl RolloutTail {
         let mut appended = Vec::new();
         self.offset += file.read_to_end(&mut appended)? as u64;
         self.partial.extend_from_slice(&appended);
+        // File offset of the first byte currently buffered in `partial`.
+        let partial_base = self.offset - self.partial.len() as u64;
         let mut lines = Vec::new();
         let mut consumed = 0;
         for (index, byte) in self.partial.iter().enumerate() {
@@ -415,7 +425,7 @@ impl RolloutTail {
                 let line = String::from_utf8_lossy(&self.partial[consumed..index]);
                 let line = line.trim_end_matches('\r');
                 if !line.is_empty() {
-                    lines.push(line.to_owned());
+                    lines.push((partial_base + consumed as u64, line.to_owned()));
                 }
                 consumed = index + 1;
             }

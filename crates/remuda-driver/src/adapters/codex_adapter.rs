@@ -439,7 +439,17 @@ impl CodexAdapter {
     }
 
     /// Map one parsed rollout line to zero or more observations.
-    fn on_line(&mut self, ordinal: u64, line: &str) -> Vec<AdapterObservation> {
+    ///
+    /// `file_identity` is the stable identity of the rollout file and
+    /// `byte_offset` the record's first-byte position in it (replay-stable),
+    /// not a per-poll line counter (Ruling B2).
+    fn on_line(
+        &mut self,
+        ordinal: u64,
+        file_identity: &str,
+        byte_offset: u64,
+        line: &str,
+    ) -> Vec<AdapterObservation> {
         let Ok(record) = parse_rollout_line_at(line, ordinal) else {
             return Vec::new();
         };
@@ -551,16 +561,17 @@ impl CodexAdapter {
                     return Vec::new();
                 };
                 let effective_turn = event.turn_id.clone().or_else(|| turn_id(&record));
-                // c-usagefu r10 item 5 (Ruling B): a per-response usage record
-                // without a native response_id is still a counted call. Emit it
-                // under a DURABLE fallback scope id (stable across a byte-0
-                // replay because it is keyed on the rollout line ordinal) so
-                // the Hub persists response-level coverage for EVERY record;
-                // otherwise the end-of-turn Turn row would be only partially
-                // covered and the rollup could not prove Message==Turn.
-                let response_id = event.request_id.clone().unwrap_or_else(|| {
-                    fallback_response_scope_id(effective_turn.as_deref(), ordinal)
-                });
+                // c-usagefu r11 item 7 (Ruling B2): a per-response usage
+                // record without a native response_id is still a counted call.
+                // Emit it under a DURABLE fallback scope id that is stable
+                // across a byte-0 replay: the ROLLOUT FILE IDENTITY plus the
+                // record's first-byte OFFSET in that file. A per-poll line
+                // counter restarted at 1 on every tail poll (and on every
+                // restart) was neither file-scoped nor replay-stable.
+                let response_id = event
+                    .request_id
+                    .clone()
+                    .unwrap_or_else(|| fallback_response_scope_id(file_identity, byte_offset));
                 let mut totals = crate::usage::UsageTotals::default();
                 totals.add(event);
                 // Stamp the native turn id so the Hub rollup can count
@@ -795,13 +806,14 @@ impl FileSignalAdapter for CodexAdapter {
             return Ok(Vec::new());
         };
         let lines = tail.poll()?;
+        let file_identity = rollout_file_identity(tail.path());
         let mut out = Vec::new();
-        // Physical line index: the tail returns only non-empty lines, so use the
-        // parser's own ordinal when present and a running counter otherwise.
+        // Physical non-empty line index: only the parser metadata ordinal; the
+        // durable response identity is the byte offset, not this counter.
         let mut ordinal = 0;
-        for line in lines {
+        for (byte_offset, line) in lines {
             ordinal += 1;
-            out.extend(self.on_line(ordinal, &line));
+            out.extend(self.on_line(ordinal, &file_identity, byte_offset, &line));
         }
         Ok(out)
     }
@@ -819,19 +831,25 @@ fn turn_id(record: &crate::codex_rollout::CodexRolloutRecord) -> Option<String> 
     }
 }
 
+/// Durable identity of a rollout FILE for the fallback scope id
+/// (c-usagefu r11 item 7, Ruling B2): the canonical path verbatim. It is
+/// replay-stable (a byte-0 replay tails the same file) and distinguishes two
+/// rollouts within one instance.
+fn rollout_file_identity(path: &Path) -> String {
+    crate::adapters::codex_discovery::canonical_claim_key(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Durable synthetic per-response scope id for a codex `token_usage_record`
-/// that carries no native `response_id` (c-usagefu r10 item 5, Ruling B). It is
-/// keyed on the rollout line `ordinal`, which is stable across a byte-0 replay
-/// (the same bytes tail again), so a re-promoted adapter re-emits the SAME
-/// scope id and the Hub dedupes it instead of double counting. The distinct
-/// prefix keeps a fallback id from ever colliding with a real native response
-/// id. `turn` disambiguates within a session; a turn-less record falls back to
-/// the ordinal alone.
-fn fallback_response_scope_id(turn: Option<&str>, ordinal: u64) -> String {
-    match turn.filter(|id| !id.is_empty()) {
-        Some(turn) => format!("_remuda_codex_response:{turn}:{ordinal}"),
-        None => format!("_remuda_codex_response:turnless:{ordinal}"),
-    }
+/// that carries no native `response_id` (Ruling B2). It is the exact pair the
+/// ruling names — the rollout FILE IDENTITY and the record's first-byte
+/// OFFSET in that file. Both halves are replay-stable: an incremental tail
+/// across many poll cycles and a fresh byte-0 re-tail produce the same id, so
+/// the Hub dedupes the replay instead of double counting. The distinct prefix
+/// keeps a fallback id from ever colliding with a real native response id.
+fn fallback_response_scope_id(file_identity: &str, byte_offset: u64) -> String {
+    format!("_remuda_codex_response:v2:{byte_offset}:{file_identity}")
 }
 
 /// Extract text from a message item, joining its content blocks.

@@ -1,7 +1,16 @@
 //! Persisted verification reports for `--onto` / `--land` / `--queue`.
 //!
-//! Reports live under the repository's common git directory, never in a
-//! worktree checkout: `<git-common-dir>/remuda/merge-reports/<branch-slug>/<base>.json`.
+//! Two separate namespaces live under the repository's common git directory
+//! (never in a worktree checkout), under
+//! `<git-common-dir>/remuda/merge-reports/<branch-slug>/`:
+//!
+//! * latest-by-base: `<base>.json` — the most recent verification ONTO that
+//!   base; a newer verification legitimately replaces it.
+//! * immutable: `immutable/<merged>.json` — one exact (base, head, merged)
+//!   tuple, published WITHOUT replacement. A pinned `--land --report <merged>`
+//!   reads only this namespace, so a newer report (even on the same base) can
+//!   never overwrite or be substituted for the tuple the gate captured.
+//!
 //! A `<base>.preparing.json` sidecar appears as soon as the merge commit has
 //! been constructed but before the gate runs, so a queue driver can start
 //! speculatively verifying the next branch onto that commit.
@@ -50,13 +59,76 @@ pub(super) fn report_path(repo: &Path, reference: &str, base: &str) -> Result<Pa
     Ok(report_dir(repo, reference)?.join(format!("{base}.json")))
 }
 
-/// Immutable, content-addressed report path keyed by the constructed merge
-/// sha. Unlike the `<base>.json` "latest verified onto this base" pointer —
-/// which a second verification legitimately overwrites — this file names one
-/// exact (base, head, merged) tuple and is never replaced. A pinned land reads
-/// THIS, so a newer same-base report cannot be substituted for an older one.
+/// Immutable, content-addressed report in its OWN namespace, keyed by the
+/// constructed merge sha. This is distinct from the `<base>.json`
+/// "latest verified onto this base" pointer — which a second verification
+/// legitimately overwrites. The immutable file names one exact
+/// (base, head, merged) tuple and is published WITHOUT replacement; a pinned
+/// land reads THIS, so a newer same-base report cannot be substituted for an
+/// older one.
 fn immutable_report_path(repo: &Path, reference: &str, merged: &str) -> Result<PathBuf> {
-    Ok(report_dir(repo, reference)?.join(format!("{merged}.json")))
+    Ok(report_dir(repo, reference)?
+        .join("immutable")
+        .join(format!("{merged}.json")))
+}
+
+/// Publish a report as a NEW immutable identity, never replacing an existing
+/// one. The contents are staged in a temp file and attached with an atomic
+/// create-new (a hard link fails if the target already exists, and both files
+/// are on the same git-dir filesystem). If an immutable record for this merge
+/// sha already exists, it must name the same captured (base, head, merged)
+/// tuple — a different record for the same identity is refused rather than
+/// overwritten.
+fn publish_immutable(path: &Path, contents: &str, captured: &MergeReport) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create report directory {}", parent.display()))?;
+    }
+    if path.is_file() {
+        let existing = fs::read_to_string(path)
+            .with_context(|| format!("read existing immutable report {}", path.display()))?;
+        let existing: MergeReport =
+            serde_json::from_str(&existing).context("parse existing immutable report")?;
+        let same_tuple = existing.merged.as_deref() == captured.merged.as_deref()
+            && existing.base.as_deref() == captured.base.as_deref()
+            && existing.head.as_deref() == captured.head.as_deref();
+        anyhow::ensure!(
+            same_tuple,
+            "immutable report {} already exists for a different (base, head, merged) tuple",
+            captured.merged.as_deref().unwrap_or("<unknown merge>")
+        );
+        // Idempotent re-publish of the identical tuple: leave it untouched.
+        return Ok(());
+    }
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, contents).context("write report file")?;
+    // Atomic create-new: fails if another lane published concurrently.
+    match fs::hard_link(&temporary, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&temporary);
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temporary);
+            // Re-check under the now-present target: identical tuple is fine.
+            let existing = fs::read_to_string(path)
+                .with_context(|| format!("read existing immutable report {}", path.display()))?;
+            let existing: MergeReport =
+                serde_json::from_str(&existing).context("parse existing immutable report")?;
+            anyhow::ensure!(
+                existing.merged.as_deref() == captured.merged.as_deref()
+                    && existing.base.as_deref() == captured.base.as_deref()
+                    && existing.head.as_deref() == captured.head.as_deref(),
+                "immutable report {} was concurrently published for a different tuple",
+                captured.merged.as_deref().unwrap_or("<unknown merge>")
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error).context("publish immutable report")
+        }
+    }
 }
 
 /// Load the immutable report for one captured merge sha.
@@ -152,7 +224,8 @@ pub(super) fn save(repo: &Path, reference: &str, report: &MergeReport) -> Result
     if let Some(merged) = report.merged.as_deref() {
         let immutable = immutable_report_path(repo, reference, merged)?;
         if immutable != path {
-            write_atomic(&immutable, &serialized)?;
+            // Immutable identity: create-new, never replace a different tuple.
+            publish_immutable(&immutable, &serialized, report)?;
         }
     }
     let sidecar = preparing_path(repo, reference, base)?;
@@ -369,6 +442,87 @@ mod tests {
         assert_eq!(
             pinned_b.merged.as_deref(),
             Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+
+        // The immutable records live in their own namespace, distinct from the
+        // latest-by-base pointer.
+        let common = common_dir(repo).unwrap();
+        assert!(
+            common
+                .join("remuda/merge-reports/wt-a-work/immutable/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json")
+                .is_file()
+        );
+        assert!(
+            !common
+                .join(
+                    "remuda/merge-reports/wt-a-work/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"
+                )
+                .is_file(),
+            "immutable report must not share the latest-by-base namespace"
+        );
+    }
+
+    #[test]
+    fn an_immutable_report_is_never_replaced_by_a_different_tuple() {
+        // r13 item 8: publishing a second record under the same merge sha with a
+        // different (base, head) must NOT overwrite the first; it errors, and
+        // the original tuple is still what load_by_merged returns. Re-publishing
+        // the identical tuple is idempotent.
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = temporary.path();
+        super::super::git(repo, &["init", "-b", "main"]).unwrap();
+        let reference = "refs/heads/wt/a/work";
+        let merged = "dddddddddddddddddddddddddddddddddddddddd";
+        let make = |base: &str, head: &str| MergeReport {
+            merged: Some(merged.into()),
+            head: Some(head.into()),
+            ..serde_json::from_value(serde_json::json!({
+                "exitCode": 0,
+                "status": "verified",
+                "branch": "wt/a/work",
+                "dryRun": false,
+                "affected": true,
+                "base": base,
+                "tree": "deadbeef",
+                "gateOverride": false,
+                "web": false,
+                "webE2e": false,
+                "mainUpdated": false,
+                "pushed": false,
+                "conflicts": [],
+                "steps": []
+            }))
+            .unwrap()
+        };
+        let first = make(
+            "1111111111111111111111111111111111111111",
+            "aaaa11111111111111111111111111111111111",
+        );
+        save(repo, reference, &first).unwrap();
+
+        // Identical tuple: idempotent, no error.
+        save(repo, reference, &first).unwrap();
+
+        // Different base/head under the SAME merged sha: refused.
+        let conflicting = make(
+            "2222222222222222222222222222222222222222",
+            "bbbb22222222222222222222222222222222222",
+        );
+        let err = save(repo, reference, &conflicting).unwrap_err();
+        assert!(
+            err.to_string().contains("already exists for a different"),
+            "{err}"
+        );
+
+        // The original immutable tuple is intact.
+        let loaded = load_by_merged(repo, reference, merged).unwrap();
+        assert_eq!(
+            loaded.base.as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            loaded.head.as_deref(),
+            Some("aaaa11111111111111111111111111111111111")
         );
     }
 }

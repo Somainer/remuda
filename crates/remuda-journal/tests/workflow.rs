@@ -966,3 +966,162 @@ fn a_start_between_the_live_failure_and_the_poll_resurrects_in_that_poll() {
         "nothing may resurrect until the past-watermark record folds: {a1_states:?}"
     );
 }
+
+/// c-cardsettle-fu2 r6 item 2: peek and poll must agree on record
+/// completeness, and the live failure's terminal watermark must survive
+/// EMPTY polls until the record it covers is actually consumed. Attempt 1
+/// starts+folds to Failed; attempt 2's start JSON is written in full but
+/// WITHOUT its terminating newline when the live SubagentStart +
+/// StopFailure arrive. The first poll consumes nothing (poll reads only
+/// newline-terminated records); the newline then lands and the next poll
+/// folds the start. That start is the failure's own settled attempt, so the
+/// member must stay Failed throughout. A later full attempt-3 start is a
+/// genuine retry and resurrects.
+#[test]
+fn an_unterminated_start_at_failure_time_stays_covered_once_completed() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_r6_unterm";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    // Attempt 1: started then failed, both folded on the first poll.
+    std::fs::write(
+        run_dir.join("journal.jsonl"),
+        "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n\
+         {\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n",
+    )
+    .unwrap();
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        bodies(tailer.poll().unwrap())
+            .iter()
+            .rev()
+            .find_map(|body| match body {
+                ObservationPayload::WorkflowMember(m)
+                    if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+                {
+                    Some(m.state)
+                }
+                _ => None,
+            })
+            .expect("a1 observed"),
+        WorkflowState::Failed,
+        "attempt 1 ends Failed"
+    );
+
+    // Attempt 2's start JSON lands in full, but WITHOUT its newline.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        write!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}}"
+        )
+        .unwrap();
+    }
+    // Live SubagentStart + StopFailure for attempt 2 while the record is
+    // still unterminated.
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+
+    // First poll consumes nothing: the trailing segment has no newline. The
+    // member must still be Failed.
+    let empty_poll: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        empty_poll
+            .iter()
+            .all(|state| *state == WorkflowState::Failed),
+        "the empty poll must not resurrect (and need not emit): {empty_poll:?}"
+    );
+
+    // The newline lands; the next poll folds the now-complete attempt-2
+    // start, which the watermark still covers.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(journal).unwrap();
+    }
+    let completed: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        completed
+            .iter()
+            .all(|state| *state == WorkflowState::Failed),
+        "the start that was only partially terminated at failure time is still the settled \
+         attempt: {completed:?}"
+    );
+
+    // A genuinely newer attempt 3 appended after the watermark was consumed
+    // resurrects.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}}"
+        )
+        .unwrap();
+    }
+    let retried = bodies(tailer.poll().unwrap());
+    let final_state = retried
+        .iter()
+        .rev()
+        .find_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .expect("a1 observed after attempt 3");
+    assert_eq!(
+        final_state,
+        WorkflowState::Running,
+        "attempt 3 after the covered start was consumed is a genuine retry"
+    );
+}

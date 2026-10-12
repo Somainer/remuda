@@ -183,17 +183,26 @@ impl FileTail {
         self.offset
     }
 
-    /// Position of the NEWEST complete (newline-terminated) `started` record
-    /// for `agent_id` in the still-unread tail, as `(file generation, byte
-    /// offset of the record's first byte)` — or `None`. Matches on `agentId`
-    /// (falling back to `key`, for records that omit `agentId`).
+    /// Position of the NEWEST complete `started` record for `agent_id` in the
+    /// still-unread tail, as `(file generation, byte offset of the record's
+    /// first byte)` — or `None`. Matches on `agentId` (falling back to `key`,
+    /// for records that omit `agentId`).
     ///
     /// Does NOT advance the cursor. A live StopFailure uses the result as a
     /// terminal watermark: only starts at or before that position are the
     /// failure's own settled attempt; a start at a later offset is a genuine
     /// retry and must resurrect the member even when both fold in the same
-    /// poll. Uses the SAME completeness rule as [`Self::poll`] (a trailing
-    /// newline-free segment is not a record yet).
+    /// poll.
+    ///
+    /// Completeness agrees with [`Self::poll`] on every terminated record, but
+    /// it ALSO recognises a trailing newline-free segment that already parses
+    /// as a complete `started`. Such a record is on disk in full — only its
+    /// terminating newline is missing — and a StopFailure arriving in that
+    /// window settles that attempt. [`Self::poll`] consumes nothing on the
+    /// first polls, so the caller must keep the watermark armed through those
+    /// empty polls until the record (completed by its newline) is actually
+    /// consumed. Skipping the unterminated segment here would leave that
+    /// ordering unprotected.
     pub fn unread_start_position(&self, agent_id: &str) -> Result<Option<(u64, u64)>, Error> {
         let mut file = match File::open(&self.path) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -205,14 +214,7 @@ impl FileTail {
         file.read_to_end(&mut rest)?;
         let mut newest: Option<(u64, u64)> = None;
         let mut start = 0usize;
-        for (i, byte) in rest.iter().enumerate() {
-            if *byte != b'\n' {
-                continue;
-            }
-            let mut line = &rest[start..i];
-            if let Some(without_cr) = line.strip_suffix(b"\r") {
-                line = without_cr;
-            }
+        let record_start = |line: &[u8], at: usize, newest: &mut Option<(u64, u64)>| {
             if !line.is_empty()
                 && let Ok(value) = serde_json::from_slice::<serde_json::Value>(line)
                 && value.get("type").and_then(serde_json::Value::as_str) == Some("started")
@@ -222,9 +224,28 @@ impl FileTail {
                     .or_else(|| value.get("key").and_then(serde_json::Value::as_str))
                     .is_some_and(|id| id == agent_id)
             {
-                newest = Some((self.generation, self.offset + start as u64));
+                *newest = Some((self.generation, self.offset + at as u64));
             }
+        };
+        for (i, byte) in rest.iter().enumerate() {
+            if *byte != b'\n' {
+                continue;
+            }
+            let mut line = &rest[start..i];
+            if let Some(without_cr) = line.strip_suffix(b"\r") {
+                line = without_cr;
+            }
+            record_start(line, start, &mut newest);
             start = i + 1;
+        }
+        // Trailing newline-free segment: a complete record awaiting only its
+        // terminating newline (see the method docs).
+        if start < rest.len() {
+            let mut line = &rest[start..];
+            if let Some(without_cr) = line.strip_suffix(b"\r") {
+                line = without_cr;
+            }
+            record_start(line, start, &mut newest);
         }
         Ok(newest)
     }

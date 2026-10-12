@@ -20,10 +20,6 @@ mod config;
 mod devices;
 mod error;
 mod fleet;
-/// Test-only gate fail_rpc writer (r11 item 4 regression).
-#[doc(hidden)]
-#[cfg(any(test, feature = "test-faults"))]
-pub use gatequeue::test_fail_gate_rpc;
 mod gatequeue;
 mod host_dirs;
 mod host_files;

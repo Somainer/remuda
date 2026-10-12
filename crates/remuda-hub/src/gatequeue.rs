@@ -997,32 +997,6 @@ async fn fail_rpc(state: &AppState, job_id: &str, expected_generation: u32, erro
     fail_rpc_inner(state, job_id, expected_generation, error).await
 }
 
-/// Test-only direct entry for fail_rpc's state write (item 4 regression).
-/// Drives the same mutation a failed gate.run RPC would, scoped to the
-/// dispatch generation.
-#[cfg(any(test, feature = "test-faults"))]
-pub async fn test_fail_gate_rpc(store: &crate::store::Store, job_id: &str, generation: u32) {
-    let message = "test RPC failure".to_owned();
-    let _ = store
-        .mutate_gate_job(job_id, move |row| {
-            if row.state != GateJobState::Running && row.state != GateJobState::Canceling {
-                return None;
-            }
-            if row.attempts != generation {
-                return None;
-            }
-            if row.home_land_in_flight {
-                return None;
-            }
-            row.state = GateJobState::Failed;
-            row.finished_at = Some(now_ts());
-            row.reason = Some(message.lines().next().unwrap_or(&message).to_owned());
-            row.error = Some(message.clone());
-            Some(())
-        })
-        .await;
-}
-
 async fn fail_rpc_inner(state: &AppState, job_id: &str, expected_generation: u32, error: &Value) {
     let message = error
         .get("message")

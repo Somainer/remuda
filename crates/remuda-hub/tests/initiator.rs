@@ -63,6 +63,9 @@ struct GateRunHook {
     released: Arc<AtomicBool>,
     release: Arc<Notify>,
     result: Arc<std::sync::Mutex<Value>>,
+    /// When true the reply is a JSON-RPC ERROR (driving the Hub's real
+    /// dispatch error callback), not a result.
+    error: Arc<AtomicBool>,
 }
 
 /// A cloneable one-shot arrival latch: `signal()` stores a permit that a
@@ -83,7 +86,14 @@ impl GateRunHook {
             released: Arc::new(AtomicBool::new(false)),
             release: Arc::new(Notify::new()),
             result: Arc::new(std::sync::Mutex::new(result)),
+            error: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Make this hook answer gate.run with a JSON-RPC error frame, exercising
+    /// the Hub dispatch callback's real error arm.
+    fn reply_error(self: &Arc<Self>) {
+        self.error.store(true, Ordering::SeqCst);
     }
 
     /// Latch arrival (idempotent: only the first frame fires it).
@@ -179,22 +189,27 @@ async fn service_inbound(
         return;
     }
     // A scripted, parkable gate.run: answer with the hook's canned verdict
-    // (and withhold it until released) instead of the generic ack.
+    // (and withhold it until released). The hook is single-use (taken per
+    // frame), so a requeue's attempt 2 can be scripted independently.
     if method == "gate.run"
-        && let Some(hook) = gate_run.lock().await.clone()
+        && let Some(hook) = gate_run.lock().await.take()
     {
         hook.mark_arrived();
         // Background reply so the read loop keeps servicing other
         // frames (a node->Hub gate.event) while this RPC is held.
         let out = out.clone();
-        let rpc_id = frame["id"].clone();
         tokio::spawn(async move {
             while !hook.released.load(Ordering::SeqCst) {
                 hook.release.notified().await;
             }
-            let result = hook.result();
-            let value = json!({"jsonrpc":"2.0","id":rpc_id,"result":result});
+            let rpc_id = frame["id"].clone();
             let mut sink = out.lock().await;
+            let value = if hook.error.load(Ordering::SeqCst) {
+                json!({"jsonrpc":"2.0","id":rpc_id,
+                       "error":{"code":-32001,"message":"lane host RPC failed (test)"}})
+            } else {
+                json!({"jsonrpc":"2.0","id":rpc_id,"result":hook.result()})
+            };
             let _ = sink.send(Message::Text(value.to_string().into())).await;
         });
         return;
@@ -1463,6 +1478,46 @@ async fn queued_job(ctx: &Ctx) -> String {
         .await;
     assert_eq!(status, 200, "{job}");
     job["id"].as_str().unwrap().to_owned()
+}
+
+/// Enqueue a LAND verify job; a base-moved verdict genuinely requeues only a
+/// land (a verify has no CAS to lose), so generation-gate requeue tests use it.
+async fn queued_land_job(ctx: &Ctx) -> String {
+    let (status, job) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":"wt/gate/requeue-land","mode":"land"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{job}");
+    job["id"].as_str().unwrap().to_owned()
+}
+
+/// Drive a GENUINE base-moved requeue through the production path (no raw
+/// SQL): after attempt 1 is claimed, deliver its base-moved verdict through
+/// the real `apply_result` writer (Running → Queued), then claim attempt 2.
+async fn genuine_requeue_to_attempt_two(ctx: &Ctx, job_id: &str) {
+    ctx.hub
+        .test_apply_gate_result(
+            job_id,
+            json!({
+                "jobId": job_id,
+                "generation": 1,
+                "status": "base-moved",
+                "currentMainSha": "0123456789abcdef0123456789abcdef01234567",
+            }),
+        )
+        .await
+        .unwrap();
+    let claimed = ctx
+        .hub
+        .test_claim_gate_job(job_id, "lane1", &ctx.host)
+        .await
+        .unwrap();
+    assert!(claimed.is_some(), "scheduler must claim requeued attempt 2");
+    let doc = ctx.hub.test_get_gate_job(job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("running"), "reclaim: {doc}");
+    assert_eq!(doc["attempts"], json!(2), "reclaim: {doc}");
 }
 
 #[tokio::test]
@@ -3299,41 +3354,62 @@ async fn a_stale_attempts_verdict_is_dropped_after_a_requeue() {
     );
 }
 
-/// r11 item 4: attempt 1's RPC error/timeout must not fail the running
-/// attempt 2 after a genuine base-moved requeue.
+/// r11 item 4 (r12 item 9): attempt 1's gate.run RPC failure must not fail the
+/// running attempt 2 after a genuine base-moved requeue — driven through the
+/// REAL dispatch error callback (the fake Node answers the gate.run RPC with
+/// a JSON-RPC error), not a store-copy test seam.
 #[tokio::test]
 async fn an_rpc_failure_for_attempt_one_does_not_fail_running_attempt_two() {
-    let (ctx, _node) = Ctx::boot().await.unwrap();
-    let job_id = queued_job(&ctx).await;
-    // claim attempt 1, requeue (base-moved), claim attempt 2 (running).
-    let _ = ctx
-        .hub
-        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
-        .await
-        .unwrap();
-    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
-    db.execute(
-        "UPDATE gate_jobs SET state='queued',
-            doc_json = json_set(json_set(doc_json,'$.state','queued'),'$.startedAt',NULL)
-          WHERE id = ?1",
-        rusqlite::params![job_id],
-    )
-    .unwrap();
-    drop(db);
-    let _ = ctx
-        .hub
-        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
-        .await
-        .unwrap();
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+
+    // Attempt 1's gate.run is parked at the Node (its RPC reply withheld).
+    let hook1 = node
+        .arm_gate_run(json!({ "jobId": "placeholder", "status": "failed" }))
+        .await;
+    let (status, enqueued) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":"wt/gate/stale-rpc","mode":"land"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{enqueued}");
+    let job_id = enqueued["id"].as_str().unwrap().to_owned();
+    hook1.wait_arrived().await;
     assert_eq!(
-        ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap()["attempts"],
-        json!(2)
+        ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap()["state"],
+        json!("running"),
+        "attempt 1 dispatched and parked"
     );
 
-    // Attempt 1's RPC error arrives (as the stale dispatch's call failed).
-    remuda_hub::test_fail_gate_rpc(ctx.store(), &job_id, 1).await;
+    // Attempt 1 requeues via its real finished-event base-moved verdict (the
+    // gate.run RPC itself is still parked — the dual-path ordering).
+    node.send_raw(json!({
+        "jsonrpc": "2.0", "method": "gate.event",
+        "params": {
+            "jobId": job_id, "generation": 1, "kind": "finished",
+            "result": {
+                "jobId": job_id, "generation": 1, "status": "base-moved",
+                "currentMainSha": "0123456789abcdef0123456789abcdef01234567",
+            },
+        },
+    }));
 
-    // Attempt 2 stays running; the stale failure did not fail it.
+    // The scheduler claims attempt 2 and dispatches a fresh gate.run. Script
+    // it (parked, will answer with an RPC error) before attempt 2's frame.
+    let hook2 = node
+        .arm_gate_run(json!({ "jobId": "placeholder", "status": "failed" }))
+        .await;
+    hook2.wait_arrived().await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["attempts"], json!(2), "attempt 2 dispatched: {doc}");
+    assert_eq!(doc["state"], json!("running"), "{doc}");
+
+    // Attempt 1's parked gate.run now answers with a JSON-RPC error. It is the
+    // stale dispatch's callback; its failure must NOT fail attempt 2.
+    hook1.reply_error();
+    hook1.release();
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
     assert_eq!(
         doc["state"],
@@ -3341,14 +3417,17 @@ async fn an_rpc_failure_for_attempt_one_does_not_fail_running_attempt_two() {
         "stale attempt-1 RPC failure must not fail attempt 2: {doc}"
     );
 
-    // The CURRENT (attempt 2) failure does fail it.
-    remuda_hub::test_fail_gate_rpc(ctx.store(), &job_id, 2).await;
-    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-    assert_eq!(
-        doc["state"],
-        json!("failed"),
-        "current-attempt failure must fail: {doc}"
-    );
+    // The CURRENT (attempt 2) gate.run RPC error does fail it.
+    hook2.reply_error();
+    hook2.release();
+    for _ in 0..100 {
+        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+        if doc["state"] == json!("failed") {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("current-attempt gate.run RPC error must fail the job");
 }
 
 /// r11 item 5: a step event from the OLD attempt must not overwrite step

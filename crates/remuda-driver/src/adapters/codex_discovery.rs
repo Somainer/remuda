@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use time::OffsetDateTime;
 
 #[derive(Default)]
@@ -29,11 +29,6 @@ struct WindowEntry {
     count: u32,
     /// True while another window overlaps (count >= 2).
     tainted: bool,
-    /// r8 item 1 tier c: STICKY — once a second window has been open at any
-    /// point in this epoch, prompt text can never attribute a rollout here
-    /// (another instance closing does not make the survivor "sole"). Cleared
-    /// only when the epoch ends (the last window closes and the entry drops).
-    ever_shared: bool,
 }
 
 static OPEN_WINDOWS: LazyLock<Mutex<HashMap<PathBuf, WindowEntry>>> =
@@ -60,6 +55,139 @@ static CLAIMED_SESSIONS: LazyLock<Mutex<HashMap<(PathBuf, String), String>>> =
 /// unreadable path keeps its lexical form).
 fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+// ---------------------------------------------------------------------------
+// Instance LIFETIMES (c-usagefu r9 item 1)
+// ---------------------------------------------------------------------------
+
+/// How long a CLOSED instance's lifetime is retained after close. Prompt-only
+/// attribution windows span minutes ([`INPUT_MATCH_WINDOW`]); a record older
+/// than this can no longer overlap any plausible discovery decision, so it is
+/// pruned on the next registration in that cwd. The bound exists because the
+/// registry lives for the whole Node process.
+const LIFETIME_RETENTION: time::Duration = time::Duration::hours(1);
+
+/// One driver launch's live interval in a cwd.
+struct InstanceLifetime {
+    /// Sampled at the agent.start boundary, BEFORE the child is spawned.
+    launched_at: OffsetDateTime,
+    /// None while the instance is live; Some(close) after it closed. The
+    /// record is RETAINED past close (independent of binding) so a later
+    /// launch cannot become the "sole live instance" over a window a
+    /// since-closed instance actually shared.
+    closed_at: Option<OffsetDateTime>,
+}
+
+/// cwd -> (instance key -> lifetime).
+static INSTANCE_LIFETIMES: LazyLock<Mutex<HashMap<PathBuf, HashMap<String, InstanceLifetime>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// RAII owner of one registered instance lifetime. The interval opens in
+/// [`begin_lifetime`] (production: before the agent process is launched) and
+/// is marked closed when the LAST clone drops — the live driver slot and the
+/// file adapter each hold one. Closing is independent of bind: a bound
+/// instance stays live for the whole driver run.
+pub(crate) struct LifetimeGuard {
+    inner: Arc<LifetimeGuardInner>,
+}
+
+struct LifetimeGuardInner {
+    key: PathBuf,
+    owner: String,
+    /// Test clock: when set, Drop records this as the close time instead of
+    /// wall-clock now, so regressions can place launches/closes on a
+    /// deterministic timeline.
+    #[cfg(test)]
+    closed_at: std::sync::Mutex<Option<OffsetDateTime>>,
+}
+
+impl Clone for LifetimeGuard {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl Drop for LifetimeGuardInner {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        let at = self
+            .closed_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(OffsetDateTime::now_utc);
+        #[cfg(not(test))]
+        let at = OffsetDateTime::now_utc();
+        let mut map = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
+        if let Some(by_instance) = map.get_mut(&self.key)
+            && let Some(lifetime) = by_instance.get_mut(&self.owner)
+        {
+            lifetime.closed_at = Some(at);
+        }
+    }
+}
+
+/// Register instance `owner` as launching in `cwd` at `launched_at` and
+/// return the lifetime guard. MUST be called before the agent process is
+/// spawned (the agent.start boundary), so an instance that launches/closes in
+/// the gap before the file adapter is constructed is still recorded.
+///
+/// Re-registering the same `(cwd, owner)` (a close→resume re-spawn with the
+/// stable instance key) reopens the interval while keeping the EARLIEST
+/// launch floor; it never erases an earlier segment.
+pub(crate) fn begin_lifetime(
+    cwd: &Path,
+    owner: &str,
+    launched_at: OffsetDateTime,
+) -> LifetimeGuard {
+    let key = canonical(cwd);
+    {
+        let cutoff = OffsetDateTime::now_utc() - LIFETIME_RETENTION;
+        let mut map = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
+        let by_instance = map.entry(key.clone()).or_default();
+        // Bound retained history: drop closed intervals that can no longer
+        // overlap a current decision. A live interval (closed_at None) is
+        // never pruned.
+        by_instance.retain(|_, lifetime| lifetime.closed_at.is_none_or(|closed| closed >= cutoff));
+        by_instance
+            .entry(owner.to_owned())
+            .and_modify(|lifetime| {
+                lifetime.launched_at = lifetime.launched_at.min(launched_at);
+                lifetime.closed_at = None;
+            })
+            .or_insert(InstanceLifetime {
+                launched_at,
+                closed_at: None,
+            });
+    }
+    LifetimeGuard {
+        inner: Arc::new(LifetimeGuardInner {
+            key,
+            owner: owner.to_owned(),
+            #[cfg(test)]
+            closed_at: std::sync::Mutex::new(None),
+        }),
+    }
+}
+
+/// Test seam: record this guard's close at `at` instead of wall-clock time,
+/// so a regression can place the close deterministically on its timeline.
+#[cfg(test)]
+pub(crate) trait LifetimeGuardClock {
+    fn close_lifetime_at(&self, at: OffsetDateTime);
+}
+
+#[cfg(test)]
+impl LifetimeGuardClock for LifetimeGuard {
+    fn close_lifetime_at(&self, at: OffsetDateTime) {
+        *self
+            .inner
+            .closed_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(at);
+    }
 }
 
 /// Whether the rollout is currently claimed by a DIFFERENT instance.
@@ -174,12 +302,10 @@ impl DiscoveryWindow {
                 .and_modify(|entry| {
                     entry.count += 1;
                     entry.tainted = true;
-                    entry.ever_shared = true;
                 })
                 .or_insert(WindowEntry {
                     count: 1,
                     tainted: false,
-                    ever_shared: false,
                 });
             OPEN_DISCOVERERS
                 .lock()
@@ -368,11 +494,19 @@ pub(crate) fn record_input_at(cwd: &Path, owner: &str, text: &str, at: OffsetDat
     put_input(cwd, owner, text, at);
 }
 
-/// r8 item 1 TIER C: prompt text authorizes a rollout ONLY when `owner` has
-/// been the single discoverer in `cwd` for the whole window epoch — the
-/// `ever_shared` sticky flag means a second instance that was live at ANY
-/// point (even if it later closed) disables prompt attribution for the
-/// epoch. Repeated sends by the same owner do not relax it.
+/// r9 item 1 TIER C: prompt text authorizes a rollout ONLY when ALL hold:
+///
+/// 1. `owner` registered an instance lifetime in `cwd`;
+/// 2. the rollout was created AT OR AFTER the owner's ACTUAL launch floor —
+///    the locator's 5 s pre-launch slack is NOT available to prompt-only
+///    attribution (only the hook and process-ownership tiers may take an
+///    in-slack candidate);
+/// 3. no OTHER instance was live in that cwd at any instant over the whole
+///    interval [owner launch, rollout creation]. A closed instance's
+///    retained interval counts, so an owner closing before the candidate is
+///    judged never makes the survivor "sole";
+/// 4. the rollout's first prompt is an input THIS owner dispatched, in its
+///    send-time window.
 pub(crate) fn sole_instance_matches(
     cwd: &Path,
     owner: &str,
@@ -384,23 +518,35 @@ pub(crate) fn sole_instance_matches(
     if wanted.is_empty() {
         return false;
     }
-    let windows = OPEN_WINDOWS.lock().expect("codex discovery windows");
-    let discoverers = OPEN_DISCOVERERS.lock().expect("open discoverers");
-    let inputs = SENT_INPUTS.lock().expect("codex sent inputs");
-    // Owner must currently be a live discoverer AND its epoch never shared.
-    let sole_epoch = windows
-        .get(&cwd_key)
-        .is_some_and(|entry| !entry.ever_shared)
-        && discoverers
-            .get(&cwd_key)
-            .is_some_and(|set| set.contains(owner));
-    drop((windows, discoverers));
-    if !sole_epoch {
+    let lifetimes = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
+    let Some(by_instance) = lifetimes.get(&cwd_key) else {
+        return false;
+    };
+    let Some(own) = by_instance.get(owner) else {
+        return false;
+    };
+    // Strict launch floor: no pre-launch slack for prompt attribution.
+    if session_started < own.launched_at {
         return false;
     }
+    // Sole-live proof over [launch, creation]. Another instance overlaps when
+    // it launched at or before creation and was still live at the owner's
+    // launch (closed exactly at the boundary is not an overlap).
+    let shared_window = by_instance.iter().any(|(other, lifetime)| {
+        other != owner
+            && lifetime.launched_at <= session_started
+            && lifetime
+                .closed_at
+                .is_none_or(|closed| closed > own.launched_at)
+    });
+    if shared_window {
+        return false;
+    }
+    drop(lifetimes);
+    let inputs = SENT_INPUTS.lock().expect("codex sent inputs");
     inputs
         .get(&cwd_key)
-        .and_then(|by_instance| by_instance.get(owner))
+        .and_then(|by_owner| by_owner.get(owner))
         .is_some_and(|list| {
             list.iter().any(|input| {
                 input.text == wanted

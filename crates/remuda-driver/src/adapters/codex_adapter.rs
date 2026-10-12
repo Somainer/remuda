@@ -98,6 +98,12 @@ pub struct CodexAdapter {
     /// Process-wide same-cwd launch window for a driver launch. None for a
     /// promoted/attach adapter (no launch floor); released on bind/give-up.
     window: Option<crate::adapters::codex_discovery::DiscoveryWindow>,
+    /// r9 item 1: the instance's live interval in its cwd, registered BEFORE
+    /// launch (production) and retained through close independent of binding.
+    /// Clones are held by the live driver slot and by this adapter; the
+    /// interval closes when the last one drops. None for a promoted/attach
+    /// adapter and for non-codex launches.
+    lifetime: Option<crate::adapters::codex_discovery::LifetimeGuard>,
     /// r8 item 1 tier b: process-tree ownership probe + live agent roots.
     ownership: Option<std::sync::Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>>,
     agent_pid_roots: Option<std::sync::Arc<std::sync::Mutex<Vec<u32>>>>,
@@ -132,6 +138,7 @@ impl CodexAdapter {
             fallback_model: None,
             discovery_gave_up: false,
             window: None,
+            lifetime: None,
             ownership: None,
             agent_pid_roots: None,
             lifecycle_owner: uuid::Uuid::new_v4().to_string(),
@@ -142,19 +149,54 @@ impl CodexAdapter {
     /// rollout claims (c-usagefu r6 item 1). Opens the discovery window for a
     /// driver-launched adapter so live cross-owner exclusivity works (r7
     /// item 1).
+    ///
+    /// r9 item 1: also registers the instance's live interval (begins at the
+    /// adapter's launch floor). Production registers it BEFORE spawning the
+    /// agent and attaches the existing guard through
+    /// [`Self::with_lifetime`]; in that case this does not open a second
+    /// interval.
     #[must_use]
     pub fn with_instance_key(mut self, key: Option<String>) -> Self {
         if let Some(ref key) = key
             && self.window.is_none()
-            && self.home.launched_at.is_some()
+            && let Some(launched_at) = self.home.launched_at
         {
             self.window = Some(crate::adapters::codex_discovery::DiscoveryWindow::open(
                 &self.home.cwd,
                 key.clone(),
             ));
+            if self.lifetime.is_none() {
+                self.lifetime = Some(crate::adapters::codex_discovery::begin_lifetime(
+                    &self.home.cwd,
+                    key,
+                    launched_at,
+                ));
+            }
         }
         self.instance_key = key;
         self
+    }
+
+    /// Attach the lifetime guard registered BEFORE this agent was launched
+    /// (generic-pty, r9 item 1). Must be applied before
+    /// [`Self::with_instance_key`] so the pre-launch interval floor is kept.
+    #[must_use]
+    pub(crate) fn with_lifetime(
+        mut self,
+        lifetime: crate::adapters::codex_discovery::LifetimeGuard,
+    ) -> Self {
+        self.lifetime = Some(lifetime);
+        self
+    }
+
+    /// Test seam: record this instance's close at `at` when the adapter
+    /// drops, instead of wall-clock time (deterministic lifetime overlaps).
+    #[cfg(test)]
+    pub(crate) fn close_lifetime_at(&self, at: time::OffsetDateTime) {
+        use crate::adapters::codex_discovery::LifetimeGuardClock as _;
+        if let Some(lifetime) = &self.lifetime {
+            lifetime.close_lifetime_at(at);
+        }
     }
 
     /// Attach the process-tree ownership evidence for tier-b discovery (r8
@@ -359,8 +401,12 @@ impl CodexAdapter {
                 {
                     return true;
                 }
-                // TIER C: prompt text ONLY when this has been the sole live
-                // instance for the entire epoch. Anything else waits.
+                // TIER C (r9 item 1): prompt text ONLY when the rollout was
+                // created at/after this instance's ACTUAL launch (no
+                // pre-launch slack) and this has been the sole live instance
+                // in the cwd over the whole [launch, creation] interval —
+                // including since-closed instances whose lifetime the
+                // registry retained. Anything else waits.
                 crate::adapters::codex_discovery::sole_instance_matches(
                     &cwd,
                     &owner,

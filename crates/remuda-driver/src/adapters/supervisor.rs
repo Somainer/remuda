@@ -69,6 +69,11 @@ pub struct AdapterCtx {
     /// c-usagefu r8 item 1 tier b: live agent pid roots refreshed by the
     /// driver while the pane is live.
     pub agent_pid_roots: Option<std::sync::Arc<std::sync::Mutex<Vec<u32>>>>,
+    /// c-usagefu r9 item 1: instance lifetime registered BEFORE the agent
+    /// launch. The codex adapter holds a clone so its interval stays open
+    /// through bind and is closed with the driver. `None` for promoted /
+    /// hook-confirmed / non-codex launches.
+    pub(crate) lifetime: Option<crate::adapters::codex_discovery::LifetimeGuard>,
 }
 
 /// Handle to a running adapter task. Dropping/aborting it stops the poll loop.
@@ -143,12 +148,17 @@ pub fn stamp_ctx(
 /// watcher without a second spawn site.
 pub fn spawn_file_adapters(
     kind: AgentKind,
-    ctx: AdapterCtx,
+    mut ctx: AdapterCtx,
 ) -> DriverResult<Option<AdapterHandle>> {
     match kind {
         AgentKind::Codex => {
-            let mut adapter =
-                CodexAdapter::new(ctx.home.clone()).with_instance_key(ctx.instance_key.clone());
+            let mut adapter = CodexAdapter::new(ctx.home.clone());
+            // r9 item 1: attach the pre-launch lifetime BEFORE the instance
+            // key so its floor is not re-registered at adapter construction.
+            if let Some(lifetime) = ctx.lifetime.take() {
+                adapter = adapter.with_lifetime(lifetime);
+            }
+            let mut adapter = adapter.with_instance_key(ctx.instance_key.clone());
             if let Some(probe) = &ctx.ownership {
                 adapter = adapter.with_ownership(probe.clone(), ctx.agent_pid_roots.clone());
             }

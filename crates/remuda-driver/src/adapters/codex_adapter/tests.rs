@@ -655,7 +655,12 @@ fn fake_ownership(
 fn a_bound_first_instance_releases_its_window_and_a_later_instance_binds_its_own() {
     // r5 item 1: A binds at 10:01 and its window must not linger; B launched
     // in the same cwd later is never tainted, and A's claimed rollout is
-    // invisible to B, so B binds B's own file.
+    // excluded for B, so B binds B's own file.
+    //
+    // r9 item 1: A stays ALIVE for the whole test, so prompt text alone can
+    // no longer attribute B's rollout (A is another live instance in the
+    // cwd) — B binds its own file through the process-ownership tier, exactly
+    // as the generic-pty wiring does on Linux.
     let home = tempfile::tempdir().unwrap();
     let cwd = "/projects/r5-sequential";
     let now = OffsetDateTime::now_utc();
@@ -681,9 +686,13 @@ fn a_bound_first_instance_releases_its_window_and_a_later_instance_binds_its_own
         "binding releases the discovery window immediately"
     );
 
-    // B launches later with a fresh floor after A's session started.
+    // B launches later with a fresh floor after A's session started. A is
+    // still live, so prompt-only attribution is off: B's process probe
+    // decides.
     let floor_b = now - time::Duration::seconds(10);
-    let mut b = launch_adapter_keyed(home.path(), cwd, floor_b, INST_B);
+    let (probe_b, roots_b) = fake_ownership(8002);
+    let mut b =
+        launch_with_fake_ownership(home.path(), cwd, floor_b, INST_B, 8002, &probe_b, &roots_b);
     assert!(
         !b.window.as_ref().is_some_and(|window| window.overlapping()),
         "A is no longer discovering: B opens clean"
@@ -694,8 +703,8 @@ fn a_bound_first_instance_releases_its_window_and_a_later_instance_binds_its_own
     );
     assert!(b.binding().is_none());
 
-    // B's own lazily-created rollout appears after B's prompt; unique and
-    // unclaimed -> binds.
+    // B's own lazily-created rollout appears after B's prompt; unique,
+    // unclaimed, and held open by B's agent process -> binds.
     send_fixture_prompt(
         Path::new(cwd),
         INST_B,
@@ -704,6 +713,13 @@ fn a_bound_first_instance_releases_its_window_and_a_later_instance_binds_its_own
     );
     let later = (now - time::Duration::seconds(2)).format(&Rfc3339).unwrap();
     write_rollout(home.path(), "2026/09/14", "B-thread", cwd, &later);
+    probe_b.hold(
+        &home
+            .path()
+            .join("sessions/2026/09/14")
+            .join("rollout-B-thread.jsonl"),
+        8002,
+    );
     assert!(b.discover().unwrap());
     assert_eq!(
         b.binding().map(|binding| binding.session_id.as_str()),
@@ -923,9 +939,11 @@ fn a_strictly_post_launch_match_hydrates_its_own_first_turn_from_byte_zero() {
 #[test]
 fn an_in_slack_match_tails_from_end_and_skips_pre_bind_records() {
     // A session started INSIDE the clock slack (session_meta.timestamp before
-    // the strict floor) could be a crash-looped previous instance: tail from
-    // EOF so its records never replay, even though it is an acceptable
-    // candidate.
+    // the strict floor) could be a crash-looped previous instance. r9 item 1:
+    // prompt text can NEVER attribute an in-slack candidate — the 5 s
+    // pre-launch slack is reserved for the hook and process-ownership tiers.
+    // With process proof the adapter binds the in-slack file and tails from
+    // EOF, so its pre-bind records never replay.
     let home = tempfile::tempdir().unwrap();
     let cwd = "/projects/r5-slack-tail";
     let now = OffsetDateTime::now_utc();
@@ -957,8 +975,25 @@ fn an_in_slack_match_tails_from_end_and_skips_pre_bind_records() {
     let mut adapter = launch_adapter(home.path(), cwd, floor);
     send_fixture_prompt(Path::new(cwd), INST_A, "fixture driver prompt", now);
     assert!(
+        !adapter.discover().unwrap(),
+        "prompt text never attributes a pre-launch (in-slack) file"
+    );
+    assert!(
+        adapter.binding().is_none(),
+        "the in-slack file stays unbound pending stronger evidence"
+    );
+
+    // The process tier proves ownership of the in-slack file: it now binds,
+    // strictly=false, so the tail starts at EOF.
+    let (probe, roots) = fake_ownership(9001);
+    probe.hold(&path, 9001);
+    let mut adapter = adapter.with_ownership(
+        probe.clone() as std::sync::Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>,
+        Some(roots),
+    );
+    assert!(
         adapter.discover().unwrap(),
-        "the in-slack file still matches"
+        "process ownership accepts the in-slack candidate"
     );
     let pre_bind = adapter.poll().unwrap();
     assert!(
@@ -1195,6 +1230,92 @@ fn a_closed_owner_file_is_never_rebound_by_idle_b() {
         );
         assert!(b.binding().is_none());
     }
+}
+
+// c-usagefu r9 item 1: lifetime intervals, not discoverer registration ----
+
+#[test]
+fn a_rollout_created_by_an_instance_closed_before_b_launches_stays_unbound() {
+    // The exact r9 review sequence:
+    //   A sends "continue", creates rollout F at t0, and CLOSES before ever
+    //   claiming it;
+    //   B launches in the same cwd at t0+2s and sends "continue" too.
+    // F passes the locator's 5 s launch slack (B's floor is t0+2) and the
+    // prompt pre-send slack, so r8 prompt attribution let B steal A's file.
+    // r9 item 1: prompt-only attribution requires the file created at/after
+    // B's ACTUAL launch — F never binds to B. B's OWN later file G (B sole
+    // live over [launch, creation]) binds normally.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r9-item1-closed-before-launch";
+    let now = OffsetDateTime::now_utc();
+    let t0 = now - time::Duration::seconds(3);
+
+    // A launches, sends "continue", creates F at t0, never scans, then
+    // closes at t0+1 (before B launches at t0+2).
+    let a = launch_adapter_keyed(home.path(), cwd, t0, INST_A);
+    send_fixture_prompt(Path::new(cwd), INST_A, "continue", t0);
+    write_rollout_prompt_at(
+        home.path(),
+        "F-closed",
+        cwd,
+        &t0.format(&Rfc3339).unwrap(),
+        "continue",
+    );
+    let f_path = home
+        .path()
+        .join("sessions/2026/09/14")
+        .join("rollout-F-closed.jsonl");
+    a.close_lifetime_at(t0 + time::Duration::seconds(1));
+    drop(a);
+    assert_eq!(
+        crate::adapters::codex_discovery::claimed_owner_of(&f_path),
+        None,
+        "A closed before claiming F: F is unclaimed"
+    );
+
+    // B launches at t0+2 and sends the identical prompt.
+    let b_floor = t0 + time::Duration::seconds(2);
+    let mut b = launch_adapter_keyed(home.path(), cwd, b_floor, INST_B);
+    send_fixture_prompt(Path::new(cwd), INST_B, "continue", now);
+    for _ in 0..3 {
+        assert!(
+            !b.discover().unwrap(),
+            "F was created before B launched: prompt text must never bind it"
+        );
+        assert!(
+            b.binding().is_none(),
+            "F stays unbound for B despite both slacks"
+        );
+        assert_eq!(
+            crate::adapters::codex_discovery::claimed_owner_of(&f_path),
+            None,
+            "the rejected scans leave F unclaimed"
+        );
+    }
+
+    // B's own session G is created while B is the sole live instance in the
+    // cwd (A closed before B launched): prompt attribution binds G.
+    let g_at = b_floor + time::Duration::seconds(1);
+    write_rollout_prompt_at(
+        home.path(),
+        "G-own",
+        cwd,
+        &g_at.format(&Rfc3339).unwrap(),
+        "continue",
+    );
+    assert!(
+        b.discover().unwrap(),
+        "B binds its own post-launch rollout G"
+    );
+    assert_eq!(
+        b.binding().map(|binding| binding.session_id.as_str()),
+        Some("G-own")
+    );
+    assert_eq!(
+        crate::adapters::codex_discovery::claimed_owner_of(&f_path),
+        None,
+        "F remains unclaimed"
+    );
 }
 
 /// A prompt sent to a GROK pane must not authorize a codex bind with the

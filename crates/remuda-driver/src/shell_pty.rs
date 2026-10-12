@@ -1440,6 +1440,8 @@ impl ShellPtyDriver {
             // carrier here (the shell_pty native path is hook-confirmed).
             ownership: None,
             agent_pid_roots: None,
+            // Hook-confirmed launch: no launch-floor lifetime interval.
+            lifetime: None,
         };
         crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx)
     }
@@ -1512,6 +1514,7 @@ impl ShellPtyDriver {
                         instance_key: None,
                         ownership: None,
                         agent_pid_roots: None,
+                        lifetime: None,
                     };
                     match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {
                         Ok(Some(started)) => handle = Some(started),

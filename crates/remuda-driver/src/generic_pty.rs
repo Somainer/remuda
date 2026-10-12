@@ -156,6 +156,10 @@ struct PtyLive {
     /// Per-launch identity shared with the codex file adapter's discovery
     /// (c-usagefu r6 item 1).
     instance_key: String,
+    /// r9 item 1: clone of the codex instance lifetime registered before
+    /// launch. Dropped with the live driver slot to close the interval; the
+    /// file adapter holds its own clone. None for non-codex launches.
+    _lifetime: Option<crate::adapters::codex_discovery::LifetimeGuard>,
     closed: bool,
     failed: Arc<AtomicBool>,
 }
@@ -382,7 +386,25 @@ impl GenericPtyDriver {
         // 0.154 writes session_meta lazily on the first turn, so a floor
         // sampled after settling could post-date the session's own timestamp
         // and the adapter would never bind (c-usagefu r4 item 2).
+        //
+        // c-usagefu r9 item 1: the per-launch instance key is minted HERE and
+        // — for codex — its lifetime is registered in the discovery registry
+        // BEFORE the child is spawned. An instance that launches/closes in
+        // the gap before the file adapter exists must still be on record, or
+        // a later same-cwd launch can become "sole" for a rollout the closed
+        // instance created. A launch failure drops the guard and records the
+        // close; success hands one clone to the adapter and keeps one here.
+        let instance_key = uuid::Uuid::new_v4().to_string();
         let launched_at = time::OffsetDateTime::now_utc();
+        let lifetime = if preset.id.eq_ignore_ascii_case("codex") {
+            Some(crate::adapters::codex_discovery::begin_lifetime(
+                std::path::Path::new(&recipe.cwd),
+                &instance_key,
+                launched_at,
+            ))
+        } else {
+            None
+        };
         let started = crate::pty_interaction::start_agent(
             &client,
             AgentStartParams {
@@ -514,9 +536,8 @@ impl GenericPtyDriver {
         // c-usagefu (d): tail the codex/grok session files from the pinned
         // native home so generic-pty dispatch gets usage/live observations the
         // way shell-pty launches do.
-        // Per-launch identity shared with the codex adapter discovery (r6
-        // item 1).
-        let instance_key = uuid::Uuid::new_v4().to_string();
+        // The per-launch instance key was minted before the agent launch
+        // (r9 item 1, above).
         // r8 item 1 tier b: process-tree ownership of the rollout file. The
         // pid roots are refreshed from the pane's foreground agent process
         // list while the pane is live; the codex adapter's /proc probe
@@ -544,6 +565,7 @@ impl GenericPtyDriver {
             &instance_key,
             ownership_probe,
             Arc::clone(&agent_pid_roots),
+            lifetime.clone(),
         );
         *self.inner.lock().await = Some(PtyLive {
             ctx,
@@ -559,6 +581,7 @@ impl GenericPtyDriver {
             matcher_task,
             adapter_handle,
             instance_key,
+            _lifetime: lifetime,
             pid_task,
             closed: false,
             failed,
@@ -603,6 +626,7 @@ impl GenericPtyDriver {
         instance_key: &str,
         ownership_probe: Option<Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>>,
         agent_pid_roots: Arc<std::sync::Mutex<Vec<u32>>>,
+        lifetime: Option<crate::adapters::codex_discovery::LifetimeGuard>,
     ) -> Option<crate::adapters::supervisor::AdapterHandle> {
         let kind = match spec.kind {
             AgentKind::Codex | AgentKind::Grok => spec.kind,
@@ -643,6 +667,7 @@ impl GenericPtyDriver {
             instance_key: Some(instance_key.to_owned()),
             ownership: ownership_probe,
             agent_pid_roots: Some(agent_pid_roots),
+            lifetime,
         };
         match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {
             Ok(Some(handle)) => Some(handle),

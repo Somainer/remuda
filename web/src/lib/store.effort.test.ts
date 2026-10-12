@@ -606,14 +606,23 @@ it("a workflows-disabled refusal is process-scoped and clears on a positive on r
   expect(hubStore.effortRefusalOf(ctx.instance.id)).toBeNull();
 });
 
-it("a degraded verdict clears a pending even when its word differs from the queued one", async () => {
+it("an id-less degraded verdict whose word differs from the queued one can never clear the pending (c-effortread r12 item 2)", async () => {
   const ctx = await startFollowing("queued-then-degrade", { state: "known", value: "working" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  // Driver reports queued on xhigh...
-  ctx.receive(configureLifecycle(2, "effort-queued:xhigh"));
+  // Driver reports queued on xhigh (a configure posted outside this UI, so
+  // the pending is synthesized from the id-less lifecycle)...
+  ctx.receive(configureLifecycle(2, "effort-queued:xhigh", ctx.instance.id, "2026-10-12T02:00:00.000Z"));
   expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
-  // ...then rejects a different word (max). The terminal verdict clears it.
-  ctx.receive(configureLifecycle(3, "effort-degraded:max:dialog-kept"));
+  const queuedId = hubStore.effortPendingOf(ctx.instance.id)?.requestId!;
+  // ...then an id-less rejection of a DIFFERENT word (max). The word alone
+  // cannot tell a stale verdict from this request's, so it neither clears nor
+  // rolls back; the request awaits its bounded reconciliation.
+  ctx.receive(configureLifecycle(3, "effort-degraded:max:dialog-kept", ctx.instance.id, "2026-10-12T02:01:00.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(queuedId);
+  // A fresh read-back matching the queued request is the one id-less path
+  // that settles it.
+  ctx.receive(effortEvent(4, "xhigh", true, "remuda", "2026-10-12T02:02:00.000Z"));
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
@@ -2401,6 +2410,74 @@ it("r11 item 3: an id-less genuine model/workflow refusal is recorded as environ
   expect(hubStore.effortRefusalOf(ctx.instance.id)).not.toBeNull();
   expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idB);
   expect(hubStore.effortOf(ctx.instance.id, "claude").ultracode).toBe(true);
+});
+
+it("r12 item 2: id-less applied/degraded lifecycles never clear an observer tab's lifecycle pending", async () => {
+  const ctx = await startFollowing("r12-item2-observer", { state: "known", value: "working" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  // Another client's configure, observed from THIS tab only over the wire:
+  // baseline flag ON, then an ID-LESS queued edge synthesizes a lifecycle
+  // pending for an OFF switch.
+  ctx.receive(effortEvent(2, "high", true, "slash", "2026-10-12T00:00:00.000Z"));
+  ctx.receive(
+    configureLifecycle(3, "effort-queued:ultracode off", ctx.instance.id, "2026-10-12T00:01:00.000Z"),
+  );
+  const queued = hubStore.effortPendingOf(ctx.instance.id);
+  expect(queued?.source).toBe("lifecycle");
+  expect(queued?.ultracode).toBe(false);
+  const queuedId = queued?.requestId!;
+
+  // An id-less APPLIED edge with the same word cannot name the request: it
+  // may be a replaced request A's stale verdict. It must not clear B's view;
+  // legacy success arrives only through the strict read-back fallback.
+  ctx.receive(
+    configureLifecycle(4, "effort-applied:ultracode off", ctx.instance.id, "2026-10-12T00:02:00.000Z"),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId, "id-less applied keeps B pending").toBe(queuedId);
+
+  // Id-less timeout and dialog-kept verdicts likewise neither delete nor roll
+  // back, and they raise no toast (the request is still in flight).
+  ctx.receive(
+    configureLifecycle(5, "effort-degraded:ultracode off:no-readback-within-window", ctx.instance.id, "2026-10-12T00:03:00.000Z"),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId, "id-less timeout keeps B pending").toBe(queuedId);
+  expect(toast, "an id-less timeout that cannot name the request raises no toast").not.toHaveBeenCalled();
+
+  ctx.receive(
+    configureLifecycle(6, "effort-degraded:ultracode off:dialog-kept", ctx.instance.id, "2026-10-12T00:04:00.000Z"),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId, "id-less dialog-kept keeps B pending").toBe(queuedId);
+  expect(toast).not.toHaveBeenCalled();
+
+  // The strict legacy read-back fallback (fresh echo, past both bounds, value
+  // matches the moved flag) is still the ONE id-less path that settles.
+  ctx.receive(
+    effortEvent(7, "high", false, "remuda", "2026-10-12T00:05:00.000Z", {
+      requested: { ultracode: false },
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id), "the strict read-back fallback settles B").toBeNull();
+});
+
+it("r12 item 2: an id-less genuine refusal is recorded but never clears an observer tab's lifecycle pending", async () => {
+  const ctx = await startFollowing("r12-item2-envrefuse", { state: "known", value: "working" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+
+  ctx.receive(effortEvent(2, "high", true, "slash", "2026-10-12T01:00:00.000Z"));
+  ctx.receive(
+    configureLifecycle(3, "effort-queued:ultracode off", ctx.instance.id, "2026-10-12T01:01:00.000Z"),
+  );
+  const queuedId = hubStore.effortPendingOf(ctx.instance.id)?.requestId!;
+
+  // Id-less environment evidence: the refusal IS recorded (switch disabled),
+  // but the lifecycle pending it cannot name survives.
+  ctx.receive(
+    configureLifecycle(4, "effort-degraded:ultracode off:ultracode-workflows-disabled", ctx.instance.id, "2026-10-12T01:02:00.000Z"),
+  );
+  expect(hubStore.effortRefusalOf(ctx.instance.id)).not.toBeNull();
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(queuedId);
 });
 
 it("r11 item 4: an older driver's clamped max echo (id-less) never settles queued C=max past the timestamp and effective-value bounds", async () => {

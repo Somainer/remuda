@@ -1626,13 +1626,11 @@ class HubStore {
     const edgeId =
       typeof edgeRequestId === "string" && edgeRequestId.trim() ? edgeRequestId : null;
     const current = this.state.effortPending[instanceId];
-    // Whether an edge belongs to the current pending: an id is authoritative;
-    // without one the strict word/value matcher decides — and, per
-    // c-effortread r11 item 3, an ID-LESS edge may close only a pending
-    // SYNTHESIZED FROM THE WIRE (a configure posted outside this UI). A
-    // client request's pending can be cleared/rolled back ONLY by an edge
-    // carrying its own id: an older driver's same-word degraded for a
-    // replaced request A must not delete the newer client request B.
+    // Whether a QUEUED edge belongs to the current pending: an id is
+    // authoritative; an id-less edge matches only a pending SYNTHESIZED FROM
+    // THE WIRE (a configure posted outside this UI) via the strict word/value
+    // matcher. c-effortread r12 item 2: applied/degraded edges never use this
+    // fallback — clearing and rollback require a non-empty matching id.
     const edgeBelongsTo = (pending: EffortPending, kind: EffortLifecycleKind): boolean => {
       if (edgeId !== null) return edgeId === pending.requestId;
       return (
@@ -1715,7 +1713,14 @@ class HubStore {
     }
     if (parsed.kind === "applied") {
       if (!current) return;
-      if (!edgeBelongsTo(current, "applied")) return;
+      // c-effortread r12 item 2: clearing a pending from an `applied`
+      // lifecycle requires a NON-EMPTY request id that names THIS pending,
+      // even when the pending was synthesized from a wire lifecycle — an
+      // observer tab's lifecycle pending is its view of another client's
+      // queued request B, and an id-less applied with the same word can be a
+      // replaced request A's stale verdict. Legacy success settles only
+      // through the strict read-back fallback (settleEffortAxes), never here.
+      if (edgeId === null || edgeId !== current.requestId) return;
       // The driver reported acceptance: the projected read-back is the source
       // of truth, but clear the indicator now rather than leaving it on 切换中
       // when the observation is delayed. The slider stays where requested.
@@ -1728,27 +1733,24 @@ class HubStore {
     // degraded
     const isUltraRefusal =
       parsed.reason === ULTRA_MODEL_REASON || parsed.reason === ULTRA_WORKFLOWS_REASON;
-    // Request identity (c-effortui r2 item 2, r10 item 3): does this verdict
-    // name the CURRENT request?
+    // Request identity (c-effortui r2 item 2, r10 item 3, r12 item 2): does
+    // this verdict name the CURRENT request?
     //  - no pending at all: an unsolicited verdict from a configure posted
     //    outside the UI — it applies (refusal recorded, tier untouched).
     //  - an edge carrying a request id: it mutates the pending ONLY when the
     //    id is the current one. Request A's timeout/cancellation can never
     //    delete or roll back newer request B.
-    //  - id-less edge (older driver): the strict word matcher decides, except
-    //    a wire-owned pending whose driver journals a different rejected word.
+    //  - id-less edge (older driver): it can NEVER clear or roll back a
+    //    pending, not even a lifecycle-synthesized one (that pending is an
+    //    observer tab's view of a queued request B, and the same word cannot
+    //    distinguish B from a replaced A). Legacy success settles only through
+    //    the strict read-back fallback; the request otherwise stays pending
+    //    until its bounded reconciliation (r12 item 5).
     //  - genuine ultracode refusals (model/workflow) are environment evidence:
     //    they are recorded and disable the switch regardless, but mutate the
     //    pending ONLY when they are this request's verdict.
     const namesCurrent = current
-      ? edgeId !== null
-        ? edgeId === current.requestId
-        : // c-effortread r11 item 3: an id-less degraded verdict can clear a
-          // pending only when THIS tab never owned the request (a wire-owned
-          // pending). It can never delete or roll back a client request: the
-          // word alone cannot tell a replaced request A from the newer B —
-          // not even when both are ultracode toggle words.
-          current.source === "lifecycle"
+      ? edgeId !== null && edgeId === current.requestId
       : false;
     const mutatesRequest = !current || namesCurrent;
     if (!mutatesRequest && !isUltraRefusal) return;

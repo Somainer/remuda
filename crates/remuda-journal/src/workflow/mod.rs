@@ -2037,6 +2037,53 @@ mod r9_cover_fold_tests {
     }
 
     #[test]
+    fn a_cover_retires_when_any_record_type_consumes_its_position() {
+        // r9 item 5: the r8 retirement sweep ran only in the started branch; a
+        // pending "{" that completed as another member's result/failed never
+        // retired the original owner's cover. Retirement now happens per
+        // consumed line for EVERY record type and both cover kinds.
+        for record_type in ["result", "failed"] {
+            for armed in [
+                pending(br#"{"#),
+                complete(br#"{"type":"started","key":"v2:k","agentId":"a1"}"#),
+            ] {
+                let kind = armed.kind;
+                let mut run = RunState::test_with_members(
+                    "wf_r9_any_type_retire",
+                    vec![failed_placeholder("a1")],
+                );
+                let mut covers = CoverSet::new();
+                covers.arm("a1", vec![armed]);
+
+                let line =
+                    format!("{{\"type\":\"{record_type}\",\"key\":\"v2:k2\",\"agentId\":\"a2\"}}");
+                run.fold_journal_line(
+                    line.as_bytes(),
+                    &cursor(line.as_bytes(), 1, W),
+                    Some(&covers),
+                );
+                covers.note_consumed(1, W);
+                assert_eq!(
+                    covers.for_agent("a1").count(),
+                    0,
+                    "{record_type} at the position retires a1's {kind:?} cover"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_cover_retires_when_a_later_record_consumes_past_its_position() {
+        // Consumption at ANY offset at/after the cover retires it: the fold
+        // loop calls note_consumed for every line, so a record the cover does
+        // not even relate to still spends it once the read cursor passes.
+        let mut covers = CoverSet::new();
+        covers.arm("a1", vec![pending(br#"{"#)]);
+        covers.note_consumed(1, W + 80);
+        assert_eq!(covers.for_agent("a1").count(), 0);
+    }
+
+    #[test]
     fn the_covered_start_stays_failed_and_a_later_start_resurrects_in_one_fold() {
         let mut run =
             RunState::test_with_members("wf_r9_cover_fold", vec![failed_placeholder("a1")]);

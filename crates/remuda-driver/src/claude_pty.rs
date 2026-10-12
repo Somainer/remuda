@@ -3145,6 +3145,93 @@ mod tests {
         assert!(!bridge.has_pending(), "B's own verdict settles B");
     }
 
+    /// c-effortread r16 item 2: a slash excluded from the armed request (an
+    /// older pre-floor command, or a human `/effort`) must still keep its PLACE
+    /// in the slash → verdict FIFO. Without that slot the old command's
+    /// delayed verdict pops the newer owned request B and rejects (or settles)
+    /// it. Sequence: old slash → B slash → old verdict → B verdict; the old
+    /// Kept refusal answers the unowned slot, B's own acceptance answers B.
+    #[tokio::test]
+    async fn r16_item2_a_pre_floor_slash_keeps_a_fifo_slot_so_its_verdict_never_consumes_b() {
+        use crate::effort::{EffortBridge, EffortRequest};
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // B arms at EOF 1000; nothing of B's is on disk yet.
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(1000));
+
+        // The pump catches up an OLDER same-word slash sitting below the floor.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        assert!(
+            bridge.has_pending(),
+            "the pre-floor slash does not arm/clear B"
+        );
+
+        // B's own slash lands at/after the floor and arms.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+
+        // The OLDER command's delayed Kept verdict is read BETWEEN B's slash
+        // and B's verdict: it answers the old slash's slot, so it never rejects
+        // B and emits no request edge.
+        let old_verdict = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Kept effort level as high"),
+                Some(1600),
+            )
+            .expect("map old refusal");
+        assert!(
+            old_verdict
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the old refusal carries no request edge"
+        );
+        assert!(
+            bridge.has_pending(),
+            "the old refusal must not reject B through the FIFO"
+        );
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "B is still awaiting ITS OWN verdict"
+        );
+
+        // B's own acceptance now pops the owned slot and settles B with B's id.
+        let out_b = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Set effort level to max"),
+                Some(1700),
+            )
+            .expect("map B verdict");
+        let edge_b = out_b
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("B's verdict emits an effort edge");
+        assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
+        assert!(!bridge.has_pending(), "B's own verdict settles B");
+    }
+
     /// c-r3 item 4: the claude-pty transcript pump driven through its REAL
     /// output channel (the spawned pump task + mpsc receiver), not by calling
     /// the emit helper on a hand-built observation. An effort edge read off the

@@ -2558,6 +2558,24 @@ impl StdoutMapper {
     }
 }
 
+/// One slot in the slash → verdict FIFO (c-effortread r16 item 2).
+enum EffortSlashSlot {
+    /// A `/effort` switch attributed to an armed bridge generation; the slot
+    /// carries the IMMUTABLE request metadata (generation, id, requested
+    /// value) bound at its slash record, so a delayed verdict pairs with its
+    /// own request even after a newer one armed (c-effortread r11 item 1).
+    Owned(u64, crate::effort::EffortRequest),
+    /// A recognised switch slash that belongs to NO armed request: an older
+    /// pre-floor command (c-effortread r15 item 4) or a human-typed
+    /// `/effort`. The slot keeps the slash's PLACE in verdict order, so the
+    /// verdict that answers it — which can land AFTER a newer owned slash —
+    /// consumes this slot and never the owned request following it.
+    /// `is_switch` is false for non-switch slashes (`status`/`current`/
+    /// `auto`/an invalid word): their status/other verdicts prune only a
+    /// non-switch slot and can never cross an outstanding switch slot.
+    Unowned { is_switch: bool },
+}
+
 /// Transcript-to-observations mapper for a live claude-pty session.
 pub struct TranscriptMapper {
     mapper: Mapper,
@@ -2570,13 +2588,14 @@ pub struct TranscriptMapper {
     effort: remuda_protocol::EffortTracker,
     /// Rendezvous for Remuda-initiated switches awaiting read-back.
     effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
-    /// c-effortread r11 item 1: Remuda slash generations whose verdict has not
-    /// been read yet, FIFO in transcript order, each carrying the IMMUTABLE
-    /// request metadata (generation, id, requested value) bound at its slash
-    /// record. A delayed verdict pairs with ITS OWN slash entry — never with
-    /// the bridge's latest pending, which can already name a newer request B
-    /// typed while A's verdict was outstanding.
-    effort_armed: std::collections::VecDeque<(u64, crate::effort::EffortRequest)>,
+    /// c-effortread r11 item 1 / r16 item 2: one FIFO slot per RECOGNISED
+    /// `/effort` switch slash, in transcript order. An owned slot carries the
+    /// IMMUTABLE request metadata (generation, id, requested value) bound at
+    /// its slash record; a pre-floor or human slash gets an unowned slot. Each
+    /// switch-family verdict pops the front slot, so a delayed old verdict
+    /// pairs with ITS OWN slash — never with a newer owned request B typed
+    /// while A's verdict was outstanding.
+    effort_armed: std::collections::VecDeque<EffortSlashSlot>,
     /// c-effortread r12 item 1: test-only one-shot seam fired immediately
     /// after a `/effort` slash takes its single pending snapshot. It lets a
     /// unit test deterministically time the request out and arm a newer one
@@ -3131,12 +3150,12 @@ impl TranscriptMapper {
             // A slash read off an unverified/displaced batch cannot belong to
             // this process: arm neither the generation nor the level await, so
             // a verdict that follows provenance loss cannot settle the switch.
+            let mut owned: Option<(u64, crate::effort::EffortRequest)> = None;
             if from_remuda
                 && let Some(pending) = pending_snapshot
-                && self
-                    .effort_armed
-                    .iter()
-                    .all(|(armed_gen, _)| *armed_gen != pending.generation)
+                && self.effort_armed.iter().all(|slot| {
+                    !matches!(slot, EffortSlashSlot::Owned(armed_gen, _) if *armed_gen == pending.generation)
+                })
             {
                 let crate::effort::PendingSwitch {
                     generation,
@@ -3152,9 +3171,22 @@ impl TranscriptMapper {
                 if let Some(name) = request.awaits_level(self.effort.semantics()) {
                     self.effort.arm_awaiting(name);
                 }
-                self.effort_armed.push_back((generation, request));
+                owned = Some((generation, request));
             }
-            self.effort.note_slash(&args, from_remuda);
+            // c-effortread r16 item 2: note_slash also says whether the args
+            // are a SWITCH (false for `status`/`current`/`auto`/invalid words).
+            // Every recognised switch slash keeps a verdict-order slot: an
+            // owned slot when attributed to the armed request, otherwise an
+            // unowned slot (an older pre-floor command or a human /effort) so
+            // its delayed verdict consumes the unowned place, never a later
+            // owned request. Non-switch slashes get a non-switch slot: their
+            // status/other verdicts prune only those and can never cross an
+            // outstanding switch slot.
+            let is_switch = self.effort.note_slash(&args, from_remuda);
+            self.effort_armed.push_back(match owned.take() {
+                Some((generation, request)) => EffortSlashSlot::Owned(generation, request),
+                None => EffortSlashSlot::Unowned { is_switch },
+            });
             return Ok(Vec::new());
         }
         if text.contains("<local-command-stdout>") {
@@ -3178,13 +3210,17 @@ impl TranscriptMapper {
         match verdict {
             remuda_protocol::EffortStdout::Accepted(parsed) => {
                 // c-effortread r11 item 1: this verdict answers the OLDEST
-                // outstanding Remuda slash (FIFO). When A's verdict is delayed
-                // past a newer armed B, the pair is still (gen A, request A):
-                // the bridge ignores the resolve for a stale generation and the
+                // outstanding slash (FIFO). When A's verdict is delayed past a
+                // newer armed B, the pair is still (gen A, request A): the
+                // bridge ignores the resolve for a stale generation and the
                 // observation is stamped with A's id/requested value, never
-                // B's. An answered verdict with no armed slash is a human/
-                // terminal command (or one whose slash predates this mapper).
-                let paired = self.effort_armed.pop_front();
+                // B's. c-effortread r16 item 2: the front slot may be UNOWNED
+                // (an older pre-floor or human slash whose verdict landed
+                // here) — it consumes that place only, and a later owned
+                // request keeps waiting for ITS verdict. A verdict with no
+                // slot at all is a human/terminal command whose slash
+                // predates this mapper.
+                let paired = self.pop_front_owned_pair();
                 let from_remuda = paired.is_some();
                 let edge = self.effort.note_stdout(&stdout, from_remuda);
                 if let Some((generation, _)) = &paired
@@ -3228,6 +3264,10 @@ impl TranscriptMapper {
             }
             remuda_protocol::EffortStdout::Status(_) => {
                 // Observation only: it never resolves/rejects an armed switch.
+                // c-effortread r16 item 2: it answers the human's non-switch
+                // `/effort status` slash; retire THAT non-switch slot without
+                // crossing an outstanding switch slot.
+                self.prune_front_non_switch_slot();
                 let from_remuda = self
                     .effort_bridge
                     .as_ref()
@@ -3252,8 +3292,10 @@ impl TranscriptMapper {
                 // Clears the awaiting attribution; refuses the armed switch
                 // (if any) with the verdict's stable reason code. The refusal
                 // pairs with its own slash generation, never a newer armed
-                // request's (r11 item 1).
-                let paired = self.effort_armed.pop_front();
+                // request's (r11 item 1). r16 item 2: an unowned front slot
+                // (pre-floor/human slash) is consumed here without touching a
+                // later owned request.
+                let paired = self.pop_front_owned_pair();
                 self.effort.note_stdout(&stdout, paired.is_some());
                 if let Some((generation, _)) = paired
                     && let Some(bridge) = &self.effort_bridge
@@ -3262,9 +3304,40 @@ impl TranscriptMapper {
                     bridge.reject(generation, reason);
                 }
             }
-            remuda_protocol::EffortStdout::Other => {}
+            remuda_protocol::EffortStdout::Other => {
+                // Unrecognised output (e.g. `/effort auto`): retire the
+                // non-switch slash slot that produced it, never a switch one.
+                self.prune_front_non_switch_slot();
+            }
         }
         Ok(Vec::new())
+    }
+
+    /// c-effortread r16 item 2: pop the front verdict-order slot. A
+    /// switch-family verdict always consumes the OLDEST outstanding slash
+    /// place (FIFO), but the owned request is returned only when that place is
+    /// owned. An unowned place — an older pre-floor command or a human slash —
+    /// or an empty FIFO yields `None`, so the verdict takes the human/terminal
+    /// path and a later owned request keeps waiting for its own verdict.
+    fn pop_front_owned_pair(&mut self) -> Option<(u64, crate::effort::EffortRequest)> {
+        match self.effort_armed.pop_front()? {
+            EffortSlashSlot::Owned(generation, request) => Some((generation, request)),
+            EffortSlashSlot::Unowned { .. } => None,
+        }
+    }
+
+    /// c-effortread r16 item 2: remove the foremost outstanding NON-SWITCH
+    /// slash slot (a human `status`/`current`/`auto` command answered by a
+    /// status/other verdict). Switch slots and owned requests are never
+    /// crossed, so such a verdict cannot steal an outstanding switch verdict.
+    fn prune_front_non_switch_slot(&mut self) {
+        if let Some(index) = self
+            .effort_armed
+            .iter()
+            .position(|slot| matches!(slot, EffortSlashSlot::Unowned { is_switch: false }))
+        {
+            self.effort_armed.remove(index);
+        }
     }
 
     /// A `/plan` command switches mode natively; arm slash attribution so the

@@ -3926,6 +3926,21 @@ class HubStore {
       const prev = earliest.get(r.instanceId);
       if (prev === undefined || r.lease.until < prev) earliest.set(r.instanceId, r.lease.until);
     }
+    // Gate 17 item 3: reconcile EXISTING timers against this authoritative
+    // snapshot, not only newly computed ones. A timer armed for B's foreign
+    // lease must be cancelled when the row left that state: B's failed
+    // delivery restored it to pending (a flush at T-500 then claims it and
+    // holds the POST), the lease moved to this owner, or the row became
+    // terminal. Leaving the old T timer live let it fire into a row awaiting
+    // its own held-retry deadline and re-POST it early. An instance still
+    // present in `earliest` keeps its (move-earlier-only) timer.
+    for (const instanceId of [...this.leaseWakeupTimer.keys()]) {
+      if (earliest.has(instanceId)) continue;
+      const old = this.leaseWakeupTimer.get(instanceId);
+      if (old) clearTimeout(old);
+      this.leaseWakeupTimer.delete(instanceId);
+      this.leaseWakeupUntil.delete(instanceId);
+    }
     for (const [instanceId, until] of earliest) {
       this.armLeaseWakeup(instanceId, until, now, includeOverdue);
     }
@@ -3964,9 +3979,50 @@ class HubStore {
     const timer = setTimeout(() => {
       this.leaseWakeupTimer.delete(instanceId);
       this.leaseWakeupUntil.delete(instanceId);
-      void this.flushAllOutbox();
+      void this.leaseWakeupFired(instanceId, until);
     }, Math.max(0, until - Date.now()));
     this.leaseWakeupTimer.set(instanceId, timer);
+  }
+
+  /**
+   * A foreign-lease timer fired. Gate 17 item 3: revalidate the tracked lease
+   * against an AUTHORITATIVE durable snapshot BEFORE flushing — the timer was
+   * armed from an older snapshot and the row may since have been claimed by
+   * this document (its POST is `held` with its own retry clock), restored to
+   * pending and re-claimed, or moved to a terminal/renewed lease. Flushing
+   * unconditionally re-POSTed a held command before its held-retry deadline.
+   * The snapshot also reconciles (cancels obsolete, re-arms renewed) every
+   * other armed timer; a flush runs only when a foreign lease for THIS
+   * instance is genuinely stealable now.
+   */
+  private async leaseWakeupFired(instanceId: Id, expectedUntil: number) {
+    if (this.pageIsUnloading) return;
+    const box = this.outbox;
+    if (!box) return;
+    const durable = await box.refreshDurable().catch(() => null);
+    if (!durable || this.pageIsUnloading) return;
+    const now = Date.now();
+    // A timer firing is not proof the wall deadline passed: the system clock
+    // can roll back after arming. Wait out the remaining time instead of
+    // reconciling/flushing against leases that are still fresh by wall time
+    // (same discipline as the Outbox wake, gate 13 item 2).
+    if (now < expectedUntil) {
+      this.armLeaseWakeup(instanceId, expectedUntil, now, false);
+      return;
+    }
+    // Reconcile from the fresh snapshot. Overdue leases are excluded from
+    // re-arming here: the due check below owns the immediate delivery, so no
+    // competing 0 ms timer can start a second flush for the same rows.
+    this.scheduleLeaseExpiryWakeup(durable, now, box.ownerId, false);
+    const due = durable.some(
+      (r) =>
+        r.instanceId === instanceId &&
+        r.state === "inflight" &&
+        r.lease !== undefined &&
+        r.lease.owner !== box.ownerId &&
+        r.lease.until <= now,
+    );
+    if (due) void this.flushAllOutbox();
   }
 
   private chainReconcile(instanceId: Id, job: () => Promise<unknown>): Promise<unknown> {

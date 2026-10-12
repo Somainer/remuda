@@ -302,7 +302,21 @@ async fn abort_past_the_finalise_bound_still_rescues_the_last_usage_run() {
         .await
         .expect("timed out waiting for the aborted close to rescue the FINAL run")
         .expect("final oneshot closed without a frame");
-    drainer.abort();
+    // c-ctxusage r13 item 5: do not stop counting at the FIRST FINAL. Wait for
+    // producer/flusher completion (a positive ack, not an idle gap), then
+    // release the remaining long-lived sender owners and drain to RECEIVER
+    // CLOSURE under a timeout before asserting exactly-once — aborting here
+    // could leave a duplicate FINAL still buffered in the channel and
+    // uncounted.
+    assert!(
+        faults.wait_flusher_exit_for(std::time::Duration::from_secs(30)),
+        "the flusher never retired after the terminal finish drained"
+    );
+    driver.abort_event_workers_for_test().await;
+    tokio::time::timeout(std::time::Duration::from_secs(30), drainer)
+        .await
+        .expect("event channel never closed after the abort drain")
+        .expect("event drainer panicked");
     assert_eq!(
         final_count.load(Ordering::SeqCst),
         1,
@@ -480,7 +494,18 @@ async fn abort_during_cooperative_finalise_parks_frames_before_retiring() {
         .await
         .expect("the aborted finalise never delivered the FINAL run")
         .expect("final oneshot closed without a frame");
-    drainer.abort();
+    // c-ctxusage r13 item 5: count only after producer/flusher completion and
+    // RECEIVER CLOSURE, not at the first FINAL — a duplicate still buffered in
+    // the channel would otherwise be missed.
+    assert!(
+        faults.wait_flusher_exit_for(std::time::Duration::from_secs(30)),
+        "the flusher never retired after the cooperative finalise drained"
+    );
+    driver.abort_event_workers_for_test().await;
+    tokio::time::timeout(std::time::Duration::from_secs(30), drainer)
+        .await
+        .expect("event channel never closed after the finalise drain")
+        .expect("event drainer panicked");
     assert_eq!(
         final_count.load(Ordering::SeqCst),
         1,

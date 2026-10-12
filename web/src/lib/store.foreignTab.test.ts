@@ -952,6 +952,226 @@ it("GATE20 item 4c: a one-shot failure of the CLAIM transaction still delivers t
   await bootItem4("4c");
 });
 
+it("GATE20 item 4c: a one-shot failure of the CLAIM transaction still delivers the row", async () => {
+  await bootItem4("4c");
+});
+
+it("GATE20 item 6: two real stores/Outboxes on one backend — B held-and-pagehides behind its lock, A's queued timer sends only P; H retries from the real held-retry timer", async () => {
+  // Replaces the old mocked-storage held-row regression: no third mocked read,
+  // no hand flushAllOutbox(). TWO real HubStores with real Outboxes share the
+  // localStorage backend and the cloned persisted owner, serialized by an
+  // ordered Web Locks shim. B claims H, its POST and instance lock stay
+  // PENDING. P (A's row, second instance) becomes durable while B is blocked.
+  // A's tracked lease timer fires at the deadline and its guarded flush
+  // QUEUES behind B's lock. B's POST is then answered HELD and the cloned
+  // sibling CLOSES (logout): B never runs another delivery pass, its own
+  // held-retry timer is torn down. A's queued turn reads the FRESH held H and
+  // the pending P: A sends only P. H's NEXT POST comes from A's real
+  // held-retry clock (same id, no attempt budget spent), exactly once.
+  vi.useFakeTimers();
+  const owner = "owner_g20_i6";
+  const heldNow = new Set<string>();
+  const queues = new Map<string, Array<() => void>>();
+  const originalNavigator = globalThis.navigator;
+  const locks = {
+    query: async () => ({ held: [] as Array<{ name: string; mode: string }> }),
+    request: (name: string, _opts: unknown, cb: () => Promise<unknown>) =>
+      new Promise((resolve, reject) => {
+        const run = () => {
+          heldNow.add(name);
+          Promise.resolve()
+            .then(cb)
+            .then(
+              (v) => {
+                heldNow.delete(name);
+                resolve(v);
+                queues.get(name)?.shift()?.();
+              },
+              (e) => {
+                heldNow.delete(name);
+                reject(e);
+                queues.get(name)?.shift()?.();
+              },
+            );
+        };
+        if (heldNow.has(name) || (queues.get(name)?.length ?? 0) > 0) {
+          const q = queues.get(name) ?? [];
+          q.push(run);
+          queues.set(name, q);
+        } else {
+          run();
+        }
+      }),
+  };
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  sessionStorage.setItem("remuda-outbox-owner", owner);
+  let releaseB: (() => void) | null = null;
+  try {
+    const { api: apiA, hubStore: a } = await fresh();
+    vi.spyOn(apiA, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(apiA, "screenRead").mockResolvedValue({ lines: [] });
+    const { api: apiB, hubStore: b } = await fresh();
+    vi.spyOn(apiB, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(apiB, "screenRead").mockResolvedValue({ lines: [] });
+    await bootLive(apiA, a);
+    await bootLive(apiB, b);
+    const ai = a as unknown as {
+      flushAllOutbox: () => Promise<void>;
+      outbox: { refreshDurable: () => Promise<unknown>; pendingLeaseWakeups: () => string[] };
+    };
+    const bi = b as unknown as { flushAllOutbox: () => Promise<void> };
+    await ai.flushAllOutbox();
+    await bi.flushAllOutbox();
+
+    const H = "cmd_g20_i6_h";
+    const P = "cmd_g20_i6_p";
+    const INS2 = "ins_g20_i6_second";
+    const J2 = "obj_g20_i6_journal_second";
+    localStorage.setItem(
+      OUTBOX_LS_KEY,
+      JSON.stringify([
+        {
+          commandId: H,
+          clientRequestId: `local_${H}`,
+          instanceId: INSTANCE,
+          journalId: JOURNAL,
+          prompt: "B holds this one",
+          createdAt: Date.now() - 1_000,
+          attempts: 0,
+          state: "pending",
+        } satisfies OutboxRecord,
+      ]),
+    );
+    let bCalls = 0;
+    vi.spyOn(apiB, "instanceSend").mockImplementation(
+      (() => {
+        bCalls += 1;
+        return new Promise((resolve) => {
+          releaseB = () =>
+            resolve({
+              relatedCommandIds: [],
+              command: {
+                commandId: H,
+                id: H,
+                state: "queued",
+                revision: "1",
+                dispatch: "not-dispatched",
+                resolution: "held",
+              },
+            });
+        });
+      }) as unknown as Api["instanceSend"],
+    );
+    void bi.flushAllOutbox();
+    for (let i = 0; i < 20 && bCalls === 0; i += 1) await vi.advanceTimersByTimeAsync(1);
+    expect(bCalls).toBe(1);
+
+    // A tracks B's live claim; P becomes durable while B's POST is still
+    // blocked (B's one delivery turn already selected only H).
+    await ai.outbox.refreshDurable();
+    expect(ai.outbox.pendingLeaseWakeups()).toEqual([H]);
+    const claimUntil = (JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[]).find(
+      (r) => r.commandId === H,
+    )?.lease?.until;
+    expect(claimUntil).toBeTruthy();
+    localStorage.setItem(
+      OUTBOX_LS_KEY,
+      JSON.stringify([
+        ...(JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[]),
+        {
+          commandId: P,
+          clientRequestId: `local_${P}`,
+          instanceId: INS2,
+          journalId: J2,
+          prompt: "A must send this one",
+          createdAt: Date.now() - 1_000,
+          attempts: 0,
+          state: "pending",
+        } satisfies OutboxRecord,
+      ]),
+    );
+
+    const sendA = vi.spyOn(apiA, "instanceSend").mockImplementation(
+      (async (_iid: string, _p: string, _a: unknown, _m: unknown, commandId: string) =>
+        ({
+          relatedCommandIds: [],
+          command: {
+            commandId,
+            id: commandId,
+            state: "accepted",
+            revision: "1",
+            dispatch: "native-acknowledged",
+            resolution: "clear",
+          },
+        }) as unknown as Awaited<ReturnType<Api["instanceSend"]>>) as unknown as Api["instanceSend"],
+    );
+
+    // A's timer fires at the deadline and its guarded flush queues behind B.
+    await vi.advanceTimersByTimeAsync(Math.max(1, (claimUntil ?? 0) - Date.now()));
+    expect(sendA).not.toHaveBeenCalled();
+    expect([...heldNow]).toContain(`remuda-outbox-${INSTANCE}`);
+
+    // B is answered HELD and the cloned sibling's pagehide lands before its
+    // next delivery pass: the held write still commits (outbox alive) but B's
+    // flush passes abort on the unload flag and a B held-retry cannot POST
+    // from a tearing-down page. B itself never drains P.
+    const T0 = Date.now();
+    releaseB!();
+    (b as unknown as { onPageHide: (e: Event) => void }).onPageHide(new Event("pagehide"));
+    for (let i = 0; i < 120 && sendA.mock.calls.length === 0; i += 1) {
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+    }
+
+    // A sent only P (B's one and only POST was the held H); H stays held.
+    expect(sendA.mock.calls.map((c) => c[4])).toEqual([P]);
+    expect(bCalls).toBe(1);
+    const stored = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(stored().find((r) => r.commandId === P)?.state).toBe("sent");
+    const heldRow = stored().find((r) => r.commandId === H);
+    expect(heldRow?.state).toBe("held");
+    // The held answer/refund spent no attempt budget; the retry uses same id.
+    expect(heldRow?.attempts).toBe(0);
+
+    // Nothing re-POSTs H before A's real held-retry deadline (~2 s) …
+    await vi.advanceTimersByTimeAsync(Math.max(0, T0 + 1_999 - Date.now()));
+    expect(sendA).toHaveBeenCalledTimes(1);
+    // … and exactly ONE H re-POST then runs through the normal held-retry
+    // flush (no manual flush in this test), clearing to sent.
+    await vi.advanceTimersByTimeAsync(Math.max(2, T0 + 2_100 - Date.now()));
+    for (let i = 0; i < 60; i += 1) {
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+      if (stored().find((r) => r.commandId === H)?.state === "sent") break;
+    }
+    expect(sendA.mock.calls.map((c) => c[4]).sort()).toEqual([H, P].sort());
+    expect(sendA).toHaveBeenCalledTimes(2);
+    expect(bCalls).toBe(1);
+    expect(stored().find((r) => r.commandId === H)?.state).toBe("sent");
+    a.logout();
+    b.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
 it("GATE10 item 7: a lease-less done row committed by another tab skips without aborting the flush; B still sends", async () => {
   const { api, hubStore } = await fresh();
   await bootLive(api, hubStore);

@@ -19,6 +19,7 @@ import { effortAt } from "../features/session/effort";
 
 afterEach(() => {
   hubStore.logout();
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -50,6 +51,10 @@ async function startFollowing(
   idSuffix: string,
   activity: Instance["activity"] = { state: "known", value: "idle" },
 ) {
+  // Pin Date (only Date — real timers keep running) before every fixture
+  // timestamp so a client request's send time (pending.at, the r12 item 3
+  // legacy lower bound when no queued edge exists) precedes its read-backs.
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z"), toFake: ["Date"] });
   const original = mockDb.instances[0];
   // Isolate: every test flips its own instance id and journal.
   const instance: Instance = {
@@ -2535,4 +2540,107 @@ it("r11 item 4: an older driver's clamped max echo (id-less) never settles queue
     }),
   );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+it("r12 item 3: an id-less queued edge is C's lower bound — A's stale max read-back cannot settle C", async () => {
+  const ctx = await startFollowing("r12-item3-queued-bound", { state: "known", value: "working" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+
+  // Baseline low BEFORE any request (clock is pinned at 00:00:00).
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+
+  // A drags to max and executes; before it reads back the user picks low (B)
+  // and then max (C). The driver is older: every queued edge is ID-LESS.
+  const aPost = hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+  await hubStore.setEffort(ctx.instance.id, { index: 2, name: "low", kind: "claude", ultracode: false });
+  await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+  await aPost;
+  const idC = posts[2]?.requestId!;
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idC);
+
+  // B's id-less queued edge stamps B, then C replaces it; C's own id-less
+  // queued edge at T2 stamps C (exact-word match binds the single outstanding
+  // request). A stale word would have been dropped.
+  ctx.receive(configureLifecycle(3, "effort-queued:low", ctx.instance.id, "2026-09-16T00:00:10.000Z"));
+  ctx.receive(configureLifecycle(4, "effort-queued:max", ctx.instance.id, "2026-09-16T00:00:30.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queuedObservedAt).toBe("2026-09-16T00:00:30.000Z");
+
+  // A's DELAYED max read-back (T0): post-baseline, value matches C, but older
+  // than C's queued bound. It must stay a veto, not settle C.
+  ctx.receive(
+    effortEvent(5, "max", false, "remuda", "2026-09-15T23:59:59.000Z", {
+      requested: { name: "max", ultracode: false },
+    }),
+  );
+  const c = hubStore.effortPendingOf(ctx.instance.id);
+  expect(c, "A's stale max read-back never settles C").not.toBeNull();
+  expect(c?.requestId).toBe(idC);
+  expect(c?.levelSettled).toBe(false);
+
+  // A genuinely fresh read-back past C's queued bound settles.
+  ctx.receive(
+    effortEvent(6, "max", false, "remuda", "2026-09-16T00:00:45.000Z", {
+      requested: { name: "max", ultracode: false },
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+it("r12 item 3: with no queued edge the client send time is the legacy lower bound", async () => {
+  const ctx = await startFollowing("r12-item3-send-bound", { state: "known", value: "working" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+  const aPost = hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+  await hubStore.setEffort(ctx.instance.id, { index: 2, name: "low", kind: "claude", ultracode: false });
+  await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+  await aPost;
+
+  // No queued edge at all (older driver). A read-back produced BEFORE C even
+  // left the client (clock pins the send at 00:00:00) cannot settle C.
+  ctx.receive(
+    effortEvent(3, "max", false, "remuda", "2026-09-15T23:59:59.000Z", {
+      requested: { name: "max", ultracode: false },
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id), "pre-send read-back stays pending").not.toBeNull();
+
+  // Post-send fresh evidence settles through the strict fallback.
+  ctx.receive(
+    effortEvent(4, "max", false, "remuda", "2026-09-16T00:00:05.000Z", {
+      requested: { name: "max", ultracode: false },
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+it("r12 item 3: a wire pending with no parseable queued bound fails closed", async () => {
+  const ctx = await startFollowing("r12-item3-fail-closed", { state: "known", value: "working" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+  // A configure posted outside this UI; the queued edge carries no id and an
+  // unparseable observedAt, so neither request id nor a trustworthy time bound
+  // exists. The pending must not settle on a value-matching read-back.
+  ctx.receive(configureLifecycle(3, "effort-queued:max", ctx.instance.id, "not-a-timestamp"));
+  const queued = hubStore.effortPendingOf(ctx.instance.id);
+  expect(queued?.source).toBe("lifecycle");
+  expect(queued?.queuedObservedAt).toBeNull();
+
+  ctx.receive(
+    effortEvent(4, "max", false, "remuda", "2026-09-16T00:00:30.000Z", {
+      requested: { name: "max", ultracode: false },
+    }),
+  );
+  expect(
+    hubStore.effortPendingOf(ctx.instance.id),
+    "no trustworthy lower bound: fail closed, stay pending",
+  ).not.toBeNull();
 });

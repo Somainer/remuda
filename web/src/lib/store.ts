@@ -1091,13 +1091,30 @@ class HubStore {
     // instant EQUAL to the queued time settles nothing (c-effortread r11 item
     // 4): it can be the state A left behind, same-second on a clock that
     // truncates milliseconds. The observed VALUE must also match the moved
-    // axes exactly. A cold start with no stamps makes the time checks vacuous.
+    // axes exactly.
     const postBaseline =
       pending.baselineObservedAt == null ||
       Date.parse(view.observedAt) > Date.parse(pending.baselineObservedAt);
+    // c-effortread r12 item 3: the legacy fallback needs a TRUSTWORTHY
+    // request-specific lower bound. An id-less queued edge used to be
+    // discarded for a client request, leaving this bound null and treating
+    // the check as vacuously satisfied — so A's delayed read-back (newer than
+    // only the pre-request baseline) settled the newer request C. The bound
+    // is now, in order: THIS request's driver-queued observedAt (host clock),
+    // or — when the older driver journals no usable queued edge — the
+    // client's own send time (the driver could not have produced THIS
+    // request's outcome before the POST left). A wire pending whose queued
+    // stamp is unparseable has NEITHER: fail closed and stay pending for the
+    // bounded reconciliation (r12 item 5).
+    const queuedBoundMs =
+      pending.queuedObservedAt != null &&
+      Number.isFinite(Date.parse(pending.queuedObservedAt))
+        ? Date.parse(pending.queuedObservedAt)
+        : pending.source === "client"
+          ? pending.at
+          : null;
     const strictlyAfterQueued =
-      pending.queuedObservedAt == null ||
-      Date.parse(view.observedAt) > Date.parse(pending.queuedObservedAt);
+      queuedBoundMs != null && Date.parse(view.observedAt) > queuedBoundMs;
     const inWindow = postBaseline && strictlyAfterQueued;
 
     const movesLevel = echoMovesLevel;
@@ -1650,7 +1667,18 @@ class HubStore {
         // `effort-queued` for request A after the user replaced it with B
         // carries a different id/axes and is dropped — it must never overwrite
         // B's pending indicator nor stamp B's queued time (A→B race).
-        if (!edgeBelongsTo(current, "queued")) return;
+        // c-effortread r12 item 3: an ID-LESS queued edge never claims
+        // ownership, but with exactly one outstanding request (this
+        // per-instance pending) whose exact command word the edge repeats,
+        // its observedAt IS a trustworthy request-specific LOWER BOUND for
+        // that request — stamp it so a read-back at or before it cannot
+        // settle. A different word is a replaced request's stale edge and is
+        // dropped without stamping.
+        const stampsLegacyQueuedBound =
+          edgeId === null &&
+          current.source === "client" &&
+          effortLifecycleMatches(current, parsed.word, "queued");
+        if (!edgeBelongsTo(current, "queued") && !stampsLegacyQueuedBound) return;
       } else {
         // No client-side pending (the configure was posted outside the UI):
         // still surface 排队中 from the lifecycle's own axes.

@@ -1125,3 +1125,153 @@ fn an_unterminated_start_at_failure_time_stays_covered_once_completed() {
         "attempt 3 after the covered start was consumed is a genuine retry"
     );
 }
+
+/// c-cardsettle-fu2 r7 item 1: binding the watermark to (generation, offset)
+/// is defeated by an in-place truncate-and-reuse that does NOT bump the
+/// generation. Attempt 1 starts+fails and is consumed through offset W;
+/// attempt 2's start sits unread (without its newline) when the live
+/// StopFailure arms the watermark at W; the writer truncates the torn tail
+/// back to W (length stays at/after the cursor, prefix digest unchanged, so
+/// no new generation) and writes a DIFFERENT start record at W. That record
+/// must not be mistaken for the settled attempt: once the intervening poll
+/// observes the discarded suffix, the watermark is retired (generation,
+/// offset AND record digest all had to match) and the retry resurrects.
+#[test]
+fn a_truncated_and_reused_start_offset_is_not_the_settled_record() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_r7_trunc";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    // Attempt 1: started then failed. Both lines are the consumed prefix; W
+    // is the byte offset right after them.
+    let prefix = "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n\
+                  {\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n";
+    std::fs::write(run_dir.join("journal.jsonl"), prefix).unwrap();
+    let w = prefix.len() as u64;
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        bodies(tailer.poll().unwrap())
+            .iter()
+            .rev()
+            .find_map(|body| match body {
+                ObservationPayload::WorkflowMember(m)
+                    if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+                {
+                    Some(m.state)
+                }
+                _ => None,
+            })
+            .expect("a1 observed"),
+        WorkflowState::Failed,
+        "attempt 1 ends Failed"
+    );
+
+    // Attempt 2's torn start: complete JSON, no newline yet.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        write!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}}"
+        )
+        .unwrap();
+    }
+    // Live failure settles the unread attempt 2.
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    // First poll consumes nothing (no newline); the watermark stays armed.
+    assert!(
+        bodies(tailer.poll().unwrap())
+            .iter()
+            .filter_map(|body| match body {
+                ObservationPayload::WorkflowMember(m)
+                    if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+                {
+                    Some(m.state)
+                }
+                _ => None,
+            })
+            .all(|state| state == WorkflowState::Failed),
+        "the torn start has not folded; a1 stays Failed"
+    );
+
+    // The writer truncates the unread torn tail back to W (no generation
+    // bump: length W is not below cursor W and the consumed prefix is
+    // unchanged); this poll makes the shrink observable.
+    {
+        // Shrink in place: open WITHOUT O_TRUNC so the consumed prefix bytes
+        // 0..W survive (O_TRUNC + set_len would zero-fill them), then drop
+        // only the unread suffix.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        file.set_len(w).unwrap();
+    }
+    assert!(
+        bodies(tailer.poll().unwrap())
+            .iter()
+            .filter_map(|body| match body {
+                ObservationPayload::WorkflowMember(m)
+                    if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+                {
+                    Some(m.state)
+                }
+                _ => None,
+            })
+            .all(|state| state == WorkflowState::Failed),
+        "the truncated file folds nothing yet; a1 stays Failed"
+    );
+
+    // A genuinely new start record is written at the reused offset W; its
+    // bytes differ from the settled attempt's record.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"retried\"}}"
+        )
+        .unwrap();
+    }
+    let final_state = bodies(tailer.poll().unwrap())
+        .iter()
+        .rev()
+        .find_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .expect("a1 observed after the reused-offset start");
+    assert_eq!(
+        final_state,
+        WorkflowState::Running,
+        "a different record at the reused offset is a genuine retry, not the settled attempt"
+    );
+}

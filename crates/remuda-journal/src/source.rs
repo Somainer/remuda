@@ -117,6 +117,30 @@ pub struct FileTail {
     generation: u64,
     offset: u64,
     prefix_digest: Option<Digest>,
+    /// Length of the file at the most recent open by [`Self::poll`] or
+    /// [`Self::unread_start`]; `None` until one has succeeded. A failure
+    /// watermark armed by the peek remembers the extent it observed, so a
+    /// later poll can tell that unread bytes were discarded by a truncate
+    /// that did NOT bump the generation (len stayed at/after the cursor).
+    last_len: Option<u64>,
+}
+
+/// The NEWEST complete `started` record a live-failure peek finds in the
+/// still-unread tail, plus the file extent observed while finding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadStart {
+    /// File generation the record belongs to (normalised against the open
+    /// file by the peek).
+    pub generation: u64,
+    /// Byte offset of the record's first byte.
+    pub offset: u64,
+    /// Digest of the record bytes — the same digest [`Self::poll`] puts on
+    /// the folded `FileCursor`, so the watermark can bind to the exact
+    /// record rather than to an offset alone.
+    pub digest: Digest,
+    /// File length at peek time. The record's bytes live below this extent;
+    /// a later same-generation file no longer than `offset` discarded them.
+    pub extent: u64,
 }
 
 impl FileTail {
@@ -128,6 +152,7 @@ impl FileTail {
             generation: 1,
             offset: 0,
             prefix_digest: None,
+            last_len: None,
         })
     }
 
@@ -149,6 +174,7 @@ impl FileTail {
             generation: 1,
             offset,
             prefix_digest: None,
+            last_len: None,
         })
     }
 
@@ -160,6 +186,7 @@ impl FileTail {
             generation: resume.generation.0.max(1),
             offset: resume.offset.0,
             prefix_digest: resume.prefix_digest,
+            last_len: None,
         }
     }
 
@@ -183,16 +210,16 @@ impl FileTail {
         self.offset
     }
 
-    /// Position of the NEWEST complete `started` record for `agent_id` in the
-    /// still-unread tail, as `(file generation, byte offset of the record's
-    /// first byte)` — or `None`. Matches on `agentId` (falling back to `key`,
-    /// for records that omit `agentId`).
+    /// Find the NEWEST complete `started` record for `agent_id` in the
+    /// still-unread tail — its position, digest and the file extent observed
+    /// while finding it ([`UnreadStart`]) — or `None`. Matches on `agentId`
+    /// (falling back to `key`, for records that omit `agentId`).
     ///
     /// Does NOT advance the cursor. A live StopFailure uses the result as a
-    /// terminal watermark: only starts at or before that position are the
-    /// failure's own settled attempt; a start at a later offset is a genuine
-    /// retry and must resurrect the member even when both fold in the same
-    /// poll.
+    /// terminal watermark: only starts at or before that position, and at the
+    /// position only with the SAME record digest, are the failure's own
+    /// settled attempt; a start at a later offset is a genuine retry and must
+    /// resurrect the member even when both fold in the same poll.
     ///
     /// Completeness agrees with [`Self::poll`] on every terminated record, but
     /// it ALSO recognises a trailing newline-free segment that already parses
@@ -203,18 +230,25 @@ impl FileTail {
     /// empty polls until the record (completed by its newline) is actually
     /// consumed. Skipping the unterminated segment here would leave that
     /// ordering unprotected.
-    pub fn unread_start_position(&self, agent_id: &str) -> Result<Option<(u64, u64)>, Error> {
+    ///
+    /// The observed file length is remembered so a later poll can invalidate
+    /// the watermark when the unread suffix it covered was discarded by a
+    /// truncate that did not bump the generation (see
+    /// [`Self::extent_discarded`]).
+    pub fn unread_start(&mut self, agent_id: &str) -> Result<Option<UnreadStart>, Error> {
         let mut file = match File::open(&self.path) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
             Ok(file) => file,
         };
+        let len = file.metadata()?.len();
+        self.last_len = Some(len);
         file.seek(SeekFrom::Start(self.offset))?;
         let mut rest = Vec::new();
         file.read_to_end(&mut rest)?;
-        let mut newest: Option<(u64, u64)> = None;
+        let mut newest: Option<UnreadStart> = None;
         let mut start = 0usize;
-        let record_start = |line: &[u8], at: usize, newest: &mut Option<(u64, u64)>| {
+        let record_start = |line: &[u8], at: usize, newest: &mut Option<UnreadStart>| {
             if !line.is_empty()
                 && let Ok(value) = serde_json::from_slice::<serde_json::Value>(line)
                 && value.get("type").and_then(serde_json::Value::as_str) == Some("started")
@@ -224,7 +258,12 @@ impl FileTail {
                     .or_else(|| value.get("key").and_then(serde_json::Value::as_str))
                     .is_some_and(|id| id == agent_id)
             {
-                *newest = Some((self.generation, self.offset + at as u64));
+                *newest = Some(UnreadStart {
+                    generation: self.generation,
+                    offset: self.offset + at as u64,
+                    digest: digest_of(line),
+                    extent: len,
+                });
             }
         };
         for (i, byte) in rest.iter().enumerate() {
@@ -250,6 +289,18 @@ impl FileTail {
         Ok(newest)
     }
 
+    /// Whether an unread suffix observed by [`Self::unread_start`] has since
+    /// been discarded while the generation stayed the same: an intervening
+    /// poll of the truncated file saw it shrink to a length at or below the
+    /// record's start offset. The caller uses this to retire a watermark
+    /// before a reused position can be mistaken for the settled record.
+    pub fn extent_discarded(&self, mark: &UnreadStart) -> bool {
+        self.generation == mark.generation
+            && self
+                .last_len
+                .is_some_and(|last| last < mark.extent && last <= mark.offset)
+    }
+
     /// Persistable cursor.
     pub fn resume(&self) -> SourceResume {
         SourceResume {
@@ -269,6 +320,10 @@ impl FileTail {
             Ok(file) => file,
         };
         let len = file.metadata()?.len();
+        // Remember the observed extent before rotation normalisation, so a
+        // later arm can tell that unread bytes it covered were discarded
+        // (including by a truncate that DID bump the generation).
+        self.last_len = Some(len);
         self.detect_rotation(&mut file, len)?;
         file.seek(SeekFrom::Start(self.offset))?;
         let mut rest = Vec::new();

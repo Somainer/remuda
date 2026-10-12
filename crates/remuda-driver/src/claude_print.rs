@@ -1955,13 +1955,17 @@ enum BacklogAdmitError {
     },
 }
 
-/// Live backlog occupancy (ma-sdk-state r12 item 1).
+/// Live backlog occupancy (ma-sdk-state r12 item 1; r13 item 1).
 ///
-/// All counters are atomics so test-stub inspection never takes the admission
-/// lock; the admission decisions themselves are serialized through
-/// [`PublishQueue`]'s mutex, so items/bytes/highs always describe an admitted
-/// state — a frame is counted before its send and the cap can never be
-/// overshot, even with concurrent enqueuers.
+/// Occupancy moves ONLY by atomic add/sub: admission RESERVES a charge with
+/// `fetch_add` BEFORE the job becomes visible in the channel, and the worker
+/// releases it with `fetch_sub` once the job is fully handled. There is no
+/// read-then-store: an admission that read the counters cannot overwrite a
+/// release that landed while it was admitting (the r12 version's stale store
+/// left a phantom charge that could trip a false overflow and kill a healthy
+/// session, and briefly under-counted the job that was already visible to the
+/// consumer). A charge that does not end in a queued job (cap refusal, send
+/// failure) is subtracted back on the same path that reserved it.
 struct BacklogMetrics {
     /// Frames currently queued (admitted, not yet drained by the worker).
     items: std::sync::atomic::AtomicUsize,
@@ -2014,9 +2018,17 @@ impl BacklogMetrics {
         }
     }
 
+    /// Release one previously-reserved frame charge after the worker finished
+    /// the job.
     fn release_frame(&self, cost: usize) {
-        self.items.fetch_sub(1, Ordering::AcqRel);
-        self.bytes.fetch_sub(cost, Ordering::AcqRel);
+        self.release_charge(1, cost);
+    }
+
+    /// Subtract a reserved charge back off the live counters (worker release
+    /// and admission rollback share this single path).
+    fn release_charge(&self, items: usize, bytes: usize) {
+        self.items.fetch_sub(items, Ordering::AcqRel);
+        self.bytes.fetch_sub(bytes, Ordering::AcqRel);
     }
 }
 
@@ -2052,10 +2064,11 @@ pub struct BacklogSnapshot {
 struct PublishQueue {
     tx: mpsc::UnboundedSender<PublishJob>,
     metrics: Arc<BacklogMetrics>,
-    /// Serializes the cap check, counter update and channel send of frame
-    /// admission. Held with no `.await` across it (the channel is unbounded),
-    /// so an std mutex suffices and cannot deadlock an async worker.
-    admit: Arc<std::sync::Mutex<()>>,
+    /// Test-only rendezvous (lib unit tests): parks an admission in the window
+    /// where its charge is reserved but its job is not yet visible, so a
+    /// concurrent release can be scheduled against it deterministically.
+    #[cfg(test)]
+    admission_gate: Arc<AdmissionGate>,
 }
 
 impl PublishQueue {
@@ -2066,7 +2079,8 @@ impl PublishQueue {
             Self {
                 tx,
                 metrics,
-                admit: Arc::new(std::sync::Mutex::new(())),
+                #[cfg(test)]
+                admission_gate: Arc::new(AdmissionGate::default()),
             },
             rx,
         )
@@ -2074,20 +2088,33 @@ impl PublishQueue {
 
     /// Try to admit a stdout FRAME under both caps. On refusal the caller
     /// owns the rejected job again (it is dropped by the reader on overflow).
+    ///
+    /// The charge is reserved with `fetch_add` BEFORE the channel send (the
+    /// job's only visibility point), so the counters always cover everything
+    /// the consumer can reach. Admission and the worker's release never
+    /// read-then-store, so they commute regardless of interleaving; a refusal
+    /// or a failed send subtracts the reservation straight back.
     fn admit_frame(&self, job: PublishJob) -> Result<(), (BacklogAdmitError, PublishJob)> {
         let PublishJob::Frame(frame) = &job else {
             unreachable!("admit_frame is only used for PublishJob::Frame")
         };
         let cost = frame_backlog_cost(frame);
-        let _guard = self.admit.lock().expect("backlog admission lock");
         if self.metrics.overflowed.load(Ordering::Acquire) {
             return Err((BacklogAdmitError::Closed, job));
         }
-        let items = self.metrics.items.load(Ordering::Acquire);
-        let bytes = self.metrics.bytes.load(Ordering::Acquire);
+        // Reserve BEFORE visibility.
+        let items_now = self.metrics.items.fetch_add(1, Ordering::AcqRel) + 1;
+        let bytes_now = self
+            .metrics
+            .bytes
+            .fetch_add(cost, Ordering::AcqRel)
+            .saturating_add(cost);
         let limit_items = self.metrics.limit_items.load(Ordering::Acquire);
         let limit_bytes = self.metrics.limit_bytes.load(Ordering::Acquire);
-        if items >= limit_items || bytes.saturating_add(cost) > limit_bytes {
+        if items_now > limit_items || bytes_now > limit_bytes {
+            self.metrics.release_charge(1, cost);
+            let items = self.metrics.items.load(Ordering::Acquire);
+            let bytes = self.metrics.bytes.load(Ordering::Acquire);
             return Err((
                 BacklogAdmitError::Overflow {
                     items,
@@ -2097,17 +2124,23 @@ impl PublishQueue {
                 job,
             ));
         }
+        // Test-only: deterministically park in the reserved-but-not-visible
+        // window. Open by default; a lib unit test shuts it to schedule a
+        // release exactly against an in-flight admission.
+        #[cfg(test)]
+        self.admission_gate.park_after_charge_reserved();
         // The channel is unbounded: this send only fails once the worker is
         // gone (close dropped the receiver), never on capacity.
         if let Err(mpsc::error::SendError(returned)) = self.tx.send(job) {
+            self.metrics.release_charge(1, cost);
             return Err((BacklogAdmitError::Closed, returned));
         }
-        let items = items + 1;
-        let bytes = bytes + cost;
-        self.metrics.items.store(items, Ordering::Release);
-        self.metrics.bytes.store(bytes, Ordering::Release);
-        self.metrics.items_high.fetch_max(items, Ordering::AcqRel);
-        self.metrics.bytes_high.fetch_max(bytes, Ordering::AcqRel);
+        self.metrics
+            .items_high
+            .fetch_max(items_now, Ordering::AcqRel);
+        self.metrics
+            .bytes_high
+            .fetch_max(bytes_now, Ordering::AcqRel);
         Ok(())
     }
 
@@ -2115,6 +2148,71 @@ impl PublishQueue {
     /// consulting the frame caps. Fails only when the channel is closed.
     fn admit_control(&self, job: PublishJob) -> Result<(), mpsc::error::SendError<PublishJob>> {
         self.tx.send(job)
+    }
+}
+
+/// Test-only admission rendezvous (lib unit tests). Synchronous, because
+/// [`PublishQueue::admit_frame`] is a synchronous function: the parking
+/// admission blocks an OS thread under the test runtime while the test thread
+/// releases a frame charge and opens the gate. Condvar waits are bounded and
+/// acknowledged — no sleeps, no polling.
+#[cfg(test)]
+#[derive(Default)]
+struct AdmissionGate {
+    /// When true, each admission parks after reserving its charge.
+    shut: std::sync::atomic::AtomicBool,
+    /// Set by the parked admission before it waits, so the test can acknowledge
+    /// the exact interleaving instead of racing into the release.
+    parked: std::sync::atomic::AtomicBool,
+    mutex: std::sync::Mutex<()>,
+    condvar: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl AdmissionGate {
+    fn shut(&self) {
+        self.shut.store(true, Ordering::Release);
+    }
+
+    fn open(&self) {
+        self.shut.store(false, Ordering::Release);
+        self.condvar.notify_all();
+    }
+
+    fn park_after_charge_reserved(&self) {
+        if !self.shut.load(Ordering::Acquire) {
+            return;
+        }
+        self.parked.store(true, Ordering::Release);
+        // Wake a test blocked in `wait_until_parked`; the predicate re-check
+        // under the mutex makes the announcement unlosable.
+        self.condvar.notify_all();
+        let mut guard = self.mutex.lock().expect("admission gate mutex");
+        while self.shut.load(Ordering::Acquire) {
+            let (g, timeout) = self
+                .condvar
+                .wait_timeout(guard, std::time::Duration::from_secs(10))
+                .expect("admission gate condvar");
+            guard = g;
+            assert!(
+                !timeout.timed_out(),
+                "an admitted frame parked behind a test gate that never opened"
+            );
+        }
+    }
+
+    /// Block until an admission has parked with its charge reserved. Runs on a
+    /// blocking thread (condvar); bounded by `timeout`.
+    fn wait_until_parked(&self, timeout: std::time::Duration) {
+        let guard = self.mutex.lock().expect("admission gate mutex");
+        let (_guard, result) = self
+            .condvar
+            .wait_timeout_while(guard, timeout, |_| !self.parked.load(Ordering::Acquire))
+            .expect("admission gate condvar");
+        assert!(
+            !result.timed_out(),
+            "timed out waiting for an admission to park at the reservation gate"
+        );
     }
 }
 
@@ -7153,5 +7251,169 @@ mod turn_book_reserved_seq_tests {
             vec![d2],
             "only D2 remains; the correction precedes its start"
         );
+    }
+}
+
+/// ma-sdk-state r13 item 1: backlog accounting under controlled concurrent
+/// admission and release.
+#[cfg(test)]
+mod backlog_accounting_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn frame_job() -> PublishJob {
+        // KeepAlive is the smallest serializable outbound; every job in the
+        // test carries the same charge, so byte accounting is checked exactly.
+        PublishJob::Frame(Box::new(Outbound::KeepAlive))
+    }
+
+    /// [`PublishJob`] does not implement `Debug`; assert admission without it.
+    fn admit(queue: &PublishQueue, what: &str) {
+        match queue.admit_frame(frame_job()) {
+            Ok(()) => {}
+            Err(_) => panic!("{what} must be admitted"),
+        }
+    }
+
+    /// Opens the admission gate on drop, so a failing assertion mid-schedule
+    /// never strands the parked admission on the blocking thread pool.
+    struct OpenGateOnDrop<'a> {
+        gate: &'a AdmissionGate,
+    }
+
+    impl Drop for OpenGateOnDrop<'_> {
+        fn drop(&mut self) {
+            self.gate.open();
+        }
+    }
+
+    /// r13 item 1: an admission that reserved its charge must not overwrite a
+    /// worker release landing while it is admitting. The schedule is forced
+    /// through the test admission gate (charge reserved → job invisible →
+    /// release lands → admission completes): occupancy settles back to exactly
+    /// zero once every job is released, and a third admission is not a false
+    /// overflow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admission_racing_release_leaves_zero_occupancy_and_no_false_overflow() {
+        const CAP_ITEMS: usize = 2;
+        let metrics = Arc::new(BacklogMetrics::new());
+        metrics.limit_items.store(CAP_ITEMS, Ordering::Release);
+        metrics
+            .limit_bytes
+            .store(1024 * 1024 * 1024, Ordering::Release);
+        let (queue, mut rx) = PublishQueue::new(Arc::clone(&metrics));
+        let frame_cost = frame_backlog_cost(&Outbound::KeepAlive);
+
+        // A is admitted with the gate open: one charge live.
+        admit(&queue, "A");
+        assert_eq!(metrics.items.load(Ordering::Acquire), 1);
+
+        // Shut the gate: B parks AFTER reserving its charge and BEFORE its job
+        // is sent. Run it on a blocking thread — the rendezvous is synchronous.
+        // The drop guard opens the gate even if an assertion below fails, so
+        // the parked admission never wedges the blocking pool.
+        let _gate_open_on_drop = OpenGateOnDrop {
+            gate: &queue.admission_gate,
+        };
+        queue.admission_gate.shut();
+        let gate_for_b = Arc::clone(&queue.admission_gate);
+        let queue_for_b = queue.clone();
+        let b = tokio::task::spawn_blocking(move || {
+            // B must reach its park before the test releases anything.
+            gate_for_b.wait_until_parked(Duration::from_secs(10));
+        });
+        let admit_b = tokio::task::spawn_blocking(move || queue_for_b.admit_frame(frame_job()));
+        b.await.expect("B parked at the reservation gate");
+        assert_eq!(
+            metrics.items.load(Ordering::Acquire),
+            2,
+            "B's charge is reserved while B is parked"
+        );
+
+        // The worker releases A WHILE B holds its reservation: the exact
+        // read-then-store hazard. Atomic sub moves occupancy 2 -> 1.
+        metrics.release_frame(frame_cost);
+        assert_eq!(metrics.items.load(Ordering::Acquire), 1);
+        assert_eq!(
+            metrics.bytes.load(Ordering::Acquire),
+            frame_cost,
+            "only B's byte charge remains"
+        );
+
+        // Let B finish: its charge was already reserved, so occupancy is
+        // unchanged by completing it.
+        queue.admission_gate.open();
+        match admit_b.await.expect("the admission thread") {
+            Ok(()) => {}
+            Err(_) => panic!("B must be admitted after the gate opens"),
+        }
+        assert_eq!(metrics.items.load(Ordering::Acquire), 1);
+
+        // Real occupancy is one (B): C must be admitted. A stale store from B
+        // would have reported two and refused C as a false overflow.
+        admit(&queue, "C");
+        assert_eq!(metrics.items.load(Ordering::Acquire), 2);
+
+        // The consumer saw exactly the three jobs in admission order. A's
+        // charge was already released (the racing release above), so draining
+        // releases only B and C.
+        let mut seen = 0usize;
+        while let Ok(job) = rx.try_recv() {
+            match job {
+                PublishJob::Frame(_) => {
+                    seen += 1;
+                    if seen >= 2 {
+                        metrics.release_frame(frame_cost);
+                    }
+                }
+                _ => panic!("the test queue contains frame jobs only"),
+            }
+        }
+        assert_eq!(seen, 3, "A, B and C are all visible, exactly once");
+        assert_eq!(
+            metrics.items.load(Ordering::Acquire),
+            0,
+            "occupancy returns to exactly zero, no phantom charge remains"
+        );
+        assert_eq!(
+            metrics.bytes.load(Ordering::Acquire),
+            0,
+            "byte occupancy returns to exactly zero"
+        );
+        assert!(
+            !metrics.overflowed.load(Ordering::Acquire),
+            "no overflow fired for a race, only for a real cap breach"
+        );
+        assert!(
+            metrics.items_high.load(Ordering::Acquire) <= CAP_ITEMS,
+            "the item high-water mark never crosses the cap"
+        );
+    }
+
+    /// A genuine cap breach is still refused and its provisional charge is
+    /// rolled back so the counters never sit above the cap.
+    #[test]
+    fn a_frame_past_the_cap_is_refused_and_its_charge_returned() {
+        let metrics = Arc::new(BacklogMetrics::new());
+        metrics.limit_items.store(1, Ordering::Release);
+        metrics
+            .limit_bytes
+            .store(1024 * 1024 * 1024, Ordering::Release);
+        let (queue, _rx) = PublishQueue::new(Arc::clone(&metrics));
+        admit(&queue, "the one frame");
+        let Err((kind, _returned)) = queue.admit_frame(frame_job()) else {
+            panic!("the second frame must be refused");
+        };
+        assert!(
+            matches!(kind, BacklogAdmitError::Overflow { .. }),
+            "refusal names the overflow, not closure: {kind:?}"
+        );
+        assert_eq!(
+            metrics.items.load(Ordering::Acquire),
+            1,
+            "the refused reservation is rolled back"
+        );
+        assert!(!metrics.overflowed.load(Ordering::Acquire));
     }
 }

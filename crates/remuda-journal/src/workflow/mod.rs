@@ -477,34 +477,42 @@ impl WorkflowJournalTailer {
         // snapshot each line changes, preserving transition order on catch-up.
         for index in 0..self.runs.len() {
             let journal_path = self.runs[index].dir.join("journal.jsonl");
-            // r7 item 1: a truncate-and-reuse that kept the file at/after the
-            // cursor did not bump the generation. An intervening poll made the
-            // shrink observable; if the suffix a watermark covered was
-            // discarded, retire it on BOTH sides before this poll folds the
-            // replacement record written at the same offset.
-            if let Some(tail) = self.tails.get(&journal_path) {
-                let discarded: Vec<String> = self
-                    .failure_watermarks
-                    .iter()
-                    .filter(|(agent_id, mark)| {
-                        tail.extent_discarded(mark)
-                            && self.runs[index]
-                                .members
-                                .iter()
-                                .any(|member| member.agent_id == **agent_id)
-                    })
-                    .map(|(agent_id, _)| agent_id.clone())
-                    .collect();
-                for agent_id in discarded {
-                    self.failure_watermarks.remove(&agent_id);
-                    self.runs[index].clear_failure_watermark(&agent_id);
+            // Covers the tailer holds for members of THIS run; the journal is
+            // shared by every member, so they all validate against this open.
+            let pending: Vec<(String, UnreadCover)> = self
+                .failure_watermarks
+                .iter()
+                .filter(|(agent_id, _)| {
+                    self.runs[index]
+                        .members
+                        .iter()
+                        .any(|member| member.agent_id == **agent_id)
+                })
+                .map(|(agent_id, cover)| (agent_id.clone(), cover.clone()))
+                .collect();
+            let (lines, invalid) = match self.tails.get_mut(&journal_path) {
+                Some(tail) => {
+                    let covers: Vec<UnreadCover> =
+                        pending.iter().map(|(_, cover)| cover.clone()).collect();
+                    tail.poll_with_covers(&covers)?
+                }
+                None => (Vec::new(), vec![false; pending.len()]),
+            };
+            // r7/r8: retire every cover this poll's open contradicts
+            // (replacement, rotation, an in-place shrink through the captured
+            // partial bytes, or a rewritten prefix) on BOTH sides BEFORE a
+            // record reused at the covered position can fold.
+            for ((agent_id, _), bad) in pending.iter().zip(invalid) {
+                if bad {
+                    self.failure_watermarks.remove(agent_id);
+                    self.runs[index].clear_failure_watermark(agent_id);
                 }
             }
-            // r5-r7 item 2: arm members carrying a terminal watermark from a
-            // live StopFailure. The watermark survives empty polls and is
-            // consumed by the fold only when the exact record it covers is
-            // read, so it is armed afresh here on every poll (re-arming the
-            // same member with the same mark is a no-op).
+            // r5-r7 item 2: arm members carrying a surviving terminal
+            // watermark from a live StopFailure BEFORE the lines fold. It
+            // survives empty polls and is consumed by the fold only when the
+            // exact record it covers is read (re-arming the same member with
+            // the same mark is a no-op).
             let armed: Vec<(String, UnreadCover)> = self
                 .failure_watermarks
                 .iter()
@@ -517,10 +525,6 @@ impl WorkflowJournalTailer {
                 .map(|(agent_id, watermark)| (agent_id.clone(), watermark.clone()))
                 .collect();
             self.runs[index].arm_failure_watermarks(&armed);
-            let lines = match self.tails.get_mut(&journal_path) {
-                Some(tail) => tail.poll()?,
-                None => Vec::new(),
-            };
             for (line, cursor) in lines {
                 let line = line.clone();
                 self.runs[index].fold_journal_line(&line, &cursor);

@@ -1687,3 +1687,104 @@ fn a_start_torn_inside_the_identity_value_stays_covered() {
         "1\"}\n",
     );
 }
+
+/// c-cardsettle-fu2 r8 item 2: a truncation ABOVE the torn record's start
+/// (keeping one byte of it) must still retire the pending boundary the
+/// moment the shrink is observed, before a DIFFERENT genuine retry that
+/// reuses the position is folded.
+#[test]
+fn a_truncation_above_the_torn_start_invalidates_its_coverage() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_r8_trunc_above";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    let prefix = "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n\
+                  {\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n";
+    std::fs::write(run_dir.join("journal.jsonl"), prefix).unwrap();
+    let w = prefix.len() as u64;
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Failed),
+        "attempt 1 ends Failed"
+    );
+
+    // Attempt 2's start torn INSIDE its identity value.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        write!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\""
+        )
+        .unwrap();
+    }
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+
+    // Truncate ABOVE W: keep exactly one byte ("{") of the torn record. The
+    // consumed prefix 0..W survives (open write handle, set_len).
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        file.set_len(w + 1).unwrap();
+    }
+    let shrink_poll: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        shrink_poll
+            .iter()
+            .all(|state| *state == WorkflowState::Failed),
+        "nothing folds from the one-byte remnant; a1 stays Failed: {shrink_poll:?}"
+    );
+
+    // A DIFFERENT genuine retry continues the surviving "{".
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(
+            journal,
+            "\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"genuine-retry\"}}"
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Running),
+        "the shrink removed captured partial bytes above W: the retry is genuine"
+    );
+}

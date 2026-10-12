@@ -140,7 +140,6 @@ type PolledLines = Vec<(Vec<u8>, FileCursor)>;
 /// content from the effective cursor in the effective generation.
 struct OpenedTail {
     file: File,
-    len: u64,
     rest: Vec<u8>,
     file_id: FileId,
 }
@@ -251,10 +250,7 @@ impl FileTail {
         // file (a replace/truncate since the last poll starts a new generation
         // here, not only later in poll), so the covers bind to the generation
         // their records will actually fold in.
-        let Some(OpenedTail {
-            rest, len, file_id, ..
-        }) = self.open_normalised()?
-        else {
+        let Some(OpenedTail { rest, file_id, .. }) = self.open_normalised()? else {
             return Ok(Vec::new());
         };
         let mut covers: Vec<Cover> = Vec::new();
@@ -294,6 +290,11 @@ impl FileTail {
         // JSON (a pending cover) — including a tear BEFORE the type/identity
         // values resolve.
         if start < rest.len() {
+            // The pending cover keeps the EXACT raw trailing bytes, including a
+            // captured CR: its whole range must validate byte-for-byte, so
+            // overwriting that CR later (e.g. with a quote that turns the
+            // record into a different completion) contradicts the cover. CRLF
+            // is stripped only for the completed-line / JSON match below.
             let raw = &rest[start..];
             let mut line = raw;
             if let Some(without_cr) = line.strip_suffix(b"\r") {
@@ -307,8 +308,8 @@ impl FileTail {
                     file_id,
                     self.generation,
                     self.offset + start as u64,
-                    len,
-                    line.to_vec(),
+                    self.offset + rest.len() as u64,
+                    raw.to_vec(),
                 ));
             }
         }
@@ -431,7 +432,6 @@ impl FileTail {
         });
         Ok(Some(OpenedTail {
             file,
-            len,
             rest,
             file_id: opened_id,
         }))

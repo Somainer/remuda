@@ -2762,3 +2762,104 @@ fn a_lone_brace_truncated_after_a_cursor_zero_rotation_keeps_the_cover_peek() {
         "the different retry at Z is genuine: {folded:?}"
     );
 }
+
+/// c-cardsettle-fu2 r10 item 2: the failure peek captures a torn tail ending
+/// in a CR (`{` followed by `\r`, raw CRLF in progress). The pending cover
+/// must bind the EXACT raw bytes including the CR: when the writer then
+/// overwrites the CR with a quote and completes a real start in place, the
+/// covered byte changed, the cover is invalidated, and the completion is a
+/// genuine retry. (Stripping the CR when arming left the cover over just "{"
+/// at the same extent, so the rewrite passed byte validation and the genuine
+/// start was wrongly held Failed.)
+#[test]
+fn rewriting_a_captured_trailing_cr_into_a_quote_revives_the_completion() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_r10_cr_rewrite";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    let prefix = "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n\
+{\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n";
+    std::fs::write(run_dir.join("journal.jsonl"), prefix).unwrap();
+    let w = prefix.len() as u64;
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Failed),
+        "attempt 1 ends Failed and is consumed through W"
+    );
+
+    // Torn tail at W: "{" then a raw CR.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        journal.write_all(b"{\r").unwrap();
+    }
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+
+    // Overwrite ONLY the CR with a quote (same length, same extent): the tail
+    // is now `{"` at W. A poll observes the contradiction before any fold.
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        file.seek(SeekFrom::Start(w + 1)).unwrap();
+        file.write_all(b"\"").unwrap();
+    }
+    let observed: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        observed.iter().all(|state| *state == WorkflowState::Failed),
+        "no record folds yet; a1 stays Failed: {observed:?}"
+    );
+
+    // Complete the record the rewritten bytes now actually start.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(
+            journal,
+            "type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"cr-genuine\"}}"
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Running),
+        "the CR->quote rewrite changed a covered byte; the completion is genuine"
+    );
+}

@@ -1848,7 +1848,27 @@ class HubStore {
       // THIS request's own queued-lifecycle observedAt, kept SEPARATE from the
       // pre-request baseline. A duplicate queued edge keeps the same time; an
       // unparseable timestamp leaves a previous stamp untouched.
-      const stamped = queuedThreshold ?? current.queuedObservedAt;
+      //
+      // c-effortread r14 item 1: the accepted bound is MONOTONIC for every
+      // pending source. An observer/lifecycle pending bound by an id-less edge
+      // at T3 (B's own effort-queued:max) must not be REPLACED by a delayed
+      // older same-word edge at T1 (the replaced request A's backlogged
+      // queued edge): with T0 < T1 < T2 < T3, taking T1 let A's matching
+      // read-back at T2 settle B. Keep the NEWEST VALID instant of the
+      // existing stamp and the incoming edge. The client send-time floor
+      // (settleEffortAxes) and the ambiguous-replacement rejection
+      // (stampsLegacyQueuedBound) are unchanged.
+      const incomingQueuedMs =
+        queuedThreshold != null ? Date.parse(queuedThreshold) : Number.NaN;
+      const establishedQueuedMs =
+        current.queuedObservedAt != null
+          ? Date.parse(current.queuedObservedAt)
+          : Number.NaN;
+      const stamped =
+        Number.isFinite(incomingQueuedMs) &&
+        (!Number.isFinite(establishedQueuedMs) || incomingQueuedMs > establishedQueuedMs)
+          ? queuedThreshold
+          : current.queuedObservedAt;
       // A lifecycle-created entry carries the queue state derived from current
       // activity; a queued edge for an EXISTING request really did re-queue it:
       // if a turn is now running again, the bound waits for the next

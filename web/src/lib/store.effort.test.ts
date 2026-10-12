@@ -2707,6 +2707,52 @@ it("r13 item 1: a delayed same-word A edge after A→B→C never lowers C's send
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
+it("r14 item 1: an older same-word queued edge never lowers an observer pending's established bound", async () => {
+  const ctx = await startFollowing("r14-item1-monotonic", { state: "known", value: "idle" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+
+  // Observer baseline low at T0; this tab only watches the wire.
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:50.000Z"));
+
+  // B's id-less effort-queued:max arrives at T3 and establishes the pending's
+  // queued bound (T0 < T1 < T2 < T3).
+  ctx.receive(configureLifecycle(3, "effort-queued:max", ctx.instance.id, "2026-09-16T00:00:30.000Z"));
+  const b = hubStore.effortPendingOf(ctx.instance.id);
+  expect(b?.source).toBe("lifecycle");
+  expect(b?.queuedObservedAt).toBe("2026-09-16T00:00:30.000Z");
+
+  // The backlog then flushes the REPLACED request A's delayed edge: same word
+  // ("max"), an id-less observer edge matches by word, but its stamp T1 is
+  // OLDER than the established bound.
+  ctx.receive(configureLifecycle(4, "effort-queued:max", ctx.instance.id, "2026-09-16T00:00:10.000Z"));
+  const stillB = hubStore.effortPendingOf(ctx.instance.id);
+  expect(stillB?.nonce).toBe(b?.nonce);
+  expect(
+    stillB?.queuedObservedAt,
+    "the older edge never replaces the established queued bound",
+  ).toBe("2026-09-16T00:00:30.000Z");
+
+  // A's matching max read-back at T2 is newer than the baseline (T0) and value
+  // matches, but OLDER than B's queued bound (T3): it must never settle B.
+  ctx.receive(
+    effortEvent(5, "max", false, "remuda", "2026-09-16T00:00:20.000Z", {
+      requested: { name: "max", ultracode: false },
+    }),
+  );
+  const vetoed = hubStore.effortPendingOf(ctx.instance.id);
+  expect(vetoed, "A's read-back between the two edges never settles B").not.toBeNull();
+  expect(vetoed?.nonce).toBe(b?.nonce);
+  expect(vetoed?.levelSettled).toBe(false);
+
+  // A genuinely fresh read-back AFTER B's bound settles through the fallback.
+  ctx.receive(
+    effortEvent(6, "max", false, "remuda", "2026-09-16T00:00:45.000Z", {
+      requested: { name: "max", ultracode: false },
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
 async function advanceEffortReconcile(ms: number) {
   // Full fake timers (Date stays pinned at the startFollowing clock) so the
   // 15 s bounded reconciliation is deterministic and instant.

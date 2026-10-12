@@ -612,8 +612,18 @@ struct BridgeState {
     /// Generation whose verdict has arrived.
     verdict_gen: u64,
     verdict: Option<Readback>,
-    /// The latest thing any side asked for (payload `requested` field).
+    /// The latest thing any side ASKED FOR (payload `requested` echo field).
+    /// Written by both the launch argv and every armed live switch; a write
+    /// failure leaves the failed attempt here because the echo reports what
+    /// was attempted, not what provenance may classify a later configure.
     requested: Option<EffortRequest>,
+    /// c-effortread r15 item 5: valid LAUNCH-argv provenance ONLY. Written by
+    /// `note_launch_request`; an armed live switch (and its failure) never
+    /// touches it. Together with the OBSERVED read-back this is the sole
+    /// fallback that may establish the tier for legacy classification — a
+    /// failed `arm()` used to linger in `requested` and let a later cold
+    /// flag-on configure masquerade as a same-tier toggle.
+    launch: Option<EffortRequest>,
     /// c-effortui r4 item 2: the latest OBSERVED effective selection (from
     /// transcript read-back — verdicts, assistant records, attachments). The
     /// live configure path classifies a new configure against THIS, not
@@ -641,6 +651,9 @@ impl EffortBridge {
     }
 
     /// Arm a new Remuda switch; returns its generation token.
+    ///
+    /// Records the attempt as the latest `requested` for the payload echo but
+    /// never overwrites the valid LAUNCH provenance (c-effortread r15 item 5).
     pub(crate) fn arm(&self, request: EffortRequest) -> u64 {
         let mut state = self.lock();
         state.generation += 1;
@@ -651,8 +664,24 @@ impl EffortBridge {
     }
 
     /// Record the launch-time requested selection (payload provenance only).
+    ///
+    /// This is the ONLY non-observed provenance a later legacy configure may
+    /// classify against (c-effortread r15 item 5): a live `arm`/`fail` cycle
+    /// never overwrites it.
     pub(crate) fn note_launch_request(&self, request: EffortRequest) {
-        self.lock().requested = Some(request);
+        let mut state = self.lock();
+        state.launch = Some(request.clone());
+        state.requested = Some(request);
+    }
+
+    /// The valid launch REQUESTED selection, for a live configure's
+    /// same-tier-provenance fallback. An armed live switch never replaces it
+    /// (c-effortread r15 item 5).
+    pub(crate) fn launch_selection(&self) -> Option<EffortSelection> {
+        self.lock().launch.as_ref().map(|request| EffortSelection {
+            name: request.name,
+            ultracode: request.ultracode,
+        })
     }
 
     /// The pending switch the mapper should arm its tracker with, if any.
@@ -679,14 +708,19 @@ impl EffortBridge {
     }
 
     /// c-effortui r5 item 1: the proven selection for classifying a live
-    /// configure — OBSERVED read-back if present, else the launch REQUESTED
-    /// selection. This is the single source the Herdr carrier uses (no inline
-    /// `observed ?? requested` that can drift from the classifier).
+    /// configure — OBSERVED read-back if present, else the valid LAUNCH
+    /// REQUESTED selection. This is the single source the Herdr carrier uses
+    /// (no inline `observed ?? requested` that can drift from the classifier).
+    ///
+    /// c-effortread r15 item 5: the fallback is launch provenance ONLY — the
+    /// latest armed attempt lives in `requested` for the payload echo but must
+    /// never classify a later configure (its write may have failed before a
+    /// single byte reached the composer).
     pub(crate) fn proven_selection(&self) -> Option<ObservedSelection> {
         let state = self.lock();
         EffortRequest::classify_provenance(
             state.observed,
-            state.requested.as_ref().map(|request| EffortSelection {
+            state.launch.as_ref().map(|request| EffortSelection {
                 name: request.name,
                 ultracode: request.ultracode,
             }),
@@ -2127,6 +2161,9 @@ mod switch_tests {
         bridge: Mutex<Option<Arc<EffortBridge>>>,
         /// Resolve the read-back once this many writes have happened.
         resolve_after: usize,
+        /// c-effortread r15 item 5: make `type_body` fail (write never lands),
+        /// so `perform_switch` records `fail` on the armed generation.
+        fail_body: AtomicBool,
         /// Reject the pending generation (with `invalid-argument`) the first
         /// time a screen containing the invalid marker is observed.
         reject_on_invalid: bool,
@@ -2188,6 +2225,9 @@ mod switch_tests {
             self.idle.load(Ordering::SeqCst)
         }
         async fn type_body(&self, body: &str) -> DriverResult<()> {
+            if self.fail_body.load(Ordering::SeqCst) {
+                return Err(crate::DriverError::ControlUnavailable);
+            }
             self.writes.lock().unwrap().push(format!("body:{body}"));
             self.maybe_resolve();
             Ok(())
@@ -2594,5 +2634,75 @@ mod switch_tests {
                 io.journals()
             );
         }
+    }
+
+    /// c-effortread r15 item 5: a live switch whose WRITE FAILS arms and then
+    /// fails a generation, but that attempted request must never become
+    /// provenance for a later LEGACY configure. Production sequence through
+    /// the real `perform_switch` seam: launch high/off → arm an explicit
+    /// max/on flag switch → body write fails (nothing was typed) → a later
+    /// legacy `{max, on}` without an axis is REFUSED rather than being
+    /// classified as `ultracode on` against the launch high tier.
+    #[tokio::test]
+    async fn r15_item5_a_failed_arm_does_not_establish_tier_for_legacy_configure() {
+        use remuda_protocol::EffortSemantics::Decoupled;
+        let bridge = Arc::new(EffortBridge::new());
+        // Valid launch provenance: high, flag off.
+        bridge.note_launch_request(EffortRequest::from_selection(EffortSelection {
+            name: EffortName::High,
+            ultracode: false,
+        }));
+
+        let io = Arc::new(MockIo {
+            fail_body: AtomicBool::new(true),
+            ..Default::default()
+        });
+        io.set_idle(true);
+        *io.bridge.lock().unwrap() = Some(Arc::clone(&bridge));
+
+        // B is an explicit flag-axis switch at max — unambiguous on its own,
+        // so the worker arms it; the write then fails and perform_switch
+        // records fail() on the generation.
+        let b = EffortRequest::for_configure(
+            "max",
+            Some(true),
+            Some(remuda_protocol::EffortAxis::Flag),
+            Decoupled,
+            bridge.proven_selection(),
+            bridge.launch_selection(),
+            Some("req-b"),
+        )
+        .expect("the explicit flag axis disambiguates B");
+        let outcome = perform_switch(b, &bridge, io.as_ref()).await;
+        assert_eq!(outcome, SwitchOutcome::ControlUnavailable);
+        assert!(!bridge.has_pending(), "the failed generation is cleared");
+        assert!(
+            io.writes().is_empty(),
+            "the failed body write means nothing reached the composer"
+        );
+
+        // The classification provenance stays the LAUNCH high/off: the failed
+        // attempt must not appear as observed-or-requested tier.
+        let proven = bridge
+            .proven_selection()
+            .expect("launch provenance remains");
+        assert_eq!(proven.name, EffortName::High);
+        assert_eq!(proven.ultracode, Some(false));
+
+        // A later LEGACY client (no axis) asking max/on cannot prove a
+        // same-tier toggle against the launch high tier: refused, no command.
+        let later = EffortRequest::for_configure(
+            "max",
+            Some(true),
+            None,
+            Decoupled,
+            bridge.proven_selection(),
+            bridge.launch_selection(),
+            Some("req-c"),
+        );
+        assert!(
+            later.is_none(),
+            "a failed arm must never make a cold flag-on look same-tier"
+        );
     }
 }

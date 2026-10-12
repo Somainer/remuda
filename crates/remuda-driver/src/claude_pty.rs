@@ -775,14 +775,12 @@ impl ClaudePtyDriver {
             // c-effortui r4 item 2: classify against the latest OBSERVED
             // effective selection (read-back); fall back to launch/requested
             // provenance only before any read-back exists.
+            // c-effortread r15 item 5: the fallback is the VALID LAUNCH
+            // selection — a previously armed switch whose write failed left
+            // its attempted target in the payload echo, and using it here let
+            // a cold flag-on configure masquerade as a same-tier toggle.
             let proven = live.effort_bridge.proven_selection();
-            let requested =
-                live.effort_bridge
-                    .requested()
-                    .map(|request| remuda_protocol::EffortSelection {
-                        name: request.name,
-                        ultracode: request.ultracode,
-                    });
+            let requested = live.effort_bridge.launch_selection();
             let Some(request) = crate::effort::EffortRequest::for_configure(
                 level,
                 ultracode,

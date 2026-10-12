@@ -105,6 +105,13 @@ const EXIT_STATUS_GRACE: std::time::Duration = std::time::Duration::from_millis(
 /// (a zombie the reaper had not reached), which the driver test caught.
 const REAP_EXITING_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Bounded flush of one live transcript drain between the promoted close
+/// ladder's rungs (c-ctxusage r15 item 7). A dying writer that appended its
+/// termination record has already settled; this only covers the poller tail
+/// read and queue flush, so it stays tight while still bounded on a loaded
+/// host.
+const PROMOTER_LIVE_DRAIN: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Native lifecycle name for a PTY process that ended (§5.5).
 pub const NATIVE_EXIT: &str = "native_exit";
 
@@ -465,6 +472,11 @@ pub struct ShellPtyDriver {
     /// hydrator finalise instead of aborting mid-pump.
     poller_shutdown: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     poller_finalised: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// Non-destructive live drain of the promotion poller (c-ctxusage r15
+    /// item 7): the promoted close stops the native writer first and flushes
+    /// its termination append between the stop-ladder rungs while the
+    /// hydrator and sender are still live.
+    live_drain: promotion::LiveDrain,
     /// Exit waiter (§5.5), stopped on close.
     waiter: Mutex<Option<JoinHandle<()>>>,
     /// Process table behind detection; a fixture in tests.
@@ -571,6 +583,7 @@ impl ShellPtyDriver {
             poller: Mutex::new(None),
             poller_shutdown: Mutex::new(None),
             poller_finalised: Mutex::new(None),
+            live_drain: promotion::LiveDrain::new(),
             waiter: Mutex::new(None),
             table,
             fallbacks: crate::hook_answer::FallbackLedger::new(),
@@ -1390,6 +1403,7 @@ impl ShellPtyDriver {
                 poller_rx,
                 finalised_tx,
                 test_faults,
+                self.live_drain.clone(),
             ));
             // A login shell has no agent at spawn; once promotion identifies a
             // hand-typed codex/grok, start its file adapter against the native
@@ -1569,7 +1583,61 @@ impl ShellPtyDriver {
     /// signal — a platform without them, or a child that reported no pid. That
     /// fallback is the pre-D-028 behaviour and inherits its weakness (it
     /// reaches the direct child only), which is why it is last and logged.
-    async fn stop_tree(&self, state: &Arc<PtyState>) -> DriverResult<StopOutcome> {
+    /// Run the stop ladder against the PTY group.
+    ///
+    /// `live_drain` (c-ctxusage r15 item 7): when the instance is a promoted
+    /// shell, close keeps the transcript poller, hydrator and event sender
+    /// live through the ladder, and after every rung the poller flushes any
+    /// record the dying native writer appended (bounded). In that mode
+    /// `state.closed` is left clear so the poller keeps draining; the caller
+    /// sets it only after the ladder verifies the group is gone.
+    /// Promoted close, phase 1 (c-ctxusage r15 item 7): stop the native
+    /// writer and verify the process group is gone WHILE the transcript
+    /// poller, hydrator and event sender are still live, draining the
+    /// writer's termination append after every stop-ladder rung. The
+    /// promoter itself is retired afterwards by close's normal poller
+    /// shutdown block.
+    async fn stop_promoted_writer_before_retire(&self) -> DriverResult<()> {
+        let state = self.state().await?;
+        // The exit waiter polls try_wait and could race the ladder's own
+        // death evidence; it is not the drain and is not needed here.
+        if let Some(mut waiter) = self.waiter.lock().await.take() {
+            waiter.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut waiter).await;
+        }
+        // From here the poller only tail-reads the bound transcript; it does
+        // not demote or finish the hydrator on an epoch boundary.
+        self.live_drain.arm_close();
+        let outcome = self.stop_tree(&state, true).await;
+        // Now that the writer is verified gone the poller may observe the
+        // closed epoch; close's poller-shutdown block retires it next.
+        state.closed.store(true, Ordering::SeqCst);
+        match outcome {
+            Ok(outcome) if outcome.group_gone => {
+                tracing::info!(
+                    rung = outcome.rung.label(),
+                    pgid = outcome.pgid,
+                    "promoted pty process group stopped before hydrator retirement"
+                );
+            }
+            Ok(outcome) => {
+                tracing::error!(
+                    rung = outcome.rung.label(),
+                    pgid = outcome.pgid,
+                    survivors = ?outcome.survivors,
+                    "stop-incomplete: the promoted process group outlived SIGKILL"
+                );
+            }
+            Err(error) => tracing::error!(%error, "promoted pty stop ladder failed"),
+        }
+        Ok(())
+    }
+
+    async fn stop_tree(
+        &self,
+        state: &Arc<PtyState>,
+        live_drain: bool,
+    ) -> DriverResult<StopOutcome> {
         let pgid = state.pgid.load(Ordering::SeqCst);
         if pgid <= 0 {
             tracing::warn!(
@@ -1598,7 +1666,11 @@ impl ShellPtyDriver {
         // closes itself: this drop is what makes its blocking read see EOF.
         let mut master = state.master.lock().await.take();
         let mut writer = state.writer.lock().await.take();
-        state.closed.store(true, Ordering::SeqCst);
+        if !live_drain {
+            // The promoted draining path sets this only after the ladder,
+            // when the writer is verified gone and the hydrator is retiring.
+            state.closed.store(true, Ordering::SeqCst);
+        }
         // Hold the child across the ladder so this is the only task reaping it.
         // The leader is our direct child; a SIGKILLed child sits as a zombie
         // until `wait`, and a zombie still answers killpg — that produced the
@@ -1621,15 +1693,22 @@ impl ShellPtyDriver {
                 }
             }
         };
-        let outcome = lifecycle::stop_group(
-            pgid,
-            move || {
-                drop(writer.take());
-                drop(master.take());
-            },
-            reaper,
-        )
-        .await?;
+        let close_master = move || {
+            drop(writer.take());
+            drop(master.take());
+        };
+        let ladder = if live_drain {
+            lifecycle::stop_group_draining(pgid, close_master, reaper, |_rung| async move {
+                // Bounded live flush of the writer's termination append
+                // while the poller, hydrator and event sender are still up.
+                let ack = self.live_drain.request().await;
+                let _ = tokio::time::timeout(PROMOTER_LIVE_DRAIN, ack).await;
+            })
+            .await
+        } else {
+            lifecycle::stop_group(pgid, close_master, reaper).await
+        };
+        let outcome = ladder?;
         // The leader can be classified dead while the kernel has not made it
         // reapable yet: on macOS a SIGKILLed session leader sits in `E`
         // (exiting) before it becomes a zombie. `stop_group` correctly reports
@@ -2732,12 +2811,28 @@ impl Driver for ShellPtyDriver {
             worker.abort();
         }
         self.events_tx.lock().await.take();
+        // Is a promoted native agent live in the foreground? In that case the
+        // native writer is stopped FIRST and its termination append drained
+        // while the poller/hydrator/sender are still live; the promoter is
+        // retired only after the process group is verified gone
+        // (c-ctxusage r15 item 7). A plain login shell keeps the old order:
+        // retire the promoter, then stop the group.
+        let promoted = self
+            .promoted
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false);
+        if promoted {
+            self.stop_promoted_writer_before_retire().await?;
+        }
         // c-ctxusage r4 item 2: cooperative poller shutdown. Signal closure
         // first, then give the poller one window to read the final append and
         // publish its last turn via `finish()` (an assistant record with usage
         // and no stop_reason would otherwise never reach usage_events). The
         // poller holds its own events sender clone, so finalised observations
-        // still reach the RunHandle while it winds down.
+        // still reach the RunHandle while it winds down. In the promoted
+        // draining path state.closed was set AFTER the ladder; here it is set
+        // BEFORE the poller retires.
         if let Some(inner) = self.inner.lock().await.as_ref() {
             inner.closed.store(true, Ordering::SeqCst);
         }
@@ -2822,10 +2917,20 @@ impl Driver for ShellPtyDriver {
         let Some(state) = self.inner.lock().await.take() else {
             return Ok(DriverAck::not_dispatched());
         };
+        if promoted {
+            // c-ctxusage r15 item 7: the writer was already stopped and
+            // verified with live drains before the promoter retired. Only the
+            // exit waiter remains to cancel.
+            if let Some(mut waiter) = self.waiter.lock().await.take() {
+                waiter.abort();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut waiter).await;
+            }
+            return Ok(DriverAck::not_dispatched());
+        }
         // Set before the ladder runs so the exit waiter reads this exit as the
         // ladder working rather than as an unexplained crash.
         state.closed.store(true, Ordering::SeqCst);
-        let outcome = self.stop_tree(&state).await;
+        let outcome = self.stop_tree(&state, false).await;
         if let Some(mut waiter) = self.waiter.lock().await.take() {
             waiter.abort();
             // Wait for the cancellation to land so the waiter's event-sender

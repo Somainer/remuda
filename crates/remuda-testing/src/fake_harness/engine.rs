@@ -231,6 +231,9 @@ struct Engine {
     osc_title: String,
     /// Last raw OSC 9;4 payload emitted (`"3;"` / `"0;"` in modern).
     osc_progress: String,
+    /// c-ctxusage r15 item 7: the stopping-signal transcript append happens
+    /// exactly once.
+    termination_record_appended: bool,
 }
 
 impl Engine {
@@ -440,6 +443,7 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         last_second: 0,
         osc_title: initial_title,
         osc_progress: initial_progress,
+        termination_record_appended: false,
     };
 
     if resuming {
@@ -868,6 +872,11 @@ impl Engine {
                 self.dirty = false;
             }
             if self.should_exit || self.stopping.load(Ordering::Relaxed) {
+                // c-ctxusage r15 item 7 test model: a native writer flushes a
+                // final transcript record WHILE HANDLING the close signal,
+                // before it exits. One record, appended exactly once, to the
+                // session transcript.
+                self.append_termination_record();
                 break;
             }
             let timeout = deadline
@@ -2807,6 +2816,55 @@ impl Engine {
             )?;
         }
         Ok(())
+    }
+
+    /// Test model for the promoted-shell close ordering (c-ctxusage r15
+    /// item 7): when FAKE_HARNESS_APPEND_ON_SIGNAL=1, append one final
+    /// assistant transcript record as the process handles the stopping
+    /// signal — the writer's termination-triggered append the closer must
+    /// drain before retiring the transcript hydrator.
+    fn append_termination_record(&mut self) {
+        if std::env::var("FAKE_HARNESS_APPEND_ON_SIGNAL").as_deref() != Ok("1") {
+            return;
+        }
+        if self.termination_record_appended {
+            return;
+        }
+        self.termination_record_appended = true;
+        // Only Claude-shaped transcripts hydrate through the promoter; the
+        // record mirrors the real assistant envelope.
+        if self.dialect != Dialect::Claude {
+            return;
+        }
+        let record = json!({
+            "type": "assistant",
+            "uuid": "termination-record-on-signal",
+            "timestamp": "2026-10-13T00:09:59.000Z",
+            "isSidechain": false,
+            "requestId": "req_termination_signal",
+            "message": {
+                "id": "msg_termination_signal",
+                "role": "assistant",
+                "type": "message",
+                "model": "claude-opus-5-5",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "termination flush"}],
+                "usage": {
+                    "input_tokens": 777,
+                    "output_tokens": 88,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0
+                }
+            }
+        });
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.paths.main)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{record}");
+            let _ = file.sync_all();
+        }
     }
 
     fn shutdown_artifacts(&mut self) -> Result<(), RunError> {

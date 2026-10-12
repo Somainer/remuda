@@ -766,6 +766,59 @@ fn silence_reason_for(
     None
 }
 
+/// A non-destructive request to the live promotion poller: run one tail
+/// collect/finalise pass and acknowledge once every parked frame has been
+/// flushed into the event channel. Used by close to drain a native writer's
+/// termination-triggered append BETWEEN the stop-ladder rungs, while the
+/// hydrator and the event sender are still live (c-ctxusage r15 item 7).
+#[derive(Clone)]
+pub(super) struct LiveDrain {
+    notify: Arc<Notify>,
+    waiters: Arc<tokio::sync::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
+    /// Armed for the whole promoted close ladder. While set the poller only
+    /// tail-reads the bound transcript: no process sampling, no demote
+    /// lifecycle, no epoch boundary finalise, so the close-time terminal
+    /// finalise keeps owning the hydrator.
+    closing: Arc<AtomicBool>,
+}
+
+impl LiveDrain {
+    pub(super) fn new() -> Self {
+        Self {
+            notify: Arc::new(Notify::new()),
+            waiters: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            closing: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Mark the close ladder as in progress.
+    pub(super) fn arm_close(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
+    }
+
+    /// Ask the poller for one live drain. The receiver fires after the next
+    /// collect pass has flushed every queued frame.
+    pub(super) async fn request(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.waiters.lock().await.push(tx);
+        // Wake AFTER enqueueing so the permit cannot be stored and lost.
+        self.notify.notify_one();
+        rx
+    }
+
+    async fn take_waiters(&self) -> Vec<tokio::sync::oneshot::Sender<()>> {
+        std::mem::take(&mut *self.waiters.lock().await)
+    }
+
+    async fn has_waiters(&self) -> bool {
+        !self.waiters.lock().await.is_empty()
+    }
+}
+
 /// Spawn the per-instance promotion poller.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn(
@@ -802,6 +855,7 @@ pub(super) fn spawn(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     finalised: tokio::sync::oneshot::Sender<()>,
     faults: Option<Arc<crate::test_faults::FaultState>>,
+    live_drain: LiveDrain,
 ) -> tokio::task::JoinHandle<()> {
     // One synchronized producer/hydrator/retirement state (c-ctxusage r9
     // item 2): a blocking closure registers before it is even queued, so an
@@ -905,6 +959,7 @@ pub(super) fn spawn(
         let mut tick = tokio::time::interval(PROMOTE_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut closing = false;
+        let mut drain_notified = false;
         loop {
             tokio::select! {
                 // Wakes close between ticks; a tick still drives normal polls.
@@ -912,9 +967,39 @@ pub(super) fn spawn(
                     closing = *shutdown.borrow_and_update();
                 }
                 _ = tick.tick() => {}
+                // c-ctxusage r15 item 7: a live mid-close drain request.
+                _ = live_drain.notify.notified() => {
+                    drain_notified = true;
+                }
             }
             if closing || state.closed.load(Ordering::SeqCst) || events.is_closed() {
                 break;
+            }
+            // c-ctxusage r15 item 7: while the promoted close ladder runs,
+            // do ONLY a non-terminal tail collect of the bound transcript.
+            // No process sampling (the writer is dying), no demote and no
+            // epoch-boundary hydrator finish: the close-time terminal finalise
+            // must keep owning the hydrator so the writer's termination append
+            // is drained while the sender is live.
+            if live_drain.is_closing() {
+                let _ = pump(
+                    &hydrator,
+                    &pending,
+                    &flush_notify,
+                    &events,
+                    &seq,
+                    &ctx,
+                    faults.as_ref(),
+                )
+                .await;
+                if drain_notified && live_drain.has_waiters().await {
+                    pending.wait_empty().await;
+                    for waiter in live_drain.take_waiters().await {
+                        let _ = waiter.send(());
+                    }
+                }
+                drain_notified = false;
+                continue;
             }
             let Sample { rows, mut found } = sample(&state, table.as_ref(), alias.as_ref()).await;
             // Detection can still be late: `ps` has not caught the exec yet,
@@ -1415,6 +1500,17 @@ pub(super) fn spawn(
                     .await
                 }
             }
+            // c-ctxusage r15 item 7: serve a live drain AFTER this
+            // iteration's collect/finalise pass and BEFORE the closing
+            // check, so a writer's termination append is read while the
+            // hydrator and sender are still live.
+            if drain_notified && live_drain.has_waiters().await {
+                pending.wait_empty().await;
+                for waiter in live_drain.take_waiters().await {
+                    let _ = waiter.send(());
+                }
+            }
+            drain_notified = false;
             // c-ctxusage r5 item 6: close can land while this iteration's pump
             // is still mapping. Check before waiting another tick so the final
             // finalise runs now (close awaits it via `finalised`), never after

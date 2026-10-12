@@ -460,3 +460,136 @@ async fn abort_before_a_queued_terminal_claims_still_delivers_final_usage_once()
         "cooperative terminal + abort residual must deliver the FINAL usage exactly once"
     );
 }
+
+const TERMINATION_MSG_ID: &str = "msg_termination_signal";
+
+/// c-ctxusage r15 item 7: a promoted native writer flushes one final
+/// transcript record WHILE HANDLING the close signal (the fake harness
+/// appends it on SIGINT, then exits). Close must stop and verify the native
+/// writer first, keeping the hydrator and sender live, drain that
+/// termination-triggered append between the stop-ladder rungs, and only then
+/// retire the hydrator. Before the fix close retired the promoter before the
+/// stop ladder ran, so the SIGINT-flushed record landed after the last tail
+/// read and was lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promoted_close_drains_the_writers_termination_append_before_hydrator_retires() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let workspace = root.join("workspace");
+    let native_home = root.join("home");
+    let instance_dir = root.join("instance");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&native_home).unwrap();
+    let install = root.join("opt/bin");
+    std::fs::create_dir_all(&install).unwrap();
+    let binary = install.join("claude");
+    std::fs::copy(ensure_workspace_bin("fake-harness"), &binary).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let events_path = root.join("harness-events.jsonl");
+
+    let transcript = remuda_driver::claude_transcript::project_dir(&native_home, &workspace)
+        .join(format!("{SESSION_ID}.jsonl"));
+    seed_transcript(&transcript, 20);
+
+    let mut options = ShellPtyOptions::agent(
+        workspace.clone(),
+        AgentKind::Claude,
+        AgentLaunch {
+            profile: Box::new(profile()),
+            launch_dir: instance_dir.join("launch"),
+            native_home: native_home.clone(),
+            binary: Some(binary),
+            origin: LaunchOrigin::Human,
+            native_home_managed: true,
+            settings_overlay: None,
+        },
+    );
+    options.emulator = true;
+    options.pin_native_home = true;
+    options.claude_home = Some(native_home.clone());
+    options
+        .extra_env
+        .insert("FAKE_HARNESS_DIALECT_VERSION".into(), "modern".into());
+    options.extra_env.insert(
+        "FAKE_HARNESS_EVENTS_OUT".into(),
+        events_path.to_string_lossy().into_owned(),
+    );
+    // The native writer's termination flush, modelled deterministically.
+    options
+        .extra_env
+        .insert("FAKE_HARNESS_APPEND_ON_SIGNAL".into(), "1".into());
+    options.hooks = Some(HookConfig {
+        instance_dir,
+        relay_binary: relay_bin(),
+        tui: remuda_driver::TuiMode::Default,
+    });
+    let driver = ShellPtyDriver::new(options);
+
+    let handle = driver
+        .start(spec_for(&workspace, DriverKind::ShellPty))
+        .await
+        .expect("start");
+    let mut events_rx = handle.into_events();
+    let term_count = Arc::new(AtomicUsize::new(0));
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
+    let drainer_count = Arc::clone(&term_count);
+    let drainer = tokio::spawn(async move {
+        while let Some(observation) = events_rx.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+                && native.native_name == "transcript_bound"
+                && let Some(tx) = bound_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+            if let ObservationPayload::Usage(payload) = &observation.body
+                && payload.scope_id == TERMINATION_MSG_ID
+            {
+                drainer_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(20), bound_rx)
+        .await
+        .expect("the seeded replay never bound")
+        .expect("bound oneshot closed without firing");
+    assert_eq!(
+        term_count.load(Ordering::SeqCst),
+        0,
+        "the termination record must not exist before the close signal"
+    );
+
+    let started = Instant::now();
+    driver.close().await.expect("promoted close");
+    // The ladder's polite rung alone has a 2 s settle bound plus the bounded
+    // live drain; a prompt writer exits within it, so the whole close stays
+    // well under the escalated-rung and promoter timeouts.
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "promoted draining close took {:?}",
+        started.elapsed()
+    );
+
+    driver.abort_event_workers_for_test().await;
+    tokio::time::timeout(Duration::from_secs(30), drainer)
+        .await
+        .expect("event channel never closed after close")
+        .expect("event drainer panicked");
+    assert_eq!(
+        term_count.load(Ordering::SeqCst),
+        1,
+        "the writer's SIGINT-flushed termination usage must be drained exactly once, \
+         before the hydrator retired"
+    );
+
+    // The record really was the writer's append (present on disk), proving the
+    // drain read a record written after the close signal.
+    let body = std::fs::read_to_string(&transcript).expect("transcript");
+    assert!(
+        body.contains(TERMINATION_MSG_ID),
+        "the fake writer appended the termination record to the transcript"
+    );
+}

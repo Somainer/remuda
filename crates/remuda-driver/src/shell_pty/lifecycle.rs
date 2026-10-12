@@ -391,18 +391,40 @@ where
 /// [`StopOutcome`] with `group_gone: false`, which the caller journals as
 /// `stop-incomplete`. An `Err` here means the *signal call itself* failed,
 /// which is a bug in the caller's pgid, not a stubborn process.
+///
+/// Stop the group with the documented ladder and no per-rung drain.
 pub(super) async fn stop_group<F, R>(
     pgid: i32,
-    mut close_master: F,
+    close_master: F,
     reap: &mut R,
 ) -> DriverResult<StopOutcome>
 where
     F: FnMut(),
     R: FnMut() -> bool,
 {
+    stop_group_draining(pgid, close_master, reap, |_| std::future::ready(())).await
+}
+
+/// Same ladder as the documented one, with `drain` invoked AFTER each rung's
+/// settle wait (Interrupt, Hangup, Kill) while the group members are gone or
+/// SIGKILLed: the promoted close uses it to flush the native writer's
+/// termination-triggered transcript append before retiring the hydrator
+/// (c-ctxusage r15 item 7). The drain receives the rung just completed.
+pub(super) async fn stop_group_draining<F, R, D, Fut>(
+    pgid: i32,
+    mut close_master: F,
+    reap: &mut R,
+    mut drain: D,
+) -> DriverResult<StopOutcome>
+where
+    F: FnMut(),
+    R: FnMut() -> bool,
+    D: FnMut(StopRung) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     #[cfg(not(unix))]
     {
-        let _ = (&mut close_master, pgid, reap);
+        let _ = (&mut close_master, pgid, reap, &mut drain);
         return Err(DriverError::CapabilityUnsupported(
             "the stop ladder requires unix process groups".into(),
         ));
@@ -413,6 +435,7 @@ where
 
         if pgid <= 0 {
             close_master();
+            drain(StopRung::Interrupt).await;
             return Ok(StopOutcome::already_gone());
         }
         // Collect an already-dead leader first: a process that exited on its
@@ -421,11 +444,15 @@ where
         reap();
         if !group_has_live_member(pgid) {
             close_master();
+            drain(StopRung::Interrupt).await;
             return Ok(StopOutcome::already_gone());
         }
 
         signal_group(pgid, Signal::SIGINT)?;
         if settled(pgid, GRACE_INT, reap).await {
+            // The polite writer is gone: its termination append lands during
+            // this wait and is drained before any escalation.
+            drain(StopRung::Interrupt).await;
             close_master();
             return Ok(StopOutcome {
                 rung: StopRung::Interrupt,
@@ -439,6 +466,7 @@ where
         close_master();
         signal_group(pgid, Signal::SIGHUP)?;
         if settled(pgid, GRACE_HUP, reap).await {
+            drain(StopRung::Hangup).await;
             return Ok(StopOutcome {
                 rung: StopRung::Hangup,
                 group_gone: true,
@@ -449,6 +477,9 @@ where
 
         signal_group(pgid, Signal::SIGKILL)?;
         let gone = settled(pgid, GRACE_KILL, reap).await;
+        // Nothing can append after SIGKILL: the final drain only covers
+        // records the dying writer parked between SIGHUP and death.
+        drain(StopRung::Kill).await;
         Ok(StopOutcome {
             rung: StopRung::Kill,
             group_gone: gone,

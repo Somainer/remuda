@@ -36,6 +36,10 @@ pub(super) struct BoundedPending<T> {
     /// Owning it here makes the notify-before-wait ordering impossible for a
     /// caller to forget.
     notify: Arc<Notify>,
+    /// Notified when the queue transitions to empty after a delivery pop
+    /// (c-ctxusage r15 item 7): a mid-close live drain parks here instead of
+    /// polling with a sleep.
+    empty: Arc<Notify>,
     /// Set once delivery can never resume (event channel gone); waiting
     /// producers unblock and discard their remainder.
     closed: AtomicBool,
@@ -72,11 +76,24 @@ impl<T> BoundedPending<T> {
             queue: Mutex::new(VecDeque::with_capacity(capacity)),
             space: Condvar::new(),
             notify,
+            empty: Arc::new(Notify::new()),
             closed: AtomicBool::new(false),
             waiting: AtomicUsize::new(0),
             #[cfg(test)]
             event_barrier: std::sync::Mutex::new(None),
             capacity,
+        }
+    }
+
+    /// Wait until every parked frame has been popped for delivery. Notify-
+    /// driven, never a timed poll.
+    pub(super) async fn wait_empty(&self) {
+        loop {
+            let notified = self.empty.notified();
+            if self.is_empty() {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -188,6 +205,10 @@ impl<T> BoundedPending<T> {
         let frame = guard.pop_front()?;
         // One slot freed: wake exactly one parked producer.
         self.space.notify_one();
+        if guard.is_empty() {
+            // The popped frame is the last queued: wake a live drain.
+            self.empty.notify_one();
+        }
         Some(frame)
     }
 
@@ -218,6 +239,8 @@ impl<T> BoundedPending<T> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.space.notify_all();
+        // Release any live drain parked on queue emptiness.
+        self.empty.notify_waiters();
     }
 }
 

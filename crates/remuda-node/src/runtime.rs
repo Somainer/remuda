@@ -6136,6 +6136,11 @@ mod tests {
 mod api_relay_launch_test {
     use super::*;
     use crate::{FakeDriver, MemoryStore};
+    // Test-only DriverKind references left without the top-level import after
+    // the ma-sdk-state origin/main merge (24a8bbdd): production code now
+    // qualifies DriverKind in full, while every other cfg(test) site imports
+    // it locally; this sibling test module needs it at its top.
+    use remuda_protocol::DriverKind;
 
     fn node() -> DevNode {
         let config = crate::DevServerConfig::loopback(0)

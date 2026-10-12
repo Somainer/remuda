@@ -230,13 +230,19 @@ const EFFORT_REQUEST_ID_KEY = "effortRequestId";
 const EFFORT_PENDING_MAX_AGE_MS = 30 * 60_000;
 
 /**
- * c-effortread r12 item 5: bounded, request-owned reconciliation for an
- * ID-LESS driver. An older driver that accepts a no-op (the target already
- * equals the observed state) emits no completion id, and its mapper suppresses
- * unchanged observations — without this bound the chip sat on 切换中 for the
- * whole 30-minute max age. The bound mirrors the driver's own read-back window
- * (10s) plus a delivery margin: at the bound we request one fresh read-back
- * (the strict fallback settles a real switch) or surface an explicit
+ * c-effortread r12 item 5 / r13 item 4: bounded, request-owned reconciliation
+ * for an ID-LESS driver. An older driver that accepts a no-op (the target
+ * already equals the observed state) emits no completion id, and its mapper
+ * suppresses unchanged observations — without this bound the chip sat on
+ * 切换中 for the whole 30-minute max age.
+ *
+ * The bound mirrors the driver's own read-back window (10s) plus a delivery
+ * margin. It NEVER queries the driver for current state: the protocol has no
+ * such operation (r13 item 4 coordinator ruling), so a re-read of the stored
+ * Hub record would be stale-state theatre, not fresh evidence. A genuine
+ * post-command projection instead arrives through the normal channels (a live
+ * follow effort edge, the routine list poll) and settles through the strict
+ * fallback before the deadline; otherwise the request ends in the explicit
  * "unconfirmed" outcome — never a silent pending.
  */
 const EFFORT_UNCONFIRMED_BOUND_MS = 15_000;
@@ -4532,7 +4538,7 @@ class HubStore {
    * running turn (`leftQueueAt == null`) waits instead of burning its bound
    * in the queue; the 30-minute max-age backstop bounds the total wait.
    */
-  private async runEffortReconciliation(instanceId: Id, nonce: number) {
+  private runEffortReconciliation(instanceId: Id, nonce: number) {
     const slot = this.effortReconcileTimers.get(instanceId);
     const pendingNow = this.state.effortPending[instanceId];
     // Settled/failed, or replaced by a newer request (which armed its own
@@ -4566,17 +4572,23 @@ class HubStore {
       this.effortReconcileTimers.set(instanceId, { nonce, timer });
       return;
     }
-    // One fresh authoritative read-back: an id-less success settles here via
-    // the strict read-back fallback in hydrateEffortEffective.
-    await this.refresh().catch(() => undefined);
+    // c-effortread r13 item 4 / coordinator ruling: the protocol offers NO
+    // request the web/Hub can send to obtain the driver's CURRENT effort (the
+    // hub-node method set has configure/send/read for other surfaces, nothing
+    // that forces a driver read-back), so the bound must not re-read the Hub
+    // database and present stored state as a FRESH read-back. Genuine driver
+    // projections produced after the command still reach this store through
+    // the normal channels — the live follow effort edge and the routine poll —
+    // and settle via the strict fallback BEFORE this instant. If the pending
+    // is still here, no fresh evidence ever arrived: end the request.
     const after = this.state.effortPending[instanceId];
     if (!after || after.nonce !== nonce) {
       this.effortReconcileTimers.delete(instanceId);
       return;
     }
     if (after.leftQueueAt == null) {
-      // A new turn re-queued the request during the read-back: the next
-      // working→idle evidence re-arms the bound; wait rather than ending it
+      // A new turn re-queued the request during the bound: the next
+      // working→idle evidence re-arms it; wait rather than ending it
       // unconfirmed against a request the driver has not run yet.
       const timer = setTimeout(() => {
         void this.runEffortReconciliation(instanceId, nonce);
@@ -4678,11 +4690,13 @@ class HubStore {
       // follow frame was gapped/coalesced; the 2s poll keeps settling it if
       // this read races. Bounded by one network round trip — no timer.
       await this.refresh().catch(() => undefined);
-      // c-effortread r12 item 5: arm the bounded reconciliation. A new
-      // driver's id-bearing completion settles the request long before the
-      // bound; an id-less driver's silent accepted no-op gets one more fresh
-      // read-back and then an explicit unconfirmed outcome instead of sitting
-      // on 切换中 for the 30-minute max age.
+      // c-effortread r12 item 5 / r13 item 4: arm the bounded reconciliation.
+      // A new driver's id-bearing completion settles the request long before
+      // the bound; an id-less driver's silent accepted no-op gets no extra
+      // query (the protocol has none) — a genuinely newer projection still
+      // arrives over the live journal or routine poll, otherwise the bound
+      // ends it in an explicit unconfirmed outcome instead of sitting on
+      // 切换中 for the 30-minute max age.
       this.armEffortReconciliation(instanceId, nonce);
     } catch (error) {
       // A failed configure (offline node, network, 4xx) must not leave an

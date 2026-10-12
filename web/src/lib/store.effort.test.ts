@@ -2787,10 +2787,10 @@ it("r13 item 2: the bound starts on working → idle evidence, so a no-op after 
   expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
   expect(toast).not.toHaveBeenCalled();
 
-  // At the post-idle bound the fresh read-back still has no newer evidence:
-  // explicit unconfirmed instead of the 30-minute silent pending.
+  // At the post-idle bound no fresh evidence ever arrived: the request ends
+  // explicitly unconfirmed (r13 item 4 — the bound performs no Hub re-read).
   await advanceEffortReconcile(2);
-  expect(listCalls, "the read-back happens only after the queue exit").toBeGreaterThan(listsAfterPost);
+  expect(listCalls, "the bound never re-reads the stored Hub record").toBe(listsAfterPost);
   expect(hubStore.effortPendingOf(ctx.instance.id), "unconfirmed ends the pending").toBeNull();
   expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");
 });
@@ -2899,16 +2899,21 @@ it("r12 item 5: an id-less accepted no-op surfaces an explicit unconfirmed outco
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("low");
 });
 
-it("r12 item 5: a fresh post-command read-back at the bound settles the id-less request (no unconfirmed)", async () => {
-  const ctx = await startFollowing("r12-item5-readback", { state: "known", value: "idle" });
+it("r13 item 4: a genuine live driver projection settles the id-less request; the bound never re-reads the Hub DB", async () => {
+  const ctx = await startFollowing("r13-item4-live", { state: "known", value: "idle" });
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // The stored Hub record stays the unchanged baseline for the WHOLE test:
+  // the bound must not treat a re-read of it as fresh evidence.
   const baseline: Instance = {
     ...ctx.instance,
     effortEffective: { name: "low", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
   };
-  let listed: Instance = baseline;
-  vi.spyOn(api, "instanceList").mockImplementation(async () => ({ items: [listed] }) as never);
+  let listCalls = 0;
+  vi.spyOn(api, "instanceList").mockImplementation(async () => {
+    listCalls += 1;
+    return { items: [baseline] } as never;
+  });
   const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
 
   ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
@@ -2916,17 +2921,52 @@ it("r12 item 5: a fresh post-command read-back at the bound settles the id-less 
   const p = hubStore.setEffort(ctx.instance.id, { index: 1, name: "low", kind: "claude", ultracode: false });
   await advanceEffortReconcile(0);
   await p;
+  const listsAfterPost = listCalls;
   expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
 
-  // The bound arrives and requests a FRESH read-back: it now carries newer,
-  // value-matching evidence and settles through the strict fallback.
-  listed = {
+  // The real driver projects the post-command read-back through the LIVE
+  // follow journal (the production channel), strictly newer than the send and
+  // matching the requested axis. It settles through the strict fallback.
+  ctx.receive(
+    effortEvent(3, "low", false, "remuda", "2026-09-16T00:00:05.000Z", {
+      requested: { name: "low", ultracode: false },
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id), "the live projection settles").toBeNull();
+
+  // The bound fires later into a no-op and performs NO database re-read; a
+  // settled request is never reported unconfirmed.
+  await advanceEffortReconcile(20_000);
+  expect(listCalls, "the bound never re-reads the stored Hub record").toBe(listsAfterPost);
+  expect(toast).not.toHaveBeenCalled();
+});
+
+it("r13 item 4: with no driver query op and no live projection the bound ends unconfirmed without a re-read", async () => {
+  const ctx = await startFollowing("r13-item4-noread", { state: "known", value: "idle" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const baseline: Instance = {
     ...ctx.instance,
-    effortEffective: { name: "low", ultracode: false, source: "remuda", observedAt: "2026-09-16T00:00:20.000Z" },
+    effortEffective: { name: "low", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
   };
+  let listCalls = 0;
+  vi.spyOn(api, "instanceList").mockImplementation(async () => {
+    listCalls += 1;
+    return { items: [baseline] } as never;
+  });
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
+  const p = hubStore.setEffort(ctx.instance.id, { index: 1, name: "low", kind: "claude", ultracode: false });
+  await advanceEffortReconcile(0);
+  await p;
+  const listsAfterPost = listCalls;
+
   await advanceEffortReconcile(15_001);
-  expect(hubStore.effortPendingOf(ctx.instance.id), "the fresh read-back settles").toBeNull();
-  expect(toast, "a settled request is never reported unconfirmed").not.toHaveBeenCalled();
+  expect(hubStore.effortPendingOf(ctx.instance.id), "explicit unconfirmed").toBeNull();
+  expect(listCalls, "a stored-state re-read is never presented as fresh evidence").toBe(listsAfterPost);
+  expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");
 });
 
 it("r12 item 5: a still-queued request gets one bounded extension and is never called unconfirmed", async () => {

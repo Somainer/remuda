@@ -144,6 +144,105 @@ pub fn group_alive(pgid: i32) -> bool {
     }
 }
 
+/// What the host can establish about one child process BEFORE its parent
+/// reaps it (ma-sdk-state r14 item 4).
+///
+/// The distinction between "missing" and "unknown" is load-bearing: an
+/// unreadable `/proc` on Linux must never be read as death (the r13 test
+/// helper mapped every read error to "gone", which is always true on macOS
+/// where `/proc` does not exist).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildDisposition {
+    /// No such process: it exited and has already been reaped (or the pid is
+    /// stale). Signal 0 returns `ESRCH` (Linux also: `/proc/<pid>` is ENOENT).
+    Gone,
+    /// Dead but not yet reaped by its parent: Linux `/proc` state `Z`/`X`/`x`.
+    Zombie,
+    /// Still running.
+    Alive,
+    /// The information is unavailable (unreadable `/proc` for a reason other
+    /// than ENOENT, `EPERM` from signal 0, or a non-Linux platform whose only
+    /// probe cannot see zombie state). Callers that need proof of death keep
+    /// waiting rather than treating this as gone.
+    Unknown,
+}
+
+/// Classify one direct child from its Linux `/proc/<pid>/stat` contents and a
+/// signal-0 probe result.
+///
+/// `stat` is the raw read result: ENOENT means gone; ANY OTHER read error
+/// falls through to the signal-0 probe and can only ever yield
+/// [`ChildDisposition::Gone`] on a confirming `ESRCH` — existence (`Ok`)
+/// under an unreadable `/proc` is [`ChildDisposition::Unknown`], never death.
+#[cfg(target_os = "linux")]
+pub(crate) fn classify_linux_child(
+    stat: std::io::Result<String>,
+    signal0: Result<(), nix::errno::Errno>,
+) -> ChildDisposition {
+    match stat {
+        Ok(text) => classify_linux_stat(&text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ChildDisposition::Gone,
+        Err(_) => match signal0 {
+            // The process exists but /proc would not say in what state: that is
+            // unavailable information, not evidence of death.
+            Ok(()) | Err(nix::errno::Errno::EPERM) => ChildDisposition::Unknown,
+            Err(nix::errno::Errno::ESRCH) => ChildDisposition::Gone,
+            Err(_) => ChildDisposition::Unknown,
+        },
+    }
+}
+
+/// Parse the state letter out of a `/proc/<pid>/stat` line ("<comm>) <state> …";
+/// comm can contain spaces/parens, so split at the LAST ')'. An unparseable
+/// line is [`ChildDisposition::Unknown`] rather than a guess.
+#[cfg(target_os = "linux")]
+fn classify_linux_stat(stat: &str) -> ChildDisposition {
+    match stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+    {
+        Some("Z") | Some("X") | Some("x") => ChildDisposition::Zombie,
+        Some(_) => ChildDisposition::Alive,
+        None => ChildDisposition::Unknown,
+    }
+}
+
+/// Establish one child's disposition (ma-sdk-state r14 item 4).
+///
+/// * **Linux**: `/proc/<pid>/stat` distinguishes a live child from an
+///   unreaped zombie — exactly the state a SIGKILLed child sits in before its
+///   parent's `wait()` — and ENOENT means reaped/gone. Any other read failure
+///   is confirmed against signal 0 instead of being assumed to be death.
+/// * **macOS/other unix**: there is no `/proc`; signal 0 is the available
+///   probe. `ESRCH` is gone/reaped, `Ok` means the process EXISTS (live or an
+///   unreaped zombie — signal 0 cannot tell them apart on this platform), and
+///   `EPERM` is unknown. Callers requiring gone/zombie evidence keep waiting.
+#[must_use]
+pub fn child_disposition(pid: i32) -> ChildDisposition {
+    if pid <= 0 {
+        return ChildDisposition::Unknown;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+        let signal0 = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
+        classify_linux_child(stat, signal0)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+            Ok(()) => ChildDisposition::Alive,
+            Err(nix::errno::Errno::ESRCH) => ChildDisposition::Gone,
+            Err(_) => ChildDisposition::Unknown,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        ChildDisposition::Unknown
+    }
+}
+
 /// Whether a single process (by pid, not group) is still running.
 ///
 /// Like [`group_alive`], this asks the kernel with signal 0 rather than parsing
@@ -1010,5 +1109,87 @@ mod tests {
         assert!(outcome.group_gone, "a zombie is not an outlived group");
         assert!(outcome.survivors.is_empty());
         assert_eq!(outcome.rung, StopRung::AlreadyGone);
+    }
+}
+
+/// ma-sdk-state r14 item 4: the child-disposition classifier distinguishes a
+/// missing child (ENOENT / ESRCH) from UNAVAILABLE information (unreadable
+/// `/proc` for another reason), and reads zombie/alive state correctly.
+#[cfg(all(test, target_os = "linux"))]
+mod child_disposition_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    fn ioerr(kind: ErrorKind) -> std::io::Result<String> {
+        Err(Error::new(kind, "synthetic /proc failure"))
+    }
+
+    #[test]
+    fn an_unreadable_proc_is_unknown_when_the_process_exists_not_gone() {
+        // The r13 bug: ANY /proc read error mapped to "gone". With the process
+        // answering signal 0, EACCES/other is unavailable information.
+        assert_eq!(
+            classify_linux_child(ioerr(ErrorKind::PermissionDenied), Ok(())),
+            ChildDisposition::Unknown
+        );
+        assert_eq!(
+            classify_linux_child(
+                ioerr(ErrorKind::PermissionDenied),
+                Err(nix::errno::Errno::EPERM)
+            ),
+            ChildDisposition::Unknown
+        );
+    }
+
+    #[test]
+    fn a_missing_proc_entry_is_gone() {
+        assert_eq!(
+            classify_linux_child(ioerr(ErrorKind::NotFound), Err(nix::errno::Errno::ESRCH)),
+            ChildDisposition::Gone
+        );
+    }
+
+    #[test]
+    fn an_unreadable_proc_with_esrch_is_gone() {
+        assert_eq!(
+            classify_linux_child(
+                ioerr(ErrorKind::PermissionDenied),
+                Err(nix::errno::Errno::ESRCH)
+            ),
+            ChildDisposition::Gone
+        );
+    }
+
+    #[test]
+    fn proc_states_are_classified_zombie_alive_or_unknown() {
+        assert_eq!(
+            classify_linux_child(Ok("1234 (fake claude) Z 100 1234".into()), Ok(())),
+            ChildDisposition::Zombie
+        );
+        assert_eq!(
+            classify_linux_child(Ok("1234 (we)ird (name)) x 1 2".into()), Ok(())),
+            ChildDisposition::Zombie,
+            "state is parsed AFTER the last ')' so comms with parens work"
+        );
+        assert_eq!(
+            classify_linux_child(Ok("1234 (fake) S 100 1234".into()), Ok(())),
+            ChildDisposition::Alive
+        );
+        assert_eq!(
+            classify_linux_child(Ok("garbage".into()), Ok(())),
+            ChildDisposition::Unknown,
+            "an unparseable stat line is not guessed alive"
+        );
+    }
+
+    #[test]
+    fn a_pid_above_the_kernel_limit_is_gone_or_unknown_never_alive() {
+        // 99,999,999 exceeds both Linux PID_MAX_LIMIT and macOS's 99,999 cap.
+        let disposition = child_disposition(99_999_999);
+        assert_ne!(
+            disposition,
+            ChildDisposition::Alive,
+            "an impossible pid must never look alive"
+        );
     }
 }

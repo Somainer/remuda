@@ -113,30 +113,33 @@ fn process_alive(pid: &str) -> bool {
     remuda_driver::shell_pty::lifecycle::group_alive(pid)
 }
 
-/// Whether the direct child has received its fatal signal: its `/proc` entry is
-/// gone (reaped) or its state is zombie/dead (ma-sdk-state r13 item 3). Signal-0
-/// liveness answers yes for an unreaped zombie, which is exactly the state a
-/// SIGKILLed child sits in before `close` reaps it, so inspect `/proc` directly.
+/// Whether the direct child has received its fatal signal: reaped/gone OR an
+/// unreaped zombie/dead (ma-sdk-state r14 item 4). Signal-0 liveness answers
+/// yes for an unreaped zombie, which is exactly the state a SIGKILLed child
+/// sits in before `close` reaps it, so Linux inspects `/proc` state directly;
+/// the classifier distinguishes a missing child from UNAVAILABLE information
+/// (`Unknown` here means "keep waiting", never "gone" — the r13 helper treated
+/// any unreadable `/proc` as death, which is always the answer on macOS where
+/// `/proc` does not exist).
 fn child_gone_or_zombie(pid: &str) -> bool {
     let Ok(pid) = pid.parse::<i32>() else {
         return false;
     };
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return true;
-    };
-    // `/proc/<pid>/stat`: "<comm in parens>) <state> ..."; the comm itself can
-    // contain spaces/parens, so split at the LAST ')'.
-    stat.rsplit_once(')')
-        .and_then(|(_, rest)| rest.split_whitespace().next())
-        .is_some_and(|state| matches!(state, "Z" | "X" | "x"))
+    matches!(
+        remuda_driver::shell_pty::lifecycle::child_disposition(pid),
+        remuda_driver::shell_pty::lifecycle::ChildDisposition::Gone
+            | remuda_driver::shell_pty::lifecycle::ChildDisposition::Zombie
+    )
 }
 
-/// ma-sdk-state r14 item 2: the ONE named bounded wait every pre-close
-/// SIGKILL-death assertion goes through (ma-sdk-state r14's no-inline-sleep
-/// rule replaces the r13 inline poll loop). The transition to gone/zombie is
-/// external kernel state with no driver acknowledgement, so a short poll
-/// interval is unavoidable — it lives inside this named helper, never at a
-/// call site — and the overall deadline is the named bound.
+/// ma-sdk-state r14 item 2/4: the ONE named bounded wait every pre-close
+/// fatal-signal death assertion goes through (the no-inline-sleep rule).
+/// `Alive` keeps polling; `Unknown` (unreadable `/proc`/`EPERM`, or a platform
+/// whose only probe cannot distinguish a zombie) also keeps polling rather
+/// than being mistaken for death. The transition to gone/zombie is external
+/// kernel state with no driver acknowledgement, so a short poll interval is
+/// unavoidable — it lives inside this named helper, never at a call site — and
+/// the overall deadline is the named bound.
 async fn wait_child_gone_or_zombie(pid: &str, timeout: Duration) {
     let deadline = std::time::Instant::now() + timeout;
     while !child_gone_or_zombie(pid) {

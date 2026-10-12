@@ -107,9 +107,12 @@ pub(crate) struct FaultState {
     /// Acknowledged when the armed close reaches the park point.
     close_tail_entered: Mutex<bool>,
     close_tail_entered_cv: Condvar,
-    /// Async gate the parked close awaits; the test opens it once the
-    /// overlapping second close is queued on the close-phase owner.
-    close_tail_gate: tokio::sync::Notify,
+    /// Async release the parked close waits for, installed BEFORE the
+    /// entered acknowledgement so a release that lands before the parked
+    /// future is polled is never lost (a bare `Notify::notify_waiters`
+    /// would be — c-ctxusage r15 item 9). `Some` while an armed close is
+    /// parked; the test's release takes and fires the oneshot.
+    close_tail_gate: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Number of close() calls that have reached the close-phase entry
     /// (signalled BEFORE acquiring the owner), so a test can prove a second
     /// close is genuinely in flight without any timing inference.
@@ -159,7 +162,7 @@ impl FaultState {
             close_tail_armed: AtomicBool::new(false),
             close_tail_entered: Mutex::new(false),
             close_tail_entered_cv: Condvar::new(),
-            close_tail_gate: tokio::sync::Notify::new(),
+            close_tail_gate: Mutex::new(None),
             close_phase_calls: Mutex::new(0),
             close_phase_calls_cv: Condvar::new(),
         })
@@ -185,19 +188,35 @@ impl FaultState {
         if !self.close_tail_armed.swap(false, Ordering::SeqCst) {
             return;
         }
+        // Install the one-shot release target FIRST (c-ctxusage r15 item 9):
+        // a release that races this park and lands before it is polled is
+        // delivered through the channel, whereas a Notify wake emitted with
+        // no registered waiter would be silently lost.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self
+            .close_tail_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+        // Only now publish the entered acknowledgement the test waits on
+        // before releasing.
         *self
             .close_tail_entered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         self.close_tail_entered_cv.notify_all();
-        // The test opens the gate with notify_waiters once the overlapping
-        // close is queued; the 120 s bound turns a forgotten release into a
-        // loud test failure instead of a hang.
-        let parked = self.close_tail_gate.notified();
-        match tokio::time::timeout(Duration::from_secs(120), parked).await {
-            Ok(()) => {}
-            Err(_) => tracing::debug!("close-tail gate timed out; proceeding"),
+        // The 120 s bound turns a forgotten release into a loud test failure
+        // instead of a hang; a racing release is already buffered in rx.
+        match tokio::time::timeout(Duration::from_secs(120), rx).await {
+            Ok(Ok(())) => {}
+            // Timed out, or the release half dropped (a second armed close
+            // replaced it): proceed either way.
+            _ => tracing::debug!("close-tail gate timed out; proceeding"),
         }
+        // Park is over: drop any stale sender before the next arm.
+        *self
+            .close_tail_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Called from INSIDE the blocking phase (a spawn_blocking closure).
@@ -510,9 +529,20 @@ impl TranscriptFaults {
         self.inner.close_tail_armed.store(true, Ordering::SeqCst);
     }
 
-    /// Release a close parked at the close-tail gate.
+    /// Release a close parked at the close-tail gate. Fires the installed
+    /// one-shot; if the park has not installed it yet this is a no-op (the
+    /// test waits for `wait_close_tail_entered` first, which is published
+    /// only AFTER the sender is installed — c-ctxusage r15 item 9).
     pub fn release_close_tail(&self) {
-        self.inner.close_tail_gate.notify_waiters();
+        let sender = self
+            .inner
+            .close_tail_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
     }
 
     /// Block until the armed close reaches its tail park point (bounded).
@@ -840,5 +870,41 @@ mod terminal_gate_tests {
             coop,
             "the post-rebind cooperative terminal never left its park",
         );
+    }
+}
+
+#[cfg(all(test, feature = "test-faults"))]
+mod close_tail_gate_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// c-ctxusage r15 item 9: the release must not be lost when it lands at
+    /// the exact protocol point the test is synchronised on — immediately
+    /// after the entered acknowledgement, before the parked close task has
+    /// necessarily registered its wait. The old `Notify::notify_waiters`
+    /// shape dropped a wake with no registered waiter, so the close sat in
+    /// its park until the 120 s bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_races_park_registration_and_still_opens_the_gate() {
+        let faults = TranscriptFaults::new();
+        let state = Arc::clone(&faults.inner);
+        faults.arm_close_tail_gate();
+        let parked = tokio::spawn(async move {
+            state.await_close_tail_gate().await;
+        });
+        // The documented protocol point: only release once the entered ack
+        // is observable (published AFTER the release sender is installed).
+        assert!(
+            faults.wait_close_tail_entered(),
+            "the parked close never published its entered ack"
+        );
+        faults.release_close_tail();
+        // With the oneshot the wake is buffered: the parked task completes
+        // promptly regardless of how its scheduling lands. Five seconds is
+        // far inside the gate's 120 s hang bound.
+        tokio::time::timeout(std::time::Duration::from_secs(5), parked)
+            .await
+            .expect("the parked close never observed its release")
+            .expect("the parked close task panicked");
     }
 }

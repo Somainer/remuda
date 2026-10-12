@@ -705,6 +705,7 @@ impl ClaudePrintDriver {
     /// Test-only (`test-stub`, r9 item 4): enqueue an ordered publication fence
     /// and return its receiver, which resolves once every earlier publication
     /// (including a deferred settle enqueued ahead of the fence) is drained.
+    #[cfg(feature = "test-stub")]
     async fn enqueue_publication_fence(&self) -> tokio::sync::oneshot::Receiver<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if let Some(publisher) = self.inner.publish.lock().await.clone() {
@@ -3298,6 +3299,7 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                                 )
                             }
                         };
+                        #[cfg(feature = "test-stub")]
                         let emitted = start.is_some();
                         if let Some(start) = start {
                             emit_all(&inner, vec![start]).await?;

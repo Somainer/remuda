@@ -35,7 +35,6 @@ use crate::launch::HookSession;
 pub const ADAPTER_POLL: Duration = Duration::from_millis(250);
 
 /// Everything the supervisor needs to stamp and route observations.
-#[derive(Clone)]
 pub struct AdapterCtx {
     /// Instance identity shared with the hook bus.
     pub stamp: StampCtx,
@@ -74,6 +73,14 @@ pub struct AdapterCtx {
     /// through bind and is closed with the driver. `None` for promoted /
     /// hook-confirmed / non-codex launches.
     pub(crate) lifetime: Option<crate::adapters::codex_discovery::LifetimeGuard>,
+    /// c-usagefu r12 item 2 (Ruling A2'): pending-discovery window the launch
+    /// site opened TOGETHER with the lifetime BEFORE the process started. The
+    /// codex adapter takes ownership of it instead of opening its own at
+    /// construction, so the gap between agent.start and adapter construction
+    /// (generic-pty settlement, up to 60 s) is covered by a live discovery
+    /// window and another window's release cannot prune intervals this
+    /// launch's pending decision still needs.
+    pub(crate) window: Option<crate::adapters::codex_discovery::DiscoveryWindow>,
 }
 
 /// Handle to a running adapter task. Dropping/aborting it stops the poll loop.
@@ -151,6 +158,12 @@ pub fn spawn_file_adapters(
             // key so its floor is not re-registered at adapter construction.
             if let Some(lifetime) = ctx.lifetime.take() {
                 adapter = adapter.with_lifetime(lifetime);
+            }
+            // r12 item 2 (A2'): take the window opened before the process
+            // started, if the launch site pre-registered one; with_instance_key
+            // then skips opening a late window of its own.
+            if let Some(window) = ctx.window.take() {
+                adapter = adapter.with_window(window);
             }
             let mut adapter = adapter.with_instance_key(ctx.instance_key.clone());
             if let Some(probe) = &ctx.ownership {

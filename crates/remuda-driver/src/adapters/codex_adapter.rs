@@ -191,6 +191,24 @@ impl CodexAdapter {
         self
     }
 
+    /// Attach a discovery window the LAUNCH site opened TOGETHER with the
+    /// lifetime BEFORE the agent process started (c-usagefu r12 item 2,
+    /// Ruling A2'). Generic-pty waits out agent settlement (up to 60 s) before
+    /// it can construct this adapter; had the window opened only here, another
+    /// window releasing during that gap would be seen as the cwd's LAST window
+    /// and prune the closed intervals / prompt evidence a registered but
+    /// not-yet-adapted launch's later discovery decision still needs. Must be
+    /// applied before [`Self::with_instance_key`], which then does not open a
+    /// second window (its `self.window.is_none()` guard).
+    #[must_use]
+    pub(crate) fn with_window(
+        mut self,
+        window: crate::adapters::codex_discovery::DiscoveryWindow,
+    ) -> Self {
+        self.window = Some(window);
+        self
+    }
+
     /// Test seam: record this instance's close at `at` when the adapter
     /// drops, instead of wall-clock time (deterministic lifetime overlaps).
     #[cfg(test)]

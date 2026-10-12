@@ -396,15 +396,32 @@ impl GenericPtyDriver {
         // close; success hands one clone to the adapter and keeps one here.
         let instance_key = uuid::Uuid::new_v4().to_string();
         let launched_at = time::OffsetDateTime::now_utc();
-        let lifetime = if preset.id.eq_ignore_ascii_case("codex") {
-            Some(crate::adapters::codex_discovery::begin_lifetime(
+        // c-usagefu r12 item 2 (Ruling A2'): for a codex launch the pending
+        // DISCOVERY window is opened TOGETHER with the lifetime and BEFORE the
+        // agent process starts — not when the file adapter is constructed.
+        // Generic-pty waits out agent settlement (up to 60 s) before it can
+        // build the adapter; opening the window only there let another
+        // instance's window release during that gap be treated as the cwd's
+        // LAST window, pruning the closed lifetime segments (and clearing the
+        // prompt evidence) this registered-but-not-yet-adapted launch's later
+        // discovery decision still needs. The window is handed to the adapter
+        // below; a launch failure drops both it and the lifetime here.
+        let lifetime;
+        let mut pending_window;
+        if preset.id.eq_ignore_ascii_case("codex") {
+            // The lifetime AND the pending-discovery window are one bundle
+            // registered BEFORE the process starts (r12 item 2, Ruling A2').
+            let pending = crate::adapters::codex_discovery::register_pending_launch(
                 std::path::Path::new(&recipe.cwd),
                 &instance_key,
                 Some(launched_at),
-            ))
+            );
+            lifetime = Some(pending.lifetime);
+            pending_window = Some(pending.window);
         } else {
-            None
-        };
+            lifetime = None;
+            pending_window = None;
+        }
         let started = crate::pty_interaction::start_agent(
             &client,
             AgentStartParams {
@@ -566,6 +583,7 @@ impl GenericPtyDriver {
             ownership_probe,
             Arc::clone(&agent_pid_roots),
             lifetime.clone(),
+            pending_window.take(),
         );
         *self.inner.lock().await = Some(PtyLive {
             ctx,
@@ -627,6 +645,9 @@ impl GenericPtyDriver {
         ownership_probe: Option<Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>>,
         agent_pid_roots: Arc<std::sync::Mutex<Vec<u32>>>,
         lifetime: Option<crate::adapters::codex_discovery::LifetimeGuard>,
+        // r12 item 2: the pending-discovery window opened before the process
+        // started; handed to the codex adapter instead of a late one.
+        window: Option<crate::adapters::codex_discovery::DiscoveryWindow>,
     ) -> Option<crate::adapters::supervisor::AdapterHandle> {
         let kind = match spec.kind {
             AgentKind::Codex | AgentKind::Grok => spec.kind,
@@ -668,6 +689,7 @@ impl GenericPtyDriver {
             ownership: ownership_probe,
             agent_pid_roots: Some(agent_pid_roots),
             lifetime,
+            window,
         };
         match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {
             Ok(Some(handle)) => Some(handle),

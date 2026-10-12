@@ -1605,6 +1605,125 @@ fn a_closed_interval_is_retained_for_a_pending_decision_past_any_hour_boundary()
 }
 
 #[test]
+fn a_pending_launch_window_survives_another_window_releasing_before_adapter_build() {
+    // c-usagefu r12 item 2 (Ruling A2'): a generic-pty codex launch registers
+    // its pending DISCOVERY window TOGETHER with its lifetime BEFORE the
+    // process starts. The file adapter is constructed only after agent
+    // settlement (up to 60 s later); r11 opened the window only at adapter
+    // construction, so another instance's window releasing during that gap was
+    // seen as the cwd's LAST window and pruned every closed interval a
+    // registered-but-not-yet-adapted launch's later decision still needed.
+    //
+    // Timeline (all anchored to wall-clock now so concurrent prompt sweeps do
+    // not evict the evidence):
+    //   t0    A launches (window open) and creates FA at t0.5
+    //   t1    C launches (known boundary)
+    //   t2    B registers lifetime + pending window BEFORE its process — no
+    //         adapter yet; B dispatches PB
+    //   t2.2  C closes
+    //   t2.5  A binds FA: its window releases. B's pending window keeps the
+    //         cwd non-last, so C's just-closed interval is retained.
+    //   t5    B's adapter is built (handed the SAME window) and FB appears.
+    //         C overlaps [B launch t2, creation t5] (closed t2.2 > t2) so B
+    //         must REFUSE FB. Under r11 the last-window prune at t2.5 dropped
+    //         C, B looked sole, and bound a rollout it did not own.
+    use crate::adapters::codex_discovery::LifetimeGuardClock as _;
+
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r12-item2-pending";
+    let t0 = OffsetDateTime::now_utc() - time::Duration::seconds(30);
+    let t1 = t0 + time::Duration::seconds(1);
+    let t2 = t0 + time::Duration::seconds(2);
+    let c_close = t0 + time::Duration::milliseconds(2200);
+    let t5 = t0 + time::Duration::seconds(5);
+
+    // A launches first; FA exists before any other instance.
+    let mut a = launch_adapter_keyed(home.path(), cwd, t0, INST_A);
+    send_fixture_prompt(Path::new(cwd), INST_A, "A prompt PA", t0);
+    write_rollout_prompt_at(
+        home.path(),
+        "FA-r12-pending",
+        cwd,
+        &(t0 + time::Duration::milliseconds(500))
+            .format(&Rfc3339)
+            .unwrap(),
+        "A prompt PA",
+    );
+
+    // C launches with a known boundary.
+    let c_guard =
+        crate::adapters::codex_discovery::begin_lifetime(Path::new(cwd), INST_C, Some(t1));
+
+    // B registers its lifetime AND its pending discovery window as the one
+    // pre-launch bundle BEFORE the process starts; the adapter is built only
+    // much further below.
+    let b_pending =
+        crate::adapters::codex_discovery::register_pending_launch(Path::new(cwd), INST_B, Some(t2));
+    let b_lifetime = b_pending.lifetime;
+    let b_window = b_pending.window;
+    send_fixture_prompt(
+        Path::new(cwd),
+        INST_B,
+        "B prompt PB",
+        t2 + time::Duration::seconds(1),
+    );
+
+    // C closes AFTER B registered but BEFORE A's window releases.
+    c_guard.close_lifetime_at(c_close);
+    drop(c_guard);
+
+    // A binds its own rollout: census over [t0, FA creation t0.5] contains
+    // neither C (launched t1) nor B (t2), so A is sole and binds. Its window
+    // releases — but B's pending window keeps that from being the cwd's last.
+    assert!(a.discover().unwrap(), "A binds its own earlier rollout");
+    assert!(a.binding().is_some());
+    assert!(
+        crate::adapters::codex_discovery::census_contains(Path::new(cwd), INST_C),
+        "C's closed interval survives A's release while B is registered-but-pending"
+    );
+
+    // FB appears at t5; only NOW is B's adapter constructed, taking the SAME
+    // pre-registered window (exactly the generic-pty wiring's handover).
+    write_rollout_prompt_at(
+        home.path(),
+        "FB-r12-pending",
+        cwd,
+        &t5.format(&Rfc3339).unwrap(),
+        "B prompt PB",
+    );
+    let mut b = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: PathBuf::from(cwd),
+        pid: None,
+        launched_at: Some(t2),
+    })
+    .with_lifetime(b_lifetime.witness())
+    .with_window(b_window)
+    .with_instance_key(Some(INST_B.to_owned()));
+
+    // Production discovery: C's retained closed interval overlaps B's census
+    // window, so prompt-only attribution is refused.
+    assert!(
+        !b.discover().unwrap(),
+        "B must not bind FB: the pruned-on-last-window interval C still overlaps"
+    );
+    assert!(b.binding().is_none());
+
+    // B gives up: its pre-registered window was the cwd's last one, so closing
+    // it ends retention — C's CLOSED segment is pruned, B's own live interval
+    // stays.
+    drop(b);
+    assert!(
+        !crate::adapters::codex_discovery::census_contains(Path::new(cwd), INST_C),
+        "closed segments prune once the last (pending) window closes"
+    );
+    assert!(
+        crate::adapters::codex_discovery::census_lifetime_is_live(Path::new(cwd), INST_B),
+        "B's live interval is retained"
+    );
+}
+
+#[test]
 fn a_resume_starts_a_new_interval_and_never_bridges_the_gap() {
     // c-usagefu r11 item 4 (Ruling A2 exact):
     //   A's first interval runs t0..t20, then CLOSES;

@@ -1495,6 +1495,9 @@ impl ShellPtyDriver {
             // known agent.start floor; the driver's cohort clone keeps the
             // interval open independent of this adapter's binding.
             lifetime,
+            // Hook-confirmed launch: no prompt-only discovery, hence no
+            // pending window (r12 item 2 applies to generic-pty launches).
+            window: None,
         };
         crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx)
     }
@@ -1575,6 +1578,8 @@ impl ShellPtyDriver {
                         // which registers before it publishes the detection;
                         // the promoted adapter binds by hook/name index only.
                         lifetime: None,
+                        // Promoted attach: no launch-floor discovery window.
+                        window: None,
                     };
                     match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {
                         Ok(Some(started)) => handle = Some(started),

@@ -281,7 +281,35 @@ pub(crate) fn begin_lifetime(
     }
 }
 
-/// Drop every CLOSED segment of every owner in `cwd`, keeping LIVE intervals.
+/// Pending-discovery ownership for ONE launch, registered TOGETHER before the
+/// agent process starts (c-usagefu r12 item 2, Ruling A2'): the census
+/// [`LifetimeGuard`] plus this launch's [`DiscoveryWindow`] slot.
+///
+/// Generic-pty cannot construct the file adapter until agent settlement (up to
+/// 60 s after agent.start). Registering the window only at adapter construction
+/// left a gap in which another same-cwd window's release was seen as the
+/// cwd's LAST window and pruned closed intervals (and cleared prompt
+/// evidence) the not-yet-adapted launch's later discovery decision still
+/// needed. The launch site holds this bundle and hands BOTH halves to the
+/// adapter builder; a launch failure drops it and closes/releases both.
+pub(crate) struct PendingCodexLaunch {
+    pub(crate) lifetime: LifetimeGuard,
+    pub(crate) window: DiscoveryWindow,
+}
+
+/// Register a codex launch's lifetime AND its pending-discovery window as one
+/// bundle, at the agent.start boundary BEFORE the child is spawned
+/// (Ruling A2', r12 item 2).
+pub(crate) fn register_pending_launch(
+    cwd: &Path,
+    owner: &str,
+    launched_at: Option<OffsetDateTime>,
+) -> PendingCodexLaunch {
+    PendingCodexLaunch {
+        lifetime: begin_lifetime(cwd, owner, launched_at),
+        window: DiscoveryWindow::open(cwd, owner),
+    }
+}
 /// Called when the cwd's LAST discovery window closes: no attribution decision
 /// is then pending, and Ruling A2 (c-usagefu r11 item 5) bounds the registry
 /// by PENDING DECISIONS rather than by a fixed time horizon. A segment that

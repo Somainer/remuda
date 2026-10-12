@@ -2737,17 +2737,24 @@ impl TranscriptMapper {
     }
 
     /// c-effortread r8 item 5: snapshot the EffortTracker latch
-    /// (name, flag, semantics) for re-seeding a replacement mapper on
-    /// re-promotion. None when no level has been observed.
+    /// (name, flag, semantics) and, per c-effortread r22 ruling S, the
+    /// channel that published the level, for re-seeding a replacement mapper
+    /// on re-promotion. None when no level has been observed.
     pub(crate) fn effort_seed(
         &self,
     ) -> Option<(
         remuda_protocol::EffortName,
         Option<bool>,
         remuda_protocol::EffortSemantics,
+        remuda_protocol::LevelSource,
     )> {
         let last = self.effort.last_observed()?;
-        Some((last.name, last.ultracode, self.effort.semantics()))
+        Some((
+            last.name,
+            last.ultracode,
+            self.effort.semantics(),
+            self.effort.level_source(),
+        ))
     }
 
     /// c-effortread r8 item 5: seed a freshly built mapper's EffortTracker
@@ -2756,20 +2763,25 @@ impl TranscriptMapper {
     /// level/flag/semantics. Without it a decoupled build with ultracode on
     /// emits `{high, ultracode: None}` on the next attachment-less assistant
     /// record and the chip drops from "ultracode" to "high".
+    ///
+    /// c-effortread r22 item 2: the seeded level keeps its ORIGINAL
+    /// LevelSource, so a status-only level stays movable by a later status.
     pub(crate) fn with_effort_seed(
         mut self,
         seed: (
             remuda_protocol::EffortName,
             Option<bool>,
             remuda_protocol::EffortSemantics,
+            remuda_protocol::LevelSource,
         ),
     ) -> Self {
-        let (name, ultracode, semantics) = seed;
+        let (name, ultracode, semantics, level_source) = seed;
         self.effort.seed_observed(
             name,
             ultracode,
             remuda_protocol::EffortSource::Remuda,
             semantics,
+            level_source,
         );
         self
     }

@@ -2474,11 +2474,13 @@ struct Hydrator {
 /// tracker from the last PUBLISHED observation restores the latch.
 #[derive(Debug, Clone, Default)]
 struct EffortTrackerSeed {
-    /// The last published effort latch (level + tri-state flag + semantics).
+    /// The last published effort latch (level + tri-state flag + semantics +
+    /// the channel that published the level, c-effortread r22 ruling S).
     last: Option<(
         remuda_protocol::EffortName,
         Option<bool>,
         remuda_protocol::EffortSemantics,
+        remuda_protocol::LevelSource,
     )>,
 }
 
@@ -2486,9 +2488,11 @@ impl EffortTrackerSeed {
     /// Capture the current tracker latch from a live mapper (c-effortread r8
     /// item 5). `None` when it has never observed a level.
     fn from_mapper(mapper: &TranscriptMapper) -> Option<Self> {
-        mapper.effort_seed().map(|(name, flag, semantics)| Self {
-            last: Some((name, flag, semantics)),
-        })
+        mapper
+            .effort_seed()
+            .map(|(name, flag, semantics, level_source)| Self {
+                last: Some((name, flag, semantics, level_source)),
+            })
     }
 }
 

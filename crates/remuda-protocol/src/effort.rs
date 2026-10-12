@@ -752,24 +752,24 @@ impl EffortTracker {
     /// known flag (e.g. `{high, ultracode: Some(true)}`) instead of dropping
     /// it to `None`. Current-process is already true (this is a live
     /// continuation, not a resume replay).
+    ///
+    /// c-effortread r22 ruling S (item 2): `level_source` is the channel the
+    /// SEEDED tracker had when it published the level — the seed is a
+    /// continuation, not new evidence, so a status-only level stays Status and
+    /// a later status read-back may still move it.
     pub fn seed_observed(
         &mut self,
         name: EffortName,
         ultracode: Option<bool>,
         source: EffortSource,
         semantics: EffortSemantics,
+        level_source: LevelSource,
     ) {
         self.semantics = semantics;
         self.last = Some(ObservedEffort { name, ultracode });
-        // The seeded tuple was an established effective state; treat its level
-        // as evidence-backed so a later status read-back yields to it (the
-        // fresh tracker cannot know status alone established it).
-        // c-effortread r22 item 2 carries the ORIGINAL source instead; until
-        // then Assistant preserves the r21 protection (status always yields).
-        self.level_source = LevelSource::Assistant;
+        self.level_source = level_source;
         // `source` is mapper-owned bookkeeping; preserve the seeded source so
         // the next observation is attributed consistently.
-        self.pending_source = source;
         self.pending_source = source;
         self.flag = ultracode;
         self.ultracode_pending = false;
@@ -2809,6 +2809,88 @@ mod tests {
             tracker.note_status(status("medium")).is_some(),
             "the released verdict level yields to a later status"
         );
+    }
+
+    #[test]
+    fn r22_item2_a_repromoted_seed_carries_the_published_levels_source() {
+        // c-effortread r22 item 2 ruling S: a re-promotion seed is a
+        // continuation, not new evidence — it carries the channel the prior
+        // tracker published the level with. A status-only level stays Status
+        // and a later status moves it; an assistant-established level keeps
+        // yielding.
+        fn status(level: &str) -> ObservedEffort {
+            match parse_effort_stdout(
+                &format!("Current effort level: {level} (resolved level)"),
+                EffortSemantics::Decoupled,
+            ) {
+                EffortStdout::Status(parsed) => parsed,
+                other => panic!("{other:?}"),
+            }
+        }
+        let reseed = |prior: &EffortTracker| {
+            let last = prior.last_observed().expect("the prior tracker published");
+            let mut tracker = EffortTracker::new();
+            tracker.seed_observed(
+                last.name,
+                last.ultracode,
+                EffortSource::Remuda,
+                EffortSemantics::Decoupled,
+                prior.level_source(),
+            );
+            tracker
+        };
+
+        // Status-only high → re-promotion → a later status moves it.
+        let mut prior = EffortTracker::new();
+        prior.note_version("2.1.289");
+        prior
+            .note_status(status("high"))
+            .expect("the prior tracker publishes high from status");
+        assert_eq!(prior.level_source(), LevelSource::Status);
+        let mut tracker = reseed(&prior);
+        assert_eq!(tracker.level_source(), LevelSource::Status);
+        let medium = tracker
+            .note_status(status("medium"))
+            .expect("the re-promoted status-only level stays movable by status");
+        assert_eq!(medium.0.name, EffortName::Medium);
+
+        // Assistant-established high → re-promotion → a status still yields.
+        let mut prior = EffortTracker::new();
+        prior.note_version("2.1.289");
+        prior
+            .observe(Some("high"), None)
+            .expect("the prior tracker publishes high from an assistant record");
+        assert_eq!(prior.level_source(), LevelSource::Assistant);
+        let mut tracker = reseed(&prior);
+        assert_eq!(tracker.level_source(), LevelSource::Assistant);
+        if let Some((observed, _)) = tracker.note_status(status("medium")) {
+            assert_eq!(
+                observed.name,
+                EffortName::High,
+                "the re-promoted assistant level keeps its clamping precedence"
+            );
+        }
+        assert_eq!(
+            tracker.last_observed().map(|observed| observed.name),
+            Some(EffortName::High)
+        );
+
+        // A verdict-published max → re-promotion → a status replaces it.
+        let mut prior = EffortTracker::new();
+        prior.note_version("2.1.289");
+        prior.note_slash("max", false);
+        prior
+            .note_stdout(
+                "Set effort level to max (saved as your default for new sessions): …",
+                false,
+            )
+            .expect("the prior tracker publishes max from a verdict");
+        assert_eq!(prior.level_source(), LevelSource::Verdict);
+        let mut tracker = reseed(&prior);
+        let xhigh = tracker
+            .note_status(status("xhigh"))
+            .expect("a re-promoted verdict level stays movable by status");
+        assert_eq!(xhigh.0.name, EffortName::Xhigh);
     }
 
     #[test]

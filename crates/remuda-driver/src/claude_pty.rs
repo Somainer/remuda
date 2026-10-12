@@ -5226,6 +5226,76 @@ mod tests {
         );
     }
 
+    /// c-effortread r22 item 2 ruling S: a demote/re-promotion seeds the
+    /// replacement tracker with the channel the PRIOR mapper published the
+    /// level with. A status-only high stays status-only after the seed, so a
+    /// status read-back after re-promotion still moves it to medium.
+    #[tokio::test]
+    async fn r22_item2_a_repromoted_status_only_level_is_moved_by_a_later_status() {
+        // The prior hydrator for this (pid, session): high is known ONLY from
+        // a /effort status read-back.
+        let mut prior = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        );
+        prior
+            .map_line_at(&effort_slash_line("cmd-status-high", "status"), Some(400))
+            .expect("map the status slash");
+        let high = prior
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status-high",
+                    "Current effort level: high (Comprehensive implementation with extensive \
+                     testing and documentation)",
+                ),
+                Some(420),
+            )
+            .expect("map the high status");
+        assert_eq!(
+            r19_effort_edges(&high),
+            vec![(Some(remuda_protocol::EffortName::High), Some(false), None)]
+        );
+        let seed = prior
+            .effort_seed()
+            .expect("the demoted hydrator captured a seed");
+
+        // The replacement hydrator is seeded on re-promotion.
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_seed(seed);
+
+        // A status read-back after re-promotion still moves the level.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-status-medium", "status"), Some(600))
+            .expect("map the second status slash");
+        let medium = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status-medium",
+                    "Current effort level: medium (Balanced, for everyday work)",
+                ),
+                Some(620),
+            )
+            .expect("map the medium status");
+        assert_eq!(
+            r19_effort_edges(&medium),
+            vec![(Some(remuda_protocol::EffortName::Medium), Some(false), None)],
+            "the status-only level stayed movable across the re-promotion"
+        );
+    }
+
     /// c-effortread r16 item 3: when the carrier's floor lookup FAILS (the
     /// bound transcript was rotated/removed or the stat errors), production no
     /// longer falls back to word-only attribution. The switch is armed with

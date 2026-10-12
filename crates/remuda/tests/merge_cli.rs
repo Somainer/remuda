@@ -4,7 +4,9 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -1240,4 +1242,82 @@ fn pending_lists_only_ahead_local_worker_branches_and_reports_conflicts_and_stag
     assert_eq!(git(&repo.root, &["show-ref"]), before);
     assert!(repo.trace().is_empty());
     repo.assert_cleaned();
+}
+
+/// r14 item 5 (R4): the push applied the exact granted merge server-side but
+/// the client's acknowledgement is lost. A pre-receive hook on the bare origin
+/// migrates the quarantined objects into the store and moves the ref exactly
+/// like the server did, then rejects the push — the client sees a failure while
+/// remote main already contains its merge. Before the verdict, the land fetches
+/// and finds the exact merge on remote main, and reports LANDED — never failed
+/// or base-moved.
+#[cfg(unix)]
+#[test]
+fn a_push_that_landed_but_lost_its_acknowledgement_is_reported_landed() {
+    let repo = Repo::new();
+    // 1. A real verified merge pinned at the old base.
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+    let base = repo.base.clone();
+    assert_ne!(repo.remote_main(), merged);
+
+    // 2. A pre-receive hook that applies the incoming ref (migrating the
+    //    quarantine objects into the object store first) and THEN rejects the
+    //    push — a server-side commit with a lost client acknowledgement.
+    let real_git: PathBuf = {
+        let path = std::env::var_os("PATH").expect("PATH");
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("git"))
+            .find(|candidate| candidate.is_file())
+            .expect("real git on PATH")
+    };
+    let hook_dir = repo.origin.join("hooks");
+    fs::create_dir_all(&hook_dir).unwrap();
+    let hook = hook_dir.join("pre-receive");
+    fs::write(
+        &hook,
+        format!(
+            r#"#!/bin/sh
+read old new dst
+# Migrate incoming objects out of the quarantine into the real store, so the
+# ref update below resolves after the quarantine is destroyed.
+find "$GIT_QUARANTINE_PATH" -type f -not -path "*/pack/*" 2>/dev/null | while IFS= read -r f; do
+  rel="${{f#$GIT_QUARANTINE_PATH/}}"
+  mkdir -p "$GIT_DIR/objects/$(dirname "$rel")"
+  cp -f "$f" "$GIT_DIR/objects/$rel"
+done
+env -i HOME="$HOME" PATH="{path_dir}" \
+  "{real_git}" --git-dir="$GIT_DIR" update-ref "$dst" "$new" "$old"
+echo "simulated post-update acknowledgement loss" >&2
+exit 1
+"#,
+            path_dir = std::env::var("PATH").unwrap_or_default(),
+            real_git = real_git.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // 3. Land: the update-ref CAS succeeds locally, the server-side ref moved,
+    //    and the push is rejected — the remote resolution turns it into landed.
+    let (output, report) = repo.merge(&["--land", "--onto", "main", "--report", &merged], &[]);
+    assert_exit(&output, &report, 0);
+    assert_eq!(report["status"], "landed", "{report}");
+    assert_eq!(
+        report["pushed"], true,
+        "resolved as landed despite the lost ack: {report}"
+    );
+    assert_eq!(report["merged"].as_str(), Some(merged.as_str()), "{report}");
+
+    // Exactly the granted merge is on remote main; never reported base-moved.
+    assert_eq!(
+        repo.remote_main(),
+        merged,
+        "the exact granted merge is on remote main"
+    );
+    // The land optimistically advanced local main to the merge; the remote
+    // resolution confirms it landed, so local main keeps the merge (no rollback).
+    assert_eq!(repo.main(), merged, "local main keeps the landed merge");
+    let _ = base;
 }

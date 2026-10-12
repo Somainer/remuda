@@ -830,6 +830,19 @@ fn execute_inner(
 /// (an ORIGIN-only move the local checkout had not seen) return
 /// `MergeStop::BaseMoved(expected, remote)` with the real current remote main;
 /// any other failure stays a normal error.
+/// Push the verified merge to the remote base branch as a compare-and-swap:
+/// `git push origin <merged>:refs/heads/main`. A successful push needs no
+/// lease because the merge is a strict descendant of `expected`.
+///
+/// r14 R4: a failed push is NOT a verdict. Before reporting anything, fetch
+/// and resolve the situation against the REMOTE state:
+/// * the exact granted merge is present on remote main (a lost
+///   acknowledgement — the ref update landed server-side but the client got an
+///   error: a failing post-receive hook, a killed connection) → this LANDED;
+///   never a failure and never a base-moved requeue;
+/// * the merge is absent but remote main moved to a descendant of `expected`
+///   (an origin-only base move) → `MergeStop::BaseMoved`;
+/// * anything else keeps the real push error.
 fn push_main_cas(repo: &Path, merged: &str, expected: &str) -> Result<()> {
     let output = git_output(
         repo,
@@ -838,14 +851,29 @@ fn push_main_cas(repo: &Path, merged: &str, expected: &str) -> Result<()> {
     if output.status.success() {
         return Ok(());
     }
-    // Best-effort refresh; keep the original push error if fetch itself fails.
-    if let Ok(remote) = git(repo, &["fetch", "-q", "origin"])
-        .and_then(|_| resolve(repo, "refs/remotes/origin/main"))
-        && remote != expected
-    {
-        return Err(MergeStop::BaseMoved(expected.to_owned(), remote).into());
+    // A failed push is NOT a verdict. Fetch and resolve against the REMOTE
+    // before reporting anything (r14 R4): the acknowledgement may be lost
+    // while the ref update committed server-side.
+    let remote = "refs/remotes/origin/main";
+    git(repo, &["fetch", "-q", "origin"])?;
+    if remote_has_commit(repo, remote, merged)? {
+        // The exact granted merge IS on remote main: the push landed, only the
+        // acknowledgement failed. Treat as success — never failed/base-moved.
+        return Ok(());
+    }
+    let remote_tip = resolve(repo, remote)?;
+    if remote_tip != expected && is_ancestor(repo, expected, &remote_tip)? {
+        // Origin-only base move: the merge is absent but main advanced from our
+        // base to another commit — the real CAS loss the caller requeues on.
+        return Err(MergeStop::BaseMoved(expected.to_owned(), remote_tip).into());
     }
     successful(&output)
+}
+
+/// Read-only: whether `commit` is an ancestor of `reference` in the fetched
+/// object database (used to resolve a rejected/lost-ack land push; r14 R4).
+fn remote_has_commit(repo: &Path, reference: &str, commit: &str) -> Result<bool> {
+    is_ancestor(repo, commit, reference)
 }
 
 fn branch_ref(branch: &str) -> Result<String> {

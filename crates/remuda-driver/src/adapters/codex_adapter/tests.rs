@@ -1513,6 +1513,91 @@ fn a_rejected_candidate_is_never_rematched_even_after_the_blocker_leaves_the_cen
 }
 
 #[test]
+fn a_resume_starts_a_new_interval_and_never_bridges_the_gap() {
+    // c-usagefu r11 item 4 (Ruling A2 exact):
+    //   A's first interval runs t0..t20, then CLOSES;
+    //   a GAP (no A process) runs t20..t100;
+    //   A resumes at t100 — a NEW interval from the resume time.
+    // The closed segment is retained as its own interval and the resumed one
+    // never reopens or bridges it. r10 kept one record per owner, setting
+    // launched_at = min(first, resume) and clearing closed_at: it invented a
+    // single t0..live interval over the gap, attributing gap rollouts to A and
+    // blocking later owners across the gap.
+    use crate::adapters::codex_discovery::LifetimeGuardClock as _;
+
+    // Times are anchored close to wall-clock now: concurrent REAL-time tests
+    // share the process prompt registry and its age sweep, so unix-epoch
+    // inputs here would be evicted by their sweeps. The logic is identical at
+    // any epoch.
+    let cwd = Path::new("/projects/r11-item4-resume");
+    let t0 = OffsetDateTime::now_utc() - time::Duration::seconds(120);
+    let t15 = t0 + time::Duration::seconds(15);
+    let t20 = t0 + time::Duration::seconds(20);
+    let t30 = t0 + time::Duration::seconds(30);
+    let t45 = t0 + time::Duration::seconds(45);
+    let t50 = t0 + time::Duration::seconds(50);
+    let t100 = t0 + time::Duration::seconds(100);
+    let t105 = t0 + time::Duration::seconds(105);
+    let t107 = t0 + time::Duration::seconds(107);
+
+    // First interval: registered at t0, closed at t20.
+    let first = crate::adapters::codex_discovery::begin_lifetime_at(cwd, INST_A, Some(t0), t0);
+    first.close_lifetime_at(t20);
+    drop(first);
+
+    // Resume at t100: a brand-new segment whose floor is the resume time.
+    let resumed =
+        crate::adapters::codex_discovery::begin_lifetime_at(cwd, INST_A, Some(t100), t100);
+
+    let segments = crate::adapters::codex_discovery::census_segments(cwd, INST_A);
+    assert_eq!(
+        segments,
+        vec![(Some(t0), Some(t20)), (Some(t100), None)],
+        "the closed segment is retained and the resume is a SEPARATE live segment"
+    );
+
+    // A cannot attribute a rollout created in the gap: its only live floor is
+    // t100, even if A dispatched the exact prompt text before it closed.
+    send_fixture_prompt(cwd, INST_A, "gap prompt", t15);
+    assert!(
+        !crate::adapters::codex_discovery::sole_instance_matches(cwd, INST_A, "gap prompt", t50),
+        "a gap rollout is pre-launch for the resumed segment — never bridged"
+    );
+
+    // A post-resume rollout IS attributable under the new interval.
+    send_fixture_prompt(cwd, INST_A, "resume prompt", t105);
+    assert!(
+        crate::adapters::codex_discovery::sole_instance_matches(cwd, INST_A, "resume prompt", t107),
+        "the new interval attributes rollouts created after the resume"
+    );
+
+    // No invented overlap ACROSS the gap: C launches at t30 — AFTER A's first
+    // interval closed at t20 and well before the resume at t100 — and scans a
+    // rollout created at t50. A's retained closed segment closed before C ever
+    // launched and the resumed segment does not exist yet, so C is sole. Under
+    // the old bridged record (launch min = t0, closed cleared), A invented an
+    // overlap spanning the gap and C was refused.
+    let _c = crate::adapters::codex_discovery::begin_lifetime_at(cwd, INST_C, Some(t30), t30);
+    send_fixture_prompt(cwd, INST_C, "gap prompt", t45);
+    assert!(
+        crate::adapters::codex_discovery::sole_instance_matches(cwd, INST_C, "gap prompt", t50),
+        "neither retained nor resumed segment may block C across the gap"
+    );
+
+    // Closing the resumed cohort touches only its own segment.
+    resumed.close_lifetime_at(t100 + time::Duration::seconds(30));
+    drop(resumed);
+    assert_eq!(
+        crate::adapters::codex_discovery::census_segments(cwd, INST_A),
+        vec![
+            (Some(t0), Some(t20)),
+            (Some(t100), Some(t100 + time::Duration::seconds(30)))
+        ],
+        "a stale/new guard never mutates the other segment"
+    );
+}
+
+#[test]
 fn the_initial_prompt_survives_thirty_two_later_prompts_for_a_live_discoverer() {
     // r10 item 7 trigger 1 (the 32-entry cap): B is a live unbound discoverer.
     // Its first prompt P creates a lazily-written rollout F inside P's window,

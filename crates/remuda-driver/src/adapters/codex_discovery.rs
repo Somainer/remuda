@@ -68,7 +68,7 @@ fn canonical(path: &Path) -> PathBuf {
 /// registry lives for the whole Node process.
 const LIFETIME_RETENTION: time::Duration = time::Duration::hours(1);
 
-/// One driver launch's live interval in a cwd.
+/// One interval an instance was live in a cwd.
 struct InstanceLifetime {
     /// The agent.start boundary, sampled BEFORE the child was spawned. `None`
     /// means the launch boundary is UNKNOWN: a promoted (hand-typed) instance
@@ -84,14 +84,43 @@ struct InstanceLifetime {
     closed_at: Option<OffsetDateTime>,
     /// Bumped on every (re-)registration of this `(cwd, owner)`. A guard from
     /// an older cohort (a close→resume scratch driver whose handle is adopted
-    /// away) records a close ONLY while it is still the current cohort, so a
-    /// resumed session is never marked closed by its previous spawn
-    /// (c-usagefu r10 item 1).
+    /// away) records a close ONLY against its own cohort segment, so a resumed
+    /// session is never marked closed by its previous spawn (c-usagefu r10
+    /// item 1; r11 item 4).
     epoch: u64,
 }
 
-/// cwd -> (instance key -> lifetime).
-static INSTANCE_LIFETIMES: LazyLock<Mutex<HashMap<PathBuf, HashMap<String, InstanceLifetime>>>> =
+/// Every interval one owner has had in a cwd, in registration order
+/// (c-usagefu r11 item 4, Ruling A2). A resume APPENDS a fresh segment
+/// starting at the resume time; the previous closed segment is never reopened
+/// or bridged. Closed segments are retained so later launches cannot become
+/// "sole" over a window an earlier segment shared.
+struct InstanceSegments {
+    segments: Vec<InstanceLifetime>,
+}
+
+impl InstanceSegments {
+    fn empty() -> Self {
+        Self {
+            segments: Vec::new(),
+        }
+    }
+    fn live(&self) -> Option<&InstanceLifetime> {
+        self.segments
+            .iter()
+            .rev()
+            .find(|segment| segment.closed_at.is_none())
+    }
+
+    fn epoch_mut(&mut self, epoch: u64) -> Option<&mut InstanceLifetime> {
+        self.segments
+            .iter_mut()
+            .find(|segment| segment.epoch == epoch)
+    }
+}
+
+/// cwd -> (instance key -> its intervals).
+static INSTANCE_LIFETIMES: LazyLock<Mutex<HashMap<PathBuf, HashMap<String, InstanceSegments>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// (owner, canonical rollout path) -> the OTHER instance whose overlapping
@@ -175,8 +204,9 @@ impl LifetimeGuard {
         let at = OffsetDateTime::now_utc();
         let mut map = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
         if let Some(by_instance) = map.get_mut(&self.inner.key)
-            && let Some(lifetime) = by_instance.get_mut(&self.inner.owner)
-            && lifetime.epoch == self.inner.epoch
+            && let Some(segments) = by_instance.get_mut(&self.inner.owner)
+            && let Some(lifetime) = segments.epoch_mut(self.inner.epoch)
+            && lifetime.closed_at.is_none()
         {
             lifetime.closed_at = Some(at);
         }
@@ -211,8 +241,11 @@ impl Drop for LifetimeGuard {
 /// decision window (c-usagefu r10 item 1, Ruling A).
 ///
 /// Re-registering the same `(cwd, owner)` (a close then resume re-spawn with
-/// the stable instance key) reopens the interval, bumps its cohort epoch and
-/// keeps the best-known earliest floor; it never erases an earlier segment.
+/// the stable instance key) does NOT reopen the old interval: it APPENDS a new
+/// segment whose launch boundary is the RESUME time, with a fresh cohort
+/// epoch. A stale guard from the earlier cohort can close only its own
+/// segment, never bridge the gap into the resumed one (c-usagefu r11 item 4,
+/// Ruling A2).
 pub(crate) fn begin_lifetime(
     cwd: &Path,
     owner: &str,
@@ -233,25 +266,24 @@ pub(crate) fn begin_lifetime_at(
     let epoch = {
         let mut map = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
         let by_instance = map.entry(key.clone()).or_default();
-        prune_closed_intervals(by_instance, now);
-        let lifetime = by_instance
+        let segments = by_instance
             .entry(owner.to_owned())
-            .or_insert_with(|| InstanceLifetime {
-                launched_at,
-                closed_at: None,
-                epoch: 0,
-            });
-        // (Re-)open and claim a fresh cohort so a resume scratch driver's
-        // stale guard cannot close the resumed interval on drop.
-        lifetime.epoch = lifetime.epoch.wrapping_add(1);
-        lifetime.closed_at = None;
-        // Best-known earliest floor. An unknown-boundary segment can never be
-        // bounded by a later known one, so None stays sticky across cohorts.
-        lifetime.launched_at = match (lifetime.launched_at, launched_at) {
-            (Some(existing), Some(incoming)) => Some(existing.min(incoming)),
-            _ => None,
-        };
-        lifetime.epoch
+            .or_insert_with(InstanceSegments::empty);
+        prune_closed_intervals(segments, now);
+        // A resume starts a NEW interval: never mutate an existing segment
+        // (no floor min, no reopening, no bridging). The cohort epoch is one
+        // past the newest segment so a stale guard's close lands on its own
+        // segment alone.
+        let epoch = segments
+            .segments
+            .last()
+            .map_or(1, |segment| segment.epoch.wrapping_add(1));
+        segments.segments.push(InstanceLifetime {
+            launched_at,
+            closed_at: None,
+            epoch,
+        });
+        epoch
     };
     LifetimeGuard {
         inner: Arc::new(LifetimeGuardInner {
@@ -272,12 +304,11 @@ pub(crate) fn begin_lifetime_at(
 /// what keep a later launch from becoming "sole" over a window a since-closed
 /// instance shared (r9 item 1); the hard horizon bounds that memory (r10
 /// item 2: after it, a rejection keyed to that blocker may flip).
-fn prune_closed_intervals(
-    by_instance: &mut HashMap<String, InstanceLifetime>,
-    now: OffsetDateTime,
-) {
+fn prune_closed_intervals(segments: &mut InstanceSegments, now: OffsetDateTime) {
     let cutoff = now - LIFETIME_RETENTION;
-    by_instance.retain(|_, lifetime| lifetime.closed_at.is_none_or(|closed| closed >= cutoff));
+    segments
+        .segments
+        .retain(|segment| segment.closed_at.is_none_or(|closed| closed >= cutoff));
 }
 
 /// Test seam: expire closed intervals in `cwd` as if retention were judged at
@@ -287,7 +318,9 @@ pub(crate) fn prune_closed_intervals_at(cwd: &Path, now: OffsetDateTime) {
     let key = canonical(cwd);
     let mut map = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
     if let Some(by_instance) = map.get_mut(&key) {
-        prune_closed_intervals(by_instance, now);
+        for segments in by_instance.values_mut() {
+            prune_closed_intervals(segments, now);
+        }
     }
 }
 
@@ -679,37 +712,50 @@ fn evaluate_prompt(
         let Some(by_instance) = lifetimes.get(&cwd_key) else {
             return PromptVerdict::Ineligible;
         };
-        let Some(own) = by_instance.get(owner) else {
+        let Some(own_segments) = by_instance.get(owner) else {
             return PromptVerdict::Ineligible;
         };
-        // The owner itself needs a KNOWN launch boundary: a promoted (unknown
-        // floor) adapter never uses prompt-only attribution at all.
-        let Some(own_launch) = own.launched_at else {
+        // The owner judges from its CURRENT live interval only: a resume
+        // started a NEW segment at the resume time and a closed segment never
+        // reopens or bridges (Ruling A2). With no live segment, or with an
+        // UNKNOWN launch boundary (a promoted instance), prompt-only
+        // attribution is never used.
+        let Some(own_live) = own_segments.live() else {
             return PromptVerdict::Ineligible;
         };
-        // Strict launch floor: no pre-launch slack for prompt attribution.
+        let Some(own_launch) = own_live.launched_at else {
+            return PromptVerdict::Ineligible;
+        };
+        // Strict launch floor: no pre-launch slack for prompt attribution. A
+        // rollout created in a pre-resume GAP is therefore never attributable
+        // to the resumed segment.
         if session_started < own_launch {
             return PromptVerdict::Ineligible;
         }
         // Complete-census sole-live proof over [launch, creation]. Another
-        // instance overlaps when it was live at any instant across that
-        // interval. A KNOWN-boundary instance overlaps iff it launched at or
-        // before creation and was still live at the owner's launch. An
-        // UNKNOWN-boundary (promoted) instance cannot be proven to have
-        // launched after creation, so it overlaps whenever it was still live at
-        // the owner's launch — the cwd census is incomplete and prompt-only
-        // attribution is refused (Ruling A; closed exactly at the boundary is
-        // not an overlap).
+        // instance overlaps when ANY of its registered segments was live at
+        // any instant across that interval. A KNOWN-boundary segment overlaps
+        // iff it launched at or before creation and was still live at the
+        // owner's launch. An UNKNOWN-boundary (promoted) segment cannot be
+        // proven to have launched after creation, so it overlaps whenever it
+        // was still live at the owner's launch — the cwd census is incomplete
+        // and prompt-only attribution is refused (Ruling A; closed exactly at
+        // the boundary is not an overlap). Every segment is considered: a
+        // resumed instance's retained closed segment still counts for the
+        // window it was actually live, and its new segment never reaches back
+        // over the gap.
         by_instance
             .iter()
-            .find(|(other, lifetime)| {
-                *other != owner
-                    && lifetime
+            .filter(|(other, _)| *other != owner)
+            .find_map(|(other, segments)| {
+                segments.segments.iter().find_map(|segment| {
+                    let overlaps = segment
                         .launched_at
                         .is_none_or(|launched| launched <= session_started)
-                    && lifetime.closed_at.is_none_or(|closed| closed > own_launch)
+                        && segment.closed_at.is_none_or(|closed| closed > own_launch);
+                    overlaps.then(|| other.clone())
+                })
             })
-            .map(|(other, _)| other.clone())
     };
     let prompt_fits = {
         let inputs = SENT_INPUTS.lock().expect("codex sent inputs");
@@ -830,7 +876,31 @@ pub(crate) fn census_lifetime_is_live(cwd: &Path, owner: &str) -> bool {
         .expect("codex instance lifetimes")
         .get(&canonical(cwd))
         .and_then(|by_instance| by_instance.get(owner))
-        .is_some_and(|lifetime| lifetime.closed_at.is_none())
+        .is_some_and(|segments| segments.live().is_some())
+}
+
+/// Test seam: the registered intervals of `owner` in `cwd` as
+/// `(launched_at, closed_at)` pairs in registration order. Ruling A2 resume
+/// regressions assert the retained closed segment and the new resumed segment
+/// are separate, never bridged (r11 item 4).
+#[cfg(test)]
+pub(crate) fn census_segments(
+    cwd: &Path,
+    owner: &str,
+) -> Vec<(Option<OffsetDateTime>, Option<OffsetDateTime>)> {
+    INSTANCE_LIFETIMES
+        .lock()
+        .expect("codex instance lifetimes")
+        .get(&canonical(cwd))
+        .and_then(|by_instance| by_instance.get(owner))
+        .map(|segments| {
+            segments
+                .segments
+                .iter()
+                .map(|segment| (segment.launched_at, segment.closed_at))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // Test-only visibility so unit tests in other modules of this crate can

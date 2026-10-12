@@ -1530,6 +1530,88 @@ fn a_rejected_candidate_stays_rejected_until_the_blocker_interval_expires() {
 }
 
 #[test]
+fn the_initial_prompt_survives_thirty_two_later_prompts_for_a_live_discoverer() {
+    // r10 item 7 trigger 1 (the 32-entry cap): B is a live unbound discoverer.
+    // Its first prompt P creates a lazily-written rollout F inside P's window,
+    // but F is discovered only AFTER B has dispatched 33 further distinct
+    // prompts. The old single Vec drained P (the oldest) once it held 32 later
+    // entries, so F no longer had any matching evidence. The initial prompt is
+    // now an anchor outside the capped recent list: B still binds F.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r10-item7-cap";
+    let base = OffsetDateTime::now_utc() - time::Duration::seconds(60);
+
+    let mut b = launch_adapter_keyed(home.path(), cwd, base, INST_B);
+    send_fixture_prompt(Path::new(cwd), INST_B, "initial prompt P", base);
+    for i in 0..33u32 {
+        send_fixture_prompt(
+            Path::new(cwd),
+            INST_B,
+            &format!("later distinct prompt {i}"),
+            base + time::Duration::seconds(10 + i64::from(i)),
+        );
+    }
+    // F is written (and discovered) only now, created inside P's window.
+    let f_at = base + time::Duration::seconds(3);
+    write_rollout_prompt_at(
+        home.path(),
+        "F-anchor-cap",
+        cwd,
+        &f_at.format(&Rfc3339).unwrap(),
+        "initial prompt P",
+    );
+    assert!(
+        b.discover().unwrap(),
+        "the anchored initial prompt still authorizes F after 33 later prompts"
+    );
+    assert_eq!(
+        b.binding().map(|binding| binding.session_id.as_str()),
+        Some("F-anchor-cap")
+    );
+}
+
+#[test]
+fn a_later_resend_keeps_the_initial_prompts_original_window() {
+    // r10 item 7 trigger 2 (resend refreshes the window): B sends P, F is
+    // created inside P's ORIGINAL window, then B RESENDS P several seconds
+    // later. The old code merged the two into one entry and moved its time to
+    // the resend, so the window's back edge (resend - 5s) slid past F and the
+    // match was lost. The anchor keeps its original window; the resend opens a
+    // separate later window — F still binds.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r10-item7-resend";
+    let base = OffsetDateTime::now_utc() - time::Duration::seconds(60);
+
+    let mut b = launch_adapter_keyed(home.path(), cwd, base, INST_B);
+    send_fixture_prompt(Path::new(cwd), INST_B, "continue", base);
+    // F is created 2 s after the ORIGINAL send (inside [P-5s, P+300s]).
+    let f_at = base + time::Duration::seconds(2);
+    write_rollout_prompt_at(
+        home.path(),
+        "F-anchor-resend",
+        cwd,
+        &f_at.format(&Rfc3339).unwrap(),
+        "continue",
+    );
+    // A resend 10 s on would, under the old merge, move the only evidence to
+    // base+10 and push the back edge to base+5 > F.
+    send_fixture_prompt(
+        Path::new(cwd),
+        INST_B,
+        "continue",
+        base + time::Duration::seconds(10),
+    );
+    assert!(
+        b.discover().unwrap(),
+        "F matches the anchor's ORIGINAL window despite the later resend"
+    );
+    assert_eq!(
+        b.binding().map(|binding| binding.session_id.as_str()),
+        Some("F-anchor-resend")
+    );
+}
+
+#[test]
 fn a_unique_process_held_candidate_wins_over_a_weaker_prompt_candidate() {
     // r9 item 2: process-owned and prompt-only candidates must not be pooled
     // into one ambiguous set. B is the sole live instance and sent

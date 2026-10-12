@@ -1433,20 +1433,20 @@ fn a_known_boundary_native_codex_overlapping_blocks_generic_prompt_attribution()
 }
 
 #[test]
-fn a_rejected_candidate_stays_rejected_until_the_blocker_interval_expires() {
-    // r10 item 2 (Ruling A retained intervals + sticky rejection):
-    //   A and B overlap in one cwd; B sends P first;
+fn a_rejected_candidate_is_never_rematched_even_after_the_blocker_leaves_the_census() {
+    // c-usagefu r11 item 1 (Ruling A1, EXACT):
+    //   A and B overlap in one cwd; B sends P;
     //   A creates F carrying P AFTER B's launch, then closes;
     //   B scans while A's closed interval is retained -> B rejects F.
-    // A merely CLOSING must never turn that into a match: repeated B scans
-    // while A is retained keep F unbound. Only once A's retained interval
-    // EXPIRES past the retention horizon (a new instance C registers 90 min
-    // later and prunes it) does the rejection clear — C launched long after F
-    // so C cannot own it — and F binds B.
+    // The rejection is stored PERMANENTLY against (B, F): once issued, nothing
+    // — the blocker merely closing, its interval being pruned past any horizon,
+    // or the blocker vanishing from the census entirely — may ever turn F into
+    // a match for B. (r10 item 2 wrongly let F bind B after a one-hour prune:
+    // that directly contradicted Ruling A.)
     use crate::adapters::codex_discovery::LifetimeGuardClock as _;
 
     let home = tempfile::tempdir().unwrap();
-    let cwd = "/projects/r10-item2-retained";
+    let cwd = "/projects/r11-item1-permanent";
     let base = OffsetDateTime::now_utc() - time::Duration::seconds(40);
     let a_launch = base;
     let b_floor = base + time::Duration::seconds(10);
@@ -1464,7 +1464,7 @@ fn a_rejected_candidate_stays_rejected_until_the_blocker_interval_expires() {
     send_fixture_prompt(Path::new(cwd), INST_B, prompt, b_floor);
     write_rollout_prompt_at(
         home.path(),
-        "F-r10-retained",
+        "F-r11-permanent",
         cwd,
         &f_at.format(&Rfc3339).unwrap(),
         prompt,
@@ -1472,61 +1472,44 @@ fn a_rejected_candidate_stays_rejected_until_the_blocker_interval_expires() {
     let f_path = home
         .path()
         .join("sessions/2026/09/14")
-        .join("rollout-F-r10-retained.jsonl");
+        .join("rollout-F-r11-permanent.jsonl");
 
     a.close_lifetime_at(a_close);
     drop(a);
 
-    // B scans repeatedly AFTER A closed: the retained interval plus the sticky
-    // rejection keep F refused — a close never flips the verdict.
+    // First scan: A's interval overlaps -> B rejects F.
+    assert!(!b.discover().unwrap(), "B rejects F while A overlaps");
+    assert!(b.binding().is_none(), "F stays unbound for B");
+
+    // The blocker leaves the census in EVERY way the r10 code could wait for:
+    // pruned past the old retention horizon, then forgotten entirely.
+    let later = a_close + time::Duration::hours(2);
+    crate::adapters::codex_discovery::prune_closed_intervals_at(Path::new(cwd), later);
+    crate::adapters::codex_discovery::forget_lifetime(Path::new(cwd), INST_A);
+
+    // A clean re-judgment with NO blocker on the census would match — the
+    // permanent rejection is the only thing standing between B and F now.
+    assert!(
+        crate::adapters::codex_discovery::sole_instance_matches(
+            Path::new(cwd),
+            INST_B,
+            prompt,
+            f_at
+        ),
+        "control: with the rejection memory aside, the census alone looks sole"
+    );
     for _ in 0..3 {
-        assert!(!b.discover().unwrap(), "B rejects F while A overlaps");
-        assert!(b.binding().is_none(), "F stays unbound for B");
+        assert!(
+            !b.discover().unwrap(),
+            "the production path keeps rejecting F long after A left the census"
+        );
+        assert!(b.binding().is_none(), "F never binds B");
     }
     assert_eq!(
         crate::adapters::codex_discovery::claimed_owner_of(&f_path),
         None,
-        "F is unclaimed after the rejected scans"
+        "F is still unclaimed"
     );
-
-    // 90 minutes after A closed, a NEW instance C registers in the cwd,
-    // pruning A's long-closed interval past the retention horizon.
-    let c_launch = a_close + time::Duration::minutes(90);
-    crate::adapters::codex_discovery::prune_closed_intervals_at(Path::new(cwd), c_launch);
-    let c = crate::adapters::codex_discovery::begin_lifetime_at(
-        Path::new(cwd),
-        INST_C,
-        Some(c_launch),
-        c_launch,
-    );
-
-    // C launched long after F existed, so a strict floor means C can never own
-    // F (it stays unclaimed by C).
-    assert!(
-        !crate::adapters::codex_discovery::sole_instance_matches(
-            Path::new(cwd),
-            INST_C,
-            prompt,
-            f_at
-        ),
-        "C cannot attribute a rollout created before its launch"
-    );
-
-    // With A expired the earlier blocker rejection clears: F now binds B.
-    assert!(
-        b.discover().unwrap(),
-        "F becomes B's once A's retained interval has expired"
-    );
-    assert_eq!(
-        b.binding().map(|binding| binding.session_id.as_str()),
-        Some("F-r10-retained")
-    );
-    assert_eq!(
-        crate::adapters::codex_discovery::claimed_owner_of(&f_path).as_deref(),
-        Some(INST_B),
-        "F is claimed by B"
-    );
-    drop(c);
 }
 
 #[test]

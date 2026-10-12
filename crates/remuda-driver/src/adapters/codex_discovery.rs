@@ -96,13 +96,12 @@ static INSTANCE_LIFETIMES: LazyLock<Mutex<HashMap<PathBuf, HashMap<String, Insta
 
 /// (owner, canonical rollout path) -> the OTHER instance whose overlapping
 /// lifetime made prompt-only attribution impossible the first time this
-/// candidate was judged. A candidate once REJECTED for an owner stays rejected
-/// for that owner for as long as the blocker remains in the cwd census: the
-/// blocker merely CLOSING (liveness ending) must never turn a correct "not
-/// yours" into a match. When the blocker's retained interval genuinely EXPIRES
-/// past [`LIFETIME_RETENTION`] and is pruned (a later same-cwd registration
-/// triggers it), the rejection is cleared on the next judgment and the
-/// candidate may bind (c-usagefu r10 item 2, Ruling A).
+/// candidate was judged. A candidate once REJECTED for an owner is rejected
+/// PERMANENTLY for that owner (c-usagefu r11 item 1, Ruling A1): neither the
+/// blocker merely closing, nor its interval being pruned, nor a resume, nor
+/// any later census change ever turns it into a match for that owner. The key
+/// is the (owner, rollout identity) pair, so a different owner is unaffected
+/// and the same owner may still bind a DIFFERENT rollout.
 static REJECTED_CANDIDATES: LazyLock<Mutex<HashMap<(String, PathBuf), String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -707,14 +706,15 @@ pub(crate) fn sole_instance_matches(
     )
 }
 
-/// Production TIER C entry point with sticky-rejection memory (r10 item 2).
+/// Production TIER C entry point with PERMANENT sticky rejection (r10 item 2;
+/// r11 item 1 tightens it to Ruling A1).
 ///
-/// A candidate judged [`PromptVerdict::Blocker`] is REMEMBERED against that
-/// blocker: while the blocker stays in the cwd census, repeated scans (after
-/// the blocker merely CLOSED) keep returning false even if a transient scan
-/// would otherwise look sole. The rejection clears only once the blocker's
-/// retained interval expires past [`LIFETIME_RETENTION`] and is pruned — then a
-/// later judgment returns true and the candidate binds.
+/// A candidate judged [`PromptVerdict::Blocker`] is remembered against that
+/// blocker. Every LATER judgment of the same `(owner, rollout)` returns false
+/// for that owner — the blocker closing, its interval being pruned, a resume
+/// or any other census change can never flip a correct first "not yours" into
+/// a match. The rejection is keyed per owner, so another owner and another
+/// rollout are unaffected.
 pub(crate) fn prompt_candidate_matches(
     cwd: &Path,
     owner: &str,
@@ -722,39 +722,42 @@ pub(crate) fn prompt_candidate_matches(
     rollout_text: &str,
     session_started: OffsetDateTime,
 ) -> bool {
+    let key = (owner.to_owned(), canonical(rollout));
+    if REJECTED_CANDIDATES
+        .lock()
+        .expect("rejected codex candidates")
+        .contains_key(&key)
+    {
+        // Ruling A1: a rejection for (owner, rollout identity) is permanent;
+        // do not even re-evaluate a cleaner-looking census.
+        return false;
+    }
     match evaluate_prompt(cwd, owner, rollout_text, session_started) {
         PromptVerdict::Ineligible => false,
         PromptVerdict::Blocker(blocker) => {
             REJECTED_CANDIDATES
                 .lock()
                 .expect("rejected codex candidates")
-                .insert((owner.to_owned(), canonical(rollout)), blocker);
+                .insert(key, blocker);
             false
         }
-        PromptVerdict::Match => {
-            let mut rejected = REJECTED_CANDIDATES
-                .lock()
-                .expect("rejected codex candidates");
-            let Some(blocker) = rejected.get(&(owner.to_owned(), canonical(rollout))) else {
-                return true;
-            };
-            let blocker = blocker.clone();
-            // Still on the census (retained after close): the earlier rejection
-            // stands. Once pruned past the retention horizon it is gone: drop
-            // the rejection and let the candidate bind.
-            let still_blocking = {
-                let lifetimes = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
-                lifetimes
-                    .get(&canonical(cwd))
-                    .is_some_and(|by_instance| by_instance.contains_key(&blocker))
-            };
-            if still_blocking {
-                false
-            } else {
-                rejected.remove(&(owner.to_owned(), canonical(rollout)));
-                true
-            }
-        }
+        PromptVerdict::Match => true,
+    }
+}
+
+/// Test seam: forget every lifetime registered for `owner` in `cwd`, as if the
+/// instance had left the cwd census entirely. Lets Ruling A1 regressions prove
+/// the rejection outlives the blocker WITHOUT depending on the interval
+/// retention policy (r11 item 1).
+#[cfg(test)]
+pub(crate) fn forget_lifetime(cwd: &Path, owner: &str) {
+    let key = canonical(cwd);
+    if let Some(by_instance) = INSTANCE_LIFETIMES
+        .lock()
+        .expect("codex instance lifetimes")
+        .get_mut(&key)
+    {
+        by_instance.remove(owner);
     }
 }
 

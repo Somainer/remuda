@@ -1171,6 +1171,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{id}/gate/jobs/{jobId}/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+                /** @description gjb_… id */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Operator-resolve a Landing whose outcome cannot be established
+         * @description Only a job still `landing` with landingOutcomeUnknown=true accepts a resolution: `failed` settles it Failed; `requeue` re-enters the queue. The Hub also tells the lane to terminate the granted land process group (r14 R1).
+         */
+        post: operations["projectGateJobResolve"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{id}/members": {
         parameters: {
             query?: never;
@@ -4019,6 +4044,7 @@ export interface operations {
                             hostId?: string | null;
                             id?: string;
                             keepLogs?: boolean;
+                            landingOutcomeUnknown?: boolean;
                             landingSessionEpoch?: string | null;
                             laneId?: string | null;
                             logObjectId?: string | null;
@@ -5522,6 +5548,7 @@ export interface operations {
                             hostId?: string | null;
                             id?: string;
                             keepLogs?: boolean;
+                            landingOutcomeUnknown?: boolean;
                             landingSessionEpoch?: string | null;
                             laneId?: string | null;
                             logObjectId?: string | null;
@@ -5592,6 +5619,7 @@ export interface operations {
                         hostId?: string | null;
                         id?: string;
                         keepLogs?: boolean;
+                        landingOutcomeUnknown?: boolean;
                         landingSessionEpoch?: string | null;
                         laneId?: string | null;
                         logObjectId?: string | null;
@@ -5650,6 +5678,7 @@ export interface operations {
                         hostId?: string | null;
                         id?: string;
                         keepLogs?: boolean;
+                        landingOutcomeUnknown?: boolean;
                         landingSessionEpoch?: string | null;
                         laneId?: string | null;
                         logObjectId?: string | null;
@@ -5713,6 +5742,7 @@ export interface operations {
                         hostId?: string | null;
                         id?: string;
                         keepLogs?: boolean;
+                        landingOutcomeUnknown?: boolean;
                         landingSessionEpoch?: string | null;
                         laneId?: string | null;
                         logObjectId?: string | null;
@@ -5737,6 +5767,46 @@ export interface operations {
                 };
             };
             400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    projectGateJobResolve: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+                /** @description gjb_… id */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @enum {string} */
+                    resolution: "failed" | "requeue";
+                } & {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Settled job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];

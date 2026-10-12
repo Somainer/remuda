@@ -37,6 +37,13 @@ pub const METHOD_GATE_UNPIN: &str = "gate.unpin";
 /// base branch (so the push in fact landed) or whether the outcome is unknown.
 /// Read-only: it never pushes.
 pub const METHOD_GATE_RESOLVE_LANDING: &str = "gate.resolveLanding";
+/// Hub→Node (lane host): the Hub established an absent/pushed-never outcome or
+/// an explicit operator resolution settled a Landing. Terminate the granted
+/// land process group (TERM → bounded wait → KILL → ESRCH) and release the
+/// lane run, so a re-queued attempt can use the lane and an operator-failed
+/// Landing cannot push after the fact. The generation is tombstoned like a
+/// cancel so the killed run's late verdict is refused (r14 R1).
+pub const METHOD_GATE_ABORT_LANDING: &str = "gate.abortLanding";
 
 /// Every Hub→Node gate RPC (stdio allowlist predicate helper).
 #[must_use]
@@ -49,6 +56,7 @@ pub fn is_gate_call(method: &str) -> bool {
             | METHOD_GATE_LAND
             | METHOD_GATE_UNPIN
             | METHOD_GATE_RESOLVE_LANDING
+            | METHOD_GATE_ABORT_LANDING
     )
 }
 
@@ -352,6 +360,16 @@ pub struct GateJob {
     /// delivered to a replacement session after a restart cannot land.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landing_session_epoch: Option<String>,
+    /// r14 R1 — true once a Landing has outlived its bounded recovery window
+    /// WITHOUT an established outcome: the remote never confirmed the granted
+    /// merge and the lane cannot prove the push is dead (or a probe failed).
+    /// The row deliberately STAYS `landing`, keeps holding its lane/land
+    /// occupancy, and is surfaced to the operator (this field + a journal
+    /// entry). Only an established remote fact (exact merge on the remote, or
+    /// provably absent with the land process group verified dead) or an
+    /// explicit operator resolution settles it; elapsed time alone never does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub landing_outcome_unknown: bool,
     /// Base (`main`) sha the merge was verified onto.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_sha: Option<String>,
@@ -582,6 +600,19 @@ pub struct GateCancelParams {
     pub generation: u32,
 }
 
+/// `gate.abortLanding` params (Hub→Node): the landing the Hub settled without
+/// a landed push (established absent or operator-resolved).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateAbortLandingParams {
+    /// Job whose granted land group must be terminated.
+    pub job_id: String,
+    /// Generation being settled, so the killed run's delayed verdict is
+    /// refused exactly like a canceled generation.
+    #[serde(default)]
+    pub generation: u32,
+}
+
 /// `gate.authorize` params (Node→Hub): asked by the lane Node before a
 /// claimed dispatch starts executing, so a canceled/stale generation can
 /// never reach `git fetch` / `--land`.
@@ -794,16 +825,21 @@ pub struct GateResolveLandingParams {
     pub merge_sha: String,
 }
 
-/// `gate.resolveLanding` verdict. `landed` means the remote base already
-/// contains the granted merge; `unknown` means it could not be confirmed
-/// (host unreachable, fetch failed, or the merge is not an ancestor), so the
-/// Hub must not claim the push succeeded.
+/// `gate.resolveLanding` verdict.
+/// * `landed` — the remote base already contains the granted merge;
+/// * `absent` — a fresh fetch succeeded, the merge is NOT on the remote base,
+///   AND the lane attests the land process group that could still push for this
+///   job is verified gone (no live run, no outstanding fence record), so the
+///   push is provably not coming;
+/// * `unknown` — the outcome cannot be established (host unreachable, fetch
+///   failed, the merge is not yet an ancestor while a land group may still be
+///   alive). The Hub must never turn `unknown` into a verdict.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GateResolveLandingResult {
     /// Job id echoed back.
     pub job_id: String,
-    /// `landed` | `unknown`.
+    /// `landed` | `absent` | `unknown`.
     pub status: String,
     /// Base-branch sha observed (when known).
     #[serde(default, skip_serializing_if = "Option::is_none")]

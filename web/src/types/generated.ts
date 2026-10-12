@@ -984,6 +984,13 @@ export type ForwardIntent = ({
   [key: string]: unknown;
 });
 
+/** `gate.abortLanding` params (Hub→Node): the landing the Hub settled without a landed push (established absent or operator-resolved). */
+export type GateAbortLandingParams = ({
+  "generation": (number);
+  "jobId": (string);
+  [key: string]: unknown;
+});
+
 /** `gate.authorize` params (Node→Hub): asked by the lane Node before a claimed dispatch starts executing, so a canceled/stale generation can never reach `git fetch` / `--land`. */
 export type GateAuthorizeParams = ({
   "generation": (number);
@@ -1064,6 +1071,7 @@ export type GateJob = ({
   "id": GateJobId;
   "initiator"?: (Initiator | (null));
   "keepLogs": (boolean);
+  "landingOutcomeUnknown"?: (boolean);
   "landingSessionEpoch"?: (string | null);
   "laneId"?: (string | null);
   "logObjectId"?: (string | null);
@@ -1148,7 +1156,7 @@ export type GateResolveLandingParams = ({
   [key: string]: unknown;
 });
 
-/** `gate.resolveLanding` verdict. `landed` means the remote base already contains the granted merge; `unknown` means it could not be confirmed (host unreachable, fetch failed, or the merge is not an ancestor), so the Hub must not claim the push succeeded. */
+/** `gate.resolveLanding` verdict. * `landed` — the remote base already contains the granted merge; * `absent` — a fresh fetch succeeded, the merge is NOT on the remote base,   AND the lane attests the land process group that could still push for this   job is verified gone (no live run, no outstanding fence record), so the   push is provably not coming; * `unknown` — the outcome cannot be established (host unreachable, fetch   failed, the merge is not yet an ancestor while a land group may still be   alive). The Hub must never turn `unknown` into a verdict. */
 export type GateResolveLandingResult = ({
   "baseSha"?: (string | null);
   "error"?: (string | null);

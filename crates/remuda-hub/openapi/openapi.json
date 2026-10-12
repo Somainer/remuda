@@ -9930,6 +9930,9 @@
                               "null"
                             ]
                           },
+                          "landingOutcomeUnknown": {
+                            "type": "boolean"
+                          },
                           "error": {
                             "type": [
                               "string",
@@ -10229,6 +10232,9 @@
                               "null"
                             ]
                           },
+                          "landingOutcomeUnknown": {
+                            "type": "boolean"
+                          },
                           "error": {
                             "type": [
                               "string",
@@ -10427,6 +10433,9 @@
                         "null"
                       ]
                     },
+                    "landingOutcomeUnknown": {
+                      "type": "boolean"
+                    },
                     "error": {
                       "type": [
                         "string",
@@ -10598,6 +10607,9 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "landingOutcomeUnknown": {
+                      "type": "boolean"
                     },
                     "error": {
                       "type": [
@@ -10779,6 +10791,9 @@
                         "null"
                       ]
                     },
+                    "landingOutcomeUnknown": {
+                      "type": "boolean"
+                    },
                     "error": {
                       "type": [
                         "string",
@@ -10813,6 +10828,84 @@
           },
           "400": {
             "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/projects/{id}/gate/jobs/{jobId}/resolve": {
+      "parameters": [
+        {
+          "description": "prj_… id",
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "description": "gjb_… id",
+          "in": "path",
+          "name": "jobId",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "projectGateJobResolve",
+        "tags": [
+          "gate"
+        ],
+        "summary": "Operator-resolve a Landing whose outcome cannot be established",
+        "description": "Only a job still `landing` with landingOutcomeUnknown=true accepts a resolution: `failed` settles it Failed; `requeue` re-enters the queue. The Hub also tells the lane to terminate the granted land process group (r14 R1).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": [
+                  "resolution"
+                ],
+                "properties": {
+                  "resolution": {
+                    "type": "string",
+                    "enum": [
+                      "failed",
+                      "requeue"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Settled job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
           },
           "401": {
             "$ref": "#/components/responses/Error"

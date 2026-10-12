@@ -4714,6 +4714,27 @@
       ],
       "type": "object"
     },
+    "GateAbortLandingParams": {
+      "description": "`gate.abortLanding` params (Hub→Node): the landing the Hub settled without\na landed push (established absent or operator-resolved).",
+      "properties": {
+        "generation": {
+          "default": 0,
+          "description": "Generation being settled, so the killed run's delayed verdict is\nrefused exactly like a canceled generation.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "jobId": {
+          "description": "Job whose granted land group must be terminated.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jobId",
+        "generation"
+      ],
+      "type": "object"
+    },
     "GateAuthorizeParams": {
       "description": "`gate.authorize` params (Node→Hub): asked by the lane Node before a\nclaimed dispatch starts executing, so a canceled/stale generation can\nnever reach `git fetch` / `--land`.",
       "properties": {
@@ -5060,6 +5081,10 @@
         "keepLogs": {
           "default": false,
           "description": "Retain the bounded run log even when the run passes (`--keep-logs`).",
+          "type": "boolean"
+        },
+        "landingOutcomeUnknown": {
+          "description": "r14 R1 — true once a Landing has outlived its bounded recovery window\nWITHOUT an established outcome: the remote never confirmed the granted\nmerge and the lane cannot prove the push is dead (or a probe failed).\nThe row deliberately STAYS `landing`, keeps holding its lane/land\noccupancy, and is surfaced to the operator (this field + a journal\nentry). Only an established remote fact (exact merge on the remote, or\nprovably absent with the land process group verified dead) or an\nexplicit operator resolution settles it; elapsed time alone never does.",
           "type": "boolean"
         },
         "landingSessionEpoch": {
@@ -5471,7 +5496,7 @@
       "type": "object"
     },
     "GateResolveLandingResult": {
-      "description": "`gate.resolveLanding` verdict. `landed` means the remote base already\ncontains the granted merge; `unknown` means it could not be confirmed\n(host unreachable, fetch failed, or the merge is not an ancestor), so the\nHub must not claim the push succeeded.",
+      "description": "`gate.resolveLanding` verdict.\n* `landed` — the remote base already contains the granted merge;\n* `absent` — a fresh fetch succeeded, the merge is NOT on the remote base,\n  AND the lane attests the land process group that could still push for this\n  job is verified gone (no live run, no outstanding fence record), so the\n  push is provably not coming;\n* `unknown` — the outcome cannot be established (host unreachable, fetch\n  failed, the merge is not yet an ancestor while a land group may still be\n  alive). The Hub must never turn `unknown` into a verdict.",
       "properties": {
         "baseSha": {
           "description": "Base-branch sha observed (when known).",
@@ -5492,7 +5517,7 @@
           "type": "string"
         },
         "status": {
-          "description": "`landed` | `unknown`.",
+          "description": "`landed` | `absent` | `unknown`.",
           "type": "string"
         }
       },

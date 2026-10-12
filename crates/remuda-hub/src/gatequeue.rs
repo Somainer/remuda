@@ -121,6 +121,10 @@ pub fn routes() -> Router<AppState> {
             "/v1/projects/{id}/gate/jobs/{jobId}/cancel",
             post(cancel_project_job),
         )
+        .route(
+            "/v1/projects/{id}/gate/jobs/{jobId}/resolve",
+            post(resolve_project_job),
+        )
         .route("/v1/gate/jobs", get(list_all_jobs))
         .route("/v1/gate/logs/{id}", get(get_gate_log))
 }
@@ -397,6 +401,7 @@ async fn enqueue_job(
         then_command: body.then_command,
         then_output: None,
         landing_session_epoch: None,
+        landing_outcome_unknown: false,
     };
     state.store.insert_gate_job(&job).await.map_err(map_store)?;
     journal(&state, &device.id, "gate.queued", &job).await;
@@ -565,6 +570,121 @@ async fn cancel_project_job(
             job.state.as_str()
         ))),
     }
+}
+
+/// r14 R1 — body of the operator Landing-resolution request.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveLandingRequest {
+    /// `failed` — the operator attests the push did not land; finish Failed.
+    /// `requeue` — re-enter the queue for a fresh verify+land attempt.
+    resolution: String,
+}
+
+/// `POST /v1/projects/{id}/gate/jobs/{jobId}/resolve`
+///
+/// The explicit operator escape hatch for a Landing whose outcome cannot be
+/// established (it is parked in the outcome-unknown Landing state holding its
+/// lane). Only a row still `landing` AND marked `landingOutcomeUnknown` may be
+/// resolved this way; an established remote fact always wins over the
+/// operator. The writer records the operator's device id as the settler.
+async fn resolve_project_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, job_id)): Path<(String, String)>,
+    Json(request): Json<ResolveLandingRequest>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    let device = caller(&state, &headers).await?;
+    let scope = caller_project_scope(&state, &device).await?;
+    if !scope.allows_project(&project) {
+        return Err(HubError::Forbidden);
+    }
+    let requeue = match request.resolution.as_str() {
+        "failed" => false,
+        "requeue" => true,
+        other => {
+            return Err(HubError::BadRequest(format!(
+                "resolution must be \"failed\" or \"requeue\", got {other:?}"
+            )));
+        }
+    };
+    let job = state
+        .store
+        .get_gate_job(&job_id)
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    if job.project_id.as_id().as_str() != project {
+        return Err(HubError::NotFound);
+    }
+    require_grant(
+        &state,
+        &device,
+        if job.mode == GateMode::Land {
+            GrantVerb::Land
+        } else {
+            GrantVerb::Dispatch
+        },
+    )
+    .await?;
+    if job.state != GateJobState::Landing || !job.landing_outcome_unknown {
+        return Err(HubError::Conflict(
+            "only a Landing parked with an unknown outcome accepts an operator resolution"
+                .to_string(),
+        ));
+    }
+    let operator = device.id.clone();
+    let outcome = state
+        .store
+        .mutate_gate_job(&job_id, move |row| {
+            if row.state != GateJobState::Landing || !row.landing_outcome_unknown {
+                return None;
+            }
+            row.home_land_in_flight = false;
+            row.landing_session_epoch = None;
+            row.landing_outcome_unknown = false;
+            if requeue {
+                row.state = GateJobState::Queued;
+                row.started_at = None;
+                row.host_id = None;
+                row.lane_id = None;
+                row.finished_at = None;
+                row.current_main_sha = None;
+                row.merge_ref = None;
+                row.merge_sha = None;
+                row.failed_step = None;
+                row.reason = None;
+                row.log_object_id = None;
+                row.error = Some(format!(
+                    "landing outcome unknown; re-queued by explicit operator resolution ({operator})"
+                ));
+            } else {
+                row.state = GateJobState::Failed;
+                row.finished_at = Some(now_ts());
+                row.error = Some(format!(
+                    "landing outcome unknown after the bounded recovery window; settled failed by \
+                     explicit operator resolution ({operator})"
+                ));
+                row.reason = Some("failed; landing outcome unknown, resolved by operator".into());
+            }
+            Some(())
+        })
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    if requeue {
+        // Stop the granted land group BEFORE the scheduler can hand the lane
+        // to the fresh attempt (an unresolved late verdict is generation-fenced).
+        abort_landing_run(&state, &job).await;
+        journal(&state, &device.id, "gate.base-moved-requeue", &outcome).await;
+        schedule_once(&state);
+    } else {
+        abort_landing_run(&state, &job).await;
+        journal(&state, &device.id, "gate.failed", &outcome).await;
+        drop_job_refs(&state, &outcome).await;
+    }
+    Ok(Json(json!(outcome)))
 }
 
 async fn resolve_job(
@@ -2198,16 +2318,18 @@ pub(crate) fn spawn_landing_reconciler(state: &AppState) -> tokio::task::JoinHan
 /// re-running a push. Called from the schedule tick (throttled) and forced for
 /// one host immediately after its carrier registers (`force_host`).
 ///
-/// Outcome rule for a row whose lane host is currently connected:
-///   * the exact granted merge is already an ancestor of the remote base →
+/// r14 R1 — outcome rule for a row whose lane host is currently connected:
+///   * the exact granted merge is an ancestor of the remote base →
 ///     LANDED (exactly once; the row keeps occupying until then);
-///   * not on the remote AND the bounded recovery window since the grant has
-///     elapsed (the Node's land group is then provably terminated by its
-///     budget, so the push cannot still land) → FAILED with an explicit
-///     indeterminate reason;
-///   * otherwise the outcome is still UNCERTAIN (push in flight, host between
-///     reconnects, or a probe error) → the row STAYS Landing and keeps its
-///     occupancy; a later tick/hello retries.
+///   * a fresh fetch proves the merge absent AND the lane attests the land
+///     process group verified dead → re-queued (or failed at the attempt cap),
+///     because nothing was pushed and nothing can still push;
+///   * anything not established (push possibly in flight, host between
+///     reconnects, a probe error, or an expired window) → the row STAYS Landing
+///     and keeps its occupancy; once the bounded recovery window has elapsed it
+///     is parked in the explicit operator-visible outcome-unknown state (flag +
+///     reason + `gate.landing-unknown` journal) until a later probe establishes
+///     a fact or the operator resolves it. Elapsed time alone never fails it.
 pub(crate) async fn reconcile_landings(state: &AppState, force_host: Option<&str>) {
     let Ok(rows) = state.store.list_landing_jobs().await else {
         return;
@@ -2244,24 +2366,82 @@ pub(crate) async fn reconcile_landings(state: &AppState, force_host: Option<&str
         {
             continue;
         }
-        let confirmed = probe_landing_contained(state, &job).await;
+        // r14 R1: only an ESTABLISHED fact moves a Landing. A probe says one
+        // of three things — the exact merge is on the remote (landed); it is
+        // provably absent AND the land group is verified dead (absent); or it
+        // cannot establish either (unknown). Elapsed time by itself is never a
+        // verdict: an expired unconfirmed Landing stays Landing in an explicit
+        // outcome-unknown state, keeps its occupancy, and is surfaced.
+        let outcome = probe_landing_outcome(state, &job).await;
         let _ = state
             .store
             .mark_landing_probed(job.id.as_id().as_str(), &now)
             .await;
-        if confirmed {
-            settle_landing_row(state, &job, true).await;
-            continue;
-        }
-        // Not confirmed. Settle failed only once the grant has outlived the
-        // whole land budget + grace; before that the push may still complete,
-        // so the honest state is the uncertainty-preserving Landing.
         let expired =
             elapsed_since(&now, landing_at.as_deref()).is_some_and(|age| age >= recovery_ms);
-        if expired {
-            settle_landing_row(state, &job, false).await;
+        match outcome {
+            LandingProbe::Landed => settle_landing_landed(state, &job).await,
+            LandingProbe::Absent => {
+                // The lane only attests groups IT spawned. A `pushFrom: home`
+                // push is driven by the home host, whose process liveness the
+                // lane cannot see; there the `absent` answer is not
+                // authoritative and the row stays Landing/unknown.
+                if job.home_land_in_flight {
+                    if expired {
+                        mark_landing_unknown(
+                            state,
+                            &job,
+                            "not confirmed on the remote; the home-host land group liveness is \
+                             not attestable from the lane",
+                        )
+                        .await;
+                    }
+                } else {
+                    // Established: nothing was pushed and the only process group
+                    // that could push is verified dead — safe to re-queue (bounded
+                    // by the same attempt cap) or fail at the cap.
+                    settle_landing_absent(state, &job).await;
+                }
+            }
+            LandingProbe::Unknown => {
+                if expired {
+                    mark_landing_unknown(
+                        state,
+                        &job,
+                        "the granted push was not confirmed on the remote base and its outcome \
+                         could not be established",
+                    )
+                    .await;
+                }
+            }
         }
     }
+}
+
+/// Tell the lane Node to terminate the granted land group of a Landing the Hub
+/// settled WITHOUT a landed push (provably absent, or operator-resolved), so
+/// the lane frees for a fresh attempt and an orphaned group cannot push after
+/// the verdict. Best-effort and bounded: an unreachable lane keeps its settled
+/// row anyway, and the Node's startup fence kills any orphaned group at its next
+/// boot. r14 R1.
+async fn abort_landing_run(state: &AppState, job: &GateJob) {
+    let (Some(host), Some(_lane)) = (&job.host_id, &job.lane_id) else {
+        return;
+    };
+    let params = serde_json::to_value(remuda_protocol::GateAbortLandingParams {
+        job_id: job.id.as_id().to_string(),
+        generation: job.attempts,
+    })
+    .unwrap_or(Value::Null);
+    let _ = state
+        .nodes
+        .call(
+            host.as_id().as_str(),
+            remuda_protocol::METHOD_GATE_ABORT_LANDING,
+            params,
+            Duration::from_secs(10),
+        )
+        .await;
 }
 
 /// Resolve the lane host a Landing job must be probed on, if its project/lane
@@ -2282,10 +2462,62 @@ async fn landing_lane_host(state: &AppState, job: &GateJob) -> Option<remuda_pro
         .map(|lane| lane.host_id.clone())
 }
 
-/// Write the one terminal state a Landing probe established. `landed` records
-/// the confirmed remote outcome; `false` records an explicit indeterminate
-/// failure after the bounded window. Never re-queues or re-dispatches.
-async fn settle_landing_row(state: &AppState, job: &GateJob, landed: bool) {
+/// One fact a read-only Landing probe established.
+enum LandingProbe {
+    /// The exact granted merge is an ancestor of the remote base.
+    Landed,
+    /// A fresh fetch says the merge is absent AND the lane attests the land
+    /// process group is verified dead.
+    Absent,
+    /// Nothing could be established (host/probe error, group possibly alive,
+    /// or non-ancestry without a dead-group attestation).
+    Unknown,
+}
+
+/// Mark an expired, unconfirmed Landing as explicitly OUTCOME UNKNOWN. The row
+/// deliberately stays `landing`, keeps holding its lane/land occupancy, and is
+/// surfaced to the operator (the `landingOutcomeUnknown` flag + reason on the
+/// job and a one-shot `gate.landing-unknown` journal entry). Probing keeps
+/// running; only an established remote fact or an operator resolution settles
+/// the row. r14 R1.
+async fn mark_landing_unknown(state: &AppState, job: &GateJob, note: &str) {
+    let flipped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flipped_writer = flipped.clone();
+    let note = note.to_owned();
+    let outcome = state
+        .store
+        .mutate_gate_job(job.id.as_id().as_str(), move |row| {
+            if row.state != GateJobState::Landing {
+                return None;
+            }
+            if !row.landing_outcome_unknown {
+                row.landing_outcome_unknown = true;
+                row.reason = Some(format!(
+                    "landing outcome unknown after the bounded recovery window: {note}; the job \
+                     keeps its landing occupancy until the remote outcome is established or an \
+                     operator resolves it"
+                ));
+                flipped_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Some(())
+        })
+        .await;
+    if let Ok(Some(updated)) = outcome
+        && flipped.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        journal(
+            state,
+            &updated.requested_by,
+            "gate.landing-unknown",
+            &updated,
+        )
+        .await;
+    }
+}
+
+/// Settle a Landing whose exact granted merge the probe confirmed on the
+/// remote. Never re-queues or re-pushes.
+async fn settle_landing_landed(state: &AppState, job: &GateJob) {
     let job_id = job.id.as_id().to_string();
     let outcome = state
         .store
@@ -2295,34 +2527,90 @@ async fn settle_landing_row(state: &AppState, job: &GateJob, landed: bool) {
             }
             row.home_land_in_flight = false;
             row.landing_session_epoch = None;
+            row.landing_outcome_unknown = false;
             row.finished_at = Some(now_ts());
-            if landed {
-                row.state = GateJobState::Landed;
-                row.error = None;
-                if row.reason.is_none() {
-                    row.reason =
-                        Some("landed; confirmed on remote main by reconciliation".into());
-                }
-            } else {
-                row.state = GateJobState::Failed;
-                let error =
-                    "landing outcome unknown after the bounded recovery window; the granted push \
-                     was not confirmed on the remote base and the land budget elapsed (the job is \
-                     not re-run automatically)";
-                row.error = Some(error.into());
-                row.reason = Some("failed; landing unconfirmed after the recovery window".into());
+            row.state = GateJobState::Landed;
+            row.error = None;
+            if row.reason.is_none() {
+                row.reason = Some("landed; confirmed on remote main by reconciliation".into());
             }
             Some(())
         })
         .await;
     if let Ok(Some(settled)) = outcome {
-        if settled.state == GateJobState::Landed {
-            journal(state, &settled.requested_by, "gate.landed", &settled).await;
-            drop_job_refs(state, &settled).await;
-            run_then_hook(state, &settled).await;
-        } else {
-            journal(state, &settled.requested_by, "gate.failed", &settled).await;
-            drop_job_refs(state, &settled).await;
+        journal(state, &settled.requested_by, "gate.landed", &settled).await;
+        drop_job_refs(state, &settled).await;
+        run_then_hook(state, &settled).await;
+    }
+}
+
+/// Settle a Landing the probe established ABSENT: a fresh remote fetch does not
+/// contain the granted merge AND the lane verified the land process group dead.
+/// Nothing was pushed and nothing can still push, so the job re-enters the
+/// queue for a fresh attempt, or fails once the attempt cap is reached. r14 R1.
+async fn settle_landing_absent(state: &AppState, job: &GateJob) {
+    let job_id = job.id.as_id().to_string();
+    let outcome = state
+        .store
+        .mutate_gate_job(&job_id, move |row| {
+            if row.state != GateJobState::Landing {
+                return None;
+            }
+            row.home_land_in_flight = false;
+            row.landing_session_epoch = None;
+            row.landing_outcome_unknown = false;
+            if row.attempts < MAX_LAND_ATTEMPTS {
+                row.state = GateJobState::Queued;
+                row.started_at = None;
+                row.host_id = None;
+                row.lane_id = None;
+                row.finished_at = None;
+                row.current_main_sha = None;
+                row.merge_ref = None;
+                row.merge_sha = None;
+                row.failed_step = None;
+                row.reason = None;
+                row.log_object_id = None;
+                row.error = Some(
+                    "landing provably absent on the remote and the land process group is verified \
+                     dead; re-queued for a fresh attempt"
+                        .into(),
+                );
+            } else {
+                row.state = GateJobState::Failed;
+                row.finished_at = Some(now_ts());
+                row.error = Some(
+                    "landing provably absent on the remote with the land process group verified \
+                     dead; the attempt cap is reached, so the job is not re-run automatically"
+                        .into(),
+                );
+                row.reason =
+                    Some("failed; landing provably absent and the land group is dead".into());
+            }
+            Some(())
+        })
+        .await;
+    if let Ok(Some(settled)) = outcome {
+        match settled.state {
+            GateJobState::Queued => {
+                // Normally the run is already gone (the probe required a
+                // verified-dead group); make sure before re-dispatching.
+                abort_landing_run(state, job).await;
+                journal(
+                    state,
+                    &settled.requested_by,
+                    "gate.base-moved-requeue",
+                    &settled,
+                )
+                .await;
+                schedule_once(state);
+            }
+            GateJobState::Failed => {
+                abort_landing_run(state, job).await;
+                journal(state, &settled.requested_by, "gate.failed", &settled).await;
+                drop_job_refs(state, &settled).await;
+            }
+            _ => {}
         }
     }
 }
@@ -2359,24 +2647,28 @@ pub(crate) async fn recover_ended_session(state: &AppState, host_id: &str, sessi
     }
 }
 
-/// Ask the lane host (read-only) whether the granted merge is already on the
-/// remote base. False for host gone / probe error / non-ancestry.
-async fn probe_landing_contained(state: &AppState, job: &GateJob) -> bool {
+/// Ask the lane host (read-only) what the remote AND its local land-process
+/// liveness establish for the granted merge:
+/// * `Landed` — exact merge is an ancestor of the remote base;
+/// * `Absent` — fresh fetch, merge not on the remote, AND the Node attests the
+///   land process group that could still push is verified gone;
+/// * `Unknown` — host gone, RPC/fetch error, or still possibly in flight.
+async fn probe_landing_outcome(state: &AppState, job: &GateJob) -> LandingProbe {
     let Some(merge_sha) = job.merge_sha.clone() else {
-        return false;
+        return LandingProbe::Unknown;
     };
     let Some(lane_id) = job.lane_id.clone() else {
-        return false;
+        return LandingProbe::Unknown;
     };
     let Ok(Some(project)) = state
         .store
         .get_project(job.project_id.as_id().to_string())
         .await
     else {
-        return false;
+        return LandingProbe::Unknown;
     };
     let Some(lane) = project.gate.lanes.iter().find(|lane| lane.id == lane_id) else {
-        return false;
+        return LandingProbe::Unknown;
     };
     let params = serde_json::to_value(remuda_protocol::GateResolveLandingParams {
         job_id: job.id.as_id().to_string(),
@@ -2394,14 +2686,18 @@ async fn probe_landing_contained(state: &AppState, job: &GateJob) -> bool {
             Duration::from_secs(30),
         )
         .await;
-    matches!(
-        reply,
-        Ok(Some(frame)) if frame
+    let status = reply.ok().flatten().and_then(|frame| {
+        frame
             .get("result")
             .and_then(|result| result.get("status"))
             .and_then(Value::as_str)
-            == Some("landed")
-    )
+            .map(str::to_owned)
+    });
+    match status.as_deref() {
+        Some("landed") => LandingProbe::Landed,
+        Some("absent") => LandingProbe::Absent,
+        _ => LandingProbe::Unknown,
+    }
 }
 
 // ── store CRUD ─────────────────────────────────────────────────────────────

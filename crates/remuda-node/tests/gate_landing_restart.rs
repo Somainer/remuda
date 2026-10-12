@@ -128,7 +128,11 @@ wait_proceed() {
   for _ in $(seq 1 600); do [ -f "$GATE_DIR/proceed" ] && return 0; sleep 0.1; done
 }
 if [ "$mode" = "gate" ]; then
+  # The real merge CLI verifies in its OWN scratch gate worktree checked out at
+  # origin/<onto>; emulate that with a forced reset so a second verify on this
+  # shared lane checkout never inherits the previous verify's merged tree.
   git checkout -qB "$onto" "origin/$onto"
+  git reset -q --hard "origin/$onto"
   base=$(git rev-parse "$onto")
   head=$(git rev-parse "origin/$branch")
   git merge -q --no-ff "origin/$branch" -m "gate merge $branch"
@@ -909,4 +913,215 @@ async fn real_cancel_during_verify_kills_the_run_and_never_grants_or_pushes() {
     // Releasing the blocked verify now must be harmless: the process group was
     // already killed at cancel (the marker file simply never proceeds).
     std::fs::write(gate_dir.join("proceed"), b"go").unwrap();
+}
+
+/// r14 item 1 (R1): an unconfirmed Landing that outlives its bounded recovery
+/// window is NEVER settled failed by time. It stays Landing in an explicit
+/// outcome-unknown state (flag + reason on the job, `gate.landing-unknown`
+/// journal), keeps its lane occupancy (a second job stays queued), and only an
+/// explicit operator resolution (POST .../resolve) settles it — here Failed —
+/// after which the lane frees and the second job runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expired_unconfirmed_landing_stays_unknown_until_operator_resolves() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate_dir = dir.path().join("gatedir");
+    std::fs::create_dir_all(&gate_dir).unwrap();
+    let origin = build_origin(dir.path());
+    let bin = write_merge_cli(dir.path());
+
+    let data_dir = dir.path().join("hub-data");
+    let port = free_port();
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+
+    let node = DevNode::new(
+        &DevServerConfig::loopback(0)
+            .with_workspace_root(dir.path().to_path_buf())
+            .with_workspace_roots(remuda_testing::test_workspace_roots!()),
+    )
+    .expect("dev node");
+    node.gate_test_set_merge_bin(bin).await;
+    let host_id = node.host().meta.id.as_id().as_str().to_owned();
+    let workspace_id = node
+        .workspaces()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .meta
+        .id
+        .as_id()
+        .as_str()
+        .to_owned();
+
+    let mut config = HubConfig::for_test(data_dir);
+    config.listen = addr;
+    // Short bounded recovery window/probe spacing so the unknown state latches
+    // promptly in the test without any sleeps in the assertions.
+    config.gate_landing_recovery_ms = 700;
+    config.gate_landing_probe_interval_ms = 250;
+    let hub = remuda_hub::spawn(config).await.unwrap();
+    let dev_token = hub.mint_device_token("h").await.unwrap();
+    let enroll = hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await
+        .unwrap();
+    let _link = WssLink::connect_runtime(
+        WssConfig::loopback(addr, enroll, host_id.clone()),
+        node.clone(),
+    )
+    .await
+    .unwrap();
+    wait_host_online(addr, &dev_token, &host_id).await;
+
+    let body = json!({
+        "name": "gate-landing-unknown",
+        "members": [{"hostId": host_id, "workspaceId": workspace_id, "role": "build"}],
+        "hosts": [{"hostId": host_id, "maxInstances": 8}],
+        "gate": {
+            "affected": true, "web": "never", "landSerialization": "global-cas",
+            "lanes": [{
+                "id": "lane1", "hostId": host_id,
+                "repoPath": origin.lane.to_string_lossy(),
+                "targetDir": dir.path().join("target").to_string_lossy(),
+                "ports": "58650-58659",
+                "env": {"GATE_DIR": gate_dir.to_string_lossy(), "CASE": "block_then_push",
+                        "PATH": std::env::var("PATH").unwrap_or_default()},
+                "lockPath": dir.path().join("gate.lock").to_string_lossy(),
+                "pwEndpoint": "ws://127.0.0.1:0/"
+            }]
+        }
+    });
+    let (status, created) = http(addr, "POST", "/v1/projects", &dev_token, Some(body)).await;
+    assert_eq!(status, 200, "{created}");
+    let project_id = created["id"].as_str().unwrap().to_owned();
+
+    async fn enqueue(addr: std::net::SocketAddr, token: &str, project_id: &str) -> String {
+        let (status, enqueued) = http(
+            addr,
+            "POST",
+            &format!("/v1/projects/{project_id}/gate"),
+            token,
+            Some(json!({"branch": "wt/land/restart", "mode": "land"})),
+        )
+        .await;
+        assert_eq!(status, 200, "{enqueued}");
+        enqueued["id"].as_str().unwrap().to_owned()
+    }
+
+    let job_id = enqueue(addr, &dev_token, &project_id).await;
+    wait_state(&hub, &job_id, &["landing"]).await;
+    // The granted land child is blocked before pushing: nothing is on the
+    // remote, and its process group is very much alive.
+    assert_eq!(
+        git(&origin.origin, &["rev-parse", "main"]),
+        origin.base_main
+    );
+
+    // A second job queues behind the held Landing occupancy.
+    let second_id = enqueue(addr, &dev_token, &project_id).await;
+
+    // R1: past the recovery window the row is parked outcome-UNKNOWN, still
+    // Landing, with the operator-visible flag and the one-shot journal entry.
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let unknown = loop {
+        let job = job_of(&hub, &job_id).await;
+        assert_eq!(job["state"], json!("landing"), "unknown never fails: {job}");
+        if job["landingOutcomeUnknown"] == json!(true) {
+            break job;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never marked unknown"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        unknown["reason"]
+            .as_str()
+            .is_some_and(|text| text.contains("outcome unknown")),
+        "{unknown}"
+    );
+    let actions = hub.test_gate_audit_actions(&job_id).await.unwrap();
+    assert!(
+        actions.iter().any(|a| a == "gate.landing-unknown"),
+        "operator-visible journal missing: {actions:?}"
+    );
+
+    // Occupancy is still held: the second job never leaves the queue, even
+    // well after the recovery window elapsed.
+    let window = tokio::time::Instant::now() + Duration::from_millis(1500);
+    while tokio::time::Instant::now() < window {
+        assert_eq!(
+            job_of(&hub, &second_id).await["state"],
+            json!("queued"),
+            "an unknown Landing keeps its occupancy"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Remote never moved and the (still alive) blocked child never pushed.
+    assert_eq!(
+        git(&origin.origin, &["rev-parse", "main"]),
+        origin.base_main
+    );
+
+    // The only ways out are an established remote fact or an explicit operator
+    // resolution. A plain cancel still cannot stop a Landing.
+    let (status, _) = http(
+        addr,
+        "POST",
+        &format!("/v1/projects/{project_id}/gate/jobs/{job_id}/cancel"),
+        &dev_token,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, 409, "cancel must not settle an unknown Landing");
+
+    // Resolve failed: the operator-attested terminal write frees the lane.
+    let (status, resolved) = http(
+        addr,
+        "POST",
+        &format!("/v1/projects/{project_id}/gate/jobs/{job_id}/resolve"),
+        &dev_token,
+        Some(json!({"resolution": "failed"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{resolved}");
+    let failed = wait_state(&hub, &job_id, &["failed"]).await;
+    assert_eq!(failed["state"], json!("failed"), "{failed}");
+    assert!(
+        !failed["landingOutcomeUnknown"].as_bool().unwrap_or(false),
+        "the unknown marker clears on resolution: {failed}"
+    );
+    assert!(
+        failed["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("operator resolution")),
+        "{failed}"
+    );
+
+    // The lane freed: the second job verifies and blocks in ITS land phase.
+    let second = wait_state(&hub, &second_id, &["landing"]).await;
+    assert_eq!(second["state"], json!("landing"), "{second}");
+
+    // Release the fresh attempt's blocked land (job1's group was aborted by
+    // the resolve; its wait loop dying with the group pushes nothing).
+    std::fs::write(gate_dir.join("proceed"), b"go").unwrap();
+    let second_done = wait_state(&hub, &second_id, &["landed"]).await;
+    assert_eq!(second_done["state"], json!("landed"), "{second_done}");
+
+    // Main advanced exactly to the second (fresh) verified merge; the aborted
+    // first land group never pushed, and the Hub never re-drove anything.
+    let remote_now = git(&origin.origin, &["rev-parse", "main"]);
+    assert_ne!(remote_now, origin.base_main, "the fresh attempt landed");
+    assert_eq!(
+        remote_now,
+        second_done["mergeSha"].as_str().unwrap_or(""),
+        "remote is the granted merge of the settled attempt"
+    );
+    let pushes = std::fs::read_to_string(gate_dir.join("pushes.log")).unwrap();
+    assert_eq!(
+        pushes.lines().count(),
+        1,
+        "the aborted first group never pushed; the fresh attempt pushed once: {pushes}"
+    );
 }

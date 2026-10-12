@@ -20,9 +20,9 @@
 use crate::DevNode;
 use crate::NodeError;
 use remuda_protocol::{
-    GateCancelParams, GateEventKind, GateEventParams, GateLandParams, GateLandResult,
-    GateResolveLandingParams, GateResolveLandingResult, GateRunLog, GateRunParams, GateRunResult,
-    GateStep, GateThenParams, GateThenResult, GateUnpinParams, GateUnpinResult,
+    GateAbortLandingParams, GateCancelParams, GateEventKind, GateEventParams, GateLandParams,
+    GateLandResult, GateResolveLandingParams, GateResolveLandingResult, GateRunLog, GateRunParams,
+    GateRunResult, GateStep, GateThenParams, GateThenResult, GateUnpinParams, GateUnpinResult,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -175,10 +175,16 @@ const STANDALONE_SUMMARY_MAX: usize = 40;
 const PLAYWRIGHT_TITLES_MAX: usize = 20;
 const PLAYWRIGHT_BLOCK_MAX: usize = 100;
 
-/// One live gate run: cancel flag and the process group to kill.
+/// One live gate run: cancel flag and the process group(s) to kill.
 struct LiveRun {
     cancel: watch::Sender<bool>,
+    /// Verify child process group.
     pgid: std::sync::Mutex<Option<i32>>,
+    /// Granted LAND child process group. `None` until the grant was taken and
+    /// the land child spawned. A read-only `gate.resolveLanding` probe treats a
+    /// live land group as "the push may still happen" and reports `unknown`
+    /// rather than `absent` (r14 R1).
+    land_pgid: std::sync::Mutex<Option<i32>>,
 }
 
 /// Bounded FIFO of text lines. Long runs (a 39-minute cargo-test) stream
@@ -673,13 +679,33 @@ pub(crate) struct GateRegistry {
     /// authority decision still runs through the real Hub.
     #[cfg(any(test, feature = "test-faults"))]
     merge_bin: Mutex<Option<std::path::PathBuf>>,
+    /// Durable ledger directory for granted LAND process groups (r14 R1). One
+    /// record per granted land, written right after the land child spawns and
+    /// removed only once the whole group is verified gone. A leftover record
+    /// at Node boot fences (kills + verifies) the possibly-orphaned group
+    /// before any carrier is served; a record present at runtime proves a push
+    /// may still land, so a read-only landing probe reports `unknown`.
+    land_fence_dir: std::path::PathBuf,
     events: tokio::sync::broadcast::Sender<GateEventParams>,
 }
 
 impl GateRegistry {
-    pub(crate) fn new() -> Self {
+    /// Construct the registry rooted at a Node data dir, fencing any land
+    /// groups orphaned by a previous Node process BEFORE returning. The land
+    /// child runs in its own process group with kill_on_drop(false), so a Node
+    /// crash would otherwise leave it free to keep pushing while the Hub could
+    /// only guess the outcome. The startup fence makes "the land process group
+    /// is verified dead" provable across restarts (r14 R1). With no leftover
+    /// records — the normal boot — this is one directory read.
+    pub(crate) fn open(land_fence_dir: std::path::PathBuf) -> Arc<Self> {
+        #[cfg(unix)]
+        fence_orphaned_land_groups(&land_fence_dir);
+        Self::new(land_fence_dir)
+    }
+
+    pub(crate) fn new(land_fence_dir: std::path::PathBuf) -> Arc<Self> {
         let (events, _) = tokio::sync::broadcast::channel(512);
-        Self {
+        Arc::new(Self {
             lanes: Mutex::new(BTreeMap::new()),
             runs: Mutex::new(GateRunTable::new()),
             authorizer: tokio::sync::RwLock::new(None),
@@ -689,8 +715,9 @@ impl GateRegistry {
             land_timeout: Mutex::new(None),
             #[cfg(any(test, feature = "test-faults"))]
             merge_bin: Mutex::new(None),
+            land_fence_dir,
             events,
-        }
+        })
     }
 
     /// Test-only: override the consumed merge/land CLI.
@@ -733,6 +760,74 @@ impl GateRegistry {
         }
         #[allow(unreachable_code)]
         Duration::from_secs(DEFAULT_LAND_TIMEOUT_SECS)
+    }
+
+    /// Durably record the granted land child's process group right after it
+    /// spawns, so a Node crash leaves the next boot a fence it can kill and
+    /// verify before serving (r14 R1).
+    #[cfg(unix)]
+    fn record_land_group(&self, job_id: &str, generation: u32, pgid: i32) {
+        write_land_fence(&self.land_fence_dir, job_id, generation, pgid);
+    }
+
+    /// The land leader has already been reaped by the caller. Finish off any
+    /// surviving group member with SIGKILL, verify the whole group is ESRCH, and
+    /// only then remove the durable fence record.
+    #[cfg(unix)]
+    async fn settle_land_group(&self, job_id: &str, pgid: i32) {
+        let dir = self.land_fence_dir.clone();
+        let job_id = job_id.to_owned();
+        let _ = tokio::task::spawn_blocking(move || {
+            if land_group_exists(pgid) {
+                use nix::sys::signal::{Signal, killpg};
+                use nix::unistd::Pid;
+                // The graceful TERM pass (if one was owed) already ran; any
+                // member still here after the leader was reaped gets KILL.
+                let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGKILL));
+                let deadline = Instant::now() + Duration::from_millis(500);
+                while Instant::now() < deadline && land_group_exists(pgid) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            if !land_group_exists(pgid) {
+                remove_land_fence(&dir, &job_id);
+            }
+            // If ESRCH still cannot be proven (an unreaped zombie under a
+            // subreaper) the record stays: the startup fence proves it later.
+        })
+        .await;
+    }
+
+    /// Whether a granted push for `job_id` can still land: a live run whose
+    /// land group is (or may be) alive in this process, or a durable fence
+    /// record the startup fence has not cleared. `false` attests the land
+    /// process group is verified gone, which lets a read-only remote probe
+    /// answer `absent` (r14 R1).
+    async fn land_group_may_push(&self, job_id: &str) -> bool {
+        let table = self.runs.lock().await;
+        if let Some(run) = table.runs.get(job_id) {
+            let land_pgid = *run
+                .land_pgid
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            match land_pgid {
+                Some(pgid) => return land_group_exists(pgid),
+                // The run exists and the grant may already have been taken but
+                // the land child has not recorded its group yet: conservative.
+                None => return true,
+            }
+        }
+        drop(table);
+        #[cfg(unix)]
+        {
+            land_fence_path(&self.land_fence_dir, job_id).exists()
+        }
+        #[cfg(not(unix))]
+        {
+            // Without process-group accounting an absent verdict cannot be
+            // attested by the Node.
+            true
+        }
     }
 
     /// Register the live session's Hub-authority hook (called on connect).
@@ -997,6 +1092,7 @@ impl DevNode {
             remuda_protocol::METHOD_GATE_RESOLVE_LANDING => {
                 self.run_gate_resolve_landing(params).await
             }
+            remuda_protocol::METHOD_GATE_ABORT_LANDING => self.abort_gate_landing(params).await,
             other => Err(NodeError::InvalidRequest(format!(
                 "not a gate method: {other}"
             ))),
@@ -1010,6 +1106,54 @@ impl DevNode {
         })?;
         let result = self.run_gate_typed(request).await?;
         serde_json::to_value(result).map_err(NodeError::from)
+    }
+
+    /// Handle `gate.abortLanding` — the Hub settled a Landing WITHOUT a landed
+    /// push (the merge is provably absent with the group dead, or an operator
+    /// resolved it). Terminate the granted LAND process group the same way a
+    /// land timeout does (TERM → bounded wait → KILL the whole group; the run
+    /// task reaps the leader and releases the durable fence record) so the lane
+    /// frees for a re-queued attempt and an operator-failed job cannot push
+    /// after the fact. The generation is tombstoned like a cancel, so the
+    /// killed run's late verdict refuses. A run that has already gone (the
+    /// common established-absent case) makes this a no-op. r14 R1.
+    pub(crate) async fn abort_gate_landing(&self, params: &Value) -> Result<Value, NodeError> {
+        let request: GateAbortLandingParams =
+            serde_json::from_value(params.clone()).map_err(|error| {
+                NodeError::InvalidRequest(format!("invalid gate.abortLanding params: {error}"))
+            })?;
+        let registry = self.gate_registry();
+        let target = {
+            let mut table = registry.runs.lock().await;
+            let land_pgid = table.runs.get(&request.job_id).and_then(|run| {
+                *run.land_pgid
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+            });
+            if land_pgid.is_none()
+                && let Some(run) = table.runs.get(&request.job_id)
+            {
+                // The grant never got to spawn its land child (or the row was
+                // settled while the verify group was the live one): release its
+                // cancel flag so a verify-phase child stands down too.
+                run.cancel.send(true).ok();
+            }
+            table.record_cancel(&request.job_id, request.generation);
+            land_pgid
+        };
+        #[cfg(unix)]
+        if let Some(pgid) = target {
+            let _ = tokio::task::spawn_blocking(move || {
+                terminate_and_verify_group(pgid, LAND_GROUP_TERM_GRACE);
+            })
+            .await;
+        }
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "jobId": request.job_id,
+            "generation": request.generation,
+        }))
     }
 
     /// Handle `gate.cancel` — kills the running step's process group and
@@ -1086,8 +1230,10 @@ impl DevNode {
     }
 
     /// Handle `gate.resolveLanding` — read-only post-restart probe: is the
-    /// granted merge already an ancestor of the remote base branch? Never
-    /// pushes; `unknown` is the honest answer when it cannot confirm.
+    /// granted merge already an ancestor of the remote base branch, provably
+    /// absent, or still indeterminate? Never pushes; `unknown` is the honest
+    /// answer whenever it cannot confirm either terminal fact. The Hub decides
+    /// nothing from this reply except what the reply ESTABLISHED (r14 R1).
     pub(crate) async fn run_gate_resolve_landing(
         &self,
         params: &Value,
@@ -1096,9 +1242,19 @@ impl DevNode {
             serde_json::from_value(params.clone()).map_err(|error| {
                 NodeError::InvalidRequest(format!("invalid gate.resolveLanding params: {error}"))
             })?;
-        let result = tokio::task::spawn_blocking(move || resolve_landing_after_restart(&request))
-            .await
-            .map_err(|error| NodeError::InvalidRequest(format!("resolveLanding join: {error}")))?;
+        // r14 R1: `absent` is only attestable when the land group that could
+        // still push this job is verified gone — no live run in this process
+        // and no durable fence record (a leftover record is fenced at boot).
+        // Otherwise a not-on-remote fetch result stays `unknown`.
+        let land_group_may_push = self
+            .gate_registry()
+            .land_group_may_push(&request.job_id)
+            .await;
+        let result = tokio::task::spawn_blocking(move || {
+            resolve_landing_after_restart(&request, land_group_may_push)
+        })
+        .await
+        .map_err(|error| NodeError::InvalidRequest(format!("resolveLanding join: {error}")))?;
         serde_json::to_value(result).map_err(NodeError::from)
     }
 
@@ -1189,6 +1345,7 @@ impl DevNode {
         let live = Arc::new(LiveRun {
             cancel: cancel_tx,
             pgid: std::sync::Mutex::new(None),
+            land_pgid: std::sync::Mutex::new(None),
         });
         {
             let mut table = registry.runs.lock().await;
@@ -1578,10 +1735,6 @@ impl DevNode {
         // exactly this (job, generation, session). A cancel committed first is
         // refused and nothing is pushed. Once granted, run the land-only
         // merge child (CAS + push); the grant already held survives a cancel.
-        eprintln!(
-            "DIAG phase2 check lands_here={lands_here} status={}",
-            result.status
-        );
         if lands_here && result.status == "passed" {
             // Final local re-check right before the grant RPC: a
             // gate.cancel that landed while the verify child ran is visible.
@@ -1668,6 +1821,17 @@ impl DevNode {
             // kept pushing after we reported failed.
             #[cfg(unix)]
             let land_pgid = land_child.id().and_then(|pid| i32::try_from(pid).ok());
+            #[cfg(unix)]
+            if let Some(pgid) = land_pgid {
+                // r14 R1: expose the live land group to read-only probes and
+                // durably fence it BEFORE the child can push, so a Node crash
+                // cannot leave an unattestable orphaned pusher.
+                *live
+                    .land_pgid
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(pgid);
+                registry.record_land_group(&request.job_id, request.generation, pgid);
+            }
             let land_stdout = land_child.stdout.take();
             // r13 item 6: drain stderr CONCURRENTLY for the life of the child
             // (and keep the handle for timeout/kill). A remote rejection can
@@ -1786,6 +1950,14 @@ impl DevNode {
             // is fully read and the pipe can never have wedged the child.
             if let Some(task) = land_stderr_task {
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            }
+            // r14 R1: the leader was awaited on every arm above; finish any
+            // surviving group member, verify the group is ESRCH, then release
+            // the durable fence record so a later remote probe may attest
+            // `absent`. Never release it while the group can still push.
+            #[cfg(unix)]
+            if let Some(pgid) = land_pgid {
+                registry.settle_land_group(&request.job_id, pgid).await;
             }
         }
         attach_failure_evidence(&mut result, &trace, request.keep_logs);
@@ -2352,11 +2524,20 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<(), String> {
     block_git(repo, args).map(|_| ())
 }
 
-/// Read-only post-restart landing resolution. Fetches the remote base branch
-/// and reports `landed` only when the granted merge is already an ancestor of
-/// `origin/<base>`. Any fetch/parse failure or non-ancestry is `unknown` — it
-/// never pushes and never asserts a push that cannot be proven.
-fn resolve_landing_after_restart(request: &GateResolveLandingParams) -> GateResolveLandingResult {
+/// Read-only landing resolution. Fetches the remote base branch and reports:
+/// * `landed` when the granted merge is already an ancestor of
+///   `origin/<base>`;
+/// * `absent` when a fresh fetch succeeded, the merge is NOT an ancestor, and
+///   `land_group_may_push` is false — the caller attested the only process
+///   group that could still push this job is verified gone, so the push is
+///   provably not coming (r14 R1);
+/// * `unknown` for every fetch/parse failure, non-ancestry while a land group
+///   may still be alive, or an empty granted sha. It never pushes and never
+///   asserts a push it cannot prove.
+fn resolve_landing_after_restart(
+    request: &GateResolveLandingParams,
+    land_group_may_push: bool,
+) -> GateResolveLandingResult {
     let repo = PathBuf::from(&request.repo_path);
     let unknown = |error: String| GateResolveLandingResult {
         job_id: request.job_id.clone(),
@@ -2394,10 +2575,17 @@ fn resolve_landing_after_restart(request: &GateResolveLandingParams) -> GateReso
             base_sha: Some(base_sha),
             error: None,
         },
-        Ok(_) => unknown(format!(
-            "{} is not an ancestor of {remote_base}; push outcome unknown",
+        Ok(_) if land_group_may_push => unknown(format!(
+            "{} is not an ancestor of {remote_base} but the granted land process group may still \
+             push; push outcome unknown",
             request.merge_sha
         )),
+        Ok(_) => GateResolveLandingResult {
+            job_id: request.job_id.clone(),
+            status: "absent".into(),
+            base_sha: Some(base_sha),
+            error: None,
+        },
         Err(error) => unknown(format!("merge-base: {error}")),
     }
 }
@@ -2413,6 +2601,162 @@ fn kill_group(pgid: i32) {
     use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
     let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
+}
+
+// ── granted-land process-group fence (r14 R1) ──────────────────────────────
+//
+// A granted land child runs in its own process group with kill_on_drop(false):
+// if the Node dies mid-push the group is orphaned but can still update the
+// remote. The Hub must never guess that outcome, so the Node keeps a DURABLE
+// ledger (`<data_dir>/gate-land/land-<job>.json`, pgid + leader start tick):
+// written right after the land child spawns, removed only once the whole group
+// is verified gone, and fenced (TERM → bounded wait → KILL → ESRCH) at the next
+// boot before any carrier is served. A read-only landing probe reports `absent`
+// only when no live run and no ledger record can still push the job.
+
+#[cfg(unix)]
+fn land_fence_path(dir: &std::path::Path, job_id: &str) -> std::path::PathBuf {
+    let slug: String = job_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    dir.join(format!("land-{slug}.json"))
+}
+
+/// Leader's start time in clock ticks (`/proc/<pid>/stat` field 22, index 19
+/// after the comm field). Pairs with the pid to defeat pid reuse.
+#[cfg(unix)]
+fn proc_start_tick(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')').map(|(_, rest)| rest)?;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    fields.get(19).and_then(|value| value.parse().ok())
+}
+
+/// True iff a process group with `pgid` still exists (signal 0 probe). EPERM
+/// means a member exists owned by another uid; ESRCH means the group is gone.
+#[cfg(unix)]
+fn land_group_exists(pgid: i32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+    match killpg(Pid::from_raw(pgid), None) {
+        Ok(()) => true,
+        Err(Errno::ESRCH) => false,
+        Err(_) => true,
+    }
+}
+
+#[cfg(unix)]
+fn write_land_fence(dir: &std::path::Path, job_id: &str, generation: u32, pgid: i32) {
+    let Some(start_tick) = proc_start_tick(pgid) else {
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let record = serde_json::json!({
+        "jobId": job_id,
+        "generation": generation,
+        "pgid": pgid,
+        "startTick": start_tick,
+    });
+    let path = land_fence_path(dir, job_id);
+    let temporary = dir.join(format!(".land-{pgid}-{}.tmp", std::process::id()));
+    if std::fs::write(&temporary, serde_json::to_vec(&record).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&temporary, &path);
+    }
+}
+
+#[cfg(unix)]
+fn remove_land_fence(dir: &std::path::Path, job_id: &str) {
+    let _ = std::fs::remove_file(land_fence_path(dir, job_id));
+}
+
+/// SIGTERM a whole land group, boundedly wait for it to empty, then SIGKILL the
+/// WHOLE group with killpg (never an enumeration that could miss a member) and
+/// verify `killpg(pgid, 0) == ESRCH`. Returns false only when the group could
+/// not be proven gone within the kill grace (the record is then kept for the
+/// next boot's fence).
+#[cfg(unix)]
+fn terminate_and_verify_group(pgid: i32, term_grace: Duration) -> bool {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+    let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGTERM));
+    let term_deadline = Instant::now() + term_grace;
+    while Instant::now() < term_deadline {
+        if !land_group_exists(pgid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Still occupied at the deadline: unconditionally KILL the whole group.
+    let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGKILL));
+    let kill_deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < kill_deadline {
+        if !land_group_exists(pgid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    !land_group_exists(pgid)
+}
+
+/// r14 R1 startup fence: every leftover record names a granted land group the
+/// PREVIOUS Node process may have orphaned mid-push. The pid+start-tick record
+/// guards pid reuse (a reused pid is never signalled); a still-present group is
+/// terminated and verified gone before its record — and the proof it provides —
+/// is removed.
+#[cfg(unix)]
+fn fence_orphaned_land_groups(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<Value>(&text) else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        let Some(pgid) = record["pgid"]
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+        else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        let Some(start_tick) = record["startTick"].as_u64() else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        // Pid reuse: if that pid now belongs to a process that started later,
+        // our leader (and its group) is dead; do not signal the stranger.
+        if let Some(current) = proc_start_tick(pgid)
+            && current != start_tick
+        {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        // Same leader, or leader already reaped: decide on the GROUP. A group
+        // still occupying this pgid is ours (pgids are not reused while a
+        // member exists).
+        if !land_group_exists(pgid) || terminate_and_verify_group(pgid, LAND_GROUP_TERM_GRACE) {
+            let _ = std::fs::remove_file(&path);
+        }
+        // Still not provably gone: keep the record; the next boot retries.
+    }
 }
 
 /// Bounded grace a land child's process group gets to exit after SIGTERM

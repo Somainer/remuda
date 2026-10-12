@@ -117,7 +117,7 @@ pub(crate) struct DevNodeInner {
     projection_epoch: Id,
     tty: TtyRegistry,
     /// Batch 6 lane gate runner state (lane locks, live jobs, event uplink).
-    pub(crate) gate: crate::gate::GateRegistry,
+    pub(crate) gate: std::sync::Arc<crate::gate::GateRegistry>,
     /// D-047/D-048 model-API relay: per-instance loopback listeners, the
     /// proxy-side egress contexts, and the live carrier link's frame broker.
     pub(crate) api_relay: Arc<crate::api_relay::ApiRelayState>,
@@ -248,7 +248,13 @@ impl DevNode {
                 workspace_registry: std::sync::RwLock::new(workspace_registry),
                 projection_epoch: Id::new("epoch")?,
                 tty: TtyRegistry::new(),
-                gate: crate::gate::GateRegistry::new(),
+                gate: crate::gate::GateRegistry::open(
+                    config
+                        .workspace_registry
+                        .clone()
+                        .unwrap_or_else(|| config.workspace_root.join(".remuda"))
+                        .join("gate-land"),
+                ),
                 api_relay: crate::api_relay::ApiRelayState::new(),
                 diagnostics: std::sync::RwLock::new(crate::DoctorContext::default()),
                 #[cfg(test)]

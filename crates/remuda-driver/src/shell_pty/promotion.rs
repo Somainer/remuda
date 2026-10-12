@@ -5878,16 +5878,23 @@ mod tests {
         );
     }
 
-    /// c-effortread r11 item 6: a hook-derived session id is SESSION IDENTITY,
-    /// not launch provenance. A hand-typed `claude` (plain argv, no
-    /// session/resume) that the poller detects ONLY through the SessionStart
-    /// hook fallback, whose user `/resume`d X before the first poll (source
-    /// resume), must open X at an unverified EOF boundary: X's historical
-    /// effort/verdict records neither publish as current nor settle an armed
-    /// switch. Driven native bus → promote_from_hook_binding → production
-    /// SessionModeTable classification → maintain_binding/promotion.
+    /// c-effortread r12 item 6 (was r11 item 6): a hook-derived session id is
+    /// SESSION IDENTITY, not launch provenance. A hand-typed agent whose
+    /// process table row normal `detect` CANNOT RECOGNIZE (a node wrapper:
+    /// `node /opt/claude/cli.js` — argv0 `node` is no agent basename) is
+    /// promoted ONLY through the authenticated SessionStart hook fallback. Its
+    /// user `/resume`d X before the first poll (source resume), so it must open
+    /// X at an unverified EOF boundary: X's historical effort/verdict records
+    /// neither publish as current nor settle an armed switch.
+    ///
+    /// This drives the SAME orchestration the poll loop runs: detect() comes
+    /// up empty → promote_from_hook_binding → apply_native_session_binding
+    /// (classify → authenticated first-claim/rebind arm → ingest) →
+    /// maintain_binding/promotion. The old test hand-fed argv `claude` (which
+    /// detect recognises, so the production fallback guard never fires) and
+    /// ingested the SessionStartReport by hand, bypassing the seam.
     #[tokio::test]
-    async fn r11_item6_hook_only_identity_with_resume_source_uses_unverified_boundary() {
+    async fn r12_item6_hook_only_identity_through_the_production_fallback_and_seam() {
         use crate::effort::EffortRequest;
         use remuda_protocol::EffortAxis::Tier;
         use remuda_protocol::EffortSemantics::Decoupled;
@@ -5937,23 +5944,31 @@ mod tests {
         let binding = bus.binding().expect("the native bus folded a binding");
         assert_eq!(binding.source.as_deref(), Some("resume"));
 
-        // Fallback detection (the production seam): the foreground group shows
-        // a plain hand-typed `claude` — no argv session/resume — so the
-        // identity comes ONLY from the authenticated hook binding.
+        // The foreground group the poller just sampled: a node-launched agent
+        // whose argv0 is `node`, which detect() cannot match — so the hook
+        // fallback is genuinely REQUIRED (the production guard at the
+        // found.is_none() branch), never a row detect would already claim.
         let rows = vec![ProcessRow {
             pid: 7,
-            args: "claude".into(),
+            args: "node /opt/claude/cli.js".into(),
         }];
+        assert!(
+            crate::promote::detect(&rows, None).is_none(),
+            "a node-wrapper argv must not be claimed by normal detection"
+        );
         let found = promote_from_hook_binding(&rows, &binding, AgentKind::Claude)
-            .expect("the hook pid in the foreground group promotes");
+            .expect("the authenticated hook pid in the foreground group promotes");
+        assert_eq!(
+            found.pid, binding.pid,
+            "the production found==binding guard"
+        );
         assert_eq!(found.session_id.as_deref(), Some(PUMP_SESSION));
-        assert!(!found.resume, "plain argv carries no resume flag");
+        assert!(!found.resume, "the wrapper argv carries no resume flag");
         assert!(
             found.session_id_from_hook,
             "the session identity is learned from the hook, not argv"
         );
-        let report =
-            SessionStartReport::from_bus_binding(&binding).expect("a named path yields a report");
+        assert!(found.hydrates_transcript);
 
         // A live configure request is already armed when the mapper replays X.
         let bridge = Arc::new(crate::effort::EffortBridge::new());
@@ -5972,7 +5987,6 @@ mod tests {
 
         let bindings = BindingHandle::empty();
         bindings.begin_epoch(&fx.ctx.cwd, &fx.ctx.claude_home);
-        bindings.ingest_session_start(report);
         let mut hydrator: Option<Hydrator> = None;
         let mut announced: Option<String> = None;
         let mut session_modes = SessionModeTable::default();
@@ -5981,6 +5995,50 @@ mod tests {
         let mut effort_seeds = std::collections::HashMap::new();
         let mut withdrawn_sessions = std::collections::HashSet::new();
         let mut active_session: Option<(i32, String)> = None;
+
+        // The production seam (poll loop ~1057): classify the bus-derived
+        // report, arm the authenticated first-claim/rebind, and ingest. No
+        // hand-built report and no manual ingest_session_start. The first
+        // bind of a hook-only identity is an ingest (false), exactly as the
+        // loop sees it.
+        let rebound = apply_native_session_binding(
+            &bindings,
+            &found,
+            &binding,
+            None,
+            &mut session_modes,
+            &mut read_anchors,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        );
+        assert!(
+            !rebound,
+            "the first hook-only bind ingests, it does not rebind"
+        );
+
+        // The classified boundary is Unverified IMMEDIATELY after the seam:
+        // a hook-only resume identity never wins Fresh launch provenance. A
+        // non-empty transcript classifies as an unverified EOF Boundary
+        // (verified=false), an empty/missing one as bare Unverified — both
+        // anchor at current EOF with the effort gate closed.
+        let classified = session_modes
+            .mode_for(7, PUMP_SESSION)
+            .expect("the seam recorded one mode for the hook (pid, session)");
+        let unverified_boundary = match &classified.mode {
+            crate::claude_transcript::ResumeMode::Unverified => true,
+            crate::claude_transcript::ResumeMode::Boundary(boundary) => !boundary.verified,
+            crate::claude_transcript::ResumeMode::Fresh => false,
+        };
+        assert!(
+            !classified.rebound && unverified_boundary,
+            "the resume-source hook-only identity is classified unverified: {classified:?}"
+        );
+
+        // The loop only resets the hydrator on a real rebind/first-claim.
+        if rebound {
+            hydrator = None;
+            announced = None;
+        }
         maintain_binding(
             &bindings,
             &fx.ctx,

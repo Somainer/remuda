@@ -30,6 +30,7 @@ pub use script::{AgentCallSite, MatchedCall, WorkflowScript};
 
 use crate::Error;
 use crate::claude::{NativeIds, envelope as file_envelope, opaque};
+use crate::cover::CoverSet;
 use crate::envelope::Envelope;
 use crate::source::{FileTail, MapContext, Source, SourceResume};
 use crate::util::{known, parse_timestamp, timestamp_from_unix_ms, timestamp_now, unknown};
@@ -133,6 +134,12 @@ struct RunState {
     note: Option<String>,
     missing_polls: u32,
     launched_ms: Option<u128>,
+    /// c-cardsettle-fu r1 item 1: agent ids whose journal `started` record was
+    /// folded onto an already-terminal member (same attempt: the terminal
+    /// outcome is protected). File catch-up must still CONVERGE with that
+    /// terminal state once; these ids have their member-envelope cache
+    /// invalidated for a single run_envelopes pass, then re-cache and dedup.
+    force_member_refresh: HashSet<String>,
 }
 
 /// One member (one agent invocation; retries share the same key).
@@ -140,6 +147,13 @@ struct MemberState {
     agent_id: String,
     key: Option<String>,
     attempt: u64,
+    /// c-cardsettle-fu2 r1 item 2: whether this member has already consumed
+    /// a journal `started` record. Hook-created placeholders (SubagentStart
+    /// failure-before-start, agent_started) are false until their own first
+    /// journal start folds; a journal-folded started on a shared key whose
+    /// counter was already bumped by ANOTHER agent must only resurrect when
+    /// THIS member previously consumed a start.
+    consumed_journal_start: bool,
     state: WorkflowState,
     label: Option<String>,
     phase: Option<String>,
@@ -207,6 +221,17 @@ impl WorkflowJournalTailer {
     /// Current tails keyed by journal path.
     pub fn resumes(&self) -> Vec<SourceResume> {
         self.tails.values().map(FileTail::resume).collect()
+    }
+
+    /// Test-only: number of live failure-settlement covers armed for `agent`
+    /// on the journal at `journal_path`, so retirement driven by a real
+    /// [`Self::poll`] fold can be asserted without the test touching the
+    /// cover set itself.
+    #[cfg(test)]
+    pub(crate) fn cover_count(&self, journal_path: &Path, agent: &str) -> usize {
+        self.tails
+            .get(journal_path)
+            .map_or(0, |tail| tail.covers().for_agent(agent).count())
     }
 
     /// Register a run from its PostToolUse(Workflow) hook and emit its first
@@ -358,6 +383,18 @@ impl WorkflowJournalTailer {
             .position(|run| run.native_id == run_id)
             .expect("run registered above");
         self.runs[index].agent_failed(agent_id, agent_transcript_path);
+        // c-cardsettle-fu2 r5-r6 item 2: if a journal `started` for this
+        // agent is already on disk but unread, this StopFailure settles THAT
+        // attempt (a failed RETRY whose start record the poll has not folded
+        // yet). Arm the independent cover set the peek returns: the fold
+        // suppresses resurrection only for records whose identity and bytes
+        // match a live cover, so a start appended AFTER the failure — even one
+        // that folds in the same poll — is still a genuine retry. The peek's
+        // open itself revalidates every other member's covers first.
+        let journal_path = self.runs[index].dir.join("journal.jsonl");
+        if let Some(tail) = self.tails.get_mut(&journal_path) {
+            tail.unread_start(agent_id)?;
+        }
         self.emit_snapshots()
     }
 
@@ -431,13 +468,27 @@ impl WorkflowJournalTailer {
         // snapshot each line changes, preserving transition order on catch-up.
         for index in 0..self.runs.len() {
             let journal_path = self.runs[index].dir.join("journal.jsonl");
+            // The poll open revalidates the tail's whole cover set before any
+            // line folds (replacement, rotation, shrink through the captured
+            // bytes, rewritten prefix, pending-tail growth).
             let lines = match self.tails.get_mut(&journal_path) {
                 Some(tail) => tail.poll()?,
                 None => Vec::new(),
             };
-            for (line, _) in lines {
+            for (line, cursor) in lines {
                 let line = line.clone();
-                self.runs[index].fold_journal_line(&line);
+                // The started fold consults the CURRENT cover set: a line at a
+                // cover's position is suppressed only when its identity and
+                // bytes match.
+                let covers: Option<&CoverSet> = self.tails.get(&journal_path).map(FileTail::covers);
+                self.runs[index].fold_journal_line(&line, &cursor, covers);
+                // The record is now consumed — by this member as this record
+                // type. Retire every cover its cursor reached (including
+                // another member's) BEFORE the next line can fold, so a start
+                // after the covered record resurrects even in this poll.
+                if let Some(tail) = self.tails.get_mut(&journal_path) {
+                    tail.note_consumed(cursor.file_generation.0, cursor.offset.0);
+                }
                 self.runs[index].refresh_agents()?;
                 // Recompute phase state per journal line so a phase running
                 // between two lines still emits its running revision (it is a
@@ -666,7 +717,12 @@ impl WorkflowJournalTailer {
             }
         }
 
-        // Members.
+        // Members. One-shot convergence for terminal members whose file fold
+        // caught up this poll (see RunState::force_member_refresh).
+        let refresh_ids: Vec<String> = self.runs[index].force_member_refresh.drain().collect();
+        for id in refresh_ids {
+            self.runs[index].emitted_member.remove(&id);
+        }
         for snapshot in members {
             let sig = snapshot.sig();
             if self.runs[index].emitted_member.get(&snapshot.agent_id) == Some(&sig) {
@@ -1100,6 +1156,7 @@ impl RunState {
             note: None,
             missing_polls: 0,
             launched_ms,
+            force_member_refresh: HashSet::new(),
         }
     }
 
@@ -1226,7 +1283,7 @@ impl RunState {
         }
     }
 
-    fn fold_journal_line(&mut self, line: &[u8]) {
+    fn fold_journal_line(&mut self, line: &[u8], cursor: &FileCursor, covers: Option<&CoverSet>) {
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
             return;
         };
@@ -1265,10 +1322,64 @@ impl RunState {
                     .position(|member| member.agent_id == agent_id)
                     .expect("member exists");
                 let member = &mut self.members[index];
+                // c-cardsettle-fu item 1: catch-up folds journal lines in
+                // their own (file/seq) order, but a terminal StopFailure can
+                // already have been applied to THIS member from the live
+                // transcript tailer before the catch-up journal fold reaches
+                // the member's older, still-unread `started` line. Folding
+                // that started must never downgrade an already-terminal
+                // member back to running — terminal wins regardless of fold
+                // order. Metadata (key/attempt/label/phase) is still updated.
+                let terminal = member.stopped
+                    || matches!(
+                        member.state,
+                        WorkflowState::Failed | WorkflowState::Completed | WorkflowState::Cancelled
+                    );
+                // A strictly newer attempt number relative to the recorded
+                // member identifies a candidate retry.
+                let is_newer_attempt = attempt > member.attempt;
+                // c-cardsettle-fu2 r1 item 2: it is a GENUINE retry only when
+                // the member already consumed a journal start. This excludes:
+                // - a hook placeholder (SubagentStart/StopFailure beat the
+                //   catch-up fold) seeing its OWN first start;
+                // - a member created on a SHARED key whose per-key counter a
+                //   different agent id already bumped (started(k,a0) then
+                //   started(k,a1) counts the key to 2, but a1 never consumed
+                //   a start).
+                // r6-r9: it also must not fire when this start record is the
+                // exact record a live StopFailure cover settled: a complete
+                // cover matches only the same digest at its generation/offset,
+                // a pending-tail cover the byte-for-byte completion at its
+                // offset. A start at a later offset — including one folded
+                // later in the SAME poll — has no matching cover and
+                // resurrects. Covers retire per consumed line (see poll) as
+                // soon as the record they cover is consumed, by any member as
+                // any record type.
+                let settled_by_watermark = covers.is_some_and(|set| {
+                    set.settles(
+                        &agent_id,
+                        cursor.file_generation.0,
+                        cursor.offset.0,
+                        &cursor.digest,
+                        line,
+                    )
+                });
+                let genuine_retry =
+                    is_newer_attempt && member.consumed_journal_start && !settled_by_watermark;
                 member.key = Some(key.clone());
                 member.attempt = attempt;
-                member.state = WorkflowState::Running;
-                member.stopped = false;
+                if !terminal || genuine_retry {
+                    member.state = WorkflowState::Running;
+                    member.stopped = false;
+                } else {
+                    // Terminal outcome held against a same-attempt started;
+                    // force one file-catch-up convergence emission.
+                    self.force_member_refresh.insert(agent_id.clone());
+                }
+                // This journal `started` has now been consumed by THIS member,
+                // regardless of whether it resurrected it or was held terminal;
+                // a subsequent newer attempt is then eligible as a real retry.
+                member.consumed_journal_start = true;
                 if member.label.is_none()
                     && let Some(label) = value.get("label").and_then(Value::as_str)
                 {
@@ -1352,7 +1463,10 @@ impl RunState {
         {
             return Ok(());
         }
-        let mut member = MemberState::new(agent_id.to_owned(), None, 1);
+        // Hook SubagentStart: the member has NOT yet consumed a journal start
+        // (the live transcript hook beats the catch-up fold); attempt 0 so
+        // its own first folded started is not mistaken for a retry.
+        let mut member = MemberState::new_placeholder(agent_id.to_owned());
         if let Some(path) = transcript_path {
             member.jsonl = Some(FileTail::new(path)?);
         }
@@ -1366,7 +1480,10 @@ impl RunState {
     /// SubagentStart. The root instance is untouched; only the member row.
     fn agent_failed(&mut self, agent_id: &str, transcript_path: Option<&Path>) {
         if !self.members.iter().any(|m| m.agent_id == agent_id) {
-            let mut member = MemberState::new(agent_id.to_owned(), None, 1);
+            // c-cardsettle-fu2 r1 items 1+2: a StopFailure that beat its
+            // SubagentStart creates a no-key placeholder that consumed no
+            // journal start (attempt 0, consumed_journal_start false).
+            let mut member = MemberState::new_placeholder(agent_id.to_owned());
             if let Some(path) = transcript_path
                 && let Ok(tail) = FileTail::new(path)
             {
@@ -1606,11 +1723,26 @@ impl RunState {
 }
 
 impl MemberState {
+    /// A hook-created member that has NOT consumed a journal start yet:
+    /// no key, attempt 0, and [`MemberState::consumed_journal_start`] false.
+    /// Used by SubagentStart (before the catch-up fold sees its first start)
+    /// and by a StopFailure that beat its SubagentStart.
+    fn new_placeholder(agent_id: String) -> Self {
+        let mut member = Self::new(agent_id, None, 0);
+        member.consumed_journal_start = false;
+        member
+    }
+
     fn new(agent_id: String, key: Option<String>, attempt: u64) -> Self {
         Self {
             agent_id,
             key,
             attempt,
+            // Only the journal fold constructs members that have already
+            // consumed a start (it is created from the `started` record
+            // currently being folded). Hook-created members use
+            // new_placeholder (attempt 0, flag false).
+            consumed_journal_start: true,
             state: WorkflowState::Running,
             label: None,
             phase: None,
@@ -1816,4 +1948,294 @@ fn workflow_native_id(journal_path: &Path) -> String {
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "wf_unknown".into())
+}
+
+#[cfg(test)]
+mod r9_cover_fold_tests {
+    use super::*;
+    use remuda_protocol::{HostId, Id, InstanceId, Knowledge};
+    use std::io::Write;
+
+    /// Consumed prefix: a1's first attempt started then failed; the cursor is
+    /// at W after the first poll.
+    const PREFIX: &str = "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n\
+{\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n";
+
+    /// A real on-disk run with a launched, once-polled tailer.
+    struct Harness {
+        // Held to keep the temp tree alive for the whole test.
+        #[allow(dead_code)]
+        tmp: tempfile::TempDir,
+        run_dir: PathBuf,
+        tailer: WorkflowJournalTailer,
+        w: u64,
+    }
+
+    impl Harness {
+        fn new(run_id: &str) -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = tmp.path().join("session");
+            let run_dir = session.join("subagents/workflows").join(run_id);
+            std::fs::create_dir_all(&run_dir).unwrap();
+            std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+            std::fs::write(run_dir.join("agent-a2.jsonl"), "{}\n").unwrap();
+            std::fs::write(run_dir.join("journal.jsonl"), PREFIX).unwrap();
+            let w = PREFIX.len() as u64;
+
+            let ctx = MapContext::claude_file(
+                InstanceId::new(),
+                Id::new("obj").unwrap(),
+                HostId::new(),
+                "sess",
+                SourceChannel::WorkflowJournal,
+            );
+            let mut tailer = WorkflowJournalTailer::new(&session, ctx);
+            tailer
+                .launch(WorkflowLaunch {
+                    run_id: run_id.into(),
+                    task_id: Some("t1".into()),
+                    tool_call_id: Some("tc".into()),
+                    transcript_dir: Some(run_dir.clone()),
+                    script_path: None,
+                    script_source: None,
+                })
+                .unwrap();
+            let envelopes = tailer.poll().unwrap();
+            assert_eq!(
+                states_for(&envelopes, "a1").last().copied(),
+                Some(WorkflowState::Failed),
+                "a1's first attempt ends Failed and is consumed through W"
+            );
+            Self {
+                tmp,
+                run_dir,
+                tailer,
+                w,
+            }
+        }
+
+        /// Absolute path of the run's journal.jsonl.
+        fn journal(&self) -> PathBuf {
+            self.run_dir.join("journal.jsonl")
+        }
+
+        /// Append raw bytes to the journal.
+        fn append(&self, bytes: &[u8]) {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(self.journal())
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+        }
+
+        /// Append a complete JSONL line.
+        fn append_line(&self, line: &str) {
+            self.append(line.as_bytes());
+            self.append(b"\n");
+        }
+
+        /// Shrink the journal back to `len` bytes.
+        fn truncate(&self, len: u64) {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(self.journal())
+                .unwrap();
+            file.set_len(len).unwrap();
+        }
+
+        /// Register a member from its SubagentStart hook (so its journal
+        /// records fold onto an existing member).
+        fn member_started(&mut self, agent: &str) {
+            self.tailer
+                .agent_event(
+                    agent,
+                    true,
+                    Some(&self.run_dir.join(format!("agent-{agent}.jsonl"))),
+                )
+                .unwrap();
+        }
+
+        /// Drive the real StopFailure entry, which arms covers from its peek.
+        fn agent_failed(&mut self, agent: &str) {
+            self.member_started(agent);
+            self.tailer
+                .agent_failed(
+                    agent,
+                    Some(&self.run_dir.join(format!("agent-{agent}.jsonl"))),
+                )
+                .unwrap();
+        }
+
+        fn poll(&mut self) -> Vec<Envelope> {
+            self.tailer.poll().unwrap()
+        }
+
+        fn live_covers(&self, agent: &str) -> usize {
+            self.tailer.cover_count(&self.journal(), agent)
+        }
+    }
+
+    fn states_for(envelopes: &[Envelope], agent: &str) -> Vec<WorkflowState> {
+        envelopes
+            .iter()
+            .filter_map(|env| match &env.body {
+                ObservationPayload::WorkflowMember(m)
+                    if m.native_agent_id
+                        == Knowledge::Known {
+                            value: agent.into(),
+                        } =>
+                {
+                    Some(m.state)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// r9 item 5 (r8 item 5 NOT MET), driven through the REAL tailer in r10:
+    /// the failure peek arms a pending "{" for a1; an append-only write
+    /// completes it at the SAME offset as ANOTHER member's result. The cover
+    /// must be retired by the poll fold's per-line consumption (not by the
+    /// test), a1's Failed outcome is untouched, and a later genuine retry
+    /// resurrects.
+    #[test]
+    fn a_pending_tail_completed_as_another_members_result_retires_on_its_owner() {
+        let mut h = Harness::new("wf_r10_result_retire");
+        h.append(b"{");
+        h.agent_failed("a1");
+        assert_eq!(
+            h.live_covers("a1"),
+            1,
+            "the failure peek armed the pending cover"
+        );
+
+        // Complete the lone brace at W as a2's RESULT, append-only: the first
+        // byte stays "{", so the cover survives the open and only the fold's
+        // consumption at W can retire it.
+        h.append(b"\"type\":\"result\",\"key\":\"v2:k2\",\"agentId\":\"a2\"}\n");
+        let envelopes = h.poll();
+        assert_eq!(
+            h.live_covers("a1"),
+            0,
+            "the real poll fold retires the cover when a2's result consumes W"
+        );
+        assert!(
+            states_for(&envelopes, "a1")
+                .iter()
+                .all(|state| *state == WorkflowState::Failed),
+            "a1's outcome is untouched by another member's result"
+        );
+
+        // A genuine retry at the later offset is no longer settled.
+        h.append_line(
+            "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"genuine\"}",
+        );
+        assert_eq!(
+            states_for(&h.poll(), "a1").last().copied(),
+            Some(WorkflowState::Running),
+            "the retry after the retired cover is genuine"
+        );
+    }
+
+    /// r9 item 5 through the real tailer: every record type that consumes the
+    /// cover's position retires the pending cover.
+    #[test]
+    fn a_cover_retires_when_any_record_type_consumes_its_position() {
+        for record_type in ["result", "failed"] {
+            let mut h = Harness::new("wf_r10_any_type_retire");
+            // a2 exists so its result/failed folds onto a2 instead of becoming
+            // a run-level event.
+            h.member_started("a2");
+            h.append(b"{");
+            h.agent_failed("a1");
+            assert_eq!(h.live_covers("a1"), 1, "{record_type}: armed");
+
+            h.append(
+                format!("\"type\":\"{record_type}\",\"key\":\"v2:k2\",\"agentId\":\"a2\"}}\n")
+                    .as_bytes(),
+            );
+            let envelopes = h.poll();
+            assert_eq!(
+                h.live_covers("a1"),
+                0,
+                "{record_type} at the position retires a1's pending cover via the real fold"
+            );
+            assert!(
+                states_for(&envelopes, "a1")
+                    .iter()
+                    .all(|state| *state == WorkflowState::Failed),
+                "{record_type}: a1's outcome is untouched"
+            );
+        }
+    }
+
+    /// The settled attempt folds Failed and is retired as it is consumed; a
+    /// genuine retry appended AFTER it in the SAME poll resurrects. The cover
+    /// set observed after the real poll must be empty.
+    #[test]
+    fn the_covered_start_stays_failed_and_a_later_start_resurrects_in_one_fold() {
+        let mut h = Harness::new("wf_r10_cover_fold");
+        h.append(b"{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}");
+        h.agent_failed("a1");
+        assert_eq!(h.live_covers("a1"), 1, "a complete cover is armed at W");
+
+        // Terminate the covered record, then append the genuine retry before
+        // polling: both fold in one poll.
+        h.append(b"\n");
+        h.append_line(
+            "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"retry\"}",
+        );
+        let states = states_for(&h.poll(), "a1");
+        assert_eq!(
+            *states.first().expect("an a1 observation while folding"),
+            WorkflowState::Failed,
+            "the settled attempt stays Failed"
+        );
+        assert_eq!(
+            *states.last().expect("an a1 observation while folding"),
+            WorkflowState::Running,
+            "the genuine retry at the later offset resurrects in the same poll"
+        );
+        assert_eq!(h.live_covers("a1"), 0, "the consumed cover is retired");
+    }
+
+    /// A pending a1 cover whose position is rewritten into a2's start does not
+    /// settle a2, leaves a1 Failed, and a genuine a1 retry afterwards runs.
+    #[test]
+    fn a_pending_completion_of_another_agent_does_not_settle() {
+        let mut h = Harness::new("wf_r10_other_agent");
+        h.append(b"{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"");
+        h.agent_failed("a1");
+        assert_eq!(h.live_covers("a1"), 1);
+
+        // Rewrite the torn tail at W into a2's complete start.
+        h.truncate(h.w);
+        h.append_line("{\"type\":\"started\",\"key\":\"v2:k2\",\"agentId\":\"a2\"}");
+        let envelopes = h.poll();
+        assert_eq!(
+            h.live_covers("a1"),
+            0,
+            "the rewritten position retires a1's cover on the open/fold"
+        );
+        assert!(
+            states_for(&envelopes, "a2").contains(&WorkflowState::Running),
+            "the record at W folds as a2's own start"
+        );
+        assert!(
+            states_for(&envelopes, "a1")
+                .iter()
+                .all(|state| *state == WorkflowState::Failed),
+            "a1 stays Failed"
+        );
+
+        h.append_line(
+            "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"genuine\"}",
+        );
+        assert_eq!(
+            states_for(&h.poll(), "a1").last().copied(),
+            Some(WorkflowState::Running),
+            "a1's later retry is genuine"
+        );
+    }
 }

@@ -126,6 +126,77 @@ impl FollowParks {
     }
 }
 
+/// Test-only park seam for an irreversible HTTP operation (c-cardsettle-fu
+/// r1 item 2). Lets a test prove the operation runs in a DETACHED task that
+/// survives the handler future being cancelled on client disconnect: arm,
+/// start the request, wait until the operation parks, abort the request
+/// future (RST), then release — a detached task completes, an inline handler
+/// does not.
+///
+/// c-cardsettle-fu2 r1 item 4: a second slot parks AFTER the delete DB job
+/// commits, so a test can RST in the window where the deletion is durable
+/// but publication/cleanup have not run yet (the fu1 seam parked before ANY
+/// DB work, which did not match the requested post-enqueue window).
+#[cfg(any(test, feature = "test-faults"))]
+#[derive(Default, Clone)]
+pub(crate) struct OperationParks {
+    /// One-shot post-delete park KEYED BY INSTANCE ID. Background settle
+    /// activity (node hello sweeps, other requests) also calls
+    /// publish_settlement; a global slot would be consumed by the first such
+    /// unrelated settlement. Keying ensures only the delete of the armed
+    /// instance parks.
+    post_delete_slot: Arc<tokio::sync::Mutex<Option<(String, OperationParkSlot)>>>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+struct OperationParkSlot {
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+impl OperationParks {
+    /// Arm the post-delete park for `instance_id`. Fires once that exact
+    /// instance's delete transaction commits (c-cardsettle-fu2 r1 item 4).
+    pub(crate) async fn arm_post_delete(
+        &self,
+        instance_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.post_delete_slot.lock().await = Some((
+            instance_id.to_owned(),
+            OperationParkSlot {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        ));
+        (reached_rx, release_tx)
+    }
+
+    /// Park after the delete job committed if a park is armed FOR THIS
+    /// instance; unrelated settlements (background sweeps etc.) pass straight
+    /// through without consuming the slot.
+    pub(crate) async fn park_after_delete_if_armed(&self, instance_id: &str) {
+        let mut guard = self.post_delete_slot.lock().await;
+        let matches = guard
+            .as_ref()
+            .is_some_and(|(armed_id, _)| armed_id == instance_id);
+        if !matches {
+            return;
+        }
+        let Some((_, slot)) = guard.take() else {
+            return;
+        };
+        drop(guard);
+        let _ = slot.reached.send(());
+        let _ = slot.release.await;
+    }
+}
+
 /// Live event for `/v1/follow`.
 #[derive(Clone, Debug)]
 pub struct FollowEvent {

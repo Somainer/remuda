@@ -124,6 +124,34 @@ fn notification_pipe() -> nix::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedF
     }
 }
 
+/// What one stdin `poll(2)` result means for the watcher.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdinPoll {
+    /// No hangup: keep watching stdin (and the parent pid at the poll cadence).
+    Continue,
+    /// Stdin hung up/errored as it does when the spawner dies: notify.
+    ParentGone,
+    /// stdin's fd became INVALID (`POLLNVAL`) — the watched process closed its
+    /// own fd 0 (e.g. `FAKE_CLAUDE_CLOSE_STDIN_AFTER_TURNS`). That says nothing
+    /// about the parent; stop watching stdin and continue the parent-pid poll.
+    StopWatchingStdin,
+}
+
+/// Pure revents decision (ma-sdk-state r14 item 5), factored out so the
+/// POLLNVAL degradation is unit-testable without a polled fd.
+#[cfg(unix)]
+fn stdin_poll_decision(revents: nix::poll::PollFlags) -> StdinPoll {
+    use nix::poll::PollFlags;
+    if revents.contains(PollFlags::POLLNVAL) {
+        StdinPoll::StopWatchingStdin
+    } else if revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
+        StdinPoll::ParentGone
+    } else {
+        StdinPoll::Continue
+    }
+}
+
 /// Watcher thread body: poll the parent pid and stdin hangup, then notify the
 /// main loop and hard-exit after a grace period.
 #[cfg(unix)]
@@ -141,19 +169,23 @@ fn watch(notify_write_fd: std::os::fd::OwnedFd, stopping: Option<Arc<AtomicBool>
     // `FAKE_CLAUDE_IGNORE_EOF=1` parks after EOF, `FAKE_CLAUDE_STOP_READING=1`
     // stops reading after the handshake (so the writer channel backs up),
     // `FAKE_CLAUDE_CLOSE_STDIN=1` closes fd 0 itself (the POLLERR that follows
-    // is self-inflicted, not spawner death), and `FAKE_CLAUDE_STDOUT_FLOOD=1`
-    // likewise never reads again. In every case watching stdin for POLLHUP
-    // would defeat that: the hangup is the spawner *closing stdin* (or the
-    // fake closing it), not the spawner dying, and treating it as death exits
-    // the process before the close ladder ever escalates. Fall back to the
-    // getppid() poll, which still reaps a leaked helper when the test binary
-    // really goes away.
+    // is self-inflicted, not spawner death), `FAKE_CLAUDE_CLOSE_STDIN_AFTER_TURNS`
+    // closes fd 0 after answering the configured turns (ma-sdk-state r14
+    // item 5), and `FAKE_CLAUDE_STDOUT_FLOOD=1` likewise never reads again. In
+    // every case watching stdin for POLLHUP would defeat that: the hangup is
+    // the spawner *closing stdin* (or the fake closing it), not the spawner
+    // dying, and treating it as death exits the process before the close ladder
+    // ever escalates. Fall back to the getppid() poll, which still reaps a
+    // leaked helper when the test binary really goes away. (The POLLNVAL path
+    // below additionally degrades a watcher whose fd gets closed mid-run.)
     let suppress_stdin_watch = std::env::var("FAKE_CLAUDE_IGNORE_EOF")
         .is_ok_and(|value| value == "1")
         || std::env::var("FAKE_CLAUDE_STOP_READING").is_ok_and(|value| value == "1")
         || std::env::var("FAKE_CLAUDE_CLOSE_STDIN").is_ok_and(|value| value == "1")
+        || std::env::var("FAKE_CLAUDE_CLOSE_STDIN_AFTER_TURNS")
+            .is_ok_and(|value| !value.is_empty())
         || std::env::var("FAKE_CLAUDE_STDOUT_FLOOD").is_ok_and(|value| value == "1");
-    let watch_stdin = stdin_is_liveness_channel(stdin.as_fd()) && !suppress_stdin_watch;
+    let mut watch_stdin = stdin_is_liveness_channel(stdin.as_fd()) && !suppress_stdin_watch;
     let poll_timeout = PollTimeout::try_from(WATCH_INTERVAL).expect("250 ms fits PollTimeout");
 
     loop {
@@ -161,16 +193,21 @@ fn watch(notify_write_fd: std::os::fd::OwnedFd, stopping: Option<Arc<AtomicBool>
             break;
         }
         if watch_stdin {
-            // POLLHUP/POLLERR are reported regardless of the interest mask;
-            // poll also paces the pid re-check at 250 ms.
+            // POLLHUP/POLLERR/POLLNVAL are reported regardless of the interest
+            // mask; poll also paces the pid re-check at 250 ms.
             let mut pollfd = PollFd::new(stdin.as_fd(), PollFlags::POLLHUP | PollFlags::POLLERR);
             match nix::poll::poll(std::slice::from_mut(&mut pollfd), poll_timeout) {
                 Ok(0) => {}
                 Ok(_) => {
-                    if let Some(revents) = pollfd.revents()
-                        && revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR)
-                    {
-                        break;
+                    match stdin_poll_decision(pollfd.revents().unwrap_or(PollFlags::empty())) {
+                        StdinPoll::ParentGone => break,
+                        // ma-sdk-state r14 item 5: the fake closed its OWN fd 0
+                        // mid-run (CLOSE_STDIN_AFTER_TURNS) — the fd is invalid, not
+                        // the spawner dead. Stop polling it and keep the parent-pid
+                        // watch: falling through as a continue would re-poll an
+                        // invalid fd that returns immediately, busy-looping a core.
+                        StdinPoll::StopWatchingStdin => watch_stdin = false,
+                        StdinPoll::Continue => {}
                     }
                 }
                 Err(nix::errno::Errno::EINTR) => {}
@@ -308,5 +345,56 @@ mod tests {
             1
         );
         assert_eq!(byte, *b"x");
+    }
+
+    /// ma-sdk-state r14 item 5: a closed/invalid stdin fd (`POLLNVAL`, what the
+    /// fake reports after closing fd 0 itself) degrades to pid-only watching
+    /// instead of reading as parent death or busy-looping.
+    #[test]
+    fn pollnval_disables_stdin_watching_rather_than_signalling_parent_death() {
+        use nix::poll::PollFlags;
+
+        assert_eq!(
+            stdin_poll_decision(PollFlags::POLLNVAL),
+            StdinPoll::StopWatchingStdin
+        );
+        // NVAL wins even if HUP/ERR bits are reported alongside it.
+        assert_eq!(
+            stdin_poll_decision(PollFlags::POLLNVAL | PollFlags::POLLHUP),
+            StdinPoll::StopWatchingStdin
+        );
+        assert_eq!(
+            stdin_poll_decision(PollFlags::POLLNVAL | PollFlags::POLLERR),
+            StdinPoll::StopWatchingStdin
+        );
+    }
+
+    /// The genuine parent-death events still terminate the watcher.
+    #[test]
+    fn hup_and_err_still_signal_parent_gone() {
+        use nix::poll::PollFlags;
+
+        assert_eq!(
+            stdin_poll_decision(PollFlags::POLLHUP),
+            StdinPoll::ParentGone
+        );
+        assert_eq!(
+            stdin_poll_decision(PollFlags::POLLERR),
+            StdinPoll::ParentGone
+        );
+        assert_eq!(
+            stdin_poll_decision(PollFlags::POLLHUP | PollFlags::POLLERR),
+            StdinPoll::ParentGone
+        );
+    }
+
+    /// No interesting revents keeps the stdin watch alive.
+    #[test]
+    fn no_events_continues_watching() {
+        use nix::poll::PollFlags;
+
+        assert_eq!(stdin_poll_decision(PollFlags::empty()), StdinPoll::Continue);
+        // Data-ready alone (POLLIN) is not a liveness event.
+        assert_eq!(stdin_poll_decision(PollFlags::POLLIN), StdinPoll::Continue);
     }
 }

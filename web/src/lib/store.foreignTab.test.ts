@@ -454,6 +454,364 @@ it("GATE20 item 2: X's deadline fire must not cancel Y's only wake when a cloned
   }
 });
 
+it("GATE20 item 3a: a same-owner deadline fire's guarded flush sends P but never an ALREADY-HELD H — H waits for its held-retry timer", async () => {
+  // A tracks P under a same-owner lease until T. Before T a sibling's POST for
+  // H is answered HELD and P is restored to lease-less pending. At T P's own
+  // deadline wake is the only trigger: the GUARDED flush must send P while the
+  // held policy (pre-lock selection AND claim boundary) keeps H out. H's next
+  // POST comes from the real held-retry clock armed by the same reconciliation
+  // (~2 s later), never early.
+  vi.useFakeTimers();
+  const owner = "owner_g20_i3a";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks: { query: async () => ({ held: [] }) } }, // query, no request
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  sessionStorage.setItem("remuda-outbox-owner", owner);
+  try {
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) => ({
+        relatedCommandIds: [],
+        command: {
+          commandId,
+          id: commandId,
+          state: "accepted",
+          revision: "1",
+          dispatch: "native-acknowledged",
+          resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    const internal = hubStore as unknown as {
+      flushAllOutbox: () => Promise<void>;
+      outbox: { refreshDurable: () => Promise<unknown>; pendingLeaseWakeups: () => string[] };
+    };
+    await internal.flushAllOutbox();
+    expect(send).not.toHaveBeenCalled();
+
+    const P = "cmd_g20_i3a_p";
+    const H = "cmd_g20_i3a_h";
+    const T_MS = 10_000;
+    const inflightP: OutboxRecord = {
+      commandId: P,
+      clientRequestId: `local_${P}`,
+      instanceId: INSTANCE,
+      journalId: JOURNAL,
+      prompt: "restored pending",
+      createdAt: Date.now() - 1_000,
+      attempts: 1,
+      state: "inflight",
+      lease: { owner, until: Date.now() + T_MS },
+    };
+    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([inflightP]));
+    await internal.outbox.refreshDurable();
+    expect(internal.outbox.pendingLeaseWakeups()).toEqual([P]);
+
+    // Before T: P is restored to lease-less pending; H is durably HELD.
+    await vi.advanceTimersByTimeAsync(5_000);
+    localStorage.setItem(
+      OUTBOX_LS_KEY,
+      JSON.stringify([
+        {
+          ...inflightP,
+          state: "pending",
+          lease: undefined,
+          lastError: "sibling failed and closed",
+        } satisfies OutboxRecord,
+        {
+          commandId: H,
+          clientRequestId: `local_${H}`,
+          instanceId: INSTANCE,
+          journalId: JOURNAL,
+          prompt: "answered held by a sibling",
+          createdAt: Date.now() - 2_000,
+          attempts: 1,
+          state: "held",
+          gotResponse: true,
+        } satisfies OutboxRecord,
+      ]),
+    );
+
+    // P's deadline wake fires the guarded flush: only P is POSTed at T.
+    await vi.advanceTimersByTimeAsync(T_MS - 5_000);
+    for (let i = 0; i < 60 && send.mock.calls.length === 0; i += 1) {
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+    }
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBe(P);
+    const stored = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(stored().find((r) => r.commandId === P)?.state).toBe("sent");
+    expect(stored().find((r) => r.commandId === H)?.state).toBe("held");
+
+    // H stays quiet until the real held-retry deadline (2 s after T) …
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(send).toHaveBeenCalledTimes(1);
+    // … which re-forwards H exactly once through a NORMAL flush.
+    await vi.advanceTimersByTimeAsync(2);
+    for (let i = 0; i < 40 && send.mock.calls.length < 2; i += 1) await Promise.resolve();
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1]?.[4]).toBe(H);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE20 item 3b: H becomes HELD while the guarded flush waits on the instance lock — A posts only P, H waits for held-retry", async () => {
+  // Two REAL stores share the localStorage backend and the cloned persisted
+  // owner, serialized by a small ordered Web Locks shim: B claims H and its
+  // POST + instance lock stay PENDING; A tracks H's lease while P sits
+  // pending on a SECOND instance. A's lease wake fires at T and its guarded
+  // flush QUEUES behind B's lock. While A waits, B's POST is answered HELD.
+  // When A finally enters the lock, its FRESH in-lock selection must skip H
+  // (held policy at the claim boundary), POST only P, and leave H's next POST
+  // to the held-retry clock.
+  vi.useFakeTimers();
+  const owner = "owner_g20_i3b";
+  const heldNow = new Set<string>();
+  const queues = new Map<string, Array<() => void>>();
+  const originalNavigator = globalThis.navigator;
+  const locks = {
+    query: async () => ({ held: [] as Array<{ name: string; mode: string }> }),
+    request: (name: string, _opts: unknown, cb: () => Promise<unknown>) =>
+      new Promise((resolve, reject) => {
+        const run = () => {
+          heldNow.add(name);
+          Promise.resolve()
+            .then(cb)
+            .then(
+              (v) => {
+                heldNow.delete(name);
+                resolve(v);
+                queues.get(name)?.shift()?.();
+              },
+              (e) => {
+                heldNow.delete(name);
+                reject(e);
+                queues.get(name)?.shift()?.();
+              },
+            );
+        };
+        if (heldNow.has(name) || (queues.get(name)?.length ?? 0) > 0) {
+          const q = queues.get(name) ?? [];
+          q.push(run);
+          queues.set(name, q);
+        } else {
+          run();
+        }
+      }),
+  };
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  sessionStorage.setItem("remuda-outbox-owner", owner);
+  let releaseB: (() => void) | null = null;
+  try {
+    const { api: apiA, hubStore: a } = await fresh();
+    vi.spyOn(apiA, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(apiA, "screenRead").mockResolvedValue({ lines: [] });
+    const { api: apiB, hubStore: b } = await fresh();
+    vi.spyOn(apiB, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(apiB, "screenRead").mockResolvedValue({ lines: [] });
+    await bootLive(apiA, a);
+    await bootLive(apiB, b);
+    const ai = a as unknown as {
+      flushAllOutbox: () => Promise<void>;
+      outbox: {
+        refreshDurable: () => Promise<unknown>;
+        pendingLeaseWakeups: () => string[];
+        enqueue: (rec: Partial<OutboxRecord> & { commandId: string; clientRequestId: string; instanceId: string; prompt: string }) => Promise<unknown>;
+      };
+    };
+    const bi = b as unknown as { flushAllOutbox: () => Promise<void> };
+    await ai.flushAllOutbox();
+    await bi.flushAllOutbox();
+
+    const H = "cmd_g20_i3b_h";
+    const P = "cmd_g20_i3b_p";
+    const INS2 = "ins_g20_i3b_second";
+    const J2 = "obj_g20_i3b_journal_second";
+    // H pending: B claims it and blocks inside the POST holding the lock.
+    localStorage.setItem(
+      OUTBOX_LS_KEY,
+      JSON.stringify([
+        {
+          commandId: H,
+          clientRequestId: `local_${H}`,
+          instanceId: INSTANCE,
+          journalId: JOURNAL,
+          prompt: "B is POSTing this one",
+          createdAt: Date.now() - 1_000,
+          attempts: 0,
+          state: "pending",
+        } satisfies OutboxRecord,
+      ]),
+    );
+    let sendBCalls = 0;
+    const sendB = vi.spyOn(apiB, "instanceSend").mockImplementation(
+      ((...args: unknown[]) => {
+        // First POST (H) blocks while B holds the instance lock; releaseB
+        // answers it HELD. Every later call (the real held-retry re-POST)
+        // succeeds immediately so retries settle instead of blocking again.
+        if (sendBCalls === 0) {
+          sendBCalls += 1;
+          return new Promise((resolve) => {
+            releaseB = () =>
+              resolve({
+                relatedCommandIds: [],
+                command: {
+                  commandId: H,
+                  id: H,
+                  state: "queued",
+                  revision: "1",
+                  dispatch: "not-dispatched",
+                  resolution: "held",
+                },
+              });
+          });
+        }
+        sendBCalls += 1;
+        const commandId = args[4] as string;
+        return Promise.resolve({
+          relatedCommandIds: [],
+          command: {
+            commandId,
+            id: commandId,
+            state: "accepted",
+            revision: "1",
+            dispatch: "native-acknowledged",
+            resolution: "clear",
+          },
+        });
+      }) as unknown as Api["instanceSend"],
+    );
+    void bi.flushAllOutbox();
+    // Let B's claim transaction commit while its POST stays blocked.
+    for (let i = 0; i < 20 && sendB.mock.calls.length === 0; i += 1) {
+      await vi.advanceTimersByTimeAsync(1);
+    }
+    expect(sendB).toHaveBeenCalledTimes(1);
+    expect(sendB.mock.calls[0]?.[4]).toBe(H);
+
+    // A discovers B's live same-owner claim and tracks its deadline. P does
+    // NOT exist yet: it is enqueued by A only after B settles H as held.
+    await ai.outbox.refreshDurable();
+    expect(ai.outbox.pendingLeaseWakeups()).toEqual([H]);
+    const claimUntil = (JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[]).find(
+      (r) => r.commandId === H,
+    )?.lease?.until;
+    expect(claimUntil).toBeTruthy();
+
+    const sendA = vi.spyOn(apiA, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) => ({
+        relatedCommandIds: [],
+        command: {
+          commandId,
+          id: commandId,
+          state: "accepted",
+          revision: "1",
+          dispatch: "native-acknowledged",
+          resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"],
+    );
+
+    // Advance to H's deadline: A's fire queues behind B's held instance lock;
+    // nothing from A yet.
+    await vi.advanceTimersByTimeAsync(Math.max(1, (claimUntil ?? 0) - Date.now()));
+    expect(sendA).not.toHaveBeenCalled();
+
+    // B's POST completes HELD while A is queued. B's own flush stops (H is in
+    // its attempted set; there are no other rows); it releases the lock and
+    // arms the held-retry clock.
+    const T0 = Date.now();
+    releaseB!();
+    for (let i = 0; i < 80; i += 1) {
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+      const storedH = (JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[]).find(
+        (r) => r.commandId === H,
+      );
+      if (storedH?.state === "held") break;
+    }
+
+    // A's queued fire read the HELD row and armed only the held-retry clock
+    // (no early re-POST). Now A enqueues P through ITS REAL Outbox (real
+    // durable write + the reconciliation's 0 ms delivery wake — no manual
+    // flush). A's GUARDED flush is what meets the held H in the fresh in-lock
+    // selection.
+    await ai.outbox.enqueue({
+      commandId: P,
+      clientRequestId: `local_${P}`,
+      instanceId: INS2,
+      journalId: J2,
+      prompt: "A must send this one",
+      createdAt: Date.now(),
+    });
+    for (let i = 0; i < 80 && sendA.mock.calls.length === 0; i += 1) {
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+    }
+
+    // A sent only P. H has B's original held answer and is still HELD: the
+    // guarded flush's held policy (fresh in-lock selection + claim boundary)
+    // never re-POSTed it while A waited on the lock.
+    const allPosts = () => [...sendA.mock.calls, ...sendB.mock.calls];
+    const postsFor = (id: string) => allPosts().filter((c) => c[4] === id);
+    expect(sendA).toHaveBeenCalledTimes(1);
+    expect(postsFor(P)).toHaveLength(1);
+    const stored = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(stored().find((r) => r.commandId === P)?.state).toBe("sent");
+    expect(stored().find((r) => r.commandId === H)?.state).toBe("held");
+    expect(postsFor(H)).toHaveLength(1);
+
+    // H's next POST is the real held-retry timer's (~2 s after T0), exactly
+    // once. Boundaries are absolute: the pump loops above advanced some time.
+    await vi.advanceTimersByTimeAsync(Math.max(0, T0 + 1_999 - Date.now()));
+    expect(postsFor(H)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(Math.max(2, T0 + 2_100 - Date.now()));
+    for (let i = 0; i < 60 && postsFor(H).length < 2; i += 1) {
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+    }
+    expect(postsFor(H)).toHaveLength(2);
+    a.logout();
+    b.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
 it("GATE10 item 7: a lease-less done row committed by another tab skips without aborting the flush; B still sends", async () => {
   const { api, hubStore } = await fresh();
   await bootLive(api, hubStore);

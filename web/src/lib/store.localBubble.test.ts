@@ -599,3 +599,170 @@ it("GATE22 item 1b-commit: a claim whose merge promise rejects after committing 
   await new Promise((r) => setTimeout(r, 300));
   expect(sendSpy).toHaveBeenCalledTimes(1);
 });
+
+/**
+ * Pump microtasks ONLY (fake timers stay parked): resolve once `fn` returns a
+ * non-nullish value. Lets real delivery flows progress through their storage
+ * /lock microturns without firing any setTimeout wake.
+ */
+async function pump<T>(fn: () => T | null | undefined, tries = 1_000): Promise<T> {
+  for (let i = 0; i < tries; i += 1) {
+    const v = fn();
+    if (v != null) return v;
+    await Promise.resolve();
+  }
+  throw new Error("pump timed out");
+}
+
+it("GATE22 item 2: a live steer whose rejected finishing write aborts once is recovered at its lease deadline — the direct route ends through the shared epilogue", async () => {
+  // The guarded flush ends every pass with endDeliveryPasses (fresh
+  // authoritative reconcile through bounded recovery); the LIVE DIRECT STEER
+  // route used to end with only endActiveDelivery. Sequence: steer POST hangs;
+  // another instance's flush finishes while the steer is ACTIVE (its
+  // reconciliations arm nothing); the steer verdict is rejected but the
+  // finishing write ABORTS ONCE, so durable state stays inflight under this
+  // owner's live lease with no patch epilogue and no wake. Pre-fix the row
+  // stranded past its lease; post-fix the direct route's shared epilogue arms
+  // the one deadline wake, and the store's real timer recovers the row at
+  // lease expiry (same-id redelivery surfaces the rejected verdict).
+  vi.useFakeTimers();
+  vi.setSystemTime(600_000);
+  const I_STEER = INSTANCE;
+  const I_OTHER = "ins_gate22_2_other";
+  const steerPrompt = "gate22 2 steer";
+  const internalsOf = (s: Store) =>
+    s as unknown as {
+      ensureOutbox: () => Promise<boolean>;
+      flushAllOutbox: () => Promise<void>;
+      outbox: {
+        ownerId: string;
+        storage: FaultableOutboxStorage;
+        pendingLeaseWakeups: () => string[];
+        leaseWakeAt: (id: string) => number | undefined;
+      } | null;
+    };
+  try {
+    const { api, hubStore } = await fresh();
+    stubPostSend(api);
+    hubStore.setConnectionStateForTest("live");
+    const internals = internalsOf(hubStore);
+    expect(await internals.ensureOutbox()).toBe(true);
+    await internals.flushAllOutbox(); // settle the empty boot flush
+    const storage = internals.outbox!.storage;
+
+    // One-shot abort of the rejected finishing write, armed from the REAL
+    // patch transition — never a hand-edited state change.
+    let abortOnce = true;
+    const realMerge = storage.mergeUnlessDone.bind(storage);
+    storage.mergeUnlessDone = vi.fn(async (id, patch) => {
+      if (abortOnce && String(id).startsWith("cmd_") && patch.state === "rejected") {
+        abortOnce = false;
+        throw new Error("gate22 2 finishing write abort");
+      }
+      return await realMerge(id, patch);
+    });
+
+    // First steer POST hangs until released with a settled+rejected verdict;
+    // the deadline redelivery gets the same deduplicated verdict.
+    let releaseSteer: (() => void) | null = null;
+    const steerGate = new Promise<void>((resolve) => {
+      releaseSteer = resolve;
+    });
+    let steerCalls = 0;
+    const rejectedFor = (commandId: string): CommandResult => {
+      const r = commandResult(commandId, "settled");
+      r.command.settlement = { outcome: "rejected", reason: "turn does not exist" };
+      return r;
+    };
+    const sendSpy = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_iid: string, prompt: string, _a?: unknown[], _m?: string, commandId?: string) => {
+        if (prompt === steerPrompt) {
+          steerCalls += 1;
+          if (steerCalls === 1) await steerGate;
+          return rejectedFor(commandId ?? "cmd_x");
+        }
+        return commandResult(commandId ?? "cmd_x", "accepted");
+      }) as Api["instanceSend"],
+    );
+
+    // 1) Live steer: real claim, POST pending.
+    const steerP = hubStore.send(I_STEER, steerPrompt, [], [], "steer");
+    const steerId = await pump(() => {
+      const b = hubStore.getSnapshot().bubbles.find((x) => x.text === steerPrompt);
+      return b?.commandId && sendSpy.mock.calls.some((c) => c[4] === b.commandId)
+        ? (b.commandId as string)
+        : null;
+    });
+
+    // 2) Another instance's REAL flush runs and finishes while the steer POST
+    //    is active; every reconciliation then sees the row as its own active
+    //    delivery and arms nothing for it.
+    await hubStore.send(I_OTHER, "gate22 2 other");
+    await pump(() =>
+      sendSpy.mock.calls.filter((c) => c[1] === "gate22 2 other").length === 1 ? true : null,
+    );
+    // Deterministic barrier: wait until NO authoritative read is in flight and
+    // none starts across a wide microtask window, so the other instance's flush
+    // AND its endDeliveryPasses epilogue have fully finished — all while the
+    // steer is still active. A late epilogue after the steer finishes would
+    // arm the wake and hide the direct-route regression.
+    let readsInFlight = 0;
+    const realAll = storage.all.bind(storage);
+    storage.all = vi.fn(async () => {
+      readsInFlight += 1;
+      try {
+        return await realAll();
+      } finally {
+        readsInFlight -= 1;
+      }
+    });
+    for (;;) {
+      const before = vi.mocked(storage.all).mock.calls.length;
+      for (let i = 0; i < 100; i += 1) await Promise.resolve();
+      if (vi.mocked(storage.all).mock.calls.length === before && readsInFlight === 0) break;
+    }
+    const storedRows = () =>
+      JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as Array<{
+        commandId: string;
+        prompt: string;
+        state: string;
+        attempts: number;
+        lease?: { owner: string; until: number };
+      }>;
+    expect(internals.outbox!.pendingLeaseWakeups()).not.toContain(steerId);
+    const live = storedRows().find((r) => r.commandId === steerId);
+    expect(live?.state).toBe("inflight");
+    expect(live?.lease?.owner).toBe(internals.outbox!.ownerId);
+
+    // 3) Verdict rejected, finishing write aborts once. The direct route's
+    //    shared epilogue re-reads the still-inflight row and arms its one
+    //    deadline wake (no earlier reconciliation left it one).
+    releaseSteer!();
+    await expect(steerP).resolves.toBe(false);
+    expect(steerCalls).toBe(1);
+    const stranded = storedRows().find((r) => r.commandId === steerId);
+    expect(stranded?.state).toBe("inflight");
+    expect(stranded?.attempts).toBe(1);
+    expect(stranded?.lease?.owner).toBe(internals.outbox!.ownerId);
+    const until = stranded!.lease!.until;
+    expect(until - Date.now()).toBeGreaterThan(20_000);
+    expect(internals.outbox!.pendingLeaseWakeups()).toContain(steerId);
+    expect(internals.outbox!.leaseWakeAt(steerId)).toBe(until);
+
+    // 4) The store's REAL lease-deadline timer is the only recovery trigger:
+    //    same-id redelivery surfaces the rejected verdict durably.
+    await vi.advanceTimersByTimeAsync(until - Date.now() + 10);
+    expect(steerCalls).toBe(2);
+    expect(sendSpy.mock.calls.filter((c) => c[4] === steerId)).toHaveLength(2);
+    const recovered = storedRows().find((r) => r.commandId === steerId);
+    expect(recovered?.state).toBe("rejected");
+    expect(recovered?.lease).toBeUndefined();
+
+    // 5) Well past every deadline: no third POST, one steer intent ever.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(sendSpy.mock.calls.filter((c) => c[4] === steerId)).toHaveLength(2);
+    expect(hubStore.getSnapshot().bubbles.filter((b) => b.text === steerPrompt)).toHaveLength(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});

@@ -3595,13 +3595,27 @@ class HubStore {
       // True only on authoritative acceptance (sent/done); held (host
       // offline), reconciling, rejected, unknown, or a lock/lease failure
       // report false even though the durable row keeps retrying.
+      //
+      // c-reconnfu gate 22 item 2: the direct route ends through the SAME
+      // shared epilogue as the guarded flush. The delivery turn clears the
+      // active marker in its own finally; if the finishing write then ABORTS
+      // (verdict in hand, durable row still inflight under this owner's live
+      // lease) no patch epilogue ran, and reconciliations by OTHER instances'
+      // flushes armed nothing while the POST was active — without the fresh
+      // authoritative reconcile here the row would strand with no deadline
+      // wake. A rejected lock/lease turn is attributed like a flush failure so
+      // the bounded backoff applies.
+      let steerFailed = false;
       try {
         await this.outbox.withInstanceLock(instanceId, (iid, rows) =>
           this.deliverOneRow(iid, rows),
         );
       } catch {
-        return false;
+        this.outbox.noteDeliveryFailure(instanceId);
+        steerFailed = true;
       }
+      await this.outbox.deliveryEpilogue().catch(() => undefined);
+      if (steerFailed) return false;
       this.syncBubbleFromOutbox(commandId);
       const finalState = this.outbox.get(commandId)?.state;
       return finalState === "sent" || finalState === "done";
@@ -3875,13 +3889,21 @@ class HubStore {
     // not raise the 已打断 receipt; recovery flushes the queued row.
     if (this.connectionState !== "live") return false;
     // Deliver the (steer-promoted) row through the single-deliverer lock.
+    // Gate 22 item 2: this direct entry ends through the SAME shared
+    // epilogue as the live steer route and the guarded flush — a finishing
+    // write that aborts leaves the row inflight with no patch epilogue.
+    let steerFailed = false;
     try {
       await this.outbox.withInstanceLock(instanceId, (id, rows) => this.deliverOneRow(id, rows));
     } catch {
       // Lock/lease failure: never claim the interrupt (the bounded retry /
-      // reconnect delivers the same id later).
-      return false;
+      // reconnect delivers the same id later). Attribute the failed turn so
+      // the bounded backoff applies, then run the shared epilogue.
+      this.outbox.noteDeliveryFailure(instanceId);
+      steerFailed = true;
     }
+    await this.outbox.deliveryEpilogue().catch(() => undefined);
+    if (steerFailed) return false;
     this.syncBubbleFromOutbox(commandId);
     // Receipt only on AUTHORITATIVE acceptance (sent/done), never while merely
     // queued/reconciling/offline.

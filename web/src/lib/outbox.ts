@@ -1247,13 +1247,6 @@ export class Outbox {
    * this right after winning its claim, for the duration of the POST). The
    * active POST is that row's in-flight guarded delivery, so the central
    * reconciliation arms nothing for it — even when its lease owner equals
-   * this persisted recovery owner (a cloned sibling shares that id).
-   */
-  /**
-   * Mark a command as being actively delivered BY THIS document (store calls
-   * this right after winning its claim, for the duration of the POST). The
-   * active POST is that row's in-flight guarded delivery, so the central
-   * reconciliation arms nothing for it — even when its lease owner equals
    * this persisted recovery owner (a cloned sibling shares that id). No
    * reconciliation runs from the cache here: the claim patch and the finish
    * patch each reconcile from an AUTHORITATIVE durable snapshot (gate 21
@@ -1264,11 +1257,33 @@ export class Outbox {
   }
 
   /**
-   * The live delivery finished (or was skipped after claim). The finish patch
-   * already re-judged authoritatively, so this only clears the active marker.
+   * The live delivery finished (or was skipped after claim). This only
+   * CLEARS the active marker — the usual finish patch already ran its
+   * post-commit epilogue. When that finishing write ABORTED (gate 22 item 2)
+   * no patch epilogue ran, so a delivery entry point that does not own a
+   * flush pass (the live direct-steer route) must follow this with
+   * {@link deliveryEpilogue}; the flush route gets the same reconcile from
+   * its pass epilogue {@link endDeliveryPasses}.
    */
   endActiveDelivery(commandId: Id) {
     this.activeDeliveries.delete(commandId);
+  }
+
+  /**
+   * The SHARED post-delivery epilogue for entry points WITHOUT a flush pass
+   * (c-reconnfu gate 22 item 2: the live direct-steer route). Runs AFTER
+   * {@link endActiveDelivery} cleared the POST marker: re-judge every row
+   * from an AUTHORITATIVE durable snapshot. This is what covers a finishing
+   * write that ABORTED after the verdict returned — the durable row stays
+   * inflight under this owner's LIVE lease, and while the POST was active the
+   * central policy armed nothing; the fresh read now arms the row's one
+   * deadline wake (so lease expiry recovers it) along with every other row
+   * whose cover ended. A rejected read enters the bounded, lifetime-aware
+   * recovery, which ends in this same central reconciliation.
+   */
+  async deliveryEpilogue(): Promise<void> {
+    if (this.disposed || this.unloading) return;
+    await this.refreshDurableRecovering(0);
   }
 
   isDeliveryActive(commandId: Id): boolean {

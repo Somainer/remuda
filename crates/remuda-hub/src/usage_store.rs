@@ -589,6 +589,12 @@ fn upsert_message_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Resul
     // Duplicate durable key: improve the stored row where the incoming row has
     // a value the stored one lacks (turn_id, native timestamp/source, NULL
     // counters/cost). Never overwrite a present value with NULL.
+    //
+    // c-usagefu r10 item 8 (Ruling C): a NULL-to-known ACCOUNTING repair is
+    // allowed independent of attribution. A row ingested with COMPLETE
+    // attribution (turn id + native time already present) but an UNKNOWN cost
+    // must still receive the known cost on replay; the old guard ran the UPDATE
+    // only while attribution was incomplete, so the cost stayed NULL forever.
     let updated = conn.execute(
         "UPDATE usage_events SET
              turn_id = COALESCE(turn_id, ?3),
@@ -607,7 +613,13 @@ fn upsert_message_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Resul
                  ELSE ?11 END
          WHERE instance_id = ?1 AND scope = 'message' AND scope_id = ?2
            AND (turn_id IS NULL
-                OR (observed_at_source != 'native' AND ?11 = 'native'))",
+                OR (observed_at_source != 'native' AND ?11 = 'native')
+                OR (total_tokens IS NULL AND ?4 IS NOT NULL)
+                OR (input_tokens IS NULL AND ?5 IS NOT NULL)
+                OR (output_tokens IS NULL AND ?6 IS NOT NULL)
+                OR (cache_read_tokens IS NULL AND ?7 IS NOT NULL)
+                OR (cache_write_tokens IS NULL AND ?8 IS NOT NULL)
+                OR (cost_usd IS NULL AND ?9 IS NOT NULL))",
         params![
             row.instance_id,        // ?1
             row.scope_id,           // ?2
@@ -3150,6 +3162,107 @@ mod tests {
         assert_eq!(turn.as_deref(), Some("t7"));
         assert_eq!(source, "native");
         assert_eq!(at, native);
+    }
+
+    #[test]
+    fn message_with_complete_attribution_repairs_unknown_cost_on_replay() {
+        // c-usagefu r10 item 8 (Ruling C NULL->known repair): a Message is
+        // ingested with COMPLETE attribution (native turn id + native time) but
+        // an UNKNOWN cost (model not priced yet). A later byte-0 replay with the
+        // same response id but a KNOWN cost must repair cost_usd even though no
+        // attribution field is missing. The row stays singular and keeps its
+        // attribution; a present value is never downgraded.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let native = "2026-09-15T00:00:00.000Z";
+        let record = |seq: i64, cost: serde_json::Value| JournalRecord {
+            instance_id: "ins_repair".into(),
+            seq,
+            event_id: format!("e{seq}"),
+            event: json!({
+                "kind": "usage",
+                "nativeAt": {"state": "known", "value": native},
+                "source": {"nativeTurnId": {"state": "known", "value": "t8"}},
+                "payload": {
+                    "scope": "message", "scopeId": "r8", "mode": "snapshot",
+                    "metricRevision": "1",
+                    "inputTokens": {"state": "known", "value": "0"},
+                    "outputTokens": {"state": "known", "value": "100"},
+                    "cost": cost,
+                    "accounting": "estimated"
+                }
+            }),
+            observed_at: native.into(),
+        };
+        // First ingest: complete attribution, unknown cost.
+        let first = record(
+            1,
+            json!({"state": "unknown", "reason": "unpriced-model", "evidenceEventIds": []}),
+        );
+        let first_row = project_usage_event(&first, Some("pvp_repair"), Some("gpt-5.4")).unwrap();
+        assert!(insert_usage_event(&conn, &first_row).unwrap());
+        let (turn, source, cost): (Option<String>, String, Option<String>) = conn
+            .query_row(
+                "SELECT turn_id, observed_at_source, cost_usd FROM usage_events WHERE scope_id='r8'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(turn.as_deref(), Some("t8"), "attribution already complete");
+        assert_eq!(source, "native");
+        assert_eq!(cost, None, "cost unknown on first ingest");
+
+        // Replay (new seq, same durable response id) now carries a known cost.
+        let replay = record(
+            2,
+            json!({"state": "known", "value": {"amount": "0.10", "currency": "USD"}}),
+        );
+        let replay_row = project_usage_event(&replay, Some("pvp_repair"), Some("gpt-5.4")).unwrap();
+        let changed = insert_usage_event(&conn, &replay_row).unwrap();
+        assert!(changed, "the NULL->known cost repair updates the row");
+
+        let (turn, source, at, cost): (Option<String>, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT turn_id, observed_at_source, observed_at, cost_usd
+                 FROM usage_events WHERE scope_id='r8'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0).unwrap(),
+                        r.get(1).unwrap(),
+                        r.get(2).unwrap(),
+                        r.get(3).unwrap(),
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            turn.as_deref(),
+            Some("t8"),
+            "attribution unchanged by repair"
+        );
+        assert_eq!(source, "native");
+        assert_eq!(at, native);
+        assert_eq!(
+            cost.as_deref(),
+            Some("0.10"),
+            "known cost repaired on replay"
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE scope_id='r8'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "the replay repairs the one durable row");
+
+        // The repair flows through to billing.
+        let agg = aggregate_instance(&conn, "ins_repair").unwrap();
+        assert!(
+            (agg.cost_usd - 0.10).abs() < 1e-9,
+            "repaired cost is billable"
+        );
     }
 
     #[test]

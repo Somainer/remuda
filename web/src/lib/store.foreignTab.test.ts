@@ -3362,3 +3362,180 @@ it("GATE22 item 4 (rebuilds gate-21 item-1a): two real stores — B blocked past
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE22 item 5 (rebuilds gate-21 item-2): B really finishes X AND restores Y to pending before A's tracked X deadline, then closes — advancing only to X's deadline, A delivers Y before Y's original 30 s lease deadline", async () => {
+  // Rebuild of the gate-21 item-2 regression per RULES. The older version
+  // advanced all the way to Y's own 30 s lease deadline, so it never proved
+  // that the tracked X deadline was sufficient. Here TWO real HubStores share
+  // one localStorage backend behind the FIFO Web Locks shim; the initial
+  // inflight claims are the only seeded state and every later transition is a
+  // real delivery flow.
+  //
+  // A boots FIRST with X (instance IX, B lease 10 s) and Y (instance IY, B
+  // lease 30 s): it tracks the two deadline wakes and posts nothing. B boots
+  // second with locks.query FREE, so its load REALLY reclaims the two
+  // same-owner fresh leases to pending; its boot flush then sends X clear and
+  // fails Y at the API boundary (POST rejects AND status GET rejects), which
+  // restores Y lease-less pending — all near t0, BEFORE A's tracked X
+  // deadline. B closes with its pinned jittered retry cancelled.
+  //
+  // Advancing fake time ONLY to X's deadline: A's real X fire is the trigger
+  // — its authoritative read sees X sent and Y PENDING; the central
+  // reconciliation arms Y's one 0 ms wake, Y's real fire hands off to A's
+  // guarded flush and A delivers Y under the same id, ~20 s before Y's
+  // original 30 s lease deadline. Combined API calls exactly B:[X, Y] A:[Y];
+  // no second POST and no manual flush anywhere.
+  vi.useFakeTimers();
+  vi.setSystemTime(1_000_000);
+  const ownerA = "owner_g22_i5_a";
+  const ownerB = "owner_g22_i5_b";
+  const IX = "ins_g22_i5_x";
+  const IY = "ins_g22_i5_y";
+  const X = "cmd_g22_i5_x";
+  const Y = "cmd_g22_i5_y";
+  const shim = fifoWebLocks();
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks: shim.locks },
+  });
+  localStorage.setItem(
+    OUTBOX_LS_KEY,
+    JSON.stringify([
+      {
+        commandId: X,
+        clientRequestId: `local_${X}`,
+        instanceId: IX,
+        journalId: JOURNAL,
+        prompt: "gate22 5 x",
+        createdAt: Date.now() - 2_000,
+        attempts: 1,
+        state: "inflight",
+        lease: { owner: ownerB, until: Date.now() + 10_000 },
+      } satisfies OutboxRecord,
+      {
+        commandId: Y,
+        clientRequestId: `local_${Y}`,
+        instanceId: IY,
+        journalId: JOURNAL,
+        prompt: "gate22 5 y",
+        createdAt: Date.now() - 1_000,
+        attempts: 1,
+        state: "inflight",
+        lease: { owner: ownerB, until: Date.now() + 30_000 },
+      } satisfies OutboxRecord,
+    ]),
+  );
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    // A boots first with the foreign live leases: tracks both deadlines.
+    sessionStorage.setItem("remuda-outbox-owner", ownerA);
+    const { api: apiA, hubStore: a } = await fresh();
+    vi.spyOn(apiA, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(apiA, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(apiA, "instanceCommandStatus").mockRejectedValue(new Error("a status unused"));
+    const sendA = vi.spyOn(apiA, "instanceSend").mockImplementation(
+      (async (_iid: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: {
+          commandId,
+          id: commandId,
+          state: "accepted",
+          revision: "1",
+          dispatch: "native-acknowledged",
+          resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(apiA, a);
+    const aOutbox = (a as unknown as { outbox: { pendingLeaseWakeups: () => string[] } }).outbox;
+    await pump(1_000);
+    expect(sendA).not.toHaveBeenCalled();
+    expect(aOutbox.pendingLeaseWakeups().sort()).toEqual([X, Y].sort());
+
+    // B boots: locks.query is FREE, its load reclaims both own fresh leases
+    // (real reclaimInflight) and its boot flush runs both rows for real.
+    sessionStorage.setItem("remuda-outbox-owner", ownerB);
+    const { api: apiB, hubStore: b } = await fresh();
+    vi.spyOn(apiB, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(apiB, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(apiB, "instanceCommandStatus").mockRejectedValue(new Error("status network down"));
+    const sendB = vi.spyOn(apiB, "instanceSend").mockImplementation(
+      (async (_iid: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => {
+        if (commandId === X) {
+          return {
+            relatedCommandIds: [],
+            command: {
+              commandId: X,
+              id: X,
+              state: "accepted",
+              revision: "1",
+              dispatch: "native-acknowledged",
+              resolution: "clear",
+            },
+          };
+        }
+        throw new Error("gate22 5 boundary POST failure");
+      }) as unknown as Api["instanceSend"],
+    );
+    // Pin the store-retry jitter high and close B before any retry can fire.
+    vi.spyOn(Math, "random").mockReturnValue(0.999);
+    const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    const row = (id: string) => storedRows().find((r) => r.commandId === id);
+    await bootLive(apiB, b);
+    // B's real flow sends X, then claims Y, POSTs and fails the status GET,
+    // and restores Y lease-less pending — wait for the durable restore, THEN
+    // close B so its pinned jittered retry is cancelled.
+    for (let i = 0; i < 2_000; i += 1) {
+      if (sendB.mock.calls.length === 2 && row(Y)?.state === "pending") break;
+      await Promise.resolve();
+    }
+    b.logout();
+    expect(sendB.mock.calls.map((c) => c[4])).toEqual([X, Y]);
+
+    // Both transitions committed well before the X deadline (fake time still
+    // at the boot instant): X sent, Y lease-less pending.
+    expect(row(X)?.state).toBe("sent");
+    expect(row(Y)?.state).toBe("pending");
+    expect(row(Y)?.lease).toBeUndefined();
+    expect(sendA).not.toHaveBeenCalled();
+
+    // Advance ONLY to the tracked X deadline (plus microtasks), nowhere near
+    // Y's original 30 s lease deadline.
+    await vi.advanceTimersByTimeAsync(10_000);
+    for (let i = 0; i < 200 && sendA.mock.calls.length === 0; i += 1) {
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1);
+    }
+    expect(sendA).toHaveBeenCalledTimes(1);
+    expect(sendA.mock.calls[0]?.[4]).toBe(Y);
+    expect(row(Y)?.state).toBe("sent");
+    // The whole recovery finished by ~10 s: Y never waited for its 30 s
+    // deadline and X was never posted by A.
+    expect(Date.now()).toBeLessThan(1_000_000 + 20_000);
+    expect(sendA.mock.calls.some((c) => c[4] === X)).toBe(false);
+
+    // Far past every deadline: exactly the one A POST and B's two calls.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(sendA).toHaveBeenCalledTimes(1);
+    expect(sendB).toHaveBeenCalledTimes(2);
+    a.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

@@ -2829,6 +2829,11 @@ impl Driver for ShellPtyDriver {
         if let Some(handle) = self.adapters.lock().await.take() {
             handle.abort();
         }
+        // Release this run's codex census interval (the aborted adapter holds
+        // the other clone; the last drop records the close). A resume adopts a
+        // newer cohort before this point, so dropping a superseded guard never
+        // closes a continued session (c-usagefu r10 item 1).
+        self.codex_lifetime.lock().await.take();
         self.interrupt_pid.store(0, Ordering::SeqCst);
         // Drop any transcript claim so a respawn starts a fresh epoch.
         self.bindings.demobilize();

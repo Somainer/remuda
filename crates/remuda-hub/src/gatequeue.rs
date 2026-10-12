@@ -1178,10 +1178,14 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
                 job_id,
                 &existing.requested_by,
                 run_log,
+                result.generation,
             )
             .await
             {
-                Ok(object_id) => log_object_id = Some(object_id),
+                // None: the in-transaction generation gate found the row
+                // advanced between the pre-read and the evidence writer.
+                Ok(Some(object_id)) => log_object_id = Some(object_id),
+                Ok(None) => log_object_id = None,
                 Err(error) => tracing::warn!(%error, job_id, "could not persist gate log object"),
             }
         } else {
@@ -1505,7 +1509,8 @@ async fn persist_run_log(
     job_id: &str,
     created_by: &str,
     run_log: &remuda_protocol::GateRunLog,
-) -> Result<String, HubError> {
+    generation: u32,
+) -> Result<Option<String>, HubError> {
     let bytes =
         serde_json::to_vec(run_log).map_err(|error| HubError::Internal(error.to_string()))?;
     if bytes.len() > GATE_LOG_MAX_BYTES {
@@ -1517,7 +1522,7 @@ async fn persist_run_log(
     let digest = crate::config::sha256_hex(&bytes);
     state
         .store
-        .insert_gate_log(project_id, job_id, bytes, digest, created_by)
+        .insert_gate_log(project_id, job_id, bytes, digest, created_by, generation)
         .await
         .map_err(HubError::Store)
 }
@@ -2661,7 +2666,8 @@ impl Store {
         bytes: Vec<u8>,
         digest: String,
         created_by: &str,
-    ) -> Result<String, crate::store::StoreError> {
+        generation: u32,
+    ) -> Result<Option<String>, crate::store::StoreError> {
         let project_id = project_id.to_owned();
         let job_id = job_id.to_owned();
         let created_by = created_by.to_owned();
@@ -2672,6 +2678,25 @@ impl Store {
             let tx = crate::store::immediate_tx(conn)?;
             let now = now();
             let expires_at = gate_log_expiry(&now);
+            // r12 item 8: read the row's current attempts INSIDE the same
+            // immediate transaction as the delete+insert. A verdict whose
+            // generation is no longer current (a genuine base-moved requeue
+            // already claimed attempt N+1) must not replace the newer
+            // attempt's evidence — the pre-read alone was racy across two
+            // writers. BEGIN IMMEDIATE serializes this against the verdict and
+            // claim writers, so the check and the replacement are atomic.
+            let current_attempts: Option<u32> = tx
+                .query_row(
+                    "SELECT json_extract(doc_json, '$.attempts') FROM gate_jobs WHERE id = ?1",
+                    params![job_id],
+                    |row| row.get::<_, Option<u32>>(0),
+                )
+                .optional()?
+                .flatten();
+            if current_attempts.is_some_and(|attempts| attempts != generation) {
+                tx.commit()?;
+                return Ok(None);
+            }
             // The id this job already references, read under the same
             // transaction before any delete. Covers legacy random ids; only
             // a row with no reference at all gets the deterministic id.
@@ -2732,7 +2757,7 @@ impl Store {
                 )?;
             }
             tx.commit()?;
-            Ok(object_id)
+            Ok(Some(object_id))
         })
         .await
     }

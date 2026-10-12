@@ -699,6 +699,27 @@ impl RunningHub {
             .collect())
     }
 
+    /// Test-only: run the production generation-gated evidence transaction
+    /// (`Store::insert_gate_log`) and return its object-id result (None when
+    /// the verdict generation no longer matches the row's attempt). Drives the
+    /// real writer, not a test copy (r12 item 8).
+    #[doc(hidden)]
+    pub async fn test_insert_gate_log(
+        &self,
+        project_id: &str,
+        job_id: &str,
+        bytes: Vec<u8>,
+        digest: String,
+        created_by: &str,
+        generation: u32,
+    ) -> anyhow::Result<Option<String>> {
+        self.store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .insert_gate_log(project_id, job_id, bytes, digest, created_by, generation)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
     /// Test-only: run the §7.5 direct-op admission (check + `admitted` row)
     /// without a live Node, for worker.provision/remove coverage while the
     /// worker routes themselves stay Agent-403 (ma-admission opens them).

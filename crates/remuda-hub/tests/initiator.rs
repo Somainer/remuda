@@ -3498,3 +3498,108 @@ async fn a_stale_attempts_step_event_does_not_overwrite_the_current_steps() {
     );
     assert_eq!(step["durationMs"], json!(0), "{doc}");
 }
+
+/// r12 item 8: after a GENUINE base-moved requeue claims attempt 2, attempt
+/// 1's late evidence (its runLog arriving with the stale base-moved verdict)
+/// must not replace attempt 2's log object. The generation check lives
+/// INSIDE the evidence transaction, so this drives both verdicts through the
+/// real apply path and then reads the stored object bytes.
+#[tokio::test]
+async fn attempt_one_log_cannot_replace_attempt_two_after_a_genuine_requeue() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    let job_id = queued_land_job(&ctx).await;
+    let _ = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap();
+    genuine_requeue_to_attempt_two(&ctx, &job_id).await;
+
+    // The CURRENT attempt 2 fails with ITS evidence.
+    ctx.hub
+        .test_apply_gate_result(
+            &job_id,
+            json!({
+                "jobId": job_id, "generation": 2, "status": "failed",
+                "error": "attempt 2 failed", "reason": "attempt 2 failed",
+                "runLog": {
+                    "step": "cargo-test", "kind": "failed",
+                    "headline": "ATTEMPT-TWO-EVIDENCE",
+                    "summary": [], "tail": [], "capturedLines": 1, "truncated": false,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    let failed = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(failed["state"], json!("failed"), "{failed}");
+    let object_id = failed["logObjectId"]
+        .as_str()
+        .expect("attempt-2 logObjectId")
+        .to_owned();
+
+    // Attempt 1's late base-moved verdict arrives carrying DIFFERENT evidence.
+    ctx.hub
+        .test_apply_gate_result(
+            &job_id,
+            json!({
+                "jobId": job_id, "generation": 1, "status": "base-moved",
+                "currentMainSha": "0123456789abcdef0123456789abcdef01234567",
+                "runLog": {
+                    "step": "cargo-test", "kind": "failed",
+                    "headline": "ATTEMPT-ONE-EVIDENCE",
+                    "summary": [], "tail": [], "capturedLines": 1, "truncated": false,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+
+    // The stored object is still attempt 2's; the stale verdict's evidence
+    // was gated out inside the evidence transaction.
+    let (status, stored) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{object_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{stored}");
+    assert_eq!(
+        stored["log"]["headline"],
+        json!("ATTEMPT-TWO-EVIDENCE"),
+        "stale attempt-1 evidence replaced attempt 2's log: {stored}"
+    );
+
+    // And the production evidence transaction itself refuses a generation-1
+    // write when the row is already attempt 2 (the pre-read→insert race),
+    // leaving attempt 2's object in place.
+    let stale_bytes = br#"{"headline":"ATTEMPT-ONE-EVIDENCE"}"#.to_vec();
+    let stale_digest = "stale-digest".to_owned();
+    let gated = ctx
+        .hub
+        .test_insert_gate_log(&ctx.project, &job_id, stale_bytes, stale_digest, "dev", 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        gated, None,
+        "a generation-1 evidence write must be gated out"
+    );
+    let (status, after) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{object_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{after}");
+    assert_eq!(
+        after["log"]["headline"],
+        json!("ATTEMPT-TWO-EVIDENCE"),
+        "the gated transaction replaced attempt 2's log: {after}"
+    );
+}

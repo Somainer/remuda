@@ -20057,6 +20057,14 @@
           "description": "`scope_id`; protocol §5.5.",
           "type": "string"
         },
+        "sourceSessionId": {
+          "default": null,
+          "description": "Native session id qualifying [`Self::metric_revision`]: the revision is\na record position WITHIN one native session transcript, so two\nsessions both start at position 1 and their authorities must not\nfreeze each other. `None` for producers that do not report a session\n(legacy/unknown lineage); the Hub compares watermarks only within one\nqualified lineage (c-ctxusage r15 item 4).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "totalTokens": {
           "$ref": "#/$defs/Knowledge3",
           "description": "`total_tokens`; protocol §5.5."
@@ -20072,6 +20080,7 @@
         "scopeId",
         "mode",
         "metricRevision",
+        "sourceSessionId",
         "inputTokens",
         "inputAccounting",
         "outputTokens",

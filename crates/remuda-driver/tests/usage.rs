@@ -64,7 +64,7 @@ fn claude_session_payload_is_estimated_turn_scoped_snapshots_per_model_call() {
             agg.push(&event);
         }
     }
-    let payload = to_usage_payload(UsageScope::Session, "sess-parity", 1, agg.session());
+    let payload = to_usage_payload(UsageScope::Session, "sess-parity", 1, None, agg.session());
     assert_eq!(payload.accounting, Accounting::Estimated);
     assert!(matches!(
         payload.input_accounting,

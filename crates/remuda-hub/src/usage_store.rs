@@ -42,6 +42,13 @@ pub struct UsageEventRow {
     /// session id and re-emit with an increasing revision, so a newer
     /// revision replaces the older row instead of being frozen.
     pub metric_revision: i64,
+    /// Native session id qualifying [`Self::metric_revision`]. The revision is
+    /// a record position WITHIN one native session transcript, so the turn
+    /// authority watermark is `(source_session_id, metric_revision)`: two
+    /// sessions both replaying from position 1 must not freeze each other.
+    /// `None` is the legacy unqualified lineage (pre-r15 rows and producers
+    /// that do not report a session) (c-ctxusage r15 item 4).
+    pub source_session_id: Option<String>,
     /// Snapshot vs delta.
     pub mode: String,
     /// Total tokens when known.
@@ -91,6 +98,7 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             observed_at TEXT NOT NULL,
             observed_at_source TEXT NOT NULL DEFAULT 'ingest',
             metric_revision INTEGER NOT NULL DEFAULT 1,
+            source_session_id TEXT,
             PRIMARY KEY (instance_id, seq)
          );
          CREATE INDEX IF NOT EXISTS usage_events_profile_model
@@ -115,6 +123,12 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         "UPDATE usage_events SET metric_revision = 1 WHERE metric_revision IS NULL",
         [],
     )?;
+    // c-ctxusage r15 item 4: the turn watermark is session-qualified
+    // (native session id + record position). Existing rows are the
+    // UNQUALIFIED legacy lineage: NULL is the defined migration value, kept
+    // distinct from a reported empty/unknown session, and the comparison rule
+    // only applies a numeric watermark within one proven lineage.
+    crate::store::ensure_column(conn, "usage_events", "source_session_id", "TEXT")?;
     // c-ctxusage r4 item 5: remember whether observed_at is native-sourced or
     // an ingest fallback, so an unchanged-counters replay can repair the
     // historical native time. Legacy rows are conservatively 'ingest'.
@@ -420,10 +434,11 @@ fn insert_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> 
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO usage_events
             (instance_id, seq, profile_id, model, scope, scope_id, mode,
-             metric_revision, total_tokens, input_tokens, output_tokens,
-             cache_read_tokens, cache_write_tokens, cost_usd, accounting,
-             observed_at, observed_at_source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             metric_revision, source_session_id, total_tokens, input_tokens,
+             output_tokens, cache_read_tokens, cache_write_tokens, cost_usd,
+             accounting, observed_at, observed_at_source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                 ?14, ?15, ?16, ?17, ?18)",
         params![
             row.instance_id,
             row.seq,
@@ -433,6 +448,7 @@ fn insert_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> 
             row.scope_id,
             row.mode,
             row.metric_revision,
+            row.source_session_id,
             row.total_tokens,
             row.input_tokens,
             row.output_tokens,
@@ -540,9 +556,40 @@ impl SnapshotCounters {
 struct StoredSnapshot {
     counters: SnapshotCounters,
     revision: i64,
+    /// Native session lineage the stored watermark belongs to.
+    source_session_id: Option<String>,
     cost_usd: Option<String>,
     observed_at: String,
     observed_at_source: String,
+}
+
+/// Turn authority gate (c-ctxusage r15 items 2-4): is `(session, position)`
+/// equal or older than the stored watermark?
+///
+/// Positions are record indices WITHIN a native session transcript, so the
+/// numeric comparison applies only inside one proven lineage:
+/// * both frames carry the SAME qualified session id — the strict watermark;
+/// * NEITHER carries one (legacy unqualified producers) — one implicit
+///   lineage, the numeric watermark still applies;
+/// * the ids differ, or exactly one side is qualified — the frames are
+///   different authorities over the colliding scope id, so the incoming
+///   frame is accepted and its lineage becomes the stored one. A resumed /
+///   re-bound session replaying a fresh transcript from position 1 must not
+///   be frozen by the previous session's high-water mark.
+fn turn_position_is_stale(
+    incoming_session: Option<&str>,
+    incoming_position: i64,
+    stored: &StoredSnapshot,
+) -> bool {
+    match (incoming_session, stored.source_session_id.as_deref()) {
+        (Some(incoming), Some(stored_session)) => {
+            incoming == stored_session && incoming_position <= stored.revision
+        }
+        (None, None) => incoming_position <= stored.revision,
+        // Different provenance, or a qualified frame over a legacy row (and
+        // vice versa): independent lineages.
+        _ => false,
+    }
 }
 
 /// Insert or revise a Turn-scoped snapshot (one revision-replaced row per
@@ -578,8 +625,8 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
     let stored: Option<StoredSnapshot> = conn
         .query_row(
             "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens,
-                    cache_write_tokens, metric_revision, cost_usd, observed_at,
-                    observed_at_source
+                    cache_write_tokens, metric_revision, source_session_id,
+                    cost_usd, observed_at, observed_at_source
              FROM usage_events
              WHERE instance_id = ?1 AND scope = 'turn' AND scope_id = ?2",
             params![row.instance_id, row.scope_id],
@@ -593,9 +640,10 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
                         cache_write: r.get(4)?,
                     },
                     revision: r.get(5)?,
-                    cost_usd: r.get(6)?,
-                    observed_at: r.get(7)?,
-                    observed_at_source: r.get(8)?,
+                    source_session_id: r.get(6)?,
+                    cost_usd: r.get(7)?,
+                    observed_at: r.get(8)?,
+                    observed_at_source: r.get(9)?,
                 })
             },
         )
@@ -607,12 +655,18 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
 
     // The authority gate runs BEFORE any field branch — including the
     // cost-only billing channel (c-ctxusage r15 item 3). An equal or older
-    // position touches nothing: no counters, no equal-position growth or
-    // bucket fill, no bill correction, no clock. Two frames at one position
-    // are one source record however often re-delivered and whichever
-    // channels each delivery used; fills and corrections arrive only with a
-    // strictly newer position.
-    if row.metric_revision <= stored.revision {
+    // position WITHIN THE SAME session lineage touches nothing: no counters,
+    // no equal-position growth or bucket fill, no bill correction, no clock.
+    // Two frames at one position are one source record however often
+    // re-delivered and whichever channels each delivery used; fills and
+    // corrections arrive only with a strictly newer position. A different
+    // native session is a different transcript lineage and is not gated
+    // (c-ctxusage r15 item 4).
+    if turn_position_is_stale(
+        row.source_session_id.as_deref(),
+        row.metric_revision,
+        &stored,
+    ) {
         return Ok(false);
     }
 
@@ -629,11 +683,13 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
             "UPDATE usage_events
              SET seq = ?1,
                  metric_revision = ?2,
-                 cost_usd = COALESCE(?3, cost_usd)
-             WHERE instance_id = ?4 AND scope = 'turn' AND scope_id = ?5",
+                 source_session_id = COALESCE(?3, source_session_id),
+                 cost_usd = COALESCE(?4, cost_usd)
+             WHERE instance_id = ?5 AND scope = 'turn' AND scope_id = ?6",
             params![
                 row.seq,
                 row.metric_revision,
+                row.source_session_id,
                 row.cost_usd,
                 row.instance_id,
                 row.scope_id,
@@ -669,22 +725,24 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
             model = ?3,
             mode = ?4,
             metric_revision = ?5,
-            total_tokens = ?6,
-            input_tokens = ?7,
-            output_tokens = ?8,
-            cache_read_tokens = ?9,
-            cache_write_tokens = ?10,
-            cost_usd = ?11,
-            accounting = ?12,
-            observed_at = ?13,
-            observed_at_source = ?14
-         WHERE instance_id = ?15 AND scope = 'turn' AND scope_id = ?16",
+            source_session_id = COALESCE(?6, source_session_id),
+            total_tokens = ?7,
+            input_tokens = ?8,
+            output_tokens = ?9,
+            cache_read_tokens = ?10,
+            cache_write_tokens = ?11,
+            cost_usd = ?12,
+            accounting = ?13,
+            observed_at = ?14,
+            observed_at_source = ?15
+         WHERE instance_id = ?16 AND scope = 'turn' AND scope_id = ?17",
         params![
             row.seq,
             row.profile_id,
             row.model,
             row.mode,
             row.metric_revision,
+            row.source_session_id,
             merged.total,
             merged.input,
             merged.output,
@@ -781,6 +839,14 @@ pub fn project_usage_event(
         // — reading it through `knowledge_u64` (which dives into `.value`)
         // yielded None and silently pinned every snapshot at revision 1.
         metric_revision: scalar_revision(payload.get("metricRevision")).unwrap_or(1),
+        // c-ctxusage r15 item 4: session-qualified turn positions. A missing
+        // field (older producers) is the unqualified lineage; an explicit
+        // empty string is normalised away.
+        source_session_id: payload
+            .get("sourceSessionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
         mode: payload
             .get("mode")
             .and_then(Value::as_str)
@@ -1717,6 +1783,7 @@ mod tests {
             scope_id: None,
             mode: "snapshot".into(),
             metric_revision: 1,
+            source_session_id: None,
             total_tokens: None,
             input_tokens: input,
             output_tokens: output,
@@ -1751,6 +1818,7 @@ mod tests {
             scope_id: Some("grok-session".into()),
             mode: "snapshot".into(),
             metric_revision: rev,
+            source_session_id: None,
             total_tokens: Some(input + output),
             input_tokens: Some(input),
             output_tokens: Some(output),
@@ -1816,6 +1884,7 @@ mod tests {
             scope_id: Some(format!("turn-{seq}")),
             mode: "snapshot".into(),
             metric_revision: seq,
+            source_session_id: None,
             total_tokens: Some(input + output),
             input_tokens: Some(input),
             output_tokens: Some(output),
@@ -2107,6 +2176,7 @@ mod tests {
                 UsageScope::Session,
                 "grok-session-9",
                 revision,
+                None,
                 &UsageTotals::default(),
             );
             // Emitting no counters with an empty totals still exercises the
@@ -3345,6 +3415,94 @@ mod tests {
         );
     }
 
+    /// c-ctxusage r15 item 4: existing rows migrate into the UNQUALIFIED
+    /// lineage (`source_session_id IS NULL`), and two unqualified frames keep
+    /// the numeric watermark. A qualified frame over a legacy NULL lineage is
+    /// an independent authority and is not numerically frozen.
+    #[test]
+    fn session_qualified_watermark_migrates_legacy_rows_to_the_null_lineage() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Legacy unqualified row already at revision 3 (as older producers
+        // wrote it).
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                1,
+                "ins_r15i4",
+                "turn",
+                Some("msg-legacy"),
+                3,
+                100,
+                20,
+                0,
+                0,
+                Some("2026-10-10T00:00:00.000Z")
+            )
+        ));
+        let lineage: Option<String> = conn
+            .query_row(
+                "SELECT source_session_id FROM usage_events
+                 WHERE instance_id='ins_r15i4' AND scope_id='msg-legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lineage, None, "existing rows are the unqualified lineage");
+
+        // Another unqualified frame at rev 2 keeps the numeric gate: frozen.
+        assert!(
+            !insert(
+                &conn,
+                &scoped_record(
+                    2,
+                    "ins_r15i4",
+                    "turn",
+                    Some("msg-legacy"),
+                    2,
+                    100,
+                    19,
+                    0,
+                    0,
+                    Some("2026-10-10T00:00:00.000Z")
+                )
+            ),
+            "two unqualified frames share the numeric watermark"
+        );
+
+        // A qualified frame for a real session at rev 1 is a DIFFERENT
+        // authority over the same message id: accepted, and its lineage is
+        // persisted.
+        let mut qualified = scoped_record(
+            3,
+            "ins_r15i4",
+            "turn",
+            Some("msg-legacy"),
+            1,
+            90,
+            9,
+            0,
+            0,
+            Some("2026-10-10T00:00:01.000Z"),
+        );
+        qualified.event["payload"]["sourceSessionId"] = json!("sess-rebound");
+        assert!(
+            insert(&conn, &qualified),
+            "a qualified frame over the legacy NULL lineage is not numerically frozen"
+        );
+        let (revision, lineage, output): (i64, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT metric_revision, source_session_id, output_tokens FROM usage_events
+                 WHERE instance_id='ins_r15i4' AND scope_id='msg-legacy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(revision, 1);
+        assert_eq!(lineage.as_deref(), Some("sess-rebound"));
+        assert_eq!(output, Some(9));
+    }
+
     /// r4 item 7b: the REAL 2.1.289 fixture replayed by a fresh mapper into a
     /// real migrated store TWICE must converge durably: the same 24 turn rows
     /// with the same counters after each pass (the second pass is a
@@ -3612,6 +3770,7 @@ mod tests {
             scope_id: None,
             mode: "snapshot".into(),
             metric_revision: 1,
+            source_session_id: None,
             total_tokens: Some(input + output),
             input_tokens: Some(input),
             output_tokens: Some(output),

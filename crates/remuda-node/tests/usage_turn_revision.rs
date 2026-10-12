@@ -226,3 +226,140 @@ fn replay_stable_positions_survive_fresh_mapper_batching_and_admit_a_new_downwar
     );
     assert_eq!(stored(&conn), (4, Some(5)), "D survives the stale replay");
 }
+
+/// c-ctxusage r15 item 4: positions are SESSION-QUALIFIED. Two native sessions
+/// can both contain an assistant message with the SAME id (the Hub dedupes
+/// turn rows on the bare message id), and every transcript starts at record
+/// position 1. A snapshot from a DIFFERENT session must not be frozen against
+/// the prior session's high position, while the strict watermark still holds
+/// WITHIN each session. The native session id travels on the usage payload and
+/// is persisted next to the watermark.
+#[test]
+fn two_sessions_with_overlapping_message_ids_keep_independent_position_watermarks() {
+    fn session_mapper(session: &str) -> TranscriptMapper {
+        TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            session.into(),
+            "2.1.289".into(),
+        )
+    }
+    fn shared_record(position: u64, output: u64) -> serde_json::Value {
+        json!({
+            "type": "assistant",
+            "uuid": format!("rec-{position}"),
+            "timestamp": format!("2026-10-09T00:00:{:02}.000Z", position * 5),
+            "isSidechain": false,
+            "requestId": "req-shared",
+            "message": {
+                "id": "msg_shared_across_sessions",
+                "role": "assistant",
+                "type": "message",
+                "model": "claude-opus-5-5",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "shared"}],
+                "usage": { "input_tokens": 100, "output_tokens": output }
+            }
+        })
+    }
+    fn session_of(obs: &Observation) -> Option<String> {
+        match &obs.body {
+            ObservationPayload::Usage(payload) => payload.source_session_id.clone(),
+            _ => panic!("usage payload"),
+        }
+    }
+    let mut seq = 0i64;
+    let mut apply = |conn: &rusqlite::Connection, obs: &Observation| -> bool {
+        seq += 1;
+        let rec = JournalRecord {
+            instance_id: "ins_two_sessions".into(),
+            seq,
+            event_id: format!("evt_two_{seq}"),
+            observed_at: String::from(obs.observed_at.clone()),
+            event: serde_json::to_value(obs).expect("serialize"),
+        };
+        let row = project_usage_event(&rec, None, None).expect("projects");
+        insert_usage_event(conn, &row).expect("insert")
+    };
+    let stored = |conn: &rusqlite::Connection| -> (i64, Option<String>, Option<i64>) {
+        conn.query_row(
+            "SELECT metric_revision, source_session_id, output_tokens FROM usage_events
+             WHERE instance_id = 'ins_two_sessions'
+               AND scope = 'turn' AND scope_id = 'msg_shared_across_sessions'",
+            [],
+            |r| Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap())),
+        )
+        .expect("the scoped row exists")
+    };
+
+    let conn = rusqlite::Connection::open_in_memory().expect("sqlite");
+    migrate(&conn).expect("migrate");
+
+    // Session alpha reaches position 3 (revision 3) / output 20 for the shared
+    // message id.
+    let mut alpha = session_mapper("sess-alpha");
+    let alpha_3 = poll_batch(
+        &mut alpha,
+        &[
+            (0, shared_record(0, 30)),
+            (1, shared_record(1, 25)),
+            (2, shared_record(2, 20)),
+        ],
+    )
+    .expect("alpha finalises");
+    assert_eq!(session_of(&alpha_3).as_deref(), Some("sess-alpha"));
+    assert!(apply(&conn, &alpha_3));
+    assert_eq!(stored(&conn), (3, Some("sess-alpha".into()), Some(20)));
+
+    // Session beta is a DIFFERENT transcript with the same message id,
+    // replayed from position 1. Its low revision is a different lineage, so
+    // the snapshot applies rather than being frozen against alpha's 3.
+    let mut beta = session_mapper("sess-beta");
+    let beta_1 = poll_batch(&mut beta, &[(0, shared_record(0, 9))]).expect("beta rev1");
+    assert_eq!(session_of(&beta_1).as_deref(), Some("sess-beta"));
+    assert!(
+        apply(&conn, &beta_1),
+        "a different session at a low position is a different authority"
+    );
+    assert_eq!(stored(&conn), (1, Some("sess-beta".into()), Some(9)));
+
+    // WITHIN beta the strict watermark still holds: re-delivering rev 1 with a
+    // growth changes nothing...
+    assert!(
+        !apply(&conn, &beta_1),
+        "an equal-position replay within the same session changes nothing"
+    );
+    assert_eq!(stored(&conn), (1, Some("sess-beta".into()), Some(9)));
+    // ...and beta rev 2 applies.
+    let beta_2 = poll_batch(&mut beta, &[(1, shared_record(1, 12))]).expect("beta rev2");
+    assert!(apply(&conn, &beta_2), "beta rev 2 is newer within beta");
+    assert_eq!(stored(&conn), (2, Some("sess-beta".into()), Some(12)));
+
+    // An alpha frame at revision 2 is STALE within alpha (alpha already
+    // reached 3): once the row lineage is alpha again it must not roll
+    // backwards. First a newer alpha frame legitimately takes the row back...
+    let alpha_4 = poll_batch(&mut alpha, &[(3, shared_record(3, 18))]).expect("alpha rev4");
+    assert!(
+        apply(&conn, &alpha_4),
+        "alpha rev 4 is a different lineage, accepted"
+    );
+    assert_eq!(stored(&conn), (4, Some("sess-alpha".into()), Some(18)));
+    // ...then the older alpha rev 2 is rejected within the alpha lineage.
+    let alpha_2 = poll_batch(
+        &mut session_mapper("sess-alpha"),
+        &[(0, shared_record(0, 30)), (1, shared_record(1, 99))],
+    )
+    .expect("alpha rev2 replay");
+    assert!(
+        !apply(&conn, &alpha_2),
+        "alpha rev 2 is stale against alpha's own watermark 4"
+    );
+    assert_eq!(
+        stored(&conn),
+        (4, Some("sess-alpha".into()), Some(18)),
+        "the stale alpha frame never writes 99"
+    );
+}

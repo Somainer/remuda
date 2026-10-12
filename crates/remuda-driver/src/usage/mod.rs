@@ -329,6 +329,7 @@ pub fn to_usage_payload(
     scope: UsageScope,
     scope_id: impl Into<String>,
     revision: u64,
+    source_session_id: Option<&str>,
     totals: &UsageTotals,
 ) -> UsagePayload {
     let total = totals.tokens.total();
@@ -338,6 +339,9 @@ pub fn to_usage_payload(
         scope_id: scope_id.into(),
         mode: UsageMode::Snapshot,
         metric_revision: U64(revision),
+        source_session_id: source_session_id
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
         input_tokens: known(totals.tokens.uncached_input),
         input_accounting: InputAccounting::Uncached,
         output_tokens: known(totals.tokens.output),
@@ -508,7 +512,13 @@ mod tests {
                 ..TokenCounters::default()
             },
         ));
-        let payload = to_usage_payload(UsageScope::Turn, "turn-a", 1, agg.turn("turn-a").unwrap());
+        let payload = to_usage_payload(
+            UsageScope::Turn,
+            "turn-a",
+            1,
+            None,
+            agg.turn("turn-a").unwrap(),
+        );
         assert_eq!(payload.accounting, Accounting::Estimated);
         assert_eq!(payload.input_accounting, InputAccounting::Uncached);
         assert_eq!(payload.scope, UsageScope::Turn);
@@ -522,7 +532,7 @@ mod tests {
 
     #[test]
     fn empty_totals_serialize_cost_as_unknown_not_zero() {
-        let payload = to_usage_payload(UsageScope::Session, "s", 1, &UsageTotals::default());
+        let payload = to_usage_payload(UsageScope::Session, "s", 1, None, &UsageTotals::default());
         assert!(matches!(payload.cost, Knowledge::Unknown { .. }));
     }
 }

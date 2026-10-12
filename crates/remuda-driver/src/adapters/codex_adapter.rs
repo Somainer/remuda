@@ -409,7 +409,15 @@ impl CodexAdapter {
                 *entry += 1;
                 *entry
             };
-            let payload = to_usage_payload(UsageScope::Turn, turn_id.to_owned(), revision, totals);
+            let payload = to_usage_payload(
+                UsageScope::Turn,
+                turn_id.to_owned(),
+                revision,
+                self.binding
+                    .as_ref()
+                    .map(|binding| binding.session_id.as_str()),
+                totals,
+            );
             out.push(
                 AdapterObservation::structured(ObservationPayload::Usage(Box::new(payload)))
                     .with_turn(turn_id)
@@ -425,6 +433,7 @@ impl CodexAdapter {
                 .map(|binding| binding.session_id.clone())
                 .unwrap_or_else(|| "codex-session".into()),
             self.session_usage_revision,
+            None,
             self.usage_totals.session(),
         );
         out.push(

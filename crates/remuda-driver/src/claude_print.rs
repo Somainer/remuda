@@ -1562,6 +1562,7 @@ fn usage_from_result(
             },
             mode: UsageMode::Snapshot,
             metric_revision: U64(result.result_index.unwrap_or(0) + 1),
+            source_session_id: (!mapper.session_id.is_empty()).then(|| mapper.session_id.clone()),
             input_tokens: opt_u64(input),
             input_accounting: InputAccounting::Unknown,
             output_tokens: opt_u64(output),
@@ -2952,8 +2953,20 @@ impl TranscriptMapper {
         };
         let mut totals = crate::usage::UsageTotals::default();
         totals.add(&event);
-        let mut payload =
-            crate::usage::to_usage_payload(UsageScope::Turn, scope_id.clone(), revision, &totals);
+        // c-ctxusage r15 item 4: qualify the record position with the native
+        // session id. A transcript pump replaced after a rebind can replay a
+        // DIFFERENT session's file from record position 1; without the
+        // qualification its low positions would be frozen against the prior
+        // session's high-water mark even though the message ids differ.
+        let source_session =
+            (!self.mapper.session_id.is_empty()).then(|| self.mapper.session_id.clone());
+        let mut payload = crate::usage::to_usage_payload(
+            UsageScope::Turn,
+            scope_id.clone(),
+            revision,
+            source_session.as_deref(),
+            &totals,
+        );
         payload.usage_id = remuda_protocol::Id::derive(
             "obj",
             self.mapper.instance_id.as_id().as_str(),

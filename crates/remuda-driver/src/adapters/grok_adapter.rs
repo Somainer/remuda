@@ -708,6 +708,7 @@ impl GrokAdapter {
             UsageScope::Session,
             self.session_id(),
             self.session_usage_revision,
+            None,
             self.usage_totals.session(),
         );
         out.push(

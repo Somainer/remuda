@@ -955,6 +955,7 @@
       "scopeId": "01993ab0-0000-7000-8000-000000000003",
       "mode": "snapshot",
       "metricRevision": "1",
+      "sourceSessionId": null,
       "inputAccounting": "unknown",
       "accounting": "reported",
       "nativeFieldsRef": null,

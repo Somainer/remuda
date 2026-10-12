@@ -499,6 +499,36 @@ impl SnapshotCounters {
         }
         (grew, decreased)
     }
+
+    /// Merge a PARTIAL incoming snapshot over the retained counters for the
+    /// scoped UPDATE. An unreported bucket (`None`) means "not reported", not
+    /// "zero": two print result frames for the same scope where the later one
+    /// carries only `output_tokens` must not erase the known input/cache
+    /// counters (c-ctxusage r12 item 2). A reported total stays authoritative;
+    /// otherwise the total is derived from the merged basket
+    /// (`input + cache_read + cache_write + output`), so it advances with it.
+    fn merged_over(self, retained: &SnapshotCounters) -> SnapshotCounters {
+        let pick = |incoming: Option<i64>, kept: Option<i64>| incoming.or(kept);
+        let input = pick(self.input, retained.input);
+        let output = pick(self.output, retained.output);
+        let cache_read = pick(self.cache_read, retained.cache_read);
+        let cache_write = pick(self.cache_write, retained.cache_write);
+        // Derive only when the incoming frame did not itself report a total:
+        // the retained total is stale relative to a merged basket that moved.
+        let total = self.total.or_else(|| {
+            [input, cache_read, cache_write, output]
+                .into_iter()
+                .flatten()
+                .reduce(i64::saturating_add)
+        });
+        SnapshotCounters {
+            total,
+            input,
+            output,
+            cache_read,
+            cache_write,
+        }
+    }
 }
 
 /// The stored state a scoped upsert conflicts with.
@@ -561,6 +591,11 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
     }
 
     if counters_change {
+        // r12 item 2: merge unreported incoming buckets with the retained
+        // counters so a partial frame (e.g. a later print result carrying only
+        // output_tokens) never erases a known counter; derive the total from
+        // the merged basket when the incoming row did not report one.
+        let merged = incoming.merged_over(&stored.counters);
         let observed_at =
             if row.observed_at_source == "native" || stored.observed_at_source != "native" {
                 row.observed_at.clone()
@@ -596,11 +631,11 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
                 row.model,
                 row.mode,
                 row.metric_revision,
-                row.total_tokens,
-                row.input_tokens,
-                row.output_tokens,
-                row.cache_read_tokens,
-                row.cache_write_tokens,
+                merged.total,
+                merged.input,
+                merged.output,
+                merged.cache_read,
+                merged.cache_write,
                 row.cost_usd,
                 row.accounting,
                 observed_at,

@@ -2576,6 +2576,16 @@ enum EffortSlashSlot {
     Unowned { is_switch: bool },
 }
 
+/// c-effortread r17 item 1: tri-state result of popping the verdict FIFO's
+/// front slot — the OWNED request this verdict answers, an UNOWNED place (an
+/// older pre-floor/human slash), or an EMPTY FIFO (a verdict whose slash
+/// predates this mapper, e.g. a terminal command).
+enum VerdictFront {
+    Owned(u64, crate::effort::EffortRequest),
+    Unowned,
+    Empty,
+}
+
 /// Transcript-to-observations mapper for a live claude-pty session.
 pub struct TranscriptMapper {
     mapper: Mapper,
@@ -3226,7 +3236,28 @@ impl TranscriptMapper {
                 // request keeps waiting for ITS verdict. A verdict with no
                 // slot at all is a human/terminal command whose slash
                 // predates this mapper.
-                let paired = self.pop_front_owned_pair();
+                let front = self.pop_front_verdict_slot();
+                let paired = match &front {
+                    VerdictFront::Owned(generation, request) => {
+                        Some((*generation, request.clone()))
+                    }
+                    VerdictFront::Unowned | VerdictFront::Empty => None,
+                };
+                // c-effortread r17 item 1: the verdict answers an UNOWNED
+                // place while a LATER owned switch B is still waiting for ITS
+                // OWN verdict (the classic case: an unread pre-floor same-word
+                // slash, whose accepted verdict lands after B armed). Fold the
+                // transcript level/flag only — B's armed attribution is
+                // preserved and the edge is never labelled Remuda — and emit
+                // NO settlement-eligible observation: an id-less effective
+                // projection here would journal before B's verdict and settle
+                // B in the store through the legacy value fallback (and a
+                // later dismissal would toast against the cleared request).
+                // B settles only when its OWN id-bearing verdict arrives.
+                if matches!(front, VerdictFront::Unowned) && self.owned_switch_outstanding() {
+                    self.effort.note_unowned_stdout(&stdout);
+                    return Ok(Vec::new());
+                }
                 let from_remuda = paired.is_some();
                 let edge = self.effort.note_stdout(&stdout, from_remuda);
                 if let Some((generation, _)) = &paired
@@ -3300,9 +3331,22 @@ impl TranscriptMapper {
                 // pairs with its own slash generation, never a newer armed
                 // request's (r11 item 1). r16 item 2: an unowned front slot
                 // (pre-floor/human slash) is consumed here without touching a
-                // later owned request.
-                let paired = self.pop_front_owned_pair();
-                self.effort.note_stdout(&stdout, paired.is_some());
+                // later owned request. r17 item 1: when such an unowned refusal
+                // lands while a later owned switch is still outstanding it
+                // folds NOTHING into the tracker — its awaiting/attribution
+                // belongs to that owned switch and must survive.
+                let front = self.pop_front_verdict_slot();
+                let paired = match &front {
+                    VerdictFront::Owned(generation, request) => {
+                        Some((*generation, request.clone()))
+                    }
+                    VerdictFront::Unowned | VerdictFront::Empty => None,
+                };
+                let unowned_while_armed =
+                    matches!(front, VerdictFront::Unowned) && self.owned_switch_outstanding();
+                if !unowned_while_armed {
+                    self.effort.note_stdout(&stdout, paired.is_some());
+                }
                 if let Some((generation, _)) = paired
                     && let Some(bridge) = &self.effort_bridge
                     && let Some(reason) = verdict.reject_reason()
@@ -3319,17 +3363,32 @@ impl TranscriptMapper {
         Ok(Vec::new())
     }
 
-    /// c-effortread r16 item 2: pop the front verdict-order slot. A
-    /// switch-family verdict always consumes the OLDEST outstanding slash
-    /// place (FIFO), but the owned request is returned only when that place is
-    /// owned. An unowned place — an older pre-floor command or a human slash —
-    /// or an empty FIFO yields `None`, so the verdict takes the human/terminal
-    /// path and a later owned request keeps waiting for its own verdict.
-    fn pop_front_owned_pair(&mut self) -> Option<(u64, crate::effort::EffortRequest)> {
-        match self.effort_armed.pop_front()? {
-            EffortSlashSlot::Owned(generation, request) => Some((generation, request)),
-            EffortSlashSlot::Unowned { .. } => None,
+    /// c-effortread r16 item 2 / r17 item 1: pop the front verdict-order slot.
+    /// A switch-family verdict always consumes the OLDEST outstanding slash
+    /// place (FIFO). The owned request is returned only when that place is
+    /// owned; an unowned place — an older pre-floor command or a human slash —
+    /// yields [`VerdictFront::Unowned`] and an empty FIFO
+    /// [`VerdictFront::Empty`], so the verdict takes the human/terminal path
+    /// and a later owned request keeps waiting for its own verdict.
+    fn pop_front_verdict_slot(&mut self) -> VerdictFront {
+        match self.effort_armed.pop_front() {
+            Some(EffortSlashSlot::Owned(generation, request)) => {
+                VerdictFront::Owned(generation, request)
+            }
+            Some(EffortSlashSlot::Unowned { .. }) => VerdictFront::Unowned,
+            None => VerdictFront::Empty,
         }
+    }
+
+    /// c-effortread r17 item 1: whether a LATER owned switch is still waiting
+    /// for its own verdict after the front slot was just popped. An unowned
+    /// verdict landing in this window must not take that switch's attribution
+    /// or emit settlement-eligible evidence; the owned request settles only
+    /// from its own id-bearing verdict.
+    fn owned_switch_outstanding(&self) -> bool {
+        self.effort_armed
+            .iter()
+            .any(|slot| matches!(slot, EffortSlashSlot::Owned(..)))
     }
 
     /// c-effortread r16 item 2: remove the foremost outstanding NON-SWITCH

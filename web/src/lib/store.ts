@@ -195,6 +195,20 @@ export type EffortPending = {
    */
   commandWord: string | null;
   /**
+   * c-effortread r17 item 1: proof that the driver handling THIS request is
+   * ID-CAPABLE — it flipped true once an edge carrying the request's OWN id was
+   * seen (its id-bearing `effort-queued` lifecycle, which the driver journals
+   * before typing, or an id-bearing verdict echo). While false the request is
+   * treated as explicitly legacy (an older driver / the e2e fake node): the
+   * id-less legacy echo matcher and the strict read-back VALUE FALLBACK stay in
+   * force. Once true the request settles ONLY on matching request-id
+   * evidence: an id-less observation — even a projection the mapper could not
+   * attribute (an older pre-floor command, or this request under provenance
+   * loss) — still updates the effective view but leaves the pending for its
+   * own id verdict or its bounded unconfirmed outcome.
+   */
+  driverEchoesId: boolean;
+  /**
    * c-effortread r13 item 2 / r14 item 2: wall-clock ms at which CURRENT
    * ACTIVITY EVIDENCE showed this request leaving the driver queue (the turn
    * becoming idle — directly, or via waiting-interaction on a
@@ -1308,9 +1322,21 @@ class HubStore {
     // bounds hold; any other id-less echo stays a veto (the no-echo fallback
     // requires NO echo at all, so a stale/non-matching echo cannot ride it).
     const ownEcho = echoNamesThisRequest;
+    // c-effortread r17 item 1: once the driver has proven itself id-capable
+    // FOR THIS REQUEST, only an echo naming THIS request id can settle it. An
+    // id-less echo with matching requested values (an unowned verdict the
+    // mapper could not pair, or this request's own verdict under provenance
+    // loss) still projects the effective view above, but never clears the
+    // pending. The legacy echo matcher and the no-echo value fallback apply
+    // ONLY while the request is still explicitly legacy (no own id seen).
     const legacyEchoSettles =
-      legacyEchoNamesRequest && inWindow && viewLevelMatches && viewFlagMatches;
-    const valueFallback = requestedEcho === undefined && inWindow;
+      !pending.driverEchoesId &&
+      legacyEchoNamesRequest &&
+      inWindow &&
+      viewLevelMatches &&
+      viewFlagMatches;
+    const valueFallback =
+      !pending.driverEchoesId && requestedEcho === undefined && inWindow;
     const ours = ownEcho || legacyEchoSettles || valueFallback;
 
     let { levelSettled, flagSettled } = pending;
@@ -1333,7 +1359,14 @@ class HubStore {
       this.settledEffortPushdown.set(instanceId, view.observedAt);
     }
     if (levelSettled && flagSettled) return null;
-    return { ...pending, levelSettled, flagSettled };
+    // An echo naming THIS request is itself the id-capability proof (e.g. the
+    // verdict echo arrives before the queued edge was folded); persist it so
+    // later id-less projections cannot settle a still-open axis.
+    const driverEchoesId = pending.driverEchoesId || echoNamesThisRequest;
+    if (driverEchoesId === pending.driverEchoesId) {
+      return { ...pending, levelSettled, flagSettled };
+    }
+    return { ...pending, levelSettled, flagSettled, driverEchoesId };
   }
 
   /**
@@ -1950,6 +1983,9 @@ class HubStore {
           // settlement knows the level and the flag are both in play.
           commandWord: wireMovesBoth ? lowerWord : null,
           afterReplacement: false,
+          // An id on the queued edge proves the driver echoes per-request ids;
+          // an id-less synthesis is an explicitly legacy request (r17 item 1).
+          driverEchoesId: edgeId !== null,
           // Idle-at-receipt arms the bound immediately; a working session arms
           // it from the working→idle evidence.
           leftQueueAt: busyNow ? null : atCreate,
@@ -2017,6 +2053,12 @@ class HubStore {
                 queued: true,
                 queuedObservedAt: stamped,
                 queuedSeq: stampedSeq,
+                // r17 item 1: THIS request's id echoed on its queued edge
+                // proves the driver is id-capable for it; later id-less
+                // projections (an unowned verdict) can no longer settle it.
+                ...(edgeId !== null && edgeId === current.requestId
+                  ? { driverEchoesId: true as const }
+                  : {}),
                 ...(requeuedBehindTurn ? { leftQueueAt: null } : {}),
               },
         },
@@ -4843,6 +4885,9 @@ class HubStore {
       source: "client",
       commandWord,
       afterReplacement,
+      // No own-id evidence yet; flips on the request's id-bearing queued edge
+      // or verdict echo (r17 item 1).
+      driverEchoesId: false,
     };
     this.settledEffortPushdown.delete(instanceId);
     // Optimistically adopt the requested axes SYNCHRONOUSLY, before the

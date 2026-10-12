@@ -2012,12 +2012,20 @@ it("a stale effort poll older than the queued configure leaves the queued switch
   await hubStore.refresh();
   expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
 
-  // A STRICTLY later read-back settles.
+  // A STRICTLY later id-less read-back no longer settles either (r17 item 1):
+  // the queued edge carried THIS request's id, so the driver proved itself
+  // id-capable and an id-less durable projection may be an unowned command's
+  // verdict. The effective view updates but B waits for its own verdict.
   const t230 = "2026-09-16T00:11:30Z";
   list.mockResolvedValue({
     items: [{ ...ctx.instance, effortEffective: { name: "max", ultracode: false, source: "remuda", observedAt: t230 } }],
   } as never);
   await hubStore.refresh();
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(t230);
+
+  // B's own id-bearing applied verdict settles it.
+  ctx.receive(configureLifecycleFor(3, "effort-applied:max", posts[0]?.requestId!, ctx.instance.id));
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
@@ -2066,12 +2074,20 @@ it("r10 item 1: an unchanged older poll cannot settle a queued ON (baseline and 
   expect(stillQueued?.queued).toBe(true);
   expect(stillQueued?.requestId).toBe(requestId);
 
-  // A genuine post-request ON read-back at T2 settles.
+  // A genuine post-request ON read-back at T2 updates the effective view but,
+  // under r17 item 1, does NOT settle: the queued edge proved the driver is
+  // id-capable for THIS request, so an id-less poll projection could be an
+  // unowned command's verdict. B stays pending for its own id verdict.
   const t2 = "2026-10-01T00:02:00.000Z";
   list.mockResolvedValue({
     items: [{ ...ctx.instance, effortEffective: { name: "high", ultracode: true, source: "remuda", observedAt: t2 } }],
   } as never);
   await hubStore.refresh();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.ultracode).toBe(true);
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(requestId);
+
+  // B's own id-bearing applied verdict settles.
+  ctx.receive(configureLifecycleFor(3, "effort-applied:ultracode on", requestId!, ctx.instance.id));
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
@@ -3488,3 +3504,103 @@ it("r12 item 5: a replaced request A resolving late never re-arms over B's recon
   expect(hubStore.effortPendingOf(ctx.instance.id), "B's reconciliation, not A's late arm").toBeNull();
   expect(toast).toHaveBeenCalledTimes(1);
 });
+
+it("r17 item 1: an id-less unowned ACCEPTED projection never settles an id-capable B; B's own id verdict does", async () => {
+  // Mapper-to-store regression for the unowned ACCEPTED case (not only Kept):
+  // an older pre-floor same-word slash's "Set effort level to max" verdict is
+  // folded as an id-less terminal-side projection BETWEEN B's queued edge and
+  // B's verdict. B's driver proved id-capable on the queued edge, so the
+  // legacy value fallback must not settle B from that projection; B clears
+  // only on its own request-id verdict.
+  const ctx = await startFollowing("r17-item1-unowned-accept");
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+
+  // Baseline high before the request.
+  ctx.receive(effortEvent(2, "high", false, "slash", "2026-10-12T00:00:00.000Z"));
+  const posted = hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false));
+  const idB = posts[0]?.requestId!;
+  await posted;
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idB);
+
+  // The id-bearing queued edge proves the driver is id-capable for B.
+  ctx.receive(
+    configureLifecycleFor(3, "effort-queued:max", idB, ctx.instance.id, "2026-10-12T00:00:05.000Z"),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.driverEchoesId).toBe(true);
+
+  // The unowned older command's accepted max verdict projects id-less and in
+  // the value/time window: the view moves but B's pending survives.
+  ctx.receive(effortEvent(4, "max", false, "slash", "2026-10-12T00:00:10.000Z"));
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
+  const pending = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pending, "B stays pending through the unowned acceptance").not.toBeNull();
+  expect(pending?.requestId).toBe(idB);
+  expect(pending?.levelSettled, "the id-less projection settles no axis of B").toBe(false);
+
+  // B's own id-bearing accepted verdict settles.
+  ctx.receive(
+    effortEvent(5, "max", false, "remuda", "2026-10-12T00:00:12.000Z", {
+      requested: { name: "max", ultracode: false },
+      requestId: idB,
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+it("r17 item 1 (failed floor): B's own verdict arriving id-less under provenance loss leaves B pending until its bounded unconfirmed outcome", async () => {
+  // The carrier's floor stat failed: the mapper attributes even B's OWN
+  // verdict to nothing and emits it id-less. The node still journals B's
+  // id-bearing queued lifecycle, so the store knows the driver is id-capable;
+  // B must not settle from the id-less read-back. No own-id verdict ever
+  // arrives, so the bounded reconciliation ends B explicitly (the dismissal
+  // toasts against a STILL-PRESENT request, never a prematurely cleared one).
+  const ctx = await startFollowing("r17-item1-failed-floor", { state: "known", value: "idle" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+  const baseline: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "high", ultracode: false, source: "slash", observedAt: "2026-10-11T23:59:57.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [baseline] } as never);
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  ctx.receive(effortEvent(2, "high", false, "slash", "2026-10-11T23:59:57.000Z"));
+  vi.useFakeTimers({ now: new Date("2026-10-12T00:00:00.000Z") });
+  const p = hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false));
+  await advanceEffortReconcile(0);
+  const idB = posts[0]?.requestId!;
+  await p;
+
+  // The independently-journaled queued edge carries B's id despite the floor
+  // failure.
+  ctx.receive(
+    configureLifecycleFor(3, "effort-queued:max", idB, ctx.instance.id, "2026-10-12T00:00:05.000Z"),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.driverEchoesId).toBe(true);
+
+  // B's own verdict, restored under provenance loss: id-less, matching, and
+  // strictly inside the legacy window. The view updates; B stays pending.
+  ctx.receive(effortEvent(4, "max", false, "slash", "2026-10-12T00:00:10.000Z"));
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
+  const pending = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pending, "the id-less own verdict does not settle B").not.toBeNull();
+  expect(pending?.requestId).toBe(idB);
+
+  // No id verdict ever arrives: the full post-queue bound ends B unconfirmed.
+  await advanceEffortReconcile(14_999);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
+  expect(toast).not.toHaveBeenCalled();
+  await advanceEffortReconcile(2);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");
+});
+

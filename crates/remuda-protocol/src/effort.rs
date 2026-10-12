@@ -790,6 +790,34 @@ impl EffortTracker {
         }
     }
 
+    /// c-effortread r17 item 1: fold a verdict that answers an UNOWNED slash
+    /// slot (an older pre-floor same-word command, or a human `/effort`) while
+    /// a LATER armed Remuda switch is still waiting for ITS OWN verdict. The
+    /// transcript effect (`last`/`flag`) is latched so the owned switch's
+    /// later verdict reads current state, but the armed attribution
+    /// (`awaiting`, `pending_source`, `ultracode_pending`) is left completely
+    /// untouched: the verdict is never relabelled Remuda and a refusal of the
+    /// unowned command can never disarm the owned switch. The caller emits no
+    /// settlement-eligible observation while the owned switch is outstanding.
+    pub fn note_unowned_stdout(&mut self, stdout: &str) -> Option<(ObservedEffort, EffortSource)> {
+        if !self.current_process {
+            return None;
+        }
+        match parse_effort_stdout(stdout, self.semantics) {
+            EffortStdout::Accepted(observed) => self.apply_unowned_accept(observed),
+            // Status never settles an awaiting switch; fold it as always.
+            EffortStdout::Status(observed) => self.note_status(observed),
+            // A refusal/dismissal concerns the unowned command only: the owned
+            // switch's armed attribution is preserved verbatim.
+            EffortStdout::Kept
+            | EffortStdout::Invalid
+            | EffortStdout::WorkflowsDisabled
+            | EffortStdout::UnavailableForModel
+            | EffortStdout::EnvOverride
+            | EffortStdout::Other => None,
+        }
+    }
+
     /// Apply one parsed accept verdict.
     fn apply_accept(
         &mut self,
@@ -830,6 +858,33 @@ impl EffortTracker {
         } else {
             None
         }
+    }
+
+    /// Latch the transcript effect of an unowned command's accepted verdict
+    /// (c-effortread r17 item 1) WITHOUT touching the later owned switch's
+    /// armed attribution (`awaiting`/`pending_source`/`ultracode_pending`).
+    /// The edge is always terminal-side ([`EffortSource::Slash`]) — an owned
+    /// switch waiting for its own verdict is never credited (or disarmed) by a
+    /// verdict that answers a different slash.
+    fn apply_unowned_accept(
+        &mut self,
+        parsed: ObservedEffort,
+    ) -> Option<(ObservedEffort, EffortSource)> {
+        let flag = match parsed.ultracode {
+            Some(flag) => Some(flag),
+            None if self.semantics == EffortSemantics::Coupled => Some(false),
+            None => self.flag,
+        };
+        if let Some(flag) = flag {
+            self.flag = Some(flag);
+        }
+        let observed = ObservedEffort {
+            name: parsed.name,
+            ultracode: flag,
+        };
+        let edge = self.last != Some(observed);
+        self.last = Some(observed);
+        edge.then_some((observed, EffortSource::Slash))
     }
 
     /// Feed a `/effort status|current` observation. Status never settles an
@@ -1780,6 +1835,44 @@ mod tests {
         assert_eq!(edge.1, EffortSource::Remuda);
         // A same-level assistant record afterwards is deduped, carrying no flag.
         assert!(tracker.observe(Some("xhigh"), None).is_none());
+    }
+
+    #[test]
+    fn an_unowned_verdict_while_a_switch_is_armed_keeps_the_armed_attribution() {
+        // c-effortread r17 item 1: B armed `/effort max`; an unowned older
+        // command's accepted verdict lands first (a different word here, so the
+        // transcript edge is visible). It latches the level as a terminal edge
+        // — never Remuda — and B's awaiting survives, so B's own later max
+        // evidence is still credited Remuda.
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.272");
+        tracker.observe(Some("high"), None);
+        tracker.note_slash("max", true);
+        let edge = tracker
+            .note_unowned_stdout("Set effort level to xhigh")
+            .expect("the unowned acceptance still latches the transcript level");
+        assert_eq!(edge.0.name, EffortName::Xhigh);
+        assert_eq!(edge.1, EffortSource::Slash, "never relabelled Remuda");
+        let owned = tracker
+            .observe(Some("max"), None)
+            .expect("B's armed awaiting survived the unowned verdict");
+        assert_eq!(owned.1, EffortSource::Remuda);
+
+        // Same-word refusal variant: the unowned "Kept" verdict clears NOTHING;
+        // B's armed switch remains attributable by its own later evidence.
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.272");
+        tracker.observe(Some("high"), None);
+        tracker.note_slash("max", true);
+        assert!(
+            tracker
+                .note_unowned_stdout("Kept effort level as high")
+                .is_none()
+        );
+        let owned = tracker
+            .observe(Some("max"), None)
+            .expect("the unowned refusal never disarmed B");
+        assert_eq!(owned.1, EffortSource::Remuda);
     }
 
     #[test]

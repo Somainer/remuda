@@ -3253,6 +3253,102 @@ mod tests {
         assert!(!bridge.has_pending(), "B's own verdict settles B");
     }
 
+    /// c-effortread r17 item 1: the r16-item2 case with an ACCEPTED old verdict
+    /// (not only a Kept refusal). The older pre-floor command is a SAME-WORD
+    /// `/effort max` whose "Set effort level to max" verdict lands between B's
+    /// slash and B's verdict. With B still armed, that unowned acceptance used
+    /// to borrow B's awaiting attribution (the edge was labelled Remuda) and
+    /// emit an id-less effective projection the store then settled B from. Now
+    /// it folds the transcript level silently (no observation, no bridge
+    /// observed refresh) and B settles only from ITS OWN id-bearing verdict.
+    #[tokio::test]
+    async fn r17_item1_an_unowned_accepted_verdict_while_b_is_armed_emits_nothing_and_b_waits_for_its_own()
+     {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // B arms at EOF 1000; nothing of B's is on disk yet.
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+
+        // The pump catches up an OLDER same-word slash sitting below the floor.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        // B's own slash lands at/after the floor and arms.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+
+        // The OLDER command's delayed ACCEPTED verdict (same word max) is read
+        // BETWEEN B's slash and B's verdict: it answers the unowned slot while
+        // B is still armed, so it emits NO settlement-eligible edge and does
+        // not touch the bridge (neither resolve nor observed refresh).
+        let old_verdict = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Set effort level to max"),
+                Some(1600),
+            )
+            .expect("map old acceptance");
+        assert!(
+            old_verdict
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the unowned acceptance emits no effective projection while B is armed"
+        );
+        assert!(
+            bridge.has_pending(),
+            "the unowned acceptance never resolves B"
+        );
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "B is still awaiting ITS OWN verdict"
+        );
+
+        // B's own acceptance now pops the owned slot, settles B with B's id,
+        // and carries the Remuda attribution (the old verdict did not consume
+        // B's armed awaiting).
+        let out_b = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Set effort level to max"),
+                Some(1700),
+            )
+            .expect("map B verdict");
+        let edge_b = out_b
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("B's verdict emits an effort edge");
+        assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
+        assert_eq!(
+            edge_b.effective.name,
+            Some(remuda_protocol::EffortName::Max)
+        );
+        assert_eq!(
+            edge_b.effective.source,
+            remuda_protocol::EffortSource::Remuda
+        );
+        assert!(!bridge.has_pending(), "B's own verdict settles B");
+    }
+
     /// c-effortread r16 item 3: when the carrier's floor lookup FAILS (the
     /// bound transcript was rotated/removed or the stat errors), production no
     /// longer falls back to word-only attribution. The switch is armed with

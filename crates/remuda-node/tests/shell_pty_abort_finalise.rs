@@ -193,6 +193,10 @@ async fn abort_past_the_finalise_bound_still_rescues_the_last_usage_run() {
     let faults = TranscriptFaults::new();
     faults.arm_pump_gate();
     faults.arm_close_timeout(std::time::Duration::from_millis(500));
+    // The parked collect cannot reach the poller handoff barrier; shorten its
+    // bound so close proceeds to the stop ladder and poller abort-rescue
+    // (P1, c-ctxusage r16 item 6) instead of waiting the production 15 s.
+    faults.arm_close_barrier_timeout(std::time::Duration::from_millis(500));
 
     let mut options = ShellPtyOptions::agent(
         workspace.clone(),

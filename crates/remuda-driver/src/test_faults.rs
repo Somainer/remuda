@@ -407,6 +407,24 @@ impl FaultState {
             .is_ok_and(|previous| previous > 0)
     }
 
+    /// Whether the injected pump gate is CURRENTLY holding a blocking collect
+    /// parked (entered, not yet released). The promoted close barrier uses
+    /// this to tell a wedged-gate collect (the abort-rescue path proceeds and
+    /// aborts the poller after the ladder) from a drain the poller never
+    /// observes (a foreign-drain defect, which stays retryable) — P1,
+    /// c-ctxusage r16 item 6.
+    pub(crate) fn pump_gate_holds(&self) -> bool {
+        let entered = *self
+            .pump_entered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let open = *self
+            .gate_open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entered && !open
+    }
+
     /// Note that a promoted close is parked at the poller handoff barrier
     /// (P1, c-ctxusage r16 item 6).
     pub(crate) fn note_close_barrier_waiting(&self) {

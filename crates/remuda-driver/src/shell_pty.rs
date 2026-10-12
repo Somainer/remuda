@@ -1687,12 +1687,37 @@ impl ShellPtyDriver {
                 .await
                 .is_err()
             {
+                // The poller never reached the closing branch. Two cases:
+                //
+                // 1. A blocking collect is genuinely parked (in production a
+                //    stalled collect; in tests the injected pump gate). Close
+                //    must still complete: run the writer stop ladder below,
+                //    and let the poller teardown abort the parked task with
+                //    its FinaliseGuard rescue — the collected frames cannot
+                //    demote/finalise from inside a parked collect.
+                //
+                // 2. The poller is observing a DIFFERENT drain (the
+                //    start_resumed foreign-drain defect): nothing is parked,
+                //    so keep the close retryable rather than racing a live
+                //    normal poll.
+                let parked_pump = self
+                    .test_faults
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_deref()
+                    .is_some_and(crate::test_faults::FaultState::pump_gate_holds);
+                if !parked_pump {
+                    tracing::warn!(
+                        "promoted close barrier was not acknowledged; close stays retryable"
+                    );
+                    return Err(DriverError::WriterStillLive(
+                        "the poller never acknowledged the close handoff barrier".into(),
+                    ));
+                }
                 tracing::warn!(
-                    "promoted close barrier was not acknowledged; close stays retryable"
+                    "promoted close barrier timed out against a parked blocking collect; \
+                     proceeding to the stop ladder and poller abort-rescue path"
                 );
-                return Err(DriverError::WriterStillLive(
-                    "the poller never acknowledged the close handoff barrier".into(),
-                ));
             }
         }
         let outcome = self.stop_tree(&state, true).await;

@@ -2877,6 +2877,117 @@ mod tests {
         assert!(!bridge.has_pending(), "B's verdict settles B");
     }
 
+    /// c-effortread r12 item 1: the slash binds its (generation, request)
+    /// tuple from ONE bridge snapshot. In production the switch worker runs
+    /// on another task: if A times out and B is armed in the gap between two
+    /// snapshots, the old mapper stored B's tuple for A's slash, so A's
+    /// delayed verdict carried B's id and cleared B. The snapshot hook
+    /// reproduces that interleaving DETERMINISTICALLY, while A's slash record
+    /// is being mapped.
+    #[tokio::test]
+    async fn r12_item1_slash_binds_its_own_tuple_when_rearm_hits_snapshot_gap() {
+        use crate::effort::{EffortBridge, EffortRequest};
+        use remuda_protocol::EffortAxis::Flag;
+        use remuda_protocol::EffortName::High;
+        use remuda_protocol::EffortSemantics::Decoupled;
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        let request_a = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            Some("req-a"),
+        )
+        .expect("A is the off toggle");
+        let gen_a = bridge.arm(request_a);
+
+        // Between the snapshot taken for A's slash and the tuple attribution,
+        // the worker gives up on A and arms B.
+        let rearm_bridge = Arc::clone(&bridge);
+        mapper.set_effort_slash_snapshot_hook(Box::new(move || {
+            rearm_bridge.fail(gen_a);
+            let request_b = EffortRequest::for_configure(
+                "high",
+                Some(true),
+                Some(Flag),
+                Decoupled,
+                None,
+                None,
+                Some("req-b"),
+            )
+            .expect("B is the on toggle");
+            rearm_bridge.arm(request_b);
+        }));
+
+        mapper
+            .map_line(&effort_slash_line("cmd-a", "ultracode off"))
+            .expect("map A slash while the re-arm hits the snapshot gap");
+
+        // A's DELAYED verdict lands afterwards: it must carry A's id and must
+        // not resolve B's generation.
+        let out_a = mapper
+            .map_line(&effort_stdout_line(
+                "out-a",
+                "Ultracode off. Effort stays high.",
+            ))
+            .expect("map A verdict");
+        let edge_a = out_a
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("A's verdict emits an effort edge");
+        assert_eq!(
+            edge_a.request_id.as_deref(),
+            Some("req-a"),
+            "A's slash was bound from the snapshot taken before the re-arm"
+        );
+        assert_eq!(edge_a.effective.ultracode, Some(false));
+        assert!(
+            bridge.has_pending(),
+            "A's stale generation must not clear the newly armed B"
+        );
+        let pending_b = bridge.pending().expect("B stays armed");
+        assert_eq!(pending_b.request_id.as_deref(), Some("req-b"));
+
+        // B's own later ON verdict settles B.
+        mapper
+            .map_line(&effort_slash_line("cmd-b", "ultracode on"))
+            .expect("map B slash");
+        let out_b = mapper
+            .map_line(&effort_stdout_line(
+                "out-b",
+                "Ultracode on (this session only): dynamic workflows on every \
+                 task. Effort stays high.",
+            ))
+            .expect("map B verdict");
+        let edge_b = out_b
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("B's verdict emits an effort edge");
+        assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
+        assert_eq!(edge_b.effective.ultracode, Some(true));
+        assert!(!bridge.has_pending(), "B's verdict settles B");
+    }
+
     /// c-r3 item 4: the claude-pty transcript pump driven through its REAL
     /// output channel (the spawned pump task + mpsc receiver), not by calling
     /// the emit helper on a hand-built observation. An effort edge read off the

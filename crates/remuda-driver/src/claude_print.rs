@@ -2577,6 +2577,13 @@ pub struct TranscriptMapper {
     /// the bridge's latest pending, which can already name a newer request B
     /// typed while A's verdict was outstanding.
     effort_armed: std::collections::VecDeque<(u64, crate::effort::EffortRequest)>,
+    /// c-effortread r12 item 1: test-only one-shot seam fired immediately
+    /// after a `/effort` slash takes its single pending snapshot. It lets a
+    /// unit test deterministically time the request out and arm a newer one
+    /// BEFORE the snapshot tuple is attributed. Never present in production
+    /// builds.
+    #[cfg(test)]
+    effort_slash_snapshot_hook: Option<Box<dyn FnOnce() + Send>>,
     /// §9.1 effective-model read-back state.
     model: remuda_protocol::ModelTracker,
     /// Rendezvous for Remuda-initiated `/model` switches.
@@ -2633,6 +2640,8 @@ impl TranscriptMapper {
             effort,
             effort_bridge: None,
             effort_armed: std::collections::VecDeque::new(),
+            #[cfg(test)]
+            effort_slash_snapshot_hook: None,
             model: remuda_protocol::ModelTracker::new(),
             model_bridge: None,
             model_generation: None,
@@ -2667,6 +2676,13 @@ impl TranscriptMapper {
         }
         self.effort_bridge = Some(bridge);
         self
+    }
+
+    /// c-effortread r12 item 1: install the one-shot test seam fired right
+    /// after a `/effort` slash takes its pending snapshot (cfg(test) only).
+    #[cfg(test)]
+    pub(crate) fn set_effort_slash_snapshot_hook(&mut self, hook: Box<dyn FnOnce() + Send>) {
+        self.effort_slash_snapshot_hook = Some(hook);
     }
 
     /// c-effortread r8 item 5: snapshot the EffortTracker latch
@@ -3041,18 +3057,35 @@ impl TranscriptMapper {
             let Some(args) = remuda_protocol::slash_effort_args(&text) else {
                 return Ok(Vec::new());
             };
-            let from_remuda = self
+            // c-effortread r12 item 1: ONE bridge snapshot. The worker lives
+            // on another task and can time this request out and arm a newer
+            // one between any two lock acquisitions, so matching the slash
+            // arguments and attributing the armed tuple must both come from
+            // this single (generation, request) pair — otherwise B's tuple
+            // gets stored for A's slash and A's delayed verdict settles B.
+            // c-effortread r12 item 1: ONE bridge snapshot. The worker lives
+            // on another task and can time this request out and arm a newer
+            // one between any two lock acquisitions, so matching the slash
+            // arguments and attributing the armed tuple must both come from
+            // this single (generation, request) pair — otherwise B's tuple
+            // gets stored for A's slash and A's delayed verdict settles B.
+            let pending_snapshot = self
                 .effort_bridge
                 .as_ref()
-                .and_then(|bridge| bridge.pending())
-                .is_some_and(|request| request.command_word() == args);
+                .and_then(|bridge| bridge.pending_with_gen());
+            // Test-only interleaving seam: fire AFTER the snapshot is taken.
+            #[cfg(test)]
+            if let Some(hook) = self.effort_slash_snapshot_hook.take() {
+                hook();
+            }
+            let from_remuda = pending_snapshot
+                .as_ref()
+                .is_some_and(|(_, request)| request.command_word() == args);
             // A slash read off an unverified/displaced batch cannot belong to
             // this process: arm neither the generation nor the level await, so
             // a verdict that follows provenance loss cannot settle the switch.
             if from_remuda
-                && self.effort.is_current_process()
-                && let Some(bridge) = &self.effort_bridge
-                && let Some((generation, request)) = bridge.pending_with_gen()
+                && let Some((generation, request)) = pending_snapshot
                 && self
                     .effort_armed
                     .iter()

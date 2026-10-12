@@ -50,6 +50,14 @@ pub(crate) struct FaultState {
     queued_entered_cv: Condvar,
     terminal_entered: Mutex<bool>,
     terminal_entered_cv: Condvar,
+    /// The registration ticket the parked cooperative terminal actually got.
+    /// A demote/rebind before close consumes ticket 0 for its in-life boundary
+    /// finish, so the close-time cooperative terminal registers a LATER
+    /// ticket; the gate selects on the cooperative flag and records whichever
+    /// ticket that terminal holds rather than hardcoding zero (c-ctxusage
+    /// r13 item 7).
+    cooperative_ticket: Mutex<Option<usize>>,
+    cooperative_ticket_cv: Condvar,
     gate_open: Mutex<bool>,
     gate_cv: Condvar,
     abort_residual: Mutex<bool>,
@@ -115,6 +123,8 @@ impl FaultState {
             queued_entered_cv: Condvar::new(),
             terminal_entered: Mutex::new(false),
             terminal_entered_cv: Condvar::new(),
+            cooperative_ticket: Mutex::new(None),
+            cooperative_ticket_cv: Condvar::new(),
             gate_open: Mutex::new(false),
             gate_cv: Condvar::new(),
             abort_residual: Mutex::new(false),
@@ -197,37 +207,48 @@ impl FaultState {
     /// Park the cooperative terminal finaliser (the close-time owner) BEFORE
     /// it claims the hydrator (c-ctxusage r10 item 1).
     ///
-    /// The gate admits EXACTLY the cooperative terminal: `cooperative` marks
-    /// the cooperative close finalise (never the abort residual and never an
-    /// in-life boundary finish), and ticket 0 is the first terminal
-    /// registered — the cooperative finalise always registers before close's
-    /// timeout can abort and register the residual. Selecting on BOTH (instead
-    /// of a first-executor swap, c-ctxusage r12 item 3) means the abort thread
-    /// can never steal the cooperative pre-claim barrier when it executes
-    /// first; it reaches the gate claim and parks there instead.
+    /// The gate admits the cooperative terminal by its EXPLICIT `cooperative`
+    /// flag and captures whichever registration ticket it holds - never by a
+    /// hardcoded ticket zero. The close-time finalise is the only cooperative
+    /// caller: the abort residual passes false and an in-life demote/rebind
+    /// boundary finish passes `final_close=false` too. That boundary terminal
+    /// registers FIRST and consumes ticket 0 when a demote/rebind happens
+    /// before close, leaving the cooperative terminal on a later ticket;
+    /// selecting `cooperative && ticket == 0` (r12 item 3's belt-and-braces
+    /// rule) then failed to ever park it (c-ctxusage r13 item 7). The flag
+    /// alone still keeps the abort thread out even when it executes first - it
+    /// reaches the gate claim and parks there instead - so the r12 guarantee
+    /// is preserved.
     pub(crate) fn terminal_finalise_queued(
         &self,
         ticket: crate::producer_gate::TerminalTicket,
         cooperative: bool,
     ) {
-        if !self.terminal_armed.load(Ordering::SeqCst) || !cooperative || ticket != 0 {
+        if !self.terminal_armed.load(Ordering::SeqCst) || !cooperative {
             return;
         }
-        *self
+        let mut guard = self
             .terminal_entered
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = true;
         self.terminal_entered_cv.notify_all();
+        drop(guard);
+        *self
+            .cooperative_ticket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ticket);
+        self.cooperative_ticket_cv.notify_all();
         let mut open = self
             .gate_open
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         while !*open {
-            let (guard, timeout) = self
+            let (next_open, timeout) = self
                 .gate_cv
                 .wait_timeout(open, GATE_WAIT)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            open = guard;
+            open = next_open;
             if timeout.timed_out() {
                 break;
             }
@@ -636,5 +657,97 @@ mod terminal_gate_tests {
             .unwrap_or_else(PoisonError::into_inner) = true;
         faults.gate_cv.notify_all();
         join_bounded(coop, "the cooperative terminal never left its park");
+    }
+
+    /// c-ctxusage r13 item 7: an in-life demote/rebind BEFORE close runs a
+    /// boundary terminal finish that registers FIRST and consumes ticket 0
+    /// (the producer gate survives the boundary and keeps incrementing
+    /// tickets). The close-time cooperative terminal therefore holds a LATER
+    /// ticket. The gate must select it by its cooperative flag - parking it
+    /// and capturing its real ticket - instead of requiring hardcoded ticket
+    /// zero, which would let the close terminal sail straight through. The
+    /// abort residual stays out regardless of its ticket.
+    #[test]
+    fn a_cooperative_terminal_after_a_demote_rebind_parks_on_its_real_ticket() {
+        let faults = FaultState::new();
+        faults.terminal_armed.store(true, Ordering::SeqCst);
+
+        // In-life demote/rebind boundary finish: ticket 0, non-cooperative.
+        // It returns immediately and never touches the cooperative gate.
+        let boundary_faults = Arc::clone(&faults);
+        let boundary =
+            std::thread::spawn(move || boundary_faults.terminal_finalise_queued(0, false));
+        join_bounded(boundary, "the in-life boundary terminal parked");
+        assert!(
+            !*faults
+                .terminal_entered
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            "an in-life boundary finish must not acknowledge the close gate"
+        );
+        assert!(
+            faults
+                .cooperative_ticket
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "no cooperative ticket may be captured for a boundary finish"
+        );
+
+        // The close cooperative terminal now registers on ticket 1 and parks,
+        // even though it is not ticket zero.
+        let coop_faults = Arc::clone(&faults);
+        let coop = std::thread::spawn(move || coop_faults.terminal_finalise_queued(1, true));
+        {
+            let guard = faults
+                .cooperative_ticket
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let (guard, wait) = faults
+                .cooperative_ticket_cv
+                .wait_timeout_while(guard, WAIT, |ticket| ticket.is_none())
+                .unwrap_or_else(PoisonError::into_inner);
+            assert!(
+                !wait.timed_out(),
+                "the post-rebind cooperative terminal never parked (ticket 1)"
+            );
+            assert_eq!(
+                *guard,
+                Some(1),
+                "the gate must capture the cooperative terminal's real later ticket"
+            );
+        }
+        assert!(
+            *faults
+                .terminal_entered
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            "the post-rebind cooperative terminal must acknowledge its park"
+        );
+
+        // The abort residual after the rebind is ticket 2 and non-cooperative:
+        // it returns immediately and cannot steal or overwrite the park.
+        let residual_faults = Arc::clone(&faults);
+        let residual =
+            std::thread::spawn(move || residual_faults.terminal_finalise_queued(2, false));
+        join_bounded(residual, "the abort residual parked in the close gate");
+        assert_eq!(
+            *faults
+                .cooperative_ticket
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            Some(1),
+            "the residual must not overwrite the captured cooperative ticket"
+        );
+
+        *faults
+            .gate_open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = true;
+        faults.gate_cv.notify_all();
+        join_bounded(
+            coop,
+            "the post-rebind cooperative terminal never left its park",
+        );
     }
 }

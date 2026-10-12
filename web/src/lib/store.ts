@@ -4529,14 +4529,16 @@ class HubStore {
   }
 
   /**
-   * Bound expiry for one effort request: request a FRESH post-command
-   * read-back (the durable projection folds through the strict legacy
-   * fallback), then either let the settle stand or surface an explicit
-   * "unconfirmed" outcome. The bound is request-owned FROM THE MOMENT THE
-   * REQUEST COULD RUN (r13 item 2/3 — a client request at the working→idle
-   * evidence, a wire pending at receipt when idle): a request still behind a
-   * running turn (`leftQueueAt == null`) waits instead of burning its bound
-   * in the queue; the 30-minute max-age backstop bounds the total wait.
+   * Bound expiry for one effort request. The protocol has no operation to
+   * query the driver's current effort (r13 item 4), so this never re-reads
+   * anything: a genuine post-command projection arrives over the live journal
+   * or the routine poll and settles through the strict legacy fallback before
+   * the deadline; otherwise the request ends in the explicit "unconfirmed"
+   * outcome. The bound is request-owned FROM THE MOMENT THE REQUEST COULD RUN
+   * (r13 item 2/3 — a client request at the working→idle evidence, a wire
+   * pending at receipt when idle): a request still behind a running turn
+   * (`leftQueueAt == null`) waits instead of burning its bound in the queue;
+   * the 30-minute max-age backstop bounds the total wait.
    */
   private runEffortReconciliation(instanceId: Id, nonce: number) {
     const slot = this.effortReconcileTimers.get(instanceId);

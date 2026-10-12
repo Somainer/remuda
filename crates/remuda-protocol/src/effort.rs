@@ -916,19 +916,18 @@ impl EffortTracker {
         // B's own verdict is the authority: any state an unowned verdict
         // latched while B was armed is superseded/published by THIS verdict
         // (c-effortread r18 item 3) and must not be re-emitted afterwards.
-        self.deferred = None;
         let observed = ObservedEffort {
             name: parsed.name,
             ultracode: flag,
         };
-        let edge = self.last != Some(observed);
-        self.last = Some(observed);
-        if edge {
+        // c-effortread r20 ruling B′: the owned accept flows through the one
+        // shared authoritative reconcile (latch + clear deferred + dedupe
+        // against the last PUBLISHED tuple).
+        let edge = self.reconcile_authoritative(observed, source);
+        if edge.is_some() {
             self.pending_source = EffortSource::Unknown;
-            Some((observed, source))
-        } else {
-            None
         }
+        edge
     }
 
     /// Latch the transcript effect of an unowned command's accepted verdict
@@ -995,6 +994,27 @@ impl EffortTracker {
         edge.then_some((observed, EffortSource::Slash))
     }
 
+    /// c-effortread r20 ruling B′ (completes r19 ruling B): the ONE reconcile
+    /// every AUTHORITATIVE effective-state evidence flows through — an owned
+    /// accept, an assistant read-back, the `/model` effort clause, an
+    /// `ultra_effort_enter|exit` attachment, and `/effort status` — whether or
+    /// not it produces a published edge. It latches the evidenced tuple,
+    /// clears the deferred suppressed-acceptance slot (the mapper pairs this
+    /// with dropping its own stashed edge), and returns an edge IFF the
+    /// resulting tuple differs from the last PUBLISHED tuple. Dedupe is
+    /// against that published tuple — never the internal flag/latch: an
+    /// unpublished suppressed acceptance may have moved the latch.
+    fn reconcile_authoritative(
+        &mut self,
+        observed: ObservedEffort,
+        source: EffortSource,
+    ) -> Option<(ObservedEffort, EffortSource)> {
+        let edge = self.last != Some(observed);
+        self.last = Some(observed);
+        self.deferred = None;
+        edge.then_some((observed, source))
+    }
+
     /// Feed a `/effort status|current` observation. Status never settles an
     /// awaiting switch and is never attributed to one ([`EffortSource::Unknown`]
     /// ): it reports the current state rather than changing it. The reported
@@ -1035,10 +1055,14 @@ impl EffortTracker {
     /// before any level is known it only latches: the edge is emitted together
     /// with the first level.
     ///
-    /// c-effortread r19 item 2 ruling B: the attachment is an AUTHORITATIVE
-    /// publication of the flag, so it clears the deferred suppressed-
-    /// acceptance slot for the CURRENT process — even a sparse repeat that
-    /// emits no edge — and the mapper drops its stashed edge in lockstep.
+    /// c-effortread r19 item 2 ruling B / r20 ruling B′: the attachment is an
+    /// AUTHORITATIVE publication of the flag, so it clears the deferred
+    /// suppressed-acceptance slot for the CURRENT process — even a sparse
+    /// repeat that emits no edge — and the mapper drops its stashed edge in
+    /// lockstep. The edge is decided against the last PUBLISHED tuple, never
+    /// the internal flag latch: a suppressed `… · Ultracode on|off` acceptance
+    /// may already have moved `flag` without publishing, so deduping on the
+    /// latch would swallow `{level, flag}` permanently.
     pub fn note_ultra_attachment(
         &mut self,
         enters: bool,
@@ -1046,23 +1070,21 @@ impl EffortTracker {
         if !self.current_process {
             return None;
         }
-        // Authoritative flag evidence: any suppressed slot is superseded.
-        self.deferred = None;
-        if self.flag == Some(enters) {
-            return None;
-        }
+        // Authoritative flag evidence: latch it unconditionally, then
+        // reconcile against the published tuple via the shared path.
         self.flag = Some(enters);
         let Some(last) = self.last else {
             // Latch only; the first assistant/verdict level carries the flag.
+            // The attachment is still authoritative evidence that supersedes
+            // any suppressed acceptance.
+            self.deferred = None;
             return None;
         };
         let observed = ObservedEffort {
             name: last.name,
             ultracode: Some(enters),
         };
-        let edge = self.last != Some(observed);
-        self.last = Some(observed);
-        edge.then_some((observed, EffortSource::Slash))
+        self.reconcile_authoritative(observed, EffortSource::Slash)
     }
 
     /// Declare the launch-level source before the first assistant record.
@@ -1123,18 +1145,15 @@ impl EffortTracker {
         }
         let ultracode = self.assistant_flag(name);
         let observed = ObservedEffort { name, ultracode };
-        let edge = self.last != Some(observed);
-        self.last = Some(observed);
-        // Authoritative read-back: the suppressed slot is superseded even
-        // when this emits nothing (same value as the last published state).
-        self.deferred = None;
-        if edge {
+        // c-effortread r20 ruling B′: one shared authoritative reconcile. The
+        // suppressed slot is superseded even when this emits nothing (the
+        // read-back equals the last published state).
+        let edge = self.reconcile_authoritative(observed, source);
+        if edge.is_some() {
             self.pending_source = EffortSource::Unknown;
             self.ultracode_pending = false;
-            Some((observed, source))
-        } else {
-            None
         }
+        edge
     }
 
     /// The flag an assistant record (or model-effort verdict) at `name`
@@ -2255,6 +2274,121 @@ mod tests {
             .expect("exit flips the agreed flag");
         assert_eq!(exit.0.ultracode, Some(false));
         assert_eq!(exit.0.name, EffortName::High);
+    }
+
+    #[test]
+    fn an_attachment_after_a_flag_moving_suppressed_accept_publishes_against_the_published_tuple() {
+        // c-effortread r20 ruling B′ (item 1), ENTER: published {high, off},
+        // a suppressed "… max · Ultracode on" acceptance moves the internal
+        // flag to on WITHOUT publishing, then the ultra_effort_enter
+        // attachment must still publish {high, on}: it reconciles against the
+        // last PUBLISHED tuple, not the moved latch, and clears the deferred
+        // slot. After B's Kept nothing stale surfaces and the published value
+        // dedups.
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.289");
+        tracker.observe(Some("high"), None);
+        // Published baseline {high, off} (human slider accepted off at high).
+        tracker.note_slash("high", false);
+        tracker
+            .note_stdout("Set effort level to high · Ultracode off", false)
+            .expect("the high/off baseline publishes");
+        // The unowned command's acceptance is suppressed while B is armed:
+        // it latches flag on and defers {max, on}, publishing nothing.
+        tracker.note_slash("max", false);
+        let latched = tracker
+            .note_unowned_stdout("Set effort level to max · Ultracode on")
+            .expect("the suppressed acceptance is handed back");
+        assert_eq!(
+            latched.observed,
+            ObservedEffort {
+                name: EffortName::Max,
+                ultracode: Some(true),
+            }
+        );
+        assert!(latched.changes_published);
+        assert_eq!(
+            tracker.last_observed(),
+            Some(ObservedEffort {
+                name: EffortName::High,
+                ultracode: Some(false),
+            }),
+            "the suppressed acceptance never publishes"
+        );
+        // The attachment ENTER must not dedupe against the moved latch.
+        let enter = tracker
+            .note_ultra_attachment(true)
+            .expect("{high, on} differs from the published {high, off}");
+        assert_eq!(
+            enter.0,
+            ObservedEffort {
+                name: EffortName::High,
+                ultracode: Some(true),
+            }
+        );
+        assert_eq!(enter.1, EffortSource::Slash);
+        assert!(
+            tracker.deferred_observation().is_none(),
+            "the attachment clears the deferred slot"
+        );
+        // B is Kept: nothing is left to publish, and the level never became max.
+        assert!(
+            tracker
+                .note_stdout("Kept effort level as max", true)
+                .is_none()
+        );
+        assert!(
+            tracker.deferred_observation().is_none(),
+            "the tracker holds no deferred value for the mapper to publish"
+        );
+        assert_eq!(
+            tracker.last_observed().map(|o| o.name),
+            Some(EffortName::High)
+        );
+        // A sparse repeat enter dedups against the published tuple.
+        assert!(tracker.note_ultra_attachment(true).is_none());
+
+        // EXIT mirror: published {high, on}, a suppressed "… · Ultracode off"
+        // acceptance moves the latch off, then the ultra_effort_exit
+        // attachment publishes {high, off} once.
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.289");
+        tracker.observe(Some("high"), None);
+        tracker.note_slash("ultracode on", false);
+        tracker
+            .note_stdout(
+                "Ultracode on (this session only): dynamic workflows on every task. Effort stays \
+                 high.",
+                false,
+            )
+            .expect("the high/on baseline publishes");
+        tracker.note_slash("high", false);
+        let latched = tracker
+            .note_unowned_stdout("Set effort level to high · Ultracode off")
+            .expect("the suppressed off acceptance is handed back");
+        assert_eq!(latched.observed.ultracode, Some(false));
+        let exit = tracker
+            .note_ultra_attachment(false)
+            .expect("{high, off} differs from the published {high, on}");
+        assert_eq!(
+            exit.0,
+            ObservedEffort {
+                name: EffortName::High,
+                ultracode: Some(false),
+            }
+        );
+        assert!(tracker.deferred_observation().is_none());
+        assert!(
+            tracker
+                .note_stdout("Kept effort level as max", true)
+                .is_none()
+        );
+        assert!(
+            tracker.deferred_observation().is_none(),
+            "the tracker holds no deferred value for the mapper to publish"
+        );
+        // A repeat exit is a dedup.
+        assert!(tracker.note_ultra_attachment(false).is_none());
     }
 
     #[test]

@@ -3534,11 +3534,12 @@ impl TranscriptMapper {
         {
             let enters = label == "ultra_effort_enter";
             let edge = self.effort.note_ultra_attachment(enters);
-            // r19 item 2 ruling B: the attachment is an authoritative flag
-            // publication and clears the suppressed slot (the tracker cleared
-            // its own deferred for the current process — including a sparse
-            // repeat that emits no edge). Replayed pre-launch attachments are
-            // ignored by both sides.
+            // r19 item 2 ruling B / r20 ruling B′: the attachment is an
+            // authoritative flag publication and clears BOTH deferred copies
+            // (the tracker reconciles for the current process — including a
+            // sparse repeat that emits no edge — and its edge is decided
+            // against the last PUBLISHED tuple, not the latched flag).
+            // Replayed pre-launch attachments are ignored by both sides.
             if self.effort.is_current_process() {
                 self.invalidate_deferred_effort();
             }

@@ -2482,10 +2482,13 @@ async fn emission_flusher(
             pending.close_and_clear();
             return;
         }
-        tokio::select! {
-            _ = notify.notified() => {}
-            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
+        // Every state this predicate waits on is an explicit wake, never a
+        // polled timer: producers notify on the empty->non-empty transition
+        // and BEFORE parking for capacity (BoundedPending owns the wake), and
+        // the two stop paths (cooperative finalise and the abort residual)
+        // notify_one immediately after setting `done` - Notify stores that as
+        // a permit, so it cannot race this wait (c-ctxusage r11 item 6).
+        notify.notified().await;
         if !flush_pending(&pending, &events, &seq, &ctx).await {
             // Channel went away with the task: nothing more can be delivered;
             // close releases any producer blocked on capacity.

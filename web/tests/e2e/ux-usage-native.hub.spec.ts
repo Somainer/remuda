@@ -372,7 +372,20 @@ test("native transcript usage drives the context chip through the real promoted 
     );
 
     await rawKeys(page, id, "NATIVEUSAGE probe");
-    await page.waitForTimeout(100);
+    // Wait for the prompt body to be read and painted BEFORE the CR: a body
+    // and CR landing in one harness PTY read are treated as a paste, so the
+    // two writes must be separated by an observed condition, not a fixed
+    // delay. The renderer-independent xterm buffer is that observation - the
+    // draft is visible there regardless of canvas/webgl/DOM rendering.
+    await expect
+      .poll(
+        async () =>
+          (
+            await page.evaluate(() => window.__ttyLab?.bufferText() ?? "")
+          ).includes("NATIVEUSAGE probe"),
+        { timeout: 20_000, intervals: [100, 250] },
+      )
+      .toBe(true);
     await rawKeys(page, id, "\r");
 
     // The owner-reported chip: 100k of 200k = 50%.

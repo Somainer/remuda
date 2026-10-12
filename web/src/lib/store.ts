@@ -2262,13 +2262,37 @@ class HubStore {
         lease: { owner: box.ownerId, until: Date.now() + LEASE_TTL_MS },
       });
     } catch {
-      // Storage aborted the claim: the first deliverable row is still first
-      // and deliverable. Signal FIFO stop so a later row is not POSTed ahead,
-      // and keep recovery responsibility: the bounded, lifetime-aware retry
-      // ends back in the central reconciliation which re-arms the row's one
-      // (backed-off) delivery wake (c-reconnfu gate 20 item 4).
-      void box.deliveryAttemptFailed([current0.instanceId]);
-      return "claim-aborted";
+      // Gate 22 item 1 (coordinator ruling): a durable mutation that COMMITTED
+      // is a success. The claim promise can reject AFTER mergeUnlessDone
+      // committed this owner's inflight lease; one authoritative read decides.
+      // A row carrying THIS owner's inflight lease is a WON claim — POST under
+      // it at once (no 30 s lease wait, attempts already holds the one claim
+      // that reached the wire). Anything else keeps the claim-aborted path:
+      // FIFO stop plus the bounded, lifetime-aware recovery.
+      let won: OutboxRecord | null = null;
+      try {
+        const durablyCommitted = await box.committedIfAny(commandId);
+        if (
+          durablyCommitted &&
+          durablyCommitted.state === "inflight" &&
+          durablyCommitted.lease?.owner === box.ownerId
+        ) {
+          won = durablyCommitted;
+        }
+      } catch {
+        won = null;
+      }
+      if (!won) {
+        // Storage aborted the claim (and did not commit it): the first
+        // deliverable row is still first and deliverable. Signal FIFO stop so
+        // a later row is not POSTed ahead, and keep recovery responsibility:
+        // the bounded, lifetime-aware retry ends back in the central
+        // reconciliation which re-arms the row's one (backed-off) delivery
+        // wake (c-reconnfu gate 20 item 4).
+        void box.deliveryAttemptFailed([current0.instanceId]);
+        return "claim-aborted";
+      }
+      claimed = won;
     }
     // A null claim means the row vanished inside the claim transaction
     // (another tab's retract deleted it — mergeUnlessDone resolves null
@@ -3501,10 +3525,10 @@ class HubStore {
       (a): a is AttachmentRef => Boolean(a.objectId),
     );
     if (this.outbox && commandId) {
-      // Storage-first: the bubble renders only AFTER the durable commit. A
-      // transaction abort left nothing in the cache/store, so retry the SAME
-      // commandId once; a second abort is an honest failure, never a phantom
-      // bubble or a second id for the intent.
+      const outbox = this.outbox;
+      // Storage-first: the bubble renders only AFTER the durable commit.
+      // Gate 22 item 1 ruling: a committed enqueue always proceeds; a
+      // transaction that really aborted retries the SAME commandId once.
       const enqueueRecord = {
         commandId,
         clientRequestId,
@@ -3518,15 +3542,24 @@ class HubStore {
         ...(persistedMode ? { mode: persistedMode } : {}),
         createdAt: createdAtMs,
       };
-      try {
-        await this.outbox.enqueue(enqueueRecord);
-      } catch {
+      // Gate 22 item 1 (coordinator ruling): the durable commit is the
+      // success. enqueueOnce only reports failure when the row did NOT commit
+      // — a promise that rejects after storage.put committed is resolved by
+      // one authoritative read, so the committed intent proceeds (one bubble,
+      // one command id) instead of being retried into a second write or
+      // reported as an honest failure. A genuine commit failure retries the
+      // SAME commandId once; the second rejection is confirmed against
+      // durable storage before giving up (never a phantom bubble or a second
+      // id).
+      const enqueueOnce = async (): Promise<boolean> => {
         try {
-          await this.outbox.enqueue(enqueueRecord);
+          await outbox.enqueue(enqueueRecord);
+          return true;
         } catch {
-          return false;
+          return (await outbox.committedIfAny(commandId).catch(() => null)) !== null;
         }
-      }
+      };
+      if (!(await enqueueOnce()) && !(await enqueueOnce())) return false;
     }
     const bubble: LocalBubble = {
       clientRequestId,

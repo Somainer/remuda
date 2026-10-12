@@ -1,7 +1,10 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { OUTBOX_LS_KEY } from "./outbox";
+import { LEASE_TTL_MS, OUTBOX_LS_KEY } from "./outbox";
 import type { CommandResult } from "../types/command";
 import type { Observation } from "../types/observation";
+
+/** Well under the 30 s delivery lease: a post must not wait for lease expiry. */
+const LEASE_GUARD_MS = LEASE_TTL_MS - 5_000;
 
 const INSTANCE = "ins_local_bubble";
 const JOURNAL = "obj_local_bubble_journal";
@@ -35,9 +38,11 @@ function commandResult(commandId: string, state: CommandResult["command"]["state
 }
 
 /** Fresh store/api module pair per test — the store is a process singleton. */
+const liveStores: Store[] = [];
 async function fresh(): Promise<{ api: Api; hubStore: Store }> {
   vi.resetModules();
   const [apiModule, storeModule] = await Promise.all([import("./api"), import("./store")]);
+  liveStores.push(storeModule.hubStore);
   return { api: apiModule.api, hubStore: storeModule.hubStore };
 }
 
@@ -71,6 +76,13 @@ function stubPostSend(api: Api) {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  // Tear down EVERY store this file booted: with real timers a previous
+  // test's jittered outbox/held retry (or a bounded recovery wake) can fire
+  // AFTER the next test enqueued — it would read the same localStorage
+  // backend (the recovery owner id lives in sessionStorage) and deliver the
+  // new test's row through a stale, un-mocked api. logout disposes the
+  // outbox and clears every delivery/retry timer.
+  for (const store of liveStores.splice(0)) store.logout();
   localStorage.removeItem(OUTBOX_LS_KEY);
 });
 
@@ -367,4 +379,223 @@ it("an aborted inflight-state claim never POSTs; recovered storage delivers the 
   await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
   await vi.waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
   expect(sendSpy.mock.calls[0]?.[4]).toBe(commandId);
+});
+
+/**
+ * GATE22 item 1 — coordinator ruling: a durable mutation that has COMMITTED
+ * (put / mergeUnlessDone / delete succeeded) is a success, full stop. A
+ * failure of the follow-up authoritative read never turns it into a failure;
+ * it only starts the bounded, lifetime-aware read recovery. Both regressions
+ * inject faults ONLY into reads after the commit, through the real storage
+ * adapter (never hand-editing storage), and let the store's real delivery
+ * flow do everything else.
+ */
+type FaultableOutboxStorage = {
+  all: () => Promise<unknown>;
+  put: (rec: { commandId?: string }) => Promise<void>;
+  mergeUnlessDone: (id: string, patch: Partial<Record<string, unknown>>) => Promise<unknown>;
+};
+
+async function bootLiveWithFaultableStorage(api: Api, hubStore: Store) {
+  const sendSpy = vi.spyOn(api, "instanceSend").mockImplementation(
+    (async (_iid: string, _p: string, _a?: unknown[], _m?: string, commandId?: string) =>
+      commandResult(commandId ?? "cmd_x", "accepted")) as Api["instanceSend"],
+  );
+  hubStore.setConnectionStateForTest("live");
+  const internals = hubStore as unknown as {
+    ensureOutbox: () => Promise<boolean>;
+    flushAllOutbox: () => Promise<void>;
+    outbox: { storage: FaultableOutboxStorage } | null;
+  };
+  expect(await internals.ensureOutbox()).toBe(true);
+  // Settle the empty boot flush BEFORE faults are armed so its reads cannot
+  // consume the one-shot faults below.
+  await internals.flushAllOutbox();
+  const storage = internals.outbox!.storage as FaultableOutboxStorage;
+  return { sendSpy, storage };
+}
+
+it("GATE22 item 1a: a committed enqueue whose follow-up read fails still yields exactly one intent and one command id, delivered once", async () => {
+  // Pre-fix enqueue awaited the post-commit read and REJECTED when it failed,
+  // although storage.put had committed; store.send retried the whole enqueue
+  // once and then returned false BEFORE rendering the bubble — one committed
+  // row with zero visible intent and no delivery trigger. The ruling makes
+  // the commit success; the read failure only enters bounded read recovery
+  // (250 ms), after which the real guarded flush delivers exactly once.
+  const { api, hubStore } = await fresh();
+  stubPostSend(api);
+  const { sendSpy, storage } = await bootLiveWithFaultableStorage(api, hubStore);
+
+  let failReads = 0;
+  const realAll = storage.all.bind(storage);
+  storage.all = vi.fn(async () => {
+    if (failReads > 0) {
+      failReads -= 1;
+      throw new Error("post-commit read abort");
+    }
+    return realAll();
+  });
+
+  // Two failing reads: pre-fix BOTH enqueue attempts (send retries the whole
+  // enqueue once after the first rejection) consume one. Post-fix there is no
+  // second enqueue for the same intent.
+  failReads = 2;
+  const accepted = await hubStore.send(INSTANCE, "gate22 1a");
+  expect(accepted).toBe(true);
+
+  await vi.waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1), { timeout: 5_000 });
+  const bubbles = hubStore.getSnapshot().bubbles.filter((b) => b.text === "gate22 1a");
+  expect(bubbles).toHaveLength(1);
+  const commandId = bubbles[0]?.commandId;
+  expect(commandId?.startsWith("cmd_")).toBe(true);
+  expect(sendSpy.mock.calls[0]?.[4]).toBe(commandId);
+
+  const mine = (JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as Array<{
+    prompt: string;
+    state: string;
+    attempts: number;
+  }>).filter((r) => r.prompt === "gate22 1a");
+  expect(mine).toHaveLength(1);
+  expect(mine[0]?.state).toBe("sent");
+  expect(mine[0]?.attempts).toBe(1);
+
+  // Well after every bounded recovery delay: no duplicate enqueue/POST.
+  await new Promise((r) => setTimeout(r, 300));
+  expect(sendSpy).toHaveBeenCalledTimes(1);
+});
+
+it("GATE22 item 1b: a committed claim whose follow-up read fails proceeds to the POST at once — no 30 s lease wait, no burned attempt slot", async () => {
+  // Pre-fix the claim's box.patch awaited the post-commit read; its rejection
+  // was misclassified as "claim-aborted" even though mergeUnlessDone had
+  // COMMITTED the inflight lease. No POST ran; the row kept a live 30 s lease
+  // (and attempts already incremented), so delivery waited for lease expiry
+  // and the eventual POST spent attempts=2 although the first one never
+  // reached the wire. Under the ruling patch returns the committed claim and
+  // the POST proceeds immediately; the failed read enters recovery alone.
+  const { api, hubStore } = await fresh();
+  stubPostSend(api);
+  const { sendSpy, storage } = await bootLiveWithFaultableStorage(api, hubStore);
+
+  let failNextRead = 0;
+  const realAll = storage.all.bind(storage);
+  storage.all = vi.fn(async () => {
+    if (failNextRead > 0) {
+      failNextRead -= 1;
+      throw new Error("post-claim read abort");
+    }
+    return realAll();
+  });
+  const realMerge = storage.mergeUnlessDone.bind(storage);
+  storage.mergeUnlessDone = vi.fn(async (id, patch) => {
+    const stored = await realMerge(id, patch);
+    // Arm the fault from the claim's OWN real commit transition (never a
+    // hand-written state change).
+    if (id.startsWith("cmd_") && patch.state === "inflight") failNextRead = 1;
+    return stored;
+  });
+
+  const startedAt = Date.now();
+  const accepted = await hubStore.send(INSTANCE, "gate22 1b");
+  expect(accepted).toBe(true);
+  await vi.waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1), { timeout: 5_000 });
+  // Delivered NOW, not after the 30 s lease TTL.
+  expect(Date.now() - startedAt).toBeLessThan(LEASE_GUARD_MS);
+
+  const bubbles = hubStore.getSnapshot().bubbles.filter((b) => b.text === "gate22 1b");
+  expect(bubbles).toHaveLength(1);
+  expect(sendSpy.mock.calls[0]?.[4]).toBe(bubbles[0]?.commandId);
+  const mine = (JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as Array<{
+    prompt: string;
+    state: string;
+    attempts: number;
+  }>).filter((r) => r.prompt === "gate22 1b");
+  expect(mine).toHaveLength(1);
+  expect(mine[0]?.state).toBe("sent");
+  // The claim that POSTed is the only attempt ever counted.
+  expect(mine[0]?.attempts).toBe(1);
+
+  await new Promise((r) => setTimeout(r, 300));
+  expect(sendSpy).toHaveBeenCalledTimes(1);
+});
+
+it("GATE22 item 1a-commit: a put whose promise rejects AFTER it committed still returns send success — one bubble, one command id, delivered once", async () => {
+  // The store-side half of the ruling: even if storage.put's PROMISE rejects
+  // after the durable row landed (request errors post-commit), send must ask
+  // the durable backend once and, finding THIS commandId committed, render
+  // the single bubble and let the real flow deliver it. Pre-fix send retried
+  // the enqueue, failed again and returned false before any bubble existed.
+  const { api, hubStore } = await fresh();
+  stubPostSend(api);
+  const { sendSpy, storage } = await bootLiveWithFaultableStorage(api, hubStore);
+
+  const realPut = storage.put.bind(storage);
+  storage.put = vi.fn(async (rec) => {
+    await realPut(rec);
+    // The real write committed; the promise fails afterwards.
+    if (rec.commandId?.startsWith("cmd_")) throw new Error("post-commit put rejection");
+  });
+
+  const accepted = await hubStore.send(INSTANCE, "gate22 1a-commit");
+  expect(accepted).toBe(true);
+
+  await vi.waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1), { timeout: 5_000 });
+  const bubbles = hubStore.getSnapshot().bubbles.filter((b) => b.text === "gate22 1a-commit");
+  expect(bubbles).toHaveLength(1);
+  const commandId = bubbles[0]?.commandId;
+  expect(commandId?.startsWith("cmd_")).toBe(true);
+  expect(sendSpy.mock.calls[0]?.[4]).toBe(commandId);
+
+  const mine = (JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as Array<{
+    prompt: string;
+    state: string;
+  }>).filter((r) => r.prompt === "gate22 1a-commit");
+  expect(mine).toHaveLength(1);
+  expect(mine[0]?.state).toBe("sent");
+
+  await new Promise((r) => setTimeout(r, 300));
+  expect(sendSpy).toHaveBeenCalledTimes(1);
+});
+
+it("GATE22 item 1b-commit: a claim whose merge promise rejects after committing THIS owner's lease POSTs immediately — no 30 s wait, no burned attempt", async () => {
+  // Store-side claim half of the ruling: mergeUnlessDone's promise rejects
+  // AFTER the inflight lease (owner = this tab) and attempts=1 committed.
+  // Pre-fix the catch meant claim-aborted: no POST, the live 30 s lease held,
+  // and the deadline recovery POSTed with attempts=2 — a burned slot for a
+  // POST that never reached the wire. The post-fix catch reads durable once,
+  // sees THIS owner's committed lease, treats it as a won claim and POSTs.
+  const { api, hubStore } = await fresh();
+  stubPostSend(api);
+  const { sendSpy, storage } = await bootLiveWithFaultableStorage(api, hubStore);
+
+  const realMerge = storage.mergeUnlessDone.bind(storage);
+  storage.mergeUnlessDone = vi.fn(async (id, patch) => {
+    const stored = await realMerge(id, patch);
+    // Fault armed from the claim's OWN real commit transition — never a
+    // hand-written state change. The finish patch (state sent) passes through.
+    if (id.startsWith("cmd_") && patch.state === "inflight") {
+      throw new Error("post-commit claim rejection");
+    }
+    return stored;
+  });
+
+  const startedAt = Date.now();
+  const accepted = await hubStore.send(INSTANCE, "gate22 1b-commit");
+  expect(accepted).toBe(true);
+  await vi.waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1), { timeout: 5_000 });
+  expect(Date.now() - startedAt).toBeLessThan(LEASE_GUARD_MS);
+
+  const bubbles = hubStore.getSnapshot().bubbles.filter((b) => b.text === "gate22 1b-commit");
+  expect(bubbles).toHaveLength(1);
+  expect(sendSpy.mock.calls[0]?.[4]).toBe(bubbles[0]?.commandId);
+  const mine = (JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as Array<{
+    prompt: string;
+    state: string;
+    attempts: number;
+  }>).filter((r) => r.prompt === "gate22 1b-commit");
+  expect(mine).toHaveLength(1);
+  expect(mine[0]?.state).toBe("sent");
+  expect(mine[0]?.attempts).toBe(1);
+
+  await new Promise((r) => setTimeout(r, 300));
+  expect(sendSpy).toHaveBeenCalledTimes(1);
 });

@@ -973,6 +973,14 @@ export class Outbox {
    * Storage-first enqueue: cache + subscribers update only after the durable
    * write commits. A transaction abort leaves the cache without the row, so no
    * uncommitted message is rendered or POSTed.
+   *
+   * c-reconnfu gate 22 item 1 (coordinator ruling): the durable commit IS the
+   * success, full stop. The authoritative re-read that follows runs the
+   * shared post-commit epilogue {@link reconcileAfterCommittedWrite}; if THAT
+   * read rejects it only starts the bounded, lifetime-aware recovery — it
+   * never rejects the enqueue (which used to make store.send report failure /
+   * mint no visible intent for a row that had already committed with its one
+   * command id) and it never triggers a second enqueue for the same intent.
    */
   async enqueue(
     rec: Omit<OutboxRecord, "attempts" | "state"> & { state?: OutboxState },
@@ -980,8 +988,8 @@ export class Outbox {
     const full: OutboxRecord = { attempts: 0, state: "pending", ...rec };
     await this.storage.put(full);
     this.cache.set(full.commandId, full);
-    await this.reconcileFromDurable();
     this.emit();
+    this.reconcileAfterCommittedWrite();
     return full;
   }
 
@@ -992,27 +1000,66 @@ export class Outbox {
    * can still be in flight) or by another tab is never downgraded to
    * sent/held/rejected/unknown by a full record built from a stale cache
    * read. The cache is updated from the AUTHORITATIVE stored row (which may
-   * be the preserved done) only after the transaction commits; on abort
-   * nothing is cached and the rejection propagates.
+   * be the preserved done) only after the transaction commits; the write
+   * rejecting means the commit failed and the rejection propagates.
+   *
+   * Gate 22 item 1 ruling: once mergeUnlessDone COMMITTED, a failure of the
+   * follow-up read does NOT turn the patch into a failure. The committed row
+   * is returned (so a committed CLAIM proceeds to its POST instead of waiting
+   * out the 30 s lease as "claim-aborted" and burning an attempt slot); the
+   * failed read is owned by the bounded recovery via the shared epilogue.
    */
   async patch(commandId: Id, patch: Partial<OutboxRecord>): Promise<OutboxRecord | null> {
     const stored = await this.storage.mergeUnlessDone(commandId, patch);
     if (!stored) return null;
     this.cache.set(commandId, stored);
-    // Re-judge every wake from an AUTHORITATIVE snapshot after the just-
-    // committed write (terminal cancels the deadline wake, held hands it to
-    // the held-retry clock, a fresh lease adopts the new deadline) through the
-    // ONE central function — never from the local cache merge.
-    await this.reconcileFromDurable();
     this.emit();
+    this.reconcileAfterCommittedWrite();
     return stored;
   }
 
   async remove(commandId: Id) {
     await this.storage.delete(commandId);
     this.cache.delete(commandId);
-    await this.reconcileFromDurable();
     this.emit();
+    this.reconcileAfterCommittedWrite();
+  }
+
+  /**
+   * The SHARED post-commit epilogue for enqueue/patch/remove (gate 22 item 1):
+   * re-judge every row from an AUTHORITATIVE durable snapshot. The durable
+   * mutation already committed, so a rejected read must never fail the
+   * writer's promise — it enters the bounded, lifetime-aware recovery chain
+   * (growing backoff, surfaced exhaustion), which ends in the SAME central
+   * reconciliation as every other delivery entry point. Deliberately not
+   * awaited by the writers: a failing chain can run for seconds, and the
+   * committed intent must be visible/acted upon immediately.
+   */
+  private reconcileAfterCommittedWrite(): void {
+    if (this.disposed || this.unloading) return;
+    void this.refreshDurableRecovering(0).catch(() => undefined);
+  }
+
+  /**
+   * Gate 22 item 1 (coordinator ruling): a writer's enqueue/claim call just
+   * REJECTED — but a storage promise can reject AFTER the durable mutation
+   * committed (a backend whose request errors post-commit, a wrapper failing
+   * after the real write). Ask the durable backend with ONE authoritative
+   * read whether the command's row exists, i.e. whether the commit in fact
+   * landed. That read failing is not a "no": it starts the bounded,
+   * lifetime-aware recovery in the BACKGROUND (never awaited — the caller has
+   * a rejected promise to settle now) and this resolves null so an
+   * unconfirmed mutation stays an honest failure rather than a phantom row.
+   */
+  async committedIfAny(commandId: Id): Promise<OutboxRecord | null> {
+    if (this.disposed) return null;
+    try {
+      await this.readDurable();
+    } catch {
+      void this.refreshDurableRecovering(1).catch(() => undefined);
+      return null;
+    }
+    return this.cache.get(commandId) ?? null;
   }
 
   /**
@@ -1422,18 +1469,6 @@ export class Outbox {
       failures,
       at: now + this.deliverWakeDelay(failures),
     });
-  }
-
-  /**
-   * Re-apply the CENTRAL policy from an AUTHORITATIVE durable snapshot (gate
-   * 21 item 2): a wake decision must never be based on the local write-through
-   * cache, which can carry rows a sibling deleted/finished or miss a
-   * committed write. Individual writes therefore re-read durable storage and
-   * reconcile from that; the snapshot is not merged with stale cache rows.
-   */
-  private async reconcileFromDurable(): Promise<void> {
-    if (this.disposed) return;
-    await this.refreshDurable();
   }
 
   /** Authoritative read + central reconcile (store flush, timer, writes). */

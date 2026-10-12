@@ -3395,7 +3395,10 @@ fn result_attrs(o: &Observation) -> Option<(&str, bool)> {
 #[tokio::test]
 async fn aborting_inside_the_real_writer_window_keeps_the_accepted_turn_ordered_and_settled() {
     let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
-    let mut handle = driver.start(spec).await.expect("start");
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
 
     // Close the writer's in-window gate: the writer parks INSIDE UserWrite
@@ -3466,7 +3469,10 @@ async fn aborting_inside_the_real_writer_window_keeps_the_accepted_turn_ordered_
         "B settles, index 1"
     );
 
-    driver.close().await.expect("close");
+    wait_bounded(driver.close(), Duration::from_secs(10), "close")
+        .await
+        .expect("bounded test wait timed out: waiting for close")
+        .expect("close");
 }
 
 /// ma-sdk-state r11 item 5 / r12 item 4 — bound proof, class SPAWNED-TASK JOIN.
@@ -3481,7 +3487,10 @@ async fn aborting_inside_the_real_writer_window_keeps_the_accepted_turn_ordered_
 async fn bound_proof_a_parked_send_join_fails_fast_at_the_named_bound_then_completes_on_release() {
     let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
     let driver = std::sync::Arc::new(driver);
-    let handle = driver.start(spec).await.expect("start");
+    let handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
 
     // Gate shut from write #1: the send parks pre-accept and stays parked.
@@ -3541,7 +3550,10 @@ async fn bound_proof_a_parked_send_join_fails_fast_at_the_named_bound_then_compl
 async fn bound_proof_a_barrier_count_wait_fails_at_its_named_deadline_then_returns_on_release() {
     let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
     let driver = std::sync::Arc::new(driver);
-    let handle = driver.start(spec).await.expect("start");
+    let handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
 
     let barrier = std::sync::Arc::new(driver.arm_write_commit_barrier());
@@ -3589,7 +3601,10 @@ async fn bound_proof_a_barrier_count_wait_fails_at_its_named_deadline_then_retur
 async fn bound_proof_the_writer_gate_park_wait_fails_named_then_returns_when_a_write_arrives() {
     let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
     let driver = std::sync::Arc::new(driver);
-    let handle = driver.start(spec).await.expect("start");
+    let handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
 
     let gate = driver.bounded_write_window(Duration::from_secs(5)).await;
@@ -3615,7 +3630,12 @@ async fn bound_proof_the_writer_gate_park_wait_fails_named_then_returns_when_a_w
         .expect("the gated send completes after the gate opens");
 
     drop(handle);
-    let _ = driver.close().await;
+    let _ = wait_bounded(
+        driver.close(),
+        Duration::from_secs(10),
+        "close after the writer gate proof",
+    )
+    .await;
 }
 
 /// ma-sdk-state r11 item 5 / r12 item 4 — bound proof, class MUTEX/FENCE
@@ -3627,7 +3647,10 @@ async fn bound_proof_the_writer_gate_park_wait_fails_named_then_returns_when_a_w
 async fn bound_proof_contended_mutex_and_fence_acquisitions_fail_named_then_complete_on_release() {
     let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
     let driver = std::sync::Arc::new(driver);
-    let handle = driver.start(spec).await.expect("start");
+    let handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
 
     // Holder acquires the publish mutex and parks until the test releases it;
@@ -3689,7 +3712,12 @@ async fn bound_proof_contended_mutex_and_fence_acquisitions_fail_named_then_comp
         .expect("the released fence signals");
 
     drop(handle);
-    let _ = driver.close().await;
+    let _ = wait_bounded(
+        driver.close(),
+        Duration::from_secs(10),
+        "close after the mutex/fence proof",
+    )
+    .await;
 }
 
 /// ma-sdk-state r11 item 5 / r12 item 4 — bound proof, class OVERALL
@@ -3703,7 +3731,10 @@ async fn bound_proof_the_recv_none_drain_fails_named_then_completes_after_close(
     let mut env = BTreeMap::new();
     env.insert("FAKE_CLAUDE_EXIT_WHEN_SCRIPT_DONE".into(), "1".into());
     let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
-    let mut handle = driver.start(spec).await.expect("start");
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
 
     // One ordinary prompt: the one-turn fake answers and then exits naturally.

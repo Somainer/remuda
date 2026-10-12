@@ -1379,11 +1379,16 @@ describe("ConnectionMachine", () => {
     expect(onAttemptFinish).not.toHaveBeenCalled();
   });
 
-  it("GATE17 item 4: a same-binding offline retirement still accepts the rejection (gate 8 chain preserved)", async () => {
+  it("GATE17 item 4: a same-binding offline retirement still accepts the rejection (gate 8 chain preserved) and it is CONSUMED — settlement runs and an explicit online after the retry deadline resumes and certifies live", async () => {
     // Defence for the fix: clearing retired-offline on BINDING changes must not
     // retire the flag within one binding — the gate-8 offline→online chain
-    // settles the old rejection via that flag.
-    const { machine, resume, probe } = setupTracked();
+    // settles the old rejection via that flag. Gate 18 item 6: this must also
+    // PROVE the rejection was consumed (not merely accepted): the settlement
+    // probe runs, the reconnect clock is armed, and after the retry deadline an
+    // explicit `online` starts a REAL second resume whose success is accepted
+    // and certifies live — a retired/non-consumed slot would drop that
+    // completion and stay offline.
+    const { clock, machine, resume, probe } = setupTracked();
     probe.mockResolvedValue(false);
     machine.bootstrapLive();
     machine.noteBinding(1);
@@ -1404,5 +1409,31 @@ describe("ConnectionMachine", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(machine.state).toBe("offline");
+    // The settlement probe ran exactly once and a reconnect clock is armed —
+    // the rejection took the normal failure-settlement path.
+    expect(probe).toHaveBeenCalledTimes(1);
+    const timerNames = () =>
+      [...(machine as unknown as { timers: Map<string, unknown> }).timers.keys()];
+    // Flush the reject -> .then-propagate -> .catch-dispatch -> probe .then
+    // chain (three microtask layers after rejectA).
+    for (let i = 0; i < 10 && !timerNames().includes("reconnect"); i += 1) {
+      await Promise.resolve();
+    }
+    expect(timerNames()).toContain("reconnect");
+    expect(resume).toHaveBeenCalledTimes(1);
+
+    // After the retry deadline the user comes back online explicitly: a real
+    // new resume runs (the autonomous reconnect and the foreground resume
+    // coalesce into one in-flight attempt for the binding).
+    clock.advance(500); // full-jitter cap at attempt 1 with random()=0.5
+    machine.dispatch({ type: "online" });
+    expect(resume).toHaveBeenCalledTimes(2);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(machine.state).toBe("live");
+    // Only the frame watchdog remains; the offline tail is gone.
+    expect(timerNames()).toContain("stale");
+    expect(timerNames()).not.toContain("reconnect");
+    expect(timerNames()).not.toContain("watchdog");
   });
 });

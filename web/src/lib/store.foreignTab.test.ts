@@ -1506,6 +1506,119 @@ it("GATE17 item 1: recovering A -> never-mounted B with a FAILING seed self-driv
   hubStore.logout();
 });
 
+it("GATE18 item 6 (real store): an offline-retired attempt's delayed catch-up rejection never crosses a binding onto adopted live B — real resume/subscribe, zero settlement probes", async () => {
+  // Real-store counterpart of the gate-17 item-4 machine unit test (which
+  // injects resume/probe/liveness and calls noteBinding/followRebindLive
+  // directly). Here the resume is the store's real reopenFollow ->
+  // openFollowSocket path, the socket death and browser offline go through the
+  // real machine dispatch/window listener, and the binding change is a real
+  // mounted-session follow. A's catch-up rejects AFTER B was adopted live; B
+  // must never demote and no settlement probe may run for either journal.
+  vi.useFakeTimers();
+  const { api, hubStore } = await fresh();
+  await bootLive(api, hubStore); // lists A = INSTANCE (journal JOURNAL)
+
+  const JOURNAL_B = "obj_journal_b_g18_i6";
+  const INSTANCE_B = "ins_mounted_b_g18_i6";
+  vi.spyOn(api, "instanceGet").mockImplementation(async (id: string) =>
+    id === INSTANCE_B
+      ? ({
+          id: INSTANCE_B,
+          journalId: JOURNAL_B,
+          lifecycle: "running",
+          revision: "0",
+          durableSeq: "0",
+        } as never as Awaited<ReturnType<Api["instanceGet"]>>)
+      : ({} as Awaited<ReturnType<Api["instanceGet"]>>),
+  );
+  vi.spyOn(api, "eventsRead").mockResolvedValue({
+    events: [],
+    windowFromSeq: "1",
+    durableSeq: "0",
+    reachedAfterSeq: true,
+  } as Awaited<ReturnType<Api["eventsRead"]>>);
+  let rejectA!: (err: Error) => void;
+  let aSubscribeCalls = 0;
+  let bSubscribeCalls = 0;
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    (async (journalId: string) => {
+      if (journalId === JOURNAL) {
+        aSubscribeCalls += 1;
+        // A's SECOND subscribe (the real reconnect resume) stays pending until
+        // the test rejects it after the binding moved to B.
+        if (aSubscribeCalls === 2) {
+          await new Promise<never>((_resolve, reject) => {
+            rejectA = reject;
+          });
+        }
+      } else {
+        bSubscribeCalls += 1;
+      }
+      return {
+        subscriptionId: `sub_g18i6_${journalId}` as never,
+        getReadyState: () => 1,
+        snapshot: { asOfSeq: "0", fromSeq: null },
+        close: () => undefined,
+      };
+    }) as unknown as Api["eventsSubscribe"],
+  );
+
+  // Mount A live, then B, then return to A — both journals are mounted.
+  await hubStore.follow(INSTANCE);
+  await hubStore.follow(INSTANCE_B);
+  expect(bSubscribeCalls).toBe(1);
+  await hubStore.follow(INSTANCE);
+  const store = hubStore as unknown as {
+    connection: ConnectionMachine;
+    connectionBoundJournal: string;
+    setFollowLiveForTest: (open: boolean, framed: boolean, journalId?: string) => void;
+  };
+  store.setFollowLiveForTest(true, true, JOURNAL);
+  store.setFollowLiveForTest(true, true, JOURNAL_B);
+  expect(aSubscribeCalls).toBe(1);
+
+  // A's link dies; a real online-driven resume starts and hangs on A's
+  // reopen subscribe; the follow socket then closes mid-attempt (latched); a
+  // real browser offline event retires the attempt with the offline flag.
+  store.setFollowLiveForTest(false, false, JOURNAL);
+  store.connection.dispatch({ type: "online" });
+  for (let i = 0; i < 20 && aSubscribeCalls < 2; i += 1) await Promise.resolve();
+  expect(aSubscribeCalls).toBe(2);
+  expect(store.connection.state).toBe("recovering");
+  store.connection.dispatch({ type: "close" });
+  window.dispatchEvent(new Event("offline"));
+  expect(store.connection.state).toBe("offline");
+
+  // Navigate to the MOUNTED B: real bind + adoption certifies B live.
+  await hubStore.follow(INSTANCE_B);
+  expect(store.connectionBoundJournal).toBe(JOURNAL_B);
+  expect(store.connection.state).toBe("live");
+
+  // A's delayed catch-up rejects across the binding.
+  rejectA(new Error("A catch-up lost the race"));
+  for (let i = 0; i < 30; i += 1) await Promise.resolve();
+  expect(store.connection.state).toBe("live");
+
+  // The stale completion was dropped BEFORE any settlement: no REST probe for
+  // either journal, and no subscribe was reopened for anyone.
+  const probes = () =>
+    vi.mocked(api.eventsRead).mock.calls.filter((c) => c[0]?.limit === 1).length;
+  expect(probes()).toBe(0);
+  expect(aSubscribeCalls).toBe(2);
+  expect(bSubscribeCalls).toBe(1);
+
+  // Still live with nothing reopened well past the rejection (the frame
+  // watchdog's own 15 s silent-socket cycle is intentionally not crossed).
+  await vi.advanceTimersByTimeAsync(10_000);
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  expect(store.connection.state).toBe("live");
+  expect(probes()).toBe(0);
+  expect(aSubscribeCalls).toBe(2);
+  expect(bSubscribeCalls).toBe(1);
+  vi.useRealTimers();
+  hubStore.logout();
+});
+
 it("GATE18 item 5: a duplicate seed that finds the journal mounted with a DEAD socket ends the current-binding attempt instead of stranding it on the 20 s watchdog", async () => {
   // follow(B) attempt 1 (unmounted seed in flight) -> navigate to mounted live
   // A (retries/retries attempt 1) -> follow(B) again before the seed returns

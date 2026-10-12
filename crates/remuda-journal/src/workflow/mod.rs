@@ -30,8 +30,9 @@ pub use script::{AgentCallSite, MatchedCall, WorkflowScript};
 
 use crate::Error;
 use crate::claude::{NativeIds, envelope as file_envelope, opaque};
+use crate::cover::CoverSet;
 use crate::envelope::Envelope;
-use crate::source::{FileTail, MapContext, Source, SourceResume, UnreadCover};
+use crate::source::{FileTail, MapContext, Source, SourceResume};
 use crate::util::{known, parse_timestamp, timestamp_from_unix_ms, timestamp_now, unknown};
 use remuda_protocol::{
     Completeness, FileCursor, ObservationPayload, OpaqueReason, SourceChannel, Timestamp, U64,
@@ -93,14 +94,6 @@ pub struct WorkflowJournalTailer {
     /// order). When the run later registers (or the member starts), the member
     /// is marked Failed immediately.
     pending_failed: HashSet<String>,
-    /// c-cardsettle-fu2 r5-r7 item 2: terminal watermark for a live
-    /// StopFailure that arrived while the retry's own journal `started` was
-    /// already on disk but not yet folded. Holds the settled record's
-    /// position, digest and the file extent observed at failure time: the
-    /// fold suppresses resurrection only for that exact record (and earlier
-    /// catch-up positions), until it is consumed, the journal rotates, or the
-    /// covered unread suffix is discarded by an in-place truncate.
-    failure_watermarks: HashMap<String, UnreadCover>,
     /// Main session transcript path. Every run adopts an end-anchored tail at
     /// registration, so a run launched minutes after the SessionStart bind
     /// never re-reads pre-launch transcript bytes.
@@ -161,14 +154,6 @@ struct MemberState {
     /// counter was already bumped by ANOTHER agent must only resurrect when
     /// THIS member previously consumed a start.
     consumed_journal_start: bool,
-    /// c-cardsettle-fu2 r5-r7 item 2: terminal watermark for a live
-    /// StopFailure that arrived ahead of its settled attempt's journal
-    /// `started` (generation, start offset, record digest and the observed
-    /// file extent). The fold suppresses resurrection for a start at an
-    /// earlier position, or AT the position only with the same digest, and
-    /// clears the watermark once that position is passed, the journal
-    /// rotates, or the covered suffix was discarded by an in-place truncate.
-    failure_watermark: Option<UnreadCover>,
     state: WorkflowState,
     label: Option<String>,
     phase: Option<String>,
@@ -217,7 +202,6 @@ impl WorkflowJournalTailer {
             ids,
             runs: Vec::new(),
             pending_failed: HashSet::new(),
-            failure_watermarks: HashMap::new(),
             main_transcript_path: None,
             main_transcript_scan: false,
         }
@@ -391,53 +375,16 @@ impl WorkflowJournalTailer {
         // c-cardsettle-fu2 r5-r6 item 2: if a journal `started` for this
         // agent is already on disk but unread, this StopFailure settles THAT
         // attempt (a failed RETRY whose start record the poll has not folded
-        // yet). Record the record's position as the terminal watermark: the
-        // fold suppresses resurrection only for starts at or before it, so a
-        // start appended AFTER the failure — even one that folds in the same
-        // poll — is still a genuine retry.
+        // yet). Arm the independent cover set the peek returns: the fold
+        // suppresses resurrection only for records whose identity and bytes
+        // match a live cover, so a start appended AFTER the failure — even one
+        // that folds in the same poll — is still a genuine retry. The peek's
+        // open itself revalidates every other member's covers first.
         let journal_path = self.runs[index].dir.join("journal.jsonl");
-        let unread = self
-            .tails
-            .get_mut(&journal_path)
-            .and_then(|tail| tail.unread_start(agent_id).transpose());
-        // r8 item 3: this peek OPENED the journal and is itself a newly
-        // observed file state. Another member's StopFailure can be the first
-        // open after a truncate/rewrite, so retire every existing cover the
-        // opened file contradicts before this peek's (fresh) watermark is
-        // armed — a peek must not overwrite evidence an earlier poll saw.
-        self.invalidate_covers(index, &journal_path);
-        if let Some(Ok(watermark)) = unread {
-            self.failure_watermarks
-                .insert(agent_id.to_owned(), watermark);
+        if let Some(tail) = self.tails.get_mut(&journal_path) {
+            tail.unread_start(agent_id)?;
         }
         self.emit_snapshots()
-    }
-
-    /// Retire, on both sides, every watermark of a member of `index` whose
-    /// cover is contradicted by the journal tail's most recent open (poll or
-    /// failure peek): a rotation, a shrink through the captured bytes, or a
-    /// rewritten pending prefix.
-    fn invalidate_covers(&mut self, index: usize, journal_path: &Path) {
-        let invalid: Vec<String> = {
-            let Some(tail) = self.tails.get(journal_path) else {
-                return;
-            };
-            self.failure_watermarks
-                .iter()
-                .filter(|(agent_id, mark)| {
-                    self.runs[index]
-                        .members
-                        .iter()
-                        .any(|member| member.agent_id == **agent_id)
-                        && !tail.cover_is_valid(mark)
-                })
-                .map(|(agent_id, _)| agent_id.clone())
-                .collect()
-        };
-        for agent_id in invalid {
-            self.failure_watermarks.remove(&agent_id);
-            self.runs[index].clear_failure_watermark(&agent_id);
-        }
     }
 
     /// Tail the main session transcript for this run's terminal markers
@@ -510,71 +457,33 @@ impl WorkflowJournalTailer {
         // snapshot each line changes, preserving transition order on catch-up.
         for index in 0..self.runs.len() {
             let journal_path = self.runs[index].dir.join("journal.jsonl");
-            // Covers the tailer holds for members of THIS run; the journal is
-            // shared by every member, so they all validate against this open.
-            let pending: Vec<(String, UnreadCover)> = self
-                .failure_watermarks
-                .iter()
-                .filter(|(agent_id, _)| {
-                    self.runs[index]
-                        .members
-                        .iter()
-                        .any(|member| member.agent_id == **agent_id)
-                })
-                .map(|(agent_id, cover)| (agent_id.clone(), cover.clone()))
-                .collect();
-            let (lines, invalid) = match self.tails.get_mut(&journal_path) {
-                Some(tail) => {
-                    let covers: Vec<UnreadCover> =
-                        pending.iter().map(|(_, cover)| cover.clone()).collect();
-                    tail.poll_with_covers(&covers)?
-                }
-                None => (Vec::new(), vec![false; pending.len()]),
+            // The poll open revalidates the tail's whole cover set before any
+            // line folds (replacement, rotation, shrink through the captured
+            // bytes, rewritten prefix, pending-tail growth).
+            let lines = match self.tails.get_mut(&journal_path) {
+                Some(tail) => tail.poll()?,
+                None => Vec::new(),
             };
-            // r7/r8: retire every cover this poll's open contradicts
-            // (replacement, rotation, an in-place shrink through the captured
-            // partial bytes, or a rewritten prefix) on BOTH sides BEFORE a
-            // record reused at the covered position can fold.
-            for ((agent_id, _), bad) in pending.iter().zip(invalid) {
-                if bad {
-                    self.failure_watermarks.remove(agent_id);
-                    self.runs[index].clear_failure_watermark(agent_id);
-                }
-            }
-            // r5-r7 item 2: arm members carrying a surviving terminal
-            // watermark from a live StopFailure BEFORE the lines fold. It
-            // survives empty polls and is consumed by the fold only when the
-            // exact record it covers is read (re-arming the same member with
-            // the same mark is a no-op).
-            let armed: Vec<(String, UnreadCover)> = self
-                .failure_watermarks
-                .iter()
-                .filter(|(agent_id, _)| {
-                    self.runs[index]
-                        .members
-                        .iter()
-                        .any(|member| member.agent_id == **agent_id)
-                })
-                .map(|(agent_id, watermark)| (agent_id.clone(), watermark.clone()))
-                .collect();
-            self.runs[index].arm_failure_watermarks(&armed);
             for (line, cursor) in lines {
                 let line = line.clone();
-                self.runs[index].fold_journal_line(&line, &cursor);
+                // The started fold consults the CURRENT cover set: a line at a
+                // cover's position is suppressed only when its identity and
+                // bytes match.
+                let covers: Option<&CoverSet> = self.tails.get(&journal_path).map(FileTail::covers);
+                self.runs[index].fold_journal_line(&line, &cursor, covers);
+                // The record is now consumed — by this member as this record
+                // type. Retire every cover its cursor reached (including
+                // another member's) BEFORE the next line can fold, so a start
+                // after the covered record resurrects even in this poll.
+                if let Some(tail) = self.tails.get_mut(&journal_path) {
+                    tail.note_consumed(cursor.file_generation.0, cursor.offset.0);
+                }
                 self.runs[index].refresh_agents()?;
                 // Recompute phase state per journal line so a phase running
                 // between two lines still emits its running revision (it is a
                 // real transition even if a later line completes it).
                 self.runs[index].recompute_phases();
                 out.extend(self.run_envelopes(index)?);
-            }
-            // Drop tailer-side entries the fold actually consumed (or
-            // invalidated by rotation). An empty poll — the covered record is
-            // still unread — keeps both sides armed.
-            for (agent_id, _) in &armed {
-                if !self.runs[index].member_has_failure_watermark(agent_id) {
-                    self.failure_watermarks.remove(agent_id);
-                }
             }
         }
 
@@ -1363,7 +1272,7 @@ impl RunState {
         }
     }
 
-    fn fold_journal_line(&mut self, line: &[u8], cursor: &FileCursor) {
+    fn fold_journal_line(&mut self, line: &[u8], cursor: &FileCursor, covers: Option<&CoverSet>) {
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
             return;
         };
@@ -1426,37 +1335,23 @@ impl RunState {
                 //   different agent id already bumped (started(k,a0) then
                 //   started(k,a1) counts the key to 2, but a1 never consumed
                 //   a start).
-                // r6 item 1 / r7 items 1+3 / r8 item 1: it also must not fire
-                // when this start record is covered by the terminal watermark
-                // of a live StopFailure — an earlier catch-up position in the
-                // same generation, or the settled record AT its position. A
-                // Complete cover additionally requires the SAME record digest
-                // (a different record reusing the offset via in-place
-                // truncate+rewrite is a genuine retry); a Pending boundary
-                // captured mid-write matches only the record completing AT
-                // ITS EXACT OFFSET — this branch guarantees the completed
-                // JSON's type is `started`, and routing to this member
-                // guarantees its agent identity — while its digest-bound
-                // fallback still covers a complete start seen earlier in the
-                // same peek. A start at a later offset, including one folded
-                // later in the SAME poll, resurrects.
-                let settled_by_watermark = member.failure_watermark.as_ref().is_some_and(|cover| {
-                    if cursor.file_generation.0 != cover.generation() {
-                        return false;
-                    }
-                    match cover {
-                        UnreadCover::Complete(mark) => {
-                            cursor.offset.0 < mark.offset
-                                || (cursor.offset.0 == mark.offset && cursor.digest == mark.digest)
-                        }
-                        UnreadCover::Pending(boundary) => {
-                            boundary.fallback.as_ref().is_some_and(|mark| {
-                                cursor.offset.0 < mark.offset
-                                    || (cursor.offset.0 == mark.offset
-                                        && cursor.digest == mark.digest)
-                            }) || cursor.offset.0 == boundary.offset
-                        }
-                    }
+                // r6-r9: it also must not fire when this start record is the
+                // exact record a live StopFailure cover settled: a complete
+                // cover matches only the same digest at its generation/offset,
+                // a pending-tail cover the byte-for-byte completion at its
+                // offset. A start at a later offset — including one folded
+                // later in the SAME poll — has no matching cover and
+                // resurrects. Covers retire per consumed line (see poll) as
+                // soon as the record they cover is consumed, by any member as
+                // any record type.
+                let settled_by_watermark = covers.is_some_and(|set| {
+                    set.settles(
+                        &agent_id,
+                        cursor.file_generation.0,
+                        cursor.offset.0,
+                        &cursor.digest,
+                        line,
+                    )
                 });
                 let genuine_retry =
                     is_newer_attempt && member.consumed_journal_start && !settled_by_watermark;
@@ -1483,43 +1378,6 @@ impl RunState {
                     && let Some(phase) = value.get("phase").and_then(Value::as_str)
                 {
                     self.assign_phase(&agent_id, phase.to_owned());
-                }
-                // r6 item 1 / r7 items 1+3 / r8 items 1+5: every boundary is
-                // spent once the fold reaches its position — a journal
-                // rotation (different generation), the record itself (whether
-                // it matched by digest, fallback or the pending position), or
-                // a start at a LATER offset. This sweeps EVERY member: a
-                // Pending boundary whose trailing record completes as ANOTHER
-                // agent's start is consumed at its position by that other
-                // member and must be retired on the original member too, not
-                // left armed to be re-armed on every later poll. A Pending
-                // boundary whose digest-bound fallback is reached drops only
-                // the fallback and stays armed for the trailing record. Empty
-                // polls never reach here and therefore keep boundaries armed.
-                let folded_generation = cursor.file_generation.0;
-                let folded_offset = cursor.offset.0;
-                for other in &mut self.members {
-                    let Some(mut cover) = other.failure_watermark.take() else {
-                        continue;
-                    };
-                    let retain = match &mut cover {
-                        UnreadCover::Complete(mark) => {
-                            folded_generation == mark.generation && folded_offset < mark.offset
-                        }
-                        UnreadCover::Pending(boundary) => {
-                            if let Some(mark) = boundary.fallback.as_ref()
-                                && !(folded_generation == mark.generation
-                                    && folded_offset < mark.offset)
-                            {
-                                boundary.fallback = None;
-                            }
-                            folded_generation == boundary.generation
-                                && folded_offset < boundary.offset
-                        }
-                    };
-                    if retain {
-                        other.failure_watermark = Some(cover);
-                    }
                 }
             }
             "result" => {
@@ -1580,37 +1438,6 @@ impl RunState {
         {
             member.phase = Some(phase);
         }
-    }
-
-    /// r5-r7 item 2: arm [`MemberState::failure_watermark`] on the named
-    /// members from the tailer's live-StopFailure marks.
-    fn arm_failure_watermarks(&mut self, armed: &[(String, UnreadCover)]) {
-        for member in &mut self.members {
-            if let Some((_, watermark)) = armed
-                .iter()
-                .find(|(agent_id, _)| agent_id == &member.agent_id)
-            {
-                member.failure_watermark = Some(watermark.clone());
-            }
-        }
-    }
-
-    /// r7 item 1: drop a member's watermark when the tailer observed the
-    /// unread suffix it covered being discarded by an in-place truncate.
-    fn clear_failure_watermark(&mut self, agent_id: &str) {
-        for member in &mut self.members {
-            if member.agent_id == agent_id {
-                member.failure_watermark = None;
-            }
-        }
-    }
-
-    /// Whether the named member still carries an unconsumed terminal
-    /// watermark (the tailer drops its side entry once the fold consumes it).
-    fn member_has_failure_watermark(&self, agent_id: &str) -> bool {
-        self.members
-            .iter()
-            .any(|member| member.agent_id == agent_id && member.failure_watermark.is_some())
     }
 
     fn agent_started(
@@ -1952,7 +1779,6 @@ impl MemberState {
             jsonl: None,
             meta_read: false,
             stopped: false,
-            failure_watermark: None,
         }
     }
 }
@@ -2147,20 +1973,19 @@ fn workflow_native_id(journal_path: &Path) -> String {
 }
 
 #[cfg(test)]
-mod r8_boundary_retire_tests {
+mod r9_cover_fold_tests {
     use super::*;
-    use crate::source::{FileId, PendingBoundary, UnreadCover, UnreadStart};
+    use crate::cover::{Cover, CoverKind, CoverSet, FileId};
     use crate::util::digest_of;
     use remuda_protocol::Id;
 
     const W: u64 = 100;
     const FILE: FileId = FileId { dev: 7, ino: 99 };
 
-    fn failed_member_with(agent_id: &str, watermark: Option<UnreadCover>) -> MemberState {
+    fn failed_placeholder(agent_id: &str) -> MemberState {
         let mut member = MemberState::new_placeholder(agent_id.to_owned());
         member.state = WorkflowState::Failed;
         member.stopped = true;
-        member.failure_watermark = watermark;
         member
     }
 
@@ -2174,93 +1999,103 @@ mod r8_boundary_retire_tests {
         }
     }
 
-    fn pending() -> UnreadCover {
-        UnreadCover::Pending(PendingBoundary {
-            generation: 1,
-            offset: W,
-            extent: W + 33,
-            file_id: FILE,
-            prefix: br#"{"type":"started","key":"v2:k","#.to_vec(),
-            fallback: None,
-        })
+    fn pending(prefix: &[u8]) -> Cover {
+        Cover::pending("a1", FILE, 1, W, W + prefix.len() as u64, prefix.to_vec())
     }
 
-    fn complete() -> UnreadCover {
-        let line = br#"{"type":"started","key":"v2:k","agentId":"a1"}"#;
-        UnreadCover::Complete(UnreadStart {
-            generation: 1,
-            offset: W,
-            digest: digest_of(line),
-            extent: W + line.len() as u64 + 1,
-            file_id: FILE,
-        })
+    fn complete(line: &[u8]) -> Cover {
+        Cover::complete("a1", FILE, 1, W, line)
     }
 
     #[test]
-    fn a_pending_boundary_completed_as_another_agent_retires_on_its_owner() {
-        let mut run = RunState::test_with_members(
-            "wf_r8_retire",
-            vec![failed_member_with("a1", Some(pending()))],
-        );
-        let line = br#"{"type":"started","key":"v2:k","agentId":"a2"}"#;
-        run.fold_journal_line(line, &cursor(line, 1, W));
+    fn a_pending_tail_completed_as_another_members_result_retires_on_its_owner() {
+        // r9 item 5 (r8 item 5 NOT MET): the retirement lives in the fold
+        // loop's per-line note_consumed, not in the started branch. A pending
+        // "{" completing as another member's RESULT record retires the
+        // original owner's cover the moment that line is consumed.
+        let mut run =
+            RunState::test_with_members("wf_r9_result_retire", vec![failed_placeholder("a1")]);
+        let mut covers = CoverSet::new();
+        covers.arm("a1", vec![pending(br#"{"#)]);
 
+        let result = br#"{"type":"result","key":"v2:k2","agentId":"a2"}"#;
+        run.fold_journal_line(result, &cursor(result, 1, W), Some(&covers));
+        covers.note_consumed(1, W);
+
+        assert_eq!(covers.for_agent("a1").count(), 0, "a1's cover is retired");
         let a1 = run
             .members
             .iter()
             .find(|member| member.agent_id == "a1")
             .unwrap();
-        assert!(
-            a1.failure_watermark.is_none(),
-            "the boundary is consumed at its position by a2's record and must retire on a1"
-        );
         assert_eq!(a1.state, WorkflowState::Failed, "a1's outcome is untouched");
-        assert!(
-            run.members.iter().any(|member| member.agent_id == "a2"),
-            "the other agent's member was created by the fold"
-        );
+
+        // With the cover gone, a byte-identical a1 start reusing the position
+        // is not settled by it.
+        let started = br#"{"type":"started","key":"v2:k","agentId":"a1"}"#;
+        assert!(!covers.settles("a1", 1, W, &digest_of(started), started));
     }
 
     #[test]
-    fn a_pending_boundary_retires_on_rotation_another_member_consumes() {
-        let mut run = RunState::test_with_members(
-            "wf_r8_retire_rotate",
-            vec![failed_member_with("a1", Some(pending()))],
-        );
-        // New generation: a2's start at offset 0 is the first folded record.
-        let line = br#"{"type":"started","key":"v2:k2","agentId":"a2"}"#;
-        run.fold_journal_line(line, &cursor(line, 2, 0));
+    fn the_covered_start_stays_failed_and_a_later_start_resurrects_in_one_fold() {
+        let mut run =
+            RunState::test_with_members("wf_r9_cover_fold", vec![failed_placeholder("a1")]);
+        let mut covers = CoverSet::new();
+        let attempt2 = br#"{"type":"started","key":"v2:k","agentId":"a1"}"#;
+        covers.arm("a1", vec![complete(attempt2)]);
 
-        assert!(
+        // The settled attempt at the cover folds first: Failed held.
+        run.fold_journal_line(attempt2, &cursor(attempt2, 1, W), Some(&covers));
+        covers.note_consumed(1, W);
+        assert_eq!(
             run.members
                 .iter()
                 .find(|member| member.agent_id == "a1")
                 .unwrap()
-                .failure_watermark
-                .is_none(),
-            "a rotation observed while another member's record folds retires a1's boundary"
+                .state,
+            WorkflowState::Failed
+        );
+
+        // A genuine retry appended after the covered record, same poll.
+        let attempt3 = br#"{"type":"started","key":"v2:k","agentId":"a1","label":"retry"}"#;
+        let offset3 = W + attempt2.len() as u64 + 1;
+        run.fold_journal_line(attempt3, &cursor(attempt3, 1, offset3), Some(&covers));
+        assert_eq!(
+            run.members
+                .iter()
+                .find(|member| member.agent_id == "a1")
+                .unwrap()
+                .state,
+            WorkflowState::Running
         );
     }
 
     #[test]
-    fn a_complete_cover_retires_when_another_member_reaches_its_position() {
-        let mut run = RunState::test_with_members(
-            "wf_r8_retire_complete",
-            vec![failed_member_with("a1", Some(complete()))],
-        );
-        // A different record at the covered position (digest mismatch, routed
-        // to a2) still spends the boundary on the original member.
+    fn a_pending_completion_of_another_agent_does_not_settle() {
+        let mut run =
+            RunState::test_with_members("wf_r9_other_agent", vec![failed_placeholder("a1")]);
+        let mut covers = CoverSet::new();
+        covers.arm("a1", vec![pending(br#"{"type":"started","agentId"#)]);
+
+        // The trailing record resolves to a2's start: the started fold routes
+        // it to a2 and the cover (keyed to a1) never settles a2; consuming
+        // the position retires a1's cover anyway.
         let line = br#"{"type":"started","key":"v2:k","agentId":"a2"}"#;
-        run.fold_journal_line(line, &cursor(line, 1, W));
-
-        assert!(
+        run.fold_journal_line(line, &cursor(line, 1, W), Some(&covers));
+        covers.note_consumed(1, W);
+        assert_eq!(covers.for_agent("a1").count(), 0);
+        assert!(run.members.iter().any(|member| member.agent_id == "a2"));
+        assert_eq!(
             run.members
                 .iter()
                 .find(|member| member.agent_id == "a1")
                 .unwrap()
-                .failure_watermark
-                .is_none(),
-            "a Complete cover reached at its position by another member also retires"
+                .state,
+            WorkflowState::Failed
+        );
+        assert_eq!(
+            covers.for_agent("a1").next().map(|c| c.kind),
+            None::<CoverKind>
         );
     }
 }

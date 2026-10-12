@@ -1,6 +1,7 @@
 //! External event sources and JSONL file tails.
 
 use crate::Error;
+use crate::cover::{Cover, CoverSet, FileId, ObservedFile};
 use crate::envelope::Envelope;
 use crate::util::digest_of;
 use remuda_protocol::{
@@ -118,146 +119,23 @@ pub struct FileTail {
     offset: u64,
     prefix_digest: Option<Digest>,
     /// Length of the file at the most recent open by [`Self::poll`] or
-    /// [`Self::unread_start`]; `None` until one has succeeded. A failure
-    /// watermark armed by the peek remembers the extent it observed, so a
-    /// later open can tell that unread bytes were discarded by a truncate
-    /// that did NOT bump the generation (len stayed at/after the cursor).
+    /// [`Self::unread_start`]; `None` until one has succeeded. Used to detect
+    /// an in-place truncate that discarded unread bytes without a rotation
+    /// (len stayed at/after the cursor) and to revalidate armed covers.
     last_len: Option<u64>,
     /// Device/inode identity of the file at the most recent open, so a
     /// replacement (rename/new file at the same path) is distinguishable from
     /// an in-place truncate even when sizes and generations coincide.
     file_id: Option<FileId>,
-    /// What the most recent open observed relative to the previous one. Every
-    /// poll and failure peek refreshes this BEFORE records are folded, so the
-    /// caller can invalidate armed covers the moment the file contradicts
-    /// them.
-    last_observation: Option<FileObservation>,
+    /// Independent failure-settlement covers armed by live-failure peeks.
+    /// EVERY open by poll or peek revalidates the whole set against the
+    /// opened file before any record is folded.
+    covers: CoverSet,
     /// Unread bytes from the read cursor captured by the most recent open
-    /// (BEFORE that open's poll advances the cursor); used to verify a
-    /// pending boundary's observed prefix byte-for-byte.
+    /// (BEFORE that open's poll advances the cursor); also consumed by
+    /// rotation detection when the cursor is anchored at offset 0.
     last_rest_base: u64,
     last_rest: Vec<u8>,
-}
-
-/// Stable kernel identity of one opened file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileId {
-    /// Device id.
-    pub dev: u64,
-    /// Inode number.
-    pub ino: u64,
-}
-
-/// What the most recent open of the journal showed relative to the open
-/// before it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FileObservation {
-    /// The path now resolves to a DIFFERENT file (device/inode changed): a
-    /// rename or replacement since the previous open.
-    pub replaced: bool,
-    /// The file is strictly shorter than at the previous open (unread bytes
-    /// may have been discarded above the cursor without a rotation).
-    pub shrunk: bool,
-    /// Length of the opened file.
-    pub len: u64,
-    /// Identity of the opened file.
-    pub file_id: Option<FileId>,
-}
-
-/// The NEWEST complete `started` record a live-failure peek finds in the
-/// still-unread tail, plus the file extent observed while finding it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnreadStart {
-    /// File generation the record belongs to (normalised against the open
-    /// file by the peek).
-    pub generation: u64,
-    /// Byte offset of the record's first byte, in the normalised generation.
-    pub offset: u64,
-    /// Digest of the record bytes — the same digest [`Self::poll`] puts on
-    /// the folded `FileCursor`, so the watermark can bind to the exact
-    /// record rather than to an offset alone.
-    pub digest: Digest,
-    /// File length at peek time. The record's bytes live below this extent;
-    /// a later same-generation file no longer than `offset` discarded them.
-    pub extent: u64,
-    /// Kernel identity of the file the record was observed in.
-    pub file_id: FileId,
-}
-
-/// A trailing record still TORN INSIDE its bytes at peek time. Its type
-/// and/or agent identity may not be written yet; both are validated against
-/// the COMPLETED record when the fold consumes it (it only covers a start of
-/// the failing member at its exact start offset).
-///
-/// The boundary binds to the exact bytes observed (`prefix` over
-/// `offset..extent`): a later file state must keep that prefix byte-for-byte
-/// and must never have shrunk below `extent`, or the completion belongs to a
-/// different write and the boundary is invalidated. When the trailing record
-/// is still unresolved but an EARLIER complete `started` for the same agent
-/// sits in the unread tail, that record is kept as a digest-bound `fallback`
-/// so the failure stays settled even if the trailing record completes as
-/// something other than the member's start.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingBoundary {
-    /// File generation the partial record is being written in.
-    pub generation: u64,
-    /// Byte offset of the partial record's first byte.
-    pub offset: u64,
-    /// File length observed at peek time.
-    pub extent: u64,
-    /// Kernel identity of the file the partial bytes were observed in.
-    pub file_id: FileId,
-    /// Raw bytes observed at `offset..extent`; the completion must continue
-    /// exactly these bytes.
-    pub prefix: Vec<u8>,
-    /// Newest complete matching `started` earlier in the same peek, kept
-    /// while the trailing record's type/identity is unresolved.
-    pub fallback: Option<UnreadStart>,
-}
-
-/// What a live-failure peek found at the newest unread position.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UnreadCover {
-    /// A complete `started` record on disk (terminated, or awaiting only its
-    /// newline). Bound by record digest.
-    Complete(UnreadStart),
-    /// A trailing record captured mid-write; type and agent identity are
-    /// validated against the completed JSON when it folds.
-    Pending(PendingBoundary),
-}
-
-impl UnreadCover {
-    /// Generation the covered record belongs to.
-    pub fn generation(&self) -> u64 {
-        match self {
-            UnreadCover::Complete(mark) => mark.generation,
-            UnreadCover::Pending(boundary) => boundary.generation,
-        }
-    }
-
-    /// Start offset of the covered record.
-    pub fn offset(&self) -> u64 {
-        match self {
-            UnreadCover::Complete(mark) => mark.offset,
-            UnreadCover::Pending(boundary) => boundary.offset,
-        }
-    }
-
-    /// File extent observed while arming the cover.
-    pub fn extent(&self) -> u64 {
-        match self {
-            UnreadCover::Complete(mark) => mark.extent,
-            UnreadCover::Pending(boundary) => boundary.extent,
-        }
-    }
-
-    /// Kernel file identity the cover was captured against.
-    pub fn file_id(&self) -> FileId {
-        match self {
-            UnreadCover::Complete(mark) => mark.file_id,
-            UnreadCover::Pending(boundary) => boundary.file_id,
-        }
-    }
 }
 
 /// Completed JSONL lines with their file cursors, as a poll folds them.
@@ -283,7 +161,7 @@ impl FileTail {
             prefix_digest: None,
             last_len: None,
             file_id: None,
-            last_observation: None,
+            covers: CoverSet::new(),
             last_rest_base: 0,
             last_rest: Vec::new(),
         })
@@ -309,7 +187,7 @@ impl FileTail {
             prefix_digest: None,
             last_len: None,
             file_id: None,
-            last_observation: None,
+            covers: CoverSet::new(),
             last_rest_base: 0,
             last_rest: Vec::new(),
         })
@@ -325,7 +203,7 @@ impl FileTail {
             prefix_digest: resume.prefix_digest,
             last_len: None,
             file_id: None,
-            last_observation: None,
+            covers: CoverSet::new(),
             last_rest_base: 0,
             last_rest: Vec::new(),
         }
@@ -351,56 +229,47 @@ impl FileTail {
         self.offset
     }
 
-    /// Find the NEWEST unread `started` for `agent_id` as an [`UnreadCover`]
-    /// — or `None`. A terminated record, or a trailing newline-free segment
-    /// that already parses whole, is a digest-bound [`UnreadCover::Complete`];
-    /// a trailing segment torn while its type/identity could still resolve to
-    /// this member's start arms an [`UnreadCover::Pending`] boundary carrying
-    /// the exact observed prefix bytes; type and identity are validated
-    /// against the completed record when it folds.
+    /// Find EVERY unread `started` for `agent_id` as an independent
+    /// [`Cover`]: one complete-record cover per terminated (or
+    /// newline-awaiting) complete `started`, plus one pending-tail cover when
+    /// the trailing segment is torn while its type/identity could still
+    /// resolve to this member.
     ///
-    /// A Pending boundary also carries the newest digest-bound COMPLETE match
-    /// earlier in the same tail as a fallback, so an unresolved trailing
-    /// record never costs the failure coverage the earlier record provides.
-    /// Matches on `agentId`, falling back to `key` for complete records that
-    /// omit it.
+    /// The open itself (like every poll open) revalidates the WHOLE cover
+    /// set against the opened file FIRST, so covers another member's peek
+    /// already contradicted are retired before this peek's fresh covers are
+    /// armed; the returned covers REPLACE the member's previous covers (other
+    /// members' covers are untouched).
     ///
-    /// Does NOT consume records, but it DOES apply the same rotation
+    /// Does NOT consume records, but it applies the same rotation
     /// normalisation against the opened file as [`Self::poll`] (a
     /// replace/truncate or prefix rewrite since the last poll starts a fresh
     /// generation here too), so positions are reported in the generation the
-    /// next fold will use. A live StopFailure uses the result as a terminal
-    /// watermark: only starts at or before that position, and at a Complete
-    /// position only with the SAME record digest, are the failure's own
-    /// settled attempt; a start at a later offset is a genuine retry and must
-    /// resurrect the member even when both fold in the same poll.
+    /// next fold will use. A live StopFailure uses the covers as terminal
+    /// watermarks: a folded `started` is suppressed only when its identity and
+    /// bytes match a live cover; a start appended AFTER the failure resurrects
+    /// the member even when both fold in the same poll.
     ///
     /// Completeness agrees with [`Self::poll`] on every terminated record, but
     /// the peek ALSO covers records the poll cannot consume yet: a complete
-    /// record awaiting only its newline (Complete), and a record torn inside
-    /// its JSON (Pending). [`Self::poll`] consumes nothing on the first polls,
-    /// so the caller keeps the cover armed through those empty polls until the
-    /// record is actually consumed. Skipping the incomplete tail here would
-    /// leave a StopFailure arriving mid-write unprotected.
-    ///
-    /// The opened file's identity, extent and bytes are remembered so every
-    /// later open (poll or another failure peek) can invalidate the cover the
-    /// moment a replacement, shrink or rewrite contradicts it (see
-    /// [`Self::cover_is_valid`]).
-    pub fn unread_start(&mut self, agent_id: &str) -> Result<Option<UnreadCover>, Error> {
-        // Normalise against the OPENED file (a replace/truncate since the
-        // last poll starts a new generation here, not only later in poll), so
-        // the watermark binds to the generation its record will actually fold
-        // in.
+    /// record awaiting only its newline, and a record torn inside its JSON.
+    /// [`Self::poll`] consumes nothing on the first polls, so the caller keeps
+    /// the covers armed through those empty polls until the record is actually
+    /// consumed.
+    pub(crate) fn unread_start(&mut self, agent_id: &str) -> Result<Vec<Cover>, Error> {
+        // open_normalised revalidates the whole cover set against the OPENED
+        // file (a replace/truncate since the last poll starts a new generation
+        // here, not only later in poll), so the covers bind to the generation
+        // their records will actually fold in.
         let Some(OpenedTail {
             rest, len, file_id, ..
         }) = self.open_normalised()?
         else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
-        let mut newest: Option<UnreadStart> = None;
+        let mut covers: Vec<Cover> = Vec::new();
         let mut start = 0usize;
-        let record_start = |line: &[u8], at: usize, newest: &mut Option<UnreadStart>| {
+        let complete_at = |line: &[u8], at: usize, covers: &mut Vec<Cover>| {
             if !line.is_empty()
                 && let Ok(value) = serde_json::from_slice::<serde_json::Value>(line)
                 && value.get("type").and_then(serde_json::Value::as_str) == Some("started")
@@ -410,13 +279,13 @@ impl FileTail {
                     .or_else(|| value.get("key").and_then(serde_json::Value::as_str))
                     .is_some_and(|id| id == agent_id)
             {
-                *newest = Some(UnreadStart {
-                    generation: self.generation,
-                    offset: self.offset + at as u64,
-                    digest: digest_of(line),
-                    extent: len,
+                covers.push(Cover::complete(
+                    agent_id,
                     file_id,
-                });
+                    self.generation,
+                    self.offset + at as u64,
+                    line,
+                ));
             }
         };
         for (i, byte) in rest.iter().enumerate() {
@@ -427,12 +296,13 @@ impl FileTail {
             if let Some(without_cr) = line.strip_suffix(b"\r") {
                 line = without_cr;
             }
-            record_start(line, start, &mut newest);
+            complete_at(line, start, &mut covers);
             start = i + 1;
         }
         // Trailing newline-free segment: either a complete record awaiting
-        // only its newline, or a record torn inside its JSON (Pending) —
-        // including a tear BEFORE the type/identity values resolve.
+        // only its newline (a complete cover), or a record torn inside its
+        // JSON (a pending cover) — including a tear BEFORE the type/identity
+        // values resolve.
         if start < rest.len() {
             let raw = &rest[start..];
             let mut line = raw;
@@ -440,77 +310,36 @@ impl FileTail {
                 line = without_cr;
             }
             if serde_json::from_slice::<serde_json::Value>(line).is_ok() {
-                record_start(line, start, &mut newest);
+                complete_at(line, start, &mut covers);
             } else if partial_started_prefix(line, agent_id) {
-                return Ok(Some(UnreadCover::Pending(PendingBoundary {
-                    generation: self.generation,
-                    offset: self.offset + start as u64,
-                    extent: len,
+                covers.push(Cover::pending(
+                    agent_id,
                     file_id,
-                    prefix: raw.to_vec(),
-                    // The trailing record could still resolve to something
-                    // other than the failing member's start; the newest
-                    // complete match earlier in the tail remains covered.
-                    fallback: newest,
-                })));
+                    self.generation,
+                    self.offset + start as u64,
+                    len,
+                    line.to_vec(),
+                ));
             }
         }
-        Ok(newest.map(UnreadCover::Complete))
+        // Replace this member's covers with the fresh peek; every other
+        // member's independently validated covers stays armed.
+        let fresh = covers.clone();
+        self.covers.arm(agent_id, covers);
+        Ok(fresh)
     }
 
-    /// What the most recent open by poll or peek observed relative to the
-    /// open before it (replacement, shrink, length, identity).
-    pub fn last_observation(&self) -> Option<FileObservation> {
-        self.last_observation
+    /// The failure-settlement covers armed on this tail.
+    pub(crate) fn covers(&self) -> &CoverSet {
+        &self.covers
     }
 
-    /// Whether a cover armed at an earlier open is still consistent with the
-    /// MOST RECENTLY observed file state. The caller invokes this BEFORE
-    /// folding records on every poll and failure peek, and retires any cover
-    /// it rejects, so a reused position can never be mistaken for the settled
-    /// record:
-    /// - a journal rotation (cover generation != current) retires it;
-    /// - a replacement (different device/inode) retires it;
-    /// - a Complete cover retires once an observed shrink removes the bytes
-    ///   at its record start;
-    /// - a Pending boundary retires the moment the file no longer reaches the
-    ///   observed extent (any shrink through the captured partial bytes, even
-    ///   one above the record start), or the captured prefix no longer matches
-    ///   the file's bytes at its offset (rewrite in place).
-    pub fn cover_is_valid(&self, cover: &UnreadCover) -> bool {
-        let Some(obs) = self.last_observation else {
-            return true;
-        };
-        if cover.generation() != self.generation {
-            return false;
-        }
-        if obs.file_id.is_some_and(|id| id != cover.file_id()) {
-            return false;
-        }
-        match cover {
-            UnreadCover::Complete(mark) => !(obs.shrunk && obs.len <= mark.offset),
-            UnreadCover::Pending(boundary) => {
-                if obs.len < boundary.extent {
-                    return false;
-                }
-                self.prefix_intact(boundary)
-            }
-        }
-    }
-
-    /// Whether the file bytes at the boundary's offset still equal the prefix
-    /// captured when the pending boundary was armed.
-    fn prefix_intact(&self, boundary: &PendingBoundary) -> bool {
-        let Some(relative) = boundary.offset.checked_sub(self.last_rest_base) else {
-            // Same generation but the window starts after the boundary; the
-            // observed bytes no longer cover it.
-            return false;
-        };
-        let relative = relative as usize;
-        let end = relative.saturating_add(boundary.prefix.len());
-        self.last_rest
-            .get(relative..end)
-            .is_some_and(|bytes| bytes == boundary.prefix)
+    /// Retire covers whose record the fold just reached (any member, any
+    /// record type). Called by the workflow fold after EACH consumed line, in
+    /// fold order, so a start appended after the covered record still
+    /// resurrects in the same poll.
+    pub(crate) fn note_consumed(&mut self, generation: u64, offset: u64) {
+        self.covers.note_consumed(generation, offset);
     }
 
     /// Persistable cursor.
@@ -525,26 +354,13 @@ impl FileTail {
     }
 
     /// Read every newly completed JSONL line. Incomplete trailing lines wait.
+    /// The open revalidates armed covers before any line is returned; the
+    /// workflow fold retires them as it consumes each line via
+    /// [`Self::note_consumed`].
     pub fn poll(&mut self) -> Result<PolledLines, Error> {
-        Ok(self.poll_with_covers(&[])?.0)
-    }
-
-    /// Like [`Self::poll`], but each supplied armed cover is validated against
-    /// THIS open's file state (replacement, rotation, shrink through the
-    /// captured bytes, rewritten prefix) BEFORE the cursor advances or any
-    /// record is folded. The returned flags align with `covers` (`true` = the
-    /// cover is contradicted and must be retired).
-    pub fn poll_with_covers(
-        &mut self,
-        covers: &[UnreadCover],
-    ) -> Result<(PolledLines, Vec<bool>), Error> {
         let Some(OpenedTail { mut file, rest, .. }) = self.open_normalised()? else {
-            return Ok((Vec::new(), vec![false; covers.len()]));
+            return Ok(Vec::new());
         };
-        let invalid: Vec<bool> = covers
-            .iter()
-            .map(|cover| !self.cover_is_valid(cover))
-            .collect();
         let mut lines: PolledLines = Vec::new();
         let mut start = 0usize;
         for (i, byte) in rest.iter().enumerate() {
@@ -572,7 +388,7 @@ impl FileTail {
         }
         self.offset += start as u64;
         self.refresh_prefix(&mut file)?;
-        Ok((lines, invalid))
+        Ok(lines)
     }
 
     /// Open the journal and apply the SAME rotation / effective-cursor
@@ -598,9 +414,9 @@ impl FileTail {
         };
         // Observe the file BEFORE normalisation: a replacement (different
         // device/inode) or an in-place shrink is recorded against the previous
-        // open so armed covers can be retired before any record is folded.
+        // open so detect_rotation (and the cover revalidation below) can act
+        // before any record is folded.
         let replaced = self.file_id.is_some_and(|id| id != opened_id);
-        let shrunk = self.last_len.is_some_and(|prev| len < prev);
         self.detect_rotation(&mut file, len, replaced)?;
         let rest_base = self.offset;
         file.seek(SeekFrom::Start(rest_base))?;
@@ -608,18 +424,22 @@ impl FileTail {
         file.read_to_end(&mut rest)?;
         // Remember the observed extent and identity for the next open. The
         // rest window is anchored to the cursor BEFORE this open's poll
-        // consumes it, so a cover can still be validated against the folded
-        // bytes afterwards.
+        // consumes it, so rotation detection at offset 0 can still compare it.
         self.last_len = Some(len);
         self.file_id = Some(opened_id);
-        self.last_observation = Some(FileObservation {
-            replaced,
-            shrunk,
-            len,
-            file_id: Some(opened_id),
-        });
         self.last_rest_base = rest_base;
         self.last_rest = rest.clone();
+        // Revalidate (and grow pending tails of) EVERY armed cover against
+        // THIS open before poll folds or peek re-arms. Poll and peek share
+        // this path, so a cover is contradicted the first open that sees it,
+        // whichever member triggered the open.
+        self.covers.observe(&ObservedFile {
+            file_id: opened_id,
+            generation: self.generation,
+            len,
+            rest_base,
+            rest: &rest,
+        });
         Ok(Some(OpenedTail {
             file,
             len,

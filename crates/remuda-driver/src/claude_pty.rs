@@ -248,6 +248,13 @@ pub struct ClaudePtyDriver {
     /// Test-only close/abort fault injection (c-ctxusage r8 item 6); injected
     /// before `start`, always `None` in production.
     test_faults: std::sync::Mutex<Option<Arc<crate::test_faults::FaultState>>>,
+    /// Close-phase owner (c-ctxusage r14 item 5): serialises the WHOLE close —
+    /// verified stop, final drain, reap and the terminal lifecycle emission —
+    /// so an overlapping close (a purge arriving while an instance.close is in
+    /// flight) cannot double-run the reap or emit a second carrier_closed. The
+    /// guard is released on every early error return, keeping the phases
+    /// resumable by the next caller.
+    close_phase: tokio::sync::Mutex<()>,
 }
 
 impl ClaudePtyDriver {
@@ -262,6 +269,7 @@ impl ClaudePtyDriver {
             closed: AtomicBool::new(false),
             seq: Arc::new(AtomicU64::new(0)),
             test_faults: std::sync::Mutex::new(None),
+            close_phase: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -1170,6 +1178,24 @@ impl Driver for ClaudePtyDriver {
     }
 
     async fn close(&self) -> DriverResult<DriverAck> {
+        // c-ctxusage r14 item 5: one close-phase owner for the whole close. A
+        // purge closing a still-live instance while the queued instance.close
+        // is in flight used to run two interleaved close bodies — the second
+        // re-ran the reap and emitted a duplicate carrier_closed. The guard is
+        // taken before any state changes and dropped on every early `?`, so the
+        // r13 item 2 resumability is preserved: the next close simply acquires
+        // it and finishes the pending phases.
+        {
+            let faults = self
+                .test_faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(faults) = faults.as_ref() {
+                faults.note_close_phase_called();
+            }
+        }
+        let _close_guard = self.close_phase.lock().await;
         self.closed.store(true, Ordering::SeqCst);
         let mut inner = self.inner.lock().await;
         let Some(live) = inner.as_mut() else {
@@ -1280,6 +1306,21 @@ impl Driver for ClaudePtyDriver {
         let ctx = live.ctx.clone();
         let recipe = live.recipe.clone();
         drop(inner);
+        // Test-only seam (c-ctxusage r14 item 5): park the FIRST close here —
+        // after the verified stop and final drain, while still holding the
+        // close-phase owner, before reap and the terminal emission — so an
+        // overlapping second close can be deterministically queued behind it.
+        // Inert in production (no injected faults). Clone the Arc as an owned
+        // value BEFORE awaiting: the std MutexGuard is !Send and must not live
+        // across the park await.
+        let tail_faults = self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(faults) = tail_faults.as_ref() {
+            faults.await_close_tail_gate().await;
+        }
         // Phase 2 of close: the final transcript append interrupted by Ctrl-C
         // is drained above; tear down the panes/tab/workspace now.
         self.resources.reap().await?;

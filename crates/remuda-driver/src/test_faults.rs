@@ -101,6 +101,20 @@ pub(crate) struct FaultState {
     /// window (c-ctxusage r13 item 2): one decremented failure per close
     /// attempt, so a retried close probes cleanly.
     close_probe_failures: AtomicU64,
+    /// Arms the one-shot gate that parks the first close between its final
+    /// drain and its reap/terminal emission (c-ctxusage r14 item 5).
+    close_tail_armed: AtomicBool,
+    /// Acknowledged when the armed close reaches the park point.
+    close_tail_entered: Mutex<bool>,
+    close_tail_entered_cv: Condvar,
+    /// Async gate the parked close awaits; the test opens it once the
+    /// overlapping second close is queued on the close-phase owner.
+    close_tail_gate: tokio::sync::Notify,
+    /// Number of close() calls that have reached the close-phase entry
+    /// (signalled BEFORE acquiring the owner), so a test can prove a second
+    /// close is genuinely in flight without any timing inference.
+    close_phase_calls: Mutex<u64>,
+    close_phase_calls_cv: Condvar,
 }
 
 /// A parked phase must never wait forever on a test that forgot to release:
@@ -142,7 +156,48 @@ impl FaultState {
             pending_capacity: AtomicU64::new(0),
             agent_exit_grace_ms: AtomicU64::new(0),
             close_probe_failures: AtomicU64::new(0),
+            close_tail_armed: AtomicBool::new(false),
+            close_tail_entered: Mutex::new(false),
+            close_tail_entered_cv: Condvar::new(),
+            close_tail_gate: tokio::sync::Notify::new(),
+            close_phase_calls: Mutex::new(0),
+            close_phase_calls_cv: Condvar::new(),
         })
+    }
+
+    /// Record one close() call reaching the close-phase entry. Signalled
+    /// BEFORE the close-phase owner is acquired, so it proves an overlapping
+    /// close is in flight even while it is queued behind the first one
+    /// (c-ctxusage r14 item 5).
+    pub(crate) fn note_close_phase_called(&self) {
+        let mut calls = self
+            .close_phase_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *calls += 1;
+        self.close_phase_calls_cv.notify_all();
+    }
+
+    /// Park the first close after its final drain and before reap/terminal
+    /// emission. Inert unless armed; bounded so a test that arms but never
+    /// releases cannot wedge the binary.
+    pub(crate) async fn await_close_tail_gate(&self) {
+        if !self.close_tail_armed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        *self
+            .close_tail_entered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.close_tail_entered_cv.notify_all();
+        // The test opens the gate with notify_waiters once the overlapping
+        // close is queued; the 120 s bound turns a forgotten release into a
+        // loud test failure instead of a hang.
+        let parked = self.close_tail_gate.notified();
+        match tokio::time::timeout(Duration::from_secs(120), parked).await {
+            Ok(()) => {}
+            Err(_) => tracing::debug!("close-tail gate timed out; proceeding"),
+        }
     }
 
     /// Called from INSIDE the blocking phase (a spawn_blocking closure).
@@ -447,6 +502,42 @@ impl TranscriptFaults {
         self.inner
             .close_probe_failures
             .store(u64::from(attempts), Ordering::SeqCst);
+    }
+
+    /// Arm the one-shot gate that parks the first close between its final
+    /// drain and its reap/terminal emission (c-ctxusage r14 item 5).
+    pub fn arm_close_tail_gate(&self) {
+        self.inner.close_tail_armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Release a close parked at the close-tail gate.
+    pub fn release_close_tail(&self) {
+        self.inner.close_tail_gate.notify_waiters();
+    }
+
+    /// Block until the armed close reaches its tail park point (bounded).
+    pub fn wait_close_tail_entered(&self) -> bool {
+        Self::wait_true(
+            &self.inner.close_tail_entered,
+            &self.inner.close_tail_entered_cv,
+            Duration::from_secs(60),
+        )
+    }
+
+    /// Block until `n` close() calls have reached the close-phase entry
+    /// (bounded, c-ctxusage r14 item 5).
+    pub fn wait_close_phase_calls(&self, n: u64) -> bool {
+        let guard = self
+            .inner
+            .close_phase_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (guard, _) = self
+            .inner
+            .close_phase_calls_cv
+            .wait_timeout_while(guard, Duration::from_secs(60), |calls| *calls < n)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard >= n
     }
 
     /// Open the gate and let every parked blocking phase proceed.

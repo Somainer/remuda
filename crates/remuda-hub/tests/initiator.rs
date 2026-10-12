@@ -122,9 +122,32 @@ impl GateRunHook {
             .expect("gate.run frame never arrived");
     }
 
+    #[allow(dead_code)]
     fn release(&self) {
         self.released.store(true, Ordering::SeqCst);
         self.release.notify_waiters();
+    }
+
+    /// Release the parked gate.run and WAIT (bounded) for the parked frame to
+    /// actually proceed, so a release that misses the parked run fails the
+    /// test fast instead of hanging the whole suite on its outer timeout
+    /// (r14 item 8d). The fake Node's reply task reads this latch; here we
+    /// verify the latch is observed and then the caller asserts on the job.
+    async fn release_and_wait_proceeded(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.release.notify_waiters();
+        // No waiter counter is exposed on Notify; the observable proof that the
+        // parked frame proceeded is left to the caller (the job reaches the
+        // expected state under its own bounded wait). This deadline only guards
+        // the latch observation itself.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !self.released.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            self.released.load(Ordering::SeqCst),
+            "gate.run release latch not observed within the deadline"
+        );
     }
 
     fn result(&self) -> Value {
@@ -2462,7 +2485,9 @@ async fn the_finished_event_and_the_gate_run_reply_both_feed_the_real_log_path()
     // ENTRY POINT 2: release the parked gate.run RPC so its reply — the
     // second real entry — is delivered. The pre-read barrier stops BOTH
     // after they observe the still-Running row (neither commits yet).
-    hook.release();
+    // Bounded release + the barrier's own bounded wait_parked prove the
+    // parked frame proceeded (r14 item 8d).
+    hook.release_and_wait_proceeded().await;
     barrier.wait_parked(2).await;
     assert_eq!(
         ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap()["state"],
@@ -3410,7 +3435,7 @@ async fn an_rpc_failure_for_attempt_one_does_not_fail_running_attempt_two() {
     // observing running immediately and watching it remain running across a
     // window comfortably longer than a verdict write takes.
     hook1.reply_error();
-    hook1.release();
+    hook1.release_and_wait_proceeded().await;
     let stability = tokio::time::Instant::now() + Duration::from_millis(250);
     loop {
         let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
@@ -3427,7 +3452,7 @@ async fn an_rpc_failure_for_attempt_one_does_not_fail_running_attempt_two() {
 
     // The CURRENT (attempt 2) gate.run RPC error does fail it.
     hook2.reply_error();
-    hook2.release();
+    hook2.release_and_wait_proceeded().await;
     for _ in 0..100 {
         let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
         if doc["state"] == json!("failed") {

@@ -117,15 +117,18 @@ impl TokenCounters {
         }
     }
 
-    /// Add two optional counts when folding separate model calls: a bucket
-    /// reported by only one side is taken as that side's value (the
-    /// unreported call contributes nothing to the bucket), and Unknown
-    /// survives only when NEITHER side reported it. Never a fabricated zero.
-    fn add_bucket(a: Option<u64>, b: Option<u64>) -> Option<u64> {
-        match (a, b) {
-            (Some(a), Some(b)) => Some(a + b),
-            (Some(a), None) | (None, Some(a)) => Some(a),
-            (None, None) => None,
+    /// Fold one contributing CALL's bucket into a non-empty accumulator: the
+    /// folded sum is Known only when EVERY contributing call reported the
+    /// bucket. A single omitted contribution — on either side — makes it
+    /// Unknown, so two calls where the second omits input fold to Unknown
+    /// input rather than presenting the first call's number as the complete
+    /// sum (U1, c-ctxusage r16 item 4). Callers seed the accumulator with the
+    /// first call verbatim so an empty accumulator is not mistaken for an
+    /// unknown contribution.
+    fn fold_bucket(acc: Option<u64>, contribution: Option<u64>) -> Option<u64> {
+        match (acc, contribution) {
+            (Some(acc), Some(part)) => Some(acc + part),
+            _ => None,
         }
     }
 
@@ -140,15 +143,17 @@ impl TokenCounters {
         Some(total)
     }
 
-    /// Per-bucket sum of two counter sets, Unknown propagating.
+    /// Per-bucket fold of another call's counters into a non-empty
+    /// accumulator. Unknown on ANY omitted constituent (U1,
+    /// c-ctxusage r16 item 4); see [`Self::fold_bucket`].
     #[must_use]
-    pub fn merge_counts(self, other: &Self) -> Self {
+    pub fn fold_counts(self, contribution: &Self) -> Self {
         Self {
-            uncached_input: Self::add_bucket(self.uncached_input, other.uncached_input),
-            output: Self::add_bucket(self.output, other.output),
-            cache_read: Self::add_bucket(self.cache_read, other.cache_read),
-            cache_write_5m: Self::add_bucket(self.cache_write_5m, other.cache_write_5m),
-            cache_write_1h: Self::add_bucket(self.cache_write_1h, other.cache_write_1h),
+            uncached_input: Self::fold_bucket(self.uncached_input, contribution.uncached_input),
+            output: Self::fold_bucket(self.output, contribution.output),
+            cache_read: Self::fold_bucket(self.cache_read, contribution.cache_read),
+            cache_write_5m: Self::fold_bucket(self.cache_write_5m, contribution.cache_write_5m),
+            cache_write_1h: Self::fold_bucket(self.cache_write_1h, contribution.cache_write_1h),
         }
     }
 
@@ -509,5 +514,23 @@ mod tests {
         assert_eq!(t.cache_write(), None);
         assert_eq!(t.total_input(), None);
         assert_eq!(t.total(), None, "Unknown never collapses to a zero");
+    }
+
+    #[test]
+    fn a_fold_with_any_omitted_constituent_is_unknown() {
+        // U1 (c-ctxusage r16 item 4): the first call reports every bucket;
+        // the second omits input. Folding a real contribution on top must
+        // poison input to Unknown rather than keeping the first call's number
+        // as the complete sum.
+        let first = TokenCounters::known(100, 10, 0, 0, 0);
+        let second = TokenCounters {
+            output: Some(20),
+            ..TokenCounters::default()
+        };
+        let folded = first.fold_counts(&second);
+        assert_eq!(folded.uncached_input, None);
+        assert_eq!(folded.output, Some(30));
+        assert_eq!(folded.cache_read, None);
+        assert_eq!(folded.total(), None, "a partial fold never yields a total");
     }
 }

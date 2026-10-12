@@ -1556,6 +1556,7 @@ async fn provider_usage(
                     crate::usage_store::BudgetStatus::Ok => "ok",
                     crate::usage_store::BudgetStatus::Warn => "warn",
                     crate::usage_store::BudgetStatus::Stop => "stop",
+                    crate::usage_store::BudgetStatus::Unknown => "unknown",
                 },
                 "estimated": true,
             }));

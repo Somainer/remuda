@@ -582,3 +582,101 @@ fn a_partial_transcript_record_keeps_omitted_buckets_unknown_end_to_end() {
          (an unreported cost never erases a known one) rather than priced on zeros"
     );
 }
+
+/// U1 (c-ctxusage r16 item 4), real mapper → Hub: a message whose native
+/// usage reports ONLY output at every revision must keep the total Unknown —
+/// output-only rev 1 followed by output-only rev 2 never derives a total from
+/// the one known basket (that would be a partial sum, not a total), even
+/// after a strictly-newer revision applies.
+#[test]
+fn output_only_revisions_keep_the_total_unknown_end_to_end() {
+    use remuda_protocol::Knowledge;
+
+    let mut mapper = TranscriptMapper::new(
+        DriverKind::ClaudePty,
+        InstanceId::new(),
+        RunId::new(),
+        Id::new("obj").expect("journal id"),
+        HostId::new(),
+        "sess-output-only".into(),
+        "2.1.289".into(),
+    );
+    let output_record = |output: u64, ts: &str| {
+        json!({
+            "type": "assistant",
+            "uuid": format!("rec-{output}"),
+            "timestamp": ts,
+            "isSidechain": false,
+            "requestId": "req-output-only",
+            "message": {
+                "id": "msg_output_only",
+                "role": "assistant",
+                "type": "message",
+                "model": "claude-opus-5-5",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "x"}],
+                "usage": { "output_tokens": output }
+            }
+        })
+    };
+    let rev1 = poll_batch(
+        &mut mapper,
+        &[(0, output_record(9, "2026-10-09T00:00:00.000Z"))],
+    )
+    .expect("output-only rev1 publishes");
+    let rev2 = poll_batch(
+        &mut mapper,
+        &[(1, output_record(7, "2026-10-09T00:00:05.000Z"))],
+    )
+    .expect("output-only rev2 publishes");
+    let ObservationPayload::Usage(p2) = &rev2.body else {
+        panic!("usage payload");
+    };
+    assert!(
+        matches!(p2.total_tokens, Knowledge::Unknown { .. }),
+        "the mapper keeps the total Unknown with only output reported"
+    );
+
+    let conn = rusqlite::Connection::open_in_memory().expect("sqlite");
+    migrate(&conn).expect("migrate");
+    for (seq, obs) in [(1, &rev1), (2, &rev2)] {
+        let row = project_usage_event(
+            &JournalRecord {
+                instance_id: "ins_output_only".into(),
+                seq,
+                event_id: format!("evt_oo_{seq}"),
+                observed_at: "2020-01-01T00:00:00.000Z".into(),
+                event: serde_json::to_value(obs).unwrap(),
+            },
+            None,
+            None,
+        )
+        .expect("projects");
+        assert!(insert_usage_event(&conn, &row).expect("insert"));
+    }
+    let total: Option<i64> = conn
+        .query_row(
+            "SELECT total_tokens FROM usage_events
+             WHERE instance_id='ins_output_only' AND scope_id='msg_output_only'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        total, None,
+        "output-only rev1 → output-only rev2 keeps the total Unknown — never a partial sum"
+    );
+    let output: Option<i64> = conn
+        .query_row(
+            "SELECT output_tokens FROM usage_events
+             WHERE instance_id='ins_output_only' AND scope_id='msg_output_only'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        output,
+        Some(7),
+        "the downward output correction still applies"
+    );
+}

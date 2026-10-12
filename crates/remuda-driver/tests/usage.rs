@@ -52,7 +52,7 @@ fn claude_extracts_one_event_per_content_block_and_dedupes_per_message() {
     assert_eq!(totals.tokens.cache_read, Some(40627));
     assert_eq!(totals.tokens.cache_write_1h, Some(3874));
     assert_eq!(totals.tokens.cache_write_5m, Some(0));
-    assert_eq!(totals.reasoning_tokens, 123);
+    assert_eq!(totals.reasoning_tokens, Some(123));
     assert!(totals.cost_usd().is_some());
 }
 

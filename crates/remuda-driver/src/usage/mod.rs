@@ -167,10 +167,14 @@ impl UsageEvent {
 pub struct UsageTotals {
     /// Number of deduped model calls represented.
     pub events: u64,
-    /// Normalized counters summed across calls.
+    /// Normalized counters summed across calls. A bucket is Known only when
+    /// EVERY contributing call reported it; one omission folds it to Unknown
+    /// (U1, c-ctxusage r16 item 4).
     pub tokens: TokenCounters,
-    /// Reasoning/thinking tokens summed when reported.
-    pub reasoning_tokens: u64,
+    /// Reasoning/thinking tokens summed when reported. `None` means either no
+    /// call has been folded yet or AT LEAST ONE contributing call omitted the
+    /// breakout — Unknown, never zero (U1, c-ctxusage r16 item 4).
+    pub reasoning_tokens: Option<u64>,
     /// Sum of table estimates; `None` when **any** call could not be priced
     /// (unknown model), so the figure is never presented as a complete bill.
     cost_usd: Option<f64>,
@@ -178,18 +182,36 @@ pub struct UsageTotals {
 
 impl UsageTotals {
     pub(crate) fn add(&mut self, event: &UsageEvent) {
+        // The first contribution SEEDS the accumulator verbatim: a defaulted
+        // `None` bucket means "nothing folded yet", while the first real
+        // call's `None` means "this call omitted the bucket" — the two must
+        // not be conflated (U1, c-ctxusage r16 item 4). After seeding, an
+        // omission by ANY later call poisons the folded bucket to Unknown.
+        let first = self.events == 0;
         self.events += 1;
-        self.tokens = self.tokens.merge_counts(&event.tokens);
-        self.reasoning_tokens = self
-            .reasoning_tokens
-            .checked_add(event.reasoning_tokens.unwrap_or(0))
-            .expect("reasoning token total must not overflow");
-        self.cost_usd = match (self.cost_usd, event.cost_usd) {
-            (Some(total), Some(cost)) => Some(total + cost),
-            (None, Some(cost)) => Some(cost),
-            // An unpriced event makes the whole total unpriceable.
-            (_, None) => None,
-        };
+        if first {
+            self.tokens = event.tokens;
+            self.reasoning_tokens = event.reasoning_tokens;
+            self.cost_usd = event.cost_usd;
+        } else {
+            self.tokens = self.tokens.fold_counts(&event.tokens);
+            self.reasoning_tokens = match (self.reasoning_tokens, event.reasoning_tokens) {
+                (Some(total), Some(part)) => Some(
+                    total
+                        .checked_add(part)
+                        .expect("reasoning token total must not overflow"),
+                ),
+                // A call that does not break reasoning out makes the fold
+                // Unknown, even when other calls reported it.
+                _ => None,
+            };
+            // Once ANY call is unpriced the bill stays Unknown: a later priced
+            // call never revives a partial sum (U1, c-ctxusage r16 item 4).
+            self.cost_usd = match (self.cost_usd, event.cost_usd) {
+                (Some(total), Some(cost)) => Some(total + cost),
+                _ => None,
+            };
+        }
     }
 
     /// Estimated USD, only when every folded event had a table price.
@@ -288,10 +310,6 @@ impl UsageAggregator {
     }
 }
 
-fn known(value: u64) -> Knowledge<U64> {
-    Knowledge::Known { value: U64(value) }
-}
-
 /// A reported bucket becomes `Known`; a bucket the source OMITTED stays
 /// `Unknown` with a provenance reason — never a fabricated zero
 /// (c-ctxusage r15 item 5).
@@ -357,7 +375,9 @@ pub fn to_usage_payload(
         input_tokens: known_optional(totals.tokens.uncached_input),
         input_accounting: InputAccounting::Uncached,
         output_tokens: known_optional(totals.tokens.output),
-        reasoning_tokens: known(totals.reasoning_tokens),
+        // U1 (c-ctxusage r16 item 4): reasoning is Unknown whenever any
+        // contributing call omitted the breakout — never a fabricated zero.
+        reasoning_tokens: known_optional(totals.reasoning_tokens),
         cache_read_tokens: known_optional(totals.tokens.cache_read),
         cache_write_tokens: known_optional(totals.tokens.cache_write()),
         total_tokens: known_optional(total),
@@ -555,6 +575,114 @@ mod tests {
         assert!(
             matches!(payload.cost, Knowledge::Unknown { .. }),
             "an omitted bucket is never priced for free"
+        );
+    }
+
+    /// U1 (c-ctxusage r16 item 4): folding two priced calls where the SECOND
+    /// omits the input bucket makes the folded input Unknown (the first call's
+    /// number is not the complete sum) — and the two-call total goes Unknown
+    /// with it.
+    #[test]
+    fn a_call_omitting_a_bucket_poisons_the_folded_total() {
+        let mut agg = UsageAggregator::new();
+        agg.push(&event(
+            UsageSource::ClaudeTranscript,
+            Some("t1"),
+            Some("msg-u1-a"),
+            Some("claude-sonnet-5"),
+            TokenCounters::known(100, 10, 0, 0, 0),
+        ));
+        // Second call reports output only.
+        agg.push(&event(
+            UsageSource::ClaudeTranscript,
+            Some("t1"),
+            Some("msg-u1-b"),
+            Some("claude-sonnet-5"),
+            TokenCounters {
+                output: Some(20),
+                ..TokenCounters::default()
+            },
+        ));
+        let totals = agg.session();
+        assert_eq!(
+            totals.tokens.uncached_input, None,
+            "input folded from a call that omitted it"
+        );
+        assert_eq!(
+            totals.tokens.output,
+            Some(30),
+            "output was reported by both"
+        );
+        assert_eq!(
+            totals.tokens.cache_read, None,
+            "never reported by either call: still Unknown, not zero"
+        );
+        assert_eq!(
+            totals.tokens.total(),
+            None,
+            "a partial fold never yields a total"
+        );
+    }
+
+    /// U1 (c-ctxusage r16 item 4): an empty accumulator is distinct from one
+    /// holding an unknown contribution — a single call that omits a bucket
+    /// folds to Unknown immediately, but the buckets it DID report stay Known.
+    #[test]
+    fn the_first_call_seeds_known_buckets_without_zeroing_omitted_ones() {
+        let mut agg = UsageAggregator::new();
+        agg.push(&event(
+            UsageSource::ClaudeTranscript,
+            Some("t1"),
+            Some("msg-u1-seed"),
+            Some("claude-sonnet-5"),
+            TokenCounters {
+                uncached_input: Some(7),
+                output: Some(3),
+                ..TokenCounters::default()
+            },
+        ));
+        let totals = agg.session();
+        assert_eq!(totals.tokens.uncached_input, Some(7));
+        assert_eq!(totals.tokens.output, Some(3));
+        assert_eq!(totals.tokens.cache_read, None);
+    }
+
+    /// U1 (c-ctxusage r16 item 4): reasoning is `Option` end to end. A call
+    /// that omits the reasoning breakout folds the reasoning total Unknown even
+    /// when another call reported one, and the wire payload carries Unknown —
+    /// never a fabricated zero.
+    #[test]
+    fn reasoning_is_unknown_when_any_call_omits_the_breakout() {
+        fn reasoning_event(request: &str, reasoning: Option<u64>) -> UsageEvent {
+            UsageEvent::new(
+                UsageSource::ClaudeTranscript,
+                Some("t-r".to_string()),
+                Some(request.to_string()),
+                Some("claude-sonnet-5".to_string()),
+                TokenCounters::known(10, 10, 0, 0, 0),
+                reasoning,
+                None,
+            )
+        }
+        // Two calls that both report reasoning sum on the wire as Known.
+        let mut agg = UsageAggregator::new();
+        agg.push(&reasoning_event("msg-r1", Some(3)));
+        agg.push(&reasoning_event("msg-r2", Some(4)));
+        let totals = agg.session();
+        assert_eq!(totals.reasoning_tokens, Some(7));
+        let payload = to_usage_payload(UsageScope::Session, "s", 1, None, totals);
+        assert_eq!(payload.reasoning_tokens, Knowledge::Known { value: U64(7) });
+
+        // A third call with no breakout: the fold goes Unknown on the wire.
+        let mut agg = UsageAggregator::new();
+        agg.push(&reasoning_event("msg-r1", Some(3)));
+        agg.push(&reasoning_event("msg-r3", None));
+        let totals = agg.session();
+        assert_eq!(totals.reasoning_tokens, None);
+        let payload = to_usage_payload(UsageScope::Session, "s", 2, None, totals);
+        assert!(
+            matches!(payload.reasoning_tokens, Knowledge::Unknown { .. }),
+            "reasoning omitted by one call is Unknown on the wire, not 0"
         );
     }
 }

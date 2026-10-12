@@ -559,7 +559,9 @@ impl SnapshotCounters {
     /// carries only `output_tokens` must not erase the known input/cache
     /// counters (c-ctxusage r12 item 2). A reported total stays authoritative;
     /// otherwise the total is derived from the merged basket
-    /// (`input + cache_read + cache_write + output`), so it advances with it.
+    /// (`input + output + cache_read + cache_write`) ONLY WHEN every basket is
+    /// Known — a single unknown constituent leaves the total Unknown, never a
+    /// partial sum (U1, c-ctxusage r16 item 4).
     fn merged_over(self, retained: &SnapshotCounters) -> SnapshotCounters {
         let pick = |incoming: Option<i64>, kept: Option<i64>| incoming.or(kept);
         let input = pick(self.input, retained.input);
@@ -568,12 +570,15 @@ impl SnapshotCounters {
         let cache_write = pick(self.cache_write, retained.cache_write);
         // Derive only when the incoming frame did not itself report a total:
         // the retained total is stale relative to a merged basket that moved.
-        let total = self.total.or_else(|| {
-            [input, cache_read, cache_write, output]
-                .into_iter()
-                .flatten()
-                .reduce(i64::saturating_add)
-        });
+        // U1: flatten would silently treat an unknown basket as zero, so fold
+        // through a strict all-known sum instead.
+        let baskets = [input, output, cache_read, cache_write];
+        let derived = baskets
+            .iter()
+            .all(Option::is_some)
+            .then(|| baskets.into_iter().flatten().reduce(i64::saturating_add))
+            .flatten();
+        let total = self.total.or(derived);
         SnapshotCounters {
             total,
             input,
@@ -909,32 +914,44 @@ pub fn project_usage_event(
 }
 
 /// Aggregated usage for one `(profile, model)` or instance.
+///
+/// Every counter and the bill are Known only when EVERY folded contributing
+/// row reported/priced them: one omitted bucket or unpriced turn makes the
+/// aggregate Unknown (`None`) rather than a partial sum (U1,
+/// c-ctxusage r16 item 4).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageAggregate {
     /// Rows folded.
     pub events: i64,
-    /// Summed total tokens.
-    pub total_tokens: i64,
-    /// Summed input tokens.
-    pub input_tokens: i64,
-    /// Summed output tokens.
-    pub output_tokens: i64,
-    /// Summed cost (decimal, estimated).
-    pub cost_usd: f64,
+    /// Summed total tokens; Unknown when any contributing row omitted it.
+    pub total_tokens: Option<i64>,
+    /// Summed input tokens; Unknown when any contributing row omitted it.
+    pub input_tokens: Option<i64>,
+    /// Summed output tokens; Unknown when any contributing row omitted it.
+    pub output_tokens: Option<i64>,
+    /// Summed cost (decimal, estimated). `None` when ANY folded contributing
+    /// row is unpriced — the bill is then Unknown, never a partial sum shown
+    /// as the complete spend (U1, c-ctxusage r16 item 4).
+    pub cost_usd: Option<f64>,
 }
 
 impl UsageAggregate {
-    /// Budget status against an estimated cap: ok → warn (estimate reached) →
-    /// stop (estimate × 1.15). Costs are labeled estimates.
+    /// Budget status against an estimated cap. `Unknown` when the bill itself
+    /// is Unknown (at least one contributing turn could not be priced): an
+    /// unknown cost can never be certified under budget, so it is never Ok
+    /// (U1, c-ctxusage r16 item 4).
     #[must_use]
     pub fn budget_status(&self, max_usd: Option<f64>) -> BudgetStatus {
+        let Some(cost) = self.cost_usd else {
+            return BudgetStatus::Unknown;
+        };
         let Some(max) = max_usd.filter(|v| *v > 0.0) else {
             return BudgetStatus::Ok;
         };
-        if self.cost_usd >= max * BUDGET_STOP_FACTOR {
+        if cost >= max * BUDGET_STOP_FACTOR {
             BudgetStatus::Stop
-        } else if self.cost_usd >= max {
+        } else if cost >= max {
             BudgetStatus::Warn
         } else {
             BudgetStatus::Ok
@@ -946,12 +963,15 @@ impl UsageAggregate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BudgetStatus {
-    /// Under the estimate.
+    /// The known estimated bill is under the cap.
     Ok,
     /// At the estimate (warn).
     Warn,
     /// At estimate × 1.15 (stop band).
     Stop,
+    /// The bill is Unknown (an unpriced contributing turn): the cap can
+    /// neither be confirmed satisfied nor breached (U1, c-ctxusage r16 item 4).
+    Unknown,
 }
 
 /// Aggregate all persisted events for one instance.
@@ -967,10 +987,14 @@ pub fn aggregate_instance(
     conn.query_row(
         &format!(
             "SELECT COUNT(*),
-                    COALESCE(SUM(total_tokens), 0),
-                    COALESCE(SUM(input_tokens), 0),
-                    COALESCE(SUM(output_tokens), 0),
-                    COALESCE(SUM(CAST(cost_usd AS REAL)), 0.0)
+                    CASE WHEN COUNT(*) = COUNT(total_tokens)
+                         THEN SUM(total_tokens) END,
+                    CASE WHEN COUNT(*) = COUNT(input_tokens)
+                         THEN SUM(input_tokens) END,
+                    CASE WHEN COUNT(*) = COUNT(output_tokens)
+                         THEN SUM(output_tokens) END,
+                    CASE WHEN COUNT(*) = COUNT(cost_usd)
+                         THEN SUM(CAST(cost_usd AS REAL)) END
              FROM (
                  SELECT total_tokens, input_tokens, output_tokens, cost_usd
                  FROM ({WINNING_TURN_ROWS_SQL})
@@ -1019,10 +1043,14 @@ pub fn aggregate_supply(
               AND profile_id = ?1 AND model = ?2
          )
          SELECT COUNT(*),
-                COALESCE(SUM(total_tokens), 0),
-                COALESCE(SUM(input_tokens), 0),
-                COALESCE(SUM(output_tokens), 0),
-                COALESCE(SUM(CAST(cost_usd AS REAL)), 0.0)
+                CASE WHEN COUNT(*) = COUNT(total_tokens)
+                     THEN SUM(total_tokens) END,
+                CASE WHEN COUNT(*) = COUNT(input_tokens)
+                     THEN SUM(input_tokens) END,
+                CASE WHEN COUNT(*) = COUNT(output_tokens)
+                     THEN SUM(output_tokens) END,
+                CASE WHEN COUNT(*) = COUNT(cost_usd)
+                     THEN SUM(CAST(cost_usd AS REAL)) END
          FROM (
              SELECT total_tokens, input_tokens, output_tokens, cost_usd
              FROM winning_turns
@@ -1170,15 +1198,19 @@ fn sum_turn_tokens_since(
             FROM usage_events
             WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NOT NULL
               AND observed_at >= ?2 AND observed_at_source = 'native'
-         )
-         SELECT SUM(input_tokens), SUM(output_tokens)
-         FROM (
+         ),
+         window_turns AS (
              SELECT input_tokens, output_tokens FROM ranked WHERE rn = 1
              UNION ALL
              SELECT input_tokens, output_tokens FROM usage_events
              WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NULL
                AND observed_at >= ?2 AND observed_at_source = 'native'
-         )",
+         )
+         SELECT CASE WHEN COUNT(*) = COUNT(input_tokens)
+                     THEN SUM(input_tokens) END,
+                CASE WHEN COUNT(*) = COUNT(output_tokens)
+                     THEN SUM(output_tokens) END
+         FROM window_turns",
         params![instance_id, since],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
@@ -1527,16 +1559,22 @@ pub fn rollup_instance(
     // even when several native-session lineages hold revision-replaced rows
     // for the same assistant message id (c-ctxusage r16 item 3). Session
     // growth points are counted separately (only their presence matters here;
-    // their stock is read via latest_session_stock).
+    // their stock is read via latest_session_stock). U1 (c-ctxusage r16
+    // item 4): a bucket omitted by ANY winning turn makes the folded sum
+    // Unknown — SUM ignores NULLs, so gate on COUNT(col) = COUNT(*).
     let totals = conn.query_row(
         &format!(
             "WITH winning_turns AS ({WINNING_TURN_ROWS_SQL})
              SELECT
                  (SELECT COUNT(*) FROM winning_turns),
-                 (SELECT SUM(input_tokens) FROM winning_turns),
-                 (SELECT SUM(output_tokens) FROM winning_turns),
-                 (SELECT SUM(cache_read_tokens) FROM winning_turns),
-                 (SELECT SUM(cache_write_tokens) FROM winning_turns),
+                 (SELECT CASE WHEN COUNT(*) = COUNT(input_tokens)
+                              THEN SUM(input_tokens) END FROM winning_turns),
+                 (SELECT CASE WHEN COUNT(*) = COUNT(output_tokens)
+                              THEN SUM(output_tokens) END FROM winning_turns),
+                 (SELECT CASE WHEN COUNT(*) = COUNT(cache_read_tokens)
+                              THEN SUM(cache_read_tokens) END FROM winning_turns),
+                 (SELECT CASE WHEN COUNT(*) = COUNT(cache_write_tokens)
+                              THEN SUM(cache_write_tokens) END FROM winning_turns),
                  (SELECT MAX(observed_at) FROM winning_turns
                   WHERE observed_at_source = 'native')"
         ),
@@ -1821,7 +1859,11 @@ mod tests {
 
         let total = aggregate_instance(&conn, "ins_test").unwrap();
         assert_eq!(total.events, 2, "no double counting after re-hydration");
-        assert_eq!(total.total_tokens, 300, "the original two rows, not four");
+        assert_eq!(
+            total.total_tokens,
+            Some(300),
+            "the original two rows, not four"
+        );
     }
 
     #[test]
@@ -1846,8 +1888,8 @@ mod tests {
 
         let total = aggregate_instance(&conn, "ins_test").unwrap();
         assert_eq!(total.events, 2);
-        assert_eq!(total.total_tokens, 1500);
-        assert!((total.cost_usd - 0.03).abs() < 1e-9);
+        assert_eq!(total.total_tokens, Some(1500));
+        assert_eq!(total.cost_usd, Some(0.03));
 
         // Unknown-cost events are not projected as cost rows...
         let third = usage_record(3, 10, None);
@@ -1855,7 +1897,10 @@ mod tests {
         insert_usage_event(&conn, &third).unwrap();
         let supply = aggregate_supply(&conn, "pvp_relay", "gw/model-y[1m]").unwrap();
         assert_eq!(supply.events, 1);
-        assert_eq!(supply.cost_usd, 0.0);
+        assert_eq!(
+            supply.cost_usd, None,
+            "an unpriced row leaves the bill Unknown"
+        );
 
         // Non-usage journal rows project to nothing.
         let mut other = usage_record(4, 1, None);
@@ -1866,21 +1911,25 @@ mod tests {
     #[test]
     fn budget_band_uses_estimate_times_tolerance() {
         let agg = UsageAggregate {
-            cost_usd: 4.9,
+            cost_usd: Some(4.9),
             ..Default::default()
         };
         assert_eq!(agg.budget_status(Some(5.0)), BudgetStatus::Ok);
         let agg = UsageAggregate {
-            cost_usd: 5.0,
+            cost_usd: Some(5.0),
             ..Default::default()
         };
         assert_eq!(agg.budget_status(Some(5.0)), BudgetStatus::Warn);
         let agg = UsageAggregate {
-            cost_usd: 5.76,
+            cost_usd: Some(5.76),
             ..Default::default()
         };
         assert_eq!(agg.budget_status(Some(5.0)), BudgetStatus::Stop);
         assert_eq!(agg.budget_status(None), BudgetStatus::Ok);
+        // An unknown bill is Unknown at every cap, never Ok (U1).
+        let agg = UsageAggregate::default();
+        assert_eq!(agg.budget_status(Some(5.0)), BudgetStatus::Unknown);
+        assert_eq!(agg.budget_status(None), BudgetStatus::Unknown);
     }
 
     /// RFC3339 stamp `seconds` before now, same fixed-width millisecond
@@ -5338,5 +5387,220 @@ mod tests {
         assert_eq!(rollup.session_output_tokens, Some(15));
         assert_eq!(rollup.tpm_in_60s, None);
         assert_eq!(rollup.tpm_out_60s, Some(5));
+    }
+
+    /// A direct turn row builder for the U1 aggregate tests.
+    #[allow(clippy::too_many_arguments)]
+    fn aggregate_turn_row(
+        seq: i64,
+        scope_id: &str,
+        total: Option<i64>,
+        input: Option<i64>,
+        output: Option<i64>,
+        cache_read: Option<i64>,
+        cache_write: Option<i64>,
+        cost: Option<&str>,
+        profile: Option<&str>,
+        model: Option<&str>,
+    ) -> UsageEventRow {
+        UsageEventRow {
+            instance_id: "ins_u1".into(),
+            seq,
+            profile_id: profile.map(str::to_string),
+            model: model.map(str::to_string),
+            scope: "turn".into(),
+            scope_id: Some(scope_id.into()),
+            mode: "snapshot".into(),
+            metric_revision: 1,
+            source_session_id: None,
+            total_tokens: total,
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
+            cost_usd: cost.map(str::to_string),
+            accounting: "estimated".into(),
+            observed_at: "2026-10-10T00:00:00.000Z".into(),
+            observed_at_source: "native".into(),
+        }
+    }
+
+    /// U1 (c-ctxusage r16 item 4): folding two turns where the SECOND omits
+    /// input must make the aggregate input Unknown (the first turn's number
+    /// is not the complete sum); reported-by-both output stays Known.
+    #[test]
+    fn aggregate_input_is_unknown_when_any_turn_omits_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Turn 1 fully reported; turn 2 reports output only.
+        insert_usage_event(
+            &conn,
+            &aggregate_turn_row(
+                1,
+                "t1",
+                Some(110),
+                Some(100),
+                Some(10),
+                Some(0),
+                Some(0),
+                None,
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        insert_usage_event(
+            &conn,
+            &aggregate_turn_row(2, "t2", None, None, Some(20), None, None, None, None, None),
+        )
+        .unwrap();
+        let agg = aggregate_instance(&conn, "ins_u1").unwrap();
+        assert_eq!(agg.events, 2);
+        assert_eq!(
+            agg.input_tokens, None,
+            "one turn omitted input: Unknown, not 100"
+        );
+        assert_eq!(agg.output_tokens, Some(30), "output was reported by both");
+        assert_eq!(agg.total_tokens, None, "the total needs every bucket");
+    }
+
+    /// U1 (c-ctxusage r16 item 4): an unpriced turn makes the aggregate bill
+    /// Unknown (never a COALESCE 0.0), and an Unknown cost yields budget
+    /// status Unknown — never Ok — at every cap.
+    #[test]
+    fn an_unpriced_turn_makes_the_bill_and_budget_status_unknown() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        insert_usage_event(
+            &conn,
+            &aggregate_turn_row(
+                1,
+                "p1",
+                Some(110),
+                Some(100),
+                Some(10),
+                Some(0),
+                Some(0),
+                Some("0.50"),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        insert_usage_event(
+            &conn,
+            &aggregate_turn_row(
+                2,
+                "p2",
+                Some(110),
+                Some(100),
+                Some(10),
+                Some(0),
+                Some(0),
+                None,
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        let agg = aggregate_instance(&conn, "ins_u1").unwrap();
+        assert_eq!(
+            agg.cost_usd, None,
+            "one unpriced turn makes the bill Unknown, not 0.50"
+        );
+        for cap in [None, Some(1_000.0), Some(0.5), Some(0.01)] {
+            assert_eq!(
+                agg.budget_status(cap),
+                BudgetStatus::Unknown,
+                "an unknown bill never certifies Ok under any cap"
+            );
+        }
+
+        // Two fully-priced turns sum to a known bill and an Ok status under a
+        // generous cap (Unknown is not contagious without an unpriced row).
+        let conn2 = Connection::open_in_memory().unwrap();
+        migrate(&conn2).unwrap();
+        insert_usage_event(
+            &conn2,
+            &aggregate_turn_row(
+                1,
+                "p1",
+                Some(110),
+                Some(100),
+                Some(10),
+                Some(0),
+                Some(0),
+                Some("0.50"),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        insert_usage_event(
+            &conn2,
+            &aggregate_turn_row(
+                2,
+                "p2",
+                Some(110),
+                Some(100),
+                Some(10),
+                Some(0),
+                Some(0),
+                Some("0.50"),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        let priced = aggregate_instance(&conn2, "ins_u1").unwrap();
+        assert_eq!(priced.cost_usd, Some(1.0));
+        assert_eq!(priced.budget_status(Some(10.0)), BudgetStatus::Ok);
+        assert_eq!(priced.budget_status(Some(1.0)), BudgetStatus::Warn);
+        assert_eq!(priced.budget_status(Some(0.5)), BudgetStatus::Stop);
+        assert_eq!(priced.budget_status(None), BudgetStatus::Ok);
+    }
+
+    /// U1 (c-ctxusage r16 item 4): the supply aggregate (profile, model) is
+    /// Unknown on any unpriced contributing row just like the instance one.
+    #[test]
+    fn aggregate_supply_cost_is_unknown_with_any_unpriced_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let profile = "pvp_supply_u1";
+        insert_usage_event(
+            &conn,
+            &aggregate_turn_row(
+                1,
+                "t1",
+                Some(110),
+                Some(100),
+                Some(10),
+                Some(0),
+                Some(0),
+                Some("1.00"),
+                Some(profile),
+                Some("m"),
+            ),
+        )
+        .unwrap();
+        insert_usage_event(
+            &conn,
+            &aggregate_turn_row(
+                2,
+                "t2",
+                Some(110),
+                Some(100),
+                Some(10),
+                Some(0),
+                Some(0),
+                None,
+                Some(profile),
+                Some("m"),
+            ),
+        )
+        .unwrap();
+        let agg = aggregate_supply(&conn, profile, "m").unwrap();
+        assert_eq!(agg.cost_usd, None);
+        assert_eq!(agg.budget_status(Some(5.0)), BudgetStatus::Unknown);
     }
 }

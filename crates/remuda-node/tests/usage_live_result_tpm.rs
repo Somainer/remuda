@@ -252,9 +252,10 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
     assert_eq!(input, Some(100), "the unreported input must be retained");
     assert_eq!(output, Some(20), "the reported output advances");
     assert_eq!(
-        total,
-        Some(120),
-        "the total is derived from the merged basket"
+        total, None,
+        "U1: the print baseline never reported the cache baskets, so the \
+         merged basket is partial and the derived total stays Unknown — \
+         never a 100+20 partial sum"
     );
     assert_eq!(
         cost.as_deref(),
@@ -318,7 +319,10 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
     );
     assert_eq!(input, Some(100), "cost-only keeps the retained input");
     assert_eq!(output, Some(20), "cost-only keeps the retained output");
-    assert_eq!(total, Some(120), "cost-only keeps the derived total");
+    assert_eq!(
+        total, None,
+        "the partial merged basket keeps the total Unknown (U1)"
+    );
     assert_eq!(
         clock, SECOND_CLOCK,
         "a cost-only frame at {THIRD_CLOCK} never rewrites the turn clock"
@@ -374,7 +378,7 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
         .unwrap();
     assert_eq!(input, Some(100), "input retained");
     assert_eq!(output, Some(20), "the older-position growth is frozen");
-    assert_eq!(total, Some(120), "derived total retained");
+    assert_eq!(total, None, "the Unknown derived total is retained (U1)");
     assert_eq!(cost.as_deref(), Some("0.75"), "nothing rolls the bill back");
     assert_eq!(clock, SECOND_CLOCK, "nothing moves the clock");
 }

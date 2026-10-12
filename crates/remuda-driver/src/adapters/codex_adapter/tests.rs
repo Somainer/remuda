@@ -1927,7 +1927,8 @@ fn closing_the_last_discovery_window_clears_recorded_prompts() {
     assert!(late.binding().is_none());
 }
 
-// c-usagefu r8 item 7: age sweep preserves a live discoverer's only prompt -
+// c-usagefu r8 item 7 / r9 item 6: age sweep preserves a live discoverer's
+// prompts -----------------------------------------------------------------
 
 #[test]
 fn age_eviction_keeps_the_only_prompt_of_a_live_unbound_discoverer() {
@@ -1969,6 +1970,88 @@ fn age_eviction_keeps_the_only_prompt_of_a_live_unbound_discoverer() {
         a.binding().map(|b| b.session_id.as_str()),
         Some("late-file")
     );
+}
+
+#[test]
+fn a_fresh_prompt_does_not_evict_a_live_discoverers_aged_first_prompt() {
+    // r9 item 6: live unbound A sent initial prompt P 90 minutes ago; the
+    // rollout for P was created inside P's match window but is discovered
+    // only now. A sends a FRESH Q in the meantime. The r8 rule retained aged
+    // prompts only when ALL of A's prompts were aged, so the Q-triggered
+    // sweep deleted P and P's file could never bind.
+    use time::Duration;
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r9-item6-pq";
+    let now = OffsetDateTime::now_utc();
+
+    let mut a = launch_adapter_keyed(home.path(), cwd, now - Duration::minutes(91), INST_A);
+    let p_at = now - Duration::minutes(90);
+    send_fixture_prompt(Path::new(cwd), INST_A, "the initial prompt P", p_at);
+
+    // A sends its FRESH Q ...
+    send_fixture_prompt(Path::new(cwd), INST_A, "fresh follow-up Q", now);
+    // ... and a LATER input (another cwd, as any record_input does) fires the
+    // sweep that now sees both the aged P and the fresh Q. Under r8 this
+    // deleted P ("not ALL prompts aged"); r9 must keep P.
+    send_fixture_prompt(
+        Path::new("/projects/r9-item6-other"),
+        "other-key",
+        "unrelated later input",
+        now,
+    );
+
+    // P's rollout is discovered only now (created inside P's match window).
+    write_rollout_prompt_at(
+        home.path(),
+        "P-file",
+        cwd,
+        &(p_at + Duration::seconds(10)).format(&Rfc3339).unwrap(),
+        "the initial prompt P",
+    );
+    assert!(
+        a.discover().unwrap(),
+        "P survives the Q-triggered sweep and binds its rollout"
+    );
+    assert_eq!(a.binding().map(|b| b.session_id.as_str()), Some("P-file"));
+}
+
+#[test]
+fn once_bound_the_aged_prompt_is_reclaimed_by_the_lifecycle() {
+    // r9 item 6 counterpart: the retention is bounded by the lifecycle. A
+    // live adapter keeps its aged prompt only while UNBOUND; binding
+    // releases the window, and a subsequent sweep in another cwd removes it.
+    use time::Duration;
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r9-item6-reclaim";
+    let now = OffsetDateTime::now_utc();
+
+    let mut a = launch_adapter_keyed(home.path(), cwd, now - Duration::minutes(91), INST_A);
+    let p_at = now - Duration::minutes(90);
+    send_fixture_prompt(Path::new(cwd), INST_A, "old prompt", p_at);
+    write_rollout_prompt_at(
+        home.path(),
+        "P-bound",
+        cwd,
+        &(p_at + Duration::seconds(10)).format(&Rfc3339).unwrap(),
+        "old prompt",
+    );
+    assert!(a.discover().unwrap(), "binds from retained aged evidence");
+    assert!(a.window.is_none(), "bind released the window");
+
+    // A fresh unrelated cwd sweep now evicts A's aged prompt (no live
+    // discoverer retains it); a later adapter in the cwd has no prompts.
+    send_fixture_prompt(
+        Path::new("/projects/r9-item6-other2"),
+        "other-key",
+        "unrelated",
+        now,
+    );
+    let mut late = launch_adapter_keyed(home.path(), cwd, now, "late-key");
+    assert!(
+        !late.discover().unwrap(),
+        "after bind the aged prompt is reclaimed, not retained forever"
+    );
+    assert!(late.binding().is_none());
 }
 
 // c-usagefu r8 item 5: aggregator-rejected usage is not emitted -----------

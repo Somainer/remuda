@@ -151,6 +151,22 @@ impl ClaudeSdkDriver {
     pub async fn outstanding_turn_seqs_for_test(&self) -> Vec<u64> {
         self.inner.outstanding_turn_seqs_for_test().await
     }
+
+    /// Test-only (`test-stub`, r12 item 1): shrink the publication backlog
+    /// caps so a regression can flood past the bound deterministically.
+    #[cfg(feature = "test-stub")]
+    pub fn set_publication_backlog_limits_for_test(&self, items: usize, bytes: usize) {
+        self.inner
+            .set_publication_backlog_limits_for_test(items, bytes);
+    }
+
+    /// Test-only (`test-stub`, r12 item 1): current/high-water backlog
+    /// occupancy and active caps.
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub fn publication_backlog_for_test(&self) -> crate::claude_print::BacklogSnapshot {
+        self.inner.publication_backlog_for_test()
+    }
 }
 
 #[async_trait]

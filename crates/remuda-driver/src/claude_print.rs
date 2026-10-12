@@ -43,7 +43,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 /// How M0 answers `can_use_tool` when the host is not in the loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,13 +547,20 @@ pub struct Inner {
     mapper: Mutex<Mapper>,
     /// D-057 OA6 r3: publication FIFO. Every stdout frame's map+emit and every
     /// locally-written turn's reservation ticket + `turn_started` map+emit goes
-    /// through ONE unbounded queue drained by a single worker, so the
-    /// published order is the causal order (a turn's frames can never precede
-    /// its start) while neither task holds a lock across the other's work. The
-    /// reader always keeps draining stdout into the unbounded queue even while
+    /// through ONE queue drained by a single worker, so the published order is
+    /// the causal order (a turn's frames can never precede its start) while
+    /// neither task holds a lock across the other's work. The underlying channel
+    /// stays UNBOUNDED so the reader never parks on a queue send (a blocked
+    /// prompt write cannot stop stdout draining), but FRAME admission goes
+    /// through [`PublishQueue`], which caps the backlog by items AND bytes
+    /// (ma-sdk-state r12 item 1): a flooding child whose frames cannot be
+    /// published is shut down with a diagnostic instead of growing Node memory
+    /// without limit. Control jobs (reserve tickets, EOF, test fences) bypass
+    /// the caps, so cancellation and close never depend on frame admission. The
+    /// reader always keeps draining stdout into the bounded backlog even while
     /// a stdin write is blocked, and `close`/`cancel` stay reachable (neither
     /// needs this queue to make progress).
-    publish: Mutex<Option<mpsc::UnboundedSender<PublishJob>>>,
+    publish: Mutex<Option<PublishQueue>>,
     /// Serializes prompt sends: each send enqueues its reservation ticket,
     /// opens the mapper book, awaits its write, and commits strictly one after
     /// another, so two concurrent prompts reserve, write and start in FIFO
@@ -603,6 +610,11 @@ pub struct Inner {
     /// deterministically while the live child stays up.
     #[cfg(feature = "test-stub")]
     reserve_send_fails: std::sync::atomic::AtomicBool,
+    /// ma-sdk-state r12 item 1: live byte/item counters for the bounded
+    /// publication backlog (see [`PublishQueue`]). Lives for the whole driver
+    /// (not just one launch) so the limits can be configured before `start`
+    /// and stay comparable across relaunches; counters reset per launch.
+    backlog: Arc<BacklogMetrics>,
 }
 
 /// Native Claude print driver (`claude -p` stream-json).
@@ -627,9 +639,7 @@ pub struct ClaudePrintDriver {
 #[cfg(feature = "test-stub")]
 #[must_use = "holding the guard is the point; drop it to release the mutex"]
 #[allow(dead_code)]
-pub struct PublishMutexHold<'a>(
-    tokio::sync::MutexGuard<'a, Option<mpsc::UnboundedSender<PublishJob>>>,
-);
+pub struct PublishMutexHold<'a>(tokio::sync::MutexGuard<'a, Option<PublishQueue>>);
 
 /// Test-only (`test-stub`): held `write_seq` guard (r10 item 3).
 /// The field exists solely to keep the lock held until this handle drops.
@@ -690,7 +700,7 @@ impl ClaudePrintDriver {
     pub async fn publication_fence(&self) -> tokio::sync::oneshot::Receiver<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if let Some(publisher) = self.inner.publish.lock().await.clone() {
-            let _ = publisher.send(PublishJob::Fence(tx));
+            let _ = publisher.admit_control(PublishJob::Fence(tx));
         }
         rx
     }
@@ -735,6 +745,30 @@ impl ClaudePrintDriver {
             .iter()
             .map(|turn| turn.seq)
             .collect()
+    }
+
+    /// ma-sdk-state r12 item 1 (test-stub): shrink the publication backlog
+    /// caps before (or between) launches so a regression can flood past the
+    /// bound in milliseconds. `items` bounds queued frames, `bytes` their
+    /// summed charge.
+    #[cfg(feature = "test-stub")]
+    pub fn set_publication_backlog_limits_for_test(&self, items: usize, bytes: usize) {
+        self.inner
+            .backlog
+            .limit_items
+            .store(items, Ordering::Release);
+        self.inner
+            .backlog
+            .limit_bytes
+            .store(bytes, Ordering::Release);
+    }
+
+    /// ma-sdk-state r12 item 1 (test-stub): current and high-water backlog
+    /// occupancy plus the active caps, to assert the backlog stays bounded.
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub fn publication_backlog_for_test(&self) -> BacklogSnapshot {
+        self.inner.backlog.snapshot()
     }
 
     /// Test-only (`test-stub`, r10 item 3): wait until `n` Result frames have
@@ -854,6 +888,7 @@ impl ClaudePrintDriver {
                 write_number: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(feature = "test-stub")]
                 reserve_send_fails: std::sync::atomic::AtomicBool::new(false),
+                backlog: BacklogMetrics::new(),
             }),
             reader: Mutex::new(None),
             publisher: Mutex::new(None),
@@ -992,11 +1027,13 @@ impl ClaudePrintDriver {
             recipe: recipe.clone(),
         });
 
-        // Fresh publication FIFO for this launch. The worker drains it in
-        // order; the reader task gets its own sender clone and `close` seals
-        // the Inner's copy before joining the worker.
-        let (publish_tx, publish_rx) = mpsc::unbounded_channel::<PublishJob>();
-        *self.inner.publish.lock().await = Some(publish_tx.clone());
+        // Fresh publication FIFO for this launch, bounded by this driver's
+        // backlog metrics (r12 item 1). The worker drains it in order; the
+        // reader task gets its own queue clone and `close` seals the Inner's
+        // copy before joining the worker.
+        self.inner.backlog.reset_for_launch();
+        let (publish_queue, publish_rx) = PublishQueue::new(Arc::clone(&self.inner.backlog));
+        *self.inner.publish.lock().await = Some(publish_queue.clone());
         let publisher = {
             let inner = Arc::clone(&self.inner);
             tokio::spawn(async move {
@@ -1008,7 +1045,7 @@ impl ClaudePrintDriver {
         let inner = Arc::clone(&self.inner);
         let carrier = self.carrier_name();
         let reader = tokio::spawn(async move {
-            map_loop(inner, outbound, publish_tx, carrier).await;
+            map_loop(inner, outbound, publish_queue, carrier).await;
         });
         *self.reader.lock().await = Some(reader);
         Ok(RunHandle::new(recipe, ack, rx))
@@ -1594,7 +1631,7 @@ async fn prepare_prompt_write(
             admission
                 .as_ref()
                 .expect("admission checked above")
-                .send(PublishJob::Reserve {
+                .admit_control(PublishJob::Reserve {
                     reservation: reservation.clone(),
                 })
                 .is_err()
@@ -1603,7 +1640,7 @@ async fn prepare_prompt_write(
         admission
             .as_ref()
             .expect("admission checked above")
-            .send(PublishJob::Reserve {
+            .admit_control(PublishJob::Reserve {
                 reservation: reservation.clone(),
             })
             .is_err()
@@ -1695,9 +1732,13 @@ async fn prepare_prompt_write(
 async fn map_loop(
     inner: Arc<Inner>,
     mut outbound: mpsc::Receiver<Outbound>,
-    publisher: mpsc::UnboundedSender<PublishJob>,
+    publisher: PublishQueue,
     carrier: &'static str,
 ) {
+    // Set when frame admission tripped the backlog cap: the loop breaks and
+    // the overflow SHUTDOWN runs instead of the natural-EOF seal (the terminal
+    // observation is delivered by that shutdown, never through the full queue).
+    let mut overflow: Option<(usize, usize, usize)> = None;
     while let Some(frame) = outbound.recv().await {
         if matches!(frame, Outbound::KeepAlive) {
             continue;
@@ -1714,38 +1755,326 @@ async fn map_loop(
                 continue;
             }
         };
-        // Unbounded: enqueue never parks on the writer/sender, so stdout keeps
-        // draining even while a prompt write is blocked and close is running.
+        // Bounded admission (r12 item 1): a frame that would cross the
+        // byte/item cap is NOT queued — it trips the overflow session shutdown
+        // instead of growing Node memory without limit. Control jobs bypass
+        // the cap, so the reader parking here (never — admission is an std
+        // critical section) could not gate cancellation or close either.
         // test-stub only: detect the turn RESULT frame specifically (not an
         // assistant/keepalive frame) so an armed barrier can wait until that
         // result is queued behind the parked ticket (ma-sdk-state r6 item 3).
         #[cfg(feature = "test-stub")]
         let is_turn_result = matches!(&frame, Outbound::Result(_));
-        if publisher.send(PublishJob::Frame(Box::new(frame))).is_err() {
-            break;
+        match publisher.admit_frame(PublishJob::Frame(Box::new(frame))) {
+            Ok(()) => {}
+            Err((BacklogAdmitError::Closed, _)) => break,
+            Err((
+                BacklogAdmitError::Overflow {
+                    items,
+                    bytes,
+                    frame_bytes,
+                },
+                _,
+            )) => {
+                overflow = Some((items, bytes, frame_bytes));
+                break;
+            }
         }
         #[cfg(feature = "test-stub")]
         if is_turn_result {
             test_barrier::note_frame_enqueued(&inner.barrier);
         }
     }
-    // Child stdout reached EOF. Seal reservation admission and enqueue the
-    // exit as ONE critical section under the publication mutex (ma-sdk-state
-    // r11 item 2): prepare_prompt_write holds that same mutex from its seal
-    // check through book creation and ticket insertion, so a reservation can
-    // never queue a Reserve ticket BEHIND this StdoutEof. Either the ticket
-    // (and therefore its start/write-failure rollback) is fully ahead of the
-    // EOF in publication order, or the reservation is rejected having opened
-    // nothing. `closed` is set here, not only by explicit close: a prompt sent
-    // after the child's natural exit can never start a turn.
-    let gate = inner.publish.lock().await;
-    inner.closed.store(true, Ordering::SeqCst);
-    if let Some(publisher) = gate.as_ref() {
-        let _ = publisher.send(PublishJob::StdoutEof);
+    match overflow {
+        Some((items, bytes, frame_bytes)) => {
+            shutdown_for_backlog_overflow(&inner, items, bytes, frame_bytes, carrier).await;
+        }
+        None => {
+            // Child stdout reached EOF. Seal reservation admission and enqueue
+            // the exit as ONE critical section under the publication mutex
+            // (ma-sdk-state r11 item 2): prepare_prompt_write holds that same
+            // mutex from its seal check through book creation and ticket
+            // insertion, so a reservation can never queue a Reserve ticket
+            // BEHIND this StdoutEof. Either the ticket (and therefore its
+            // start/write-failure rollback) is fully ahead of the EOF in
+            // publication order, or the reservation is rejected having opened
+            // nothing. The EOF is a CONTROL job: it bypasses the frame caps so
+            // a full backlog cannot delay the terminal seal. `closed` is set
+            // here, not only by explicit close: a prompt sent after the
+            // child's natural exit can never start a turn.
+            let gate = inner.publish.lock().await;
+            inner.closed.store(true, Ordering::SeqCst);
+            if let Some(publisher) = gate.as_ref() {
+                let _ = publisher.admit_control(PublishJob::StdoutEof);
+            }
+            drop(gate);
+            #[cfg(feature = "test-stub")]
+            test_barrier::note_stdout_eof_queued(&inner.barrier);
+        }
     }
-    drop(gate);
+}
+
+/// ma-sdk-state r12 item 1: the bounded publication backlog overflowed.
+///
+/// Overflow policy: SHUT THE SESSION DOWN with a clear diagnostic. The child is
+/// the memory source (a flooding stdout producer, or one whose publication is
+/// stuck behind a prompt write it refuses to drain), so it is killed directly;
+/// the terminal observation rides the reserved exit permit instead of the full
+/// publication/events queue.
+///
+/// Independence from backlog admission: none of the steps here enqueue a frame
+/// or wait for the publication worker. Reservation admission is sealed under
+/// the publish mutex (the same gate `prepare_prompt_write` takes), the kill is
+/// two synchronous signals, and terminal delivery uses the reserved permit. A
+/// concurrent `close` therefore never parks on frame admission, and the blocked
+/// prompt write unblocks with an error once the child's pipes close.
+async fn shutdown_for_backlog_overflow(
+    inner: &Arc<Inner>,
+    items: usize,
+    bytes: usize,
+    frame_bytes: usize,
+    carrier: &'static str,
+) {
+    // Exactly one shutdown; the loser (a second overflowing reader frame) has
+    // nothing left to do.
+    if inner.backlog.overflowed.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // Seal reservation admission BEFORE the kill: a prompt that wins past this
+    // point would write to a child this routine is about to kill. The publish
+    // mutex serializes this with prepare_prompt_write's admission section.
+    {
+        let _admission = inner.publish.lock().await;
+        inner.closed.store(true, Ordering::SeqCst);
+    }
+    // Kill the flooding child NOW, without the writer channel or the close
+    // ladder: SIGKILL to the whole group plus the direct kill are synchronous
+    // and cannot block on a child that stopped draining stdin. If `close`
+    // already owns `live` it is running its own ladder against this same
+    // child, so skipping the signals is safe.
+    if let Ok(mut live) = inner.live.try_lock()
+        && let Some(live) = live.as_mut()
+    {
+        let pgid = live.process.id().and_then(|pid| i32::try_from(pid).ok());
+        kill_group(pgid, carrier);
+        let _ = live.process.kill();
+    }
+    error!(
+        carrier,
+        items,
+        bytes,
+        frame_bytes,
+        limit_items = inner.backlog.limit_items.load(Ordering::Acquire),
+        limit_bytes = inner.backlog.limit_bytes.load(Ordering::Acquire),
+        "publication backlog overflow: the child produced stdout faster than it \
+         could be published; shutting the session down (reason=publication_backlog_overflow)"
+    );
+    let _ = emit_overflow_exit(inner, items, bytes).await;
     #[cfg(feature = "test-stub")]
-    test_barrier::note_stdout_eof_queued(&inner.barrier);
+    test_barrier::note_backlog_overflow(&inner.barrier);
+}
+
+/// Production cap on the publication backlog: at most this many stdout FRAMES
+/// wait for the single publication worker (ma-sdk-state r12 item 1). The
+/// reservation tickets that can accompany them are bounded separately by the
+/// writer's 64-slot command channels and are not counted here. Chosen so a
+/// 2 kHz flood takes ~8 s of total publication stall even before the byte cap
+/// matters, while a wedged worker can never accumulate more than ~16k frames.
+const PUBLICATION_BACKLOG_MAX_ITEMS: usize = 16_384;
+
+/// Production cap on the backlog measured by queued frame bytes (each frame
+/// charged its serialized JSON size plus its fixed job overhead — see
+/// [`frame_backlog_cost`]). A handful of near-line-limit (8 MiB) frames suffice
+/// to trip this long before the item cap, while ordinary stream-json traffic
+/// never comes near either.
+const PUBLICATION_BACKLOG_MAX_BYTES: usize = 128 * 1024 * 1024;
+
+/// Why a frame was refused admission to the publication backlog.
+#[derive(Debug, PartialEq, Eq)]
+enum BacklogAdmitError {
+    /// The queue is closed (close in progress) or overflow already fired.
+    Closed,
+    /// Admitting the frame would cross the item or byte cap. Carries the
+    /// current occupancy and the refused frame's cost so the caller can emit a
+    /// diagnostic naming exactly what tripped the limit.
+    Overflow {
+        items: usize,
+        bytes: usize,
+        frame_bytes: usize,
+    },
+}
+
+/// Live backlog occupancy (ma-sdk-state r12 item 1).
+///
+/// All counters are atomics so test-stub inspection never takes the admission
+/// lock; the admission decisions themselves are serialized through
+/// [`PublishQueue`]'s mutex, so items/bytes/highs always describe an admitted
+/// state — a frame is counted before its send and the cap can never be
+/// overshot, even with concurrent enqueuers.
+struct BacklogMetrics {
+    /// Frames currently queued (admitted, not yet drained by the worker).
+    items: std::sync::atomic::AtomicUsize,
+    /// Sum of [`frame_backlog_cost`] over the currently queued frames.
+    bytes: std::sync::atomic::AtomicUsize,
+    /// High-water marks for the life of the launch (the regression asserts the
+    /// backlog never crossed the configured caps).
+    items_high: std::sync::atomic::AtomicUsize,
+    bytes_high: std::sync::atomic::AtomicUsize,
+    /// Configured caps (test-stub can shrink them before/at launch).
+    limit_items: std::sync::atomic::AtomicUsize,
+    limit_bytes: std::sync::atomic::AtomicUsize,
+    /// Set exactly once, by the overflow shutdown winner.
+    overflowed: std::sync::atomic::AtomicBool,
+}
+
+impl BacklogMetrics {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            items: std::sync::atomic::AtomicUsize::new(0),
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            items_high: std::sync::atomic::AtomicUsize::new(0),
+            bytes_high: std::sync::atomic::AtomicUsize::new(0),
+            limit_items: std::sync::atomic::AtomicUsize::new(PUBLICATION_BACKLOG_MAX_ITEMS),
+            limit_bytes: std::sync::atomic::AtomicUsize::new(PUBLICATION_BACKLOG_MAX_BYTES),
+            overflowed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Per-launch reset: zero occupancy/high-water/overflow, keep the
+    /// configured limits.
+    fn reset_for_launch(&self) {
+        self.items.store(0, Ordering::SeqCst);
+        self.bytes.store(0, Ordering::SeqCst);
+        self.items_high.store(0, Ordering::SeqCst);
+        self.bytes_high.store(0, Ordering::SeqCst);
+        self.overflowed.store(false, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-stub"))]
+    fn snapshot(&self) -> BacklogSnapshot {
+        BacklogSnapshot {
+            items: self.items.load(Ordering::Acquire),
+            bytes: self.bytes.load(Ordering::Acquire),
+            items_high: self.items_high.load(Ordering::Acquire),
+            bytes_high: self.bytes_high.load(Ordering::Acquire),
+            overflowed: self.overflowed.load(Ordering::Acquire),
+            limit_items: self.limit_items.load(Ordering::Acquire),
+            limit_bytes: self.limit_bytes.load(Ordering::Acquire),
+        }
+    }
+
+    fn release_frame(&self, cost: usize) {
+        self.items.fetch_sub(1, Ordering::AcqRel);
+        self.bytes.fetch_sub(cost, Ordering::AcqRel);
+    }
+}
+
+/// Test-only snapshot of the bounded publication backlog (r12 item 1).
+#[cfg(any(test, feature = "test-stub"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BacklogSnapshot {
+    /// Frames currently queued.
+    pub items: usize,
+    /// Bytes currently queued.
+    pub bytes: usize,
+    /// Largest occupancy reached this launch.
+    pub items_high: usize,
+    /// Largest byte occupancy reached this launch.
+    pub bytes_high: usize,
+    /// Whether the overflow shutdown already fired.
+    pub overflowed: bool,
+    /// Configured item cap.
+    pub limit_items: usize,
+    /// Configured byte cap.
+    pub limit_bytes: usize,
+}
+
+/// Admission gate around the otherwise-unbounded publication channel
+/// (ma-sdk-state r12 item 1).
+///
+/// FRAME jobs pass through the byte/item caps; CONTROL jobs
+/// (reserve tickets, the terminal EOF, test fences) always pass as long as the
+/// channel is open so prompt cancellation, natural-EOF sealing and close never
+/// wait on frame backlog admission — the bounded backlog must not recreate the
+/// shutdown deadlock an unbounded queue was chosen to avoid.
+#[derive(Clone)]
+struct PublishQueue {
+    tx: mpsc::UnboundedSender<PublishJob>,
+    metrics: Arc<BacklogMetrics>,
+    /// Serializes the cap check, counter update and channel send of frame
+    /// admission. Held with no `.await` across it (the channel is unbounded),
+    /// so an std mutex suffices and cannot deadlock an async worker.
+    admit: Arc<std::sync::Mutex<()>>,
+}
+
+impl PublishQueue {
+    /// Create the publication channel for one launch, bound by `metrics`.
+    fn new(metrics: Arc<BacklogMetrics>) -> (Self, mpsc::UnboundedReceiver<PublishJob>) {
+        let (tx, rx) = mpsc::unbounded_channel::<PublishJob>();
+        (
+            Self {
+                tx,
+                metrics,
+                admit: Arc::new(std::sync::Mutex::new(())),
+            },
+            rx,
+        )
+    }
+
+    /// Try to admit a stdout FRAME under both caps. On refusal the caller
+    /// owns the rejected job again (it is dropped by the reader on overflow).
+    fn admit_frame(&self, job: PublishJob) -> Result<(), (BacklogAdmitError, PublishJob)> {
+        let PublishJob::Frame(frame) = &job else {
+            unreachable!("admit_frame is only used for PublishJob::Frame")
+        };
+        let cost = frame_backlog_cost(frame);
+        let _guard = self.admit.lock().expect("backlog admission lock");
+        if self.metrics.overflowed.load(Ordering::Acquire) {
+            return Err((BacklogAdmitError::Closed, job));
+        }
+        let items = self.metrics.items.load(Ordering::Acquire);
+        let bytes = self.metrics.bytes.load(Ordering::Acquire);
+        let limit_items = self.metrics.limit_items.load(Ordering::Acquire);
+        let limit_bytes = self.metrics.limit_bytes.load(Ordering::Acquire);
+        if items >= limit_items || bytes.saturating_add(cost) > limit_bytes {
+            return Err((
+                BacklogAdmitError::Overflow {
+                    items,
+                    bytes,
+                    frame_bytes: cost,
+                },
+                job,
+            ));
+        }
+        // The channel is unbounded: this send only fails once the worker is
+        // gone (close dropped the receiver), never on capacity.
+        if let Err(mpsc::error::SendError(returned)) = self.tx.send(job) {
+            return Err((BacklogAdmitError::Closed, returned));
+        }
+        let items = items + 1;
+        let bytes = bytes + cost;
+        self.metrics.items.store(items, Ordering::Release);
+        self.metrics.bytes.store(bytes, Ordering::Release);
+        self.metrics.items_high.fetch_max(items, Ordering::AcqRel);
+        self.metrics.bytes_high.fetch_max(bytes, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Admit a CONTROL job (reserve ticket / terminal EOF / test fence) without
+    /// consulting the frame caps. Fails only when the channel is closed.
+    fn admit_control(&self, job: PublishJob) -> Result<(), mpsc::error::SendError<PublishJob>> {
+        self.tx.send(job)
+    }
+}
+
+/// Memory a queued frame is charged: its serialized JSON (a lower bound on the
+/// parsed heap footprint — the frame can only be larger in memory) plus the
+/// fixed size of the queue job that owns it. Serialization failing is only
+/// possible for a non-string map key, which the wire parser cannot produce;
+/// such a frame is conservatively charged the fixed job cost alone.
+fn frame_backlog_cost(frame: &Outbound) -> usize {
+    let json_bytes = serde_json::to_vec(frame).map_or(0, |buf| buf.len());
+    std::mem::size_of::<PublishJob>() + json_bytes
 }
 
 /// One ordered unit of publication work. See [`Inner::publish`].
@@ -2111,6 +2440,9 @@ pub mod test_barrier {
         /// section. A send attempted only after this is set must lose the
         /// admission race deterministically.
         stdout_eof_queued: AtomicBool,
+        /// r12 item 1: the bounded publication backlog tripped and the
+        /// overflow session-shutdown fired (terminal diagnostic emitted).
+        backlog_overflowed: AtomicBool,
         /// r11 item 3: a fail_without_ticket caller reached the rollback (set
         /// right before its mapper-lock await). With the mapper externally
         /// held, count n acknowledges n callers parked in that wait.
@@ -2159,6 +2491,7 @@ pub mod test_barrier {
             cancelled_gate_open: AtomicBool::new(true),
             cancelled_gate: tokio::sync::Notify::new(),
             stdout_eof_queued: AtomicBool::new(false),
+            backlog_overflowed: AtomicBool::new(false),
             rollback_wait_count: AtomicUsize::new(0),
             rollback_done_count: AtomicUsize::new(0),
             rollback_parked: AtomicBool::new(false),
@@ -2262,6 +2595,13 @@ pub mod test_barrier {
     pub(super) fn note_stdout_eof_queued(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.stdout_eof_queued.store(true, Ordering::Release);
+        }
+    }
+
+    /// r12 item 1 hook: the publication backlog overflow shutdown fired.
+    pub(super) fn note_backlog_overflow(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state.backlog_overflowed.store(true, Ordering::Release);
         }
     }
 
@@ -2449,6 +2789,24 @@ pub mod test_barrier {
                 }
                 if tokio::time::Instant::now() >= deadline {
                     panic!("write_commit barrier: timed out waiting for stdout EOF to be queued");
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// r12 item 1: wait until the bounded publication backlog tripped and
+        /// the overflow session-shutdown fired (terminal diagnostic emitted).
+        pub async fn wait_until_backlog_overflow(&self, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.backlog_overflowed.load(Ordering::Acquire) {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "write_commit barrier: timed out waiting for the publication \
+                         backlog overflow"
+                    );
                 }
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
@@ -2706,9 +3064,28 @@ pub mod test_barrier {
 /// Single drainer of [`Inner::publish`]: map + emit strictly in enqueue order.
 async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<PublishJob>) {
     while let Some(job) = rx.recv().await {
+        // r12 item 1: a frame's backlog charge is held until it has been
+        // fully handled (mapped AND its observations handed to the events
+        // channel); a worker parked on a full events channel keeps the frame
+        // counted, which is exactly the memory it is still holding.
+        let frame_charge = if let PublishJob::Frame(frame) = &job {
+            Some(frame_backlog_cost(frame))
+        } else {
+            None
+        };
         let result = match job {
             PublishJob::Frame(frame) => {
                 async {
+                    // r12 item 1: when the backlog overflow shutdown already
+                    // delivered the terminal observation directly (the worker
+                    // was parked behind a blocked write or a full events
+                    // channel), every job still queued is residue from a dead
+                    // session. Drop it — including outbound control requests,
+                    // which must not answer a child already killed — so nothing
+                    // is ever published after the terminal lifecycle.
+                    if inner.exit_emitted.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
                     if let Outbound::ControlRequest(env) = &*frame
                         && let ControlRequest::CanUseTool(req) = &env.request
                     {
@@ -2746,18 +3123,37 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                     // drained; every frame behind waits here, so the start is
                     // emitted before any of this turn's frames.
                     if reservation.wait_for_commit().await && reservation.claim_start() {
+                        // r12 item 1: the overflow terminal may have been
+                        // delivered while the worker parked at this ticket
+                        // (the blocked write only errors once the child is
+                        // killed). Keep the book coherent but emit nothing:
+                        // no start may follow the terminal lifecycle.
                         let start = {
                             let mut mapper = inner.mapper.lock().await;
                             mapper.commit_turn_reservation(reservation.seq);
-                            mapper.turn_started_observation(&reservation.client_message_id)?
+                            if inner.exit_emitted.load(Ordering::Acquire) {
+                                None
+                            } else {
+                                Some(
+                                    mapper
+                                        .turn_started_observation(&reservation.client_message_id)?,
+                                )
+                            }
                         };
-                        emit_all(&inner, vec![start]).await?;
+                        let emitted = start.is_some();
+                        if let Some(start) = start {
+                            emit_all(&inner, vec![start]).await?;
+                        }
                         // test-stub only: hold the worker AT the ticket after
                         // publishing the start, so a test can open the next
                         // turn's book before this turn's buffered result maps.
                         // A no-op unless the worker gate is deliberately shut.
+                        // The overflow-suppressed path skips it: the launch is
+                        // ending and no test gate still owns this position.
                         #[cfg(feature = "test-stub")]
-                        test_barrier::hold_worker_after_start(&inner.barrier).await;
+                        if emitted {
+                            test_barrier::hold_worker_after_start(&inner.barrier).await;
+                        }
                         Ok(())
                     } else {
                         // The ticket was cancelled. Roll the book back HERE, at
@@ -2794,6 +3190,9 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
         };
         if let Err(error) = result {
             warn!("ordered publication failed: {error}");
+        }
+        if let Some(charge) = frame_charge {
+            inner.backlog.release_frame(charge);
         }
     }
 }
@@ -3017,20 +3416,9 @@ async fn emit_all(inner: &Inner, observations: Vec<Observation>) -> DriverResult
 /// [`Driver::close`] after the ladder. Whichever arrives first wins; the other
 /// is a no-op, so a consumer never sees the session exit twice (§2.3).
 async fn emit_exit(inner: &Inner, status: &str) -> DriverResult<()> {
-    if inner.exit_emitted.swap(true, Ordering::SeqCst) {
-        return Ok(());
-    }
-    // r5 item 5: take the reserved terminal permit BEFORE the fallible
-    // observation build. If `mapper.lifecycle(...)?` errors, `permit` is a local
-    // and is dropped while unwinding, releasing the reserved channel slot;
-    // taking it only after a successful build left it parked in
-    // Inner.exit_permit on that error, so the RunHandle never reached EOF after
-    // close.
-    let permit = inner.exit_permit.lock().await.take();
-    let observation = {
-        let mut mapper = inner.mapper.lock().await;
+    emit_terminal(inner, |mapper| {
         // ma-sdk-state r6 item 4: test fault seam — fail the build AFTER the
-        // permit was taken. Dropping `permit` on this early return is exactly
+        // permit was taken. Dropping the permit on this early return is exactly
         // what must free the terminal slot so the RunHandle reaches EOF.
         #[cfg(feature = "test-stub")]
         if inner
@@ -3048,7 +3436,41 @@ async fn emit_exit(inner: &Inner, status: &str) -> DriverResult<()> {
             Knowledge::Known { value: session_id },
             status,
             false,
-        )?
+        )
+    })
+    .await
+}
+
+/// r12 item 1: terminal lifecycle for the publication-backlog overflow
+/// shutdown. Status "failed" (with `reason=publication_backlog_overflow` in
+/// related ids) is the process-end classifier's exact Failed token for a
+/// `session` lifecycle, so Node/Hub end the instance on it, and the reason is
+/// machine-readable on the journaled event.
+async fn emit_overflow_exit(inner: &Inner, items: usize, bytes: usize) -> DriverResult<()> {
+    let limit_items = inner.backlog.limit_items.load(Ordering::Acquire);
+    let limit_bytes = inner.backlog.limit_bytes.load(Ordering::Acquire);
+    emit_terminal(inner, move |mapper| {
+        mapper.session_backlog_overflow_observation(items, bytes, limit_items, limit_bytes)
+    })
+    .await
+}
+
+/// Build and deliver the single per-launch terminal observation: exactly-once
+/// guard, reserved permit taken BEFORE the fallible build (a build failure
+/// drops the permit and frees the slot), permit delivery first with ordinary
+/// emission as fallback. Used by natural/close exits and the r12 backlog
+/// overflow shutdown.
+async fn emit_terminal(
+    inner: &Inner,
+    build: impl FnOnce(&mut Mapper) -> DriverResult<Observation>,
+) -> DriverResult<()> {
+    if inner.exit_emitted.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    let permit = inner.exit_permit.lock().await.take();
+    let observation = {
+        let mut mapper = inner.mapper.lock().await;
+        build(&mut mapper)?
     };
     // Deliver on the reserved terminal slot first. The permit occupies a
     // position in the SAME bounded channel behind every observation already
@@ -3872,6 +4294,34 @@ impl Mapper {
         // in-flight write, so it holds no reservation.
         self.turns.turn_committed(seq);
         self.turn_started_observation(client_message_id)
+    }
+
+    /// ma-sdk-state r12 item 1: the terminal observation for a publication
+    /// backlog overflow. A `session` lifecycle with the exact Failed token
+    /// "failed", carrying a machine-readable reason and the occupancy/caps that
+    /// tripped it, so the overflow shutdown is diagnosable from the journal.
+    fn session_backlog_overflow_observation(
+        &mut self,
+        items: usize,
+        bytes: usize,
+        limit_items: usize,
+        limit_bytes: usize,
+    ) -> DriverResult<Observation> {
+        let mut related = std::collections::BTreeMap::new();
+        related.insert("reason".into(), "publication_backlog_overflow".into());
+        related.insert("backlogItems".into(), items.to_string());
+        related.insert("backlogBytes".into(), bytes.to_string());
+        related.insert("backlogItemsLimit".into(), limit_items.to_string());
+        related.insert("backlogBytesLimit".into(), limit_bytes.to_string());
+        let session_id = self.session_id.clone();
+        self.lifecycle_related(
+            LifecycleTopic::Session,
+            "session",
+            Knowledge::Known { value: session_id },
+            "failed",
+            related,
+            false,
+        )
     }
 
     fn lifecycle_named(

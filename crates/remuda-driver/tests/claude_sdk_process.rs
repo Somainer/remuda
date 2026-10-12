@@ -12,8 +12,8 @@ use remuda_driver::{
 };
 use remuda_protocol::{
     ContentBlock, Digest, DispatchState, DriverInput, DriverKind, InputOrigin, InstanceSpec,
-    Knowledge, LifecyclePayload, Observation, ObservationPayload, PromptInput, PromptMode,
-    SourceChannel, TextBlock,
+    Knowledge, LifecyclePayload, LifecycleTopic, Observation, ObservationPayload, PromptInput,
+    PromptMode, SourceChannel, TextBlock,
 };
 use remuda_testing::{ScriptKind, ensure_workspace_bin, script_path};
 use std::collections::BTreeMap;
@@ -910,6 +910,170 @@ async fn a_blocked_send_cannot_gate_close_and_emission_gates_at_the_ticket_witho
     assert!(
         send_result.is_err(),
         "a write the dead child never drained must surface an error, not success: {send_result:?}"
+    );
+}
+
+/// Related ids of the session terminal lifecycle, when it is the named event;
+/// used to read the ma-sdk-state r12 item 1 overflow diagnostic.
+fn session_terminal_related(
+    obs: &Observation,
+) -> Option<&std::collections::BTreeMap<String, String>> {
+    match &obs.body {
+        ObservationPayload::Lifecycle(payload) => match payload.as_ref() {
+            LifecyclePayload::Native(native)
+                if native.topic == LifecycleTopic::Session && native.native_name == "session" =>
+            {
+                Some(&native.related_ids)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// ma-sdk-state r12 item 1: the publication backlog is bounded by BOTH bytes
+/// and items. In the blocked-send fixture (the child stops reading stdin and
+/// floods stdout forever while a 256 KiB prompt is stuck in the writer) the
+/// old unbounded publication queue grew Node memory without limit. With small
+/// caps the bounded admission trips, the session is shut down with the
+/// `publication_backlog_overflow` terminal diagnostic (the process-end
+/// classifier's exact `session`/`failed` token), the parked send surfaces an
+/// error, and `close` still completes — while the measured backlog never
+/// crosses either cap and nothing is published after the terminal observation.
+#[tokio::test]
+async fn a_publication_backlog_overflow_shuts_the_session_down_bounded_with_a_diagnostic() {
+    const ITEM_CAP: usize = 32;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_STOP_READING".into(), "1".into());
+    env.insert("FAKE_CLAUDE_STDOUT_FLOOD".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    // Shrink the caps BEFORE launch: the flood (~one small frame/500 µs) trips
+    // the item cap in tens of milliseconds; 32 tiny frames stay far below the
+    // byte cap, so the ITEM limit is the one proven here.
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = driver.start(spec).await.expect("start");
+
+    let barrier = driver.arm_write_commit_barrier();
+
+    // One oversized prompt parks on the pipe the child never drains: the
+    // publication worker holds its reservation ticket while flood frames
+    // accumulate behind it (the exact fixture the brief names).
+    let big = "x".repeat(256 * 1024);
+    let d = driver.clone();
+    let parked_send = tokio::spawn(async move { d.send(prompt(&big)).await });
+
+    // ACKNOWLEDGED overflow: the barrier note is set inside the shutdown
+    // routine after the terminal observation was delivered — no polling.
+    barrier
+        .wait_until_backlog_overflow(Duration::from_secs(10))
+        .await;
+
+    // The reserved terminal permit delivers the diagnostic even while the
+    // worker is parked; drain until it arrives (bounded overall, no quiet
+    // period).
+    let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+        seen.iter().any(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+    })
+    .await;
+    let terminal = all
+        .iter()
+        .find(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+        .expect("the session ends with the publication_backlog_overflow diagnostic");
+    assert_eq!(
+        lifecycle_named(terminal),
+        Some("session"),
+        "the overflow diagnostic is the session terminal lifecycle: {terminal:?}"
+    );
+    assert_eq!(
+        lifecycle_status(terminal),
+        Some("failed"),
+        "overflow shutdown ends the instance as Failed, not a clean exit: {terminal:?}"
+    );
+    let related = session_terminal_related(terminal).expect("related ids");
+    assert_eq!(
+        related.get("backlogItems").map(String::as_str),
+        Some(ITEM_CAP.to_string().as_str()),
+        "the diagnostic names the occupancy that tripped the cap: {related:?}"
+    );
+    assert_eq!(
+        related.get("backlogItemsLimit").map(String::as_str),
+        Some(ITEM_CAP.to_string().as_str()),
+        "the diagnostic names the configured item cap: {related:?}"
+    );
+    assert_eq!(
+        related.get("backlogBytesLimit").map(String::as_str),
+        Some(BYTE_CAP.to_string().as_str()),
+        "the diagnostic names the configured byte cap: {related:?}"
+    );
+    assert!(
+        related
+            .get("backlogBytes")
+            .and_then(|s| s.parse::<usize>().ok())
+            .is_some_and(|bytes| bytes <= BYTE_CAP),
+        "named byte occupancy is within the byte cap: {related:?}"
+    );
+
+    // BOUNDED MEMORY: neither high-water mark ever crossed its cap.
+    let snapshot = driver.publication_backlog_for_test();
+    assert!(snapshot.overflowed, "the driver reports the overflow once");
+    assert!(
+        snapshot.items_high <= ITEM_CAP,
+        "frame backlog crossed the item cap: {} > {ITEM_CAP}",
+        snapshot.items_high
+    );
+    assert!(
+        snapshot.bytes_high <= BYTE_CAP,
+        "frame backlog crossed the byte cap: {} > {BYTE_CAP}",
+        snapshot.bytes_high
+    );
+
+    // The diagnostic is terminal: close seals the channel and nothing trails
+    // it. The parked send unblocks with an error once the killed child's pipes
+    // close.
+    drop(barrier);
+    let send_result = tokio::time::timeout(Duration::from_secs(10), parked_send)
+        .await
+        .expect("parked send resolves after the overflow kill")
+        .expect("send task joined");
+    assert!(
+        send_result.is_err(),
+        "a write the killed child never drained surfaces an error: {send_result:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(10), driver.close())
+        .await
+        .expect("close completes after the overflow shutdown")
+        .expect("close ack");
+    let mut tail = Vec::new();
+    let drain = async {
+        while let Some(obs) = handle.recv().await {
+            tail.push(obs);
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+    assert!(
+        tail.iter().all(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_none()
+        }),
+        "the overflow diagnostic is not emitted twice: {tail:?}"
+    );
+    assert!(
+        !tail.iter().any(|o| lifecycle_named(o) == Some("session")),
+        "no session lifecycle follows the overflow terminal observation: {tail:?}"
     );
 }
 

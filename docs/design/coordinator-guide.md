@@ -240,34 +240,62 @@ queued → running → (only via gate.landGrant) → landing → landed
   `canceling` row never matches, so a cancel that commits first always wins
   and nothing is pushed. After the grant the row is `landing`; a later cancel
   returns 409 "landing in progress" and the granted push runs to completion.
-- **Session fencing.** At dispatch the Hub records the authenticated carrier
-  session (the node-link generation minted at that socket's hello) on the
-  row. Both the pre-execute `gate.authorize` fence and the `gate.landGrant`
-  (including its idempotent re-answer for an already-`landing` row) require
-  the inbound socket's own session to equal that recorded session — the Hub
-  uses the socket host/session, never a value the frame claims. A paused
-  frame delivered to a replacement session after a reconnect is refused even
-  when job/generation/host still match. On the Node, a WSS reconnect revokes
-  run authority for the whole reconnect window and rebinds it to the new
-  hello; the durable daemon bumps a controller generation on takeover and
-  includes a unique per-boot id in its session epoch. A Node with **no
-  registered carrier authorizer always refuses** — missing authority is
-  permission, at both the run fence and the land grant.
-- **Landing is in-flight, not terminal.** Until it settles, a `landing` land
-  still holds its lane checkout and the project's single land slot: the
+- **Session fencing.** Every Node carrier connection mints a **process-wide,
+  monotonically non-reused** session id (not a per-host counter that resets to 1
+  after a disconnect). At dispatch the Hub records that session on the row.
+  The socket's own authenticated session — never a value a frame claims — is
+  required at every authority gate:
+  - the pre-execute `gate.authorize` fence;
+  - `gate.landGrant`, in both the `running → landing` arm and the
+    idempotent "already landing" re-answer;
+  - and the verdict that *settles* a `landing` row — both the `finished`
+    `gate.event` and the `gate.run` RPC reply carry their socket session, and the
+    Landing writer (plus the evidence log transaction) only accepts a verdict whose
+    session equals the persisted granted session.
+
+  A superseded-but-still-open socket is refused `session-superseded` even though
+  it stays connected: it can neither authorize, re-grant, nor finish-settle a
+  granted Landing. On the Node, a WSS reconnect revokes run authority for the
+  reconnect window and rebinds to the new hello; the durable daemon bumps a
+  controller generation on takeover. A Node with **no registered carrier
+  authorizer always refuses** — missing authority is permission. When a carrier
+  session ends, pre-grant `running` jobs dispatched on that session re-enter the
+  queue (or finish `canceled`), keyed to the ended session so a takeover
+  (old socket still open) does not yank a run that is verifying.
+- **Landing is in-flight, not terminal.** Until its outcome is established a
+  `landing` row keeps its lane checkout and the project's single land slot: the
   scheduler counts it for lane-busy and land-serialization, and it stays in
-  the active-jobs view. A `gate.run` RPC error/timeout against a `landing`
-  row never fails it (the child's push may still finish).
-- **Restart never blindly re-runs a landing push.** A Hub restart that finds
-  a `landing` row does not dispatch a second push (that is the hazard the
-  grant exists to prevent). It sends a read-only `gate.resolveLanding` probe
-  to the lane host, which fetches and reports whether the granted merge
-  (recorded on the row at grant time) is already an ancestor of the remote
-  base: yes → settle `landed` (journal `gate.landed`, run `--then`, drop
-  pins); no/host-gone/non-ancestor → settle `failed` with an explicit
-  "landing outcome unknown after hub restart" reason. A granted land child
-  that overruns its budget has its whole process group killed and is reaped
-  before the failure verdict, so it cannot keep pushing afterward.
+  the active view. The rule for settling is: **landed** only when the exact
+  granted merge is confirmed on the remote base; **failed** only when the push is
+  provably not pushed AND the land process group is dead; **uncertain**
+  otherwise it stays `landing` and occupied. A `gate.run` RPC error/timeout
+  against a `landing` row never fails it, and losing the RPC or the carrier
+  after the grant schedules an immediate bounded read-only reconciliation while the
+  row stays Landing.
+- **Restart preserves Landing; it is reconciled only after carriers
+  reconnect.** Startup does not settle Landing rows at all — before the listener
+  binds there is no carrier registry to probe with, so guessing a verdict there is
+  wrong (a push that reached origin before exit could be called failed, a still
+  running push could be re-run). Landing rows keep their lane/host occupancy
+  across the restart. Once a lane host reconnects (or on a periodic tick), a
+  self-serializing, throttled reconciler does a read-only `gate.resolveLanding`
+  probe — `git fetch` + `merge-base --is-ancestor` of the **exact granted merge**
+  against the remote base: present → settle `landed` (journal `gate.landed`,
+  run `--then`, drop pins); absent → keep `landing` until the bounded recovery
+  window (`gateLandingRecoveryMs`, default 12 min: the Node land budget plus
+  reconnect grace) elapses, then settle `failed` with an explicit
+  "unconfirmed after the recovery window" reason. Nothing is ever re-dispatched
+  or re-pushed by the reconciler.
+- **Land timeout is synchronous and reported uncertain.** If a granted land child
+  overruns its budget, the Node terminates its **whole process group** before
+  returning: SIGTERM the group, boundedly wait for every non-zombie member
+  (enumerated via `/proc`, so a SIGTERM-ignoring git/ssh descendant is killed
+  too), SIGKILL survivors, then reap. The verdict is `uncertain`, never
+  `failed`: even with the group dead, the remote may already have accepted
+  the ref, so the Hub leaves the row Landing and establishes the outcome via
+  the remote reconciliation above. The land child's stderr is drained
+  concurrently for its whole life, so a large remote rejection cannot block the
+  pipe.
 
 Several agents sharing one worktree is a different situation, covered by
 [CONTRIBUTING.md](../../CONTRIBUTING.md) "Staged-content verification":

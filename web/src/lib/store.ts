@@ -4014,15 +4014,29 @@ class HubStore {
     // re-arming here: the due check below owns the immediate delivery, so no
     // competing 0 ms timer can start a second flush for the same rows.
     this.scheduleLeaseExpiryWakeup(durable, now, box.ownerId, false);
-    const due = durable.some(
-      (r) =>
-        r.instanceId === instanceId &&
-        r.state === "inflight" &&
-        r.lease !== undefined &&
-        r.lease.owner !== box.ownerId &&
-        r.lease.until <= now,
-    );
-    if (due) void this.flushAllOutbox();
+    // Gate 18 item 1: the fired timer's revalidation must also deliver a
+    // PENDING row the dead owner left behind. A armed foreign expiry T for B;
+    // B's POST failed (row restored to pending, lease cleared) with only B's
+    // in-memory retry, which B's pagehide then cleared — at T this idle tab
+    // is the row's only trigger. The old `due` predicate recognised an
+    // inflight foreign lease past its deadline but NOT the lease-less pending
+    // row it became, so nothing ever POSTed. Flush when THIS firing instance
+    // has a row deliverable now. HELD rows keep the no-immediate-POST rule
+    // (their own bounded held-retry clock owns the next POST — re-POSTing here
+    // revived the gate-17 item-3 early POST); terminal rows are never
+    // deliverable, and a command this document is actively POSTing is excluded.
+    // Held rows anywhere are still suppressed inside the triggered flush
+    // (pre-seeded into its attempted set), so delivering this instance can
+    // never ride a sibling held row along.
+    const suppressedHeld = new Set<Id>();
+    let deliverableNow = false;
+    for (const r of durable) {
+      if (r.state === "held") suppressedHeld.add(r.commandId);
+      if (r.instanceId !== instanceId) continue;
+      if (r.state === "held" || box.isDeliveryActive(r.commandId)) continue;
+      if (isDeliverableOutbox(r, now)) deliverableNow = true;
+    }
+    if (deliverableNow) void this.flushAllOutbox(suppressedHeld);
   }
 
   private chainReconcile(instanceId: Id, job: () => Promise<unknown>): Promise<unknown> {

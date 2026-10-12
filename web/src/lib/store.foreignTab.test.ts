@@ -674,6 +674,136 @@ it("GATE17 item 3b: a stale lease timer revalidates the durable row on fire and 
   }
 });
 
+it("GATE18 item 1: a fired foreign-lease timer delivers the lease-less pending row the dead owner left — its only trigger — while a held row never rides along", async () => {
+  // A armed foreign-expiry T for B's lease. B's POST fails: B restores the
+  // row to PENDING with the lease cleared and arms only an in-memory retry,
+  // which B's pagehide then clears. B is closed; A is an otherwise IDLE
+  // focused tab — at T its timer is the row's only trigger. The gate-17 item-3
+  // revalidation predicate recognised only an inflight FOREIGN lease, so the
+  // lease-less pending row it read at T produced no flush and the command was
+  // never POSTed. A HELD row on the same instance must NOT ride the triggered
+  // flush (its own held-retry clock owns that POST).
+  vi.useFakeTimers();
+  const owner = "owner_g18_i1";
+  const foreign = "owner_g18_i1_crashed_b";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks: { query: async () => ({ held: [] }) } },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  sessionStorage.setItem("remuda-outbox-owner", owner);
+  try {
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    const send = vi
+      .spyOn(api, "instanceSend")
+      .mockImplementation((async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) => ({
+        relatedCommandIds: [],
+        command: {
+          commandId,
+          id: commandId,
+          state: "accepted",
+          revision: "1",
+          dispatch: "native-acknowledged",
+          resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"]);
+    await bootLive(api, hubStore);
+    const internal = hubStore as unknown as {
+      ensureOutbox: () => Promise<boolean>;
+      flushAllOutbox: () => Promise<void>;
+      leaseWakeupTimer: Map<string, unknown>;
+    };
+    expect(await internal.ensureOutbox()).toBe(true);
+    await internal.flushAllOutbox();
+    expect(send).not.toHaveBeenCalled();
+
+    const cmdP = "cmd_g18_i1_pending";
+    const cmdH = "cmd_g18_i1_held";
+    const T = Date.now() + 10_000;
+    // B holds a live foreign lease; A arms T.
+    localStorage.setItem(
+      OUTBOX_LS_KEY,
+      JSON.stringify([
+        {
+          commandId: cmdP,
+          clientRequestId: "local_g18_i1_p",
+          instanceId: INSTANCE,
+          journalId: JOURNAL,
+          prompt: "pending after crash",
+          createdAt: Date.now() - 2_000,
+          attempts: 1,
+          state: "inflight",
+          lease: { owner: foreign, until: T },
+        } satisfies OutboxRecord,
+      ]),
+    );
+    await internal.flushAllOutbox();
+    expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+
+    // B's failed POST restores P to pending (lease cleared); an EARLIER row of
+    // the same instance was answered held. B closes; its in-memory retry dies
+    // with it. A performs no flush — the stale timer is the next reader.
+    await vi.advanceTimersByTimeAsync(2_000);
+    localStorage.setItem(
+      OUTBOX_LS_KEY,
+      JSON.stringify([
+        {
+          commandId: cmdH,
+          clientRequestId: "local_g18_i1_h",
+          instanceId: INSTANCE,
+          journalId: JOURNAL,
+          prompt: "held earlier",
+          createdAt: Date.now() - 5_000,
+          attempts: 1,
+          state: "held",
+          gotResponse: true,
+        } satisfies OutboxRecord,
+        {
+          commandId: cmdP,
+          clientRequestId: "local_g18_i1_p",
+          instanceId: INSTANCE,
+          journalId: JOURNAL,
+          prompt: "pending after crash",
+          createdAt: Date.now() - 2_000,
+          attempts: 1,
+          state: "pending",
+          lastError: "network down",
+        } satisfies OutboxRecord,
+      ]),
+    );
+
+    // T fires on an idle tab: P is delivered exactly once; H never rides.
+    await vi.advanceTimersByTimeAsync(8_000);
+    for (let i = 0; i < 30 && send.mock.calls.length === 0; i += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBe(cmdP);
+    const stored = JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(stored.find((r) => r.commandId === cmdP)?.state).toBe("sent");
+    expect(stored.find((r) => r.commandId === cmdH)?.state).toBe("held");
+
+    // No later double POST of P and no timer-driven POST of the held row.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
 it("GATE17 item 2: the Outbox wake is what FIRST discovers the foreign replacement — it hands T2 to the store, which POSTs exactly once at T2", async () => {
   // A's tracked SAME-OWNER wake (a cloned sibling's inactive claim, T1) fires
   // and only THEN discovers B's FOREIGN replacement lease (T2, B crashed).

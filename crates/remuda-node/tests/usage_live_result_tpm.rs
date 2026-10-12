@@ -82,18 +82,28 @@ fn live_print_result_flows_into_the_tpm_window_end_to_end() {
 /// counters: input stays 100, output advances 10 -> 20, and the derived total
 /// moves 110 -> 120. Before the fix the second UPDATE wrote every incoming
 /// bucket verbatim and erased input (and the total) to NULL.
+///
+/// c-ctxusage r13 item 4: that token-only partial frame also carries NO cost,
+/// so the first frame's reported cost survives the merge (NULL never erases a
+/// known cost); a following COST-ONLY result frame (total_cost_usd, no token
+/// buckets) updates the bill on its own authority, with no token growth.
 #[test]
 fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
-    fn usage_for(usage: serde_json::Value) -> Observation {
+    fn usage_for(usage: Option<serde_json::Value>, total_cost_usd: Option<f64>) -> Observation {
         let mut mapper = StdoutMapper::new(DriverKind::ClaudePrint, "sess");
-        let frame = serde_json::json!({
+        let mut frame = serde_json::json!({
             "type": "result",
             "subtype": "success",
             "num_turns": 1,
             "result_index": 0,
             "stop_reason": "end_turn",
-            "usage": usage,
         });
+        if let Some(usage) = usage {
+            frame["usage"] = usage;
+        }
+        if let Some(cost) = total_cost_usd {
+            frame["total_cost_usd"] = serde_json::json!(cost);
+        }
         mapper
             .map(frame)
             .expect("result frame maps")
@@ -102,15 +112,18 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
             .expect("a result frame yields one usage observation")
     }
 
-    let first = usage_for(serde_json::json!({
-        "input_tokens": 100,
-        "output_tokens": 10,
-    }));
+    // First frame: full counters AND a reported cost.
+    let first = usage_for(
+        Some(serde_json::json!({
+            "input_tokens": 100,
+            "output_tokens": 10,
+        })),
+        Some(0.5),
+    );
     // The real mapper accepts a result with no input_tokens bucket: it simply
-    // does not report that bucket.
-    let second = usage_for(serde_json::json!({
-        "output_tokens": 20,
-    }));
+    // does not report that bucket — and a frame with no cost leaves the cost
+    // unreported rather than reporting zero.
+    let second = usage_for(Some(serde_json::json!({"output_tokens": 20})), None);
 
     if let ObservationPayload::Usage(payload) = &second.body {
         assert_eq!(payload.scope_id, "1:0");
@@ -121,9 +134,16 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
             ),
             "missing input projects as unknown, not 0"
         );
+        assert!(
+            matches!(payload.cost, remuda_protocol::Knowledge::Unknown { .. }),
+            "a missing cost projects as unknown, not a reported zero"
+        );
     } else {
         panic!("second frame must map to usage");
     }
+
+    // Cost-only frame: no usage buckets at all, just a corrected bill.
+    let third = usage_for(None, Some(0.75));
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate(&conn).unwrap();
@@ -141,12 +161,19 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
         assert!(insert_usage_event(&conn, &row).unwrap());
     }
 
-    let (input, output, total): (Option<i64>, Option<i64>, Option<i64>) = conn
-        .query_row(
-            "SELECT input_tokens, output_tokens, total_tokens FROM usage_events \
+    let (input, output, total, cost): (Option<i64>, Option<i64>, Option<i64>, Option<String>) =
+        conn.query_row(
+            "SELECT input_tokens, output_tokens, total_tokens, cost_usd FROM usage_events \
              WHERE instance_id = 'ins_partial_merge' AND scope = 'turn' AND scope_id = '1:0'",
             [],
-            |r| Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap())),
+            |r| {
+                Ok((
+                    r.get(0).unwrap(),
+                    r.get(1).unwrap(),
+                    r.get(2).unwrap(),
+                    r.get(3).unwrap(),
+                ))
+            },
         )
         .expect("the scoped row exists");
     assert_eq!(input, Some(100), "the unreported input must be retained");
@@ -156,4 +183,60 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
         Some(120),
         "the total is derived from the merged basket"
     );
+    assert_eq!(
+        cost.as_deref(),
+        Some("0.5"),
+        "the token-only partial frame must not erase the known cost"
+    );
+
+    // The cost-only frame carries no counters, so it never reaches the row by
+    // token growth; it must be accepted on its own authority, and every
+    // retained counter (and the derived total) survives.
+    let cost_only = JournalRecord {
+        instance_id: "ins_partial_merge".into(),
+        seq: 3,
+        event_id: "evt_partial_cost_only".into(),
+        observed_at: "2020-01-01T00:00:00.000Z".into(),
+        event: serde_json::to_value(&third).unwrap(),
+    };
+    let cost_only_row = project_usage_event(&cost_only, None, None).expect("projects");
+    assert!(
+        cost_only_row.input_tokens.is_none() && cost_only_row.output_tokens.is_none(),
+        "the cost-only frame reports no token buckets"
+    );
+    assert!(
+        insert_usage_event(&conn, &cost_only_row).expect("cost-only insert"),
+        "an authoritative cost-only update must be accepted without token growth"
+    );
+    let (input, output, total, cost): (Option<i64>, Option<i64>, Option<i64>, Option<String>) =
+        conn.query_row(
+            "SELECT input_tokens, output_tokens, total_tokens, cost_usd FROM usage_events \
+             WHERE instance_id = 'ins_partial_merge' AND scope = 'turn' AND scope_id = '1:0'",
+            [],
+            |r| {
+                Ok((
+                    r.get(0).unwrap(),
+                    r.get(1).unwrap(),
+                    r.get(2).unwrap(),
+                    r.get(3).unwrap(),
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        cost.as_deref(),
+        Some("0.75"),
+        "the cost-only frame updates the bill"
+    );
+    assert_eq!(
+        input,
+        Some(100),
+        "cost-only update keeps the retained input"
+    );
+    assert_eq!(
+        output,
+        Some(20),
+        "cost-only update keeps the retained output"
+    );
+    assert_eq!(total, Some(120), "cost-only update keeps the derived total");
 }

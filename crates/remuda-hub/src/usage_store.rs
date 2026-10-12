@@ -540,6 +540,7 @@ impl SnapshotCounters {
 struct StoredSnapshot {
     counters: SnapshotCounters,
     revision: i64,
+    cost_usd: Option<String>,
     observed_at: String,
     observed_at_source: String,
 }
@@ -556,6 +557,13 @@ struct StoredSnapshot {
 /// recomputed from the merged basket. Cumulative SESSION snapshots have their
 /// own monotone acceptance path and are intentionally not governed here.
 ///
+/// Cost (c-ctxusage r13 item 4): a frame that does not REPORT a cost leaves
+/// the stored one in place — an unreported cost means "not reported", never
+/// zero, so a token-only partial update never erases a known cost. An
+/// explicitly reported cost on an equal-or-newer revision is authoritative on
+/// its own, so a cost-only frame updates the row without any token growth; an
+/// older-revision cost is frozen with the rest of the snapshot.
+///
 /// Independently, a NATIVE observation repairs a stored ingest-fallback
 /// provenance even when counters are identical AND the timestamp string
 /// equals the fallback (r11 item 5); an ingest fallback never overwrites a
@@ -564,7 +572,8 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
     let stored: Option<StoredSnapshot> = conn
         .query_row(
             "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens,
-                    cache_write_tokens, metric_revision, observed_at, observed_at_source
+                    cache_write_tokens, metric_revision, cost_usd, observed_at,
+                    observed_at_source
              FROM usage_events
              WHERE instance_id = ?1 AND scope = 'turn' AND scope_id = ?2",
             params![row.instance_id, row.scope_id],
@@ -578,8 +587,9 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
                         cache_write: r.get(4)?,
                     },
                     revision: r.get(5)?,
-                    observed_at: r.get(6)?,
-                    observed_at_source: r.get(7)?,
+                    cost_usd: r.get(6)?,
+                    observed_at: r.get(7)?,
+                    observed_at_source: r.get(8)?,
                 })
             },
         )
@@ -608,6 +618,14 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
         let (grew, decreased) = incoming.growth_against(&stored.counters);
         grew && !decreased
     };
+    // An explicitly reported cost is authoritative on an equal-or-newer
+    // revision even when no token bucket moved (a cost-only update); a frame
+    // with no reported cost contributes nothing here and keeps the stored one
+    // via the merge below. An older revision's cost is frozen with its
+    // counters.
+    let cost_change = row.metric_revision >= stored.revision
+        && row.cost_usd.is_some()
+        && row.cost_usd != stored.cost_usd;
     // Independently, a NATIVE observation repairs a stored ingest-fallback
     // PROVENANCE even when the counters and timestamp string are unchanged:
     // the native source carrying the exact fallback string still proves the
@@ -616,16 +634,19 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
     // overwrites a native time.
     let time_repair = row.observed_at_source == "native" && stored.observed_at_source != "native";
 
-    if !counters_change && !time_repair {
+    if !counters_change && !cost_change && !time_repair {
         return Ok(false);
     }
 
-    if counters_change {
+    if counters_change || cost_change {
         // r12 item 2: merge unreported incoming buckets with the retained
         // counters so a partial frame (e.g. a later print result carrying only
         // output_tokens) never erases a known counter; derive the total from
-        // the merged basket when the incoming row did not report one.
+        // the merged basket when the incoming row did not report one. r13
+        // item 4: the same merge for cost — an unreported incoming cost keeps
+        // the known one instead of overwriting it with NULL.
         let merged = incoming.merged_over(&stored.counters);
+        let merged_cost = row.cost_usd.clone().or_else(|| stored.cost_usd.clone());
         let observed_at =
             if row.observed_at_source == "native" || stored.observed_at_source != "native" {
                 row.observed_at.clone()
@@ -666,7 +687,7 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
                 merged.output,
                 merged.cache_read,
                 merged.cache_write,
-                row.cost_usd,
+                merged_cost,
                 row.accounting,
                 observed_at,
                 observed_at_source,

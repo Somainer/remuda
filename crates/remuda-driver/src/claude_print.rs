@@ -8079,6 +8079,15 @@ mod turn_reservation_wakeup_tests {
     use super::*;
     use std::time::Duration;
 
+    /// The ONE named bound for every await in the ticket-wakeup tests
+    /// (ma-sdk-state r16 item 3): no inline `tokio::time::timeout` at the
+    /// wait/join sites.
+    async fn bounded_ticket_wait<F: std::future::Future>(future: F, what: &str) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .unwrap_or_else(|_| panic!("bounded test wait timed out: {what}"))
+    }
+
     /// ma-sdk-state r5 item 3: cancelling BEFORE a waiter registers its
     /// `committed.notified()` must not lose the wakeup. `wait_for_commit`
     /// observes the resolved flag and returns false promptly (pre-fix it parked
@@ -8088,9 +8097,8 @@ mod turn_reservation_wakeup_tests {
         let reservation = TurnReservation::shared(0, "msg-cancel-before-wait".to_string());
         // Cancel first; only afterwards does the (worker) side await.
         reservation.cancel();
-        let committed = tokio::time::timeout(Duration::from_secs(2), reservation.wait_for_commit())
-            .await
-            .expect("a cancel that raced ahead must still resolve the wait");
+        let committed = bounded_ticket_wait(reservation.wait_for_commit(), "a cancel racing ahead")
+            .await;
         assert!(!committed, "a cancel resolves the ticket as not-committed");
     }
 
@@ -8104,9 +8112,8 @@ mod turn_reservation_wakeup_tests {
         let ticket = reservation.clone();
         let waiter = tokio::spawn(async move { ticket.wait_for_commit().await });
         reservation.commit();
-        let committed = tokio::time::timeout(Duration::from_secs(2), waiter)
+        let committed = bounded_ticket_wait(waiter, "the waiter task")
             .await
-            .expect("waiter task")
             .expect("waiter resolves");
         assert!(committed, "a commit resolves the ticket as committed");
         assert!(
@@ -8367,6 +8374,15 @@ mod backlog_accounting_tests {
         BacklogBudget::new(cap_items, cap_bytes)
     }
 
+    /// The ONE named bound for joining the admission/drain stress threads
+    /// (ma-sdk-state r16 item 3): no inline `tokio::time::timeout` at the
+    /// join sites.
+    async fn bounded_accounting_join<F: std::future::Future>(future: F, what: &str) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(30), future)
+            .await
+            .unwrap_or_else(|_| panic!("bounded test wait timed out: {what}"))
+    }
+
     /// Directive (b): every exit path releases by Drop — a queued job drained,
     /// a job discarded while queued (worker aborted, receiver dropped), and a
     /// charge the caller never queued all return their permits exactly once, so
@@ -8462,16 +8478,14 @@ mod backlog_accounting_tests {
             }));
         }
         for handle in admitters {
-            let n = tokio::time::timeout(Duration::from_secs(30), handle)
+            let n = bounded_accounting_join(handle, "an admitter thread")
                 .await
-                .expect("admitter bound")
                 .expect("admitter thread");
             assert_eq!(n, PER_ADMITTER);
         }
         drop(queue);
-        let seen = tokio::time::timeout(Duration::from_secs(30), drainer)
+        let seen = bounded_accounting_join(drainer, "the drainer thread")
             .await
-            .expect("drainer bound")
             .expect("drainer thread");
         assert_eq!(seen, TOTAL);
         assert_eq!(

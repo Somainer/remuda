@@ -1388,6 +1388,98 @@ async fn an_overflow_kill_contending_on_live_still_reaps_the_child() {
         .expect("the RunHandle reaches recv=None after close");
 }
 
+/// ma-sdk-state r13 item 4: when the overflow terminal is published with the
+/// worker blocked in emit against the FULL events channel, the terminal rides
+/// the reserved permit behind every queued observation and NOTHING follows it;
+/// the observations queued ahead of it are all preserved.
+#[tokio::test]
+async fn nothing_follows_the_overflow_terminal_when_the_consumer_channel_was_full() {
+    // Above the 255 ordinary slots: overflow trips from the FRAME backlog while
+    // the worker is parked emitting, the exact r13 item 4 shape.
+    const ITEM_CAP: usize = 512;
+    const BYTE_CAP: usize = 16 * 1024 * 1024;
+
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_STDOUT_FLOOD".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+
+    let barrier = driver.arm_write_commit_barrier();
+
+    // Do NOT drain: 255 ordinary observations fill the channel and the worker
+    // parks in emit. Acknowledge the saturated state (bounded window).
+    let saturated = async {
+        for _ in 0..400 {
+            if driver.publication_is_saturated().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("publication never saturated with a flooding child");
+    };
+    tokio::time::timeout(Duration::from_secs(10), saturated)
+        .await
+        .expect("saturation window");
+
+    // The frame backlog keeps growing behind the parked worker and trips the
+    // overflow shutdown; the terminal goes through the reserved permit.
+    barrier
+        .wait_until_backlog_overflow(Duration::from_secs(20))
+        .await;
+
+    // Drain up to and including the terminal. Freed slots here are exactly what
+    // the OLD in-flight ordinary send would have completed into after the
+    // terminal.
+    let head = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+        seen.iter().any(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+    })
+    .await;
+    let terminal = head
+        .last()
+        .filter(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+        .expect("the head drain ends ON the overflow terminal");
+    assert_eq!(lifecycle_status(terminal), Some("failed"));
+    // Every ordinary slot that was occupied at saturation is delivered ahead
+    // of the permit terminal: 255 observations + the terminal.
+    assert_eq!(
+        head.len(),
+        256,
+        "the queued observations are preserved and the terminal is last among them"
+    );
+
+    // Close and drain whatever remains: the tail must be empty — the cancelled
+    // in-flight ordinary send is never completed.
+    drop(barrier);
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close after the full-channel overflow",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close after the full-channel overflow")
+    .expect("close ack");
+    let tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+    assert!(
+        tail.is_empty(),
+        "no observation follows the terminal through the full channel: {tail:?}"
+    );
+}
+
 /// Item 4: a reader from a previous launch must never emit into the next one.
 ///
 /// `close` joins or aborts the reader before it returns, and `start` re-arms

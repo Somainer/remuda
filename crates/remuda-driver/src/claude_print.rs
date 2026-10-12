@@ -579,6 +579,13 @@ pub struct Inner {
     /// exactly one exit observation ahead of stream EOF. It is re-acquired on
     /// every launch (start resets exit_emitted).
     exit_permit: Mutex<Option<mpsc::OwnedPermit<Observation>>>,
+    /// ma-sdk-state r13 item 4: set `true` immediately BEFORE the terminal
+    /// observation is delivered through the reserved `exit_permit`. An
+    /// `emit_all` ordinary send parked on the FULL events channel selects on
+    /// this and drops its in-flight/remaining sends instead of completing them
+    /// once the consumer frees capacity — otherwise that ordinary observation
+    /// lands AFTER the terminal. Reset to `false` on every launch.
+    terminal_direct: tokio::sync::watch::Sender<bool>,
     closed: AtomicBool,
     /// Whether the `exited` session lifecycle has already been emitted, so the
     /// reader task and [`Driver::close`] cannot both emit it (§2.3: exactly once).
@@ -943,6 +950,7 @@ impl ClaudePrintDriver {
                 policy: Mutex::new(PermissionPolicy::Host),
                 events: Mutex::new(None),
                 exit_permit: Mutex::new(None),
+                terminal_direct: tokio::sync::watch::channel(false).0,
                 closed: AtomicBool::new(false),
                 exit_emitted: AtomicBool::new(false),
                 last_spec: Mutex::new(None),
@@ -1083,6 +1091,9 @@ impl ClaudePrintDriver {
         *self.inner.last_spec.lock().await = Some(spec.clone());
         self.inner.closed.store(false, Ordering::SeqCst);
         self.inner.exit_emitted.store(false, Ordering::SeqCst);
+        // r13 item 4: re-arm the shutdown-aware ordinary-send seal for this
+        // launch (the previous launch's worker and its subscriber are gone).
+        self.inner.terminal_direct.send_replace(false);
 
         let mut ack = DriverAck::transport_written();
         ack.native_ids.insert("sessionId".into(), session_id);
@@ -3875,9 +3886,32 @@ async fn emit_all(inner: &Inner, observations: Vec<Observation>) -> DriverResult
     let Some(tx) = tx else {
         return Ok(());
     };
+    // r13 item 4: shutdown-aware ordinary emission. The terminal goes out
+    // through its RESERVED permit without waiting for consumer capacity; if
+    // that happens while a send here is parked on the full events channel, the
+    // parked send must be CANCELLED — completing it once the consumer frees a
+    // slot would enqueue it AFTER the terminal (the permit occupies the last
+    // slot, the ordinary send takes the next freed one). Explicit policy:
+    // abandon the in-flight and every remaining ordinary observation; nothing
+    // queued AHEAD of the terminal is touched (it is already in the channel).
+    let mut terminal_seal = inner.terminal_direct.subscribe();
     for observation in observations {
-        if tx.send(observation).await.is_err() {
+        if *terminal_seal.borrow() || inner.exit_emitted.load(Ordering::Acquire) {
             break;
+        }
+        tokio::select! {
+            biased;
+            recv = terminal_seal.changed() => {
+                // The sender lives for the whole driver; an Err here only means
+                // it is gone, which is itself a shutdown — stop either way.
+                let _ = recv;
+                break;
+            }
+            result = tx.send(observation) => {
+                if result.is_err() {
+                    break;
+                }
+            }
         }
     }
     Ok(())
@@ -3951,6 +3985,12 @@ async fn emit_terminal(
     // be blocked or aborted by close. Fall back to the ordinary sender only if
     // the permit is gone.
     if let Some(permit) = permit {
+        // r13 item 4: seal ordinary emission BEFORE the terminal enters the
+        // channel. A worker parked in emit_all on a full channel cancels its
+        // in-flight send when this lands, so no ordinary observation can be
+        // completed into the next freed slot AFTER this terminal. Everything
+        // already queued ahead of it is untouched and preserved.
+        inner.terminal_direct.send_replace(true);
         permit.send(observation);
         return Ok(());
     }

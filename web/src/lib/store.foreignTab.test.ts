@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import type { ConnectionMachine } from "./connection";
+import { REST_PROBE_MS } from "./connection";
 import { OUTBOX_LS_KEY, type OutboxRecord } from "./outbox";
 
 const INSTANCE = "ins_foreign_tab";
@@ -1501,6 +1502,134 @@ it("GATE17 item 1: recovering A -> never-mounted B with a FAILING seed self-driv
   // And the machine is still not stranded: after the retried seed fails it
   // arms another reconnect clock.
   expect(timerNames()).toContain("reconnect");
+  vi.useRealTimers();
+  hubStore.logout();
+});
+
+it("GATE18 item 5: a duplicate seed that finds the journal mounted with a DEAD socket ends the current-binding attempt instead of stranding it on the 20 s watchdog", async () => {
+  // follow(B) attempt 1 (unmounted seed in flight) -> navigate to mounted live
+  // A (retries/retries attempt 1) -> follow(B) again before the seed returns
+  // (attempt 2) -> attempt 1's seed returns FIRST: it journals.set B, then its
+  // openFollowSocket rejects (failure dropped: stale generation). Attempt 2's
+  // seed then returns to a mounted-but-dead B: the journals.has branch used to
+  // return WITHOUT followAttemptEnd, leaving attempt 2 in recovering with no
+  // timer until the 20 s watchdog. It must end the attempt as failed so the
+  // real probe/reopen path self-drives before the watchdog.
+  vi.useFakeTimers();
+  const { api, hubStore } = await fresh();
+  await bootLive(api, hubStore); // lists A = INSTANCE (journal JOURNAL)
+
+  const JOURNAL_B = "obj_journal_b_g18_i5";
+  const INSTANCE_B = "ins_unmounted_b_g18_i5";
+  vi.spyOn(api, "instanceGet").mockImplementation(async (id: string) =>
+    id === INSTANCE_B
+      ? ({
+          id: INSTANCE_B,
+          journalId: JOURNAL_B,
+          lifecycle: "running",
+          revision: "0",
+          durableSeq: "0",
+        } as never as Awaited<ReturnType<Api["instanceGet"]>>)
+      : ({} as Awaited<ReturnType<Api["instanceGet"]>>),
+  );
+  const emptyRead = {
+    events: [],
+    windowFromSeq: "1",
+    durableSeq: "0",
+    reachedAfterSeq: true,
+  } as Awaited<ReturnType<Api["eventsRead"]>>;
+  // The first two B seeds are externally ordered; later B reads (the settle
+  // probe, the reopen catch-up) answer immediately.
+  const seedResolvers: Array<() => void> = [];
+  let bSeedCalls = 0;
+  vi.spyOn(api, "eventsRead").mockImplementation((async (args) => {
+    if (args.journalId !== JOURNAL_B) return emptyRead;
+    bSeedCalls += 1;
+    if (bSeedCalls <= 2) {
+      return await new Promise<Awaited<ReturnType<Api["eventsRead"]>>>((resolve) => {
+        seedResolvers[bSeedCalls - 1] = () => resolve(emptyRead);
+      });
+    }
+    return emptyRead;
+  }) as Api["eventsRead"]);
+  // B's FIRST subscribe (attempt 1's late open) is blocked; every later one
+  // opens live with an immediate snapshot. A's subscribe always succeeds.
+  let bSubscribeCalls = 0;
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    (async (journalId: string) => {
+      if (journalId === JOURNAL_B) {
+        bSubscribeCalls += 1;
+        if (bSubscribeCalls === 1) throw new Error("attempt 1 follow blocked");
+      }
+      return {
+        subscriptionId: `sub_g18i5_${bSubscribeCalls}` as never,
+        getReadyState: () => 1,
+        snapshot: { asOfSeq: "0", fromSeq: null },
+        close: () => undefined,
+      };
+    }) as unknown as Api["eventsSubscribe"],
+  );
+
+  // Mount A live (a framed socket).
+  await hubStore.follow(INSTANCE);
+  const store = hubStore as unknown as {
+    connection: ConnectionMachine;
+    setFollowLiveForTest: (open: boolean, framed: boolean, journalId?: string) => void;
+  };
+  store.setFollowLiveForTest(true, true, JOURNAL);
+  const timerNames = () =>
+    [...(store.connection as unknown as { timers: Map<string, unknown> }).timers.keys()];
+
+  // Attempt 1: follow(B) while its seed is still pending.
+  const followB1 = hubStore.follow(INSTANCE_B);
+  void followB1.catch(() => undefined);
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
+  expect(bSeedCalls).toBe(1);
+
+  // Navigate to the MOUNTED live A (retries attempt 1, adopts A's socket).
+  await hubStore.follow(INSTANCE);
+  expect(store.connection.state).toBe("live");
+
+  // Attempt 2: follow(B) again before attempt 1's seed returns.
+  const followB2 = hubStore.follow(INSTANCE_B);
+  void followB2.catch(() => undefined);
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
+  expect(bSeedCalls).toBe(2);
+  expect(store.connection.state).toBe("recovering");
+
+  // Attempt 1's seed returns: it journals.set B and its open is rejected; the
+  // failure is dropped (generation stale) and followB1 rejects.
+  seedResolvers[0]!();
+  await expect(followB1).rejects.toThrow("attempt 1 follow blocked");
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
+  expect(bSubscribeCalls).toBe(1);
+  expect(store.connection.state).toBe("recovering");
+
+  // Attempt 2's seed returns to a mounted-but-dead B.
+  seedResolvers[1]!();
+  await followB2;
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+
+  // FIX: the attempt ended through the NORMAL failure path — quiet stale with
+  // the probe/reopen clocks armed, NOT a timer-less recovering waiting on the
+  // 20 s watchdog.
+  expect(store.connection.state).toBe("stale");
+  expect(timerNames()).toContain("probe");
+  expect(timerNames()).not.toContain("watchdog");
+  expect(bSubscribeCalls).toBe(1);
+
+  // The quiet probe fires well before the 20 s watchdog and reopens B for
+  // real: a second subscribe succeeds, a snapshot frame certifies live.
+  await vi.advanceTimersByTimeAsync(REST_PROBE_MS);
+  for (let i = 0; i < 30; i += 1) await vi.advanceTimersByTimeAsync(0);
+  expect(bSubscribeCalls).toBe(2);
+  expect(store.connection.state).toBe("live");
+
+  // No competing reopen from the 20 s watchdog (the mock socket is silent, so
+  // the frame watchdog's own ordinary stale cycle owns anything past 30 s).
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(bSubscribeCalls).toBe(2);
+  expect(store.connection.state).toBe("live");
   vi.useRealTimers();
   hubStore.logout();
 });

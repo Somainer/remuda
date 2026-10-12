@@ -2945,6 +2945,25 @@ class HubStore {
         // bracket settles the attempt when its socket is not live yet.
         if (this.connection && mountAttemptId !== null && this.followSocketLive()) {
           this.connection.followAttemptLive(mountAttemptId, bindGen);
+          return;
+        }
+        // Gate 18 item 5: the journal can be mounted WITHOUT a live socket:
+        // an earlier attempt for this same navigation won the journals.set
+        // race but its openFollowSocket then rejected. The current call's
+        // attempt is still in flight (the obsolete attempt's failure was
+        // dropped on the generation guard), and the bare return left it in
+        // recovering with nothing but the 20 s watchdog. End it as failed
+        // while its binding is still current so the ordinary probe ->
+        // stale/offline -> reopenFollow -> follow() recovery owns retry; a
+        // superseded call is dropped inside followAttemptEnd as everywhere
+        // else.
+        if (
+          this.connection &&
+          mountAttemptId !== null &&
+          bindGen === this.connectionBindGen &&
+          !this.followSocketLive()
+        ) {
+          this.connection.followAttemptEnd(false, mountAttemptId, bindGen);
         }
         return;
       }

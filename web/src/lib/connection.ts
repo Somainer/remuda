@@ -325,6 +325,20 @@ export class ConnectionMachine {
           this.closedDuringResume = true;
           return;
         }
+        if (this.resumeRetiredOffline) {
+          // c-reconnfu gate 20 item 5: the browser `offline` event retired
+          // this attempt WHILE its REST catch-up was still pending, but the
+          // socket it opened can genuinely CLOSE before that read resolves
+          // (offline → close ordering — gate 19 item 5 covered close →
+          // offline). Preserve the close information for the retired attempt
+          // too: without this latch its later SUCCESSFUL completion certified
+          // live over the dead link. The completion takes the same dead-link
+          // settlement as an in-flight close (probe-verified stale / offline).
+          // State already is "offline" and the reconnect clock is armed, so
+          // do not re-run goOfflineAndSchedule here.
+          this.closedDuringResume = true;
+          return;
+        }
         this.goOfflineAndSchedule();
         return;
       case "online":

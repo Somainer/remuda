@@ -1909,6 +1909,142 @@ it("GATE19 item 5 (real store): a follow socket that genuinely closes while the 
   }
 });
 
+it("GATE20 item 5 (real store): offline retires the attempt, THEN its reopen socket genuinely closes, THEN the pending catch-up succeeds — never certified live", async () => {
+  // Gate 19 item 5 covered close -> offline. This is the inverse ordering the
+  // reviewer found: browser OFFLINE arrives first (the attempt is retired with
+  // resumeRetiredOffline while resumeAfterReconnect's REST read is pending),
+  // the follow socket the attempt opened genuinely CLOSES only afterwards, and
+  // the delayed catch-up then SUCCEEDS before the reconnect timer runs. The
+  // success proves journal catch-up, not a live link: the close must stay
+  // latched for the offline-retired attempt and the completion takes the dead-
+  // link settlement (quiet stale; a REAL reopen re-certifies), never "live".
+  vi.useFakeTimers();
+  try {
+    const { api, hubStore } = await fresh();
+    await bootLive(api, hubStore);
+
+    const emptyRead = {
+      events: [],
+      windowFromSeq: "1",
+      durableSeq: "0",
+      reachedAfterSeq: true,
+    } as Awaited<ReturnType<Api["eventsRead"]>>;
+
+    let resumeReads = 0;
+    let closeSub2: (() => void) | null = null;
+    let closeDispatched = false;
+    let releaseResume: () => void = () => undefined;
+    let releaseOrderGate: () => void = () => undefined;
+    const resumeGate = new Promise<void>((resolve) => {
+      releaseResume = resolve;
+    });
+    // The close is allowed ONLY after the test dispatched browser `offline`,
+    // forcing the offline -> close ordering this regression targets.
+    const orderGate = new Promise<void>((resolve) => {
+      releaseOrderGate = resolve;
+    });
+    vi.spyOn(api, "eventsRead").mockImplementation(
+      (async (args: Parameters<Api["eventsRead"]>[0]) => {
+        if (args.limit === 128) {
+          resumeReads += 1;
+          if (resumeReads === 1) {
+            await orderGate;
+            // Socket genuinely closes WHILE this catch-up read is pending,
+            // but strictly AFTER the browser offline event retired the attempt.
+            closeSub2?.();
+            closeDispatched = true;
+            await resumeGate;
+          }
+        }
+        return emptyRead;
+      }) as Api["eventsRead"],
+    );
+
+    let subscribes = 0;
+    vi.spyOn(api, "eventsSubscribe").mockImplementation(
+      (async (
+        _journalId: string,
+        _afterSeq: unknown,
+        _onBatch: unknown,
+        _onGap: unknown,
+        hooks?: { onOpen?: () => void; onClose?: () => void; onFrame?: () => void },
+      ) => {
+        subscribes += 1;
+        if (subscribes === 2) {
+          const close = hooks?.onClose;
+          closeSub2 = () => close?.();
+        }
+        return {
+          subscriptionId: `sub_g20_i5_${subscribes}` as never,
+          getReadyState: () => 1,
+          snapshot: { asOfSeq: "0", fromSeq: null },
+          close: () => undefined,
+        };
+      }) as unknown as Api["eventsSubscribe"],
+    );
+
+    // Initial real mount: subscribe #1, framed live.
+    await hubStore.follow(INSTANCE);
+    expect(subscribes).toBe(1);
+    const store = hubStore as unknown as {
+      connection: ConnectionMachine;
+      setFollowLiveForTest: (open: boolean, framed: boolean, journalId?: string) => void;
+    };
+    store.setFollowLiveForTest(true, true, JOURNAL);
+
+    // Link dies; an online-driven resume opens subscribe #2; its snapshot
+    // frames live while the first catch-up read blocks on the gate.
+    store.setFollowLiveForTest(false, false, JOURNAL);
+    store.connection.dispatch({ type: "online" });
+    for (let i = 0; i < 50 && subscribes < 2; i += 1) await Promise.resolve();
+    expect(subscribes).toBe(2);
+    // Let subscribe #2's snapshot frame the optimistic live state while the
+    // gated catch-up read is still pending (close still held back).
+    for (let i = 0; i < 50 && store.connection.state !== "live"; i += 1) {
+      await Promise.resolve();
+    }
+    expect(store.connection.state).toBe("live");
+
+    // Ordering under test: browser OFFLINE retires the attempt first …
+    store.connection.dispatch({ type: "offline" });
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    expect(store.connection.state).toBe("offline");
+    expect(closeDispatched).toBe(false);
+    // … allow the pending read's real onClose to land THEN …
+    releaseOrderGate();
+    for (let i = 0; i < 50 && !closeDispatched; i += 1) await Promise.resolve();
+    expect(closeDispatched).toBe(true);
+    expect(store.connection.state).toBe("offline");
+    expect(subscribes).toBe(2);
+    // … and the pending catch-up SUCCEEDS (no fake time passes: the reconnect
+    // timer has not run).
+    releaseResume();
+    for (let i = 0; i < 100 && store.connection.state === "offline"; i += 1) {
+      await Promise.resolve();
+    }
+    // Dead-link settlement: quiet stale on the successful REST read, never the
+    // "live" label over a socket that already closed.
+    expect(store.connection.state).toBe("stale");
+    expect(subscribes).toBe(2);
+
+    // Recovery reopens for REAL on the stale-probe clock: subscribe #3 with a
+    // real catch-up, and only the NEW socket's snapshot re-certifies live.
+    await vi.advanceTimersByTimeAsync(REST_PROBE_MS);
+    for (let i = 0; i < 100 && subscribes < 3; i += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(subscribes).toBe(3);
+    for (let i = 0; i < 100 && store.connection.state !== "live"; i += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(store.connection.state).toBe("live");
+    expect(resumeReads).toBe(2);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it("GATE18 item 5: a duplicate seed that finds the journal mounted with a DEAD socket ends the current-binding attempt instead of stranding it on the 20 s watchdog", async () => {
   // follow(B) attempt 1 (unmounted seed in flight) -> navigate to mounted live
   // A (retries/retries attempt 1) -> follow(B) again before the seed returns

@@ -1889,8 +1889,12 @@ class HubStore {
           // read KEEPS recovery responsibility via the bounded, lifetime-aware
           // retry that ends back in the central reconciliation (its 0 ms/
           // backoff wake re-triggers this flush); other triggers help too.
+          // Fire-and-forget: the bounded timer must outlive this pass and run
+          // AFTER the finally clears delivery suppression, not be awaited
+          // inside the still-suppressed region (a wake armed while suppressed
+          // would be skipped and the row left with no cover).
           this.reconcileToast(err, "刷新待发队列");
-          await this.outbox?.deliveryAttemptFailed();
+          void this.outbox?.deliveryAttemptFailed();
           return;
         }
         const instances = [

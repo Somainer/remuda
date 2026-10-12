@@ -1805,7 +1805,7 @@ class HubStore {
         ? observation.observedAt
         : null;
     if (parsed.kind === "queued") {
-      let current = this.state.effortPending[instanceId];
+      let current: EffortPending | undefined = this.state.effortPending[instanceId];
       if (current) {
         // A queued lifecycle belongs to the REQUEST in flight only. A late
         // `effort-queued` for request A after the user replaced it with B
@@ -1826,10 +1826,35 @@ class HubStore {
           current.source === "client" &&
           !current.afterReplacement &&
           effortLifecycleMatches(current, parsed.word, "queued");
-        if (!edgeBelongsTo(current, "queued") && !stampsLegacyQueuedBound) return;
-      } else {
-        // No client-side pending (the configure was posted outside the UI):
-        // still surface 排队中 from the lifecycle's own axes.
+        if (!edgeBelongsTo(current, "queued") && !stampsLegacyQueuedBound) {
+          // c-effortread r15 item 3: a PROVABLY NEWER queued lifecycle (its
+          // observedAt is strictly later in journal order than the pending's
+          // own queued stamp) replaces a LIFECYCLE-owned pending — the driver
+          // queue discards a replaced same-axis op, so the older request A
+          // never executes and an observer tracking it would wait for a
+          // verdict that never comes. The replacement gets the new edge's
+          // id/target/timing. A delayed OLDER edge (or an unusable/missing
+          // stamp on either side) is rejected: order unknown fails closed.
+          // Client-owned pendings and their nonce/afterReplacement
+          // protection never enter this path.
+          const incomingMs = queuedThreshold != null ? Date.parse(queuedThreshold) : Number.NaN;
+          const establishedMs =
+            current.queuedObservedAt != null ? Date.parse(current.queuedObservedAt) : Number.NaN;
+          const replacesLifecycle =
+            current.source === "lifecycle" &&
+            Number.isFinite(incomingMs) &&
+            Number.isFinite(establishedMs) &&
+            incomingMs > establishedMs;
+          if (!replacesLifecycle) return;
+          // Fall through and synthesize the replacement pending from the
+          // newer edge exactly like a fresh observer-side create below.
+          current = undefined;
+        }
+      }
+      if (!current) {
+        // No client-side pending (the configure was posted outside the UI, or
+        // a newer lifecycle just replaced a lifecycle-owned pending): surface
+        // 排队中 from the lifecycle's own axes.
         const request = effortLifecycleRequest(parsed.word);
         const instance = this.state.instances.find((row) => row.id === instanceId);
         const kind = (instance?.kind ?? "claude") as EffortKind;

@@ -3077,6 +3077,41 @@ it("r15 item 2: a bare coupled effort-queued:ultracode keeps xhigh/on identity a
   expect(hubStore.effortEffectiveOf(ctx.instance.id)).toMatchObject({ name: "xhigh", ultracode: true });
 });
 
+it("r15 item 3: a provably newer queued lifecycle replaces the lifecycle-owned pending (A → B → B completes)", async () => {
+  const ctx = await startFollowing("r15-item3-observer-ab");
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const baseline: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "low", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [baseline] } as never);
+
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
+  // Another client's configure A (low), seen by this observer tab only.
+  ctx.receive(configureLifecycleFor(3, "effort-queued:low", "req-a", ctx.instance.id, "2026-09-16T00:00:05.000Z"));
+  const a = hubStore.effortPendingOf(ctx.instance.id);
+  expect(a).toMatchObject({ name: "low", requestId: "req-a", source: "lifecycle" });
+
+  // Before B executed, the same client replaced it with max. The journal
+  // ordering proves B newer: the observer must now track B, not A.
+  ctx.receive(configureLifecycleFor(4, "effort-queued:max", "req-b", ctx.instance.id, "2026-09-16T00:00:07.000Z"));
+  const b = hubStore.effortPendingOf(ctx.instance.id);
+  expect(b, "B replaces the lifecycle-owned pending with its own id/target").toMatchObject({
+    name: "max",
+    requestId: "req-b",
+    source: "lifecycle",
+  });
+
+  // A's delayed older queued edge (backlog) is rejected: B stays.
+  ctx.receive(configureLifecycleFor(5, "effort-queued:low", "req-a", ctx.instance.id, "2026-09-16T00:00:06.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId, "an older replacement never wins").toBe("req-b");
+
+  // B executes and its applied verdict completes the tracked request.
+  ctx.receive(configureLifecycleFor(6, "effort-applied:max", "req-b", ctx.instance.id, "2026-09-16T00:00:10.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id), "B completing clears the pending").toBeNull();
+});
+
 it("r13 item 3: an observer-tab legacy pending with a silent no-op completes unconfirmed at its bound", async () => {
   const ctx = await startFollowing("r13-item3-observer-noop");
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);

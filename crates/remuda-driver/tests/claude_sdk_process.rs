@@ -1911,31 +1911,30 @@ async fn close_under_output_pressure_still_delivers_exactly_one_terminal_exit() 
     let mut env = BTreeMap::new();
     env.insert("FAKE_CLAUDE_STDOUT_FLOOD".into(), "1".into());
     let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
-    let mut handle = driver.start(spec).await.expect("start");
-
-    // Do NOT drain handle at all. Wait until the 255-slot observation channel
-    // is saturated (the publication worker is parked on emit). The child
-    // floods fast; give the saturation a bounded window.
-    let saturated = async {
-        for _ in 0..200 {
-            if driver.publication_is_saturated().await {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        panic!("publication never saturated with a flooding child");
-    };
-    tokio::time::timeout(Duration::from_secs(10), saturated)
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
         .await
-        .expect("saturation window");
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+
+    // Do NOT drain handle at all. Acknowledge the worker parking on the full
+    // 255-slot observation channel through the named barrier hook — no
+    // sleep-poll for channel capacity (ma-sdk-state r14).
+    let barrier = driver.arm_write_commit_barrier();
+    barrier
+        .wait_until_emit_waiting(1, Duration::from_secs(10))
+        .await;
 
     // Close under pressure: it aborts the blocked worker and reaps the child
     // through its bounded ladder, and must not hang.
     let started = std::time::Instant::now();
-    tokio::time::timeout(Duration::from_secs(20), driver.close())
-        .await
-        .expect("close hung under output pressure")
-        .expect("close ack");
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close under output pressure",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close under output pressure")
+    .expect("close ack");
     assert!(
         started.elapsed() < Duration::from_secs(15),
         "close took {:?} under output pressure",

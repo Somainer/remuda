@@ -4917,20 +4917,32 @@ mod tests {
             .to_string()
                 + "\n"
         };
-        let restored_history = serde_json::json!({
-            "type": "assistant",
-            "uuid": "msg-5",
-            "sessionId": "launch-x",
-            "version": DECOUPLED,
-            "message": {
-                "id": "msg-5",
-                "role": "assistant",
-                "content": [{"type": "text", "text": "high reply"}],
-                "effort": "high"
-            },
-        })
-        .to_string()
-            + "\n";
+        // The replacement X file already carries, BEFORE re-promotion, the
+        // resumed session's high read-back AND the historical /effort max slash
+        // with its ACCEPTED verdict — the exact pair that settles the armed
+        // request when the returning boundary is wrongly opened Fresh.
+        let restored_history = format!(
+            "{}{}{}",
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": "msg-5",
+                "sessionId": "launch-x",
+                "version": DECOUPLED,
+                "message": {
+                    "id": "msg-5",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "high reply"}],
+                    "effort": "high"
+                },
+            })
+            .to_string()
+                + "\n",
+            x_slash_max(6),
+            x_stdout(
+                7,
+                "Set effort level to max (this session only): Maximum capability",
+            ),
+        );
         let restored = slug_session(dir.path(), &cwd, "launch-x", &restored_history);
         let resume_binding = native_binding("launch-x", &restored, &cwd, Some("resume")).await;
         assert!(apply_native_session_binding(
@@ -4943,6 +4955,42 @@ mod tests {
             &mut withdrawn_sessions,
             &mut active_session,
         ));
+
+        // c-effortread r12 item 8: assert the PRODUCTION MODE-SELECTION result
+        // BEFORE the explicit-withdrawal override can mask it. The X→Z rebind
+        // marked X withdrawn, so maintain_binding's session_withdrawn arm would
+        // force an Unverified reopen regardless of the selected mode; the old
+        // test only asserted after that override. epoch_mode is the exact
+        // selection maintain_binding runs — the returning launch sticky must
+        // keep its OWN Unverified mode, never the rebound Z's carried
+        // Dead(Fresh).
+        assert!(
+            withdrawn_sessions.contains(&(7, "launch-x".to_string())),
+            "X is the withdrawn session whose reopen override would mask the selection"
+        );
+        let sticky_x = session_modes
+            .mode_for(7, "launch-x")
+            .expect("the launch sticky survives the Z rebind");
+        let mut probe_launch_mode = launch_mode.clone();
+        let mut probe_found = found_x.clone();
+        probe_found.session_id = Some("launch-x".to_owned());
+        let selected_mode = epoch_mode(
+            &mut probe_launch_mode,
+            Some(ResumeMode::Unverified),
+            Some(sticky_x),
+            &probe_found,
+        );
+        let selected_unverified = match selected_mode {
+            ResumeMode::Unverified => true,
+            ResumeMode::Boundary(boundary) => !boundary.verified,
+            ResumeMode::Fresh => false,
+        };
+        assert!(
+            selected_unverified,
+            "the production mode selection is itself unverified, independent of the withdrawal \
+             override: {selected_mode:?}"
+        );
+
         // Production loop rebind arm.
         hydrator = None;
         announced = None;
@@ -4973,26 +5021,35 @@ mod tests {
         let reopened = hydrator.as_ref().expect("X reopens after the rebind");
         assert!(
             !reopened.tail.verified(),
-            "returning to X reuses its Unverified boundary, not Z's Fresh: {:?}",
+            "returning to X reuses an Unverified boundary, not Z's Fresh: {:?}",
             session_modes.mode_for(7, "launch-x").map(|m| m.mode)
         );
+
+        // The slash + accepted verdict are replayed as UNVERIFIED HISTORY at
+        // re-promotion (they were already in the replaced file): no Current
+        // effort edge, and the armed request survives that replay.
+        let replayed = drain(&mut fx);
         assert!(
-            !effort_rows(&drain(&mut fx))
+            !effort_rows(&replayed)
                 .iter()
                 .any(|(name, _)| *name == Some(remuda_protocol::EffortName::High)
                     || *name == Some(remuda_protocol::EffortName::Max)),
-            "the replaced X history never publishes Current effort"
+            "the replaced X history (slash+verdict included) never publishes Current effort"
         );
+        let pending = bridge
+            .pending()
+            .expect("the pre-repromotion slash/verdict replay cannot settle the armed request");
+        assert_eq!(pending.request_id.as_deref(), Some("req-returning-x"));
+        assert_eq!(pending.name, remuda_protocol::EffortName::Max);
 
-        // A same-session /effort max slash + accepted verdict arrive while the
-        // boundary is still unverified (the resumed session keeps emitting).
-        // They hydrate conversation under Unverified provenance but must
-        // neither publish an effort edge nor settle the armed bridge request.
-        append_line(&fx.binding.path, &x_slash_max(6));
+        // Defense in depth: a slash + verdict appended AFTER re-promotion, while
+        // the epoch is still unverified, likewise hydrate conversation but can
+        // neither publish an edge nor settle the armed bridge.
+        append_line(&fx.binding.path, &x_slash_max(8));
         append_line(
             &fx.binding.path,
             &x_stdout(
-                7,
+                9,
                 "Set effort level to max (this session only): Maximum capability",
             ),
         );
@@ -5024,10 +5081,9 @@ mod tests {
                 .iter()
                 .any(|(name, _)| *name == Some(remuda_protocol::EffortName::High)
                     || *name == Some(remuda_protocol::EffortName::Max)),
-            "unverified slash/verdict never publishes Current effort: {:?}",
+            "unverified slash/verdict appended after re-promotion never publishes Current effort: {:?}",
             effort_rows(&observations)
         );
-        // The unverified slash/verdict cannot settle the armed bridge request.
         let pending = bridge
             .pending()
             .expect("the resumed X history never settles the armed request");

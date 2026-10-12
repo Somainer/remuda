@@ -601,14 +601,14 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
 
     let incoming = SnapshotCounters::of(row);
     let counters_change = if row.metric_revision > stored.revision {
-        // Authoritative correction: any REPORTED basket that differs wins,
-        // downwards included; unreported baskets are retained below. The
-        // derived total is excluded — it is recomputed after the merge.
-        incoming
-            .token_baskets()
-            .into_iter()
-            .zip(stored.counters.token_baskets())
-            .any(|(incoming, kept)| incoming.is_some_and(|value| Some(value) != kept))
+        // A STRICTLY NEWER snapshot is authoritative and advances the watermark
+        // EVEN when every counter it reports is unchanged: the source position
+        // itself must persist, so a later stale position is rejected against
+        // the new high-water mark (c-ctxusage r14 item 3). Any REPORTED basket
+        // that differs wins, downwards included; unreported baskets are
+        // retained below. The derived total is excluded — it is recomputed
+        // after the merge.
+        true
     } else if row.metric_revision < stored.revision {
         // A stale revision never overrides a newer correction.
         false
@@ -2991,6 +2991,84 @@ mod tests {
             !insert(&conn, &again),
             "native -> native with identical counters/time changes nothing"
         );
+    }
+
+    /// c-ctxusage r14 item 3: the turn authority is a watermark that advances
+    /// on a STRICTLY NEWER position even when the counters are unchanged.
+    /// Sequence from the ruling: rev 1 / output 20, then rev 3 / output 20
+    /// (identical), then a stale rev 2 carrying a decrease to 15 — the row
+    /// must stay at rev 3 / 20. Before the fix the identical newer snapshot
+    /// was dropped ("nothing changed"), leaving the watermark at 1, so the
+    /// later rev 2 was accepted as newer and rolled output back to 15.
+    #[test]
+    fn the_watermark_advances_on_an_unchanged_newer_snapshot() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // rev 1: input 100 / output 20.
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                1,
+                "ins_r14w3",
+                "turn",
+                Some("msg-w3"),
+                1,
+                100,
+                20,
+                0,
+                0,
+                Some("2026-10-10T00:00:00.000Z")
+            )
+        ));
+        // rev 3: SAME counters, newer source position. Must apply (watermark
+        // advances) even though nothing moved.
+        assert!(
+            insert(
+                &conn,
+                &scoped_record(
+                    2,
+                    "ins_r14w3",
+                    "turn",
+                    Some("msg-w3"),
+                    3,
+                    100,
+                    20,
+                    0,
+                    0,
+                    Some("2026-10-10T00:00:10.000Z")
+                )
+            ),
+            "an unchanged newer snapshot must still persist its watermark"
+        );
+        // rev 2 / output 15: now STALE, and a decrease on top of that — frozen.
+        assert!(
+            !insert(
+                &conn,
+                &scoped_record(
+                    3,
+                    "ins_r14w3",
+                    "turn",
+                    Some("msg-w3"),
+                    2,
+                    100,
+                    15,
+                    0,
+                    0,
+                    Some("2026-10-10T00:00:05.000Z")
+                )
+            ),
+            "the older position must not roll output back to 15"
+        );
+        let (revision, output): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT metric_revision, output_tokens FROM usage_events
+                 WHERE instance_id='ins_r14w3' AND scope_id='msg-w3'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(revision, 3, "the watermark persisted at 3");
+        assert_eq!(output, Some(20), "output stays 20 after the stale frame");
     }
     /// r4 item 7b: the REAL 2.1.289 fixture replayed by a fresh mapper into a
     /// real migrated store TWICE must converge durably: the same 24 turn rows

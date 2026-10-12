@@ -1070,6 +1070,40 @@ export class Outbox {
     this.deliveryFailures.delete(instanceId);
   }
 
+  /**
+   * A guarded delivery attempt could not progress (c-reconnfu gate 20 item 4):
+   * the flush's durable read rejected, the deliverer's in-lock read rejected,
+   * or the claim storage transaction aborted. The failed attempt KEEPS
+   * recovery responsibility: count the bounded per-instance failure and run
+   * the lifetime-aware read retry, whose success ENDS IN THE CENTRAL
+   * reconciliation — the row keeps exactly one (backed-off) delivery wake and
+   * is delivered once the transient clears.
+   *
+   * With explicit instance ids the failure is attributed to them. Without,
+   * the failure was the global flush read: the successful recovery read
+   * itself identifies every deliverable instance and the policy is re-applied
+   * once after accounting so the new backoff replaces the 0 ms wake the
+   * recovery's own pass armed.
+   */
+  async deliveryAttemptFailed(instanceIds?: Iterable<Id>): Promise<void> {
+    if (this.disposed || this.unloading) return;
+    const ids = instanceIds ? [...new Set(instanceIds)] : null;
+    if (ids) for (const id of ids) this.noteDeliveryFailure(id);
+    const rows = await this.refreshDurableRecovering(1);
+    if (!rows || this.disposed || this.unloading) return;
+    if (!ids) {
+      const now = Date.now();
+      for (const rec of rows) {
+        const d = leaseWakeDecision(rec, {
+          now,
+          isActiveDelivery: (id) => this.activeDeliveries.has(id),
+        });
+        if (d.kind === "deliver") this.noteDeliveryFailure(rec.instanceId);
+      }
+      this.applyLeaseWakeReconcile(rows);
+    }
+  }
+
   /** Mark instances whose guarded delivery the store starts immediately. */
   suppressDeliveryWakes(ids: Iterable<Id>) {
     for (const id of ids) this.deliverySuppressed.add(id);
@@ -1236,8 +1270,14 @@ export class Outbox {
         continue;
       }
       // Deliverable NOW: arm the bounded 0 ms/backoff delivery wake unless the
-      // guarded delivery for this instance is already running/imminent.
-      if (entry.kind === "deliver") continue; // bounded retry already pending
+      // guarded delivery for this instance is already running/imminent. An
+      // already-armed deliver wake whose failure count changed moves to the
+      // new backoff instant (a failed attempt's recovery re-applies here).
+      if (entry.kind === "deliver") {
+        const failures = this.deliveryFailures.get(d.instanceId) ?? 0;
+        if (entry.failures !== failures) this.armDeliverWake(id, d.instanceId, now);
+        continue;
+      }
       if (this.deliveryCovered(d.instanceId)) {
         this.cancelLeaseWake(id);
         continue;
@@ -1439,7 +1479,17 @@ export class Outbox {
     fn: (instanceId: Id, deliverable: OutboxRecord[]) => Promise<T>,
   ): Promise<T> {
     const now = Date.now();
-    const durable = await this.readDurable();
+    let durable: OutboxRecord[];
+    try {
+      durable = await this.readDurable();
+    } catch {
+      // c-reconnfu gate 20 item 4: the in-lock durable read rejected. No POST
+      // may run on a stale selection: keep recovery responsibility with the
+      // bounded, lifetime-aware retry that ends in the central reconciliation,
+      // and hand the deliverer an EMPTY selection for this turn.
+      void this.deliveryAttemptFailed([instanceId]);
+      return await fn(instanceId, []);
+    }
     if (!this.disposed) this.applyLeaseWakeReconcile(durable);
     const deliverable = durable
       .filter((r) => r.instanceId === instanceId && isDeliverable(r, now))

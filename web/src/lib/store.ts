@@ -1885,10 +1885,12 @@ class HubStore {
         } catch (err) {
           // flushAllOutbox is fire-and-forget from many call sites; a rejected
           // durable refresh must not become an unhandled rejection (gate 6 item
-          // 4c). Surface it and stop this pass — gate 20 item 4 adds the
-          // bounded recovery retry that ends back in the central
-          // reconciliation; until then other triggers re-run the flush.
+          // 4c). Surface it and stop this pass — gate 20 item 4: the failed
+          // read KEEPS recovery responsibility via the bounded, lifetime-aware
+          // retry that ends back in the central reconciliation (its 0 ms/
+          // backoff wake re-triggers this flush); other triggers help too.
           this.reconcileToast(err, "刷新待发队列");
+          await this.outbox?.deliveryAttemptFailed();
           return;
         }
         const instances = [
@@ -1923,11 +1925,16 @@ class HubStore {
             if (id) {
               attempted.add(id);
               deliveredNew = true;
+              // A real POST of one of this instance's rows clears its bounded
+              // delivery-failure backoff (gate 20 item 4).
+              box.noteDeliveryProgress(instanceId);
             }
           } catch {
-            // The lease/lock acquisition failed (never a double POST: the row is
-            // inflight with a fresh durable lease). A retry timer / reconnect
-            // re-triggers under the same id; keep draining other instances.
+            // The lease/lock acquisition failed (never a double POST: the row
+            // is inflight with a fresh durable lease). The in-lock read
+            // failure armed its bounded recovery inside the deliverer; a
+            // genuine lock-request failure waits for the next timer /
+            // reconnect under the same id. Keep draining other instances.
           }
         }
         if (!deliveredNew) break;
@@ -2223,7 +2230,11 @@ class HubStore {
       });
     } catch {
       // Storage aborted the claim: the first deliverable row is still first
-      // and deliverable. Signal FIFO stop so a later row is not POSTed ahead.
+      // and deliverable. Signal FIFO stop so a later row is not POSTed ahead,
+      // and keep recovery responsibility: the bounded, lifetime-aware retry
+      // ends back in the central reconciliation which re-arms the row's one
+      // (backed-off) delivery wake (c-reconnfu gate 20 item 4).
+      void box.deliveryAttemptFailed([current0.instanceId]);
       return "claim-aborted";
     }
     // A null claim means the row vanished inside the claim transaction

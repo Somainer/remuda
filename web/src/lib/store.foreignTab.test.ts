@@ -812,6 +812,146 @@ it("GATE20 item 3b: H becomes HELD while the guarded flush waits on the instance
   }
 });
 
+/**
+ * Gate 20 item 4 harness: one same-owner inflight row whose tracked deadline
+ * wake is the only trigger. `inject` runs once right after the deadline fire,
+ * before the guarded flush; the row must still be delivered exactly once via
+ * the bounded, lifetime-aware recovery that ends in the central reconciliation.
+ */
+async function bootItem4(which: "4a" | "4b" | "4c") {
+  vi.useFakeTimers();
+  const owner = `owner_g20_${which}`;
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks: { query: async () => ({ held: [] }) } }, // query, no request
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  sessionStorage.setItem("remuda-outbox-owner", owner);
+  const { api, hubStore } = await fresh();
+  vi.spyOn(api, "eventsRead").mockResolvedValue({
+    events: [],
+    durableSeq: "0",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
+  });
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  const send = vi.spyOn(api, "instanceSend").mockImplementation(
+    (async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) => ({
+      relatedCommandIds: [],
+      command: {
+        commandId,
+        id: commandId,
+        state: "accepted",
+        revision: "1",
+        dispatch: "native-acknowledged",
+        resolution: "clear",
+      },
+    })) as unknown as Api["instanceSend"],
+  );
+  await bootLive(api, hubStore);
+  const box = (hubStore as unknown as { outbox: unknown }).outbox as {
+    refreshDurable: () => Promise<unknown>;
+    pendingLeaseWakeups: () => string[];
+    readDurable: () => Promise<unknown>;
+    patch: (...args: unknown[]) => Promise<unknown>;
+    onClaimWake: (() => void) | null;
+  };
+  const flush = () =>
+    (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+  await flush();
+  expect(send).not.toHaveBeenCalled();
+
+  const cmd = `cmd_g20_${which}_row`;
+  const T_MS = 10_000;
+  localStorage.setItem(
+    OUTBOX_LS_KEY,
+    JSON.stringify([
+      {
+        commandId: cmd,
+        clientRequestId: `local_${cmd}`,
+        instanceId: INSTANCE,
+        journalId: JOURNAL,
+        prompt: "recover me after the one-shot failure",
+        createdAt: Date.now() - 1_000,
+        attempts: 1,
+        state: "inflight",
+        lease: { owner, until: Date.now() + T_MS },
+      } satisfies OutboxRecord,
+    ]),
+  );
+  await box.refreshDurable();
+  expect(box.pendingLeaseWakeups()).toEqual([cmd]);
+
+  if (which === "4a") {
+    // The TIMER read succeeds; the GUARDED FLUSH's own next durable read is
+    // what rejects once. onClaimWake runs after the fire read and before the
+    // flush read, so arm the one-shot there.
+    const prev = box.onClaimWake;
+    let armed = false;
+    box.onClaimWake = () => {
+      if (!armed) {
+        armed = true;
+        vi.spyOn(box, "readDurable").mockImplementationOnce(() =>
+          Promise.reject(new Error("g20-4a one-shot flush read failure")),
+        );
+      }
+      prev?.();
+    };
+  } else if (which === "4b") {
+    // The timer read (#1) and the flush's pre-lock read (#2) succeed; the
+    // IN-LOCK read (#3) rejects once. All later reads (recovery + retry)
+    // pass through to the real implementation.
+    const realRead = box.readDurable.bind(box) as () => Promise<unknown>;
+    let reads = 0;
+    vi.spyOn(box, "readDurable").mockImplementation(function (this: unknown) {
+      reads += 1;
+      if (reads === 3) return Promise.reject(new Error("g20-4b one-shot in-lock read failure"));
+      return realRead.call(this);
+    });
+  } else {
+    // The reads succeed; the CLAIM TRANSACTION (box.patch mergeUnlessDone)
+    // rejects once. The first patch of the delivery turn is the claim.
+    const realPatch = box.patch.bind(box) as (...args: unknown[]) => Promise<unknown>;
+    let claims = 0;
+    vi.spyOn(box, "patch").mockImplementation((...args: unknown[]) => {
+      claims += 1;
+      if (claims === 1) return Promise.reject(new Error("g20-4c one-shot claim abort"));
+      return realPatch(...args);
+    });
+  }
+
+  await vi.advanceTimersByTimeAsync(T_MS);
+  // The bounded retry is a 250 ms backoff; allow a couple of rounds and pumps.
+  for (let i = 0; i < 400 && send.mock.calls.length === 0; i += 1) {
+    await vi.advanceTimersByTimeAsync(10);
+    await Promise.resolve();
+  }
+  expect(send).toHaveBeenCalledTimes(1);
+  expect(send.mock.calls[0]?.[4]).toBe(cmd);
+  const stored = JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+  expect(stored.find((r) => r.commandId === cmd)?.state).toBe("sent");
+  await vi.advanceTimersByTimeAsync(120_000);
+  expect(send).toHaveBeenCalledTimes(1);
+  hubStore.logout();
+  vi.useRealTimers();
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+  sessionStorage.removeItem("remuda-outbox-owner");
+}
+
+it("GATE20 item 4a: a one-shot failure of the guarded flush's durable READ still delivers the row", async () => {
+  await bootItem4("4a");
+});
+
+it("GATE20 item 4b: a one-shot failure of the deliverer's IN-LOCK read still delivers the row", async () => {
+  await bootItem4("4b");
+});
+
+it("GATE20 item 4c: a one-shot failure of the CLAIM transaction still delivers the row", async () => {
+  await bootItem4("4c");
+});
+
 it("GATE10 item 7: a lease-less done row committed by another tab skips without aborting the flush; B still sends", async () => {
   const { api, hubStore } = await fresh();
   await bootLive(api, hubStore);

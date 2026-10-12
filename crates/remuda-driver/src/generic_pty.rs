@@ -734,12 +734,14 @@ fn spawn_status_pump(
                 }
                 failed.store(true, Ordering::SeqCst);
                 let _ = interactions.close().await;
-                let payload = failure_lifecycle(
-                    "exit",
-                    &ctx.session_id,
-                    &pane_id,
-                    "pane exited; agent process is gone",
-                );
+                // c-cardsettle-fu r1 item 3: a generic-PTY pane exit carries
+                // its real diagnostic in the event data (exit code / signal /
+                // last stderr line); persist THAT rather than the literal
+                // "failed", which told the operator nothing about the death.
+                // The generic string remains only the fallback when the
+                // carrier supplied no usable detail.
+                let diagnostic = pane_exit_diagnostic(&event.data);
+                let payload = failure_lifecycle("exit", &ctx.session_id, &pane_id, &diagnostic);
                 if emit_on(
                     &tx,
                     &seq,
@@ -986,7 +988,136 @@ async fn emit_startup_failure(
     .await
 }
 
-fn failure_lifecycle(
+/// Build the human-facing diagnostic for a generic-PTY `pane.exited` event
+/// (c-cardsettle-fu r1 item 3). Prefers the real evidence the carrier
+/// reports — a signal, an exit code, or the last stderr line — over the
+/// uninformative literal "failed". Returns the generic fallback only when
+/// none of those fields is present. Field names are checked across the
+/// snake_case and camelCase shapes the herdr wire uses.
+/// Build the human-facing diagnostic for a pane-exit event; pub so the Node
+/// integration tests can construct observations with the exact production
+/// helpers instead of hand-stamping fields.
+pub fn pane_exit_diagnostic(data: &serde_json::Value) -> String {
+    const FALLBACK: &str = "pane exited; agent process is gone";
+    let str_field = |names: &[&str]| -> Option<String> {
+        names
+            .iter()
+            .find_map(|name| data.get(*name))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let num_field = |names: &[&str]| -> Option<i64> {
+        names
+            .iter()
+            .find_map(|name| data.get(*name))
+            .and_then(serde_json::Value::as_i64)
+    };
+
+    // c-cardsettle-fu2 r4 item 1: the diagnostic carries ONLY structured
+    // evidence — a signal name/number or an exit code — never child text. A
+    // pane event's lastStderr is the agent process's own stderr and can
+    // contain anything (Authorization headers, tokens, URLs with
+    // passwords); a heuristic redactor cannot enumerate every leak shape, so
+    // the stderr field is not rendered at all. The same string is journaled,
+    // projected to instances.last_error on both Node and Hub, and shown in
+    // the session end bar, so its vocabulary is fixed here.
+    if let Some(text) = pane_signal_diagnostic(
+        str_field(&["signalName", "signal_name", "signal"]),
+        num_field(&["signal", "signalNumber", "signal_number"]),
+    ) {
+        return text;
+    }
+
+    // An exit code: prefer the explicit field, also accept an object
+    // `{code: …}`/`exit_status` shape.
+    if let Some(code) = num_field(&[
+        "exitCode",
+        "exit_code",
+        "code",
+        "exitStatus",
+        "exit_status",
+        "status",
+    ])
+    .filter(|code| *code != 0)
+    {
+        return format!("agent process exited with code {code}");
+    }
+
+    FALLBACK.to_owned()
+}
+
+/// Build the structured `killed by signal` diagnostic from a signal NAME
+/// string and/or NUMBER carried by the pane event (both optional), using
+/// the PLATFORM's own signal definitions (`nix`) — the same source
+/// shell_pty's `signal_name` uses — never a baked-in table: numbers mean
+/// different signals on macOS vs Linux (10 is BUS there, USR1 here; 30 is
+/// USR1 there, PWR here).
+///
+/// Number resolution:
+/// - `129..=192` decodes the shell `128+N` encoding and is signal evidence
+///   only when the platform recognizes `N`;
+/// - `1..=127` is taken as a direct signal number and must be recognized;
+/// - anything else (0, 128, >=193, negatives) is not a signal.
+///
+/// A numeric field the platform does NOT recognize (0, 72, 200, …) is not
+/// signal evidence at all — the caller falls through to the exit-code field
+/// and then the fixed fallback, so `{"signal":200,"exitCode":42}` reports
+/// the exit code instead of inventing "signal 72".
+///
+/// Name resolution (only when no numeric field is present): uppercase
+/// FIRST, then prepend `SIG` when missing ("usr1" → "SIGUSR1"); the
+/// resolved signal renders as its name without the prefix plus its
+/// platform number. An unrecognized name contributes nothing.
+#[cfg(unix)]
+fn pane_signal_diagnostic(name: Option<String>, number: Option<i64>) -> Option<String> {
+    use nix::sys::signal::Signal;
+    use std::str::FromStr;
+
+    /// Render exactly "agent process killed by signal NAME (N)".
+    fn render(signal: Signal) -> String {
+        let name = signal
+            .as_str()
+            .strip_prefix("SIG")
+            .unwrap_or(signal.as_str());
+        format!("agent process killed by signal {name} ({})", signal as i32)
+    }
+
+    if let Some(raw) = number {
+        let candidate: Option<i32> = match raw {
+            129..=192 => i32::try_from(raw - 128).ok(),
+            1..=127 => i32::try_from(raw).ok(),
+            _ => None,
+        };
+        // Present-but-unrecognized numeric signal vetoes the whole signal
+        // branch, including a name carried alongside it.
+        let signal = Signal::try_from(candidate?).ok()?;
+        return Some(render(signal));
+    }
+    if let Some(raw) = name {
+        let upper = raw.trim().to_ascii_uppercase();
+        let prefixed = if upper.starts_with("SIG") {
+            upper
+        } else {
+            format!("SIG{upper}")
+        };
+        let signal = Signal::from_str(&prefixed).ok()?;
+        return Some(render(signal));
+    }
+    None
+}
+
+/// Non-Unix builds carry no signal vocabulary; signal fields are ignored and
+/// the caller renders the exit code or fixed fallback.
+#[cfg(not(unix))]
+fn pane_signal_diagnostic(_name: Option<String>, _number: Option<i64>) -> Option<String> {
+    None
+}
+
+/// Test/integration-visible builder for the pane-exit lifecycle payload;
+/// production callers use the private wrapper inside the status pump.
+pub fn failure_lifecycle(
     native_name: &str,
     agent_name: &str,
     pane_id: &str,
@@ -1005,6 +1136,11 @@ fn failure_lifecycle(
             related_ids: BTreeMap::from([
                 ("paneId".into(), pane_id.into()),
                 ("lastError".into(), reason.into()),
+                // c-cardsettle-fu2 r1 item 2: the node's native_exit reads
+                // related_ids["reason"] first; without this the stored
+                // instance failure collapsed to "failed" even though
+                // status/lastError carried the real diagnostic.
+                ("reason".into(), reason.into()),
             ]),
             data_ref: None,
             severity: Severity::Error,
@@ -1295,5 +1431,193 @@ mod tests {
         ));
         assert!(!looks_like_shell_prompt("❯ \n"));
         assert!(!looks_like_shell_prompt("OK\n❯ \n"));
+    }
+
+    /// c-cardsettle-fu r1 item 3 / r4-r5 item 1: the stored PaneExited
+    /// diagnostic carries ONLY structured evidence — exit code, a signal
+    /// resolved through the PLATFORM's own definitions, or the fixed
+    /// fallback. Child stderr is never rendered.
+    #[test]
+    fn pane_exit_diagnostic_names_the_real_exit_code() {
+        let diag = |data: serde_json::Value| pane_exit_diagnostic(&data);
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "exitCode": 42 })),
+            "agent process exited with code 42"
+        );
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "exit_code": 7 })),
+            "agent process exited with code 7"
+        );
+        // A bare code 0 adds no failure diagnostic; fall through.
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "exitCode": 0 })),
+            "pane exited; agent process is gone"
+        );
+        // Nothing usable: generic fallback, never the literal "failed".
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1" })),
+            "pane exited; agent process is gone"
+        );
+        // 137 standing alone is an EXIT CODE, never silently decoded as a
+        // signal.
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "exitCode": 137 })),
+            "agent process exited with code 137"
+        );
+        // Numeric fields the platform does not recognize as signals (0, 200)
+        // are NOT signal evidence: the exit code still renders.
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "signal": 0, "exitCode": 42 })),
+            "agent process exited with code 42"
+        );
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "signal": 200, "exitCode": 42 })),
+            "agent process exited with code 42"
+        );
+        // …and with no exit code they collapse to the fallback.
+        assert_eq!(
+            diag(serde_json::json!({ "pane_id": "p1", "signal": 200 })),
+            "pane exited; agent process is gone"
+        );
+    }
+
+    /// Signal cases resolved with the platform's own nix definitions. Numbers
+    /// are computed from nix (never hard-coded): BUS is 7 on Linux but 10 on
+    /// macOS, USR1 is 10 on Linux but 30 on macOS, so a baked-in table named
+    /// them wrong for the owner's macOS gate.
+    #[cfg(unix)]
+    #[test]
+    fn pane_exit_signal_resolved_from_platform_definitions() {
+        use nix::sys::signal::Signal;
+        use std::str::FromStr;
+
+        let diag = |data: serde_json::Value| pane_exit_diagnostic(&data);
+        let expected = |signal: Signal| {
+            format!(
+                "agent process killed by signal {} ({})",
+                signal.as_str().strip_prefix("SIG").unwrap(),
+                signal as i32
+            )
+        };
+
+        for signal in [Signal::SIGBUS, Signal::SIGUSR1, Signal::SIGKILL] {
+            let num = i64::from(signal as i32);
+            // Direct number.
+            assert_eq!(
+                diag(serde_json::json!({ "signal": num })),
+                expected(signal),
+                "numeric {num} must resolve via nix on THIS platform"
+            );
+            // Shell 128+N encoding.
+            assert_eq!(
+                diag(serde_json::json!({ "signal": 128 + num })),
+                expected(signal),
+                "128+{num} must decode via nix on THIS platform"
+            );
+        }
+
+        // Name-only shapes: SIG-prefixed, bare lowercase, and the literal
+        // reviewer example.
+        assert_eq!(
+            diag(serde_json::json!({ "signalName": "SIGBUS" })),
+            expected(Signal::from_str("SIGBUS").unwrap())
+        );
+        assert_eq!(
+            diag(serde_json::json!({ "signalName": "usr1" })),
+            expected(Signal::SIGUSR1)
+        );
+        assert_eq!(
+            diag(serde_json::json!({ "signal_name": "sigkill" })),
+            expected(Signal::SIGKILL)
+        );
+
+        // A 128+N whose N the platform does not recognize is not a signal.
+        assert_eq!(
+            diag(serde_json::json!({ "signal": 128 + 72, "exitCode": 42 })),
+            "agent process exited with code 42"
+        );
+        // An unrecognized name alongside a good exit code falls through.
+        assert_eq!(
+            diag(serde_json::json!({ "signalName": "SIGBOGUS", "exitCode": 42 })),
+            "agent process exited with code 42"
+        );
+    }
+
+    /// c-cardsettle-fu2 r4 item 1: stderr text — including every credential
+    /// shape the heuristic redactor used to miss (a decoy word before the
+    /// real key, standalone Bearer, JSON password, `--token x`, a URL whose
+    /// long username was swallowed, truncation, escaped quotes, ':' inside
+    /// values) — is not a leak the diagnostic can carry any more: a
+    /// lastStderr-only pane exit ALWAYS persists the fixed fallback and no
+    /// fragment of the stderr survives.
+    #[test]
+    fn pane_exit_never_carries_stderr_text() {
+        // (stderr line, fragments that WOULD leak under the old redactor).
+        let cases: [(&str, &[&str]); 5] = [
+            // Decoy key before the real one; standalone Bearer; JSON pair.
+            (
+                r#"the keyboard broke: Authorization decoy, Bearer abc123xyz {"password":"hunter2-secret"}"#,
+                &["abc123xyz", "hunter2-secret"],
+            ),
+            // Space-separated --token (no '=' or ':' after the key).
+            (
+                "fatal auth --token secretvalue-9931 retry gave up",
+                &["secretvalue-9931"],
+            ),
+            // URL whose long username runs into the bare-token rule and the
+            // password sits after the ':'.
+            (
+                "GET https://abcdefghijklmnopqrstuvwxyz0123456789-long:hunter2pw@git.example.com/x failed",
+                &["hunter2pw"],
+            ),
+            // Escaped quotes and ':' inside an otherwise credential-looking
+            // value.
+            (
+                r#"Authorization: Bearer \"tok-live-AA:BB:CC\" end of line"#,
+                &["tok-live-AA:BB:CC", "Bearer"],
+            ),
+            // Oversized line: a redactor truncating before redacting left the
+            // head intact.
+            (
+                &format!("password=head-secret-{} tail", "Z".repeat(500)),
+                &["head-secret"],
+            ),
+        ];
+        for (line, fragments) in cases {
+            let data = serde_json::json!({ "pane_id": "p1", "lastStderr": line });
+            let diag = pane_exit_diagnostic(&data);
+            assert_eq!(
+                diag, "pane exited; agent process is gone",
+                "stderr must collapse to the fixed fallback, got: {diag}"
+            );
+            for fragment in fragments {
+                assert!(
+                    line.contains(fragment),
+                    "test sanity: {fragment:?} is actually carried by the stderr"
+                );
+                assert!(
+                    !diag.contains(fragment),
+                    "stderr fragment {fragment:?} must never reach the diagnostic: {diag}"
+                );
+            }
+        }
+        // last_stderr alias and a stderr accompanied by code 0 alike fall
+        // back; code 0 is not failure evidence and the text is dropped.
+        assert_eq!(
+            pane_exit_diagnostic(&serde_json::json!({
+                "last_stderr": "Authorization: Bearer zzz",
+                "exitCode": 0
+            })),
+            "pane exited; agent process is gone"
+        );
+        // Arbitrary message/error/detail objects were never accepted and
+        // still are not.
+        assert_eq!(
+            pane_exit_diagnostic(&serde_json::json!({
+                "message": "Bearer x",
+                "error": { "detail": "password=y" }
+            })),
+            "pane exited; agent process is gone"
+        );
     }
 }

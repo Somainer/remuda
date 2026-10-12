@@ -1415,19 +1415,12 @@ async fn nothing_follows_the_overflow_terminal_when_the_consumer_channel_was_ful
     let barrier = driver.arm_write_commit_barrier();
 
     // Do NOT drain: 255 ordinary observations fill the channel and the worker
-    // parks in emit. Acknowledge the saturated state (bounded window).
-    let saturated = async {
-        for _ in 0..400 {
-            if driver.publication_is_saturated().await {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        panic!("publication never saturated with a flooding child");
-    };
-    tokio::time::timeout(Duration::from_secs(10), saturated)
-        .await
-        .expect("saturation window");
+    // parks in emit. ACKNOWLEDGE the saturation through the named barrier hook
+    // (the worker records an emission parked at zero capacity) — no polling
+    // sleep (ma-sdk-state r14 item 1).
+    barrier
+        .wait_until_emit_waiting(1, Duration::from_secs(10))
+        .await;
 
     // The frame backlog keeps growing behind the parked worker and trips the
     // overflow shutdown; the terminal goes through the reserved permit.
@@ -1481,6 +1474,100 @@ async fn nothing_follows_the_overflow_terminal_when_the_consumer_channel_was_ful
         tail.is_empty(),
         "no observation follows the terminal through the full channel: {tail:?}"
     );
+}
+
+/// ma-sdk-state r14 item 1 (directives (a)/(b)/(e)): closing while the
+/// publisher is mid-release of a frame charge and relaunching on the same
+/// driver must give launch B a FRESH budget. The aborted launch-A worker's
+/// permits release onto launch A's (dead) semaphores only — launch B's budget
+/// starts at zero and its one init-frame charge is the only occupancy it ever
+/// shows.
+#[tokio::test]
+async fn close_relaunch_with_the_publisher_mid_release_keeps_the_new_budget_clean() {
+    const ITEM_CAP: usize = 16;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+
+    // Launch A with the pre-charge-release gate shut. The worker maps and
+    // emits the single init frame, then parks holding that frame's permits.
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.hold_charge_release();
+    let mut handle_a = wait_bounded(
+        driver.start(spec.clone()),
+        Duration::from_secs(10),
+        "start A",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for start A")
+    .expect("start A");
+    barrier
+        .wait_until_charge_release_parked(Duration::from_secs(10))
+        .await;
+    let id_a = driver.active_backlog_id_for_test();
+    let snap_a = driver.publication_backlog_for_test();
+    assert!(
+        snap_a.items >= 1,
+        "A's worker holds at least the init frame charge: {snap_a:?}"
+    );
+    assert!(snap_a.bytes > 0);
+
+    // Close with the worker still parked: the bounded join times out, the
+    // worker is aborted AND JOINED (directive (e)); its charge drops onto the
+    // dying launch-A budget. close still returns inside its bound.
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close A with the publisher parked mid-release",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close A")
+    .expect("close A ack");
+    drain_until_closed(&mut handle_a, Duration::from_secs(5))
+        .await
+        .expect("RunHandle A reaches recv=None after close");
+
+    // Relaunch B with the same gate shut: B's worker parks holding B's own
+    // init-frame charge.
+    barrier.hold_charge_release();
+    let mut handle_b = wait_bounded(
+        driver.start(spec.clone()),
+        Duration::from_secs(10),
+        "start B",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for start B")
+    .expect("start B");
+    barrier
+        .wait_until_charge_release_parked(Duration::from_secs(10))
+        .await;
+    let id_b = driver.active_backlog_id_for_test();
+    assert_ne!(id_a, id_b, "relaunch built a fresh per-launch budget");
+    let snap_b = driver.publication_backlog_for_test();
+    assert_eq!(
+        snap_b.items, snap_a.items,
+        "B shows exactly its own startup charges — launch A leaked none: \
+         A={snap_a:?} B={snap_b:?}"
+    );
+    assert_eq!(
+        snap_b.bytes, snap_a.bytes,
+        "B's byte occupancy is just its own startup frames: A={snap_a:?} B={snap_b:?}"
+    );
+    assert_eq!(snap_b.limit_items, ITEM_CAP);
+    assert_eq!(snap_b.limit_bytes, BYTE_CAP);
+    assert!(!snap_b.overflowed);
+
+    // Let B finish and close it cleanly.
+    drop(barrier);
+    wait_bounded(driver.close(), Duration::from_secs(20), "close B")
+        .await
+        .expect("bounded test wait timed out: waiting for close B")
+        .expect("close B ack");
+    drain_until_closed(&mut handle_b, Duration::from_secs(5))
+        .await
+        .expect("RunHandle B reaches recv=None after close");
 }
 
 /// Item 4: a reader from a previous launch must never emit into the next one.

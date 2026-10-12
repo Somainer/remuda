@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Semaphore, TryAcquireError, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
 
@@ -540,6 +540,20 @@ impl NativeIds {
     }
 }
 
+/// Per-launch observation channel state behind [`Inner::emission`]
+/// (ma-sdk-state r14 item 1, directive (d)).
+struct Emission {
+    /// The bounded observation channel for the live launch (`None` once close
+    /// sealed it).
+    tx: Option<mpsc::Sender<Observation>>,
+    /// Set ONLY while holding the emission mutex, immediately before the
+    /// terminal observation is pushed through its reserved slot. An ordinary
+    /// send that reserved consumer capacity outside the mutex rechecks this
+    /// seal under the mutex and abandons the reserved slot, so the terminal is
+    /// the last observation every consumer can receive. Reset per launch.
+    terminal_sent: bool,
+}
+
 /// Shared per-launch driver state. Public only for the `test-stub`
 /// Weak-based drop-leak seam; not part of the stable driver API.
 pub struct Inner {
@@ -551,18 +565,20 @@ pub struct Inner {
     /// the causal order (a turn's frames can never precede its start) while
     /// neither task holds a lock across the other's work. The underlying channel
     /// stays UNBOUNDED so the reader never parks on a queue send (a blocked
-    /// prompt write cannot stop stdout draining), but FRAME admission goes
-    /// through [`PublishQueue`], which caps the backlog by items AND bytes
-    /// (ma-sdk-state r12 item 1), and RESERVE-ticket admission reserves a fixed
-    /// charge under the same caps before its book entry opens (r13 item 2): a
-    /// flooding child, or one whose prompts keep landing while publication is
-    /// wedged, is shut down with a diagnostic instead of growing Node memory
-    /// without limit. The terminal EOF and test fences bypass the caps, so
-    /// natural-EOF sealing and close never depend on frame admission; cancelling
-    /// a queued reservation enqueues nothing and is independent of admission
-    /// too. The reader always keeps draining stdout into the bounded backlog
-    /// even while a stdin write is blocked, and `close`/`cancel` stay reachable
-    /// (neither needs this queue to make progress).
+    /// prompt write cannot stop stdout draining), but FRAME admission and
+    /// RESERVE-ticket admission take OWNED permits from the queue's PER-LAUNCH
+    /// [`BacklogBudget`] (item + byte semaphores) before the job becomes
+    /// visible. Every admitted job CARRIES its permits, so a job discarded
+    /// (refused send), dropped (worker aborted with queued residue), cancelled
+    /// or completed releases its charge exactly once by Drop — there are no
+    /// shared counters to race or reset. The budget is created fresh per
+    /// launch, so nothing from launch A's tasks can touch launch B's accounts.
+    /// The terminal EOF and test fences bypass the caps, so natural-EOF sealing
+    /// and close never depend on admission; cancelling a queued reservation
+    /// enqueues nothing and is independent of admission too. The reader always
+    /// keeps draining stdout into the bounded backlog even while a stdin write
+    /// is blocked, and `close`/`cancel` stay reachable (neither needs this queue
+    /// to make progress).
     publish: Mutex<Option<PublishQueue>>,
     /// Serializes prompt sends: each send enqueues its reservation ticket,
     /// opens the mapper book, awaits its write, and commits strictly one after
@@ -571,21 +587,22 @@ pub struct Inner {
     /// take it, so a blocked prompt cannot gate them.
     write_seq: tokio::sync::Mutex<()>,
     policy: Mutex<PermissionPolicy>,
-    events: Mutex<Option<mpsc::Sender<Observation>>>,
+    /// Observation channel for THIS launch plus its terminal seal, behind one
+    /// emission mutex (ma-sdk-state r14 item 1, design directive (d)).
+    /// Ordinary emission reserves channel capacity OUTSIDE this mutex and only
+    /// fills the reserved slot under the mutex after rechecking the seal; the
+    /// terminal is sealed AND sent through its pre-reserved slot under the SAME
+    /// mutex, so an ordinary observation can never land after the terminal —
+    /// even on a multi-threaded runtime where a parked send and the terminal
+    /// send otherwise race into the channel.
+    emission: tokio::sync::Mutex<Emission>,
     /// ma-sdk-state r4 item 4: ONE channel slot reserved for the terminal
     /// session-exit event for the life of a launch. When the stdout reader is
     /// wedged against a full `events` channel (a flooding child nobody drains)
     /// and `close` aborts the publication worker, this permit still delivers
     /// exactly one exit observation ahead of stream EOF. It is re-acquired on
-    /// every launch (start resets exit_emitted).
+    /// every launch (launch resets the terminal seal).
     exit_permit: Mutex<Option<mpsc::OwnedPermit<Observation>>>,
-    /// ma-sdk-state r13 item 4: set `true` immediately BEFORE the terminal
-    /// observation is delivered through the reserved `exit_permit`. An
-    /// `emit_all` ordinary send parked on the FULL events channel selects on
-    /// this and drops its in-flight/remaining sends instead of completing them
-    /// once the consumer frees capacity — otherwise that ordinary observation
-    /// lands AFTER the terminal. Reset to `false` on every launch.
-    terminal_direct: tokio::sync::watch::Sender<bool>,
     closed: AtomicBool,
     /// Whether the `exited` session lifecycle has already been emitted, so the
     /// reader task and [`Driver::close`] cannot both emit it (§2.3: exactly once).
@@ -620,11 +637,73 @@ pub struct Inner {
     /// deterministically while the live child stays up.
     #[cfg(feature = "test-stub")]
     reserve_send_fails: std::sync::atomic::AtomicBool,
-    /// ma-sdk-state r12 item 1: live byte/item counters for the bounded
-    /// publication backlog (see [`PublishQueue`]). Lives for the whole driver
-    /// (not just one launch) so the limits can be configured before `start`
-    /// and stay comparable across relaunches; counters reset per launch.
-    backlog: Arc<BacklogMetrics>,
+    /// ma-sdk-state r12/14: configured caps for the bounded publication
+    /// backlog. Driver-lifetime configuration (tests shrink the caps before
+    /// `start`); the ACTIVE accounting is the per-launch [`BacklogBudget`] the
+    /// launch builds from these values.
+    backlog_config: Arc<BacklogConfig>,
+    /// The per-launch budget currently accounting for the publication FIFO, so
+    /// the test snapshot reads the launch that owns the live queue. Set at
+    /// launch; the budget also lives inside the launch's [`PublishQueue`] and
+    /// every charge's permits keep it alive independently.
+    active_budget: std::sync::Mutex<Option<Arc<BacklogBudget>>>,
+}
+
+/// Build the shared per-launch [`Inner`]. Factored out of the driver
+/// constructor so in-crate tests can drive the publication/emission machinery
+/// without a child process.
+fn build_inner(
+    media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
+    carrier: DriverKind,
+) -> Arc<Inner> {
+    Arc::new(Inner {
+        live: Mutex::new(None),
+        mapper: Mutex::new(Mapper {
+            stream: stream::StreamState::default(),
+            ids: NativeIds::default(),
+            seq: 0,
+            instance_id: InstanceId::new(),
+            run_id: RunId::new(),
+            journal_id: fallback_obj(),
+            host_id: fallback_host(),
+            session_id: String::new(),
+            pin: BinaryPin {
+                abs_path: String::new(),
+                version: String::new(),
+                sha256: dummy_digest(),
+            },
+            driver_kind: carrier,
+            channel: SourceChannel::Stdout,
+            media_stager,
+            turns: TurnBook::default(),
+            deferred_result: None,
+        }),
+        publish: Mutex::new(None),
+        write_seq: tokio::sync::Mutex::new(()),
+        policy: Mutex::new(PermissionPolicy::Host),
+        emission: tokio::sync::Mutex::new(Emission {
+            tx: None,
+            terminal_sent: false,
+        }),
+        exit_permit: Mutex::new(None),
+        closed: AtomicBool::new(false),
+        exit_emitted: AtomicBool::new(false),
+        last_spec: Mutex::new(None),
+        #[cfg(any(test, feature = "test-stub"))]
+        child_exit_status: Mutex::new(None),
+        #[cfg(feature = "test-stub")]
+        barrier: std::sync::Mutex::new(None),
+        #[cfg(feature = "test-stub")]
+        exit_build_fails: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "test-stub")]
+        fail_from_write: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        #[cfg(feature = "test-stub")]
+        write_number: std::sync::atomic::AtomicUsize::new(0),
+        #[cfg(feature = "test-stub")]
+        reserve_send_fails: std::sync::atomic::AtomicBool::new(false),
+        backlog_config: BacklogConfig::new(),
+        active_budget: std::sync::Mutex::new(None),
+    })
 }
 
 /// Native Claude print driver (`claude -p` stream-json).
@@ -682,7 +761,7 @@ impl ClaudePrintDriver {
     pub async fn publication_is_saturated(&self) -> bool {
         // The exit permit permanently holds one of 256 slots; capacity is
         // therefore 255.
-        let Some(tx) = self.inner.events.lock().await.clone() else {
+        let Some(tx) = self.inner.emission.lock().await.tx.clone() else {
             return false;
         };
         tx.capacity() == 0
@@ -827,17 +906,10 @@ impl ClaudePrintDriver {
     /// ma-sdk-state r12 item 1 (test-stub): shrink the publication backlog
     /// caps before (or between) launches so a regression can flood past the
     /// bound in milliseconds. `items` bounds queued frames, `bytes` their
-    /// summed charge.
+    /// summed charge. Applies to the NEXT launch's fresh budget.
     #[cfg(feature = "test-stub")]
     pub fn set_publication_backlog_limits_for_test(&self, items: usize, bytes: usize) {
-        self.inner
-            .backlog
-            .limit_items
-            .store(items, Ordering::Release);
-        self.inner
-            .backlog
-            .limit_bytes
-            .store(bytes, Ordering::Release);
+        self.inner.backlog_config.set(items, bytes);
     }
 
     /// ma-sdk-state r12 item 1 (test-stub): current and high-water backlog
@@ -845,7 +917,30 @@ impl ClaudePrintDriver {
     #[cfg(feature = "test-stub")]
     #[must_use]
     pub fn publication_backlog_for_test(&self) -> BacklogSnapshot {
-        self.inner.backlog.snapshot()
+        match self
+            .inner
+            .active_budget
+            .lock()
+            .expect("active budget slot")
+            .as_ref()
+        {
+            Some(budget) => budget.snapshot(),
+            None => BacklogSnapshot::idle(&self.inner.backlog_config),
+        }
+    }
+
+    /// ma-sdk-state r14 item 1 (test-stub): identity of the ACTIVE launch's
+    /// backlog budget. Every launch builds a fresh budget, so a close/relaunch
+    /// while the old publisher is mid-release must show a new id here.
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub fn active_backlog_id_for_test(&self) -> usize {
+        self.inner
+            .active_budget
+            .lock()
+            .expect("active budget slot")
+            .as_ref()
+            .map_or(0, |budget| budget.id())
     }
 
     /// Test-only (`test-stub`, r10 item 3): wait until `n` Result frames have
@@ -920,54 +1015,10 @@ impl ClaudePrintDriver {
 
     /// [`Self::new`], stamping and launching `carrier` instead of `claude-print`.
     pub(crate) fn with_carrier(options: ClaudePrintOptions, carrier: DriverKind) -> Self {
-        let media_stager = options.media_stager.clone();
+        let carrier_name = carrier;
         Self {
+            inner: build_inner(options.media_stager.clone(), carrier_name),
             options,
-            inner: Arc::new(Inner {
-                live: Mutex::new(None),
-                mapper: Mutex::new(Mapper {
-                    stream: stream::StreamState::default(),
-                    ids: NativeIds::default(),
-                    seq: 0,
-                    instance_id: InstanceId::new(),
-                    run_id: RunId::new(),
-                    journal_id: fallback_obj(),
-                    host_id: fallback_host(),
-                    session_id: String::new(),
-                    pin: BinaryPin {
-                        abs_path: String::new(),
-                        version: String::new(),
-                        sha256: dummy_digest(),
-                    },
-                    driver_kind: carrier,
-                    channel: SourceChannel::Stdout,
-                    media_stager,
-                    turns: TurnBook::default(),
-                    deferred_result: None,
-                }),
-                publish: Mutex::new(None),
-                write_seq: tokio::sync::Mutex::new(()),
-                policy: Mutex::new(PermissionPolicy::Host),
-                events: Mutex::new(None),
-                exit_permit: Mutex::new(None),
-                terminal_direct: tokio::sync::watch::channel(false).0,
-                closed: AtomicBool::new(false),
-                exit_emitted: AtomicBool::new(false),
-                last_spec: Mutex::new(None),
-                #[cfg(any(test, feature = "test-stub"))]
-                child_exit_status: Mutex::new(None),
-                #[cfg(feature = "test-stub")]
-                barrier: std::sync::Mutex::new(None),
-                #[cfg(feature = "test-stub")]
-                exit_build_fails: std::sync::atomic::AtomicBool::new(false),
-                #[cfg(feature = "test-stub")]
-                fail_from_write: std::sync::atomic::AtomicUsize::new(usize::MAX),
-                #[cfg(feature = "test-stub")]
-                write_number: std::sync::atomic::AtomicUsize::new(0),
-                #[cfg(feature = "test-stub")]
-                reserve_send_fails: std::sync::atomic::AtomicBool::new(false),
-                backlog: BacklogMetrics::new(),
-            }),
             reader: Mutex::new(None),
             publisher: Mutex::new(None),
             carrier,
@@ -1086,14 +1137,17 @@ impl ClaudePrintDriver {
             };
         }
         *self.inner.policy.lock().await = policy;
-        *self.inner.events.lock().await = Some(tx);
+        // Fresh emission channel AND a fresh terminal seal for this launch:
+        // close left `tx` as None and the previous launch's seal as `true`.
+        {
+            let mut emission = self.inner.emission.lock().await;
+            emission.tx = Some(tx);
+            emission.terminal_sent = false;
+        }
         *self.inner.exit_permit.lock().await = Some(exit_permit);
         *self.inner.last_spec.lock().await = Some(spec.clone());
         self.inner.closed.store(false, Ordering::SeqCst);
         self.inner.exit_emitted.store(false, Ordering::SeqCst);
-        // r13 item 4: re-arm the shutdown-aware ordinary-send seal for this
-        // launch (the previous launch's worker and its subscriber are gone).
-        self.inner.terminal_direct.send_replace(false);
 
         let mut ack = DriverAck::transport_written();
         ack.native_ids.insert("sessionId".into(), session_id);
@@ -1108,12 +1162,22 @@ impl ClaudePrintDriver {
             recipe: recipe.clone(),
         });
 
-        // Fresh publication FIFO for this launch, bounded by this driver's
-        // backlog metrics (r12 item 1). The worker drains it in order; the
-        // reader task gets its own queue clone and `close` seals the Inner's
-        // copy before joining the worker.
-        self.inner.backlog.reset_for_launch();
-        let (publish_queue, publish_rx) = PublishQueue::new(Arc::clone(&self.inner.backlog));
+        // Fresh publication FIFO AND fresh accounting for this launch (r14
+        // directive (a)): this budget's item/byte semaphores are owned nowhere
+        // outside this launch — queued jobs hold owned permits and a task from
+        // launch A can release only onto A's semaphores, never onto launch B's.
+        let budget = BacklogBudget::new(
+            self.inner
+                .backlog_config
+                .limit_items
+                .load(Ordering::Acquire),
+            self.inner
+                .backlog_config
+                .limit_bytes
+                .load(Ordering::Acquire),
+        );
+        *self.inner.active_budget.lock().expect("active budget slot") = Some(Arc::clone(&budget));
+        let (publish_queue, publish_rx) = PublishQueue::new(budget);
         *self.inner.publish.lock().await = Some(publish_queue.clone());
         let publisher = {
             let inner = Arc::clone(&self.inner);
@@ -1426,32 +1490,23 @@ impl Driver for ClaudePrintDriver {
         // The abort is the point. A reader outlives close detached, and a later
         // `start()` on this driver resets `exit_emitted` for the new launch; a
         // reader A still parked on `inner.live` at that moment could then emit a
-        // *second* `exited` into launch B's channel. Joining it here (or killing
-        // it) closes that window: by the time `close` returns, no task from this
-        // launch can emit.
-        if let Some(mut reader) = self.reader.lock().await.take()
-            && tokio::time::timeout(Duration::from_millis(500), &mut reader)
-                .await
-                .is_err()
-        {
-            reader.abort();
-        }
+        // *second* `exited` into launch B's channel. Directive (e): after the
+        // abort the handle is AWAITED (bounded), so by the time close returns
+        // the task has actually terminated — an abort merely sent could
+        // otherwise leave a launch-A task alive across a relaunch.
+        join_or_abort(&self.reader, "reader").await;
 
         // Seal the publication FIFO now that the reader can no longer enqueue,
         // and join its drainer so every already-queued frame (and the reader's
-        // trailing StdoutEof) is published before `exited`. Bounded, then
-        // abort: a worker parked on a wedged control-response write must not
-        // keep close open — the child is already reaped above. Same
-        // cross-launch window as the reader: no task from this launch may emit
-        // into a later launch's channel.
+        // trailing StdoutEof) is published before `exited`. Bounded, abort and
+        // AWAIT the aborted handle (see `join_or_abort`, directive (e)): a
+        // worker parked on a wedged control-response write must not keep close
+        // open — the child is already reaped above — but close also may not
+        // return while that task still exists: it owns the launch-A budget and
+        // its queued jobs' permits must finish dropping onto that dead budget,
+        // never onto the next launch's.
         self.inner.publish.lock().await.take();
-        if let Some(mut publisher) = self.publisher.lock().await.take()
-            && tokio::time::timeout(Duration::from_millis(500), &mut publisher)
-                .await
-                .is_err()
-        {
-            publisher.abort();
-        }
+        join_or_abort(&self.publisher, "publisher").await;
 
         // Seal the events channel BEFORE covering the exit. Under output
         // pressure (a child that floods stdout while stdin is wedged) the
@@ -1460,7 +1515,7 @@ impl Driver for ClaudePrintDriver {
         // On the normal path the worker already drained StdoutEof and emitted
         // `exited` into the receiver before it was joined, so dropping the
         // sender loses nothing; here the once-guard below is then a no-op.
-        *self.inner.events.lock().await = None;
+        self.inner.emission.lock().await.tx = None;
         // Whichever path got there first — the worker draining StdoutEof, or
         // this call covering an aborted one — records exactly once
         // (`exit_emitted`); emission is skipped once events is sealed.
@@ -1587,6 +1642,35 @@ async fn close_ladder(
         .and_then(|result| result.ok())
 }
 
+/// Join a launch task bounded; if it does not finish in the window, abort it
+/// and AWAIT its termination (also bounded) before returning (ma-sdk-state r14
+/// item 1, directive (e)).
+///
+/// The second await is load-bearing: `JoinHandle::abort` only SCHEDULES the
+/// cancellation, which is delivered at the task's next await point. Returning
+/// from close before an aborted publisher actually unwinds could leave a
+/// launch-A task — still holding its launch's backlog permits — alive when a
+/// relaunch installs launch B. A task blocked in uninterruptible work keeps
+/// the second bound from growing without limit; such a task cannot reach any
+/// driver state that close replaces before it next hits an await anyway.
+async fn join_or_abort(slot: &Mutex<Option<JoinHandle<()>>>, what: &'static str) {
+    let Some(mut handle) = slot.lock().await.take() else {
+        return;
+    };
+    if tokio::time::timeout(Duration::from_millis(500), &mut handle)
+        .await
+        .is_err()
+    {
+        handle.abort();
+        if tokio::time::timeout(Duration::from_millis(500), &mut handle)
+            .await
+            .is_err()
+        {
+            warn!("close: the {what} task did not unwind within the abort bound");
+        }
+    }
+}
+
 /// SIGTERM every member of the child's process group. Unix only; on other
 /// platforms the child has no group to signal and `kill()` in the ladder is the
 /// fallback, so this is a no-op there. `None` means the pid was already gone.
@@ -1692,33 +1776,36 @@ async fn prepare_prompt_write(
         return Err(DriverError::ControlUnavailable);
     };
 
-    // ma-sdk-state r13 item 2: Reserve tickets are bounded by the SAME item/byte
-    // caps as frames, and the charge is reserved HERE — before the book entry
-    // opens. A child that keeps reading prompts while the publication worker is
-    // blocked on an undrained RunHandle otherwise queues one ticket (and one
-    // outstanding turn) per prompt without limit. A breach runs the same
-    // overflow shutdown as a frame flood; natural EOF (StdoutEof) and
-    // cancellation bypass this gate entirely.
-    if let Err(kind) = publisher.reserve_slot() {
-        match kind {
-            BacklogAdmitError::Closed => return Err(DriverError::ControlUnavailable),
-            BacklogAdmitError::Overflow {
-                items,
-                bytes,
-                frame_bytes,
-            } => {
-                // The shutdown takes the publish mutex itself; release it first.
-                drop(admission);
-                shutdown_for_backlog_overflow(inner, items, bytes, frame_bytes, carrier).await;
-                return Err(DriverError::ControlUnavailable);
-            }
+    // ma-sdk-state r14 item 1 (directives (a)-(c)): Reserve tickets take the
+    // SAME owned item/byte permits as frames, from THIS launch's per-launch
+    // budget, BEFORE the book entry opens. A child that keeps reading prompts
+    // while the publication worker is blocked on an undrained RunHandle
+    // otherwise queues one ticket (and one outstanding turn) per prompt
+    // without limit. A breach SPAWNS the cancellation-independent overflow
+    // shutdown as its own task BEFORE this function can await anything, then is
+    // rejected: aborting this send (even while the shutdown parks on the live
+    // handle) can no longer cancel the kill or the terminal delivery. Natural
+    // EOF (StdoutEof) and cancellation bypass this gate entirely.
+    let budget = Arc::clone(publisher.budget());
+    let mut charge = Some(match publisher.reserve_charge() {
+        Ok(charge) => charge,
+        Err(BacklogAdmitError::Closed) => return Err(DriverError::ControlUnavailable),
+        Err(BacklogAdmitError::Overflow {
+            items,
+            bytes,
+            frame_bytes,
+        }) => {
+            // The shutdown takes the publish mutex itself; release the gate
+            // first, then SPAWN the shutdown (never await it — the triggering
+            // send must not own its lifetime).
+            drop(admission);
+            // Detached: the send rejects and does not await the shutdown; its
+            // kill and terminal delivery survive the caller being aborted.
+            let _shutdown =
+                spawn_backlog_overflow_shutdown(inner, &budget, items, bytes, frame_bytes, carrier);
+            return Err(DriverError::ControlUnavailable);
         }
-    }
-    // The ticket charge is live from here until either the ticket is queued (the
-    // worker then releases it when the Reserve job drains) or this function
-    // leaves before queueing — including a caller aborted on the mapper-lock
-    // await — in which case the guard's Drop gives the charge back.
-    let mut charge = Some(ReservationChargeGuard::new(inner.clone()));
+    });
 
     // Open the book entry and enqueue its Reserve ticket with NO await between
     // opening and insertion WHILE holding admission: the mapper await is the
@@ -1744,22 +1831,40 @@ async fn prepare_prompt_write(
         if force_send_failure {
             true
         } else {
-            admission
+            match admission
                 .as_ref()
                 .expect("admission checked above")
                 .admit_control(PublishJob::Reserve {
                     reservation: reservation.clone(),
-                })
-                .is_err()
+                    charge: charge
+                        .take()
+                        .expect("the reserved charge rides the Reserve ticket"),
+                }) {
+                Ok(()) => false,
+                // The worker is gone (close dropped the receiver). The
+                // returned job carries the permits and releases them on drop.
+                Err(mpsc::error::SendError(returned)) => {
+                    drop(returned);
+                    true
+                }
+            }
         }
         #[cfg(not(feature = "test-stub"))]
-        admission
+        match admission
             .as_ref()
             .expect("admission checked above")
             .admit_control(PublishJob::Reserve {
                 reservation: reservation.clone(),
-            })
-            .is_err()
+                charge: charge
+                    .take()
+                    .expect("the reserved charge rides the Reserve ticket"),
+            }) {
+            Ok(()) => false,
+            Err(mpsc::error::SendError(returned)) => {
+                drop(returned);
+                true
+            }
+        }
     };
     // Admission is decided: release the gate before the (mapper-locked)
     // rollback so a sealed/closed channel never parks the EOF sealer or close
@@ -1767,20 +1872,16 @@ async fn prepare_prompt_write(
     // owes nothing.
     drop(admission);
     if send_failed {
-        // The publisher is closed (close in progress): no worker will ever
-        // visit this ticket. Roll the just-opened entry back and return the
-        // reserved backlog charge — no job is queued to release it.
+        // The publisher is closed (close in progress) or the send was forced to
+        // fail: no worker will ever visit this ticket. Roll the just-opened
+        // entry back; the owned charge is released here too (force-failure kept
+        // it local; a closed-send failure released it with the returned job).
         guard.take().unwrap().fail_without_ticket().await;
-        drop(charge.take().expect("charge guard before the failed send"));
+        drop(charge);
         return Err(DriverError::ControlUnavailable);
     }
-    // The ticket is queued, so its charge is released by the worker when the
-    // Reserve job drains — defuse the local guard before the worker can.
-    charge
-        .take()
-        .expect("charge guard after the successful send")
-        .defuse();
-    // The ticket is queued; Drop from here on only has to wake the worker.
+    // The ticket is queued and its permits ride in the job: the worker
+    // releases them by Drop when the Reserve job drains. Nothing to defuse.
     guard
         .as_mut()
         .expect("guard before accept")
@@ -1859,10 +1960,11 @@ async fn map_loop(
     publisher: PublishQueue,
     carrier: &'static str,
 ) {
-    // Set when frame admission tripped the backlog cap: the loop breaks and
-    // the overflow SHUTDOWN runs instead of the natural-EOF seal (the terminal
-    // observation is delivered by that shutdown, never through the full queue).
-    let mut overflow: Option<(usize, usize, usize)> = None;
+    // Set when frame admission tripped the backlog cap: the loop breaks after
+    // SPAWNING the overflow shutdown (the terminal observation is delivered by
+    // that detached task, never through the full queue); only natural EOF then
+    // takes the seal branch.
+    let mut tripped = false;
     while let Some(frame) = outbound.recv().await {
         if matches!(frame, Outbound::KeepAlive) {
             continue;
@@ -1879,11 +1981,12 @@ async fn map_loop(
                 continue;
             }
         };
-        // Bounded admission (r12 item 1): a frame that would cross the
-        // byte/item cap is NOT queued — it trips the overflow session shutdown
-        // instead of growing Node memory without limit. Control jobs bypass
-        // the cap, so the reader parking here (never — admission is an std
-        // critical section) could not gate cancellation or close either.
+        // Bounded admission (r12 item 1; r14 item 1 ownership rewrite): a frame
+        // that would cross the byte/item cap is NOT queued — it trips the
+        // overflow session shutdown instead of growing Node memory without
+        // limit. Control jobs bypass the cap, so the reader parking here
+        // (never — admission is an std critical section) could not gate
+        // cancellation or close either.
         // test-stub only: detect the turn RESULT frame specifically (not an
         // assistant/keepalive frame) so an armed barrier can wait until that
         // result is queued behind the parked ticket (ma-sdk-state r6 item 3).
@@ -1894,7 +1997,7 @@ async fn map_loop(
         // race the ordered processing of an earlier cancelled ticket.
         #[cfg(feature = "test-stub")]
         test_barrier::hold_result_enqueue(&inner.barrier, &frame).await;
-        match publisher.admit_frame(PublishJob::Frame(Box::new(frame))) {
+        match publisher.admit_frame(Box::new(frame)) {
             Ok(()) => {}
             Err((BacklogAdmitError::Closed, _)) => break,
             Err((
@@ -1905,7 +2008,22 @@ async fn map_loop(
                 },
                 _,
             )) => {
-                overflow = Some((items, bytes, frame_bytes));
+                // SPAWN the cancellation-independent shutdown BEFORE any await
+                // (directive (c)): the reader going away (or being aborted by
+                // close) must not take the kill or the terminal delivery with
+                // it. The rejected frame owns nothing and drops here.
+                let budget = publisher.budget_clone();
+                // Detached: the reader may be torn down by close at any moment;
+                // the kill and the terminal do not depend on it staying alive.
+                let _shutdown = spawn_backlog_overflow_shutdown(
+                    &inner,
+                    &budget,
+                    items,
+                    bytes,
+                    frame_bytes,
+                    carrier,
+                );
+                tripped = true;
                 break;
             }
         }
@@ -1914,33 +2032,58 @@ async fn map_loop(
             test_barrier::note_frame_enqueued(&inner.barrier);
         }
     }
-    match overflow {
-        Some((items, bytes, frame_bytes)) => {
-            shutdown_for_backlog_overflow(&inner, items, bytes, frame_bytes, carrier).await;
+    if !tripped {
+        // Child stdout reached EOF. Seal reservation admission and enqueue the
+        // exit as ONE critical section under the publication mutex
+        // (ma-sdk-state r11 item 2): prepare_prompt_write holds that same mutex
+        // from its seal check through book creation and ticket insertion, so a
+        // reservation can never queue a Reserve ticket BEHIND this StdoutEof.
+        // Either the ticket (and therefore its start/write-failure rollback) is
+        // fully ahead of the EOF in publication order, or the reservation is
+        // rejected having opened nothing. The EOF is a CONTROL job: it bypasses
+        // the frame caps so a full backlog cannot delay the terminal seal.
+        // `closed` is set here, not only by explicit close: a prompt sent after
+        // the child's natural exit can never start a turn.
+        let gate = inner.publish.lock().await;
+        inner.closed.store(true, Ordering::SeqCst);
+        if let Some(publisher) = gate.as_ref() {
+            let _ = publisher.admit_control(PublishJob::StdoutEof);
         }
-        None => {
-            // Child stdout reached EOF. Seal reservation admission and enqueue
-            // the exit as ONE critical section under the publication mutex
-            // (ma-sdk-state r11 item 2): prepare_prompt_write holds that same
-            // mutex from its seal check through book creation and ticket
-            // insertion, so a reservation can never queue a Reserve ticket
-            // BEHIND this StdoutEof. Either the ticket (and therefore its
-            // start/write-failure rollback) is fully ahead of the EOF in
-            // publication order, or the reservation is rejected having opened
-            // nothing. The EOF is a CONTROL job: it bypasses the frame caps so
-            // a full backlog cannot delay the terminal seal. `closed` is set
-            // here, not only by explicit close: a prompt sent after the
-            // child's natural exit can never start a turn.
-            let gate = inner.publish.lock().await;
-            inner.closed.store(true, Ordering::SeqCst);
-            if let Some(publisher) = gate.as_ref() {
-                let _ = publisher.admit_control(PublishJob::StdoutEof);
-            }
-            drop(gate);
-            #[cfg(feature = "test-stub")]
-            test_barrier::note_stdout_eof_queued(&inner.barrier);
-        }
+        drop(gate);
+        #[cfg(feature = "test-stub")]
+        test_barrier::note_stdout_eof_queued(&inner.barrier);
     }
+}
+
+/// ma-sdk-state r14 item 1 (directive (c)): spawn the overflow session
+/// shutdown as its OWN detached task.
+///
+/// The spawn happens synchronously at the admission-failure site BEFORE any
+/// await, so cancelling the triggering future (a prompt send aborted while the
+/// shutdown contends on the `live` handle, a reader aborted by close) cannot
+/// cancel the kill or the terminal publication: the task owns an [`Arc<Inner>`]
+/// and nobody owns its lifetime. Callers do not even keep the [`JoinHandle`].
+/// Exactly one shutdown per launch wins the budget's CAS latch.
+#[must_use = "the shutdown is detached; the handle is only for callers that choose to await it"]
+fn spawn_backlog_overflow_shutdown(
+    inner: &Arc<Inner>,
+    budget: &Arc<BacklogBudget>,
+    items: usize,
+    bytes: usize,
+    frame_bytes: usize,
+    carrier: &'static str,
+) -> Option<JoinHandle<()>> {
+    // Exactly one shutdown per LAUNCH (the latch lives on the per-launch
+    // budget); a second overflowing frame or ticket loses and does nothing.
+    if budget.overflowed.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let inner = Arc::clone(inner);
+    let budget = Arc::clone(budget);
+    let handle = tokio::spawn(async move {
+        shutdown_for_backlog_overflow(&inner, &budget, items, bytes, frame_bytes, carrier).await;
+    });
+    Some(handle)
 }
 
 /// ma-sdk-state r12 item 1: the bounded publication backlog overflowed.
@@ -1957,18 +2100,19 @@ async fn map_loop(
 /// two synchronous signals, and terminal delivery uses the reserved permit. A
 /// concurrent `close` therefore never parks on frame admission, and the blocked
 /// prompt write unblocks with an error once the child's pipes close.
+///
+/// ma-sdk-state r14 item 1: this runs in a DETACHED spawned task (see
+/// [`spawn_backlog_overflow_shutdown`]), so the kill and the terminal complete
+/// even if the triggering send was aborted while this routine waits for the
+/// `live` handle.
 async fn shutdown_for_backlog_overflow(
     inner: &Arc<Inner>,
+    budget: &BacklogBudget,
     items: usize,
     bytes: usize,
     frame_bytes: usize,
     carrier: &'static str,
 ) {
-    // Exactly one shutdown; the loser (a second overflowing reader frame) has
-    // nothing left to do.
-    if inner.backlog.overflowed.swap(true, Ordering::AcqRel) {
-        return;
-    }
     // Seal reservation admission BEFORE the kill: a prompt that wins past this
     // point would write to a child this routine is about to kill. The publish
     // mutex serializes this with prepare_prompt_write's admission section.
@@ -1988,9 +2132,13 @@ async fn shutdown_for_backlog_overflow(
     // lock only DELAYS under such a holder; it cannot deadlock: no lock this
     // routine still needs is held across this await, and `close` — the only
     // long holder — runs its own ladder against this same child and then reaps
-    // it to None (its reader abort means a parked overflow call cannot pin
-    // close), so reaching a None/absent handle means the child is already
+    // it to None, so reaching a None/absent handle means the child is already
     // removed/reaped and there is nothing to kill.
+    //
+    // ma-sdk-state r14 item 2: a caller ABORTED while parked here used to take
+    // the whole shutdown down with it (the send future owned this future). The
+    // shutdown now runs detached, so the wait survives that abort and the kill
+    // still lands.
     #[cfg(feature = "test-stub")]
     test_barrier::note_overflow_kill_waiting(&inner.barrier);
     {
@@ -2001,17 +2149,18 @@ async fn shutdown_for_backlog_overflow(
             let _ = live.process.kill();
         }
     }
+    let (limit_items, limit_bytes) = budget.caps();
     error!(
         carrier,
         items,
         bytes,
         frame_bytes,
-        limit_items = inner.backlog.limit_items.load(Ordering::Acquire),
-        limit_bytes = inner.backlog.limit_bytes.load(Ordering::Acquire),
+        limit_items,
+        limit_bytes,
         "publication backlog overflow: the child produced stdout faster than it \
          could be published; shutting the session down (reason=publication_backlog_overflow)"
     );
-    let _ = emit_overflow_exit(inner, items, bytes).await;
+    let _ = emit_overflow_exit(inner, budget, items, bytes).await;
     #[cfg(feature = "test-stub")]
     test_barrier::note_backlog_overflow(&inner.barrier);
 }
@@ -2058,81 +2207,181 @@ enum BacklogAdmitError {
     },
 }
 
-/// Live backlog occupancy (ma-sdk-state r12 item 1; r13 item 1).
+/// Driver-lifetime CONFIGURATION for the bounded publication backlog
+/// (ma-sdk-state r14 item 1, directive (a)). Only the caps live here: tests
+/// shrink them before `start`, and every launch builds a fresh
+/// [`BacklogBudget`] from them. No live occupancy lives here — that is why a
+/// relaunch cannot inherit or corrupt a previous launch's accounting.
+struct BacklogConfig {
+    limit_items: std::sync::atomic::AtomicUsize,
+    limit_bytes: std::sync::atomic::AtomicUsize,
+}
+
+impl BacklogConfig {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            limit_items: std::sync::atomic::AtomicUsize::new(PUBLICATION_BACKLOG_MAX_ITEMS),
+            limit_bytes: std::sync::atomic::AtomicUsize::new(PUBLICATION_BACKLOG_MAX_BYTES),
+        })
+    }
+
+    #[cfg(any(test, feature = "test-stub"))]
+    fn set(&self, items: usize, bytes: usize) {
+        self.limit_items.store(items, Ordering::Release);
+        self.limit_bytes.store(bytes, Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "test-stub"))]
+    fn caps(&self) -> (usize, usize) {
+        (
+            self.limit_items.load(Ordering::Acquire),
+            self.limit_bytes.load(Ordering::Acquire),
+        )
+    }
+}
+
+/// Driver-local launch sequence for [`BacklogBudget::id`].
+static BACKLOG_BUDGET_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// PER-LAUNCH accounting for the bounded publication backlog (ma-sdk-state r14
+/// item 1, directives (a)/(b)).
 ///
-/// Occupancy moves ONLY by atomic add/sub: admission RESERVES a charge with
-/// `fetch_add` BEFORE the job becomes visible in the channel, and the worker
-/// releases it with `fetch_sub` once the job is fully handled. There is no
-/// read-then-store: an admission that read the counters cannot overwrite a
-/// release that landed while it was admitting (the r12 version's stale store
-/// left a phantom charge that could trip a false overflow and kill a healthy
-/// session, and briefly under-counted the job that was already visible to the
-/// consumer). A charge that does not end in a queued job (cap refusal, send
-/// failure) is subtracted back on the same path that reserved it.
-struct BacklogMetrics {
-    /// Frames currently queued (admitted, not yet drained by the worker).
-    items: std::sync::atomic::AtomicUsize,
-    /// Sum of [`frame_backlog_cost`] over the currently queued frames.
-    bytes: std::sync::atomic::AtomicUsize,
-    /// High-water marks for the life of the launch (the regression asserts the
+/// Two semaphores are the whole accounting: one permit per admitted item, and
+/// `frame_backlog_cost` (or [`RESERVATION_BACKLOG_COST`]) permits per admitted
+/// byte charge. Admission is `try_acquire_many_owned`; the owned permits move
+/// INTO the queued job and are released by `Drop`, so completed, cancelled,
+/// aborted and discarded jobs all return their charge exactly once, with no
+/// explicit release call. Nothing is shared across launches: the budget is
+/// created in `launch`, owned by the launch's [`PublishQueue`], and kept alive
+/// by outstanding permits themselves, so a launch-A task that releases after a
+/// relaunch touches only launch A's semaphores.
+///
+/// The high-water gauges and the overflow latch are OBSERVATIONAL, not
+/// admission state: admission itself is decided entirely by the semaphores —
+/// no read-then-store counter can exist (the r12/r13 races), and the latch only
+/// chooses whether to spawn the one shutdown task.
+struct BacklogBudget {
+    /// Monotonic per-launch identity, so a regression can assert a relaunch
+    /// built a fresh budget.
+    #[cfg_attr(not(any(test, feature = "test-stub")), allow(dead_code))]
+    id: usize,
+    items: Arc<Semaphore>,
+    bytes: Arc<Semaphore>,
+    cap_items: usize,
+    cap_bytes: usize,
+    /// High-water gauges for the life of the launch (regressions assert the
     /// backlog never crossed the configured caps).
     items_high: std::sync::atomic::AtomicUsize,
     bytes_high: std::sync::atomic::AtomicUsize,
-    /// Configured caps (test-stub can shrink them before/at launch).
-    limit_items: std::sync::atomic::AtomicUsize,
-    limit_bytes: std::sync::atomic::AtomicUsize,
-    /// Set exactly once, by the overflow shutdown winner.
+    /// Set exactly once, when the detached overflow shutdown task is spawned.
     overflowed: std::sync::atomic::AtomicBool,
 }
 
-impl BacklogMetrics {
-    fn new() -> Arc<Self> {
+impl BacklogBudget {
+    fn new(cap_items: usize, cap_bytes: usize) -> Arc<Self> {
         Arc::new(Self {
-            items: std::sync::atomic::AtomicUsize::new(0),
-            bytes: std::sync::atomic::AtomicUsize::new(0),
+            id: BACKLOG_BUDGET_SEQ.fetch_add(1, Ordering::Relaxed),
+            items: Arc::new(Semaphore::new(cap_items)),
+            bytes: Arc::new(Semaphore::new(cap_bytes)),
+            cap_items,
+            cap_bytes,
             items_high: std::sync::atomic::AtomicUsize::new(0),
             bytes_high: std::sync::atomic::AtomicUsize::new(0),
-            limit_items: std::sync::atomic::AtomicUsize::new(PUBLICATION_BACKLOG_MAX_ITEMS),
-            limit_bytes: std::sync::atomic::AtomicUsize::new(PUBLICATION_BACKLOG_MAX_BYTES),
             overflowed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
-    /// Per-launch reset: zero occupancy/high-water/overflow, keep the
-    /// configured limits.
-    fn reset_for_launch(&self) {
-        self.items.store(0, Ordering::SeqCst);
-        self.bytes.store(0, Ordering::SeqCst);
-        self.items_high.store(0, Ordering::SeqCst);
-        self.bytes_high.store(0, Ordering::SeqCst);
-        self.overflowed.store(false, Ordering::SeqCst);
+    #[cfg(any(test, feature = "test-stub"))]
+    fn id(&self) -> usize {
+        self.id
     }
 
-    #[cfg(any(test, feature = "test-stub"))]
-    fn snapshot(&self) -> BacklogSnapshot {
-        BacklogSnapshot {
-            items: self.items.load(Ordering::Acquire),
-            bytes: self.bytes.load(Ordering::Acquire),
-            items_high: self.items_high.load(Ordering::Acquire),
-            bytes_high: self.bytes_high.load(Ordering::Acquire),
-            overflowed: self.overflowed.load(Ordering::Acquire),
-            limit_items: self.limit_items.load(Ordering::Acquire),
-            limit_bytes: self.limit_bytes.load(Ordering::Acquire),
+    fn caps(&self) -> (usize, usize) {
+        (self.cap_items, self.cap_bytes)
+    }
+
+    /// Permits currently held by admitted but unreleased jobs.
+    fn occupied(&self) -> (usize, usize) {
+        (
+            self.cap_items
+                .saturating_sub(self.items.available_permits()),
+            self.cap_bytes
+                .saturating_sub(self.bytes.available_permits()),
+        )
+    }
+
+    /// Try to reserve one item permit and `cost` byte permits (directive (c)).
+    /// The returned [`BacklogCharge`] releases by Drop; there is deliberately
+    /// no separate release call. A charge larger than the byte cap is reported
+    /// as overflow rather than wrapping.
+    fn acquire(&self, cost: usize) -> Result<BacklogCharge, BacklogAdmitError> {
+        if self.overflowed.load(Ordering::Acquire) {
+            return Err(BacklogAdmitError::Closed);
+        }
+        let cost_u32 = u32::try_from(cost).unwrap_or(u32::MAX);
+        // The owned acquire consumes an `Arc<Semaphore>` (the permit keeps it
+        // alive); the clone is a refcount bump.
+        let items_permit = match self.items.clone().try_acquire_many_owned(1) {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => return Err(self.overflow_error(cost)),
+            // Semaphores are never closed: only permit exhaustion exists.
+            Err(TryAcquireError::Closed) => {
+                unreachable!("backlog item semaphore is never closed")
+            }
+        };
+        let bytes_permit = match self.bytes.clone().try_acquire_many_owned(cost_u32) {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                // The item permit rolls back by Drop before the error returns.
+                drop(items_permit);
+                return Err(self.overflow_error(cost));
+            }
+            Err(TryAcquireError::Closed) => {
+                unreachable!("backlog byte semaphore is never closed")
+            }
+        };
+        let (items_now, bytes_now) = self.occupied();
+        self.items_high.fetch_max(items_now, Ordering::AcqRel);
+        self.bytes_high.fetch_max(bytes_now, Ordering::AcqRel);
+        Ok(BacklogCharge {
+            items: items_permit,
+            bytes: bytes_permit,
+        })
+    }
+
+    fn overflow_error(&self, frame_bytes: usize) -> BacklogAdmitError {
+        let (items, bytes) = self.occupied();
+        BacklogAdmitError::Overflow {
+            items,
+            bytes,
+            frame_bytes,
         }
     }
 
-    /// Release one previously-reserved frame charge after the worker finished
-    /// the job.
-    fn release_frame(&self, cost: usize) {
-        self.release_charge(1, cost);
+    #[cfg(any(test, feature = "test-stub"))]
+    fn snapshot(self: &Arc<Self>) -> BacklogSnapshot {
+        let (items, bytes) = self.occupied();
+        BacklogSnapshot {
+            items,
+            bytes,
+            items_high: self.items_high.load(Ordering::Acquire),
+            bytes_high: self.bytes_high.load(Ordering::Acquire),
+            overflowed: self.overflowed.load(Ordering::Acquire),
+            limit_items: self.cap_items,
+            limit_bytes: self.cap_bytes,
+        }
     }
+}
 
-    /// Subtract a reserved charge back off the live counters (worker release
-    /// and admission rollback share this single path).
-    fn release_charge(&self, items: usize, bytes: usize) {
-        self.items.fetch_sub(items, Ordering::AcqRel);
-        self.bytes.fetch_sub(bytes, Ordering::AcqRel);
-    }
+/// One admitted job's owned budget permits (ma-sdk-state r14 item 1, directive
+/// (b)). Carried inside every queued FRAME and RESERVE job; releasing is just
+/// dropping the job, so every exit path — worker drain, queue teardown on
+/// close/abort, refused enqueue, caller cancellation — gives the charge back
+/// exactly once.
+#[allow(dead_code)] // the fields exist to be held, not read
+struct BacklogCharge {
+    items: tokio::sync::OwnedSemaphorePermit,
+    bytes: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Test-only snapshot of the bounded publication backlog (r12 item 1).
@@ -2149,215 +2398,100 @@ pub struct BacklogSnapshot {
     pub bytes_high: usize,
     /// Whether the overflow shutdown already fired.
     pub overflowed: bool,
-    /// Configured item cap.
+    /// Active launch's item cap.
     pub limit_items: usize,
-    /// Configured byte cap.
+    /// Active launch's byte cap.
     pub limit_bytes: usize,
 }
 
+#[cfg(any(test, feature = "test-stub"))]
+impl BacklogSnapshot {
+    /// Snapshot reported before any launch installed a budget.
+    fn idle(config: &BacklogConfig) -> BacklogSnapshot {
+        let (limit_items, limit_bytes) = config.caps();
+        BacklogSnapshot {
+            items: 0,
+            bytes: 0,
+            items_high: 0,
+            bytes_high: 0,
+            overflowed: false,
+            limit_items,
+            limit_bytes,
+        }
+    }
+}
+
 /// Admission gate around the otherwise-unbounded publication channel
-/// (ma-sdk-state r12 item 1; r13 item 2).
+/// (ma-sdk-state r12 item 1; r13 item 2; r14 item 1 ownership rewrite).
 ///
-/// FRAME jobs and Reserve tickets pass through the shared byte/item caps
-/// (tickets reserve a fixed charge via [`PublishQueue::reserve_slot`] BEFORE
-/// their turn-book entry opens); the remaining CONTROL jobs (the terminal EOF,
-/// test fences) always pass as long as the channel is open so natural-EOF
-/// sealing and close never wait on backlog admission — the bounded backlog must
-/// not recreate the shutdown deadlock an unbounded queue was chosen to avoid.
-/// Cancelling an already-queued reservation enqueues nothing and therefore
-/// stays independent of admission too.
+/// FRAME jobs and Reserve tickets take owned permits from the launch's shared
+/// byte/item semaphores (tickets reserve theirs BEFORE their turn-book entry
+/// opens); the remaining CONTROL jobs (the terminal EOF, test fences) always
+/// pass as long as the channel is open so natural-EOF sealing and close never
+/// wait on backlog admission — the bounded backlog must not recreate the
+/// shutdown deadlock an unbounded queue was chosen to avoid. Cancelling an
+/// already-queued reservation enqueues nothing and therefore stays independent
+/// of admission too.
 #[derive(Clone)]
 struct PublishQueue {
     tx: mpsc::UnboundedSender<PublishJob>,
-    metrics: Arc<BacklogMetrics>,
-    /// Test-only rendezvous (lib unit tests): parks an admission in the window
-    /// where its charge is reserved but its job is not yet visible, so a
-    /// concurrent release can be scheduled against it deterministically.
-    #[cfg(test)]
-    admission_gate: Arc<AdmissionGate>,
+    budget: Arc<BacklogBudget>,
 }
 
 impl PublishQueue {
-    /// Create the publication channel for one launch, bound by `metrics`.
-    fn new(metrics: Arc<BacklogMetrics>) -> (Self, mpsc::UnboundedReceiver<PublishJob>) {
+    /// Create the publication channel and fresh accounting for one launch.
+    fn new(budget: Arc<BacklogBudget>) -> (Self, mpsc::UnboundedReceiver<PublishJob>) {
         let (tx, rx) = mpsc::unbounded_channel::<PublishJob>();
-        (
-            Self {
-                tx,
-                metrics,
-                #[cfg(test)]
-                admission_gate: Arc::new(AdmissionGate::default()),
-            },
-            rx,
-        )
+        (Self { tx, budget }, rx)
     }
 
-    /// Try to admit a stdout FRAME under both caps. On refusal the caller
-    /// owns the rejected job again (it is dropped by the reader on overflow).
-    ///
-    /// The charge is reserved with `fetch_add` BEFORE the channel send (the
-    /// job's only visibility point), so the counters always cover everything
-    /// the consumer can reach. Admission and the worker's release never
-    /// read-then-store, so they commute regardless of interleaving; a refusal
-    /// or a failed send subtracts the reservation straight back.
-    fn admit_frame(&self, job: PublishJob) -> Result<(), (BacklogAdmitError, PublishJob)> {
-        let PublishJob::Frame(frame) = &job else {
-            unreachable!("admit_frame is only used for PublishJob::Frame")
+    fn budget(&self) -> &Arc<BacklogBudget> {
+        &self.budget
+    }
+
+    fn budget_clone(&self) -> Arc<BacklogBudget> {
+        Arc::clone(&self.budget)
+    }
+
+    /// Try to admit a stdout FRAME under both caps. The frame is boxed here so
+    /// the admitted job carries it together with its permits. On refusal the
+    /// caller owns the frame again (the reader drops it on overflow); no
+    /// permits were attached, so nothing needs releasing. On success the
+    /// permits move INTO the job, and both the queued job and a send that fails
+    /// because the worker is gone release them by Drop.
+    fn admit_frame(&self, frame: Box<Outbound>) -> Result<(), (BacklogAdmitError, Box<Outbound>)> {
+        let cost = frame_backlog_cost(&frame);
+        let charge = match self.budget.acquire(cost) {
+            Ok(charge) => charge,
+            Err(error) => return Err((error, frame)),
         };
-        let cost = frame_backlog_cost(frame);
-        if self.metrics.overflowed.load(Ordering::Acquire) {
-            return Err((BacklogAdmitError::Closed, job));
-        }
-        // Reserve BEFORE visibility.
-        let items_now = self.metrics.items.fetch_add(1, Ordering::AcqRel) + 1;
-        let bytes_now = self
-            .metrics
-            .bytes
-            .fetch_add(cost, Ordering::AcqRel)
-            .saturating_add(cost);
-        let limit_items = self.metrics.limit_items.load(Ordering::Acquire);
-        let limit_bytes = self.metrics.limit_bytes.load(Ordering::Acquire);
-        if items_now > limit_items || bytes_now > limit_bytes {
-            self.metrics.release_charge(1, cost);
-            let items = self.metrics.items.load(Ordering::Acquire);
-            let bytes = self.metrics.bytes.load(Ordering::Acquire);
-            return Err((
-                BacklogAdmitError::Overflow {
-                    items,
-                    bytes,
-                    frame_bytes: cost,
-                },
-                job,
-            ));
-        }
-        // Test-only: deterministically park in the reserved-but-not-visible
-        // window. Open by default; a lib unit test shuts it to schedule a
-        // release exactly against an in-flight admission.
-        #[cfg(test)]
-        self.admission_gate.park_after_charge_reserved();
+        let charged = PublishJob::Frame { frame, charge };
         // The channel is unbounded: this send only fails once the worker is
-        // gone (close dropped the receiver), never on capacity.
-        if let Err(mpsc::error::SendError(returned)) = self.tx.send(job) {
-            self.metrics.release_charge(1, cost);
-            return Err((BacklogAdmitError::Closed, returned));
+        // gone (close dropped the receiver), never on capacity. The returned
+        // job carries the permits and releases them as the caller drops it.
+        if let Err(mpsc::error::SendError(returned)) = self.tx.send(charged) {
+            let PublishJob::Frame { frame, .. } = returned else {
+                unreachable!("the channel was just sent a Frame");
+            };
+            return Err((BacklogAdmitError::Closed, frame));
         }
-        self.metrics
-            .items_high
-            .fetch_max(items_now, Ordering::AcqRel);
-        self.metrics
-            .bytes_high
-            .fetch_max(bytes_now, Ordering::AcqRel);
         Ok(())
     }
 
-    /// Reserve one Reserve-ticket slot under the shared item/byte caps
-    /// (ma-sdk-state r13 item 2), BEFORE the turn-book entry exists. On
-    /// refusal the provisional charge has already been returned; on success
-    /// the caller owns the charge and must either queue the ticket (the worker
-    /// releases it when the job drains) or hand it back through
-    /// [`BacklogMetrics::release_charge`] if the ticket never makes it in.
-    fn reserve_slot(&self) -> Result<(), BacklogAdmitError> {
-        if self.metrics.overflowed.load(Ordering::Acquire) {
-            return Err(BacklogAdmitError::Closed);
-        }
-        let items_now = self.metrics.items.fetch_add(1, Ordering::AcqRel) + 1;
-        let bytes_now = self
-            .metrics
-            .bytes
-            .fetch_add(RESERVATION_BACKLOG_COST, Ordering::AcqRel)
-            .saturating_add(RESERVATION_BACKLOG_COST);
-        let limit_items = self.metrics.limit_items.load(Ordering::Acquire);
-        let limit_bytes = self.metrics.limit_bytes.load(Ordering::Acquire);
-        if items_now > limit_items || bytes_now > limit_bytes {
-            self.metrics.release_charge(1, RESERVATION_BACKLOG_COST);
-            let items = self.metrics.items.load(Ordering::Acquire);
-            let bytes = self.metrics.bytes.load(Ordering::Acquire);
-            return Err(BacklogAdmitError::Overflow {
-                items,
-                bytes,
-                frame_bytes: RESERVATION_BACKLOG_COST,
-            });
-        }
-        self.metrics
-            .items_high
-            .fetch_max(items_now, Ordering::AcqRel);
-        self.metrics
-            .bytes_high
-            .fetch_max(bytes_now, Ordering::AcqRel);
-        Ok(())
+    /// Reserve one Reserve-ticket charge under the shared item/byte caps,
+    /// BEFORE the turn-book entry exists. On success the caller owns the
+    /// permits and must move them into the queued ticket; dropping them gives
+    /// the charge back if the ticket never makes it into the queue.
+    fn reserve_charge(&self) -> Result<BacklogCharge, BacklogAdmitError> {
+        self.budget.acquire(RESERVATION_BACKLOG_COST)
     }
 
     /// Admit a CONTROL job (terminal EOF / test fence) without consulting the
     /// frame caps. Fails only when the channel is closed. Reserve tickets do
-    /// NOT go through here: they reserve a fixed charge under the shared caps
-    /// via [`Self::reserve_slot`] before their book entry is opened.
+    /// NOT go through here: they take a charge under the shared caps via
+    /// [`Self::reserve_charge`] before their book entry is opened.
     fn admit_control(&self, job: PublishJob) -> Result<(), mpsc::error::SendError<PublishJob>> {
         self.tx.send(job)
-    }
-}
-
-/// Test-only admission rendezvous (lib unit tests). Synchronous, because
-/// [`PublishQueue::admit_frame`] is a synchronous function: the parking
-/// admission blocks an OS thread under the test runtime while the test thread
-/// releases a frame charge and opens the gate. Condvar waits are bounded and
-/// acknowledged — no sleeps, no polling.
-#[cfg(test)]
-#[derive(Default)]
-struct AdmissionGate {
-    /// When true, each admission parks after reserving its charge.
-    shut: std::sync::atomic::AtomicBool,
-    /// Set by the parked admission before it waits, so the test can acknowledge
-    /// the exact interleaving instead of racing into the release.
-    parked: std::sync::atomic::AtomicBool,
-    mutex: std::sync::Mutex<()>,
-    condvar: std::sync::Condvar,
-}
-
-#[cfg(test)]
-impl AdmissionGate {
-    fn shut(&self) {
-        self.shut.store(true, Ordering::Release);
-    }
-
-    fn open(&self) {
-        self.shut.store(false, Ordering::Release);
-        self.condvar.notify_all();
-    }
-
-    fn park_after_charge_reserved(&self) {
-        if !self.shut.load(Ordering::Acquire) {
-            return;
-        }
-        self.parked.store(true, Ordering::Release);
-        // Wake a test blocked in `wait_until_parked`; the predicate re-check
-        // under the mutex makes the announcement unlosable.
-        self.condvar.notify_all();
-        let mut guard = self.mutex.lock().expect("admission gate mutex");
-        while self.shut.load(Ordering::Acquire) {
-            let (g, timeout) = self
-                .condvar
-                .wait_timeout(guard, std::time::Duration::from_secs(10))
-                .expect("admission gate condvar");
-            guard = g;
-            assert!(
-                !timeout.timed_out(),
-                "an admitted frame parked behind a test gate that never opened"
-            );
-        }
-    }
-
-    /// Block until an admission has parked with its charge reserved. Runs on a
-    /// blocking thread (condvar); bounded by `timeout`.
-    fn wait_until_parked(&self, timeout: std::time::Duration) {
-        let guard = self.mutex.lock().expect("admission gate mutex");
-        let (_guard, result) = self
-            .condvar
-            .wait_timeout_while(guard, timeout, |_| !self.parked.load(Ordering::Acquire))
-            .expect("admission gate condvar");
-        assert!(
-            !result.timed_out(),
-            "timed out waiting for an admission to park at the reservation gate"
-        );
     }
 }
 
@@ -2375,15 +2509,27 @@ fn frame_backlog_cost(frame: &Outbound) -> usize {
 enum PublishJob {
     /// Map one already-prefolded stdout frame and emit its observations.
     /// Boxed: `Outbound` is ~1 KiB while the other jobs are tiny, and this job
-    /// already crosses the unbounded queue boundary.
-    Frame(Box<Outbound>),
+    /// already crosses the unbounded queue boundary. `charge` is the job's
+    /// owned backlog permits, released by Drop when the worker finishes the
+    /// job (or when a queued job is discarded on close/abort) — ma-sdk-state
+    /// r14 item 1 directive (b).
+    Frame {
+        frame: Box<Outbound>,
+        #[allow(dead_code)] // held, released on Drop
+        charge: BacklogCharge,
+    },
     /// A turn's publication ticket, enqueued by the send task BEFORE its prompt
     /// write. It occupies the turn's exact FIFO position: the worker parks here
     /// until the write resolves, then on commit clears the mapper reservation
     /// and emits `turn_started` AT THIS POSITION (no-op start on cancel). Every
     /// frame enqueued after it — including the turn's own result — is therefore
-    /// published behind its start.
-    Reserve { reservation: Arc<TurnReservation> },
+    /// published behind its start. Its reservation charge rides the same way a
+    /// frame's does and is held until the ticket is fully handled.
+    Reserve {
+        reservation: Arc<TurnReservation>,
+        #[allow(dead_code)] // held, released on Drop
+        charge: BacklogCharge,
+    },
     /// The child's stdout closed; emit exactly one `exited` (deduped).
     StdoutEof,
     /// Ordered publication fence (ma-sdk-state r9 item 4): when the single worker
@@ -2545,43 +2691,6 @@ async fn rollback_without_ticket(inner: &Arc<Inner>, seq: u64) {
     }
     #[cfg(feature = "test-stub")]
     test_barrier::note_rollback_without_ticket_done(&inner.barrier);
-}
-
-/// Owns the provisional backlog charge of one reservation between its
-/// reservation under the caps (before the book entry opens) and the successful
-/// queueing of its Reserve ticket (ma-sdk-state r13 item 2). Defused once the
-/// ticket is queued — from then on the publication worker releases the charge
-/// when the Reserve job drains. Any other exit (closed/overflow check passed but
-/// the ticket send failed, or the caller aborted while parked on the mapper
-/// lock) drops this guard and gives the charge straight back, so a reservation
-/// that never queued cannot occupy backlog.
-struct ReservationChargeGuard {
-    inner: Arc<Inner>,
-    defused: bool,
-}
-
-impl ReservationChargeGuard {
-    fn new(inner: Arc<Inner>) -> Self {
-        Self {
-            inner,
-            defused: false,
-        }
-    }
-
-    /// The ticket is queued; its charge now belongs to the worker's release.
-    fn defuse(mut self) {
-        self.defused = true;
-    }
-}
-
-impl Drop for ReservationChargeGuard {
-    fn drop(&mut self) {
-        if !self.defused {
-            self.inner
-                .backlog
-                .release_charge(1, RESERVATION_BACKLOG_COST);
-        }
-    }
 }
 
 /// Owns one turn's [`TurnReservation`] for the lifetime of a prompt write
@@ -2809,6 +2918,19 @@ pub mod test_barrier {
         rollback_parked: AtomicBool,
         rollback_gate_open: AtomicBool,
         rollback_gate: tokio::sync::Notify,
+        /// ma-sdk-state r14 item 1: number of ordinary emissions that found the
+        /// observation channel at zero capacity and are parking for a consumer
+        /// slot — the acknowledged saturation point (replaces sleep-polling the
+        /// channel capacity).
+        emit_waiting_count: AtomicUsize,
+        /// ma-sdk-state r14 item 1: the worker has fully handled a charged job
+        /// but its owned permits are still held (the pre-release gate is
+        /// shut). A regression parks the publisher here across close and
+        /// relaunch to prove the release lands on the DEAD launch's budget
+        /// only.
+        charge_release_parked: AtomicBool,
+        charge_release_open: AtomicBool,
+        charge_release_gate: tokio::sync::Notify,
     }
 
     /// An armed write-commit barrier. Releases on drop.
@@ -2856,6 +2978,10 @@ pub mod test_barrier {
             rollback_parked: AtomicBool::new(false),
             rollback_gate_open: AtomicBool::new(true),
             rollback_gate: tokio::sync::Notify::new(),
+            emit_waiting_count: AtomicUsize::new(0),
+            charge_release_parked: AtomicBool::new(false),
+            charge_release_open: AtomicBool::new(true),
+            charge_release_gate: tokio::sync::Notify::new(),
         });
         *slot.lock().expect("barrier lock") = Some(state.clone());
         WriteCommitBarrier { state }
@@ -3038,6 +3164,36 @@ pub mod test_barrier {
             state.overflow_kill_waiting.store(true, Ordering::Release);
             state.state_changed.notify_waiters();
         }
+    }
+
+    /// ma-sdk-state r14 item 1 hook: an ordinary emission found the observation
+    /// channel saturated and is about to park for consumer capacity.
+    pub(super) fn note_emit_waiting(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state.emit_waiting_count.fetch_add(1, Ordering::AcqRel);
+            state.state_changed.notify_waiters();
+        }
+    }
+
+    /// ma-sdk-state r14 item 1 worker gate: the job is fully handled but its
+    /// owned backlog permits are still held. Open by default; a regression
+    /// shuts it BEFORE close so the publisher is parked mid-release while the
+    /// driver relaunches (the charge must then release onto the dead launch's
+    /// budget alone).
+    pub(super) async fn hold_before_charge_release(slot: &Slot) {
+        let Some(state) = current(slot) else {
+            return;
+        };
+        state.charge_release_parked.store(true, Ordering::Release);
+        state.state_changed.notify_waiters();
+        if state.charge_release_open.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = state.charge_release_gate.notified();
+        if state.charge_release_open.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
     }
 
     /// r11 item 3 hook: fail_without_ticket reached its rollback and is about
@@ -3321,6 +3477,64 @@ pub mod test_barrier {
             .await;
         }
 
+        /// ma-sdk-state r14 item 1: wait until `n` ordinary emissions found the
+        /// observation channel saturated and parked for consumer capacity.
+        pub async fn wait_until_emit_waiting(&self, n: usize, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.emit_waiting_count.load(Ordering::Acquire) >= n,
+                || {
+                    format!(
+                        "write_commit barrier: timed out waiting for {n} saturated emissions \
+                         (waiting={})",
+                        self.state.emit_waiting_count.load(Ordering::Acquire)
+                    )
+                },
+            )
+            .await;
+        }
+
+        /// ma-sdk-state r14 item 1: SHUT the worker's pre-charge-release gate so
+        /// the publisher parks after fully handling a charged job while still
+        /// holding its permits. Used to park a publisher across close/relaunch.
+        pub fn hold_charge_release(&self) {
+            self.state
+                .charge_release_parked
+                .store(false, Ordering::Release);
+            self.state
+                .charge_release_open
+                .store(false, Ordering::Release);
+        }
+
+        /// Release the pre-charge-release gate.
+        pub fn release_charge_release(&self) {
+            if !self.state.charge_release_open.swap(true, Ordering::AcqRel) {
+                self.state.charge_release_gate.notify_waiters();
+            }
+        }
+
+        /// Wait until the worker has handled a charged job and is parked at the
+        /// shut pre-release gate with its permits still held.
+        pub async fn wait_until_charge_release_parked(&self, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| {
+                    state.charge_release_parked.load(Ordering::Acquire)
+                        && !state.charge_release_open.load(Ordering::Acquire)
+                },
+                || {
+                    "write_commit barrier: timed out waiting for the publisher to park before \
+                     releasing its backlog charge"
+                        .to_owned()
+                },
+            )
+            .await;
+        }
+
         /// r11 item 4(a): wait until the READER has enqueued `n` Result frames
         /// (behind the parked/held tickets), so a natural EOF provoked after
         /// this is provably queued behind those results, not ahead of them.
@@ -3558,6 +3772,7 @@ pub mod test_barrier {
             self.resume_worker();
             self.release_cancelled_ticket();
             self.release_rollback_without_ticket();
+            self.release_charge_release();
         }
     }
 
@@ -3574,21 +3789,15 @@ pub mod test_barrier {
 /// Single drainer of [`Inner::publish`]: map + emit strictly in enqueue order.
 async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<PublishJob>) {
     while let Some(job) = rx.recv().await {
-        // r12 item 1: a frame's backlog charge is held until it has been
-        // fully handled (mapped AND its observations handed to the events
-        // channel); a worker parked on a full events channel keeps the frame
-        // counted, which is exactly the memory it is still holding.
-        // r13 item 2: a Reserve ticket's fixed charge is held the same way
-        // until the ticket is fully handled (start emitted, or cancelled and
-        // rolled back at its position), so queued tickets stay counted while
-        // the worker is wedged ahead of them.
-        let frame_charge = match &job {
-            PublishJob::Frame(frame) => Some(frame_backlog_cost(frame)),
-            PublishJob::Reserve { .. } => Some(RESERVATION_BACKLOG_COST),
-            _ => None,
-        };
+        // ma-sdk-state r14 item 1 directive (b): the job's owned permits are
+        // its whole accounting. Hold them in `held_charge` until the job is
+        // fully handled (mapped + emitted, or its ticket resolved) and the
+        // pre-release test gate has passed; dropping them releases the charge
+        // exactly once — also when this worker is aborted with jobs queued.
+        let mut held_charge: Option<BacklogCharge> = None;
         let result = match job {
-            PublishJob::Frame(frame) => {
+            PublishJob::Frame { frame, charge } => {
+                held_charge = Some(charge);
                 async {
                     // r12 item 1: when the backlog overflow shutdown already
                     // delivered the terminal observation directly (the worker
@@ -3626,7 +3835,11 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                 }
                 .await
             }
-            PublishJob::Reserve { reservation } => {
+            PublishJob::Reserve {
+                reservation,
+                charge,
+            } => {
+                held_charge = Some(charge);
                 async {
                     // test-stub only: the worker has reached the turn's ticket
                     // and is about to park on the not-yet-committed write.
@@ -3712,9 +3925,15 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
         if let Err(error) = result {
             warn!("ordered publication failed: {error}");
         }
-        if let Some(charge) = frame_charge {
-            inner.backlog.release_frame(charge);
+        // Test gate (open by default): the job is fully handled but its charge
+        // is still HELD. A regression shuts this before close so the publisher
+        // is provably mid-release across the relaunch; the charge that then
+        // drops must come off the DEAD launch's budget alone.
+        #[cfg(feature = "test-stub")]
+        if held_charge.is_some() {
+            test_barrier::hold_before_charge_release(&inner.barrier).await;
         }
+        drop(held_charge);
     }
 }
 
@@ -3919,37 +4138,43 @@ async fn send_control(
 }
 
 async fn emit_all(inner: &Inner, observations: Vec<Observation>) -> DriverResult<()> {
-    let tx = inner.events.lock().await.clone();
-    let Some(tx) = tx else {
-        return Ok(());
-    };
-    // r13 item 4: shutdown-aware ordinary emission. The terminal goes out
-    // through its RESERVED permit without waiting for consumer capacity; if
-    // that happens while a send here is parked on the full events channel, the
-    // parked send must be CANCELLED — completing it once the consumer frees a
-    // slot would enqueue it AFTER the terminal (the permit occupies the last
-    // slot, the ordinary send takes the next freed one). Explicit policy:
-    // abandon the in-flight and every remaining ordinary observation; nothing
-    // queued AHEAD of the terminal is touched (it is already in the channel).
-    let mut terminal_seal = inner.terminal_direct.subscribe();
     for observation in observations {
-        if *terminal_seal.borrow() || inner.exit_emitted.load(Ordering::Acquire) {
-            break;
-        }
-        tokio::select! {
-            biased;
-            recv = terminal_seal.changed() => {
-                // The sender lives for the whole driver; an Err here only means
-                // it is gone, which is itself a shutdown — stop either way.
-                let _ = recv;
-                break;
+        // ma-sdk-state r14 item 1 directive (d): reserve channel capacity
+        // OUTSIDE the emission mutex — this is the await that can park on a
+        // full consumer and must never hold the seal lock — then take the
+        // mutex and recheck the terminal seal before filling the reserved
+        // slot. The terminal is sealed and sent under the SAME mutex through
+        // its own reserved slot, so an ordinary observation can never land
+        // after it, even with the worker and the overflow shutdown sending on
+        // parallel OS threads.
+        let tx = {
+            let emission = inner.emission.lock().await;
+            if emission.terminal_sent {
+                return Ok(());
             }
-            result = tx.send(observation) => {
-                if result.is_err() {
-                    break;
-                }
+            match emission.tx.clone() {
+                Some(tx) => tx,
+                None => return Ok(()),
             }
+        };
+        #[cfg(feature = "test-stub")]
+        if tx.capacity() == 0 {
+            // The NEXT await parks for consumer capacity; record the worker at
+            // the saturation point so regressions acknowledge it instead of
+            // polling channel capacity on a timer.
+            test_barrier::note_emit_waiting(&inner.barrier);
         }
+        let Ok(permit) = tx.reserve_owned().await else {
+            return Ok(());
+        };
+        let emission = inner.emission.lock().await;
+        if emission.terminal_sent || emission.tx.is_none() {
+            // The terminal won while the reservation parked: abandon the slot.
+            drop(permit);
+            drop(emission);
+            return Ok(());
+        }
+        permit.send(observation);
     }
     Ok(())
 }
@@ -3990,20 +4215,36 @@ async fn emit_exit(inner: &Inner, status: &str) -> DriverResult<()> {
 /// related ids) is the process-end classifier's exact Failed token for a
 /// `session` lifecycle, so Node/Hub end the instance on it, and the reason is
 /// machine-readable on the journaled event.
-async fn emit_overflow_exit(inner: &Inner, items: usize, bytes: usize) -> DriverResult<()> {
-    let limit_items = inner.backlog.limit_items.load(Ordering::Acquire);
-    let limit_bytes = inner.backlog.limit_bytes.load(Ordering::Acquire);
+async fn emit_overflow_exit(
+    inner: &Inner,
+    budget: &BacklogBudget,
+    items: usize,
+    bytes: usize,
+) -> DriverResult<()> {
+    let (limit_items, limit_bytes) = budget.caps();
     emit_terminal(inner, move |mapper| {
         mapper.session_backlog_overflow_observation(items, bytes, limit_items, limit_bytes)
     })
     .await
 }
 
-/// Build and deliver the single per-launch terminal observation: exactly-once
-/// guard, reserved permit taken BEFORE the fallible build (a build failure
-/// drops the permit and frees the slot), permit delivery first with ordinary
-/// emission as fallback. Used by natural/close exits and the r12 backlog
-/// overflow shutdown.
+/// Build and deliver the single per-launch terminal observation (ma-sdk-state
+/// r14 item 1, directive (d)).
+///
+/// Ordering is a single emission mutex:
+/// 1. the exactly-once guard (`exit_emitted`);
+/// 2. the reserved terminal permit is taken BEFORE the fallible build, so a
+///    build failure drops it and frees the slot (r6 item 4);
+/// 3. under the emission mutex the terminal seal is set FIRST and the reserved
+///    permit is filled SYNCHRONOUSLY while the mutex is held — the slot is
+///    already reserved so this never waits for consumer capacity.
+///
+/// An ordinary sender that reserved a slot while parked on a full consumer
+/// must take the same mutex and rechecks the seal before its `permit.send`, so
+/// it drops that slot: nothing ordinary can follow the terminal, and every
+/// observation already queued ahead of it is preserved. The rare fallback (no
+/// reserved permit) seals first and then waits for one ordinary slot; the seal
+/// still excludes every other ordinary sender.
 async fn emit_terminal(
     inner: &Inner,
     build: impl FnOnce(&mut Mapper) -> DriverResult<Observation>,
@@ -4012,26 +4253,41 @@ async fn emit_terminal(
         return Ok(());
     }
     let permit = inner.exit_permit.lock().await.take();
+    // Build BEFORE sealing: a build error must leave the seal unset and drop
+    // the just-taken permit, exactly as the r6 item 4 fault contract requires.
     let observation = {
         let mut mapper = inner.mapper.lock().await;
         build(&mut mapper)?
     };
-    // Deliver on the reserved terminal slot first. The permit occupies a
-    // position in the SAME bounded channel behind every observation already
-    // queued, so FIFO order is preserved even though the publication worker may
-    // be blocked or aborted by close. Fall back to the ordinary sender only if
-    // the permit is gone.
+    let mut emission = inner.emission.lock().await;
+    if emission.terminal_sent {
+        // Defensive: another terminal path won the mutex even though
+        // exit_emitted should already have stopped it.
+        return Ok(());
+    }
+    emission.terminal_sent = true;
     if let Some(permit) = permit {
-        // r13 item 4: seal ordinary emission BEFORE the terminal enters the
-        // channel. A worker parked in emit_all on a full channel cancels its
-        // in-flight send when this lands, so no ordinary observation can be
-        // completed into the next freed slot AFTER this terminal. Everything
-        // already queued ahead of it is untouched and preserved.
-        inner.terminal_direct.send_replace(true);
+        // Reserved slot: synchronous delivery, ordered behind everything
+        // already queued, impossible to overtake or be overtaken by an
+        // ordinary sender under the same mutex.
         permit.send(observation);
         return Ok(());
     }
-    emit_all(inner, vec![observation]).await
+    // No reserved permit: seal is already set, so every ordinary sender stops;
+    // wait for one slot for the terminal itself and send it through the sealed
+    // path.
+    let Some(tx) = emission.tx.clone() else {
+        return Ok(());
+    };
+    drop(emission);
+    if let Ok(slot) = tx.reserve_owned().await {
+        let emission = inner.emission.lock().await;
+        if emission.tx.is_some() {
+            slot.send(observation);
+        }
+        drop(emission);
+    }
+    Ok(())
 }
 
 fn map_outbound(mapper: &mut Mapper, frame: &Outbound) -> DriverResult<Vec<Observation>> {
@@ -7541,166 +7797,226 @@ mod turn_book_reserved_seq_tests {
     }
 }
 
-/// ma-sdk-state r13 item 1: backlog accounting under controlled concurrent
-/// admission and release.
+/// ma-sdk-state r14 item 1: the per-launch owned-permit backlog accounting
+/// under controlled admission/release, cap breach, concurrent drain, and
+/// cross-launch isolation.
 #[cfg(test)]
 mod backlog_accounting_tests {
     use super::*;
     use std::sync::Arc;
-    use std::time::Duration;
-
-    fn frame_job() -> PublishJob {
-        // KeepAlive is the smallest serializable outbound; every job in the
-        // test carries the same charge, so byte accounting is checked exactly.
-        PublishJob::Frame(Box::new(Outbound::KeepAlive))
-    }
 
     /// [`PublishJob`] does not implement `Debug`; assert admission without it.
     fn admit(queue: &PublishQueue, what: &str) {
-        match queue.admit_frame(frame_job()) {
+        match queue.admit_frame(Box::new(Outbound::KeepAlive)) {
             Ok(()) => {}
             Err(_) => panic!("{what} must be admitted"),
         }
     }
 
-    /// Opens the admission gate on drop, so a failing assertion mid-schedule
-    /// never strands the parked admission on the blocking thread pool.
-    struct OpenGateOnDrop<'a> {
-        gate: &'a AdmissionGate,
+    fn budget(cap_items: usize, cap_bytes: usize) -> Arc<BacklogBudget> {
+        BacklogBudget::new(cap_items, cap_bytes)
     }
 
-    impl Drop for OpenGateOnDrop<'_> {
-        fn drop(&mut self) {
-            self.gate.open();
-        }
-    }
+    /// Directive (b): every exit path releases by Drop — a queued job drained,
+    /// a job discarded while queued (worker aborted, receiver dropped), and a
+    /// charge the caller never queued all return their permits exactly once, so
+    /// occupancy settles at exactly zero and the next admission succeeds
+    /// instead of tripping a false overflow.
+    #[test]
+    fn dropped_jobs_release_their_charge_on_every_exit_path() {
+        const CAP: usize = 2;
+        let b = budget(CAP, 1024 * 1024 * 1024);
+        let (queue, mut rx) = PublishQueue::new(Arc::clone(&b));
+        let cost = frame_backlog_cost(&Outbound::KeepAlive);
 
-    /// r13 item 1: an admission that reserved its charge must not overwrite a
-    /// worker release landing while it is admitting. The schedule is forced
-    /// through the test admission gate (charge reserved → job invisible →
-    /// release lands → admission completes): occupancy settles back to exactly
-    /// zero once every job is released, and a third admission is not a false
-    /// overflow.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn admission_racing_release_leaves_zero_occupancy_and_no_false_overflow() {
-        const CAP_ITEMS: usize = 2;
-        let metrics = Arc::new(BacklogMetrics::new());
-        metrics.limit_items.store(CAP_ITEMS, Ordering::Release);
-        metrics
-            .limit_bytes
-            .store(1024 * 1024 * 1024, Ordering::Release);
-        let (queue, mut rx) = PublishQueue::new(Arc::clone(&metrics));
-        let frame_cost = frame_backlog_cost(&Outbound::KeepAlive);
-
-        // A is admitted with the gate open: one charge live.
         admit(&queue, "A");
-        assert_eq!(metrics.items.load(Ordering::Acquire), 1);
+        admit(&queue, "B");
+        assert_eq!(b.occupied(), (2, 2 * cost), "A and B charged");
 
-        // Shut the gate: B parks AFTER reserving its charge and BEFORE its job
-        // is sent. Run it on a blocking thread — the rendezvous is synchronous.
-        // The drop guard opens the gate even if an assertion below fails, so
-        // the parked admission never wedges the blocking pool.
-        let _gate_open_on_drop = OpenGateOnDrop {
-            gate: &queue.admission_gate,
-        };
-        queue.admission_gate.shut();
-        let gate_for_b = Arc::clone(&queue.admission_gate);
-        let queue_for_b = queue.clone();
-        let b = tokio::task::spawn_blocking(move || {
-            // B must reach its park before the test releases anything.
-            gate_for_b.wait_until_parked(Duration::from_secs(10));
-        });
-        let admit_b = tokio::task::spawn_blocking(move || queue_for_b.admit_frame(frame_job()));
-        b.await.expect("B parked at the reservation gate");
-        assert_eq!(
-            metrics.items.load(Ordering::Acquire),
-            2,
-            "B's charge is reserved while B is parked"
-        );
+        // The worker drains A (takes the job and drops it after handling).
+        let job_a = rx.try_recv().expect("A visible");
+        assert!(matches!(job_a, PublishJob::Frame { .. }));
+        drop(job_a);
+        assert_eq!(b.occupied(), (1, cost), "A released by Drop");
 
-        // The worker releases A WHILE B holds its reservation: the exact
-        // read-then-store hazard. Atomic sub moves occupancy 2 -> 1.
-        metrics.release_frame(frame_cost);
-        assert_eq!(metrics.items.load(Ordering::Acquire), 1);
-        assert_eq!(
-            metrics.bytes.load(Ordering::Acquire),
-            frame_cost,
-            "only B's byte charge remains"
-        );
-
-        // Let B finish: its charge was already reserved, so occupancy is
-        // unchanged by completing it.
-        queue.admission_gate.open();
-        match admit_b.await.expect("the admission thread") {
-            Ok(()) => {}
-            Err(_) => panic!("B must be admitted after the gate opens"),
-        }
-        assert_eq!(metrics.items.load(Ordering::Acquire), 1);
-
-        // Real occupancy is one (B): C must be admitted. A stale store from B
-        // would have reported two and refused C as a false overflow.
+        // Real occupancy is one: C is admitted — no false overflow.
         admit(&queue, "C");
-        assert_eq!(metrics.items.load(Ordering::Acquire), 2);
+        assert_eq!(b.occupied(), (2, 2 * cost), "B + C charged");
 
-        // The consumer saw exactly the three jobs in admission order. A's
-        // charge was already released (the racing release above), so draining
-        // releases only B and C.
-        let mut seen = 0usize;
-        while let Ok(job) = rx.try_recv() {
-            match job {
-                PublishJob::Frame(_) => {
-                    seen += 1;
-                    if seen >= 2 {
-                        metrics.release_frame(frame_cost);
+        // close aborts the worker with B and C still queued: dropping the
+        // receiver drops the buffered jobs, and their permits return.
+        drop(rx);
+        assert_eq!(b.occupied(), (0, 0), "queued residue releases on teardown");
+
+        // The next admission succeeds on the same (drained) budget.
+        let charge = b
+            .acquire(cost)
+            .expect("a fresh admission succeeds once occupancy returned to zero");
+        assert_eq!(b.occupied(), (1, cost));
+        drop(charge);
+        assert_eq!(b.occupied(), (0, 0));
+        assert!(!b.overflowed.load(Ordering::Acquire));
+        assert!(b.snapshot().items_high <= CAP);
+        assert!(b.snapshot().bytes_high <= 2 * cost);
+    }
+
+    /// Controlled concurrent admission and drain on a multi-thread runtime:
+    /// admitting threads and a dropping consumer run truly in parallel, and
+    /// once every job is drained occupancy is exactly zero with no false
+    /// overflow and high-water marks inside the caps (directive (b): permit
+    /// add/drop is the only accounting movement, so it cannot race itself).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_admissions_and_drains_settle_at_exactly_zero() {
+        const CAP: usize = 16;
+        const ADMITTERS: usize = 8;
+        const PER_ADMITTER: usize = 200;
+        const TOTAL: usize = ADMITTERS * PER_ADMITTER;
+
+        let b = budget(CAP, 1024 * 1024 * 1024);
+        let (queue, rx) = PublishQueue::new(Arc::clone(&b));
+
+        let drainer = tokio::task::spawn_blocking(move || {
+            let mut rx = rx;
+            let mut seen = 0usize;
+            while seen < TOTAL {
+                match rx.blocking_recv() {
+                    Some(job) => {
+                        assert!(matches!(job, PublishJob::Frame { .. }));
+                        seen += 1;
+                        drop(job);
+                    }
+                    None => panic!("the queue closed with only {seen}/{TOTAL} jobs drained"),
+                }
+            }
+            seen
+        });
+
+        let mut admitters = Vec::new();
+        for _ in 0..ADMITTERS {
+            let q = queue.clone();
+            admitters.push(tokio::task::spawn_blocking(move || {
+                let mut accepted = 0usize;
+                while accepted < PER_ADMITTER {
+                    match q.admit_frame(Box::new(Outbound::KeepAlive)) {
+                        Ok(()) => accepted += 1,
+                        // Caps momentarily full while the drainer is behind:
+                        // yield and retry — this is admission contention, not a
+                        // shutdown (no overflow latch fires in this test).
+                        Err((BacklogAdmitError::Overflow { .. }, _)) => {
+                            std::thread::yield_now();
+                        }
+                        Err((kind, _)) => panic!("unexpected admission refusal: {kind:?}"),
                     }
                 }
-                _ => panic!("the test queue contains frame jobs only"),
-            }
+                accepted
+            }));
         }
-        assert_eq!(seen, 3, "A, B and C are all visible, exactly once");
+        for handle in admitters {
+            let n = tokio::time::timeout(Duration::from_secs(30), handle)
+                .await
+                .expect("admitter bound")
+                .expect("admitter thread");
+            assert_eq!(n, PER_ADMITTER);
+        }
+        drop(queue);
+        let seen = tokio::time::timeout(Duration::from_secs(30), drainer)
+            .await
+            .expect("drainer bound")
+            .expect("drainer thread");
+        assert_eq!(seen, TOTAL);
         assert_eq!(
-            metrics.items.load(Ordering::Acquire),
-            0,
-            "occupancy returns to exactly zero, no phantom charge remains"
+            b.occupied(),
+            (0, 0),
+            "concurrent drain leaves exactly zero occupancy"
         );
+        assert!(!b.overflowed.load(Ordering::Acquire));
+        let snapshot = b.snapshot();
+        assert!(
+            snapshot.items_high <= CAP,
+            "items high-water stays inside the cap"
+        );
+        // One more admission succeeds on the drained budget.
+        let charge = b
+            .acquire(frame_backlog_cost(&Outbound::KeepAlive))
+            .expect("the drained budget admits again");
+        drop(charge);
+        assert_eq!(b.occupied(), (0, 0));
+    }
+
+    /// Directive (a): a launch-A charge released AFTER launch B's budget exists
+    /// can touch only A's semaphores. The budgets are independent objects — the
+    /// relaunch regression asserts the same property through the driver.
+    #[test]
+    fn a_launch_a_charge_cannot_touch_launch_b_budget() {
+        let budget_a = budget(4, 1024 * 1024 * 1024);
+        let (queue_a, mut rx_a) = PublishQueue::new(Arc::clone(&budget_a));
+        admit(&queue_a, "A");
+        let job_a = rx_a.try_recv().expect("A visible");
+        // Simulate the publisher still holding A's charge while the driver
+        // relaunches: B is constructed FRESH with A's job still in flight.
+        let budget_b = budget(4, 1024 * 1024 * 1024);
+        let (queue_b, _rx_b) = PublishQueue::new(Arc::clone(&budget_b));
+        assert_ne!(
+            budget_a.id(),
+            budget_b.id(),
+            "each launch gets a fresh budget"
+        );
+        assert_eq!(budget_b.occupied(), (0, 0), "B starts unencumbered");
+        let b_cost = frame_backlog_cost(&Outbound::KeepAlive);
+        admit(&queue_b, "B");
+        assert_eq!(budget_b.occupied(), (1, b_cost), "B admits its own job");
+
+        // A's publisher now releases its in-flight charge (an aborted task's
+        // Drop). It lands on A's dead semaphore only.
+        drop(job_a);
+        assert_eq!(budget_a.occupied(), (0, 0), "A returned to zero");
         assert_eq!(
-            metrics.bytes.load(Ordering::Acquire),
-            0,
-            "byte occupancy returns to exactly zero"
-        );
-        assert!(
-            !metrics.overflowed.load(Ordering::Acquire),
-            "no overflow fired for a race, only for a real cap breach"
-        );
-        assert!(
-            metrics.items_high.load(Ordering::Acquire) <= CAP_ITEMS,
-            "the item high-water mark never crosses the cap"
+            budget_b.occupied(),
+            (1, b_cost),
+            "launch B's budget is untouched by launch A's release"
         );
     }
 
-    /// A genuine cap breach is still refused and its provisional charge is
-    /// rolled back so the counters never sit above the cap.
+    /// A genuine item-cap breach is refused, names the overflow, and leaves no
+    /// charge behind: the refused frame is returned to the caller with no
+    /// permits attached.
     #[test]
-    fn a_frame_past_the_cap_is_refused_and_its_charge_returned() {
-        let metrics = Arc::new(BacklogMetrics::new());
-        metrics.limit_items.store(1, Ordering::Release);
-        metrics
-            .limit_bytes
-            .store(1024 * 1024 * 1024, Ordering::Release);
-        let (queue, _rx) = PublishQueue::new(Arc::clone(&metrics));
+    fn a_frame_past_the_item_cap_is_refused_without_holding_a_charge() {
+        let b = budget(1, 1024 * 1024 * 1024);
+        let (queue, _rx) = PublishQueue::new(Arc::clone(&b));
         admit(&queue, "the one frame");
-        let Err((kind, _returned)) = queue.admit_frame(frame_job()) else {
+        let Err((kind, returned)) = queue.admit_frame(Box::new(Outbound::KeepAlive)) else {
             panic!("the second frame must be refused");
         };
         assert!(
             matches!(kind, BacklogAdmitError::Overflow { .. }),
             "refusal names the overflow, not closure: {kind:?}"
         );
-        assert_eq!(
-            metrics.items.load(Ordering::Acquire),
-            1,
-            "the refused reservation is rolled back"
+        // The refused frame comes back uncharged and dropping it changes
+        // nothing.
+        drop(returned);
+        assert_eq!(b.occupied().0, 1, "the refusal reserved nothing");
+        assert!(
+            !b.overflowed.load(Ordering::Acquire),
+            "the latch is the spawner's job"
         );
-        assert!(!metrics.overflowed.load(Ordering::Acquire));
+    }
+
+    /// A byte-cap breach is refused the same way and carries the frame's exact
+    /// byte cost in the diagnostic.
+    #[test]
+    fn a_frame_past_the_byte_cap_is_refused_with_its_cost() {
+        let cost = frame_backlog_cost(&Outbound::KeepAlive);
+        let b = budget(16, cost); // one frame fits, a second does not
+        let (queue, _rx) = PublishQueue::new(Arc::clone(&b));
+        admit(&queue, "the one frame");
+        let Err((kind, _returned)) = queue.admit_frame(Box::new(Outbound::KeepAlive)) else {
+            panic!("the second frame must exceed the byte cap");
+        };
+        match kind {
+            BacklogAdmitError::Overflow { frame_bytes, .. } => assert_eq!(frame_bytes, cost),
+            other => panic!("expected overflow, got {other:?}"),
+        }
+        assert_eq!(b.occupied(), (1, cost));
     }
 }

@@ -206,6 +206,14 @@ impl ClaudeSdkDriver {
     pub fn publication_backlog_for_test(&self) -> crate::claude_print::BacklogSnapshot {
         self.inner.publication_backlog_for_test()
     }
+
+    /// Test-only (`test-stub`, r14 item 1): identity of the active launch's
+    /// backlog budget; a relaunch must show a fresh id.
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub fn active_backlog_id_for_test(&self) -> usize {
+        self.inner.active_backlog_id_for_test()
+    }
 }
 
 #[async_trait]

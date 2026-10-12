@@ -116,6 +116,15 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
     // kill and is reaped only by the group signal.
     #[cfg(unix)]
     let _grandchild = spawn_group_grandchild();
+    // `FAKE_CLAUDE_SPARE_FRAME_TRIGGER=<path>` (ma-sdk-state r15 item 4):
+    // arm a background watcher that, once the trigger file appears (always
+    // after the handshake in practice — tests create it post-overflow),
+    // emits exactly ONE assistant frame on stdout. Lets a test make the child
+    // speak again after a reservation-triggered overflow has paused its
+    // shutdown.
+    if let Ok(path) = std::env::var("FAKE_CLAUDE_SPARE_FRAME_TRIGGER") {
+        spawn_spare_frame_trigger(path);
+    }
     let session_id = flags
         .session_id
         .clone()
@@ -566,6 +575,35 @@ fn record_stdin_marker(path: &str, incoming: &Value) {
         let _ = writeln!(file, "{marker}");
         let _ = file.sync_all();
     }
+}
+
+/// Wait for a trigger file and emit ONE assistant frame (r15 item 4 fixture).
+///
+/// Fixture-side polling is bounded by a 60 s deadline; this runs in the fake
+/// peer process, not in a test task. A single `writeln!` under the stdout lock
+/// delivers the frame in one write.
+fn spawn_spare_frame_trigger(path: String) {
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            if std::path::Path::new(&path).exists() {
+                let frame = json!({
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg_r15_4_spare",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "text", "text": "spare frame after the overflow" }]
+                    }
+                });
+                let mut stdout = io::stdout().lock();
+                let _ = writeln!(stdout, "{frame}");
+                let _ = stdout.flush();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
 }
 
 /// Emit valid stream-json frames forever without touching stdin again. The

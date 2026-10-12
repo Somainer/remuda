@@ -2145,11 +2145,21 @@ async fn map_loop(
     publisher: PublishQueue,
     carrier: &'static str,
 ) {
-    // Set when frame admission tripped the backlog cap: the loop breaks after
-    // SPAWNING the overflow shutdown (the terminal observation is delivered by
-    // that detached task, never through the full queue); only natural EOF then
-    // takes the seal branch.
-    let mut tripped = false;
+    // The loop exits three ways:
+    // * `recv()` returns None — the CHILD's stdout reached EOF. That is the
+    //   ONLY case that seals reservation admission and enqueues StdoutEof.
+    // * frame admission refuses with Overflow — spawn the overflow shutdown
+    //   and stop: its task owns the terminal.
+    // * frame admission refuses with Closed — the overflow latch already
+    //   tripped elsewhere (e.g. a reservation breach, possibly with its
+    //   shutdown still in progress) or close dropped the receiver. This is
+    //   NOT child EOF: enqueuing a StdoutEof here (the r15 item 4 defect)
+    //   let the worker emit the ordinary exit and suppress the overflow
+    //   terminal. Neither close nor a paused-but-alive overflow shutdown may
+    //   get a false EOF, so just stop and leave the terminal to its owner.
+    // Set when the loop stopped on a frame ADMISSION refusal (Overflow or
+    // Closed): the child did not close its stdout, so no StdoutEof.
+    let mut refused = false;
     while let Some(frame) = outbound.recv().await {
         if matches!(frame, Outbound::KeepAlive) {
             continue;
@@ -2184,7 +2194,6 @@ async fn map_loop(
         test_barrier::hold_result_enqueue(&inner.barrier, &frame).await;
         match publisher.admit_frame(Box::new(frame)) {
             Ok(()) => {}
-            Err((BacklogAdmitError::Closed, _)) => break,
             Err((
                 BacklogAdmitError::Overflow {
                     items,
@@ -2211,7 +2220,24 @@ async fn map_loop(
                     frame_bytes,
                     carrier,
                 );
-                tripped = true;
+                // The spawned shutdown owns the terminal: do NOT fall through
+                // to the stdout-EOF seal.
+                #[cfg(feature = "test-stub")]
+                test_barrier::note_overflow_frame_refused(&inner.barrier);
+                refused = true;
+                break;
+            }
+            Err((BacklogAdmitError::Closed, _)) => {
+                // Overflow already tripped at another admission site (its
+                // shutdown — possibly paused at a test gate — owns the
+                // terminal; ma-sdk-state r15 item 4 used to make this the
+                // false-StdoutEof path after a RESERVATION breach) or close
+                // dropped the receiver (close owns it). This is NOT child
+                // stdout EOF: mark the refusal so the seal section below is
+                // skipped.
+                #[cfg(feature = "test-stub")]
+                test_barrier::note_closed_frame_refused(&inner.barrier);
+                refused = true;
                 break;
             }
         }
@@ -2220,18 +2246,19 @@ async fn map_loop(
             test_barrier::note_frame_enqueued(&inner.barrier);
         }
     }
-    if !tripped {
-        // Child stdout reached EOF. Seal reservation admission and enqueue the
-        // exit as ONE critical section under the publication mutex
-        // (ma-sdk-state r11 item 2): prepare_prompt_write holds that same mutex
-        // from its seal check through book creation and ticket insertion, so a
-        // reservation can never queue a Reserve ticket BEHIND this StdoutEof.
-        // Either the ticket (and therefore its start/write-failure rollback) is
-        // fully ahead of the EOF in publication order, or the reservation is
-        // rejected having opened nothing. The EOF is a CONTROL job: it bypasses
-        // the frame caps so a full backlog cannot delay the terminal seal.
-        // `closed` is set here, not only by explicit close: a prompt sent after
-        // the child's natural exit can never start a turn.
+    if !refused {
+        // recv() returned None: the CHILD's stdout reached EOF. Seal
+        // reservation admission and enqueue the exit as ONE critical section
+        // under the publication mutex (ma-sdk-state r11 item 2):
+        // prepare_prompt_write holds that same mutex from its seal check
+        // through book creation and ticket insertion, so a reservation can
+        // never queue a Reserve ticket BEHIND this StdoutEof. Either the
+        // ticket (and therefore its start/write-failure rollback) is fully
+        // ahead of the EOF in publication order, or the reservation is
+        // rejected having opened nothing. The EOF is a CONTROL job: it
+        // bypasses the frame caps so a full backlog cannot delay the terminal
+        // seal. `closed` is set here, not only by explicit close: a prompt
+        // sent after the child's natural exit can never start a turn.
         let gate = launch.publish.lock().await;
         launch.closed.store(true, Ordering::SeqCst);
         if let Some(publisher) = gate.as_ref() {
@@ -2240,6 +2267,12 @@ async fn map_loop(
         drop(gate);
         #[cfg(feature = "test-stub")]
         test_barrier::note_stdout_eof_queued(&inner.barrier);
+    } else {
+        // r15 item 4: the reader is stopping AFTER an admission refusal, with
+        // no StdoutEof queued. Fired here, after the seal section, so a test
+        // can enqueue a fence knowing no terminal job will jump its queue.
+        #[cfg(feature = "test-stub")]
+        test_barrier::note_reader_finished_after_refusal(&inner.barrier);
     }
 }
 
@@ -3138,6 +3171,22 @@ pub mod test_barrier {
         charge_release_parked: AtomicBool,
         charge_release_open: AtomicBool,
         charge_release_gate: tokio::sync::Notify,
+        /// ma-sdk-state r15 item 4: number of stdout FRAMES the reader refused
+        /// with `Closed` — admission already tripped (e.g. a reservation
+        /// breach) or the receiver was dropped — while the child's stdout is
+        /// still open. Acknowledges the "one more frame after the paused
+        /// reservation overflow" point WITHOUT a sleep; on this refusal the
+        /// reader must now stop WITHOUT enqueuing StdoutEof.
+        closed_frame_refusals: AtomicUsize,
+        /// ma-sdk-state r15 item 4: number of frames the reader refused with
+        /// `Overflow` (its own admission site tripped).
+        overflow_frame_refusals: AtomicUsize,
+        /// ma-sdk-state r15 item 4: the reader task FINISHED after a frame
+        /// admission refusal — set at map_loop's end, AFTER any (now
+        /// forbidden) StdoutEof enqueue, so a test can enqueue an
+        /// acknowledgement fence knowing the reader will no longer insert a
+        /// terminal job ahead of it.
+        reader_finished_after_refusal: AtomicBool,
     }
 
     /// An armed write-commit barrier. Releases on drop.
@@ -3192,6 +3241,9 @@ pub mod test_barrier {
             charge_release_parked: AtomicBool::new(false),
             charge_release_open: AtomicBool::new(true),
             charge_release_gate: tokio::sync::Notify::new(),
+            closed_frame_refusals: AtomicUsize::new(0),
+            overflow_frame_refusals: AtomicUsize::new(0),
+            reader_finished_after_refusal: AtomicBool::new(false),
         });
         *slot.lock().expect("barrier lock") = Some(state.clone());
         WriteCommitBarrier { state }
@@ -3362,6 +3414,35 @@ pub mod test_barrier {
     pub(super) fn note_backlog_overflow(slot: &Slot) {
         if let Some(state) = current(slot) {
             state.backlog_overflowed.store(true, Ordering::Release);
+            state.state_changed.notify_waiters();
+        }
+    }
+
+    /// r15 item 4 hook: the reader refused a stdout FRAME with `Closed`
+    /// (admission already tripped elsewhere or the receiver was dropped).
+    pub(super) fn note_closed_frame_refused(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state.closed_frame_refusals.fetch_add(1, Ordering::AcqRel);
+            state.state_changed.notify_waiters();
+        }
+    }
+
+    /// r15 item 4 hook: the reader refused a stdout FRAME with `Overflow` at
+    /// its own admission site.
+    pub(super) fn note_overflow_frame_refused(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state.overflow_frame_refusals.fetch_add(1, Ordering::AcqRel);
+            state.state_changed.notify_waiters();
+        }
+    }
+
+    /// r15 item 4 hook: the reader FINISHED after an admission refusal without
+    /// enqueuing StdoutEof (fires after the seal section was skipped).
+    pub(super) fn note_reader_finished_after_refusal(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state
+                .reader_finished_after_refusal
+                .store(true, Ordering::Release);
             state.state_changed.notify_waiters();
         }
     }
@@ -3687,6 +3768,41 @@ pub mod test_barrier {
                 deadline,
                 |state| state.backlog_overflowed.load(Ordering::Acquire),
                 || "write_commit barrier: timed out waiting for the publication                     backlog overflow".to_owned(),
+            )
+            .await;
+        }
+
+        /// r15 item 4: wait until the reader refuses `n` stdout frames with
+        /// `Closed` — a frame arrived AFTER admission tripped (or after close)
+        /// — WITHOUT enqueuing StdoutEof. The acknowledged point the false-EOF
+        /// regression parks at.
+        pub async fn wait_until_closed_frame_refusals(&self, n: usize, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            wait_until_with(
+                &self.state,
+                deadline,
+                move |state| state.closed_frame_refusals.load(Ordering::Acquire) >= n,
+                || {
+                    "write_commit barrier: timed out waiting for a closed-admission frame refusal"
+                        .to_owned()
+                },
+            )
+            .await;
+        }
+
+        /// r15 item 4: wait until the reader stops after a frame admission
+        /// refusal WITHOUT enqueuing a StdoutEof.
+        pub async fn wait_until_reader_finished_after_refusal(&self, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.reader_finished_after_refusal.load(Ordering::Acquire),
+                || {
+                    "write_commit barrier: timed out waiting for the reader to finish after the \
+                     frame admission refusal"
+                        .to_owned()
+                },
             )
             .await;
         }

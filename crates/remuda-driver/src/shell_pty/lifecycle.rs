@@ -377,12 +377,14 @@ pub async fn wait_child_exit(pid: i32, timeout: Duration) -> bool {
     join.await.unwrap_or_default()
 }
 
-/// What one bounded event wait ended on (ma-sdk-state r16 item 2).
+/// What one bounded event wait ended on (ma-sdk-state r16 item 2). The
+/// `Fired` payload carries the parsed event for the platform waiter (the
+/// Linux arm carries nothing; the macOS arm carries its [`KqueueEventRead`]).
 #[cfg(all(any(test, feature = "test-stub"), unix))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InterruptibleEventWait {
+enum InterruptibleEventWait<T> {
     /// The termination event fired.
-    Fired,
+    Fired(T),
     /// The single bound elapsed without an event.
     TimedOut,
 }
@@ -399,10 +401,10 @@ enum InterruptibleEventWait {
 /// source is level-triggered on Linux (a pidfd stays readable), so restarting
 /// the wait loses no event.
 #[cfg(all(any(test, feature = "test-stub"), unix))]
-fn wait_with_eintr_retry(
+fn wait_with_eintr_retry<T>(
     timeout: Duration,
-    mut wait_once: impl FnMut(Duration) -> std::io::Result<InterruptibleEventWait>,
-) -> std::io::Result<InterruptibleEventWait> {
+    mut wait_once: impl FnMut(Duration) -> std::io::Result<InterruptibleEventWait<T>>,
+) -> std::io::Result<InterruptibleEventWait<T>> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -414,6 +416,82 @@ fn wait_with_eintr_retry(
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         }
+    }
+}
+
+/// What one `kevent(2)` wait on the macOS/BSD arm ended on (ma-sdk-state
+/// r16 item 4), expressed without nix types so the decision below is
+/// unit-testable on EVERY unix target — the kqueue arm itself builds only off
+/// Linux and the coordinator runs it on a Mac.
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KqueueWaitOutcome {
+    /// The eventlist entry fired with NOTE_EXIT (no EV_ERROR).
+    NoteExit,
+    /// The returned entry carried EV_ERROR: the changelist registration
+    /// FAILED — this is NOT an exit (its payload is the errno, e.g. ESRCH for
+    /// a process that died in the registration window, EPERM when the pid is
+    /// not watchable). The old arm read every `Ok(1)` as an exit.
+    ChangeError(i32),
+    /// `kevent` returned 0: the bound elapsed with no event.
+    BoundElapsed,
+    /// The `kevent` syscall itself failed with an error other than EINTR
+    /// (EINTR never reaches here — the retry helper owns it).
+    WaitFailed,
+}
+
+/// The pre-arm move of the macOS child-exit wait (ma-sdk-state r16 item 4).
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KqueuePreArm {
+    /// The disposition already reads Gone or Zombie: no kqueue is needed.
+    /// This is the defect fix: EVFILT_PROC/NOTE_EXIT is edge-triggered and
+    /// never replays a death that happened BEFORE registration, so an
+    /// already-exited unreaped zombie used to wait out the full bound.
+    AlreadyConfirmed,
+    /// Register NOTE_EXIT and wait: the child is Alive, or the disposition is
+    /// Unknown (a `ps` hiccup, EPERM), in which case kqueue is the last
+    /// available event source.
+    RegisterAndWait,
+}
+
+/// Decide the pre-arm move from an injected/real disposition (r16 item 4).
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+fn kqueue_pre_arm_move(disposition: ChildDisposition) -> KqueuePreArm {
+    match disposition {
+        ChildDisposition::Gone | ChildDisposition::Zombie => KqueuePreArm::AlreadyConfirmed,
+        ChildDisposition::Alive | ChildDisposition::Unknown => KqueuePreArm::RegisterAndWait,
+    }
+}
+
+/// The terminal decision of the macOS child-exit wait (ma-sdk-state r16 item
+/// 4): NEITHER a changelist EV_ERROR nor a timeout is itself evidence of an
+/// exit, and even a delivered NOTE_EXIT keeps the r15 item-2 discipline of a
+/// confirming classifier read — the wait is satisfied only when a FRESH
+/// disposition independently reads Gone or Zombie.
+///
+/// `event` therefore never sways the verdict (every outcome is confirmed the
+/// same way), but threading the PARSED event through the caller is the fix
+/// shape: the wait closure must distinguish a changelist EV_ERROR from a real
+/// NOTE_EXIT instead of treating every `Ok(1)` as an exit. The injected tests
+/// pin the full event×disposition table.
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+fn kqueue_exit_confirmed(event: KqueueWaitOutcome, disposition: ChildDisposition) -> bool {
+    match (event, disposition) {
+        // A fresh Gone/Zombie classifier read confirms the wait however it
+        // ended — a registration EV_ERROR, an elapsed bound, or a failed
+        // syscall — matching the "re-check on timeout or error" contract.
+        (_, ChildDisposition::Gone | ChildDisposition::Zombie) => true,
+        // A delivered NOTE_EXIT paired with an inconclusive disposition, a
+        // changelist EV_ERROR (never an exit), an elapsed bound, or a failed
+        // wait can none of them confirm death on their own.
+        (
+            KqueueWaitOutcome::NoteExit
+            | KqueueWaitOutcome::ChangeError(_)
+            | KqueueWaitOutcome::BoundElapsed
+            | KqueueWaitOutcome::WaitFailed,
+            _,
+        ) => false,
     }
 }
 
@@ -450,13 +528,13 @@ fn wait_child_exit_blocking(pid: i32, timeout: Duration) -> bool {
             return Ok(InterruptibleEventWait::TimedOut);
         };
         match poll(&mut fds, Some(&timespec)) {
-            Ok(1) => Ok(InterruptibleEventWait::Fired),
+            Ok(1) => Ok(InterruptibleEventWait::Fired(())),
             Ok(_) => Ok(InterruptibleEventWait::TimedOut),
             Err(rustix::io::Errno::INTR) => Err(std::io::Error::from(rustix::io::Errno::INTR)),
             Err(other) => Err(std::io::Error::from(other)),
         }
     });
-    matches!(waited, Ok(InterruptibleEventWait::Fired))
+    matches!(waited, Ok(InterruptibleEventWait::Fired(())))
         && matches!(
             child_disposition(pid),
             ChildDisposition::Gone | ChildDisposition::Zombie
@@ -471,8 +549,23 @@ fn wait_child_exit_blocking(pid: i32, timeout: Duration) -> bool {
     // processes (our own test children) are watchable though not reaped by us.
     use nix::sys::event::{EventFilter, EventFlag, FilterFlag, KEvent, Kqueue};
 
+    // ma-sdk-state r16 item 4: classify BEFORE arming. The pre-close SIGKILL
+    // proofs call this on a child that has ALREADY exited and is an unreaped
+    // zombie, and EVFILT_PROC/NOTE_EXIT is edge-triggered — it never replays a
+    // death that happened before the EV_ADD landed, so the old arm parked for
+    // its whole bound and panicked the proofs. Gone/Zombie is success without
+    // a syscall (the Linux pidfd arm needs no equivalent: pidfd readiness is
+    // level-triggered).
+    if kqueue_pre_arm_move(child_disposition(pid)) == KqueuePreArm::AlreadyConfirmed {
+        return true;
+    }
+
     let Ok(kq) = Kqueue::new() else {
-        return false;
+        // No event source: a fresh classifier read is the only evidence left.
+        return matches!(
+            child_disposition(pid),
+            ChildDisposition::Gone | ChildDisposition::Zombie
+        );
     };
     let change = KEvent::new(
         pid as nix::libc::uintptr_t,
@@ -490,26 +583,41 @@ fn wait_child_exit_blocking(pid: i32, timeout: Duration) -> bool {
         0,
         0,
     )];
-    // A delivered NOTE_EXIT and a changelist EV_ERROR (the process was
-    // already gone) both return 1; 0 is the timeout. EINTR retries against
-    // the ONE monotonic deadline with the remaining time (r16 item 2).
-    let waited = wait_with_eintr_retry(timeout, |remaining| {
+    // EINTR retries against the ONE monotonic deadline with the remaining
+    // time (r16 item 2). On Ok(1) the returned entry is PARSED: a changelist
+    // EV_ERROR (errno in data) is a failed registration, NOT a NOTE_EXIT
+    // (r16 item 4 — the old arm treated every Ok(1) as an exit).
+    let waited = wait_with_eintr_retry::<KqueueWaitOutcome>(timeout, |remaining| {
         let deadline = Some(nix::libc::timespec {
             tv_sec: remaining.as_secs() as nix::libc::time_t,
             tv_nsec: remaining.subsec_nanos() as nix::libc::c_long,
         });
         match kq.kevent(&[change], &mut events, deadline) {
-            Ok(1) => Ok(InterruptibleEventWait::Fired),
+            Ok(0) => Ok(InterruptibleEventWait::TimedOut),
+            Ok(1) => {
+                let entry = &events[0];
+                let outcome = if entry.flags().contains(EventFlag::EV_ERROR) {
+                    KqueueWaitOutcome::ChangeError(entry.data() as i32)
+                } else {
+                    KqueueWaitOutcome::NoteExit
+                };
+                Ok(InterruptibleEventWait::Fired(outcome))
+            }
+            // eventlist has exactly one slot; the kernel cannot report more.
             Ok(_) => Ok(InterruptibleEventWait::TimedOut),
             Err(nix::errno::Errno::EINTR) => Err(std::io::Error::from(nix::errno::Errno::EINTR)),
-            Err(other) => Err(std::io::Error::from(other)),
+            Err(_) => Ok(InterruptibleEventWait::Fired(KqueueWaitOutcome::WaitFailed)),
         }
     });
-    matches!(waited, Ok(InterruptibleEventWait::Fired))
-        && matches!(
-            child_disposition(pid),
-            ChildDisposition::Gone | ChildDisposition::Zombie
-        )
+    // Terminal read (r16 item 4): re-classify on EVERY outcome — a delivered
+    // NOTE_EXIT, a changelist EV_ERROR, an elapsed bound, or a failed wait —
+    // and confirm only Gone/Zombie.
+    let event = match waited {
+        Ok(InterruptibleEventWait::Fired(event)) => event,
+        Ok(InterruptibleEventWait::TimedOut) => KqueueWaitOutcome::BoundElapsed,
+        Err(_) => KqueueWaitOutcome::WaitFailed,
+    };
+    kqueue_exit_confirmed(event, child_disposition(pid))
 }
 
 /// One member of a process group as read from the host process table.
@@ -1416,11 +1524,11 @@ mod tests {
             }
             match n {
                 0..=2 => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
-                _ => Ok(InterruptibleEventWait::Fired),
+                _ => Ok(InterruptibleEventWait::Fired(())),
             }
         })
         .expect("the wait itself never returns an error");
-        assert_eq!(outcome, InterruptibleEventWait::Fired);
+        assert_eq!(outcome, InterruptibleEventWait::Fired(()));
         assert_eq!(calls.load(Ordering::Acquire), 4);
     }
 
@@ -1435,7 +1543,7 @@ mod tests {
 
         let calls = AtomicUsize::new(0);
         let start = std::time::Instant::now();
-        let outcome = wait_with_eintr_retry(BOUND, |_| {
+        let outcome = wait_with_eintr_retry::<()>(BOUND, |_| {
             calls.fetch_add(1, Ordering::AcqRel);
             Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
         })
@@ -1456,7 +1564,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_non_eintr_wait_error_propagates_immediately() {
-        let error = wait_with_eintr_retry(Duration::from_secs(60), |_| {
+        let error = wait_with_eintr_retry::<()>(Duration::from_secs(60), |_| {
             Err(std::io::Error::other("boom"))
         })
         .expect_err("the non-EINTR error propagates");
@@ -1468,14 +1576,62 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_zero_remaining_bound_times_out_without_a_wait() {
-        let outcome = wait_with_eintr_retry(
+        let outcome = wait_with_eintr_retry::<()>(
             Duration::ZERO,
-            |_| -> std::io::Result<InterruptibleEventWait> {
+            |_| -> std::io::Result<InterruptibleEventWait<()>> {
                 unreachable!("no wait attempt happens after the deadline is gone")
             },
         )
         .expect("the wait itself never returns an error");
-        assert_eq!(outcome, InterruptibleEventWait::TimedOut);
+        assert_eq!(outcome, InterruptibleEventWait::<()>::TimedOut);
+    }
+
+    /// r16 item 4 (injectable; the coordinator also runs this on macOS): the
+    /// pre-arm move and the full kqueue-outcome × disposition decision table.
+    /// The kqueue syscall arm itself is macOS/BSD-only, but these rules are
+    /// pure and must hold on every unix target.
+    #[cfg(unix)]
+    #[test]
+    fn the_macos_exit_wait_confirms_zombies_before_arming_and_reads_ev_error() {
+        use ChildDisposition::{Alive, Gone, Unknown, Zombie};
+        use KqueueWaitOutcome::{BoundElapsed, ChangeError, NoteExit, WaitFailed};
+
+        // Pre-arm: an already-dead child is confirmed WITHOUT touching
+        // kqueue — the edge-triggered NOTE_EXIT never replays for a zombie
+        // that died before the EV_ADD (the r16 item 4 defect); an Alive or
+        // Unknown child is registered and watched.
+        assert_eq!(kqueue_pre_arm_move(Gone), KqueuePreArm::AlreadyConfirmed);
+        assert_eq!(kqueue_pre_arm_move(Zombie), KqueuePreArm::AlreadyConfirmed);
+        assert_eq!(kqueue_pre_arm_move(Alive), KqueuePreArm::RegisterAndWait);
+        assert_eq!(kqueue_pre_arm_move(Unknown), KqueuePreArm::RegisterAndWait);
+
+        // The ESRCH a dying child leaves in a changelist EV_ERROR must not be
+        // read as an exit by itself: with an inconclusive disposition the
+        // answer is false (the old arm treated every Ok(1) as an exit).
+        assert!(!kqueue_exit_confirmed(
+            ChangeError(nix::libc::ESRCH),
+            Unknown
+        ));
+        assert!(!kqueue_exit_confirmed(ChangeError(nix::libc::EPERM), Alive));
+        // …but the SAME changelist EV_ERROR confirms once a fresh classifier
+        // read independently says Gone/Zombie ("re-check on error").
+        assert!(kqueue_exit_confirmed(ChangeError(nix::libc::ESRCH), Gone));
+        assert!(kqueue_exit_confirmed(ChangeError(0), Zombie));
+
+        // A real NOTE_EXIT keeps the r15 item-2 confirming classifier read:
+        // the event alone with an Alive/Unknown disposition is not enough.
+        assert!(kqueue_exit_confirmed(NoteExit, Gone));
+        assert!(kqueue_exit_confirmed(NoteExit, Zombie));
+        assert!(!kqueue_exit_confirmed(NoteExit, Alive));
+        assert!(!kqueue_exit_confirmed(NoteExit, Unknown));
+
+        // The bound elapsing (the exact pre-close-proof hang the fix removes)
+        // and a failed wait are satisfied by Gone/Zombie alone, never by an
+        // Alive/Unknown read.
+        assert!(kqueue_exit_confirmed(BoundElapsed, Zombie));
+        assert!(!kqueue_exit_confirmed(BoundElapsed, Alive));
+        assert!(kqueue_exit_confirmed(WaitFailed, Gone));
+        assert!(!kqueue_exit_confirmed(WaitFailed, Unknown));
     }
 
     /// r16 item 2, Linux: a signal delivered to the WAITING thread while the

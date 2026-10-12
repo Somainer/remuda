@@ -128,7 +128,7 @@ impl ClaudeSdkDriver {
     pub async fn bounded_hold_publish_mutex_for_test(
         &self,
         timeout: std::time::Duration,
-    ) -> crate::claude_print::PublishMutexHold<'_> {
+    ) -> crate::claude_print::PublishMutexHold {
         self.inner
             .bounded_hold_publish_mutex_for_test(timeout)
             .await

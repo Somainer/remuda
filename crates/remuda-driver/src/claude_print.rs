@@ -540,7 +540,7 @@ impl NativeIds {
     }
 }
 
-/// Per-launch observation channel state behind [`Inner::emission`]
+/// Per-launch observation channel state behind [`Launch::emission`]
 /// (ma-sdk-state r14 item 1, directive (d)).
 struct Emission {
     /// The bounded observation channel for the live launch (`None` once close
@@ -552,6 +552,78 @@ struct Emission {
     /// seal under the mutex and abandons the reserved slot, so the terminal is
     /// the last observation every consumer can receive. Reset per launch.
     terminal_sent: bool,
+}
+
+/// Everything that belongs to ONE launch and must never be reachable from a
+/// task outliving that launch (ma-sdk-state r15 item 1).
+///
+/// The reader, the publication worker and the detached overflow-shutdown task
+/// all hold an [`Arc<Launch>`] for THEIR launch. The shutdown therefore kills
+/// a captured pid and seals/emits on this object — it never reads the driver's
+/// current `live` slot, so a launch-A shutdown delayed past `close(A)` and
+/// `start(B)` cannot kill B's child. `close` takes the driver's launch slot
+/// and finishes (bounded join, then abort+join) the tracked shutdown before
+/// its own kill ladder runs, and a shutdown that races close either registers
+/// (and is finished) or sees the launch already closing and never spawns.
+struct Launch {
+    /// This launch's publication FIFO behind its admission mutex, created
+    /// fresh per launch. `Arc`-wrapped so the test publish hold can take an
+    /// owned guard; production callers lock through the launch.
+    publish: Arc<tokio::sync::Mutex<Option<PublishQueue>>>,
+    /// Observation channel for THIS launch plus its terminal seal, behind one
+    /// emission mutex (r14 directive (d)).
+    emission: tokio::sync::Mutex<Emission>,
+    /// ONE channel slot reserved for the terminal event for this launch; the
+    /// overflow shutdown and close both deliver through it past a full
+    /// consumer channel.
+    exit_permit: Mutex<Option<mpsc::OwnedPermit<Observation>>>,
+    /// Admission seal for THIS launch (natural stdout EOF, overflow, close).
+    closed: AtomicBool,
+    /// Whether this launch's terminal was already emitted.
+    exit_emitted: AtomicBool,
+    /// The launched child's pid — which `spawn_command` makes its own process
+    /// group id — captured at launch so the detached overflow shutdown can
+    /// signal the group and its leader without ever looking at the driver's
+    /// current `live` slot. `None` only for the in-crate publication tests
+    /// that drive no child.
+    kill_target: Option<i32>,
+    /// The detached overflow-shutdown task, if one spawned. Registration and
+    /// close's claim are serialized on this mutex: either the spawn observed
+    /// `closed == false` and registered (close finishes it) or close sealed
+    /// first and the spawn is dropped (close's own ladder owns the kill).
+    shutdown: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Shared handle to the driver's test barrier slot (test-stub): the
+    /// emission path runs from launch-owned tasks, so the launch needs the
+    /// same slot `arm_write_commit_barrier` arms. It is an `Arc` to the
+    /// driver-scoped slot rather than a copy, so (re)arming after a launch
+    /// still reaches the task in flight.
+    #[cfg(feature = "test-stub")]
+    barrier: test_barrier::Slot,
+}
+
+impl Launch {
+    fn new(
+        publish_queue: PublishQueue,
+        tx: Option<mpsc::Sender<Observation>>,
+        exit_permit: Option<mpsc::OwnedPermit<Observation>>,
+        kill_target: Option<i32>,
+        #[cfg(feature = "test-stub")] barrier: test_barrier::Slot,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            publish: Arc::new(tokio::sync::Mutex::new(Some(publish_queue))),
+            emission: tokio::sync::Mutex::new(Emission {
+                tx,
+                terminal_sent: false,
+            }),
+            exit_permit: Mutex::new(exit_permit),
+            closed: AtomicBool::new(false),
+            exit_emitted: AtomicBool::new(false),
+            kill_target,
+            shutdown: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-stub")]
+            barrier,
+        })
+    }
 }
 
 /// Shared per-launch driver state. Public only for the `test-stub`
@@ -579,7 +651,15 @@ pub struct Inner {
     /// keeps draining stdout into the bounded backlog even while a stdin write
     /// is blocked, and `close`/`cancel` stay reachable (neither needs this queue
     /// to make progress).
-    publish: Mutex<Option<PublishQueue>>,
+    ///
+    /// The CURRENT launch's scoped state: that publication FIFO and its
+    /// per-launch budget handles, the emission channel/seal, admission seal,
+    /// captured kill target, and the detached overflow-shutdown task. `close`
+    /// takes the slot and every launch task owns its own [`Arc<Launch>`], so
+    /// launch A's tasks can never read or write launch B's accounts, channel,
+    /// or live process (ma-sdk-state r15 item 1). The mapper stays
+    /// driver-scoped but is reset wholesale at every launch.
+    launch: tokio::sync::Mutex<Option<Arc<Launch>>>,
     /// Serializes prompt sends: each send enqueues its reservation ticket,
     /// opens the mapper book, awaits its write, and commits strictly one after
     /// another, so two concurrent prompts reserve, write and start in FIFO
@@ -587,26 +667,6 @@ pub struct Inner {
     /// take it, so a blocked prompt cannot gate them.
     write_seq: tokio::sync::Mutex<()>,
     policy: Mutex<PermissionPolicy>,
-    /// Observation channel for THIS launch plus its terminal seal, behind one
-    /// emission mutex (ma-sdk-state r14 item 1, design directive (d)).
-    /// Ordinary emission reserves channel capacity OUTSIDE this mutex and only
-    /// fills the reserved slot under the mutex after rechecking the seal; the
-    /// terminal is sealed AND sent through its pre-reserved slot under the SAME
-    /// mutex, so an ordinary observation can never land after the terminal —
-    /// even on a multi-threaded runtime where a parked send and the terminal
-    /// send otherwise race into the channel.
-    emission: tokio::sync::Mutex<Emission>,
-    /// ma-sdk-state r4 item 4: ONE channel slot reserved for the terminal
-    /// session-exit event for the life of a launch. When the stdout reader is
-    /// wedged against a full `events` channel (a flooding child nobody drains)
-    /// and `close` aborts the publication worker, this permit still delivers
-    /// exactly one exit observation ahead of stream EOF. It is re-acquired on
-    /// every launch (launch resets the terminal seal).
-    exit_permit: Mutex<Option<mpsc::OwnedPermit<Observation>>>,
-    closed: AtomicBool,
-    /// Whether the `exited` session lifecycle has already been emitted, so the
-    /// reader task and [`Driver::close`] cannot both emit it (§2.3: exactly once).
-    exit_emitted: AtomicBool,
     /// Last successfully launched spec; `resume` re-materializes from this.
     last_spec: Mutex<Option<InstanceSpec>>,
     /// The real OS exit status of the most recently reaped child, captured for
@@ -647,6 +707,12 @@ pub struct Inner {
     /// launch; the budget also lives inside the launch's [`PublishQueue`] and
     /// every charge's permits keep it alive independently.
     active_budget: std::sync::Mutex<Option<Arc<BacklogBudget>>>,
+    /// The terminal-evidence latch of the LAST finished launch, copied out by
+    /// `close` when it takes the launch slot (r15 item 1 moved the live latch
+    /// onto [`Launch`]): callers asking `process_gone` after close (no launch
+    /// installed) still get the dead-child answer the r5 contract requires.
+    /// Reset to false by the next launch.
+    last_process_gone: AtomicBool,
 }
 
 /// Build the shared per-launch [`Inner`]. Factored out of the driver
@@ -678,21 +744,14 @@ fn build_inner(
             turns: TurnBook::default(),
             deferred_result: None,
         }),
-        publish: Mutex::new(None),
+        launch: tokio::sync::Mutex::new(None),
         write_seq: tokio::sync::Mutex::new(()),
         policy: Mutex::new(PermissionPolicy::Host),
-        emission: tokio::sync::Mutex::new(Emission {
-            tx: None,
-            terminal_sent: false,
-        }),
-        exit_permit: Mutex::new(None),
-        closed: AtomicBool::new(false),
-        exit_emitted: AtomicBool::new(false),
         last_spec: Mutex::new(None),
         #[cfg(any(test, feature = "test-stub"))]
         child_exit_status: Mutex::new(None),
         #[cfg(feature = "test-stub")]
-        barrier: std::sync::Mutex::new(None),
+        barrier: Arc::new(std::sync::Mutex::new(None)),
         #[cfg(feature = "test-stub")]
         exit_build_fails: std::sync::atomic::AtomicBool::new(false),
         #[cfg(feature = "test-stub")]
@@ -703,6 +762,7 @@ fn build_inner(
         reserve_send_fails: std::sync::atomic::AtomicBool::new(false),
         backlog_config: BacklogConfig::new(),
         active_budget: std::sync::Mutex::new(None),
+        last_process_gone: AtomicBool::new(false),
     })
 }
 
@@ -724,11 +784,19 @@ pub struct ClaudePrintDriver {
 }
 
 /// Test-only (`test-stub`): held publication-mutex guard (r10 item 1).
-/// The field exists solely to keep the lock held until this handle drops.
+///
+/// The lock belongs to the CURRENT launch (r15 item 1 moved it onto
+/// [`Launch`]), so the hold owns the launch Arc and an OWNED guard: the held
+/// mutex then cannot be replaced by a relaunch while the test parks a sender
+/// on it. The fields exist solely to keep the lock held until this handle
+/// drops.
 #[cfg(feature = "test-stub")]
 #[must_use = "holding the guard is the point; drop it to release the mutex"]
 #[allow(dead_code)]
-pub struct PublishMutexHold<'a>(tokio::sync::MutexGuard<'a, Option<PublishQueue>>);
+pub struct PublishMutexHold {
+    _launch: Arc<Launch>,
+    guard: tokio::sync::OwnedMutexGuard<Option<PublishQueue>>,
+}
 
 /// Test-only (`test-stub`): held `write_seq` guard (r10 item 3).
 /// The field exists solely to keep the lock held until this handle drops.
@@ -761,7 +829,10 @@ impl ClaudePrintDriver {
     pub async fn publication_is_saturated(&self) -> bool {
         // The exit permit permanently holds one of 256 slots; capacity is
         // therefore 255.
-        let Some(tx) = self.inner.emission.lock().await.tx.clone() else {
+        let Some(launch) = self.inner.launch.lock().await.clone() else {
+            return false;
+        };
+        let Some(tx) = launch.emission.lock().await.tx.clone() else {
             return false;
         };
         tx.capacity() == 0
@@ -805,7 +876,9 @@ impl ClaudePrintDriver {
     #[cfg(feature = "test-stub")]
     async fn enqueue_publication_fence(&self) -> tokio::sync::oneshot::Receiver<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if let Some(publisher) = self.inner.publish.lock().await.clone() {
+        if let Some(launch) = self.inner.launch.lock().await.clone()
+            && let Some(publisher) = launch.publish.lock().await.clone()
+        {
             let _ = publisher.admit_control(PublishJob::Fence(tx));
         }
         rx
@@ -830,12 +903,21 @@ impl ClaudePrintDriver {
     /// mutex so a concurrent send parks on it BEFORE opening its book entry.
     /// Bounded by a NAMED wait. Drop the returned hold to release.
     #[cfg(feature = "test-stub")]
-    pub async fn bounded_hold_publish_mutex_for_test(
-        &self,
-        timeout: Duration,
-    ) -> PublishMutexHold<'_> {
+    pub async fn bounded_hold_publish_mutex_for_test(&self, timeout: Duration) -> PublishMutexHold {
         tokio::time::timeout(timeout, async {
-            PublishMutexHold(self.inner.publish.lock().await)
+            // Pin the CURRENT launch: the hold parks a sender of THIS launch
+            // on its own admission mutex and survives a driver relaunch.
+            let launch_slot = self.inner.launch.lock().await;
+            let launch = launch_slot
+                .as_ref()
+                .expect("test access: a launch is installed")
+                .clone();
+            drop(launch_slot);
+            let mutex = Arc::clone(&launch.publish);
+            PublishMutexHold {
+                _launch: launch,
+                guard: mutex.lock_owned().await,
+            }
         })
         .await
         .expect("bounded test wait timed out: acquiring the publication mutex hold")
@@ -1137,30 +1219,17 @@ impl ClaudePrintDriver {
             };
         }
         *self.inner.policy.lock().await = policy;
-        // Fresh emission channel AND a fresh terminal seal for this launch:
-        // close left `tx` as None and the previous launch's seal as `true`.
-        {
-            let mut emission = self.inner.emission.lock().await;
-            emission.tx = Some(tx);
-            emission.terminal_sent = false;
-        }
-        *self.inner.exit_permit.lock().await = Some(exit_permit);
         *self.inner.last_spec.lock().await = Some(spec.clone());
-        self.inner.closed.store(false, Ordering::SeqCst);
-        self.inner.exit_emitted.store(false, Ordering::SeqCst);
 
         let mut ack = DriverAck::transport_written();
         ack.native_ids.insert("sessionId".into(), session_id);
         if let Some(pid) = process.id() {
             ack.native_ids.insert("pid".into(), pid.to_string());
         }
-
-        *self.inner.live.lock().await = Some(Live {
-            process,
-            pending: HashMap::new(),
-            pending_by_native: HashMap::new(),
-            recipe: recipe.clone(),
-        });
+        // Captured NOW, before `process` moves into `live`: the launch-scoped
+        // overflow shutdown signals THIS pid/pgid and never re-reads the
+        // driver's current live slot (r15 item 1).
+        let kill_target = process.id().and_then(|pid| i32::try_from(pid).ok());
 
         // Fresh publication FIFO AND fresh accounting for this launch (r14
         // directive (a)): this budget's item/byte semaphores are owned nowhere
@@ -1178,11 +1247,35 @@ impl ClaudePrintDriver {
         );
         *self.inner.active_budget.lock().expect("active budget slot") = Some(Arc::clone(&budget));
         let (publish_queue, publish_rx) = PublishQueue::new(budget);
-        *self.inner.publish.lock().await = Some(publish_queue.clone());
+
+        // Fresh per-launch scope: emission channel, terminal seal, exit
+        // permit, admission seal and the shutdown-task slot all start clean
+        // and are owned by the Arc every launch task carries (r15 item 1).
+        let launch = Launch::new(
+            publish_queue.clone(),
+            Some(tx),
+            Some(exit_permit),
+            kill_target,
+            #[cfg(feature = "test-stub")]
+            Arc::clone(&self.inner.barrier),
+        );
+
+        *self.inner.live.lock().await = Some(Live {
+            process,
+            pending: HashMap::new(),
+            pending_by_native: HashMap::new(),
+            recipe: recipe.clone(),
+        });
+        // Install the launch scope only after live is in place; close/start
+        // are driver-serialized by the Node and close takes this slot first.
+        self.inner.last_process_gone.store(false, Ordering::SeqCst);
+        *self.inner.launch.lock().await = Some(Arc::clone(&launch));
+
         let publisher = {
             let inner = Arc::clone(&self.inner);
+            let launch = Arc::clone(&launch);
             tokio::spawn(async move {
-                publish_worker(inner, publish_rx).await;
+                publish_worker(inner, launch, publish_rx).await;
             })
         };
         *self.publisher.lock().await = Some(publisher);
@@ -1190,7 +1283,7 @@ impl ClaudePrintDriver {
         let inner = Arc::clone(&self.inner);
         let carrier = self.carrier_name();
         let reader = tokio::spawn(async move {
-            map_loop(inner, outbound, publish_queue, carrier).await;
+            map_loop(inner, launch, outbound, publish_queue, carrier).await;
         });
         *self.reader.lock().await = Some(reader);
         Ok(RunHandle::new(recipe, ack, rx))
@@ -1344,17 +1437,29 @@ impl Driver for ClaudePrintDriver {
     }
 
     async fn process_gone(&self) -> bool {
-        // The reader task sets this (once) when the child's stdout closes and
-        // `emit_exit` runs, i.e. the driver's OWN process-end evidence; the
-        // close ladder sets it too. A failed `send` while it is still false
-        // means the child is alive (control/API error), never a task exit.
-        self.inner.exit_emitted.load(Ordering::Acquire)
+        // The launch's reader task sets this (once) when the child's stdout
+        // closes and `emit_exit` runs, i.e. the driver's OWN process-end
+        // evidence; the close ladder sets it too. It lives on the CURRENT
+        // launch's scope, so a launch-A reader outliving close cannot read or
+        // reset launch B's answer.
+        match self.inner.launch.lock().await.as_ref() {
+            Some(launch) => launch.exit_emitted.load(Ordering::Acquire),
+            // After close the launch slot is gone; close copied the last
+            // launch's latch out so the post-close r5 answer still lands.
+            None => self.inner.last_process_gone.load(Ordering::Acquire),
+        }
     }
 
     async fn send(&self, input: DriverInput) -> DriverResult<DriverAck> {
-        if self.inner.closed.load(Ordering::SeqCst) {
+        let launch_slot = self.inner.launch.lock().await;
+        if launch_slot
+            .as_ref()
+            .is_none_or(|launch| launch.closed.load(Ordering::SeqCst))
+        {
             return Err(DriverError::ControlUnavailable);
         }
+        let launch = Arc::clone(launch_slot.as_ref().expect("present and open"));
+        drop(launch_slot);
         match input {
             DriverInput::Prompt(prompt) => {
                 // ma-sdk-state r6 item 1: resolve ALL fallible prompt content
@@ -1375,6 +1480,7 @@ impl Driver for ClaudePrintDriver {
                 // detached completion that survives the caller (r8 item 1).
                 let completion = prepare_prompt_write(
                     &self.inner,
+                    &launch,
                     writer,
                     content,
                     client_message_id,
@@ -1465,7 +1571,26 @@ impl Driver for ClaudePrintDriver {
     }
 
     async fn close(&self) -> DriverResult<DriverAck> {
-        self.inner.closed.store(true, Ordering::SeqCst);
+        // Take THIS launch's scope out of the driver before anything else:
+        // every later send sees no launch, and every launch task keeps using
+        // its own Arc until close joins it (r15 item 1).
+        let launch = self.inner.launch.lock().await.take();
+
+        // Finish the launch-scoped overflow shutdown BEFORE the kill ladder.
+        // The seal and the claim of the task handle are ONE critical section
+        // on the launch's shutdown mutex, so a spawn racing close either
+        // registered (this finishes it) or observed the seal and never ran
+        // (the ladder below owns A's kill). The shutdown targets only the
+        // captured A pid anyway — it can never reach a relaunched child.
+        if let Some(launch) = launch.as_ref() {
+            let handle = {
+                let mut slot = launch.shutdown.lock().expect("overflow shutdown slot");
+                launch.closed.store(true, Ordering::SeqCst);
+                slot.take()
+            };
+            join_or_abort_handle(handle, "overflow shutdown").await;
+        }
+
         let mut live_guard = self.inner.live.lock().await;
         let recipe = live_guard.as_ref().map(|live| live.recipe.clone());
         if let Some(live) = live_guard.as_mut() {
@@ -1487,13 +1612,11 @@ impl Driver for ClaudePrintDriver {
         // its way out; give it a short bound to finish and deliver the `exited`
         // lifecycle itself, then abort it if it is still parked.
         //
-        // The abort is the point. A reader outlives close detached, and a later
-        // `start()` on this driver resets `exit_emitted` for the new launch; a
-        // reader A still parked on `inner.live` at that moment could then emit a
-        // *second* `exited` into launch B's channel. Directive (e): after the
-        // abort the handle is AWAITED (bounded), so by the time close returns
-        // the task has actually terminated — an abort merely sent could
-        // otherwise leave a launch-A task alive across a relaunch.
+        // The abort is the point. The reader owns launch A's Arc, and a later
+        // `start()` installs launch B; directive (e): after the abort the
+        // handle is AWAITED (bounded), so by the time close returns the task
+        // has actually terminated — an abort merely sent could otherwise
+        // leave a launch-A task alive across a relaunch.
         join_or_abort(&self.reader, "reader").await;
 
         // Seal the publication FIFO now that the reader can no longer enqueue,
@@ -1505,7 +1628,9 @@ impl Driver for ClaudePrintDriver {
         // return while that task still exists: it owns the launch-A budget and
         // its queued jobs' permits must finish dropping onto that dead budget,
         // never onto the next launch's.
-        self.inner.publish.lock().await.take();
+        if let Some(launch) = launch.as_ref() {
+            launch.publish.lock().await.take();
+        }
         join_or_abort(&self.publisher, "publisher").await;
 
         // Seal the events channel BEFORE covering the exit. Under output
@@ -1515,11 +1640,20 @@ impl Driver for ClaudePrintDriver {
         // On the normal path the worker already drained StdoutEof and emitted
         // `exited` into the receiver before it was joined, so dropping the
         // sender loses nothing; here the once-guard below is then a no-op.
-        self.inner.emission.lock().await.tx = None;
-        // Whichever path got there first — the worker draining StdoutEof, or
-        // this call covering an aborted one — records exactly once
-        // (`exit_emitted`); emission is skipped once events is sealed.
-        let _ = emit_exit(&self.inner, "exited").await;
+        if let Some(launch) = launch.as_ref() {
+            launch.emission.lock().await.tx = None;
+            // Whichever path got there first — the worker draining StdoutEof,
+            // the finished overflow shutdown, or this call covering an aborted
+            // one — records exactly once (`exit_emitted` on THIS launch);
+            // emission is skipped once events is sealed.
+            let _ = emit_exit(&self.inner, launch, "exited").await;
+            // Copy the terminal evidence to the driver-level latch before the
+            // launch Arc drops, so process_gone after close answers true.
+            self.inner.last_process_gone.store(
+                launch.exit_emitted.load(Ordering::Acquire),
+                Ordering::SeqCst,
+            );
+        }
         // S5: the child has exited, so the launch overlays can go. The label is
         // the carrier's wire name, matching the kebab-case the sibling drivers
         // pass (`claude-pty`, `claude-bg`, `generic-pty`).
@@ -1654,7 +1788,16 @@ async fn close_ladder(
 /// the second bound from growing without limit; such a task cannot reach any
 /// driver state that close replaces before it next hits an await anyway.
 async fn join_or_abort(slot: &Mutex<Option<JoinHandle<()>>>, what: &'static str) {
-    let Some(mut handle) = slot.lock().await.take() else {
+    let handle = slot.lock().await.take();
+    join_or_abort_handle(handle, what).await;
+}
+
+/// [`join_or_abort`] for a task handle close CLAIMED from somewhere other
+/// than a driver slot — the launch-scoped overflow shutdown
+/// (ma-sdk-state r15 item 1): close must finish even that detached task
+/// before its kill ladder and before a relaunch can install another child.
+async fn join_or_abort_handle(handle: Option<JoinHandle<()>>, what: &'static str) {
+    let Some(mut handle) = handle else {
         return;
     };
     if tokio::time::timeout(Duration::from_millis(500), &mut handle)
@@ -1699,6 +1842,34 @@ fn kill_group(pgid: Option<i32>, carrier: &str) {
     let _ = (pgid, carrier);
 }
 
+/// SIGKILL the launch child's LEADER directly by its captured pid (r15 item 1).
+///
+/// The launch-scoped overflow shutdown must kill without acquiring the
+/// driver's `live` slot, so unlike the close ladder it signals the captured
+/// pid rather than going through the [`ClaudeProcess`] handle. The leader is
+/// its own process-group leader, so [`kill_group`] already reaches it; this
+/// direct signal is the belt-and-braces twin of `live.process.kill()` for a
+/// pid that was reaped-and-recycled away from the group (an `ESRCH` race the
+/// group signal would also swallow). No reaping happens here — close's ladder
+/// reaps the child.
+#[cfg(unix)]
+fn kill_child_direct(pid: Option<i32>, carrier: &str) {
+    if let Some(pid) = pid.filter(|pid| *pid > 0) {
+        match nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        ) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(errno) => debug!(carrier, pid, %errno, "direct child signal failed"),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_child_direct(pid: Option<i32>, carrier: &str) {
+    let _ = (pid, carrier);
+}
+
 /// Send a signal to every member of process group `pgid`.
 ///
 /// `unsafe` is forbidden workspace-wide, so this goes through `nix` rather than
@@ -1737,6 +1908,7 @@ type WriteCompletion = tokio::sync::oneshot::Receiver<DriverResult<DriverAck>>;
 /// the result.
 async fn prepare_prompt_write(
     inner: &Arc<Inner>,
+    launch: &Arc<Launch>,
     writer: ProcessWriter,
     content: UserContent,
     client_message_id: String,
@@ -1768,8 +1940,8 @@ async fn prepare_prompt_write(
     // this section.
     #[cfg(feature = "test-stub")]
     test_barrier::note_publish_lock_wait(&inner.barrier);
-    let admission = inner.publish.lock().await;
-    if inner.closed.load(Ordering::SeqCst) {
+    let admission = launch.publish.lock().await;
+    if launch.closed.load(Ordering::SeqCst) {
         return Err(DriverError::ControlUnavailable);
     }
     let Some(publisher) = admission.as_ref() else {
@@ -1781,11 +1953,13 @@ async fn prepare_prompt_write(
     // budget, BEFORE the book entry opens. A child that keeps reading prompts
     // while the publication worker is blocked on an undrained RunHandle
     // otherwise queues one ticket (and one outstanding turn) per prompt
-    // without limit. A breach SPAWNS the cancellation-independent overflow
-    // shutdown as its own task BEFORE this function can await anything, then is
-    // rejected: aborting this send (even while the shutdown parks on the live
-    // handle) can no longer cancel the kill or the terminal delivery. Natural
-    // EOF (StdoutEof) and cancellation bypass this gate entirely.
+    // without limit. A breach SPAWNS the cancellation-independent,
+    // LAUNCH-SCOPED overflow shutdown as its own task BEFORE this function
+    // can await anything, then is rejected: aborting this send (even while
+    // the shutdown parks at its pre-kill gate) can no longer cancel the kill
+    // or the terminal delivery, and close finishes the registered task
+    // before a relaunch (r15 item 1). Natural EOF (StdoutEof) and
+    // cancellation bypass this gate entirely.
     let budget = Arc::clone(publisher.budget());
     let mut charge = Some(match publisher.reserve_charge() {
         Ok(charge) => charge,
@@ -1797,12 +1971,22 @@ async fn prepare_prompt_write(
         }) => {
             // The shutdown takes the publish mutex itself; release the gate
             // first, then SPAWN the shutdown (never await it — the triggering
-            // send must not own its lifetime).
+            // send must not own its lifetime; close owns it through the
+            // launch's tracked handle instead).
             drop(admission);
-            // Detached: the send rejects and does not await the shutdown; its
-            // kill and terminal delivery survive the caller being aborted.
-            let _shutdown =
-                spawn_backlog_overflow_shutdown(inner, &budget, items, bytes, frame_bytes, carrier);
+            // Detached from the send: the send rejects and does not await the
+            // shutdown; its kill and terminal delivery survive the caller
+            // being aborted. The task is attached to THIS LAUNCH, though:
+            // close finishes it and it can only touch launch A.
+            let _shutdown = spawn_backlog_overflow_shutdown(
+                inner,
+                launch,
+                &budget,
+                items,
+                bytes,
+                frame_bytes,
+                carrier,
+            );
             return Err(DriverError::ControlUnavailable);
         }
     });
@@ -1956,6 +2140,7 @@ async fn prepare_prompt_write(
 
 async fn map_loop(
     inner: Arc<Inner>,
+    launch: Arc<Launch>,
     mut outbound: mpsc::Receiver<Outbound>,
     publisher: PublishQueue,
     carrier: &'static str,
@@ -2013,10 +2198,13 @@ async fn map_loop(
                 // close) must not take the kill or the terminal delivery with
                 // it. The rejected frame owns nothing and drops here.
                 let budget = publisher.budget_clone();
-                // Detached: the reader may be torn down by close at any moment;
-                // the kill and the terminal do not depend on it staying alive.
+                // Detached from the reader but attached to THIS LAUNCH: the
+                // kill and terminal do not depend on the reader staying alive,
+                // while close claims the tracked task and it can only touch
+                // launch A's captured process/emission state (r15 item 1).
                 let _shutdown = spawn_backlog_overflow_shutdown(
                     &inner,
+                    &launch,
                     &budget,
                     items,
                     bytes,
@@ -2044,8 +2232,8 @@ async fn map_loop(
         // the frame caps so a full backlog cannot delay the terminal seal.
         // `closed` is set here, not only by explicit close: a prompt sent after
         // the child's natural exit can never start a turn.
-        let gate = inner.publish.lock().await;
-        inner.closed.store(true, Ordering::SeqCst);
+        let gate = launch.publish.lock().await;
+        launch.closed.store(true, Ordering::SeqCst);
         if let Some(publisher) = gate.as_ref() {
             let _ = publisher.admit_control(PublishJob::StdoutEof);
         }
@@ -2055,35 +2243,50 @@ async fn map_loop(
     }
 }
 
-/// ma-sdk-state r14 item 1 (directive (c)): spawn the overflow session
-/// shutdown as its OWN detached task.
+/// ma-sdk-state r14 item 1 (directive (c)); r15 item 1: spawn the overflow
+/// session shutdown as its OWN task, attached to the overflowing LAUNCH.
 ///
 /// The spawn happens synchronously at the admission-failure site BEFORE any
-/// await, so cancelling the triggering future (a prompt send aborted while the
-/// shutdown contends on the `live` handle, a reader aborted by close) cannot
-/// cancel the kill or the terminal publication: the task owns an [`Arc<Inner>`]
-/// and nobody owns its lifetime. Callers do not even keep the [`JoinHandle`].
-/// Exactly one shutdown per launch wins the budget's CAS latch.
-#[must_use = "the shutdown is detached; the handle is only for callers that choose to await it"]
+/// await, so cancelling the triggering future (a prompt send aborted while
+/// the shutdown parks at its pre-kill gate, a reader aborted by close) cannot
+/// cancel the kill or the terminal publication: the task owns its
+/// [`Arc<Launch>`] and the send does not own its lifetime. It IS tracked on
+/// the launch, though — `close` finishes it before its kill ladder and a
+/// relaunch — and it signals only the launch's captured child pid, so it can
+/// never reach a relaunched process through the driver's current live slot.
+/// Exactly one shutdown per launch wins the budget's CAS latch; a spawn that
+/// loses the race with close (the launch already sealed) is dropped, leaving
+/// close's own ladder to do the kill.
 fn spawn_backlog_overflow_shutdown(
     inner: &Arc<Inner>,
+    launch: &Arc<Launch>,
     budget: &Arc<BacklogBudget>,
     items: usize,
     bytes: usize,
     frame_bytes: usize,
     carrier: &'static str,
-) -> Option<JoinHandle<()>> {
+) -> bool {
     // Exactly one shutdown per LAUNCH (the latch lives on the per-launch
     // budget); a second overflowing frame or ticket loses and does nothing.
     if budget.overflowed.swap(true, Ordering::AcqRel) {
-        return None;
+        return false;
     }
+    // Register under the launch's shutdown mutex with the seal rechecked:
+    // either close has NOT claimed the launch (we spawn and store the handle
+    // for close to finish) or it has (sealed; no spawn — close owns the kill).
+    let mut slot = launch.shutdown.lock().expect("overflow shutdown slot");
+    if launch.closed.load(Ordering::Acquire) {
+        return false;
+    }
+    let launch = Arc::clone(launch);
     let inner = Arc::clone(inner);
     let budget = Arc::clone(budget);
     let handle = tokio::spawn(async move {
-        shutdown_for_backlog_overflow(&inner, &budget, items, bytes, frame_bytes, carrier).await;
+        shutdown_for_backlog_overflow(&launch, &inner, &budget, items, bytes, frame_bytes, carrier)
+            .await;
     });
-    Some(handle)
+    *slot = Some(handle);
+    true
 }
 
 /// ma-sdk-state r12 item 1: the bounded publication backlog overflowed.
@@ -2096,16 +2299,19 @@ fn spawn_backlog_overflow_shutdown(
 ///
 /// Independence from backlog admission: none of the steps here enqueue a frame
 /// or wait for the publication worker. Reservation admission is sealed under
-/// the publish mutex (the same gate `prepare_prompt_write` takes), the kill is
-/// two synchronous signals, and terminal delivery uses the reserved permit. A
-/// concurrent `close` therefore never parks on frame admission, and the blocked
-/// prompt write unblocks with an error once the child's pipes close.
+/// the launch's publish mutex (the same gate `prepare_prompt_write` takes),
+/// the kill targets the launch's captured pid/pgid with synchronous signals,
+/// and terminal delivery uses the reserved permit. A concurrent `close`
+/// therefore never parks on frame admission, and the blocked prompt write
+/// unblocks with an error once the child's pipes close.
 ///
-/// ma-sdk-state r14 item 1: this runs in a DETACHED spawned task (see
-/// [`spawn_backlog_overflow_shutdown`]), so the kill and the terminal complete
-/// even if the triggering send was aborted while this routine waits for the
-/// `live` handle.
+/// ma-sdk-state r14 item 2: this runs in its OWN spawned task, so the kill and
+/// the terminal complete even if the triggering send was aborted while this
+/// routine parks. ma-sdk-state r15 item 1: the task is launch-scoped — it
+/// never reads the driver's current `live` slot, signals only the captured
+/// launch-A pid, and is finished by close(A) before start(B).
 async fn shutdown_for_backlog_overflow(
+    launch: &Arc<Launch>,
     inner: &Arc<Inner>,
     budget: &BacklogBudget,
     items: usize,
@@ -2117,45 +2323,26 @@ async fn shutdown_for_backlog_overflow(
     // point would write to a child this routine is about to kill. The publish
     // mutex serializes this with prepare_prompt_write's admission section.
     {
-        let _admission = inner.publish.lock().await;
-        inner.closed.store(true, Ordering::SeqCst);
+        let _admission = launch.publish.lock().await;
+        launch.closed.store(true, Ordering::SeqCst);
     }
-    // Kill the flooding child NOW, without the writer channel or the close
-    // ladder: SIGKILL to the whole group plus the direct kill are synchronous
-    // and cannot block on a child that stopped draining stdin.
-    //
-    // ma-sdk-state r13 item 3: ACQUIRE the handle and guarantee the signals.
-    // The old `try_lock` skipped the kill whenever `live` was transiently held
-    // (a prompt writer lookup, a permission-response pending mutation, a
-    // Host-policy insert) and nothing retried, so ordinary contention could
-    // leave the flooding child alive for the rest of the session. Awaiting the
-    // lock only DELAYS under such a holder; it cannot deadlock: no lock this
-    // routine still needs is held across this await, and `close` — the only
-    // long holder — runs its own ladder against this same child and then reaps
-    // it to None, so reaching a None/absent handle means the child is already
-    // removed/reaped and there is nothing to kill.
-    //
-    // ma-sdk-state r14 item 2: a caller ABORTED while parked here used to take
-    // the whole shutdown down with it (the send future owned this future). The
-    // shutdown now runs detached, so the wait survives that abort and the kill
-    // still lands.
     #[cfg(feature = "test-stub")]
     test_barrier::note_overflow_kill_waiting(&inner.barrier);
     // ma-sdk-state r14 item 2 (test-stub): a deterministic gate BETWEEN the
-    // admission seal and the live-handle kill. A regression parks the detached
-    // shutdown here, takes the live lock itself, and ABORTS the triggering send
-    // task; the kill must still land after the gate opens because the shutdown
-    // owns its own task and lifetime. Open by default.
+    // admission seal and the kill. A regression parks the shutdown here,
+    // aborts the triggering send (or runs close), and proves the kill still
+    // lands after the gate opens because the task owns its own lifetime —
+    // r15 item 1 further proves that after close+relaunch the kill can only
+    // reach launch A's captured pid. Open by default.
     #[cfg(feature = "test-stub")]
     test_barrier::hold_before_overflow_kill(&inner.barrier).await;
-    {
-        let mut live = inner.live.lock().await;
-        if let Some(live) = live.as_mut() {
-            let pgid = live.process.id().and_then(|pid| i32::try_from(pid).ok());
-            kill_group(pgid, carrier);
-            let _ = live.process.kill();
-        }
-    }
+    // Kill the captured launch-A child directly — SIGKILL the whole group and
+    // the leader by pid. No inner.live lookup: the signals are synchronous,
+    // cannot block on a child that stopped draining stdin, and a delayed
+    // shutdown from a closed launch can never kill a relaunched child.
+    let target = launch.kill_target;
+    kill_group(target, carrier);
+    kill_child_direct(target, carrier);
     let (limit_items, limit_bytes) = budget.caps();
     error!(
         carrier,
@@ -2167,7 +2354,7 @@ async fn shutdown_for_backlog_overflow(
         "publication backlog overflow: the child produced stdout faster than it \
          could be published; shutting the session down (reason=publication_backlog_overflow)"
     );
-    let _ = emit_overflow_exit(inner, budget, items, bytes).await;
+    let _ = emit_overflow_exit(inner, launch, budget, items, bytes).await;
     #[cfg(feature = "test-stub")]
     test_barrier::note_backlog_overflow(&inner.barrier);
 }
@@ -2645,7 +2832,11 @@ impl TurnReservation {
 /// * there is exactly one rollback path per reservation.
 ///
 /// Does NOT take `write_seq`: the worker never holds it.
-async fn rollback_reservation_at_ticket(inner: &Arc<Inner>, seq: u64) -> DriverResult<()> {
+async fn rollback_reservation_at_ticket(
+    inner: &Arc<Inner>,
+    launch: &Launch,
+    seq: u64,
+) -> DriverResult<()> {
     let released = {
         let mut mapper = inner.mapper.lock().await;
         mapper.cancel_turn_reservation(seq)?
@@ -2661,11 +2852,11 @@ async fn rollback_reservation_at_ticket(inner: &Arc<Inner>, seq: u64) -> DriverR
     // the terminal observation regardless of how the ticket got there. The
     // book is still rolled back above; the launch is ending, so the owed
     // correction is dropped the same way rollback_without_ticket drops one.
-    if inner.exit_emitted.load(Ordering::Acquire) {
+    if launch.exit_emitted.load(Ordering::Acquire) {
         debug!("ordered publication: deferred settle released after exit; dropped");
         return Ok(());
     }
-    emit_all(inner, vec![observation]).await
+    emit_all(launch, vec![observation]).await
 }
 
 /// Roll back a reservation whose ticket NO worker will ever visit: the Reserve
@@ -2826,8 +3017,10 @@ pub mod test_barrier {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    /// Per-driver slot holding the currently armed barrier, if any.
-    pub(super) type Slot = Mutex<Option<Arc<State>>>;
+    /// Per-driver slot holding the currently armed barrier, if any. `Arc` so a
+    /// launch can share the exact slot the driver (re)arms — a launch
+    /// outlives its `start` call and emits from its own tasks.
+    pub(super) type Slot = Arc<Mutex<Option<Arc<State>>>>;
 
     pub(super) struct State {
         /// ma-sdk-state r13 item 5: signalled AFTER every hook below updates one
@@ -3865,8 +4058,13 @@ pub mod test_barrier {
     }
 }
 
-/// Single drainer of [`Inner::publish`]: map + emit strictly in enqueue order.
-async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<PublishJob>) {
+/// Single drainer of THIS launch's publication queue: map + emit strictly in
+/// enqueue order (r15 item 1: the launch scope, not driver-wide state).
+async fn publish_worker(
+    inner: Arc<Inner>,
+    launch: Arc<Launch>,
+    mut rx: mpsc::UnboundedReceiver<PublishJob>,
+) {
     while let Some(job) = rx.recv().await {
         // ma-sdk-state r14 item 1 directive (b): the job's owned permits are
         // its whole accounting. Hold them in `held_charge` until the job is
@@ -3885,13 +4083,13 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                     // session. Drop it — including outbound control requests,
                     // which must not answer a child already killed — so nothing
                     // is ever published after the terminal lifecycle.
-                    if inner.exit_emitted.load(Ordering::Acquire) {
+                    if launch.exit_emitted.load(Ordering::Acquire) {
                         return Ok(());
                     }
                     if let Outbound::ControlRequest(env) = &*frame
                         && let ControlRequest::CanUseTool(req) = &env.request
                     {
-                        return handle_can_use_tool(&inner, env, req).await;
+                        return handle_can_use_tool(&inner, &launch, env, req).await;
                     }
                     // No per-frame reservation wait: ordering is guaranteed by
                     // the Reserve ticket ahead of this frame in the queue. A
@@ -3910,7 +4108,7 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                     if matches!(&*frame, Outbound::Result(_)) {
                         test_barrier::note_result_mapped(&inner.barrier);
                     }
-                    emit_all(&inner, observations).await
+                    emit_all(&launch, observations).await
                 }
                 .await
             }
@@ -3937,7 +4135,7 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                         let start = {
                             let mut mapper = inner.mapper.lock().await;
                             mapper.commit_turn_reservation(reservation.seq);
-                            if inner.exit_emitted.load(Ordering::Acquire) {
+                            if launch.exit_emitted.load(Ordering::Acquire) {
                                 None
                             } else {
                                 Some(
@@ -3949,7 +4147,7 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                         #[cfg(feature = "test-stub")]
                         let emitted = start.is_some();
                         if let Some(start) = start {
-                            emit_all(&inner, vec![start]).await?;
+                            emit_all(&launch, vec![start]).await?;
                         }
                         // test-stub only: hold the worker AT the ticket after
                         // publishing the start, so a test can open the next
@@ -3983,7 +4181,7 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                         #[cfg(feature = "test-stub")]
                         test_barrier::hold_cancelled_ticket(&inner.barrier).await;
                         let rolled_back =
-                            rollback_reservation_at_ticket(&inner, reservation.seq).await;
+                            rollback_reservation_at_ticket(&inner, &launch, reservation.seq).await;
                         // r12 item 2: acknowledge the rollback COMPLETED at the
                         // ticket position before any later job is handled.
                         #[cfg(feature = "test-stub")]
@@ -3993,7 +4191,7 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                 }
                 .await
             }
-            PublishJob::StdoutEof => emit_exit(&inner, "exited").await,
+            PublishJob::StdoutEof => emit_exit(&inner, &launch, "exited").await,
             #[cfg(feature = "test-stub")]
             PublishJob::Fence(signal) => {
                 // Everything enqueued before this fence has now been published.
@@ -4136,6 +4334,7 @@ fn prefold_blocking(
 
 async fn handle_can_use_tool(
     inner: &Inner,
+    launch: &Launch,
     env: &ControlRequestEnvelope,
     req: &CanUseToolRequest,
 ) -> DriverResult<()> {
@@ -4156,7 +4355,7 @@ async fn handle_can_use_tool(
             )),
         )?]
     };
-    emit_all(inner, observations).await?;
+    emit_all(launch, observations).await?;
 
     match policy {
         PermissionPolicy::AutoAllow => {
@@ -4216,7 +4415,7 @@ async fn send_control(
         .map_err(map_wire)
 }
 
-async fn emit_all(inner: &Inner, observations: Vec<Observation>) -> DriverResult<()> {
+async fn emit_all(launch: &Launch, observations: Vec<Observation>) -> DriverResult<()> {
     for observation in observations {
         // ma-sdk-state r14 item 1 directive (d): reserve channel capacity
         // OUTSIDE the emission mutex — this is the await that can park on a
@@ -4227,7 +4426,7 @@ async fn emit_all(inner: &Inner, observations: Vec<Observation>) -> DriverResult
         // after it, even with the worker and the overflow shutdown sending on
         // parallel OS threads.
         let tx = {
-            let emission = inner.emission.lock().await;
+            let emission = launch.emission.lock().await;
             if emission.terminal_sent {
                 return Ok(());
             }
@@ -4240,13 +4439,14 @@ async fn emit_all(inner: &Inner, observations: Vec<Observation>) -> DriverResult
         if tx.capacity() == 0 {
             // The NEXT await parks for consumer capacity; record the worker at
             // the saturation point so regressions acknowledge it instead of
-            // polling channel capacity on a timer.
-            test_barrier::note_emit_waiting(&inner.barrier);
+            // polling channel capacity on a timer. The barrier slot rides the
+            // launch (a shared Arc to the driver's arm slot).
+            test_barrier::note_emit_waiting(&launch.barrier);
         }
         let Ok(permit) = tx.reserve_owned().await else {
             return Ok(());
         };
-        let emission = inner.emission.lock().await;
+        let emission = launch.emission.lock().await;
         if emission.terminal_sent || emission.tx.is_none() {
             // The terminal won while the reservation parked: abandon the slot.
             drop(permit);
@@ -4260,11 +4460,12 @@ async fn emit_all(inner: &Inner, observations: Vec<Observation>) -> DriverResult
 
 /// Emit the session `exited` lifecycle, at most once per launch.
 ///
-/// Two callers race for it: the reader task when stdout hits EOF, and
-/// [`Driver::close`] after the ladder. Whichever arrives first wins; the other
-/// is a no-op, so a consumer never sees the session exit twice (§2.3).
-async fn emit_exit(inner: &Inner, status: &str) -> DriverResult<()> {
-    emit_terminal(inner, |mapper| {
+/// Two callers race for it on the launch scope: the reader task when stdout
+/// hits EOF, and [`Driver::close`] after the ladder. Whichever arrives first
+/// wins; the other is a no-op, so a consumer never sees the session exit
+/// twice (§2.3).
+async fn emit_exit(inner: &Inner, launch: &Launch, status: &str) -> DriverResult<()> {
+    emit_terminal(inner, launch, |mapper| {
         // ma-sdk-state r6 item 4: test fault seam — fail the build AFTER the
         // permit was taken. Dropping the permit on this early return is exactly
         // what must free the terminal slot so the RunHandle reaches EOF.
@@ -4296,19 +4497,21 @@ async fn emit_exit(inner: &Inner, status: &str) -> DriverResult<()> {
 /// machine-readable on the journaled event.
 async fn emit_overflow_exit(
     inner: &Inner,
+    launch: &Launch,
     budget: &BacklogBudget,
     items: usize,
     bytes: usize,
 ) -> DriverResult<()> {
     let (limit_items, limit_bytes) = budget.caps();
-    emit_terminal(inner, move |mapper| {
+    emit_terminal(inner, launch, move |mapper| {
         mapper.session_backlog_overflow_observation(items, bytes, limit_items, limit_bytes)
     })
     .await
 }
 
 /// Build and deliver the single per-launch terminal observation (ma-sdk-state
-/// r14 item 1, directive (d)).
+/// r14 item 1, directive (d); r15 item 1 keeps every touched slot on the
+/// passed [`Launch`]).
 ///
 /// Ordering is a single emission mutex:
 /// 1. the exactly-once guard (`exit_emitted`);
@@ -4326,19 +4529,20 @@ async fn emit_overflow_exit(
 /// still excludes every other ordinary sender.
 async fn emit_terminal(
     inner: &Inner,
+    launch: &Launch,
     build: impl FnOnce(&mut Mapper) -> DriverResult<Observation>,
 ) -> DriverResult<()> {
-    if inner.exit_emitted.swap(true, Ordering::SeqCst) {
+    if launch.exit_emitted.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
-    let permit = inner.exit_permit.lock().await.take();
+    let permit = launch.exit_permit.lock().await.take();
     // Build BEFORE sealing: a build error must leave the seal unset and drop
     // the just-taken permit, exactly as the r6 item 4 fault contract requires.
     let observation = {
         let mut mapper = inner.mapper.lock().await;
         build(&mut mapper)?
     };
-    let mut emission = inner.emission.lock().await;
+    let mut emission = launch.emission.lock().await;
     if emission.terminal_sent {
         // Defensive: another terminal path won the mutex even though
         // exit_emitted should already have stopped it.
@@ -4360,7 +4564,7 @@ async fn emit_terminal(
     };
     drop(emission);
     if let Ok(slot) = tx.reserve_owned().await {
-        let emission = inner.emission.lock().await;
+        let emission = launch.emission.lock().await;
         if emission.tx.is_some() {
             slot.send(observation);
         }
@@ -8143,12 +8347,18 @@ mod emission_ordering_tests {
             .clone()
             .try_reserve_owned()
             .expect("the terminal slot reserves");
-        {
-            let mut emission = inner.emission.lock().await;
-            emission.tx = Some(tx);
-            emission.terminal_sent = false;
-        }
-        *inner.exit_permit.lock().await = Some(exit_permit);
+        // The emission state is launch-scoped (r15 item 1); the in-crate
+        // publication tests drive the launch directly with no child.
+        let budget = BacklogBudget::new(16_384, 128 * 1024 * 1024);
+        let (publish_queue, _publish_rx) = PublishQueue::new(budget);
+        let launch = Launch::new(
+            publish_queue,
+            Some(tx),
+            Some(exit_permit),
+            None,
+            #[cfg(feature = "test-stub")]
+            Arc::clone(&inner.barrier),
+        );
 
         let ordinary = {
             let mut mapper = inner.mapper.lock().await;
@@ -8168,7 +8378,6 @@ mod emission_ordering_tests {
 
         // Fast drainer: frees slots as fast as it can, which is exactly what
         // lets a parked ordinary send compete with the terminal send.
-        let drainer_inner = Arc::clone(&inner);
         let drainer_notify = std::sync::Arc::clone(&drained_before_terminal);
         let drainer_seen = std::sync::Arc::clone(&ordinary_seen);
         let drainer = tokio::spawn(async move {
@@ -8197,11 +8406,13 @@ mod emission_ordering_tests {
         // Emitters hammer the ordinary path on parallel OS threads.
         let mut emitters = Vec::new();
         for _ in 0..EMITTERS {
-            let inner = Arc::clone(&inner);
+            let launch = Arc::clone(&launch);
             let obs = ordinary.clone();
             emitters.push(tokio::spawn(async move {
                 for _ in 0..PER_EMITTER {
-                    emit_all(&inner, vec![obs.clone()]).await.expect("emit_all");
+                    emit_all(&launch, vec![obs.clone()])
+                        .await
+                        .expect("emit_all");
                 }
             }));
         }
@@ -8210,7 +8421,11 @@ mod emission_ordering_tests {
         // then fire the terminal on yet another thread.
         drained_before_terminal.notified().await;
         let terminal_inner = Arc::clone(&inner);
-        let terminal = tokio::spawn(async move { emit_exit(&terminal_inner, "exited").await });
+        let terminal_launch = Arc::clone(&launch);
+        let terminal =
+            tokio::spawn(
+                async move { emit_exit(&terminal_inner, &terminal_launch, "exited").await },
+            );
         tokio::time::timeout(Duration::from_secs(10), terminal)
             .await
             .unwrap_or_else(|_| panic!("iteration {iter}: terminal send bound"))
@@ -8224,8 +8439,8 @@ mod emission_ordering_tests {
                 .expect("emitter task");
         }
         // Seal and drop the sender so the drainer reaches channel EOF.
-        inner.emission.lock().await.tx = None;
-        drop(drainer_inner);
+        launch.emission.lock().await.tx = None;
+        drop(launch);
         let (preserved, after) = tokio::time::timeout(Duration::from_secs(10), drainer)
             .await
             .unwrap_or_else(|_| panic!("iteration {iter}: drainer bound"))

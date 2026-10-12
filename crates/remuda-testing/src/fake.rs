@@ -315,8 +315,16 @@ impl Session {
                 // not even the inbound-user echo — one queued turn_started per
                 // prompt accumulates behind a wedged publication worker and
                 // only reservation admission can bound it.
-                let silent = std::env::var("FAKE_CLAUDE_SILENT_PROMPTS").is_ok_and(|v| v == "1")
-                    && self.saw_initialize;
+                //
+                // r15 item 1 adds a FILE-GATED spelling: silence holds only
+                // while the marker file exists, so a relaunched child on the
+                // same driver goes back to answering turns once a test removes
+                // the marker (A overflows silently; B must stay usable).
+                let silent = self.saw_initialize
+                    && (std::env::var("FAKE_CLAUDE_SILENT_PROMPTS").is_ok_and(|v| v == "1")
+                        || std::env::var("FAKE_CLAUDE_SILENT_PROMPTS_FILE")
+                            .as_deref()
+                            .is_ok_and(|path| std::path::Path::new(path).exists()));
                 if !silent && self.flags.replay_user_messages {
                     emit(&incoming)?;
                 }

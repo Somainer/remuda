@@ -1299,12 +1299,13 @@ async fn a_silent_prompt_flood_is_bounded_by_reservation_admission() {
         .expect("the RunHandle reaches recv=None after close");
 }
 
-/// ma-sdk-state r13 item 3: when the overflow shutdown's kill contends with a
-/// held `live` process handle, it must WAIT for the handle and still kill the
-/// flooding child — the old `try_lock` skipped the signals permanently on
-/// contention.
+/// ma-sdk-state r13 item 3 (revised r15 item 1): the overflow shutdown used to
+/// re-read the driver's live slot, so a held handle could delay (or a skipped
+/// `try_lock` permanently miss) the kill. The shutdown now signals the launch's
+/// CAPTURED pid/pgid directly, so the SIGKILL lands THROUGH a live lock the
+/// test keeps held for the whole proof.
 #[tokio::test]
-async fn an_overflow_kill_contending_on_live_still_reaps_the_child() {
+async fn an_overflow_kill_reaches_the_child_through_a_held_live_handle() {
     const ITEM_CAP: usize = 32;
     const BYTE_CAP: usize = 256 * 1024;
 
@@ -1327,35 +1328,24 @@ async fn an_overflow_kill_contending_on_live_still_reaps_the_child() {
 
     let barrier = driver.arm_write_commit_barrier();
 
-    // Hold the live process handle BEFORE the flood trips: the overflow kill
-    // must park on this lock rather than skip the child.
+    // Hold the live process handle BEFORE the flood trips and KEEP it through
+    // the kill: the launch-scoped shutdown must not need it.
     let live_hold = driver
         .bounded_hold_live_for_test(Duration::from_secs(5))
         .await;
 
-    // ACKNOWLEDGED: the shutdown sealed admission and reached the kill step
-    // while the handle is held.
+    // ACKNOWLEDGED: the shutdown sealed admission and reached the kill step.
     barrier
         .wait_until_overflow_kill_waiting(Duration::from_secs(10))
         .await;
-    assert!(
-        process_alive(&pid),
-        "the flooding child is still alive while the guaranteed kill waits for the handle"
-    );
 
-    // Release the handle: the kill lands and the terminal is delivered.
-    drop(live_hold);
+    // The SIGKILL lands while the handle is STILL held — the kill targets the
+    // captured pid, never the driver's live slot. Pre-close evidence goes
+    // through the named bounded, event-driven death waiter (r15 item 2).
+    wait_child_gone_or_zombie(&pid, Duration::from_secs(15)).await;
     barrier
         .wait_until_backlog_overflow(Duration::from_secs(10))
         .await;
-
-    // The SIGKILL landed even though close has not reaped yet: the direct
-    // child is therefore GONE or a zombie (/proc state Z), which
-    // group_alive (signal 0) cannot distinguish from a live process. This is
-    // the pre-close evidence — close's own ladder would otherwise mask a
-    // skipped overflow kill. It goes through the named bounded death waiter
-    // (ma-sdk-state r14: no inline poll/sleep at the call site).
-    wait_child_gone_or_zombie(&pid, Duration::from_secs(15)).await;
 
     // The terminal diagnostic rides the reserved permit.
     let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
@@ -1372,18 +1362,19 @@ async fn an_overflow_kill_contending_on_live_still_reaps_the_child() {
             .is_some_and(|reason| reason == "publication_backlog_overflow")
     }));
 
+    drop(live_hold);
     drop(barrier);
     wait_bounded(
         driver.close(),
         Duration::from_secs(20),
-        "close after the contended overflow kill",
+        "close after the captured-pid overflow kill",
     )
     .await
-    .expect("bounded test wait timed out: waiting for close after the contended overflow kill")
+    .expect("bounded test wait timed out: waiting for close after the overflow kill")
     .expect("close ack");
     assert!(
         !process_alive(&pid),
-        "close reaps the SIGKILLed group the contended overflow already killed"
+        "close reaps the SIGKILLed group the overflow kill already reached"
     );
     let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
         .await
@@ -1439,8 +1430,9 @@ async fn aborting_the_triggering_send_mid_overflow_shutdown_still_kills_and_publ
         .wait_until_overflow_kill_gate_parked(Duration::from_secs(20))
         .await;
 
-    // Contend the kill exactly like the r13 item-3 fixture: take the live
-    // handle BEFORE releasing the shutdown into its kill step.
+    // Contend the kill with a held live handle, exactly like the old r13
+    // item-3 fixture: with the launch-scoped captured-pid kill the handle is
+    // now irrelevant, but keeping it held proves the kill does not read it.
     let live_hold = driver
         .bounded_hold_live_for_test(Duration::from_secs(5))
         .await;
@@ -1452,20 +1444,17 @@ async fn aborting_the_triggering_send_mid_overflow_shutdown_still_kills_and_publ
     let _ = wait_bounded(&mut flooder, Duration::from_secs(5), "the aborted flooder").await;
     assert!(
         process_alive(&pid),
-        "the child is still alive while the kill contends for the held handle"
+        "the child is still alive while the shutdown parks at the pre-kill gate"
     );
 
-    // Release the shutdown into its kill; the held live handle blocks it, and
-    // the child still cannot have been killed meanwhile.
+    // Release the shutdown into its kill: it reaches the captured pid THROUGH
+    // the still-held live handle, rather than waiting for it.
     barrier.release_overflow_kill();
-    assert!(
-        process_alive(&pid),
-        "the kill lands only once the live handle is released"
-    );
+    wait_child_gone_or_zombie(&pid, Duration::from_secs(15)).await;
     drop(live_hold);
 
-    // The detached shutdown survived the abort: the kill lands and the
-    // terminal diagnostic is published.
+    // The detached shutdown survived the abort: the terminal diagnostic is
+    // published after the kill.
     barrier
         .wait_until_backlog_overflow(Duration::from_secs(20))
         .await;
@@ -1501,6 +1490,144 @@ async fn aborting_the_triggering_send_mid_overflow_shutdown_still_kills_and_publ
     let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
         .await
         .expect("the RunHandle reaches recv=None after close");
+}
+
+/// ma-sdk-state r15 item 1: the overflow shutdown is LAUNCH-SCOPED.
+///
+/// Park launch A's spawned overflow shutdown at its pre-kill gate, close A
+/// (close must finish the detached shutdown itself — bounded join then abort —
+/// before its kill ladder), start B, and only then release A's gate. A
+/// shutdown that merely detached and re-read the driver's live slot would now
+/// kill B's child; the launch-scoped shutdown signals A's captured pid only
+/// (and the parked task was aborted by close), so B stays alive and answers a
+/// real turn after the gate release.
+#[tokio::test]
+async fn a_parked_overflow_shutdown_cannot_kill_the_relaunched_child() {
+    const ITEM_CAP: usize = 256;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    // The silent fixture is FILE-GATED: present while A floods, removed before
+    // B starts, so the relaunched child answers turns normally.
+    let marker = std::env::temp_dir().join(format!("remuda-r15-1-silent-{}", std::process::id()));
+    std::fs::write(&marker, b"x").expect("create the silence marker");
+    let mut env = BTreeMap::new();
+    env.insert(
+        "FAKE_CLAUDE_SILENT_PROMPTS_FILE".into(),
+        marker.to_string_lossy().into_owned(),
+    );
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.release();
+    barrier.hold_overflow_kill();
+
+    // Launch A and flood reservations until A's overflow shutdown spawns and
+    // parks at the pre-kill gate.
+    let mut handle_a = wait_bounded(
+        driver.start(spec.clone()),
+        Duration::from_secs(10),
+        "start A",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for start A")
+    .expect("start A");
+    let d = driver.clone();
+    let flooder = tokio::spawn(async move {
+        for n in 0..4_000usize {
+            let id = format!("msg-r15-1-a-{n}");
+            if d.send(prompt_id("silent turn", &id)).await.is_err() {
+                break;
+            }
+        }
+    });
+    barrier
+        .wait_until_overflow_kill_gate_parked(Duration::from_secs(20))
+        .await;
+    join_bounded(
+        flooder,
+        Duration::from_secs(10),
+        "A's flood after the refusal",
+    )
+    .await;
+
+    // Close A with the shutdown STILL parked. close must finish the detached
+    // task (bounded join → abort at the gate → await its unwind) before it
+    // returns; the close ladder then kills and reaps A itself.
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close A with shutdown parked",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close A")
+    .expect("close A ack");
+    let a_tail = drain_until_closed(&mut handle_a, Duration::from_secs(5))
+        .await
+        .expect("RunHandle A reaches recv=None after close");
+    // The parked overflow never published; close covered A with an ordinary
+    // exit (no overflow terminal leaking from the aborted task).
+    assert!(
+        !a_tail.iter().any(|o| session_terminal_related(o)
+            .and_then(|r| r.get("reason"))
+            .is_some_and(|reason| reason == "publication_backlog_overflow")),
+        "close A aborts the parked shutdown before it publishes: {a_tail:?}"
+    );
+
+    // B starts on the same driver while A's gate is still shut.
+    std::fs::remove_file(&marker).expect("un-silence the relaunched fake");
+    let mut handle_b = wait_bounded(
+        driver.start(spec.clone()),
+        Duration::from_secs(10),
+        "start B",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for start B")
+    .expect("start B");
+    let pid_b = handle_b
+        .ack()
+        .native_ids
+        .get("pid")
+        .expect("pid on B's launch ack")
+        .clone();
+
+    // NOW release A's parked pre-kill gate. Nothing (in the fixed code: no
+    // task at all) may reach B.
+    barrier.release_overflow_kill();
+
+    // B is alive and usable: a full turn round-trip completes AFTER the gate
+    // release. The regression killed B's child from the stale live slot, so B
+    // never answered and its handle got an exit instead.
+    wait_bounded(
+        driver.send(prompt_id("hello after relaunch", "msg-r15-1-b")),
+        Duration::from_secs(10),
+        "B accepts the post-gate prompt",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for B's send")
+    .expect("B accepts the prompt");
+    let b_obs = collect_until(&mut handle_b, Duration::from_secs(15), |seen| {
+        turn_done_count(seen) >= 1
+    })
+    .await;
+    assert!(
+        turn_done_count(&b_obs) >= 1,
+        "B completes a real turn after A's gate release: {b_obs:?}"
+    );
+    assert!(
+        process_alive(&pid_b),
+        "B's child is still alive after A's shutdown gate released"
+    );
+
+    drop(barrier);
+    wait_bounded(driver.close(), Duration::from_secs(20), "close B")
+        .await
+        .expect("bounded test wait timed out: waiting for close B")
+        .expect("close B ack");
+    let _tail = drain_until_closed(&mut handle_b, Duration::from_secs(5))
+        .await
+        .expect("RunHandle B reaches recv=None after close");
 }
 
 /// ma-sdk-state r13 item 4: when the overflow terminal is published with the

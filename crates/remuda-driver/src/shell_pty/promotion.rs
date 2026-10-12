@@ -1049,70 +1049,23 @@ pub(super) fn spawn(
                         }
                     }
                 }
-                // One report derived from the NATIVE hook binding. Its source
-                // was folded by the bus at hook delivery (r9 item 1): reading
-                // it here sizes the first tick correctly even when this
-                // report has not yet been ingested into `start_sources`, so a
-                // /clear whose Z.jsonl already holds the queued prompt is
-                // classified Fresh instead of an unverified EOF anchor.
-                let hook_report = SessionStartReport::from_bus_binding(&binding);
-                if session_modes
-                    .mode_for(binding.pid, &binding.session_id)
-                    .is_none()
-                {
-                    session_modes.record(
-                        binding.pid,
-                        &binding.session_id,
-                        binding.transcript_path.as_deref().map(std::path::Path::new),
-                        pre_resume_mode,
-                        hook_report
-                            .as_ref()
-                            .and_then(|report| report.start_source.as_deref()),
-                        found.as_ref().expect("matched foreground"),
-                    );
-                }
-                if let Some(report) = hook_report {
-                    // r7 item 1: the authenticated report names the session
-                    // ACTUALLY live in this pid. It governs both when an
-                    // existing binding flips (/resume, /clear after the launch
-                    // session was bound) and when NOTHING is bound yet (the
-                    // lazy-create case: argv still names the launch session
-                    // while its stale file would otherwise win resolve's argv
-                    // channel). Either way the hydrator reopens against the
-                    // reported session and its sticky boundary.
-                    let rebound = bindings.rebind_authenticated_start(
-                        found.as_ref().expect("matched foreground"),
-                        &report,
-                    );
-                    let first_claim = !rebound
-                        && bindings.binding().is_none()
-                        && found.as_ref().is_some_and(|found| {
-                            found.session_id.as_deref() != Some(report.session_id.as_str())
-                        })
-                        && bindings.bind_authenticated_report(
-                            found.as_ref().expect("matched foreground"),
-                            &report,
-                        );
-                    if rebound || first_claim {
-                        // c-effortread r10 item 6: switching to a different
-                        // session EXPLICITLY withdraws the transcript the live
-                        // hydrator was reading — it will not be polled while
-                        // absent and its file cannot be proven unchanged, so a
-                        // later restore of the old (pid, session) must reopen
-                        // unverified rather than resume the cached gate.
-                        if let Some(previous) = active_session.take()
-                            && previous.1 != report.session_id
-                        {
-                            mark_session_withdrawn(
-                                previous,
-                                &mut read_anchors,
-                                &mut withdrawn_sessions,
-                            );
-                        }
-                        hydrator = None;
-                        announced = None;
-                    }
-                    bindings.ingest_session_start(report);
+                // One production seam (c-effortread r11 item 7): classify the
+                // bus-derived report, run the authenticated rebind/first-claim
+                // arm and the explicit-withdrawal marking, then ingest. The
+                // same function is what tests drive — never a hand-built
+                // record/rebind sequence.
+                if apply_native_session_binding(
+                    &bindings,
+                    found.as_ref().expect("matched foreground"),
+                    &binding,
+                    pre_resume_mode,
+                    &mut session_modes,
+                    &mut read_anchors,
+                    &mut withdrawn_sessions,
+                    &mut active_session,
+                ) {
+                    hydrator = None;
+                    announced = None;
                 }
             }
 
@@ -1983,6 +1936,80 @@ fn mark_session_withdrawn(
         anchor.mark_withdrawn();
     }
     withdrawn.insert(key);
+}
+
+/// Apply one NATIVE SessionStart binding for the current foreground — the
+/// single production seam the poll loop runs once per tick and the one tests
+/// drive (c-effortread r11 item 7: no hand-built `table.record` / rebind /
+/// `mark_session_withdrawn` sequences).
+///
+/// 1. classifies the bus-derived report's sticky boundary BEFORE it is
+///    ingested into `start_sources` (a /clear whose transcript already holds
+///    the queued prompt is sized Fresh from the authenticated source, not from
+///    file size);
+/// 2. runs the authenticated rebind (or first-claim) against the observed
+///    foreground, dropping/marking the previous session;
+/// 3. explicitly withdraws the live session when the report names a different
+///    one;
+/// 4. ingests the report so later ticks (and pid-file binds) see its source.
+///
+/// Returns true when the rebind/first-claim dropped the live hydrator.
+#[allow(clippy::too_many_arguments)]
+fn apply_native_session_binding(
+    bindings: &BindingHandle,
+    found: &Detected,
+    binding: &remuda_signal::SessionBinding,
+    pre_resume_mode: Option<ResumeMode>,
+    session_modes: &mut SessionModeTable,
+    read_anchors: &mut std::collections::HashMap<(i32, String), TailAnchor>,
+    withdrawn_sessions: &mut std::collections::HashSet<(i32, String)>,
+    active_session: &mut Option<(i32, String)>,
+) -> bool {
+    // One report derived from the NATIVE hook binding. Its source was folded
+    // by the bus at hook delivery (r9 item 1): reading it here sizes the first
+    // tick correctly even before the report is ingested into `start_sources`.
+    let hook_report = SessionStartReport::from_bus_binding(binding);
+    if session_modes
+        .mode_for(binding.pid, &binding.session_id)
+        .is_none()
+    {
+        session_modes.record(
+            binding.pid,
+            &binding.session_id,
+            binding.transcript_path.as_deref().map(std::path::Path::new),
+            pre_resume_mode,
+            hook_report
+                .as_ref()
+                .and_then(|report| report.start_source.as_deref()),
+            found,
+        );
+    }
+    let Some(report) = hook_report else {
+        return false;
+    };
+    // r7 item 1: the authenticated report names the session ACTUALLY live in
+    // this pid, both for a rebind (/resume, /clear after the launch session
+    // was bound) and for the lazy-create first claim (argv still names the
+    // launch session while the hook already reports the new one).
+    let rebound = bindings.rebind_authenticated_start(found, &report);
+    let first_claim = !rebound
+        && bindings.binding().is_none()
+        && found.session_id.as_deref() != Some(report.session_id.as_str())
+        && bindings.bind_authenticated_report(found, &report);
+    if rebound || first_claim {
+        // c-effortread r10 item 6: switching sessions EXPLICITLY withdraws the
+        // transcript the live hydrator was reading — it will not be polled
+        // while absent and its file cannot be proven unchanged, so a later
+        // restore of the old (pid, session) reopens unverified even with the
+        // same inode or a cached verified anchor.
+        if let Some(previous) = active_session.take()
+            && previous.1 != report.session_id
+        {
+            mark_session_withdrawn(previous, read_anchors, withdrawn_sessions);
+        }
+    }
+    bindings.ingest_session_start(report);
+    rebound || first_claim
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3953,6 +3980,47 @@ mod tests {
         )
     }
 
+    /// c-effortread r11 item 7: fold one SessionStart through the REAL native
+    /// bus and return the folded binding — exactly the payload the promotion
+    /// loop feeds to `apply_native_session_binding`. Tests never hand-build a
+    /// SessionStartReport for a hook-driven rebind anymore.
+    async fn native_binding(
+        session: &str,
+        path: &std::path::Path,
+        cwd: &std::path::Path,
+        source: Option<&str>,
+    ) -> remuda_signal::SessionBinding {
+        let (tx, _rx) = mpsc::channel(256);
+        let bus = remuda_signal::SignalBus::new(
+            remuda_signal::BusContext {
+                instance_id: InstanceId::new(),
+                host_id: HostId::new(),
+                journal_id: Id::new("obj").expect("journal id"),
+                run_id: RunId::new(),
+                driver_kind: remuda_protocol::DriverKind::ShellPty,
+                adapter_version: "test".into(),
+            },
+            tx,
+            Arc::new(AtomicU64::new(0)),
+        );
+        let mut payload = serde_json::json!({
+            "session_id": session,
+            "transcript_path": path.to_string_lossy(),
+            "cwd": cwd.to_string_lossy(),
+        });
+        if let Some(source) = source {
+            payload["source"] = serde_json::json!(source);
+        }
+        bus.handle(remuda_signal::HookEnvelope {
+            credential: "cred".into(),
+            event: "SessionStart".into(),
+            ppid: 7,
+            payload,
+        })
+        .await;
+        bus.binding().expect("the native bus folded a binding")
+    }
+
     /// Core unverifiable-resume assertion shared by the item 1/2 cases: the
     /// pump anchors at current EOF, conversation appended afterwards still
     /// hydrates, and the effort gate never opens.
@@ -4691,6 +4759,10 @@ mod tests {
     /// publish Current evidence.
     #[tokio::test]
     async fn r8_item6_returning_to_launch_after_clear_reopens_unverified_via_maintain_binding() {
+        use crate::effort::{EffortBridge, EffortRequest};
+        use remuda_protocol::EffortAxis::Tier;
+        use remuda_protocol::EffortSemantics::Decoupled;
+
         let dir = tempfile::tempdir().expect("tmp");
         let cwd = dir.path().join("repo");
         std::fs::create_dir_all(&cwd).expect("mkdir");
@@ -4700,6 +4772,21 @@ mod tests {
         fx.ctx.cwd = cwd.clone();
         fx.binding.session_id = "launch-x".to_owned();
         fx.binding.path = launch_path.clone();
+
+        // A REAL bridge with a request armed across the whole sequence. The
+        // replaced X's historical slash/verdict must never settle it.
+        let bridge = Arc::new(EffortBridge::new());
+        let armed = EffortRequest::for_configure(
+            "max",
+            Some(false),
+            Some(Tier),
+            Decoupled,
+            None,
+            None,
+            Some("req-returning-x"),
+        )
+        .expect("max tier request");
+        bridge.arm(armed);
 
         let bindings = BindingHandle::empty();
         bindings.begin_epoch(&cwd, dir.path());
@@ -4713,18 +4800,21 @@ mod tests {
         let mut active_session: Option<(i32, String)> = None;
         let found_x = detected_claude(7, Some("launch-x"));
 
-        let report_for =
-            |session_id: &str, path: &std::path::Path, source: Option<&str>| SessionStartReport {
-                session_id: session_id.to_owned(),
-                transcript_path: path.to_path_buf(),
-                cwd: Some(cwd.clone()),
-                ppid: Some(7),
-                start_source: source.map(str::to_owned),
-            };
-        bindings.ingest_session_start(report_for("launch-x", &launch_path, None));
-
-        // Tick 1: the launch session binds with a pre-spawn Unverified mode
-        // (a Remuda --resume capture), exactly as the loop passes it.
+        // Tick 1: the launch SessionStart rides the NATIVE bus through the
+        // production hook seam, then maintain_binding binds and pumps.
+        let launch_binding = native_binding("launch-x", &launch_path, &cwd, None).await;
+        // The launch report names the same session argv already does: no
+        // rebind, the first maintain_binding tick resolves the argv channel.
+        assert!(!apply_native_session_binding(
+            &bindings,
+            &found_x,
+            &launch_binding,
+            Some(ResumeMode::Unverified),
+            &mut session_modes,
+            &mut read_anchors,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        ));
         maintain_binding(
             &bindings,
             &fx.ctx,
@@ -4733,7 +4823,7 @@ mod tests {
             &mut announced,
             &fx.tx,
             &fx.seq,
-            None,
+            Some(&bridge),
             None,
             None,
             None,
@@ -4750,17 +4840,24 @@ mod tests {
         assert!(hydrator.is_some(), "launch X hydrates");
         let _ = drain(&mut fx);
 
-        // Tick 2: an in-TUI /clear to Z (Fresh rebound). The production loop
-        // rebinds on the authenticated start and drops the hydrator; the mode
-        // table records Z as Fresh from the source.
-        bindings.ingest_session_start(report_for("clear-z", &clear_path, Some("clear")));
+        // Tick 2: an in-TUI /clear to Z (Fresh rebound) over the native bus.
+        // The production seam performs the rebind, the withdrawal marking and
+        // the report ingestion; it returns true so the caller drops hydrator.
+        let clear_binding = native_binding("clear-z", &clear_path, &cwd, Some("clear")).await;
         let found_z = detected_claude(7, Some("clear-z"));
-        assert!(bindings.rebind_authenticated_start(
+        assert!(apply_native_session_binding(
+            &bindings,
             &found_z,
-            &report_for("clear-z", &clear_path, Some("clear"))
+            &clear_binding,
+            None,
+            &mut session_modes,
+            &mut read_anchors,
+            &mut withdrawn_sessions,
+            &mut active_session,
         ));
-        // Production rebind arm: the previous session's hydrator is dropped.
+        // Production loop rebind arm.
         hydrator = None;
+        announced = None;
         fx.binding.session_id = "clear-z".to_owned();
         fx.binding.path = clear_path.clone();
         maintain_binding(
@@ -4771,7 +4868,7 @@ mod tests {
             &mut announced,
             &fx.tx,
             &fx.seq,
-            None,
+            Some(&bridge),
             None,
             None,
             None,
@@ -4789,30 +4886,66 @@ mod tests {
         let _ = drain(&mut fx);
 
         // Tick 3: /resume back to X. X.jsonl was REPLACED with a DISTINCT
-        // inode carrying a prior session's high record; the old anchor cannot
-        // validate. Rename the old file aside first so the recreated session
-        // file gets a NEW inode (a quick remove+create can reuse the inode).
+        // inode carrying a prior session's high record AND a historical
+        // /effort max slash+verdict — the exact pair that settles the armed
+        // request when the boundary is wrongly Fresh. Rename the old file
+        // aside so the recreated session file gets a NEW inode.
         std::fs::rename(&launch_path, dir.path().join("launch-x.old"))
             .expect("move the old X inode aside");
-        let high_record = serde_json::json!({
+        let x_slash_max = |n: u64| {
+            serde_json::json!({
+                "type": "user",
+                "uuid": format!("cmd-{n}"),
+                "sessionId": "launch-x",
+                "version": DECOUPLED,
+                "message": {
+                    "role": "user",
+                    "content": "<command-name>/effort</command-name>\n<command-message>effort</command-message>\n<command-args>max</command-args>",
+                },
+            })
+            .to_string()
+                + "\n"
+        };
+        let x_stdout = |n: u64, body: &str| {
+            serde_json::json!({
+                "type": "user",
+                "uuid": format!("out-{n}"),
+                "sessionId": "launch-x",
+                "version": DECOUPLED,
+                "message": {"role": "user", "content": format!("<local-command-stdout>{body}</local-command-stdout>")},
+            })
+            .to_string()
+                + "\n"
+        };
+        let restored_history = serde_json::json!({
             "type": "assistant",
             "uuid": "msg-5",
             "sessionId": "launch-x",
             "version": DECOUPLED,
-            "message": { "id": "msg-5", "role": "assistant",
-                "content": [{"type":"text","text":"high reply"}],
-                "effort": "high" },
+            "message": {
+                "id": "msg-5",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "high reply"}],
+                "effort": "high"
+            },
         })
         .to_string()
             + "\n";
-        let restored = slug_session(dir.path(), &cwd, "launch-x", &high_record);
-        bindings.ingest_session_start(report_for("launch-x", &restored, Some("resume")));
-        assert!(bindings.rebind_authenticated_start(
+        let restored = slug_session(dir.path(), &cwd, "launch-x", &restored_history);
+        let resume_binding = native_binding("launch-x", &restored, &cwd, Some("resume")).await;
+        assert!(apply_native_session_binding(
+            &bindings,
             &found_x,
-            &report_for("launch-x", &restored, Some("resume"))
+            &resume_binding,
+            None,
+            &mut session_modes,
+            &mut read_anchors,
+            &mut withdrawn_sessions,
+            &mut active_session,
         ));
-        // Production rebind arm: the prior session's hydrator is dropped.
+        // Production loop rebind arm.
         hydrator = None;
+        announced = None;
         fx.binding.session_id = "launch-x".to_owned();
         fx.binding.path = restored.clone();
         maintain_binding(
@@ -4823,7 +4956,7 @@ mod tests {
             &mut announced,
             &fx.tx,
             &fx.seq,
-            None,
+            Some(&bridge),
             None,
             None,
             None,
@@ -4843,14 +4976,63 @@ mod tests {
             "returning to X reuses its Unverified boundary, not Z's Fresh: {:?}",
             session_modes.mode_for(7, "launch-x").map(|m| m.mode)
         );
+        assert!(
+            !effort_rows(&drain(&mut fx))
+                .iter()
+                .any(|(name, _)| *name == Some(remuda_protocol::EffortName::High)
+                    || *name == Some(remuda_protocol::EffortName::Max)),
+            "the replaced X history never publishes Current effort"
+        );
+
+        // A same-session /effort max slash + accepted verdict arrive while the
+        // boundary is still unverified (the resumed session keeps emitting).
+        // They hydrate conversation under Unverified provenance but must
+        // neither publish an effort edge nor settle the armed bridge request.
+        append_line(&fx.binding.path, &x_slash_max(6));
+        append_line(
+            &fx.binding.path,
+            &x_stdout(
+                7,
+                "Set effort level to max (this session only): Maximum capability",
+            ),
+        );
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &found_x,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
+            Some(&bridge),
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            Some(ResumeMode::Unverified),
+            &mut read_anchors,
+            &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        )
+        .await;
         let observations = drain(&mut fx);
         assert!(
             !effort_rows(&observations)
                 .iter()
-                .any(|(name, _)| *name == Some(remuda_protocol::EffortName::High)),
-            "the replaced X history never publishes Current effort: {:?}",
+                .any(|(name, _)| *name == Some(remuda_protocol::EffortName::High)
+                    || *name == Some(remuda_protocol::EffortName::Max)),
+            "unverified slash/verdict never publishes Current effort: {:?}",
             effort_rows(&observations)
         );
+        // The unverified slash/verdict cannot settle the armed bridge request.
+        let pending = bridge
+            .pending()
+            .expect("the resumed X history never settles the armed request");
+        assert_eq!(pending.request_id.as_deref(), Some("req-returning-x"));
+        assert_eq!(pending.name, remuda_protocol::EffortName::Max);
     }
 
     /// c-effortread r8 item 2: a `/clear` hook with source "clear" is Fresh
@@ -4937,6 +5119,12 @@ mod tests {
     /// keeps the effort read-back gate shut. Unlike the r8 test this goes bus
     /// -> binding -> [`SessionStartReport::from_bus_binding`] -> record -> the
     /// production Hydrator pump, with no hand-passed `Some("clear")`.
+    /// c-effortread r9 item 1 / r11 item 7: the source rides the NATIVE hook
+    /// bus all the way to the first-tick classification, through the PRODUCTION
+    /// `apply_native_session_binding` seam (classify → rebind/first-claim arm
+    /// → ingest) — no manual ingest, no direct rebind call, no table.record
+    /// hand-off. A `/clear` whose Z.jsonl ALREADY holds the queued prompt is
+    /// Fresh: the gate opens and the queued prompt is current-session content.
     #[tokio::test]
     async fn r9_item1_native_bus_clear_source_sizes_z_fresh_at_the_first_tick() {
         let dir = tempfile::tempdir().expect("tmp");
@@ -4951,47 +5139,6 @@ mod tests {
             &user_line(1, "queued before first tick"),
         );
 
-        // Native hook bus: deliver the /clear SessionStart exactly as the
-        // relay socket would, with the folded source.
-        let (tx, _rx) = mpsc::channel(256);
-        let bus = remuda_signal::SignalBus::new(
-            remuda_signal::BusContext {
-                instance_id: InstanceId::new(),
-                host_id: HostId::new(),
-                journal_id: Id::new("obj").expect("journal id"),
-                run_id: RunId::new(),
-                driver_kind: remuda_protocol::DriverKind::ShellPty,
-                adapter_version: "test".into(),
-            },
-            tx,
-            Arc::new(AtomicU64::new(0)),
-        );
-        bus.handle(remuda_signal::HookEnvelope {
-            credential: "cred".into(),
-            event: "SessionStart".into(),
-            ppid: 7,
-            payload: serde_json::json!({
-                "session_id": "clear-z",
-                "transcript_path": z.to_string_lossy(),
-                "cwd": cwd.to_string_lossy(),
-                "source": "clear",
-            }),
-        })
-        .await;
-        let binding = bus.binding().expect("the native bus folded a binding");
-        assert_eq!(binding.source.as_deref(), Some("clear"));
-
-        // The poll loop's own conversion (production seam).
-        let report =
-            SessionStartReport::from_bus_binding(&binding).expect("a named path yields a report");
-        assert_eq!(report.start_source.as_deref(), Some("clear"));
-
-        // c-effortread r10 item 9: the source rides the NATIVE bus all the
-        // way through the PRODUCTION binding + maintain_binding orchestration
-        // (no table.record hand-off, no direct Hydrator::open). The pid's
-        // launch session binds first, exactly like the real loop, then the
-        // authenticated /clear report rebinds it to Z and the next tick
-        // records the sticky mode and pumps the transcript.
         let mut fx = pump_fixture(dir.path(), "{}");
         fx.ctx.cwd = cwd.clone();
         fx.binding.session_id = CORRECT.to_owned();
@@ -5007,13 +5154,21 @@ mod tests {
         let mut withdrawn_sessions = std::collections::HashSet::new();
         let mut active_session: Option<(i32, String)> = None;
         let launch_found = detected_claude(7, Some(CORRECT));
-        bindings.ingest_session_start(SessionStartReport {
-            session_id: CORRECT.to_owned(),
-            transcript_path: launch.clone(),
-            cwd: Some(cwd.clone()),
-            ppid: Some(7),
-            start_source: Some("startup".into()),
-        });
+
+        // The launch SessionStart rides the native bus through the production
+        // seam; argv already names that session, so no rebind happens and the
+        // first maintain_binding tick resolves + pumps it.
+        let launch_binding = native_binding(CORRECT, &launch, &cwd, Some("startup")).await;
+        assert!(!apply_native_session_binding(
+            &bindings,
+            &launch_found,
+            &launch_binding,
+            None,
+            &mut session_modes,
+            &mut read_anchors,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        ));
         maintain_binding(
             &bindings,
             &fx.ctx,
@@ -5039,16 +5194,31 @@ mod tests {
         assert!(hydrator.is_some(), "the launch session hydrates first");
         let _ = drain(&mut fx);
 
-        // The /clear SessionStart (source carried on the native bus) rebinds
-        // the epoch to Z; the next maintain_binding tick records the Fresh
-        // sticky mode from the report and pumps Z's non-empty file.
-        bindings.ingest_session_start(report.clone());
-        let z_found = detected_claude(7, Some("clear-z"));
-        assert!(bindings.rebind_authenticated_start(&z_found, &report));
-        // The production rebind arm drops the previous session's hydrator.
+        // The /clear SessionStart (source folded on the native bus) goes
+        // through the SAME seam: it classifies Z Fresh from the source despite
+        // the non-empty file, performs the authenticated rebind (returning
+        // true so the loop drops the previous hydrator), and ingests. The
+        // argv the poller reads is IMMUTABLE — it still names the launch
+        // session; only the authenticated hook report knows about Z.
+        let z_found = launch_found.clone();
+        let clear_binding = native_binding("clear-z", &z, &cwd, Some("clear")).await;
+        assert_eq!(clear_binding.source.as_deref(), Some("clear"));
+        assert!(apply_native_session_binding(
+            &bindings,
+            &z_found,
+            &clear_binding,
+            None,
+            &mut session_modes,
+            &mut read_anchors,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        ));
+        // The production loop arm on a rebind/first-claim: drop the previous
+        // session's hydrator and its one-shot announce.
         hydrator = None;
+        announced = None;
         fx.binding.session_id = "clear-z".to_owned();
-        fx.binding.path = report.transcript_path.clone();
+        fx.binding.path = z.clone();
         maintain_binding(
             &bindings,
             &fx.ctx,
@@ -5211,15 +5381,16 @@ mod tests {
         );
     }
 
-    /// c-effortread r10 item 6: an EXPLICIT withdrawal (session X renamed away
-    /// while no hydrator polls it, then restored to a new file) must never
-    /// restore the cached verified anchor. Driven through the production
-    /// rebind + maintain_binding orchestration: X hydrates Fresh (capturing a
-    /// live, gate-open anchor), rebind to Z marks X withdrawn, and the
-    /// restored X rebind opens an UNVERIFIED EOF tail — the restored file's
-    /// history never publishes Current evidence and a later current record
-    /// stays gated.
+    /// c-effortread r10 item 6 / r11 item 7: the EXACT verified-anchor
+    /// withdrawal sequence, driven through production lines only (no direct
+    /// `mark_session_withdrawn` / rebind calls):
+    /// rename-away → a maintain_binding pump whose anchor capture FAILS
+    /// (the bound file vanished) marks the withdrawal from the pump's Err arm
+    /// → the loop demotes while absent → the ORIGINAL file is restored (same
+    /// inode, renamed back) → re-promotion reopens UNVERIFIED, so neither the
+    /// restored history nor a later current record publishes effort evidence.
     #[tokio::test]
+    #[allow(unused_assignments)] // the loop-arm `hydrator/announced = None` resets mirror production
     async fn r10_item6_withdrawn_session_restored_reopens_unverified_never_cached_verified() {
         let other_session = "zzzzzzzz-2222-4333-8444-zzzzzzzzzzzz";
         let x_history = assistant_line(Some("high"), 1);
@@ -5230,14 +5401,6 @@ mod tests {
 
         let bindings = BindingHandle::empty();
         bindings.begin_epoch(&fx.ctx.cwd, &fx.ctx.claude_home);
-        let x_report = SessionStartReport {
-            session_id: PUMP_SESSION.to_owned(),
-            transcript_path: fx.binding.path.clone(),
-            cwd: Some(fx.binding.cwd.clone()),
-            ppid: Some(7),
-            start_source: Some("startup".into()),
-        };
-        bindings.ingest_session_start(x_report.clone());
         let mut hydrator: Option<Hydrator> = None;
         let mut announced: Option<String> = None;
         let mut session_modes = SessionModeTable::default();
@@ -5247,6 +5410,25 @@ mod tests {
         let mut withdrawn_sessions = std::collections::HashSet::new();
         let mut active_session: Option<(i32, String)> = None;
 
+        // Tick 1: X hydrates FRESH through the native-bus seam; the first
+        // pump captures a gate-open (live) anchor and publishes high.
+        let x_binding = native_binding(
+            PUMP_SESSION,
+            &fx.binding.path,
+            &fx.binding.cwd,
+            Some("startup"),
+        )
+        .await;
+        assert!(!apply_native_session_binding(
+            &bindings,
+            &found,
+            &x_binding,
+            Some(ResumeMode::Fresh),
+            &mut session_modes,
+            &mut read_anchors,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        ));
         maintain_binding(
             &bindings,
             &fx.ctx,
@@ -5271,70 +5453,127 @@ mod tests {
         .await;
         assert!(hydrator.is_some(), "X hydrates on the first tick");
         assert!(
-            read_anchors.contains_key(&(7, PUMP_SESSION.to_owned())),
-            "the first pump captures X's gate-open anchor"
+            read_anchors
+                .get(&(7, PUMP_SESSION.to_owned()))
+                .is_some_and(|anchor| anchor.current),
+            "the first pump captures X's gate-open live anchor"
         );
-        // X's fresh history published with the gate open.
-        let first = {
-            let mut out = Vec::new();
-            while let Ok(observation) = fx.rx.try_recv() {
-                out.push(observation);
-            }
-            out
-        };
         assert!(
-            effort_rows(&first)
+            effort_rows(&drain(&mut fx))
                 .iter()
                 .any(|(name, _)| *name == Some(remuda_protocol::EffortName::High))
         );
 
-        // The user switches to a DIFFERENT session in the same shell pid
-        // (X "renamed away"): production rebind, exactly as the loop does.
+        // RENAME AWAY: the bound file vanishes while the hydrator is live (no
+        // anchor can be captured this pump).
+        let moved_aside = fx.binding.path.with_extension("jsonl.old");
+        std::fs::rename(&fx.binding.path, &moved_aside).expect("rename X away");
+
+        // The next production pumps fail to open the file. A LIVE tail
+        // tolerates LIVE_MISSING_POLL_DEGRADE transient missing polls; the
+        // final one degrades and its ERR arm marks the withdrawal, downgrades
+        // the cached anchor and drops the hydrator.
+        for missing_tick in 0..LIVE_MISSING_POLL_DEGRADE {
+            maintain_binding(
+                &bindings,
+                &fx.ctx,
+                &found,
+                &mut hydrator,
+                &mut announced,
+                &fx.tx,
+                &fx.seq,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &mut session_modes,
+                &mut launch_mode,
+                Some(ResumeMode::Fresh),
+                &mut read_anchors,
+                &mut effort_seeds,
+                &mut withdrawn_sessions,
+                &mut active_session,
+            )
+            .await;
+            if missing_tick + 1 < LIVE_MISSING_POLL_DEGRADE {
+                assert!(hydrator.is_some(), "a transient miss keeps the hydrator");
+                assert!(!bindings.degraded(), "one miss does not degrade yet");
+            }
+        }
+        assert!(
+            hydrator.is_none(),
+            "the vanished-file arm drops the hydrator"
+        );
+        assert!(bindings.degraded(), "the binding is degraded while absent");
+        assert!(
+            withdrawn_sessions.contains(&(7, PUMP_SESSION.to_owned())),
+            "the pump's failed anchor capture marks X withdrawn"
+        );
+        assert!(
+            read_anchors
+                .get(&(7, PUMP_SESSION.to_owned()))
+                .is_some_and(|anchor| !anchor.current),
+            "the cached anchor is downgraded by the production arm"
+        );
+        let _ = drain(&mut fx);
+
+        // DEMOTE WHILE ABSENT: the exact promotion-loop demote arms.
+        let now = now_ts().expect("timestamp");
+        let mut promote = PromoteState::default();
+        for (completeness, payload) in transition(&mut promote, Some(&found), &now) {
+            emit(
+                &fx.tx,
+                &fx.seq,
+                &fx.ctx,
+                SourceChannel::Runtime,
+                completeness,
+                payload,
+            )
+            .await
+            .expect("emit promote");
+        }
+        for (completeness, payload) in transition(&mut promote, None, &now) {
+            emit(
+                &fx.tx,
+                &fx.seq,
+                &fx.ctx,
+                SourceChannel::Runtime,
+                completeness,
+                payload,
+            )
+            .await
+            .expect("emit demote");
+        }
+        bindings.demobilize();
+        hydrator = None;
+        announced = None;
+        let _ = drain(&mut fx);
+
+        // A different session Z takes the foreground while X is away. The
+        // re-promotion begins a fresh epoch and the authenticated Z report
+        // first-claims the binding through the production seam.
         let z_path = slug_session(
             dir.path(),
             &fx.binding.cwd,
             other_session,
             &assistant_line(Some("medium"), 1),
         );
-        let z_report = SessionStartReport {
-            session_id: other_session.to_owned(),
-            transcript_path: z_path,
-            cwd: Some(fx.binding.cwd.clone()),
-            ppid: Some(7),
-            start_source: Some("resume".into()),
-        };
-        assert!(
-            bindings.rebind_authenticated_start(&found, &z_report),
-            "the authenticated start rebinds X -> Z"
-        );
-        // The production loop's rebind arm: demote X while absent and persist
-        // its withdrawal before dropping the hydrator.
-        if let Some(previous) = active_session.take()
-            && previous.1 != z_report.session_id
-        {
-            mark_session_withdrawn(previous, &mut read_anchors, &mut withdrawn_sessions);
-        }
+        bindings.begin_epoch(&fx.ctx.cwd, &fx.ctx.claude_home);
+        let z_binding =
+            native_binding(other_session, &z_path, &fx.binding.cwd, Some("resume")).await;
+        assert!(apply_native_session_binding(
+            &bindings,
+            &found,
+            &z_binding,
+            None,
+            &mut session_modes,
+            &mut read_anchors,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        ));
         hydrator = None;
-        assert!(withdrawn_sessions.contains(&(7, PUMP_SESSION.to_owned())));
-        let cached = read_anchors
-            .get(&(7, PUMP_SESSION.to_owned()))
-            .expect("X still has a cached anchor");
-        assert!(
-            !cached.current,
-            "the cached anchor is downgraded on withdrawal"
-        );
-
-        // X is RESTORED while we were away: its transcript was replaced with a
-        // brand-new file holding fresh history (different inode/head).
-        std::fs::remove_file(&fx.binding.path).expect("remove old X file");
-        let restored_history = assistant_line(Some("max"), 9);
-        std::fs::write(&fx.binding.path, restored_history).expect("restore X file");
-
-        // The user comes back to X: another production rebind, then a tick.
-        assert!(
-            bindings.rebind_authenticated_start(&found, &x_report),
-            "the authenticated start rebinds Z -> X"
-        );
+        announced = None;
         maintain_binding(
             &bindings,
             &fx.ctx,
@@ -5350,7 +5589,54 @@ mod tests {
             None,
             &mut session_modes,
             &mut launch_mode,
-            Some(ResumeMode::Fresh),
+            None,
+            &mut read_anchors,
+            &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        )
+        .await;
+        assert!(hydrator.is_some(), "Z hydrates while X stays away");
+        let _ = drain(&mut fx);
+
+        // RESTORE THE ORIGINAL FILE (rename back — SAME inode and head) and
+        // come back to X via another authenticated report + production seam.
+        std::fs::rename(&moved_aside, &fx.binding.path).expect("restore the original X file");
+        let x_resume = native_binding(
+            PUMP_SESSION,
+            &fx.binding.path,
+            &fx.binding.cwd,
+            Some("resume"),
+        )
+        .await;
+        assert!(apply_native_session_binding(
+            &bindings,
+            &found,
+            &x_resume,
+            None,
+            &mut session_modes,
+            &mut read_anchors,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        ));
+        hydrator = None;
+        announced = None;
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &found,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            None,
             &mut read_anchors,
             &mut effort_seeds,
             &mut withdrawn_sessions,
@@ -5360,27 +5646,18 @@ mod tests {
         let reopened = hydrator.as_ref().expect("restored X reopens a hydrator");
         assert!(
             !reopened.tail.verified(),
-            "the restored session must NOT restore the cached verified gate"
+            "the SAME-INODE restore still reopens unverified — the withdrawal is sticky"
         );
 
-        // The restored file's HISTORY can never publish Current evidence.
-        let after_restore = {
-            let mut out = Vec::new();
-            while let Ok(observation) = fx.rx.try_recv() {
-                out.push(observation);
-            }
-            out
-        };
+        // The restored ORIGINAL history can never publish Current evidence.
         assert!(
-            !effort_rows(&after_restore)
+            !effort_rows(&drain(&mut fx))
                 .iter()
-                .any(|(name, _)| *name == Some(remuda_protocol::EffortName::Max)),
-            "restored history replays as current: {:?}",
-            effort_rows(&after_restore)
+                .any(|(name, _)| *name == Some(remuda_protocol::EffortName::High)),
+            "restored original history replays as current"
         );
 
-        // Even a genuinely NEW current-process record stays gated while the
-        // boundary is unverified.
+        // Even a genuinely NEW current-process record stays gated.
         append_line(&fx.binding.path, &assistant_line(Some("max"), 10));
         maintain_binding(
             &bindings,
@@ -5397,26 +5674,18 @@ mod tests {
             None,
             &mut session_modes,
             &mut launch_mode,
-            Some(ResumeMode::Fresh),
+            None,
             &mut read_anchors,
             &mut effort_seeds,
             &mut withdrawn_sessions,
             &mut active_session,
         )
         .await;
-        let later = {
-            let mut out = Vec::new();
-            while let Ok(observation) = fx.rx.try_recv() {
-                out.push(observation);
-            }
-            out
-        };
         assert!(
-            !effort_rows(&later)
+            !effort_rows(&drain(&mut fx))
                 .iter()
                 .any(|(name, _)| *name == Some(remuda_protocol::EffortName::Max)),
-            "an unverified boundary never opens the effort gate: {:?}",
-            effort_rows(&later)
+            "an unverified boundary never opens the effort gate"
         );
     }
 

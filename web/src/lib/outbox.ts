@@ -689,12 +689,19 @@ export class Outbox {
    */
   private deliveryFailures = new Map<Id, number>();
   /**
-   * Instances whose guarded delivery the store is about to run IMMEDIATELY
-   * after the current snapshot read (its normal flush loop). Deliverable rows
-   * there need no 0 ms wake — the starting flush IS the in-flight cover; the
-   * store clears this once that loop ends and re-reconciles leftovers.
+   * Per-FLUSH suppression of 0 ms delivery wakes (c-reconnfu gate 21 item 1):
+   * each guarded flush receives a TOKEN scoped to the instances ITS pass read.
+   * The count is REFERENCE-COUNTED because flushes overlap (a timer fires
+   * while another flush is waiting on a contended instance lock): one flush
+   * ending must never clear the suppression another flush still relies on
+   * (the old shared Set let the first leaver drop the other's responsibility).
+   * When the last owner releases an instance it disappears from
+   * {@link deliverySuppressed}, and the ending flush's FRESH authoritative
+   * reconciliation then re-arms every leftover row's one wake.
    */
-  private deliverySuppressed = new Set<Id>();
+  private deliverySuppressed = new Map<Id, number>();
+  private deliveryPasses = new Map<number, Set<Id>>();
+  private nextDeliveryPassToken = 1;
   /**
    * Single bounded READ-RETRY chain for a rejected authoritative read (timer
    * fire or store flush). The retry ends in the SAME central reconciliation;
@@ -1032,6 +1039,7 @@ export class Outbox {
       this.readRetry = null;
     }
     this.deliveryFailures.clear();
+    this.deliveryPasses.clear();
     this.deliverySuppressed.clear();
   }
 
@@ -1104,14 +1112,51 @@ export class Outbox {
     }
   }
 
-  /** Mark instances whose guarded delivery the store starts immediately. */
-  suppressDeliveryWakes(ids: Iterable<Id>) {
-    for (const id of ids) this.deliverySuppressed.add(id);
+  /**
+   * Mark instances whose guarded delivery THIS flush pass is about to run
+   * IMMEDIATELY after its snapshot read. Returns an opaque per-pass TOKEN the
+   * flush later hands back; suppression is reference-counted so overlapping
+   * flushes do not clear one another's cover (gate 21 item 1).
+   */
+  beginDeliveryPass(ids: Iterable<Id>): number {
+    const token = this.nextDeliveryPassToken++;
+    const owned = new Set<Id>();
+    for (const id of ids) {
+      if (owned.has(id)) continue;
+      owned.add(id);
+      this.deliverySuppressed.set(id, (this.deliverySuppressed.get(id) ?? 0) + 1);
+    }
+    this.deliveryPasses.set(token, owned);
+    return token;
   }
 
-  /** Flush loop ended: leftovers must be re-judged without suppression. */
-  clearSuppressedDeliveryWakes() {
-    this.deliverySuppressed.clear();
+  /** Release ONE pass's suppression without reconciling (teardown only). */
+  releaseDeliveryPass(token: number) {
+    const owned = this.deliveryPasses.get(token);
+    if (!owned) return;
+    this.deliveryPasses.delete(token);
+    for (const id of owned) {
+      const left = (this.deliverySuppressed.get(id) ?? 1) - 1;
+      if (left <= 0) this.deliverySuppressed.delete(id);
+      else this.deliverySuppressed.set(id, left);
+    }
+  }
+
+  /**
+   * Flush epilogue (gate 21 item 1): release THIS flush's passes and ALWAYS
+   * re-judge every row from a FRESH authoritative snapshot. A flush that
+   * posted nothing — its instance lock rejected, a claim aborted, or a sibling
+   * held the lock past the 250 ms recovery read — used to leave deliverable
+   * rows without ANY cover: its recovery read had been skipped as
+   * "suppressed" and the old finally only CLEARED the suppression set. The
+   * fresh read runs AFTER this flush's counts are gone, so each leftover row
+   * gets exactly one (backed-off when an attempt failed) wake; a rejected
+   * re-read joins the bounded, lifetime-aware recovery chain.
+   */
+  async endDeliveryPasses(tokens: Iterable<number>): Promise<void> {
+    for (const token of tokens) this.releaseDeliveryPass(token);
+    if (this.disposed || this.unloading) return;
+    await this.refreshDurableRecovering(0);
   }
 
   /**

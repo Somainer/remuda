@@ -1869,6 +1869,15 @@ class HubStore {
     const box = this.outbox;
     if (!box) return;
     if (this.pageIsUnloading) return;
+    // c-reconnfu gate 21 item 1: every pass's suppression is SCOPED to this
+    // flush via reference-counted tokens (an overlapping flush keeps its own
+    // cover), and the finally ALWAYS ends in a fresh authoritative
+    // reconciliation — a pass that posted nothing (its lock request rejected,
+    // a claim aborted, or a sibling held the lock past the bounded recovery
+    // read) used to leave deliverable rows with no wake at all: the recovery
+    // read ran while the pass still suppressed them and the old finally only
+    // cleared the suppression set.
+    const passTokens: number[] = [];
     try {
       // Drain passes; each pass acquires the lock, posts at most the FIRST
       // deliverable unattempted row, and releases — letting queued conversions
@@ -1887,12 +1896,9 @@ class HubStore {
           // durable refresh must not become an unhandled rejection (gate 6 item
           // 4c). Surface it and stop this pass — gate 20 item 4: the failed
           // read KEEPS recovery responsibility via the bounded, lifetime-aware
-          // retry that ends back in the central reconciliation (its 0 ms/
-          // backoff wake re-triggers this flush); other triggers help too.
-          // Fire-and-forget: the bounded timer must outlive this pass and run
-          // AFTER the finally clears delivery suppression, not be awaited
-          // inside the still-suppressed region (a wake armed while suppressed
-          // would be skipped and the row left with no cover).
+          // retry that ends back in the central reconciliation. The finally
+          // joins that SAME chain only AFTER releasing this flush's
+          // suppression, so its reconciliation cannot be skipped as covered.
           this.reconcileToast(err, "刷新待发队列");
           void this.outbox?.deliveryAttemptFailed();
           return;
@@ -1901,11 +1907,12 @@ class HubStore {
           ...new Set(durable.filter((r) => isDeliverableOutbox(r, now)).map((r) => r.instanceId)),
         ];
         // This flush loop is the imminent guarded delivery for every instance
-        // with a deliverable row: mark it before applying the CENTRAL
-        // reconciliation (c-reconnfu gate 20) so no parallel 0 ms delivery
-        // wake is armed for rows THIS loop is about to claim. Live leases get
-        // their one deadline wake; held rows their held-retry clock.
-        box.suppressDeliveryWakes(instances);
+        // with a deliverable row: take a scoped token before applying the
+        // CENTRAL reconciliation (c-reconnfu gate 20) so no parallel 0 ms
+        // delivery wake is armed for rows THIS loop is about to claim. Live
+        // leases get their one deadline wake; held rows their held-retry
+        // clock.
+        passTokens.push(box.beginDeliveryPass(instances));
         box.applyLeaseWakeReconcile(durable);
         let deliveredNew = false;
         for (const instanceId of instances) {
@@ -1934,20 +1941,30 @@ class HubStore {
               box.noteDeliveryProgress(instanceId);
             }
           } catch {
-            // The lease/lock acquisition failed (never a double POST: the row
-            // is inflight with a fresh durable lease). The in-lock read
-            // failure armed its bounded recovery inside the deliverer; a
-            // genuine lock-request failure waits for the next timer /
-            // reconnect under the same id. Keep draining other instances.
+            // The instance lock request itself rejected (deadlock/
+            // SecurityError), or the no-Web-Locks lease wait ran past its
+            // deadline. No double POST is possible, but the pass posts nothing
+            // for this instance: count the bounded attempt so the fresh
+            // reconciliation in the finally arms the backed-off delivery wake
+            // instead of hot-looping, and keep draining other instances.
+            box.noteDeliveryFailure(instanceId);
           }
         }
         if (!deliveredNew) break;
       }
     } finally {
-      // Clear imminent-delivery suppression even on early return: any leftover
-      // row must be re-judged freely by the next central reconciliation (gate
-      // 20 item 4 makes the flush end in one authoritatively).
-      this.outbox?.clearSuppressedDeliveryWakes();
+      const outbox = this.outbox;
+      if (!outbox) return;
+      if (this.pageIsUnloading) {
+        // A genuine teardown owns all cancellation (cancelAllWakesForUnload
+        // already cleared the books); just drop the tokens, arm nothing.
+        for (const token of passTokens) outbox.releaseDeliveryPass(token);
+        return;
+      }
+      // Release ONLY this flush's suppression (overlapping flushes keep
+      // theirs) and ALWAYS re-judge from a fresh authoritative snapshot: a
+      // pass that posted nothing keeps exactly one wake per leftover row.
+      void outbox.endDeliveryPasses(passTokens).catch(() => undefined);
     }
   }
 

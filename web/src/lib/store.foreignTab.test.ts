@@ -812,12 +812,96 @@ it("GATE20 item 3b: H becomes HELD while the guarded flush waits on the instance
   }
 });
 
-/**
- * Gate 20 item 4 harness: one same-owner inflight row whose tracked deadline
- * wake is the only trigger. `inject` runs once right after the deadline fire,
- * before the guarded flush; the row must still be delivered exactly once via
- * the bounded, lifetime-aware recovery that ends in the central reconciliation.
- */
+it("GATE21 item 1b: a guarded flush whose instance lock request rejects keeps one wake and still delivers", async () => {
+  // The deadline/delivery wake's own read lock is granted; the guarded
+  // flush's SECOND lock request rejects (a user-agent lock failure). The old
+  // catch swallowed it and the finally only cleared suppression — the row's
+  // sole wake had fired, so nothing ever re-triggered delivery. The bounded
+  // failure count plus the finally's fresh reconciliation must arm one
+  // backed-off wake; the next attempts get the lock and POST the row.
+  vi.useFakeTimers();
+  const owner = "owner_g21_i1b";
+  const originalNavigator = globalThis.navigator;
+  // Per-name request counter: #1 granted (the fire read), #2 rejected (the
+  // flush's delivery lock), #3+ granted.
+  const tries = new Map<string, number>();
+  const locks = {
+    query: async () => ({ held: [] as Array<{ name: string; mode: string }> }),
+    request(name: string, _opts: unknown, cb: () => Promise<unknown>) {
+      const n = (tries.get(name) ?? 0) + 1;
+      tries.set(name, n);
+      if (n === 2) return Promise.reject(new Error("navigator.locks.request rejected"));
+      return Promise.resolve().then(cb);
+    },
+  };
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  sessionStorage.setItem("remuda-outbox-owner", owner);
+  try {
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) => ({
+        relatedCommandIds: [],
+        command: {
+          commandId,
+          id: commandId,
+          state: "accepted",
+          revision: "1",
+          dispatch: "native-acknowledged",
+          resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    const internal = hubStore as unknown as {
+      flushAllOutbox: () => Promise<void>;
+      outbox: { enqueue: (rec: Partial<OutboxRecord> & {
+        commandId: string;
+        clientRequestId: string;
+        instanceId: string;
+        prompt: string;
+      }) => Promise<unknown> };
+    };
+    await internal.flushAllOutbox();
+    expect(send).not.toHaveBeenCalled();
+
+    await internal.outbox.enqueue({
+      commandId: "cmd_g21_i1b_r",
+      clientRequestId: "local_g21_i1b_r",
+      instanceId: INSTANCE,
+      journalId: JOURNAL,
+      prompt: "deliver me after the rejected lock",
+      createdAt: Date.now(),
+    });
+
+    // Wake #1 read granted; flush lock #2 rejects → one 250 ms backed-off
+    // wake; its fire (#3) and flush lock (#4) deliver.
+    for (let i = 0; i < 200 && send.mock.calls.length === 0; i += 1) {
+      await vi.advanceTimersByTimeAsync(5);
+      await Promise.resolve();
+    }
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBe("cmd_g21_i1b_r");
+    const stored = JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(stored.find((r) => r.commandId === "cmd_g21_i1b_r")?.state).toBe("sent");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+
 async function bootItem4(which: "4a" | "4b" | "4c") {
   vi.useFakeTimers();
   const owner = `owner_g20_${which}`;

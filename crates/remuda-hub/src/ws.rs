@@ -864,8 +864,13 @@ pub(crate) async fn handle_node_method(
             // application is detached. Ack immediately.
             let state = state.clone();
             let host = host_id.as_ref().ok_or(HubError::Unauthenticated)?.clone();
+            // r13 item 4: the authenticated session this event rode, so a
+            // Finished verdict from a replacement carrier cannot settle a
+            // Landing granted to the superseded session.
+            let event_session = *session_generation;
             tokio::spawn(async move {
-                if let Err(error) = crate::gatequeue::on_event(&state, host.as_str(), params).await
+                if let Err(error) =
+                    crate::gatequeue::on_event(&state, host.as_str(), event_session, params).await
                 {
                     tracing::warn!(%error, "gate.event apply failed");
                 }

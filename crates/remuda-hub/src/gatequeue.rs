@@ -974,7 +974,9 @@ async fn dispatch(
                 // apply_result is idempotent on the running state.
                 if let Some(result) = frame.get("result") {
                     if let Ok(result) = serde_json::from_value::<GateRunResult>(result.clone()) {
-                        apply_result(&state, &job_id, result).await;
+                        // r13 item 4: the RPC reply settles only the dispatch's
+                        // own granted session.
+                        apply_result(&state, &job_id, result, dispatch_session).await;
                     }
                 } else if let Some(error) = frame.get("error") {
                     fail_rpc(&state, &job_id, dispatch_generation, error).await;
@@ -1085,6 +1087,7 @@ async fn fail_rpc_inner(state: &AppState, job_id: &str, expected_generation: u32
 pub(crate) async fn on_event(
     state: &AppState,
     from_host: &str,
+    source_session: Option<u64>,
     params: Value,
 ) -> Result<(), HubError> {
     let event: remuda_protocol::GateEventParams =
@@ -1125,7 +1128,11 @@ pub(crate) async fn on_event(
                 })
                 .await;
         }
-        Kind::Finished { result } => apply_result(state, &job_id, *result).await,
+        Kind::Finished { result } => {
+            // r13 item 4: carry the inbound socket's authenticated host/session
+            // so a replacement carrier cannot finish-settle a granted Landing.
+            apply_result(state, &job_id, *result, source_session).await
+        }
     }
     Ok(())
 }
@@ -1133,7 +1140,12 @@ pub(crate) async fn on_event(
 /// Apply a gate run verdict (RPC reply or terminal event). Idempotent: only a
 /// running/canceling job transitions. `pub(crate)` for the deterministic
 /// pre-read-vs-writer race test in the initiator suite.
-pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
+pub(crate) async fn apply_result(
+    state: &AppState,
+    job_id: &str,
+    result: GateRunResult,
+    source_session: Option<u64>,
+) {
     #[cfg(any(test, feature = "test-faults"))]
     let barrier = state.store.gate_apply_barrier();
     // The terminal `finished` event and the `gate.run` reply carry the same
@@ -1183,6 +1195,34 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
         barrier.note_completed();
         return;
     }
+    // r13 item 4 SESSION FENCE: a Landing can only be settled by the exact
+    // authenticated carrier session the grant was bound to. A replacement
+    // carrier B that received A's delayed Finished/reply (generation and host
+    // still equal) rides a different session and must not settle A's granted
+    // push. Read the Hub-only persisted grant session and require the verdict's
+    // source session to equal it. A Landing row's dispatch_session is immutable
+    // while it stays Landing, so the value captured here is still the authority
+    // inside the writer (which re-checks state + generation and this session).
+    let grant_session = state
+        .store
+        .gate_job_dispatch_session(job_id)
+        .await
+        .ok()
+        .flatten();
+    let grant_session_u64 = grant_session.and_then(|v| u64::try_from(v).ok());
+    if existing.state == GateJobState::Landing
+        && source_session.is_none_or(|s| Some(s) != grant_session_u64)
+    {
+        tracing::warn!(
+            job_id,
+            ?source_session,
+            ?grant_session_u64,
+            "dropping Landing verdict from a session that does not hold the grant"
+        );
+        #[cfg(any(test, feature = "test-faults"))]
+        barrier.note_completed();
+        return;
+    }
     // Test-only pre-read barrier: park here (row confirmed live + generation
     // matched) so two real arrivals can be held simultaneously.
     #[cfg(any(test, feature = "test-faults"))]
@@ -1207,12 +1247,15 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
                 job_id,
                 &existing.requested_by,
                 run_log,
-                result.generation,
+                LogAuth {
+                    generation: result.generation,
+                    session: source_session,
+                },
             )
             .await
             {
-                // None: the in-transaction generation gate found the row
-                // advanced between the pre-read and the evidence writer.
+                // None: the in-transaction generation/session gate found the row
+                // advanced (or a non-granted Landing session) before the write.
                 Ok(Some(object_id)) => log_object_id = Some(object_id),
                 Ok(None) => log_object_id = None,
                 Err(error) => tracing::warn!(%error, job_id, "could not persist gate log object"),
@@ -1283,6 +1326,19 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
             // finished-event/RPC-reply: the first arrival moves the row to a
             // terminal state, after which the top guard stands the second down.
             if row.state == GateJobState::Landing {
+                // r13 item 4: re-assert the session fence INSIDE the writer.
+                // The granted session is immutable while the row is Landing, so
+                // the grant_session captured at the pre-read still names the
+                // only session allowed to settle it; a verdict from a
+                // replacement carrier stands down even if state/generation match.
+                if source_session.is_none_or(|s| Some(s) != grant_session_u64) {
+                    tracing::info!(
+                        ?source_session,
+                        ?grant_session_u64,
+                        "dropping Landing verdict in writer from a non-granted session"
+                    );
+                    return None;
+                }
                 for step in &result.steps {
                     match row
                         .steps
@@ -1532,13 +1588,22 @@ pub(crate) async fn apply_result(state: &AppState, job_id: &str, result: GateRun
 
 /// Serialize and store the bounded run log as an `obj_…` gate log object.
 /// One log per job: a later attempt replaces the previous row.
+/// What a bounded run log object is persisted for: the attempt generation and
+/// the authenticated carrier session the verdict rode (r13 item 4). Evidence
+/// for a Landing may only be written by the granted session.
+#[derive(Clone, Copy)]
+pub(crate) struct LogAuth {
+    pub(crate) generation: u32,
+    pub(crate) session: Option<u64>,
+}
+
 async fn persist_run_log(
     state: &AppState,
     project_id: &str,
     job_id: &str,
     created_by: &str,
     run_log: &remuda_protocol::GateRunLog,
-    generation: u32,
+    auth: LogAuth,
 ) -> Result<Option<String>, HubError> {
     let bytes =
         serde_json::to_vec(run_log).map_err(|error| HubError::Internal(error.to_string()))?;
@@ -1551,7 +1616,7 @@ async fn persist_run_log(
     let digest = crate::config::sha256_hex(&bytes);
     state
         .store
-        .insert_gate_log(project_id, job_id, bytes, digest, created_by, generation)
+        .insert_gate_log(project_id, job_id, bytes, digest, created_by, auth)
         .await
         .map_err(HubError::Store)
 }
@@ -2380,6 +2445,27 @@ impl Store {
         .await
     }
 
+    /// r13 item 4: the authenticated carrier session the live dispatch/grant
+    /// is bound to (Hub-only column), so a verdict arriving on a replacement
+    /// session can be compared against the GRANTED session inside the writer.
+    pub(crate) async fn gate_job_dispatch_session(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<i64>, crate::store::StoreError> {
+        let job_id = job_id.to_owned();
+        self.run_named("gate_job_dispatch_session", move |conn| {
+            let value: Option<Option<i64>> = conn
+                .query_row(
+                    "SELECT dispatch_session FROM gate_jobs WHERE id = ?1",
+                    params![job_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(value.flatten())
+        })
+        .await
+    }
+
     /// r13 item 1: list every Landing row together with its grant timestamp
     /// and last remote-probe timestamp (both Hub-only columns).
     pub(crate) async fn list_landing_jobs(
@@ -2918,11 +3004,13 @@ impl Store {
         bytes: Vec<u8>,
         digest: String,
         created_by: &str,
-        generation: u32,
+        auth: LogAuth,
     ) -> Result<Option<String>, crate::store::StoreError> {
         let project_id = project_id.to_owned();
         let job_id = job_id.to_owned();
         let created_by = created_by.to_owned();
+        let source_session_i64 = auth.session.map(|s| i64::try_from(s).unwrap_or(0));
+        let generation = auth.generation;
         // Drain the one-shot insert fault before the 'static writer closure.
         #[cfg(any(test, feature = "test-faults"))]
         let insert_fault = self.take_gate_log_insert_fault();
@@ -2948,6 +3036,24 @@ impl Store {
             if current_attempts.is_some_and(|attempts| attempts != generation) {
                 tx.commit()?;
                 return Ok(None);
+            }
+            // r13 item 4: while the row is Landing the evidence belongs to the
+            // GRANTED carrier session only. A verdict carrying run_log from a
+            // replacement session must not replace the granted attempt's
+            // evidence, checked in the SAME immediate transaction.
+            if let Some(source) = source_session_i64 {
+                let landing_for_other: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM gate_jobs
+                      WHERE id = ?1
+                        AND state = 'landing'
+                        AND (dispatch_session IS NULL OR dispatch_session != ?2)",
+                    params![job_id, source],
+                    |row| row.get(0),
+                )?;
+                if landing_for_other > 0 {
+                    tx.commit()?;
+                    return Ok(None);
+                }
             }
             // The id this job already references, read under the same
             // transaction before any delete. Covers legacy random ids; only

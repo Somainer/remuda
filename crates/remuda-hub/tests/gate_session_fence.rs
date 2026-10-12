@@ -64,6 +64,13 @@ impl RawNode {
         reply.get("result").cloned().unwrap_or(json!({}))
     }
 
+    /// Send a JSON-RPC notification (no `id`); the Hub does not reply.
+    fn notify(&self, method: &str, params: Value) {
+        self.out
+            .send(json!({"jsonrpc": "2.0", "method": method, "params": params}))
+            .unwrap();
+    }
+
     fn run_count(&self) -> usize {
         self.arrivals.lock().unwrap().len()
     }
@@ -428,4 +435,62 @@ async fn full_disconnect_requeues_and_a_fresh_session_is_dispatched_and_grants()
         "fresh session grants: {granted}"
     );
     assert_eq!(h.job(&job).await["state"], json!("landing"));
+}
+
+/// r13 item 4: a granted Landing can only be settled by the authenticated
+/// session that holds the grant. After A is granted and B takes over the host,
+/// a Finished verdict B sends (same host, same generation, even carrying the
+/// exact merge) must be dropped — the row stays Landing; only A's own Finished
+/// (the granted session) settles it landed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_session_finished_cannot_settle_a_granted_landing() {
+    let (h, a) = Harness::new().await;
+    let a_token = a.node_token().to_owned();
+
+    let job = h.enqueue_land("wt/land/settle-fence").await;
+    a.wait_runs(1).await;
+    let a_gen = a.last_run_generation();
+    let granted = a
+        .request(grant_frame("g", &job, a_gen as u32, &h.host))
+        .await;
+    assert_eq!(granted["granted"], json!(true), "{granted}");
+    assert_eq!(h.job(&job).await["state"], json!("landing"));
+
+    // B takes over the host while A's socket stays open.
+    let b = h.connect(&a_token, 4).await;
+
+    let finished = |g: u64| {
+        json!({
+            "jobId": job, "generation": g,
+            "kind": "finished",
+            "result": {
+                "jobId": job, "generation": g, "status": "landed",
+                "mergeSha": MERGE, "mergeRef": "refs/remuda/gate/settle-fence",
+                "steps": []
+            }
+        })
+    };
+
+    // B forges a Finished on the replacement session: dropped, row unchanged.
+    b.notify("gate.event", finished(a_gen));
+    // Give the spawned (detached) apply a bounded moment to run — then prove it
+    // did NOT settle. A poll with an explicit deadline replaces any sleep.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(
+            h.job(&job).await["state"],
+            json!("landing"),
+            "B must not settle A's Landing"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The granted session A sends the identical verdict: it settles landed.
+    a.notify("gate.event", finished(a_gen));
+    let settled = h.wait_state(&job, &["landed", "failed"]).await;
+    assert_eq!(
+        settled["state"],
+        json!("landed"),
+        "only the granted session settles: {settled}"
+    );
 }

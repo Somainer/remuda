@@ -665,7 +665,18 @@ impl RunningHub {
     ) -> anyhow::Result<()> {
         let result: remuda_protocol::GateRunResult =
             serde_json::from_value(result).map_err(|err| anyhow::anyhow!("{err}"))?;
-        crate::gatequeue::apply_result(&self.state, job_id, result).await;
+        // Represent the verdict as arriving on the session the row's live
+        // dispatch rode (the production RPC-callback identity). Tests that need
+        // a replacement carrier drive the raw gate.event/reply path instead.
+        let session = self
+            .state
+            .store
+            .gate_job_dispatch_session(job_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| u64::try_from(v).ok());
+        crate::gatequeue::apply_result(&self.state, job_id, result, session).await;
         Ok(())
     }
 
@@ -720,7 +731,17 @@ impl RunningHub {
     ) -> anyhow::Result<Option<String>> {
         self.store()
             .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
-            .insert_gate_log(project_id, job_id, bytes, digest, created_by, generation)
+            .insert_gate_log(
+                project_id,
+                job_id,
+                bytes,
+                digest,
+                created_by,
+                crate::gatequeue::LogAuth {
+                    generation,
+                    session: None,
+                },
+            )
             .await
             .map_err(|err| anyhow::anyhow!("{err}"))
     }

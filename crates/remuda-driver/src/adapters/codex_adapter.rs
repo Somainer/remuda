@@ -548,9 +548,17 @@ impl CodexAdapter {
                 }) else {
                     return Vec::new();
                 };
-                let Some(response_id) = event.request_id.clone() else {
-                    return Vec::new();
-                };
+                let effective_turn = event.turn_id.clone().or_else(|| turn_id(&record));
+                // c-usagefu r10 item 5 (Ruling B): a per-response usage record
+                // without a native response_id is still a counted call. Emit it
+                // under a DURABLE fallback scope id (stable across a byte-0
+                // replay because it is keyed on the rollout line ordinal) so
+                // the Hub persists response-level coverage for EVERY record;
+                // otherwise the end-of-turn Turn row would be only partially
+                // covered and the rollup could not prove Message==Turn.
+                let response_id = event.request_id.clone().unwrap_or_else(|| {
+                    fallback_response_scope_id(effective_turn.as_deref(), ordinal)
+                });
                 let mut totals = crate::usage::UsageTotals::default();
                 totals.add(event);
                 // Stamp the native turn id so the Hub rollup can count
@@ -562,7 +570,7 @@ impl CodexAdapter {
                 // native-time rate SQL (60 s / 5 min TPM) and lastTurnAt use
                 // the real model-call time instead of ingest time.
                 .with_native_at(native_timestamp(record.timestamp.as_deref()));
-                if let Some(turn) = event.turn_id.clone().or_else(|| turn_id(&record)) {
+                if let Some(turn) = effective_turn {
                     obs = obs.with_turn(turn);
                 }
                 vec![obs]
@@ -806,6 +814,21 @@ fn turn_id(record: &crate::codex_rollout::CodexRolloutRecord) -> Option<String> 
         | ItemCompleted { turn_id, .. }
         | TurnContext { turn_id, .. } => turn_id.clone(),
         _ => None,
+    }
+}
+
+/// Durable synthetic per-response scope id for a codex `token_usage_record`
+/// that carries no native `response_id` (c-usagefu r10 item 5, Ruling B). It is
+/// keyed on the rollout line `ordinal`, which is stable across a byte-0 replay
+/// (the same bytes tail again), so a re-promoted adapter re-emits the SAME
+/// scope id and the Hub dedupes it instead of double counting. The distinct
+/// prefix keeps a fallback id from ever colliding with a real native response
+/// id. `turn` disambiguates within a session; a turn-less record falls back to
+/// the ordinal alone.
+fn fallback_response_scope_id(turn: Option<&str>, ordinal: u64) -> String {
+    match turn.filter(|id| !id.is_empty()) {
+        Some(turn) => format!("_remuda_codex_response:{turn}:{ordinal}"),
+        None => format!("_remuda_codex_response:turnless:{ordinal}"),
     }
 }
 

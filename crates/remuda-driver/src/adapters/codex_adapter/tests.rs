@@ -2517,3 +2517,64 @@ fn a_duplicate_usage_record_emits_only_one_message_observation() {
         "duplicate rejected by aggregator → no Message"
     );
 }
+
+#[test]
+fn a_usage_record_without_response_id_emits_a_durable_fallback_message() {
+    // c-usagefu r10 item 5 (Ruling B): a per-response token_usage_record that
+    // reports NO response_id is still a counted call. It must be emitted as a
+    // Message under a durable fallback scope id (stable across a byte-0 replay
+    // because it is keyed on the rollout line ordinal) so response-level
+    // coverage is persisted for every record. Previously it was dropped,
+    // leaving the turn only partially covered.
+    let line = |ordinal: u32, turn: &str| {
+        format!(
+            "{{\"ordinal\":{ordinal},\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"{turn}\",\"usage\":{{\"input_tokens\":0,\"cached_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":20,\"reasoning_output_tokens\":0,\"total_tokens\":20}}}}}}\n"
+        )
+    };
+    let mut adapter = CodexAdapter::new(AdapterHome {
+        home: tempfile::tempdir().unwrap().path().to_path_buf(),
+        cwd: PathBuf::from("/w"),
+        pid: None,
+        launched_at: None,
+    });
+
+    let obs = adapter.on_line(7, &line(7, "t1"));
+    let message = obs
+        .iter()
+        .find_map(|o| match &o.payload {
+            ObservationPayload::Usage(u) if u.scope == UsageScope::Message => Some(u),
+            _ => None,
+        })
+        .expect("the no-response-id record still emits a Message");
+    assert_eq!(
+        message.scope_id,
+        super::fallback_response_scope_id(Some("t1"), 7),
+        "durable turn+ordinal fallback scope id"
+    );
+
+    // A turn-less record falls back to the ordinal alone.
+    let turnless = adapter.on_line(8, &line(8, ""));
+    let turnless = turnless
+        .iter()
+        .find_map(|o| match &o.payload {
+            ObservationPayload::Usage(u) if u.scope == UsageScope::Message => Some(u),
+            _ => None,
+        })
+        .expect("a turn-less no-id record emits a Message too");
+    assert_eq!(
+        turnless.scope_id,
+        super::fallback_response_scope_id(None, 8)
+    );
+
+    // Re-tailing the same byte at the same ordinal emits the SAME fallback id,
+    // so the Hub dedupes the replay.
+    let replayed = adapter.on_line(7, &line(7, "t1"));
+    let replayed = replayed
+        .iter()
+        .find_map(|o| match &o.payload {
+            ObservationPayload::Usage(u) if u.scope == UsageScope::Message => Some(u),
+            _ => None,
+        })
+        .expect("replay re-emits through on_line (Hub dedupes by scope id)");
+    assert_eq!(replayed.scope_id, message.scope_id, "stable across replay");
+}

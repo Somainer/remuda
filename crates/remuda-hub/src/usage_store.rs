@@ -966,22 +966,23 @@ pub enum BudgetStatus {
     Stop,
 }
 
-/// c-usagefu r10 Ruling B: ONE shared eligible-FLOW relation by CALL identity,
-/// used by the rollup, both aggregates and the TPM windows.
+/// c-usagefu r10 Ruling B (items 4/5): ONE shared eligible-FLOW relation by
+/// CALL identity, used by the rollup, both aggregates and the TPM windows.
 ///
 /// Each native turn is counted EITHER from its Turn row OR from its Message
 /// rows, never both.
 ///
-/// * A MODERN Message (`turn_id` present) represents the call once a Turn row
-///   for that turn exists; the Turn is then suppressed ([`turn_fully_covered_sql`]
-///   is tightened to a provably-COMPLETE equality check in item 5).
+/// * A MODERN Message (`turn_id` present) is counted only when either there is
+///   no Turn row for that turn, or those Messages PROVABLY cover the whole
+///   turn (see [`turn_fully_covered_sql`]). When coverage is partial — e.g. a
+///   pre-fix accepted usage record without a response id was never emitted as
+///   a Message — the Turn is counted and that turn's Messages are dropped.
 /// * A LEGACY Message has no `turn_id` (pre-r6 wrote one Message + one Turn per
 ///   call). It is counted only when NO Turn row covers its time window; where
-///   a covering Turn exists the Turn is counted and the legacy Message dropped
-///   (item 4).
-/// * A Turn row is counted only when its modern Messages do NOT represent the
-///   call. A legacy-covered turn therefore always counts (its Messages are the
-///   link-less legacy kind).
+///   a covering Turn exists the Turn is counted and the legacy Message dropped.
+/// * A Turn row is counted only when its modern Messages do NOT provably cover
+///   it completely. A legacy-covered turn therefore always counts (its
+///   Messages are the link-less legacy kind).
 fn eligible_flow_predicate(outer: &str) -> String {
     let cover_linked =
         turn_fully_covered_sql(&format!("{outer}.instance_id"), &format!("{outer}.turn_id"));
@@ -1017,14 +1018,26 @@ fn eligible_flow_predicate(outer: &str) -> String {
     )
 }
 
-/// True when the turn `(inst, tid)` already has a modern linked Message
-/// representing it (a `message` row stamped with the turn id that carries a
-/// durable response-level `scope_id`). c-usagefu r10 item 5 tightens this to a
-/// PROVABLY COMPLETE equality check; item 4 only needs the linked existence
-/// rule so a modern Message/Turn pair still bills once while the legacy
-/// no-turn_id pairing is handled by the time-window branch above.
+/// True when the Messages linked to turn `(inst, tid)` PROVABLY cover the whole
+/// turn (Ruling B item 5):
+///
+/// - at least one linked Message carries a persisted response-level identity
+///   (`scope_id`, a real response id or the durable fallback id the adapter
+///   mints for a record without one);
+/// - the linked Messages' summed token buckets and cost EQUAL the Turn row's
+///   (NULL-safe). Equality is the only proof the data contains: when a response
+///   record was not persisted, its tokens are missing from the sum and the
+///   Turn is billed instead. The adapter emits every accepted record (fallback
+///   identity included) so normal turns reach equality and bill per response.
 fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
-    format!(
+    let buckets = [
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+    ];
+    let mut conds = vec![format!(
         "EXISTS (
             SELECT 1 FROM usage_events _fc_e
             WHERE _fc_e.instance_id = {inst}
@@ -1032,7 +1045,31 @@ fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
               AND _fc_e.turn_id = {tid}
               AND _fc_e.scope_id IS NOT NULL
         )"
-    )
+    )];
+    for bucket in buckets {
+        conds.push(format!(
+            "COALESCE((
+                SELECT SUM(_fc_s.{bucket}) FROM usage_events _fc_s
+                WHERE _fc_s.instance_id = {inst}
+                  AND _fc_s.scope = 'message' AND _fc_s.turn_id = {tid}
+             ), 0)
+             IS COALESCE((
+                SELECT _fc_t.{bucket} FROM usage_events _fc_t
+                WHERE _fc_t.instance_id = {inst}
+                  AND _fc_t.scope = 'turn' AND _fc_t.scope_id = {tid}
+             ), 0)"
+        ));
+    }
+    // Cost: NULL-safe (an unpriced turn and unpriced messages are both NULL).
+    conds.push(format!(
+        "(SELECT CAST(SUM(_fc_sc.cost_usd) AS REAL) FROM usage_events _fc_sc
+          WHERE _fc_sc.instance_id = {inst}
+            AND _fc_sc.scope = 'message' AND _fc_sc.turn_id = {tid})
+         IS (SELECT CAST(_fc_tc.cost_usd AS REAL) FROM usage_events _fc_tc
+             WHERE _fc_tc.instance_id = {inst}
+               AND _fc_tc.scope = 'turn' AND _fc_tc.scope_id = {tid})"
+    ));
+    conds.join(" AND ")
 }
 
 /// A response usage record is written DURING the turn, up to the whole turn
@@ -2403,6 +2440,60 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(rollup.session_output_tokens, Some(150));
+    }
+
+    #[test]
+    fn partially_covered_turn_bills_the_turn_and_a_fully_covered_one_bills_messages() {
+        // c-usagefu r10 item 5 (Ruling B): a Turn is suppressed in favour of
+        // its Messages only when they PROVABLY cover the whole turn.
+        //   t1: Turn 120 / $0.12 with ONE linked Message r1 = 100 / $0.10 —
+        //       the other accepted record (20, no response_id) was never
+        //       emitted as a Message, so coverage is incomplete -> count the
+        //       Turn 120 and drop r1 (never 100, never 220).
+        //   t2: Turn 120 / $0.12 fully covered by r2a = 100 plus r2b = 20
+        //       persisted under the adapter's DURABLE FALLBACK response id —
+        //       sums equal the Turn -> bill the two Messages, drop the Turn.
+        // Both turns contribute 120 -> 240 output, $0.24.
+        let conn = open_old_dual_schema();
+        conn.execute_batch(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode,
+                 output_tokens, cost_usd, observed_at, observed_at_source,
+                 profile_id, model)
+             VALUES
+                ('ins_partial', 1, 'message', 'r1', 't1', 'snapshot',
+                 100, '0.10', '2030-01-01T00:00:00.000Z', 'native',
+                 'pvp_partial', 'gpt-5.4'),
+                ('ins_partial', 2, 'turn', 't1', 't1', 'snapshot',
+                 120, '0.12', '2030-01-01T00:00:01.000Z', 'native',
+                 'pvp_partial', 'gpt-5.4'),
+                ('ins_partial', 3, 'message', 'r2a', 't2', 'snapshot',
+                 100, '0.10', '2030-01-01T00:00:04.000Z', 'native',
+                 'pvp_partial', 'gpt-5.4'),
+                ('ins_partial', 4, 'message',
+                 '_remuda_codex_response:t2:7', 't2', 'snapshot',
+                 20, '0.02', '2030-01-01T00:00:04.500Z', 'native',
+                 'pvp_partial', 'gpt-5.4'),
+                ('ins_partial', 5, 'turn', 't2', 't2', 'snapshot',
+                 120, '0.12', '2030-01-01T00:00:05.000Z', 'native',
+                 'pvp_partial', 'gpt-5.4');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        let agg = aggregate_instance(&conn, "ins_partial").unwrap();
+        assert_eq!(
+            agg.output_tokens, 240,
+            "partial t1 counts its Turn 120; fully covered t2 counts 100+20"
+        );
+        assert!((agg.cost_usd - 0.24).abs() < 1e-9, "0.12 + 0.12");
+        let supply = aggregate_supply(&conn, "pvp_partial", "gpt-5.4").unwrap();
+        assert_eq!(supply.output_tokens, 240);
+        assert!((supply.cost_usd - 0.24).abs() < 1e-9);
+        let rollup = rollup_fold(&conn, "ins_partial", "codex", Some("gpt-5.4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_output_tokens, Some(240));
     }
 
     #[test]

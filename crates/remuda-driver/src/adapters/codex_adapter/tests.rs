@@ -1729,87 +1729,117 @@ fn a_pending_launch_window_survives_another_window_releasing_before_adapter_buil
 }
 
 #[test]
-fn a_resume_starts_a_new_interval_and_never_bridges_the_gap() {
-    // c-usagefu r11 item 4 (Ruling A2 exact):
+fn a_resumed_instance_discovers_through_real_adapters_without_bridging_the_gap() {
+    // c-usagefu r12 item 6 (Ruling A2): the r11 version of this regression
+    // hand-built lifetime segments and judged through the test-only
+    // sole_instance_matches seam. The real guarantees are now exercised on
+    // the production discovery path with ACTUAL rollout fixtures:
+    //
     //   A's first interval runs t0..t20, then CLOSES;
-    //   a GAP (no A process) runs t20..t100;
-    //   A resumes at t100 — a NEW interval from the resume time.
-    // The closed segment is retained as its own interval and the resumed one
-    // never reopens or bridges it. r10 kept one record per owner, setting
-    // launched_at = min(first, resume) and clearing closed_at: it invented a
-    // single t0..live interval over the gap, attributing gap rollouts to A and
-    // blocking later owners across the gap.
+    //   a GAP (no A process) runs t20..t100, F_gap is created at t50;
+    //   C launches at t30 in the same cwd and binds F_gap at t50 — A's
+    //   retained closed segment must not invent an overlap across the gap;
+    //   A RESUMES at t100 (stable instance key, a NEW interval): a REAL
+    //   CodexAdapter with the resume floor must NOT bind F_gap (created in
+    //   the closed gap), while a rollout F_after created at t107 binds.
+    //
+    // Times are anchored close to wall-clock now: concurrent real-time tests
+    // share the process prompt registry and its age sweep.
     use crate::adapters::codex_discovery::LifetimeGuardClock as _;
 
-    // Times are anchored close to wall-clock now: concurrent REAL-time tests
-    // share the process prompt registry and its age sweep, so unix-epoch
-    // inputs here would be evicted by their sweeps. The logic is identical at
-    // any epoch.
-    let cwd = Path::new("/projects/r11-item4-resume");
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r12-item6-resume";
     let t0 = OffsetDateTime::now_utc() - time::Duration::seconds(120);
-    let t15 = t0 + time::Duration::seconds(15);
     let t20 = t0 + time::Duration::seconds(20);
     let t30 = t0 + time::Duration::seconds(30);
     let t45 = t0 + time::Duration::seconds(45);
     let t50 = t0 + time::Duration::seconds(50);
+    let t90 = t0 + time::Duration::seconds(90);
     let t100 = t0 + time::Duration::seconds(100);
     let t105 = t0 + time::Duration::seconds(105);
     let t107 = t0 + time::Duration::seconds(107);
 
-    // First interval: registered at t0, closed at t20.
-    let first = crate::adapters::codex_discovery::begin_lifetime(cwd, INST_A, Some(t0));
+    // A's first cohort: registered at t0, confirmed closed at t20 (the driver
+    // closes only after the stop ladder; here the test clock places it).
+    let first = crate::adapters::codex_discovery::begin_lifetime(Path::new(cwd), INST_A, Some(t0));
     first.close_lifetime_at(t20);
     drop(first);
 
-    // Resume at t100: a brand-new segment whose floor is the resume time.
-    let resumed = crate::adapters::codex_discovery::begin_lifetime(cwd, INST_A, Some(t100));
+    // F_gap is written DURING THE CLOSED GAP at t50.
+    write_rollout_prompt_at(
+        home.path(),
+        "F-gap",
+        cwd,
+        &t50.format(&Rfc3339).unwrap(),
+        "gap prompt",
+    );
 
-    let segments = crate::adapters::codex_discovery::census_segments(cwd, INST_A);
+    // The resume cohort is registered on the STABLE instance key with its
+    // t100 floor. It is created before C judges below on purpose: the census
+    // is pure interval math over [launch, creation], and the invariant is that
+    // a resume APPENDS a segment at t100 without REOPENING the closed t0
+    // segment — so even with the resumed cohort on record, nothing of A's
+    // reaches back over the gap. The r10 shape reopened one t0..live record
+    // on resume and blocked C across the gap.
+    let resumed =
+        crate::adapters::codex_discovery::begin_lifetime(Path::new(cwd), INST_A, Some(t100));
+
+    // C launches at t30 and runs the REAL discovery path: its prompt was
+    // dispatched at t45 and F_gap was created at t50. A's retained segment
+    // closed at t20 — before C launched — and the resumed segment starts only
+    // at t100 (after F_gap was created), so C is sole and binds.
+    let mut c = launch_adapter_keyed(home.path(), cwd, t30, INST_C);
+    send_fixture_prompt(Path::new(cwd), INST_C, "gap prompt", t45);
+    assert!(
+        c.discover().unwrap(),
+        "production discovery: C binds the gap rollout with no bridged blocker"
+    );
+    assert_eq!(c.binding().map(|b| b.session_id.as_str()), Some("F-gap"));
+    // C closes at t90 — still before A's resume interval begins at t100.
+    c.close_lifetime_at(t90);
+    drop(c);
+
+    // The resumed session gets a REAL adapter whose floor is the resume time,
+    // handed a witness to the pre-spawned lifetime exactly as the shell-pty
+    // resume wiring does.
+    let mut a_resumed = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: PathBuf::from(cwd),
+        pid: None,
+        launched_at: Some(t100),
+    })
+    .with_lifetime(resumed.witness())
+    .with_instance_key(Some(INST_A.to_owned()));
+
+    // F_gap is in the resume home but the locator's floor is the resume time:
+    // it is NOT returned, so the closed-gap rollout can never bind.
+    assert!(
+        !a_resumed.discover().unwrap(),
+        "a rollout created in the closed gap is pre-launch for the resume"
+    );
+    assert!(a_resumed.binding().is_none());
+
+    // A post-resume rollout binds under the new interval.
+    send_fixture_prompt(Path::new(cwd), INST_A, "after resume prompt", t105);
+    write_rollout_prompt_at(
+        home.path(),
+        "F-after",
+        cwd,
+        &t107.format(&Rfc3339).unwrap(),
+        "after resume prompt",
+    );
+    assert!(
+        a_resumed.discover().unwrap(),
+        "the new interval attributes a rollout created after resume"
+    );
     assert_eq!(
-        segments,
-        vec![(Some(t0), Some(t20)), (Some(t100), None)],
-        "the closed segment is retained and the resume is a SEPARATE live segment"
+        a_resumed.binding().map(|b| b.session_id.as_str()),
+        Some("F-after"),
+        "it binds the post-resume rollout, never the gap one"
     );
-
-    // A cannot attribute a rollout created in the gap: its only live floor is
-    // t100, even if A dispatched the exact prompt text before it closed.
-    send_fixture_prompt(cwd, INST_A, "gap prompt", t15);
-    assert!(
-        !crate::adapters::codex_discovery::sole_instance_matches(cwd, INST_A, "gap prompt", t50),
-        "a gap rollout is pre-launch for the resumed segment — never bridged"
-    );
-
-    // A post-resume rollout IS attributable under the new interval.
-    send_fixture_prompt(cwd, INST_A, "resume prompt", t105);
-    assert!(
-        crate::adapters::codex_discovery::sole_instance_matches(cwd, INST_A, "resume prompt", t107),
-        "the new interval attributes rollouts created after the resume"
-    );
-
-    // No invented overlap ACROSS the gap: C launches at t30 — AFTER A's first
-    // interval closed at t20 and well before the resume at t100 — and scans a
-    // rollout created at t50. A's retained closed segment closed before C ever
-    // launched and the resumed segment does not exist yet, so C is sole. Under
-    // the old bridged record (launch min = t0, closed cleared), A invented an
-    // overlap spanning the gap and C was refused.
-    let _c = crate::adapters::codex_discovery::begin_lifetime(cwd, INST_C, Some(t30));
-    send_fixture_prompt(cwd, INST_C, "gap prompt", t45);
-    assert!(
-        crate::adapters::codex_discovery::sole_instance_matches(cwd, INST_C, "gap prompt", t50),
-        "neither retained nor resumed segment may block C across the gap"
-    );
-
-    // Closing the resumed cohort touches only its own segment.
+    drop(a_resumed);
     resumed.close_lifetime_at(t100 + time::Duration::seconds(30));
     drop(resumed);
-    assert_eq!(
-        crate::adapters::codex_discovery::census_segments(cwd, INST_A),
-        vec![
-            (Some(t0), Some(t20)),
-            (Some(t100), Some(t100 + time::Duration::seconds(30)))
-        ],
-        "a stale/new guard never mutates the other segment"
-    );
 }
 
 #[test]

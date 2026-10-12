@@ -881,30 +881,6 @@ pub(crate) fn census_lifetime_is_live(cwd: &Path, owner: &str) -> bool {
         .is_some_and(|segments| segments.live().is_some())
 }
 
-/// Test seam: the registered intervals of `owner` in `cwd` as
-/// `(launched_at, closed_at)` pairs in registration order. Ruling A2 resume
-/// regressions assert the retained closed segment and the new resumed segment
-/// are separate, never bridged (r11 item 4).
-#[cfg(test)]
-pub(crate) fn census_segments(
-    cwd: &Path,
-    owner: &str,
-) -> Vec<(Option<OffsetDateTime>, Option<OffsetDateTime>)> {
-    INSTANCE_LIFETIMES
-        .lock()
-        .expect("codex instance lifetimes")
-        .get(&canonical(cwd))
-        .and_then(|by_instance| by_instance.get(owner))
-        .map(|segments| {
-            segments
-                .segments
-                .iter()
-                .map(|segment| (segment.launched_at, segment.closed_at))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 // Test-only visibility so unit tests in other modules of this crate can
 // build deterministic identities without touching process globals elsewhere.
 #[cfg(test)]

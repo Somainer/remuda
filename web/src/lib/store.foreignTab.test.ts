@@ -2340,6 +2340,135 @@ it("GATE18 item 6 (real store): an offline-retired attempt's delayed catch-up re
   hubStore.logout();
 });
 
+it("GATE19 item 5 (real store): a follow socket that genuinely closes while the resume catch-up read is pending never certifies live when that catch-up later succeeds — recovery reopens for real", async () => {
+  // Reconnect opens the follow socket (subscribe snapshot frames it live),
+  // the socket genuinely closes WHILE resumeAfterReconnect's REST read is in
+  // flight (closedDuringResume latched through the REAL eventsSubscribe
+  // onClose), and the delayed catch-up then SUCCEEDS. The successful read
+  // certifies journal catch-up, not the link: the machine must leave live,
+  // run the dead-link settlement, and reopen a REAL follow subscribe.
+  vi.useFakeTimers();
+  try {
+  const { api, hubStore } = await fresh();
+  await bootLive(api, hubStore); // lists A = INSTANCE (journal JOURNAL)
+
+  const emptyRead = {
+    events: [],
+    windowFromSeq: "1",
+    durableSeq: "0",
+    reachedAfterSeq: true,
+  } as Awaited<ReturnType<Api["eventsRead"]>>;
+
+  // The FIRST resume catch-up read (limit 128) blocks on a gate; while it is
+  // pending it dispatches the genuine close of the reopen subscribe. The
+  // second resume read (the real recovery reopen) resolves immediately.
+  let resumeReads = 0;
+  let closeSub2: (() => void) | null = null;
+  let closeDispatched = false;
+  let releaseResume: () => void = () => undefined;
+  const resumeGate = new Promise<void>((resolve) => {
+    releaseResume = resolve;
+  });
+  vi.spyOn(api, "eventsRead").mockImplementation(
+    (async (args: Parameters<Api["eventsRead"]>[0]) => {
+      if (args.limit === 128) {
+        resumeReads += 1;
+        if (resumeReads === 1) {
+          // Socket genuinely closes WHILE this catch-up read is pending.
+          closeSub2?.();
+          closeDispatched = true;
+          await resumeGate;
+        }
+      }
+      return emptyRead;
+    }) as Api["eventsRead"],
+  );
+
+  let subscribes = 0;
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    (async (
+      _journalId: string,
+      _afterSeq: unknown,
+      _onBatch: unknown,
+      _onGap: unknown,
+      hooks?: { onOpen?: () => void; onClose?: () => void; onFrame?: () => void },
+    ) => {
+      subscribes += 1;
+      if (subscribes === 2) {
+        const close = hooks?.onClose;
+        closeSub2 = () => close?.();
+      }
+      return {
+        subscriptionId: `sub_g19_i5_${subscribes}` as never,
+        getReadyState: () => 1,
+        snapshot: { asOfSeq: "0", fromSeq: null },
+        close: () => undefined,
+      };
+    }) as unknown as Api["eventsSubscribe"],
+  );
+
+  // Initial real mount: seed + subscribe #1, framed live.
+  await hubStore.follow(INSTANCE);
+  expect(subscribes).toBe(1);
+  const store = hubStore as unknown as {
+    connection: ConnectionMachine;
+    setFollowLiveForTest: (open: boolean, framed: boolean, journalId?: string) => void;
+  };
+  store.setFollowLiveForTest(true, true, JOURNAL);
+
+  // Record every link transition from here on.
+  const states: string[] = [];
+  hubStore.subscribe(() => {
+    const s = hubStore.getSnapshot() as unknown as { connection?: string };
+    const last = states.at(-1);
+    if (s.connection && s.connection !== last) states.push(s.connection);
+  });
+
+  // Link dies; a real online-driven resume opens subscribe #2; its snapshot
+  // frames live while the catch-up read is still pending.
+  store.setFollowLiveForTest(false, false, JOURNAL);
+  store.connection.dispatch({ type: "online" });
+  for (let i = 0; i < 50 && subscribes < 2; i += 1) await Promise.resolve();
+  expect(subscribes).toBe(2);
+  for (let i = 0; i < 50 && !closeDispatched; i += 1) await Promise.resolve();
+  expect(closeDispatched).toBe(true);
+  // Catch-up still pending; the snapshot had optimistically framed it live.
+  expect(store.connection.state).toBe("live");
+
+  // The delayed catch-up SUCCEEDS. The completion must not certify live:
+  // the dead-link settlement runs and the machine drops to quiet stale
+  // (REST reachable) WITHOUT reopening yet — still only two subscribes.
+  releaseResume();
+  for (let i = 0; i < 100 && store.connection.state !== "stale"; i += 1) {
+    await Promise.resolve();
+  }
+  expect(store.connection.state).toBe("stale");
+  expect(subscribes).toBe(2);
+  // The successful resume did not keep the dead-link "live" label: after the
+  // latched-close live it transited recovering -> stale.
+  const firstLive = states.indexOf("live");
+  expect(firstLive).toBeGreaterThanOrEqual(0);
+  expect(states.slice(firstLive + 1)).toContain("stale");
+
+  // Recovery proceeds on the real stale-probe clock: the probe succeeds and
+  // the quiet reopen opens a REAL follow subscribe (#3) with a real catch-up;
+  // the NEW socket's own snapshot is what re-certifies live.
+  await vi.advanceTimersByTimeAsync(REST_PROBE_MS);
+  for (let i = 0; i < 100 && subscribes < 3; i += 1) {
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  expect(subscribes).toBe(3);
+  for (let i = 0; i < 100 && store.connection.state !== "live"; i += 1) {
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  expect(store.connection.state).toBe("live");
+  expect(resumeReads).toBe(2); // the reopen's catch-up ran for real too
+  hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it("GATE18 item 5: a duplicate seed that finds the journal mounted with a DEAD socket ends the current-binding attempt instead of stranding it on the 20 s watchdog", async () => {
   // follow(B) attempt 1 (unmounted seed in flight) -> navigate to mounted live
   // A (retries/retries attempt 1) -> follow(B) again before the seed returns

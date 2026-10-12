@@ -399,10 +399,29 @@ export class ConnectionMachine {
         // resets (loud: armResumeAttempt; quiet: armResumeAttemptQuiet).
         this.closedDuringResume = false;
         this.clearTimer("watchdog");
-        if (event.ok) {
+        if (event.ok && !closed) {
+          // Successful resume with no latched close: certify live. This is
+          // explicit about the NO-BOUND-FOLLOW bootstrap case too — a resume
+          // on the session list/new-session page opens no follow socket (the
+          // store's resumeConnection has no bound instance), so nothing can
+          // latch a close for that attempt; closed is necessarily false and
+          // the REST-success resume correctly reports live there.
           this.attempt = 0;
           this.setState("live");
           this.armFrameWatchdog();
+        } else if (event.ok) {
+          // Gate 19 item 5: the follow socket this attempt opened genuinely
+          // CLOSED while resumeAfterReconnect's REST catch-up was still
+          // pending (closed latched by the real close event). The catch-up
+          // then succeeding certifies the bounded READ — journal caught up —
+          // NOT a live link: that socket is dead and its frame stream is
+          // gone. Certifying live here reported 已连接 on a frozen transcript
+          // with no recovery running. Take the SAME dead-link settlement/
+          // recovery path a failed resume uses: REST reachable settles quiet
+          // stale and quietly reopens (a real new follow certifies), REST
+          // down goes loud offline with the reconnect clock.
+          if (this.state === "live") this.setState("recovering");
+          this.settleResumeFailureViaProbe(true);
         } else if (!closed && this.deps.isFollowLive()) {
           // The resume ACTION rejected (a resume-side REST catch-up read
           // timed out under load), but the follow socket it opened is still

@@ -719,7 +719,7 @@ it("GATE21 item 5 (was GATE20 item 3a): sibling B's real flow answers H HELD and
   }
 });
 
-it("GATE20 item 3b: H becomes HELD while the guarded flush waits on the instance lock — A posts only P, H waits for held-retry", async () => {
+it("GATE21 item 6 (was GATE20 item 3b): P gets its own wake while H is still inflight behind B's lock — A posts only P; H retries from the held-retry timer", async () => {
   // Two REAL stores share the localStorage backend and the cloned persisted
   // owner, serialized by a small ordered Web Locks shim: B claims H and its
   // POST + instance lock stay PENDING; A tracks H's lease while P sits
@@ -896,25 +896,12 @@ it("GATE20 item 3b: H becomes HELD while the guarded flush waits on the instance
     await vi.advanceTimersByTimeAsync(Math.max(1, (claimUntil ?? 0) - Date.now()));
     expect(sendA).not.toHaveBeenCalled();
 
-    // B's POST completes HELD while A is queued. B's own flush stops (H is in
-    // its attempted set; there are no other rows); it releases the lock and
-    // arms the held-retry clock.
+    // Gate 21 item 6: P is enqueued WHILE A's guarded flush is already queued
+    // and H is still B's blocked INFLIGHT POST — not after H is settled. P's
+    // own real delivery wake (the enqueue reconciliation) fires another
+    // guarded flush: its pre-lock read completes while H is inflight, and that
+    // flush QUEUES on the same lock. Nothing is sent while B holds it.
     const T0 = Date.now();
-    releaseB!();
-    for (let i = 0; i < 80; i += 1) {
-      await vi.advanceTimersByTimeAsync(1);
-      await Promise.resolve();
-      const storedH = (JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[]).find(
-        (r) => r.commandId === H,
-      );
-      if (storedH?.state === "held") break;
-    }
-
-    // A's queued fire read the HELD row and armed only the held-retry clock
-    // (no early re-POST). Now A enqueues P through ITS REAL Outbox (real
-    // durable write + the reconciliation's 0 ms delivery wake — no manual
-    // flush). A's GUARDED flush is what meets the held H in the fresh in-lock
-    // selection.
     await ai.outbox.enqueue({
       commandId: P,
       clientRequestId: `local_${P}`,
@@ -923,25 +910,46 @@ it("GATE20 item 3b: H becomes HELD while the guarded flush waits on the instance
       prompt: "A must send this one",
       createdAt: Date.now(),
     });
-    for (let i = 0; i < 80 && sendA.mock.calls.length === 0; i += 1) {
+    for (let i = 0; i < 40; i += 1) await vi.advanceTimersByTimeAsync(1);
+    expect(sendA).not.toHaveBeenCalled();
+    const storedPre = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(storedPre().find((r) => r.commandId === H)?.state).toBe("inflight");
+    expect(storedPre().find((r) => r.commandId === P)?.state).toBe("pending");
+
+    // B's POST now completes HELD while A's flushes are queued. B releases the
+    // lock and arms the held-retry clock.
+    releaseB!();
+    // Let ONLY the blocked POST's held write commit (microtasks, no fake
+    // time), then close B before its flush continuation runs another pass
+    // over the now-existing P or its held-retry timer fires. A's queued turns
+    // are already in the FIFO lock queue and stay alive across B's logout.
+    for (let i = 0; i < 600; i += 1) {
+      await Promise.resolve();
+      const storedH = (JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[]).find(
+        (r) => r.commandId === H,
+      );
+      if (storedH?.state === "held") break;
+    }
+    b.logout();
+
+    // A's queued guarded flushes enter on the FRESH in-lock state: H is HELD
+    // there (held policy at the claim boundary), so only P is POSTed. The
+    // wake that delivered P existed before H was settled — its own real wake.
+    for (let i = 0; i < 120 && sendA.mock.calls.length === 0; i += 1) {
       await vi.advanceTimersByTimeAsync(1);
       await Promise.resolve();
     }
-
-    // A sent only P. H has B's original held answer and is still HELD: the
-    // guarded flush's held policy (fresh in-lock selection + claim boundary)
-    // never re-POSTed it while A waited on the lock.
     const allPosts = () => [...sendA.mock.calls, ...sendB.mock.calls];
     const postsFor = (id: string) => allPosts().filter((c) => c[4] === id);
     expect(sendA).toHaveBeenCalledTimes(1);
-    expect(postsFor(P)).toHaveLength(1);
+    expect(sendA.mock.calls[0]?.[4]).toBe(P);
     const stored = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
     expect(stored().find((r) => r.commandId === P)?.state).toBe("sent");
     expect(stored().find((r) => r.commandId === H)?.state).toBe("held");
     expect(postsFor(H)).toHaveLength(1);
 
-    // H's next POST is the real held-retry timer's (~2 s after T0), exactly
-    // once. Boundaries are absolute: the pump loops above advanced some time.
+    // H's next POST is A's real held-retry timer (~2 s after T0), exactly
+    // once (B's own retry was cancelled at logout).
     await vi.advanceTimersByTimeAsync(Math.max(0, T0 + 1_999 - Date.now()));
     expect(postsFor(H)).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(Math.max(2, T0 + 2_100 - Date.now()));
@@ -950,8 +958,8 @@ it("GATE20 item 3b: H becomes HELD while the guarded flush waits on the instance
       await Promise.resolve();
     }
     expect(postsFor(H)).toHaveLength(2);
+    expect(sendA.mock.calls.map((c) => c[4]).sort()).toEqual([H, P].sort());
     a.logout();
-    b.logout();
   } finally {
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });

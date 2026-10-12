@@ -186,8 +186,10 @@ export type EffortPending = {
    */
   commandWord: string | null;
   /**
-   * c-effortread r13 item 2: wall-clock ms at which CURRENT ACTIVITY EVIDENCE
-   * showed this request leaving the driver queue (working → idle). The bounded
+   * c-effortread r13 item 2 / r14 item 2: wall-clock ms at which CURRENT
+   * ACTIVITY EVIDENCE showed this request leaving the driver queue (the turn
+   * becoming idle — directly, or via waiting-interaction on a
+   * PermissionRequest/Elicitation before Stop/StopFailure). The bounded
    * reconciliation is anchored HERE, not at the immutable `queued` snapshot
    * taken at send time: a request queued behind a running turn gets its full
    * request-owned bound only AFTER the turn ends. Null while the turn is still
@@ -1068,21 +1070,30 @@ class HubStore {
   getSnapshot = () => this.state;
 
   private emit(patch: Partial<HubState>) {
-    // c-effortread r13 item 2/3: current activity evidence (live follow native
-    // turn events or full-instance entity snapshots) is the ONLY authority on
-    // when a queued effort request can actually run. A pending stamped while a
-    // turn was running waits for working → idle; at that transition the exact
-    // nonce-guarded pending gets its reconciliation bound anchored (a client
-    // pending also drops the chip's 排队中 flag — its immutable send-time
-    // snapshot could not track this; a wire pending keeps the driver-provided
-    // queue word). Everything happens inside the same emission so listeners
-    // never see split state.
+    // c-effortread r13 item 2/3, r14 item 2: current activity evidence (live
+    // follow native turn events or full-instance entity snapshots) is the ONLY
+    // authority on when a queued effort request can actually run. A pending
+    // stamped while a turn was running waits for the next idle evidence; at
+    // that instant the exact nonce-guarded pending gets its reconciliation
+    // bound anchored (a client pending also drops the chip's 排队中 flag — its
+    // immutable send-time snapshot could not track this; a wire pending keeps
+    // the driver-provided queue word). Everything happens inside the same
+    // emission so listeners never see split state.
+    //
+    // r14 item 2: the exit is ANY transition of authoritative activity TO
+    // idle, not only a direct working → idle. The production turn end can be
+    // working → waiting-interaction → idle (PermissionRequest/Elicitation
+    // then Stop/StopFailure), and the previous activity may be unknown when a
+    // fresh idle snapshot is the first evidence this store sees. Requiring
+    // prev === "working" left a silent accepted legacy no-op pending until
+    // the 30-minute max age; anchor the deadline whenever a nonce-owned
+    // pending is still awaiting its queue exit and activity is now idle
+    // (idle → idle emissions are no-ops: such a pending already carries its
+    // anchor, and a request can only be queued while a turn was running).
     let queueExits: Map<Id, number> | null = null;
     if (patch.instances) {
       for (const next of patch.instances) {
         if (next.activity?.state !== "known" || next.activity.value !== "idle") continue;
-        const prev = this.state.instances.find((row) => row.id === next.id);
-        if (prev?.activity?.state !== "known" || prev.activity.value !== "working") continue;
         const pending = this.state.effortPending[next.id];
         if (pending && pending.leftQueueAt == null) {
           (queueExits ??= new Map()).set(next.id, pending.nonce);

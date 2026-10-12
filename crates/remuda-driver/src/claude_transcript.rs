@@ -489,11 +489,21 @@ fn read_head(path: &Path, max: u64) -> String {
 ///
 /// Holds a byte offset and hands back whole lines only, so a half-written tail
 /// is read on the next poll rather than parsed as truncated JSON.
+///
+/// Every emitted line carries its 0-based RECORD INDEX within the file (its
+/// ordinal among newline-terminated non-empty records since the start of the
+/// current file incarnation). The index is a property of the file, not of the
+/// reader: a fresh reader replaying the same transcript computes identical
+/// indexes, which makes it the replay-stable turn source position the Hub's
+/// authority watermark is keyed on (c-ctxusage r14 item 2) — never a
+/// per-reader publication counter.
 #[derive(Debug)]
 pub struct TranscriptTail {
     path: PathBuf,
     offset: u64,
     partial: String,
+    /// 0-based index of the next non-empty line emitted.
+    record_index: u64,
 }
 
 impl TranscriptTail {
@@ -504,6 +514,7 @@ impl TranscriptTail {
             path,
             offset: 0,
             partial: String::new(),
+            record_index: 0,
         }
     }
 
@@ -519,11 +530,22 @@ impl TranscriptTail {
     /// An open error (the bound file was deleted) is surfaced to the caller,
     /// which marks the binding degraded rather than silently rebinding.
     pub fn poll(&mut self) -> std::io::Result<Vec<String>> {
+        Ok(self
+            .poll_indexed()?
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect())
+    }
+
+    /// Same read as [`Self::poll`], with each line paired with its
+    /// file-relative record index (see the struct docs).
+    pub fn poll_indexed(&mut self) -> std::io::Result<Vec<(u64, String)>> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = std::fs::File::open(&self.path)?;
         let len = file.metadata()?.len();
         if len < self.offset {
             self.offset = 0;
+            self.record_index = 0;
             self.partial.clear();
         }
         if len == self.offset {
@@ -539,7 +561,8 @@ impl TranscriptTail {
             let line: String = self.partial.drain(..=index).collect();
             let line = line.trim_end_matches(['\n', '\r']).to_owned();
             if !line.is_empty() {
-                lines.push(line);
+                lines.push((self.record_index, line));
+                self.record_index += 1;
             }
         }
         Ok(lines)

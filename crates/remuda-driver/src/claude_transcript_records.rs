@@ -21,6 +21,15 @@
 use remuda_protocol::MessageOrigin;
 use serde_json::Value;
 
+/// Replay-stable position of a record within a session transcript: its 0-based
+/// ordinal among the file's records (see
+/// [`crate::claude_transcript::TranscriptTail`]). The Hub keys turn authority
+/// on this position, so a fresh mapper replaying the same file produces the
+/// SAME positions a live mapper published — unlike a per-mapper publication
+/// counter, which a replay always resets and which lets a genuinely newer
+/// record be wrongly rejected as stale (c-ctxusage r14 item 2).
+pub(crate) type SourcePosition = u64;
+
 /// The text of a record's `message.content`, whatever shape it took.
 ///
 /// A record is either a bare string or an array of blocks. Classification only
@@ -198,9 +207,15 @@ pub(crate) struct Group {
     saw_stop_reason: bool,
     /// Global arrival counter (drives same-`apiBlockIndex` tie ordering).
     seen: usize,
-    /// Number of usage snapshots already emitted for this message; the next
-    /// emit is revision + 1.
-    usage_revision: u64,
+    /// Replay-stable file position of the record that supplied `last_usage`.
+    /// The turn revision published with a usage snapshot is DERIVED from this
+    /// position, not from a count of publications (c-ctxusage r14 item 2):
+    /// every mapper replaying the same transcript lands on the same value.
+    last_usage_position: Option<SourcePosition>,
+    /// Whether a provisional usage snapshot was already PUBLISHED for the
+    /// current last-usage record. A supersede must still publish a run that
+    /// never reached a poll, but never re-publish an unchanged snapshot.
+    usage_published: bool,
     /// New usage (or a freshly-seen stop_reason) arrived since the last usage
     /// emit. A poll only (re)publishes when this is set.
     usage_dirty: bool,
@@ -221,8 +236,8 @@ pub(crate) struct PendingUsage {
     pub model: Option<String>,
     /// The group's last `message.usage` object.
     pub usage: Value,
-    /// Snapshot revision for this message (1 for the first publish).
-    pub revision: u64,
+    /// Replay-stable position of the record that produced this snapshot.
+    pub source_position: SourcePosition,
     /// Raw top-level record timestamp for the usage-bearing record.
     pub native_at: Option<String>,
 }
@@ -239,20 +254,22 @@ impl Group {
         self.head.is_none()
     }
 
-    /// Start a new run at `key`, carrying `record` as the envelope source.
-    pub(crate) fn start(&mut self, key: GroupKey, record: Value) {
+    /// Start a new run at `key`, carrying `record` (at transcript file
+    /// position `position`) as the envelope source.
+    pub(crate) fn start(&mut self, key: GroupKey, record: Value, position: SourcePosition) {
         self.key = Some(key);
         self.head = Some(record.clone());
         self.pending_head = None;
         self.blocks.clear();
         self.last_usage = None;
         self.last_usage_at = None;
+        self.last_usage_position = None;
         self.saw_stop_reason = false;
         self.seen = 0;
-        self.usage_revision = 0;
+        self.usage_published = false;
         self.usage_dirty = false;
         if let Some(message) = record.pointer("/message") {
-            self.note_usage(&record, message);
+            self.note_usage(&record, message, position);
         }
         if record
             .pointer("/message/stop_reason")
@@ -264,8 +281,8 @@ impl Group {
     }
 
     /// Buffer one record's content blocks and fold in its usage/stop metadata.
-    pub(crate) fn push(&mut self, record: &Value, message: &Value) {
-        self.note_usage(record, message);
+    pub(crate) fn push(&mut self, record: &Value, message: &Value, position: SourcePosition) {
+        self.note_usage(record, message, position);
         if !self.saw_stop_reason && message.get("stop_reason").and_then(Value::as_str).is_some() {
             self.saw_stop_reason = true;
             // A stop without fresh usage still makes the buffered usage
@@ -290,14 +307,15 @@ impl Group {
     }
 
     /// Fold one message's `usage` (if object-shaped) into the retained counters
-    /// and remember when it was reported.
-    fn note_usage(&mut self, record: &Value, message: &Value) {
+    /// and remember when and where it was reported.
+    fn note_usage(&mut self, record: &Value, message: &Value, position: SourcePosition) {
         if let Some(usage) = message.get("usage").filter(|value| value.is_object()) {
             self.last_usage = Some(usage.clone());
             self.last_usage_at = record
                 .get("timestamp")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            self.last_usage_position = Some(position);
             self.usage_dirty = true;
         }
     }
@@ -330,16 +348,18 @@ impl Group {
     /// Whether a supersede must publish the final usage: it was never
     /// published, or fresh counters arrived after the provisional publish.
     pub(crate) fn usage_publishable_on_supersede(&self) -> bool {
-        self.last_usage.is_some() && (self.usage_dirty || self.usage_revision == 0)
+        self.last_usage.is_some() && (self.usage_dirty || !self.usage_published)
     }
 
-    /// Take the next usage snapshot (advancing the revision), clearing the
-    /// dirty flag but retaining the run so a later same-id record can publish a
-    /// higher revision. `None` when the run carries no usage.
+    /// Take the next usage snapshot at the retained replay-stable source
+    /// position, clearing the dirty flag (but retaining the run) so a later
+    /// same-id record publishes at its OWN strictly newer position. `None`
+    /// when the run carries no usage.
     pub(crate) fn take_usage(&mut self) -> Option<PendingUsage> {
         let head = self.head.as_ref()?;
         let usage = self.last_usage.clone()?;
-        self.usage_revision += 1;
+        let source_position = self.last_usage_position?;
+        self.usage_published = true;
         self.usage_dirty = false;
         let message_id = head
             .pointer("/message/id")
@@ -360,7 +380,7 @@ impl Group {
             request_id,
             model,
             usage,
-            revision: self.usage_revision,
+            source_position,
             native_at: self.last_usage_at.clone(),
         })
     }
@@ -540,10 +560,10 @@ mod tests {
         });
         let key = GroupKey::of(&first, &first["message"]).expect("key");
         assert!(group.is_empty());
-        group.start(key.clone(), first.clone());
-        group.push(&first, &first["message"]);
+        group.start(key.clone(), first.clone(), 0);
+        group.push(&first, &first["message"], 0);
         assert!(group.continues(&key), "the second record continues the run");
-        group.push(&second, &second["message"]);
+        group.push(&second, &second["message"], 1);
         let drained = group.drain_content().expect("drain");
         let content = drained.record["message"]["content"]
             .as_array()
@@ -576,9 +596,10 @@ mod tests {
         group.start(
             GroupKey::of(&late, &late["message"]).expect("key"),
             late.clone(),
+            0,
         );
-        group.push(&late, &late["message"]);
-        group.push(&early, &early["message"]);
+        group.push(&late, &late["message"], 0);
+        group.push(&early, &early["message"], 1);
         let drained = group.drain_content().expect("drain");
         let content = drained.record["message"]["content"]
             .as_array()
@@ -597,6 +618,7 @@ mod tests {
         group.start(
             GroupKey::of(&first, &first["message"]).expect("key"),
             first.clone(),
+            0,
         );
         let next = GroupKey::of(&other, &other["message"]).expect("key");
         assert!(!group.continues(&next));
@@ -609,7 +631,11 @@ mod tests {
         let first = json!({"type": "assistant", "requestId": "req_a", "message": {"id": "m", "content": []}});
         let retry = json!({"type": "assistant", "requestId": "req_b", "message": {"id": "m", "content": []}});
         let mut group = Group::default();
-        group.start(GroupKey::of(&first, &first["message"]).expect("key"), first);
+        group.start(
+            GroupKey::of(&first, &first["message"]).expect("key"),
+            first,
+            0,
+        );
         assert!(!group.continues(&GroupKey::of(&retry, &retry["message"]).expect("key")));
     }
 }

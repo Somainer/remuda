@@ -1744,7 +1744,7 @@ fn spawn_transcript_pump(
                     if let Some(faults) = &collect_faults {
                         faults.pump_collect_entered();
                     }
-                    let lines = hydrated.tail.poll().unwrap_or_default();
+                    let lines = hydrated.tail.poll_indexed().unwrap_or_default();
                     let mut chunk: Vec<Observation> = Vec::with_capacity(TRANSCRIPT_EMIT_CHUNK);
                     let park = |frames: &mut Vec<Observation>| {
                         if frames.is_empty() {
@@ -1756,11 +1756,11 @@ fn spawn_transcript_pump(
                         // item 1).
                         pending.push_all_blocking(frames.drain(..));
                     };
-                    for line in &lines {
+                    for (position, line) in &lines {
                         if pending.is_closed() {
                             break;
                         }
-                        if let Ok(batch) = hydrated.mapper.map_line(line) {
+                        if let Ok(batch) = hydrated.mapper.map_line_at(line, *position) {
                             chunk.extend(batch);
                             if chunk.len() >= TRANSCRIPT_EMIT_CHUNK {
                                 park(&mut chunk);
@@ -1845,10 +1845,10 @@ async fn drain_pending(
 /// buffered run's final usage. Shared by the cooperative finalise and the
 /// abort residual so neither produces different frames.
 fn finish_hydrator(hydrated: &mut TranscriptHydrator) -> Vec<Observation> {
-    let lines = hydrated.tail.poll().unwrap_or_default();
+    let lines = hydrated.tail.poll_indexed().unwrap_or_default();
     let mut frames = Vec::new();
-    for line in &lines {
-        if let Ok(batch) = hydrated.mapper.map_line(line) {
+    for (position, line) in &lines {
+        if let Ok(batch) = hydrated.mapper.map_line_at(line, *position) {
             frames.extend(batch);
         }
     }

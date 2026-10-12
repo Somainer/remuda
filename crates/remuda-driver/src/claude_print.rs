@@ -2628,6 +2628,11 @@ pub struct TranscriptMapper {
     permission: remuda_protocol::LivePermissionTracker,
     /// Rendezvous for Remuda-initiated permission switches.
     permission_bridge: Option<Arc<crate::permission::PermissionBridge>>,
+    /// File-relative record position to stamp the next record fed through
+    /// [`Self::map_line`] without an explicit position. Pump callers that
+    /// track the transcript's own record index use
+    /// [`Self::map_line_at`] instead (c-ctxusage r14 item 2).
+    auto_position: records::SourcePosition,
 }
 
 impl TranscriptMapper {
@@ -2673,6 +2678,7 @@ impl TranscriptMapper {
             model_launch_emitted: false,
             permission: remuda_protocol::LivePermissionTracker::new(),
             permission_bridge: None,
+            auto_position: 0,
         }
     }
 
@@ -2780,6 +2786,13 @@ impl TranscriptMapper {
 
     /// Map one transcript line. Blank lines and undecodable JSON yield nothing:
     /// a partially written tail is normal while the file is being appended to.
+    ///
+    /// The source position is this mapper's own running record ordinal — fine
+    /// for a single mapper consuming one file in order. Pump code that can be
+    /// REPLACED by a fresh mapper (every transcript pump) MUST use
+    /// [`Self::map_line_at`] with the tail's file-relative index, otherwise a
+    /// replaying mapper resets the turn authority positions (c-ctxusage r14
+    /// item 2).
     pub fn map_line(&mut self, line: &str) -> DriverResult<Vec<Observation>> {
         let line = line.trim();
         if line.is_empty() {
@@ -2788,7 +2801,28 @@ impl TranscriptMapper {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return Ok(Vec::new());
         };
-        self.map_record(value)
+        let position = self.auto_position;
+        self.auto_position += 1;
+        self.map_record_at(value, position)
+    }
+
+    /// Map one transcript line at its file-relative RECORD position. The
+    /// position is the turn snapshot's replay-stable authority: a fresh mapper
+    /// replaying the same file hands the same record the same position
+    /// (c-ctxusage r14 item 2).
+    pub fn map_line_at(
+        &mut self,
+        line: &str,
+        position: records::SourcePosition,
+    ) -> DriverResult<Vec<Observation>> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return Ok(Vec::new());
+        };
+        self.map_record_at(value, position)
     }
 
     /// Poll-boundary drain (called at the end of every pump batch): publish
@@ -2941,6 +2975,12 @@ impl TranscriptMapper {
 
     /// Build the usage observation for a group's pending snapshot, parsing its
     /// record timestamp into the protocol millisecond clock.
+    ///
+    /// The snapshot revision is the record's REPLAY-STABLE source position
+    /// (1-based record index within the session transcript), never a per-mapper
+    /// publication counter: a fresh mapper replaying the file assigns the same
+    /// revision to the same record, and only a genuinely later record advances
+    /// it (c-ctxusage r14 item 2).
     fn usage_from_pending(
         &mut self,
         pending: &records::PendingUsage,
@@ -2951,13 +2991,28 @@ impl TranscriptMapper {
             pending.request_id.as_deref(),
             pending.model.as_deref(),
             &pending.usage,
-            pending.revision,
+            pending.source_position.saturating_add(1),
             native_at,
         )
     }
 
-    /// Map one decoded transcript record.
+    /// Map one decoded transcript record at an UNSPECIFIED position (the
+    /// mapper's running [`Self::map_line`] ordinal). Direct callers modeling a
+    /// transcript replay should prefer [`Self::map_record_at`] with the real
+    /// file-relative position so turn authority survives a mapper reset.
     pub fn map_record(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
+        let position = self.auto_position;
+        self.map_record_at(value, position)
+    }
+
+    /// Map one decoded transcript record located at `position` within its
+    /// session transcript. The position (not a per-mapper publish count) is
+    /// what the usage snapshot carries as its turn authority.
+    pub fn map_record_at(
+        &mut self,
+        value: Value,
+        position: records::SourcePosition,
+    ) -> DriverResult<Vec<Observation>> {
         // A sidechain record belongs to a sub-agent's own transcript view; the
         // main conversation is what the 结构 tab renders.
         if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
@@ -2983,7 +3038,7 @@ impl TranscriptMapper {
             extra = self.note_effort_attachment(&value)?;
         }
         let mut mapped = match kind {
-            "assistant" => self.map_assistant_record(value),
+            "assistant" => self.map_assistant_record(value, position),
             "user" => {
                 // Any user record ends (supersedes) the assistant run before it.
                 let mut out = self.finish()?;
@@ -3322,8 +3377,13 @@ impl TranscriptMapper {
         Ok(Vec::new())
     }
 
-    /// Buffer an assistant record, flushing the previous run when superseded.
-    fn map_assistant_record(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
+    /// Buffer an assistant record (at transcript file `position`), flushing the
+    /// previous run when superseded.
+    fn map_assistant_record(
+        &mut self,
+        value: Value,
+        position: records::SourcePosition,
+    ) -> DriverResult<Vec<Observation>> {
         let message = value.get("message").cloned().unwrap_or(Value::Null);
         let Some(key) = records::GroupKey::of(&value, &message) else {
             // No `message.id` to group on — replay it on its own rather than
@@ -3333,12 +3393,12 @@ impl TranscriptMapper {
             return Ok(out);
         };
         if self.group.continues(&key) {
-            self.group.push(&value, &message);
+            self.group.push(&value, &message, position);
             return Ok(Vec::new());
         }
         let out = self.finish()?;
-        self.group.start(key, value.clone());
-        self.group.push(&value, &message);
+        self.group.start(key, value.clone(), position);
+        self.group.push(&value, &message, position);
         Ok(out)
     }
 

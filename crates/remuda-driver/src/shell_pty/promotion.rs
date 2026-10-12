@@ -2181,10 +2181,10 @@ impl Hydrator {
     /// stop_reason still publishes its counters. A poll read error is treated
     /// as "nothing new" here: the finalise itself must never be skipped.
     fn finish_collect(&mut self) -> DriverResult<Vec<Observation>> {
-        let lines = self.tail.poll().unwrap_or_default();
+        let lines = self.tail.poll_indexed().unwrap_or_default();
         let mut observations = Vec::new();
-        for line in &lines {
-            observations.extend(self.mapper.map_line(line)?);
+        for (position, line) in &lines {
+            observations.extend(self.mapper.map_line_at(line, *position)?);
         }
         observations.extend(self.mapper.finish()?);
         Ok(observations)
@@ -2212,7 +2212,7 @@ impl Hydrator {
             faults.pump_collect_entered();
         }
         let launch = std::mem::take(&mut self.pending);
-        let lines = self.tail.poll()?;
+        let lines = self.tail.poll_indexed()?;
         // c-ctxusage r8 item 4+5: queue the launch snapshot BEFORE this
         // collect's mapped frames. FIFO append keeps any prior-epoch backlog
         // ahead of it without moving parked frames, and the bounded queue
@@ -2235,13 +2235,13 @@ impl Hydrator {
             parked.push_all_blocking(frames.drain(..));
             notify.notify_one();
         };
-        for line in &lines {
+        for (position, line) in &lines {
             if parked.is_closed() {
                 // Event channel gone: do not spend the rest of the replay
                 // mapping frames nobody can deliver.
                 break;
             }
-            match self.mapper.map_line(line) {
+            match self.mapper.map_line_at(line, *position) {
                 Ok(batch) => {
                     chunk.extend(batch);
                     if chunk.len() >= EMIT_CHUNK {

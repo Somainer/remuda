@@ -2227,14 +2227,18 @@ it("GATE17 item 1: recovering A -> never-mounted B with a FAILING seed self-driv
   hubStore.logout();
 });
 
-it("GATE18 item 6 (real store): an offline-retired attempt's delayed catch-up rejection never crosses a binding onto adopted live B — real resume/subscribe, zero settlement probes", async () => {
-  // Real-store counterpart of the gate-17 item-4 machine unit test (which
-  // injects resume/probe/liveness and calls noteBinding/followRebindLive
-  // directly). Here the resume is the store's real reopenFollow ->
-  // openFollowSocket path, the socket death and browser offline go through the
-  // real machine dispatch/window listener, and the binding change is a real
-  // mounted-session follow. A's catch-up rejects AFTER B was adopted live; B
-  // must never demote and no settlement probe may run for either journal.
+it("GATE18 item 6 (real store): an offline-retired attempt's delayed CATCH-UP rejection never crosses a binding onto adopted live B — the subscribe succeeds; the catch-up after openFollowSocket is what rejects", async () => {
+  // Gate-19 acceptance: the previous version of this test rejected the
+  // SUBSCRIBE (eventsSubscribe #2 hung) while every eventsRead succeeded, so
+  // it never reached the path it claimed — the delayed rejection of
+  // resumeAfterReconnect's bounded CATCH-UP read (store.ts reopenFollow:
+  // openFollowSocket THEN client.resumeAfterReconnect). Here subscribe #2
+  // really opens (its snapshot frames), the socket genuinely closes mid
+  // attempt through the REAL subscribe onClose hook, a browser offline event
+  // retires the attempt, navigation adopts the MOUNTED B live, and only THEN
+  // does A's pending catch-up read (limit 128) reject. The stale completion
+  // is dropped on the binding-generation guard: B stays live and no
+  // settlement probe or reopen runs for either journal.
   vi.useFakeTimers();
   const { api, hubStore } = await fresh();
   await bootLive(api, hubStore); // lists A = INSTANCE (journal JOURNAL)
@@ -2252,31 +2256,50 @@ it("GATE18 item 6 (real store): an offline-retired attempt's delayed catch-up re
         } as never as Awaited<ReturnType<Api["instanceGet"]>>)
       : ({} as Awaited<ReturnType<Api["instanceGet"]>>),
   );
-  vi.spyOn(api, "eventsRead").mockResolvedValue({
+  const emptyRead = {
     events: [],
     windowFromSeq: "1",
     durableSeq: "0",
     reachedAfterSeq: true,
-  } as Awaited<ReturnType<Api["eventsRead"]>>);
-  let rejectA!: (err: Error) => void;
-  let aSubscribeCalls = 0;
-  let bSubscribeCalls = 0;
-  vi.spyOn(api, "eventsSubscribe").mockImplementation(
-    (async (journalId: string) => {
-      if (journalId === JOURNAL) {
-        aSubscribeCalls += 1;
-        // A's SECOND subscribe (the real reconnect resume) stays pending until
-        // the test rejects it after the binding moved to B.
-        if (aSubscribeCalls === 2) {
+  } as Awaited<ReturnType<Api["eventsRead"]>>;
+  let catchUpReads = 0;
+  let rejectCatchUp!: (err: Error) => void;
+  vi.spyOn(api, "eventsRead").mockImplementation(
+    (async (args: Parameters<Api["eventsRead"]>[0]) => {
+      // The resume catch-up is the bounded limit-128 read AFTER the socket
+      // opened. A's FIRST one stays pending until the test rejects it across
+      // the binding; every other read (seeds/probes/later catch-ups) succeeds.
+      if (args.limit === 128 && args.journalId === JOURNAL) {
+        catchUpReads += 1;
+        if (catchUpReads === 1) {
           await new Promise<never>((_resolve, reject) => {
-            rejectA = reject;
+            rejectCatchUp = reject;
           });
         }
+      }
+      return emptyRead;
+    }) as Api["eventsRead"],
+  );
+  let aSubscribeCalls = 0;
+  let bSubscribeCalls = 0;
+  let closeSub2: (() => void) | null = null;
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    (async (
+      journalId: string,
+      _afterSeq: unknown,
+      _onBatch: unknown,
+      _onGap: unknown,
+      hooks?: { onOpen?: () => void; onClose?: () => void; onFrame?: () => void },
+    ) => {
+      if (journalId === JOURNAL) {
+        aSubscribeCalls += 1;
+        // Subscribe #2 REALLY opens; expose its genuine close hook.
+        if (aSubscribeCalls === 2) closeSub2 = () => hooks?.onClose?.();
       } else {
         bSubscribeCalls += 1;
       }
       return {
-        subscriptionId: `sub_g18i6_${journalId}` as never,
+        subscriptionId: `sub_g18i6_${journalId}_${aSubscribeCalls + bSubscribeCalls}` as never,
         getReadyState: () => 1,
         snapshot: { asOfSeq: "0", fromSeq: null },
         close: () => undefined,
@@ -2298,15 +2321,19 @@ it("GATE18 item 6 (real store): an offline-retired attempt's delayed catch-up re
   store.setFollowLiveForTest(true, true, JOURNAL_B);
   expect(aSubscribeCalls).toBe(1);
 
-  // A's link dies; a real online-driven resume starts and hangs on A's
-  // reopen subscribe; the follow socket then closes mid-attempt (latched); a
-  // real browser offline event retires the attempt with the offline flag.
+  // A's link dies; the real online resume opens subscribe #2 (snapshot frames
+  // it live) and then blocks in its catch-up read.
   store.setFollowLiveForTest(false, false, JOURNAL);
   store.connection.dispatch({ type: "online" });
-  for (let i = 0; i < 20 && aSubscribeCalls < 2; i += 1) await Promise.resolve();
+  for (let i = 0; i < 30 && aSubscribeCalls < 2; i += 1) await Promise.resolve();
   expect(aSubscribeCalls).toBe(2);
-  expect(store.connection.state).toBe("recovering");
-  store.connection.dispatch({ type: "close" });
+  for (let i = 0; i < 30 && catchUpReads < 1; i += 1) await Promise.resolve();
+  expect(catchUpReads).toBe(1);
+  expect(store.connection.state).toBe("live"); // snapshot-certified while read pending
+
+  // The follow socket genuinely closes mid-attempt (REAL subscribe hook ->
+  // machine latch), then a browser offline event retires the attempt.
+  (closeSub2 as (() => void) | null)?.();
   window.dispatchEvent(new Event("offline"));
   expect(store.connection.state).toBe("offline");
 
@@ -2315,27 +2342,152 @@ it("GATE18 item 6 (real store): an offline-retired attempt's delayed catch-up re
   expect(store.connectionBoundJournal).toBe(JOURNAL_B);
   expect(store.connection.state).toBe("live");
 
-  // A's delayed catch-up rejects across the binding.
-  rejectA(new Error("A catch-up lost the race"));
+  // A's delayed CATCH-UP read now rejects across the binding.
+  rejectCatchUp(new Error("A catch-up lost the race"));
   for (let i = 0; i < 30; i += 1) await Promise.resolve();
   expect(store.connection.state).toBe("live");
 
   // The stale completion was dropped BEFORE any settlement: no REST probe for
-  // either journal, and no subscribe was reopened for anyone.
+  // either journal, no retry of A's catch-up, and no subscribe reopened.
   const probes = () =>
     vi.mocked(api.eventsRead).mock.calls.filter((c) => c[0]?.limit === 1).length;
   expect(probes()).toBe(0);
+  expect(catchUpReads).toBe(1);
   expect(aSubscribeCalls).toBe(2);
   expect(bSubscribeCalls).toBe(1);
 
-  // Still live with nothing reopened well past the rejection (the frame
-  // watchdog's own 15 s silent-socket cycle is intentionally not crossed).
+  // Still live with nothing reopened well past the rejection.
   await vi.advanceTimersByTimeAsync(10_000);
   for (let i = 0; i < 20; i += 1) await Promise.resolve();
   expect(store.connection.state).toBe("live");
   expect(probes()).toBe(0);
+  expect(catchUpReads).toBe(1);
   expect(aSubscribeCalls).toBe(2);
   expect(bSubscribeCalls).toBe(1);
+  vi.useRealTimers();
+  hubStore.logout();
+});
+
+it("GATE19 item 6b (real store): a same-binding offline-retired rejection is CONSUMED — settlement probe + reconnect clock — then an explicit online after the retry deadline runs a REAL resume + subscribe and certifies live", async () => {
+  // Replaces the setupTracked machine unit test. Same binding throughout: the
+  // reopen subscribe really opens, its socket genuinely closes while its
+  // catch-up read (limit 128) is pending, a browser offline event retires the
+  // attempt, and the delayed catch-up then REJECTS. Because the binding did
+  // not move, the rejection must be CONSUMED (not dropped): the settlement
+  // probe runs, REST being down keeps the loud offline reconnect clock; past
+  // the retry deadline an explicit online starts a REAL second resume whose
+  // subscribe + catch-up succeed and certify live.
+  vi.useFakeTimers();
+  const { api, hubStore } = await fresh();
+  await bootLive(api, hubStore); // lists A = INSTANCE (journal JOURNAL)
+
+  const emptyRead = {
+    events: [],
+    windowFromSeq: "1",
+    durableSeq: "0",
+    reachedAfterSeq: true,
+  } as Awaited<ReturnType<Api["eventsRead"]>>;
+  let catchUpReads = 0;
+  let rejectCatchUp!: (err: Error) => void;
+  vi.spyOn(api, "eventsRead").mockImplementation(
+    (async (args: Parameters<Api["eventsRead"]>[0]) => {
+      // Settlement probes always fail (REST down for follow reads).
+      if (args.limit === 1) throw new Error("probe unreachable");
+      if (args.limit === 128) {
+        catchUpReads += 1;
+        // The FIRST catch-up (resume #1) blocks and is rejected after the
+        // offline retirement; every later catch-up (resume #2) succeeds.
+        if (catchUpReads === 1) {
+          await new Promise<never>((_resolve, reject) => {
+            rejectCatchUp = reject;
+          });
+        }
+      }
+      return emptyRead;
+    }) as Api["eventsRead"],
+  );
+  let subscribes = 0;
+  let closeSub2: (() => void) | null = null;
+  vi.spyOn(api, "eventsSubscribe").mockImplementation(
+    (async (
+      _journalId: string,
+      _afterSeq: unknown,
+      _onBatch: unknown,
+      _onGap: unknown,
+      hooks?: { onOpen?: () => void; onClose?: () => void; onFrame?: () => void },
+    ) => {
+      subscribes += 1;
+      if (subscribes === 2) closeSub2 = () => hooks?.onClose?.();
+      return {
+        subscriptionId: `sub_g19_i6b_${subscribes}` as never,
+        getReadyState: () => 1,
+        snapshot: { asOfSeq: "0", fromSeq: null },
+        close: () => undefined,
+      };
+    }) as unknown as Api["eventsSubscribe"],
+  );
+
+  await hubStore.follow(INSTANCE);
+  expect(subscribes).toBe(1);
+  const store = hubStore as unknown as {
+    connection: ConnectionMachine;
+    setFollowLiveForTest: (open: boolean, framed: boolean, journalId?: string) => void;
+  };
+  store.setFollowLiveForTest(true, true, JOURNAL);
+  const timerNames = () =>
+    [...(store.connection as unknown as { timers: Map<string, unknown> }).timers.keys()];
+  const probes = () =>
+    vi.mocked(api.eventsRead).mock.calls.filter((c) => c[0]?.limit === 1).length;
+
+  // Link dies; resume #1 opens subscribe #2 and blocks in its catch-up read.
+  store.setFollowLiveForTest(false, false, JOURNAL);
+  store.connection.dispatch({ type: "online" });
+  for (let i = 0; i < 40 && subscribes < 2; i += 1) await Promise.resolve();
+  expect(subscribes).toBe(2);
+  for (let i = 0; i < 40 && catchUpReads < 1; i += 1) await Promise.resolve();
+  expect(catchUpReads).toBe(1);
+
+  // Same-binding socket close (latched) then browser offline retirement.
+  (closeSub2 as (() => void) | null)?.();
+  window.dispatchEvent(new Event("offline"));
+  expect(store.connection.state).toBe("offline");
+
+  // The delayed catch-up rejection is CONSUMED: the settlement probe runs and
+  // fails, leaving the loud offline state with a reconnect clock.
+  rejectCatchUp(new Error("catch-up lost"));
+  for (let i = 0; i < 40 && !timerNames().includes("reconnect"); i += 1) {
+    await Promise.resolve();
+  }
+  expect(probes()).toBe(1);
+  expect(store.connection.state).toBe("offline");
+  expect(timerNames()).toContain("reconnect");
+
+  // Past the retry deadline an explicit online starts a REAL second resume:
+  // a new follow subscribe and a real catch-up that succeeds. Cancel the
+  // autonomous reconnect handle so the foreground online is the sole driver
+  // under observation (the clock's existence was just proven above); let wall
+  // time cross the deadline first.
+  {
+    const timers = (store.connection as unknown as {
+      timers: Map<string, ReturnType<typeof setTimeout>>;
+    }).timers;
+    const h = timers.get("reconnect");
+    if (h) clearTimeout(h);
+    timers.delete("reconnect");
+  }
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect(subscribes).toBe(2); // nothing resumed autonomously
+  store.connection.dispatch({ type: "online" });
+  for (let i = 0; i < 100 && store.connection.state !== "live"; i += 1) {
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  expect(store.connection.state).toBe("live");
+  expect(subscribes).toBe(3);
+  expect(catchUpReads).toBe(2);
+  // The reconnect tail is gone; the frame watchdog owns the link.
+  expect(timerNames()).toContain("stale");
+  expect(timerNames()).not.toContain("reconnect");
+  expect(timerNames()).not.toContain("watchdog");
   vi.useRealTimers();
   hubStore.logout();
 });

@@ -334,29 +334,149 @@ it("GATE19 item 1: a cloned sibling's sole claim timer reads the lease-less PEND
   }
 });
 
-it("GATE20 item 2: X's deadline fire must not cancel Y's only wake when a cloned sibling restored Y to lease-less pending — Y delivers", async () => {
-  // A tracks two SAME-owner inflight claims: X until T1, Y until T2 (T2 > T1).
-  // The cloned sibling finishes X (sent) but its POST/status reconciliation
-  // for Y FAILS: Y is restored to lease-less PENDING and the sibling closes
-  // before its in-memory retry. A performs no flush: X's expiry at T1 is the
-  // only external trigger. The old per-snapshot reconciliation CANCELLED Y's
-  // wake there (it was no longer inflight) with no handoff, so Y stranded.
-  // The central reconciliation must instead re-judge Y as deliverable: one
-  // 0 ms delivery wake → guarded flush → exactly one POST, for Y. X is never
-  // POSTed and nothing waits for T2.
+/**
+ * FIFO Web Locks shim for gate 21: query reports really held names; the first
+ * requester runs, queued requesters run in order on release.
+ */
+function fifoWebLocks() {
+  const heldNow = new Set<string>();
+  const queues = new Map<string, Array<() => void>>();
+  const pop = (name: string) => queues.get(name)?.shift()?.();
+  const locks = {
+    query: async () => ({ held: [...heldNow].map((name) => ({ name, mode: "exclusive" })) }),
+    request(name: string, _opts: unknown, cb: () => Promise<unknown>) {
+      return new Promise((resolve, reject) => {
+        const run = () => {
+          heldNow.add(name);
+          Promise.resolve()
+            .then(cb)
+            .then(
+              (v) => {
+                heldNow.delete(name);
+                resolve(v);
+                pop(name);
+              },
+              (e) => {
+                heldNow.delete(name);
+                reject(e);
+                pop(name);
+              },
+            );
+        };
+        if (heldNow.has(name) || (queues.get(name)?.length ?? 0) > 0) {
+          const q = queues.get(name) ?? [];
+          q.push(run);
+          queues.set(name, q);
+        } else {
+          run();
+        }
+      });
+    },
+  };
+  return { locks };
+}
+
+it("GATE21 item 5 (was GATE20 item 2): sibling B really finishes X and fails Y at the API boundary then closes — surviving store A delivers Y with only its real timer", async () => {
+  // Rebuilt from the hand-written localStorage version: TWO real
+  // HubStores/Outboxes on one backend (distinct tab owners), serialized by a
+  // FIFO Web Locks shim. Initial inflight claims are the only seeded state;
+  // every later transition is a real delivery flow. X (instance IX) is B's
+  // claim until 10 s; Y (instance IY) is B's claim until 30 s.
+  //
+  // At 10 s B's real flow sends X (clear → sent); A's X fire reads the
+  // terminal row. At 30 s B claims Y and the POST fails at the API boundary
+  // (network error AND status GET rejected) → Y returns lease-less pending;
+  // B closes, its jittered retry cancelled. A's real deadline wake is queued
+  // on the same FIFO lock: its guarded flush reads pending Y and delivers
+  // exactly once. No storage hand-editing, no manual flush.
   vi.useFakeTimers();
-  const owner = "owner_g20_i2";
+  const ownerA = "owner_g21_i5_2_a";
+  const ownerB = "owner_g21_i5_2_b";
   const originalNavigator = globalThis.navigator;
+  const shim = fifoWebLocks();
+  const realQuery = shim.locks.query;
+  shim.locks.query = async () => {
+    throw new Error("locks.query unavailable during load");
+  };
   Object.defineProperty(globalThis, "navigator", {
     configurable: true,
     writable: true,
-    value: { locks: { query: async () => ({ held: [] }) } }, // query, no request
+    value: { locks: shim.locks },
   });
   localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
-  sessionStorage.setItem("remuda-outbox-owner", owner);
   try {
-    const { api, hubStore } = await fresh();
-    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+    const X = "cmd_g21_i5_2_x";
+    const Y = "cmd_g21_i5_2_y";
+    const IX = "ins_g21_i5_2_x";
+    const IY = "ins_g21_i5_2_y";
+    localStorage.setItem(
+      OUTBOX_LS_KEY,
+      JSON.stringify([
+        {
+          commandId: X,
+          clientRequestId: `local_${X}`,
+          instanceId: IX,
+          journalId: JOURNAL,
+          prompt: "sibling finishes this one",
+          createdAt: Date.now() - 2_000,
+          attempts: 1,
+          state: "inflight",
+          lease: { owner: ownerB, until: Date.now() + 10_000 },
+        } satisfies OutboxRecord,
+        {
+          commandId: Y,
+          clientRequestId: `local_${Y}`,
+          instanceId: IY,
+          journalId: JOURNAL,
+          prompt: "sibling fails this one",
+          createdAt: Date.now() - 1_000,
+          attempts: 1,
+          state: "inflight",
+          lease: { owner: ownerB, until: Date.now() + 30_000 },
+        } satisfies OutboxRecord,
+      ]),
+    );
+
+    sessionStorage.setItem("remuda-outbox-owner", ownerB);
+    const { api: apiB, hubStore: b } = await fresh();
+    vi.spyOn(apiB, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(apiB, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(apiB, "instanceCommandStatus").mockRejectedValue(new Error("status network down"));
+    const sendB = vi.spyOn(apiB, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) => {
+        if (commandId === X) {
+          return {
+            relatedCommandIds: [],
+            command: {
+              commandId: X,
+              id: X,
+              state: "accepted",
+              revision: "1",
+              dispatch: "native-acknowledged",
+              resolution: "clear",
+            },
+          };
+        }
+        throw new Error("network POST failed");
+      }) as unknown as Api["instanceSend"],
+    );
+    await bootLive(apiB, b);
+    shim.locks.query = realQuery;
+    sessionStorage.setItem("remuda-outbox-owner", ownerA);
+    const { api: apiA, hubStore: a } = await fresh();
+    vi.spyOn(apiA, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(apiA, "screenRead").mockResolvedValue({ lines: [] });
+    const sendA = vi.spyOn(apiA, "instanceSend").mockImplementation(
       (async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) => ({
         relatedCommandIds: [],
         command: {
@@ -369,84 +489,55 @@ it("GATE20 item 2: X's deadline fire must not cancel Y's only wake when a cloned
         },
       })) as unknown as Api["instanceSend"],
     );
-    await bootLive(api, hubStore);
-    const internal = hubStore as unknown as {
-      flushAllOutbox: () => Promise<void>;
+    await bootLive(apiA, a);
+
+    // Pin B's network-retry jitter high so it cannot retry Y inside the
+    // windows below; the logout right after the failure cancels it anyway.
+    vi.spyOn(Math, "random").mockReturnValue(0.999);
+
+    const ai = a as unknown as {
       outbox: { refreshDurable: () => Promise<unknown>; pendingLeaseWakeups: () => string[] };
     };
-    await internal.flushAllOutbox(); // settle the empty boot flush
-    expect(send).not.toHaveBeenCalled();
+    await ai.outbox.refreshDurable();
+    expect(ai.outbox.pendingLeaseWakeups().sort()).toEqual([X, Y].sort());
 
-    const X = "cmd_g20_i2_x";
-    const Y = "cmd_g20_i2_y";
-    const T1_MS = 10_000;
-    const T2_MS = 30_000;
-    const inflightRow = (id: string, untilMs: number, prompt: string): OutboxRecord => ({
-      commandId: id,
-      clientRequestId: `local_${id}`,
-      instanceId: INSTANCE,
-      journalId: JOURNAL,
-      prompt,
-      createdAt: Date.now() - 1_000,
-      attempts: 1,
-      state: "inflight",
-      lease: { owner, until: Date.now() + untilMs },
-    });
-    localStorage.setItem(
-      OUTBOX_LS_KEY,
-      JSON.stringify([
-        inflightRow(X, T1_MS, "sibling finishes this one"),
-        inflightRow(Y, T2_MS, "sibling fails this one"),
-      ]),
-    );
-    await internal.outbox.refreshDurable();
-    expect(internal.outbox.pendingLeaseWakeups().sort()).toEqual([X, Y].sort());
-    expect(send).not.toHaveBeenCalled();
-
-    // Midway to T1: X is durably SENT, Y is lease-less PENDING (the sibling's
-    // failed reconciliation), and the sibling has closed.
-    await vi.advanceTimersByTimeAsync(5_000);
-    localStorage.setItem(
-      OUTBOX_LS_KEY,
-      JSON.stringify([
-        {
-          ...inflightRow(X, T1_MS, "sibling finishes this one"),
-          state: "sent",
-          gotResponse: true,
-          lease: undefined,
-        } satisfies OutboxRecord,
-        {
-          commandId: Y,
-          clientRequestId: `local_${Y}`,
-          instanceId: INSTANCE,
-          journalId: JOURNAL,
-          prompt: "sibling fails this one",
-          createdAt: Date.now() - 2_000,
-          attempts: 1,
-          state: "pending",
-          lastError: "sibling POST reconciliation failed",
-        } satisfies OutboxRecord,
-      ]),
-    );
-
-    // X's deadline at T1 is the ONLY trigger. Y's 0 ms delivery wake is armed
-    // from inside X's awaited read chain: pump with positive fake-time steps
-    // (a 0 ms advance does not dispatch a timer a fire's microtask scheduled).
-    await vi.advanceTimersByTimeAsync(T1_MS - 5_000);
-    for (let i = 0; i < 60 && send.mock.calls.length === 0; i += 1) {
+    // 10 s: B sends X for real; A's X fire settles on the sent row.
+    await vi.advanceTimersByTimeAsync(10_000);
+    for (let i = 0; i < 40 && sendB.mock.calls.filter((c) => c[4] === X).length === 0; i += 1) {
       await vi.advanceTimersByTimeAsync(1);
       await Promise.resolve();
     }
-    expect(send).toHaveBeenCalledTimes(1);
-    expect(send.mock.calls[0]?.[4]).toBe(Y);
+    expect(sendB.mock.calls.map((c) => c[4])).toEqual([X]);
+    expect(sendA).not.toHaveBeenCalled();
+
+    // 30 s: B's real flow claims Y, POST + status fail at the boundary and Y
+    // is restored lease-less pending. Pump microtasks only, then close B so
+    // its bounded jittered retry never POSTs Y again.
+    await vi.advanceTimersByTimeAsync(20_000);
+    for (let i = 0; i < 400 && sendB.mock.calls.filter((c) => c[4] === Y).length === 0; i += 1) {
+      await Promise.resolve();
+    }
+    expect(sendB.mock.calls.map((c) => c[4])).toEqual([X, Y]);
     const stored = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    // B closes before its pinned ~500 ms jittered retry can fire; A's queued
+    // real deadline wake is what carries Y the rest of the way.
+    b.logout();
+
+    // A's guarded flush delivers Y exactly once (microtask drain of the
+    // FIFO-queued timer turn, otherwise a few ms of fake time).
+    for (let i = 0; i < 200 && sendA.mock.calls.length === 0; i += 1) {
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1);
+    }
+    expect(sendA).toHaveBeenCalledTimes(1);
+    expect(sendA.mock.calls[0]?.[4]).toBe(Y);
     expect(stored().find((r) => r.commandId === X)?.state).toBe("sent");
     expect(stored().find((r) => r.commandId === Y)?.state).toBe("sent");
 
-    // Well past T2: no second POST, X never POSTed.
-    await vi.advanceTimersByTimeAsync(T2_MS * 2);
-    expect(send).toHaveBeenCalledTimes(1);
-    hubStore.logout();
+    // Well past every deadline: no second POST, X never posted by A.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(sendA).toHaveBeenCalledTimes(1);
+    a.logout();
   } finally {
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
@@ -454,82 +545,40 @@ it("GATE20 item 2: X's deadline fire must not cancel Y's only wake when a cloned
   }
 });
 
-it("GATE20 item 3a: a same-owner deadline fire's guarded flush sends P but never an ALREADY-HELD H — H waits for its held-retry timer", async () => {
-  // A tracks P under a same-owner lease until T. Before T a sibling's POST for
-  // H is answered HELD and P is restored to lease-less pending. At T P's own
-  // deadline wake is the only trigger: the GUARDED flush must send P while the
-  // held policy (pre-lock selection AND claim boundary) keeps H out. H's next
-  // POST comes from the real held-retry clock armed by the same reconciliation
-  // (~2 s later), never early.
+it("GATE21 item 5 (was GATE20 item 3a): sibling B's real flow answers H HELD and fails P at the boundary then closes — A's timer-driven guarded flush sends only P; H retries from A's real held-retry clock", async () => {
+  // Rebuilt from the hand-written localStorage version. TWO real
+  // HubStores/Outboxes on one backend (distinct owners), serialized by a FIFO
+  // Web Locks shim. Initial state: H and P are B's fresh inflight claims on
+  // the SAME instance, both due at 10 s (H created first so B claims it
+  // first). Everything afterwards is a real delivery flow:
+  //   - B claims H and the Hub answers HELD (resolution "held");
+  //   - B's same flush then claims P; the POST fails at the API boundary and
+  //     the status GET is also rejected → P returns to lease-less pending;
+  //   - B closes immediately (its held/outbox retry timers are cancelled).
+  // A tracked both leases; its queued deadline wake then runs the GUARDED
+  // flush (skipCurrentlyHeld): P is sent once and H is never posted early.
+  // H's NEXT POST comes from A's real held-retry clock (~2 s), exactly once.
   vi.useFakeTimers();
-  const owner = "owner_g20_i3a";
+  const ownerA = "owner_g21_i5_3a_a";
+  const ownerB = "owner_g21_i5_3a_b";
   const originalNavigator = globalThis.navigator;
+  const shim = fifoWebLocks();
+  const realQuery = shim.locks.query;
+  shim.locks.query = async () => {
+    throw new Error("locks.query unavailable during load");
+  };
   Object.defineProperty(globalThis, "navigator", {
     configurable: true,
     writable: true,
-    value: { locks: { query: async () => ({ held: [] }) } }, // query, no request
+    value: { locks: shim.locks },
   });
   localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
-  sessionStorage.setItem("remuda-outbox-owner", owner);
   try {
-    const { api, hubStore } = await fresh();
-    vi.spyOn(api, "eventsRead").mockResolvedValue({
-      events: [],
-      durableSeq: "0",
-      windowFromSeq: null,
-      reachedAfterSeq: true,
-    });
-    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
-    const send = vi.spyOn(api, "instanceSend").mockImplementation(
-      (async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) => ({
-        relatedCommandIds: [],
-        command: {
-          commandId,
-          id: commandId,
-          state: "accepted",
-          revision: "1",
-          dispatch: "native-acknowledged",
-          resolution: "clear",
-        },
-      })) as unknown as Api["instanceSend"],
-    );
-    await bootLive(api, hubStore);
-    const internal = hubStore as unknown as {
-      flushAllOutbox: () => Promise<void>;
-      outbox: { refreshDurable: () => Promise<unknown>; pendingLeaseWakeups: () => string[] };
-    };
-    await internal.flushAllOutbox();
-    expect(send).not.toHaveBeenCalled();
-
-    const P = "cmd_g20_i3a_p";
-    const H = "cmd_g20_i3a_h";
-    const T_MS = 10_000;
-    const inflightP: OutboxRecord = {
-      commandId: P,
-      clientRequestId: `local_${P}`,
-      instanceId: INSTANCE,
-      journalId: JOURNAL,
-      prompt: "restored pending",
-      createdAt: Date.now() - 1_000,
-      attempts: 1,
-      state: "inflight",
-      lease: { owner, until: Date.now() + T_MS },
-    };
-    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([inflightP]));
-    await internal.outbox.refreshDurable();
-    expect(internal.outbox.pendingLeaseWakeups()).toEqual([P]);
-
-    // Before T: P is restored to lease-less pending; H is durably HELD.
-    await vi.advanceTimersByTimeAsync(5_000);
+    const H = "cmd_g21_i5_3a_h";
+    const P = "cmd_g21_i5_3a_p";
     localStorage.setItem(
       OUTBOX_LS_KEY,
       JSON.stringify([
-        {
-          ...inflightP,
-          state: "pending",
-          lease: undefined,
-          lastError: "sibling failed and closed",
-        } satisfies OutboxRecord,
         {
           commandId: H,
           clientRequestId: `local_${H}`,
@@ -538,33 +587,131 @@ it("GATE20 item 3a: a same-owner deadline fire's guarded flush sends P but never
           prompt: "answered held by a sibling",
           createdAt: Date.now() - 2_000,
           attempts: 1,
-          state: "held",
-          gotResponse: true,
+          state: "inflight",
+          lease: { owner: ownerB, until: Date.now() + 10_000 },
+        } satisfies OutboxRecord,
+        {
+          commandId: P,
+          clientRequestId: `local_${P}`,
+          instanceId: INSTANCE,
+          journalId: JOURNAL,
+          prompt: "restored pending after sibling failure",
+          createdAt: Date.now() - 1_000,
+          attempts: 1,
+          state: "inflight",
+          lease: { owner: ownerB, until: Date.now() + 10_000 },
         } satisfies OutboxRecord,
       ]),
     );
 
-    // P's deadline wake fires the guarded flush: only P is POSTed at T.
-    await vi.advanceTimersByTimeAsync(T_MS - 5_000);
-    for (let i = 0; i < 60 && send.mock.calls.length === 0; i += 1) {
-      await vi.advanceTimersByTimeAsync(1);
+    sessionStorage.setItem("remuda-outbox-owner", ownerB);
+    const { api: apiB, hubStore: b } = await fresh();
+    vi.spyOn(apiB, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(apiB, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(apiB, "instanceCommandStatus").mockRejectedValue(new Error("status network down"));
+    let bCalls = 0;
+    const sendB = vi.spyOn(apiB, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) => {
+        bCalls += 1;
+        if (commandId === H && bCalls === 1) {
+          return {
+            relatedCommandIds: [],
+            command: {
+              commandId: H,
+              id: H,
+              state: "queued",
+              revision: "1",
+              dispatch: "not-dispatched",
+              resolution: "held",
+            },
+          };
+        }
+        throw new Error("network POST failed");
+      }) as unknown as Api["instanceSend"],
+    );
+    await bootLive(apiB, b);
+    shim.locks.query = realQuery;
+
+    sessionStorage.setItem("remuda-outbox-owner", ownerA);
+    const { api: apiA, hubStore: a } = await fresh();
+    vi.spyOn(apiA, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(apiA, "screenRead").mockResolvedValue({ lines: [] });
+    const sendA = vi.spyOn(apiA, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) => ({
+        relatedCommandIds: [],
+        command: {
+          commandId,
+          id: commandId,
+          state: "accepted",
+          revision: "1",
+          dispatch: "native-acknowledged",
+          resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(apiA, a);
+    vi.spyOn(Math, "random").mockReturnValue(0.999);
+
+    // 10 s: B claims H (held answer) then P (network+status fail → pending).
+    // Its fires were registered first, so it holds the FIFO lock; A's guarded
+    // flush queues behind it.
+    await vi.advanceTimersByTimeAsync(10_000);
+    for (let i = 0; i < 400; i += 1) {
       await Promise.resolve();
+      const rows = JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+      if (
+        rows.find((r) => r.commandId === H)?.state === "held" &&
+        rows.find((r) => r.commandId === P)?.state === "pending"
+      ) {
+        break;
+      }
     }
-    expect(send).toHaveBeenCalledTimes(1);
-    expect(send.mock.calls[0]?.[4]).toBe(P);
     const stored = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(stored().find((r) => r.commandId === H)?.state).toBe("held");
+    expect(stored().find((r) => r.commandId === P)?.state).toBe("pending");
+    expect(sendB.mock.calls.map((c) => c[4])).toEqual([H, P]);
+
+    // B closes at once: its held-retry and network-retry timers are cancelled,
+    // so it never POSTs either row again.
+    const T0 = Date.now();
+    b.logout();
+
+    // A's queued guarded flush runs: only P is posted; H stays held.
+    for (let i = 0; i < 200 && sendA.mock.calls.length === 0; i += 1) {
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1);
+    }
+    const allPosts = () => [...sendA.mock.calls, ...sendB.mock.calls];
+    const postsFor = (id: string) => allPosts().filter((c) => c[4] === id);
+    expect(sendA.mock.calls.map((c) => c[4])).toEqual([P]);
     expect(stored().find((r) => r.commandId === P)?.state).toBe("sent");
     expect(stored().find((r) => r.commandId === H)?.state).toBe("held");
 
-    // H stays quiet until the real held-retry deadline (2 s after T) …
-    await vi.advanceTimersByTimeAsync(1_999);
-    expect(send).toHaveBeenCalledTimes(1);
-    // … which re-forwards H exactly once through a NORMAL flush.
-    await vi.advanceTimersByTimeAsync(2);
-    for (let i = 0; i < 40 && send.mock.calls.length < 2; i += 1) await Promise.resolve();
-    expect(send).toHaveBeenCalledTimes(2);
-    expect(send.mock.calls[1]?.[4]).toBe(H);
-    hubStore.logout();
+    // H stays quiet until A's real held-retry deadline (~2 s after T0) …
+    await vi.advanceTimersByTimeAsync(Math.max(0, T0 + 1_999 - Date.now()));
+    expect(postsFor(H)).toHaveLength(1);
+    // … then the normal held-retry flush re-forwards H exactly once.
+    await vi.advanceTimersByTimeAsync(Math.max(2, T0 + 2_100 - Date.now()));
+    for (let i = 0; i < 60 && postsFor(H).length < 2; i += 1) {
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+    }
+    expect(postsFor(H)).toHaveLength(2);
+    expect(sendA.mock.calls.map((c) => c[4]).sort()).toEqual([H, P].sort());
+    expect(stored().find((r) => r.commandId === H)?.state).toBe("sent");
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    a.logout();
   } finally {
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });

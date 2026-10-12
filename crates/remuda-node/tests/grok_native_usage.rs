@@ -45,7 +45,11 @@ fn turn_ended(ts: &str) -> String {
 }
 
 fn usage_json(input: u64, output: u64) -> String {
-    format!("{{\"modelId\":\"grok-1\",\"inputTokens\":{input},\"outputTokens\":{output}}}\n")
+    // Real grok usage.json reports the cache buckets as structural zeros;
+    // they are reported zeros, not omitted Unknown buckets (c-ctxusage r15 item 5).
+    format!(
+        "{{\"modelId\":\"grok-1\",\"inputTokens\":{input},\"outputTokens\":{output},\"cacheReadInputTokens\":0,\"cacheCreationInputTokens\":0}}\n"
+    )
 }
 
 /// Poll the adapter and return the single stamped Session usage observation

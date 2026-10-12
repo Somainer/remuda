@@ -47,11 +47,11 @@ fn claude_extracts_one_event_per_content_block_and_dedupes_per_message() {
     assert_eq!(agg.session().events, 2);
     assert_eq!(agg.turns().len(), 0, "transcript records have no requestId");
     let totals = agg.session();
-    assert_eq!(totals.tokens.uncached_input, 18);
-    assert_eq!(totals.tokens.output, 261);
-    assert_eq!(totals.tokens.cache_read, 40627);
-    assert_eq!(totals.tokens.cache_write_1h, 3874);
-    assert_eq!(totals.tokens.cache_write_5m, 0);
+    assert_eq!(totals.tokens.uncached_input, Some(18));
+    assert_eq!(totals.tokens.output, Some(261));
+    assert_eq!(totals.tokens.cache_read, Some(40627));
+    assert_eq!(totals.tokens.cache_write_1h, Some(3874));
+    assert_eq!(totals.tokens.cache_write_5m, Some(0));
     assert_eq!(totals.reasoning_tokens, 123);
     assert!(totals.cost_usd().is_some());
 }
@@ -161,9 +161,9 @@ fn codex_aggregates_per_response_records_without_the_cumulative_snapshots() {
     assert_eq!(agg.session().events, 10);
     assert!(agg.session().cost_usd().is_some(), "all responses priced");
     // 10 per-response records × 100 input / 20 output (10 cached each).
-    assert_eq!(agg.session().tokens.uncached_input, 900);
-    assert_eq!(agg.session().tokens.cache_read, 100);
-    assert_eq!(agg.session().tokens.output, 200);
+    assert_eq!(agg.session().tokens.uncached_input, Some(900));
+    assert_eq!(agg.session().tokens.cache_read, Some(100));
+    assert_eq!(agg.session().tokens.output, Some(200));
     assert_eq!(agg.ignored_cumulative(), 0, "caller filters snapshots out");
     // Turn totals exist for every turn with usage.
     assert!(agg.turns().len() >= 5);
@@ -183,7 +183,7 @@ fn codex_cumulative_snapshots_do_not_inflate_session_totals() {
     }
     // With snapshots folded in via push(), they are refused: output stays 200
     // (the per-response sum), never the 200 cumulative-final double count.
-    assert_eq!(agg.session().tokens.output, 200);
+    assert_eq!(agg.session().tokens.output, Some(200));
     assert_eq!(agg.ignored_cumulative(), 10);
 }
 
@@ -196,9 +196,9 @@ fn grok_usage_file_yields_priced_event_with_subtracted_cache() {
     assert_eq!(events.len(), 1);
     let event = &events[0];
     assert_eq!(event.harness(), Harness::Grok);
-    assert_eq!(event.tokens.uncached_input, 25872);
-    assert_eq!(event.tokens.output, 35);
-    assert_eq!(event.tokens.cache_read, 640);
+    assert_eq!(event.tokens.uncached_input, Some(25872));
+    assert_eq!(event.tokens.output, Some(35));
+    assert_eq!(event.tokens.cache_read, Some(640));
     assert_eq!(event.reported_cost_usd, Some(0.00910418));
     assert!(event.cost_usd.is_some());
 }
@@ -219,10 +219,10 @@ fn grok_updates_fixture_has_two_priced_turn_completed_frames_and_a_chunk() {
     assert_eq!(agg.session().events, 2);
     // turn 1: 1000 total input - 200 read - 50 write = 750 uncached;
     // turn 2: 2000 - 300 - 0 = 1700 uncached.
-    assert_eq!(agg.session().tokens.uncached_input, 2450);
-    assert_eq!(agg.session().tokens.cache_read, 500);
-    assert_eq!(agg.session().tokens.cache_write_5m, 50);
-    assert_eq!(agg.session().tokens.output, 100);
+    assert_eq!(agg.session().tokens.uncached_input, Some(2450));
+    assert_eq!(agg.session().tokens.cache_read, Some(500));
+    assert_eq!(agg.session().tokens.cache_write_5m, Some(50));
+    assert_eq!(agg.session().tokens.output, Some(100));
     assert_eq!(agg.turns().len(), 2);
     assert!(agg.session().cost_usd().is_some());
 }

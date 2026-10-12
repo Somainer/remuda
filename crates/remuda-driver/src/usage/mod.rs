@@ -179,12 +179,11 @@ pub struct UsageTotals {
 impl UsageTotals {
     pub(crate) fn add(&mut self, event: &UsageEvent) {
         self.events += 1;
-        self.tokens.uncached_input += event.tokens.uncached_input;
-        self.tokens.output += event.tokens.output;
-        self.tokens.cache_read += event.tokens.cache_read;
-        self.tokens.cache_write_5m += event.tokens.cache_write_5m;
-        self.tokens.cache_write_1h += event.tokens.cache_write_1h;
-        self.reasoning_tokens += event.reasoning_tokens.unwrap_or(0);
+        self.tokens = self.tokens.merge_counts(&event.tokens);
+        self.reasoning_tokens = self
+            .reasoning_tokens
+            .checked_add(event.reasoning_tokens.unwrap_or(0))
+            .expect("reasoning token total must not overflow");
         self.cost_usd = match (self.cost_usd, event.cost_usd) {
             (Some(total), Some(cost)) => Some(total + cost),
             (None, Some(cost)) => Some(cost),
@@ -293,6 +292,19 @@ fn known(value: u64) -> Knowledge<U64> {
     Knowledge::Known { value: U64(value) }
 }
 
+/// A reported bucket becomes `Known`; a bucket the source OMITTED stays
+/// `Unknown` with a provenance reason — never a fabricated zero
+/// (c-ctxusage r15 item 5).
+fn known_optional(value: Option<u64>) -> Knowledge<U64> {
+    match value {
+        Some(value) => Knowledge::Known { value: U64(value) },
+        None => Knowledge::Unknown {
+            reason: "bucket-not-reported".into(),
+            evidence_event_ids: Vec::new(),
+        },
+    }
+}
+
 fn cost_knowledge(totals: &UsageTotals) -> Knowledge<Cost> {
     match totals.cost_usd() {
         Some(cost) => Knowledge::Known {
@@ -342,13 +354,13 @@ pub fn to_usage_payload(
         source_session_id: source_session_id
             .filter(|id| !id.is_empty())
             .map(str::to_owned),
-        input_tokens: known(totals.tokens.uncached_input),
+        input_tokens: known_optional(totals.tokens.uncached_input),
         input_accounting: InputAccounting::Uncached,
-        output_tokens: known(totals.tokens.output),
+        output_tokens: known_optional(totals.tokens.output),
         reasoning_tokens: known(totals.reasoning_tokens),
-        cache_read_tokens: known(totals.tokens.cache_read),
-        cache_write_tokens: known(totals.tokens.cache_write()),
-        total_tokens: known(total),
+        cache_read_tokens: known_optional(totals.tokens.cache_read),
+        cache_write_tokens: known_optional(totals.tokens.cache_write()),
+        total_tokens: known_optional(total),
         cost: cost_knowledge(totals),
         accounting: Accounting::Estimated,
         native_fields_ref: None,
@@ -377,13 +389,14 @@ mod tests {
         )
     }
 
+    /// Fully-reported counters for the legacy "complete record" tests.
+    fn tk(input: u64, output: u64) -> TokenCounters {
+        TokenCounters::known(input, output, 0, 0, 0)
+    }
+
     #[test]
     fn claude_message_usage_is_deduped_per_message_id() {
-        let tokens = TokenCounters {
-            uncached_input: 10,
-            output: 20,
-            ..TokenCounters::default()
-        };
+        let tokens = tk(10, 20);
         let mut agg = UsageAggregator::new();
         // Five content-block records repeat the same message usage.
         let mut results = Vec::new();
@@ -400,23 +413,13 @@ mod tests {
         assert_eq!(results, vec![true, false, false, false, false]);
         let accepted = agg.session().events;
         assert_eq!(accepted, 1, "repeated content-block usage must count once");
-        assert_eq!(agg.turn("turn-1").unwrap().tokens.output, 20);
+        assert_eq!(agg.turn("turn-1").unwrap().tokens.output, Some(20));
     }
 
     #[test]
     fn codex_cumulative_token_count_snapshots_are_never_added() {
-        let per_response = TokenCounters {
-            uncached_input: 90,
-            cache_read: 10,
-            output: 20,
-            ..TokenCounters::default()
-        };
-        let cumulative = TokenCounters {
-            uncached_input: 900,
-            cache_read: 100,
-            output: 200,
-            ..TokenCounters::default()
-        };
+        let per_response = TokenCounters::known(90, 20, 10, 0, 0);
+        let cumulative = TokenCounters::known(900, 200, 100, 0, 0);
         let mut agg = UsageAggregator::new();
         assert!(agg.push(&event(
             UsageSource::CodexTokenUsageRecord,
@@ -433,7 +436,7 @@ mod tests {
             cumulative,
         )));
         assert_eq!(agg.ignored_cumulative(), 1);
-        assert_eq!(agg.session().tokens.output, 20);
+        assert_eq!(agg.session().tokens.output, Some(20));
     }
 
     #[test]
@@ -444,27 +447,19 @@ mod tests {
             Some("t1"),
             Some("r1"),
             Some("gpt-5.4"),
-            TokenCounters {
-                uncached_input: 100,
-                output: 5,
-                ..TokenCounters::default()
-            },
+            tk(100, 5),
         ));
         agg.push(&event(
             UsageSource::CodexTokenUsageRecord,
             Some("t2"),
             Some("r2"),
             Some("gpt-5.4"),
-            TokenCounters {
-                uncached_input: 200,
-                output: 7,
-                ..TokenCounters::default()
-            },
+            tk(200, 7),
         ));
         assert_eq!(agg.turns().len(), 2);
-        assert_eq!(agg.turn("t1").unwrap().tokens.uncached_input, 100);
-        assert_eq!(agg.turn("t2").unwrap().tokens.uncached_input, 200);
-        assert_eq!(agg.session().tokens.uncached_input, 300);
+        assert_eq!(agg.turn("t1").unwrap().tokens.uncached_input, Some(100));
+        assert_eq!(agg.turn("t2").unwrap().tokens.uncached_input, Some(200));
+        assert_eq!(agg.session().tokens.uncached_input, Some(300));
         assert_eq!(agg.session().events, 2);
         assert!(agg.session().cost_usd().is_some());
     }
@@ -477,22 +472,14 @@ mod tests {
             Some("t1"),
             Some("m1"),
             Some("claude-sonnet-5"),
-            TokenCounters {
-                uncached_input: 10,
-                output: 10,
-                ..TokenCounters::default()
-            },
+            tk(10, 10),
         ));
         agg.push(&event(
             UsageSource::ClaudeTranscript,
             Some("t1"),
             Some("m2"),
             Some("some-internal-model"),
-            TokenCounters {
-                uncached_input: 10,
-                output: 10,
-                ..TokenCounters::default()
-            },
+            tk(10, 10),
         ));
         assert_eq!(agg.session().cost_usd(), None);
     }
@@ -505,12 +492,7 @@ mod tests {
             Some("turn-a"),
             Some("resp-a"),
             Some("gpt-5.4"),
-            TokenCounters {
-                uncached_input: 90,
-                cache_read: 10,
-                output: 20,
-                ..TokenCounters::default()
-            },
+            TokenCounters::known(90, 20, 10, 0, 0),
         ));
         let payload = to_usage_payload(
             UsageScope::Turn,
@@ -534,5 +516,45 @@ mod tests {
     fn empty_totals_serialize_cost_as_unknown_not_zero() {
         let payload = to_usage_payload(UsageScope::Session, "s", 1, None, &UsageTotals::default());
         assert!(matches!(payload.cost, Knowledge::Unknown { .. }));
+    }
+
+    #[test]
+    fn an_omitted_bucket_is_unknown_in_the_payload_and_unpriced() {
+        // Only output reported: every other bucket and the derived total stay
+        // Unknown end to end, and no bill is produced (c-ctxusage r15 item 5).
+        let mut agg = UsageAggregator::new();
+        agg.push(&event(
+            UsageSource::ClaudeTranscript,
+            Some("turn-x"),
+            Some("msg-x"),
+            Some("claude-sonnet-5"),
+            TokenCounters {
+                output: Some(15),
+                ..TokenCounters::default()
+            },
+        ));
+        let payload = to_usage_payload(
+            UsageScope::Turn,
+            "turn-x",
+            1,
+            None,
+            agg.turn("turn-x").unwrap(),
+        );
+        assert_eq!(payload.output_tokens, Knowledge::Known { value: U64(15) });
+        for omitted in [
+            &payload.input_tokens,
+            &payload.cache_read_tokens,
+            &payload.cache_write_tokens,
+            &payload.total_tokens,
+        ] {
+            assert!(
+                matches!(omitted, Knowledge::Unknown { .. }),
+                "an omitted bucket is Unknown, never zero"
+            );
+        }
+        assert!(
+            matches!(payload.cost, Knowledge::Unknown { .. }),
+            "an omitted bucket is never priced for free"
+        );
     }
 }

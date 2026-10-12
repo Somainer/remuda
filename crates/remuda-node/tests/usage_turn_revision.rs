@@ -363,3 +363,192 @@ fn two_sessions_with_overlapping_message_ids_keep_independent_position_watermark
         "the stale alpha frame never writes 99"
     );
 }
+
+/// c-ctxusage r15 item 5: a partial transcript record whose `message.usage`
+/// OMITS buckets (e.g. only `output_tokens`) maps end to end to Unknown
+/// buckets — never zeros — and is never priced on the missing counters. The
+/// turn clock moves with the strictly newer partial snapshot while the
+/// retained buckets survive the merge.
+#[test]
+fn a_partial_transcript_record_keeps_omitted_buckets_unknown_end_to_end() {
+    use remuda_protocol::Knowledge;
+
+    fn mapper() -> TranscriptMapper {
+        TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "sess-omitted-buckets".into(),
+            "2.1.289".into(),
+        )
+    }
+    // Full record: every bucket reported.
+    let full = json!({
+        "type": "assistant",
+        "uuid": "rec-full",
+        "timestamp": "2026-10-09T00:00:00.000Z",
+        "isSidechain": false,
+        "requestId": "req-partial",
+        "message": {
+            "id": "msg_partial_buckets",
+            "role": "assistant",
+            "type": "message",
+            "model": "claude-opus-5-5",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "full"}],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 30,
+                "cache_creation_input_tokens": 0
+            }
+        }
+    });
+    // Later record for the SAME message id carrying ONLY output (a genuine
+    // downward correction) — every other field absent from the native usage.
+    let partial = json!({
+        "type": "assistant",
+        "uuid": "rec-partial",
+        "timestamp": "2026-10-09T00:00:10.000Z",
+        "isSidechain": false,
+        "requestId": "req-partial",
+        "message": {
+            "id": "msg_partial_buckets",
+            "role": "assistant",
+            "type": "message",
+            "model": "claude-opus-5-5",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "corrected"}],
+            "usage": { "output_tokens": 15 }
+        }
+    });
+
+    let mut live = mapper();
+    let full_obs = poll_batch(&mut live, &[(0, full)]).expect("full publishes");
+    let partial_obs = poll_batch(&mut live, &[(1, partial)]).expect("partial publishes");
+
+    // At the mapper the omitted buckets are already Unknown (never zero),
+    // the reported output is known, and the partial frame carries no bill.
+    let ObservationPayload::Usage(partial_payload) = &partial_obs.body else {
+        panic!("usage payload");
+    };
+    assert!(matches!(
+        partial_payload.output_tokens,
+        Knowledge::Known { value: U64(15) }
+    ));
+    for omitted in [
+        &partial_payload.input_tokens,
+        &partial_payload.cache_read_tokens,
+        &partial_payload.cache_write_tokens,
+        &partial_payload.total_tokens,
+    ] {
+        assert!(
+            matches!(omitted, Knowledge::Unknown { .. }),
+            "an omitted bucket is Unknown on the wire, never zero"
+        );
+    }
+    assert!(
+        matches!(partial_payload.cost, Knowledge::Unknown { .. }),
+        "a partial record is never priced on missing buckets"
+    );
+    assert_eq!(
+        partial_payload.metric_revision,
+        U64(2),
+        "strictly newer position"
+    );
+
+    // Through the Hub: the first frame lands fully...
+    let conn = rusqlite::Connection::open_in_memory().expect("sqlite");
+    migrate(&conn).expect("migrate");
+    let full_row = project_usage_event(
+        &JournalRecord {
+            instance_id: "ins_partial_buckets".into(),
+            seq: 1,
+            event_id: "evt_full".into(),
+            observed_at: "2020-01-01T00:00:00.000Z".into(),
+            event: serde_json::to_value(&full_obs).unwrap(),
+        },
+        None,
+        None,
+    )
+    .expect("projects full");
+    assert!(insert_usage_event(&conn, &full_row).expect("insert full"));
+
+    // ...and the strictly newer partial snapshot applies its downward output
+    // correction while the retained buckets survive and the omitted ones
+    // remain NULL (Unknown), with no cost written.
+    let partial_row = project_usage_event(
+        &JournalRecord {
+            instance_id: "ins_partial_buckets".into(),
+            seq: 2,
+            event_id: "evt_partial".into(),
+            observed_at: "2020-01-01T00:00:00.000Z".into(),
+            event: serde_json::to_value(&partial_obs).unwrap(),
+        },
+        None,
+        None,
+    )
+    .expect("projects partial");
+    assert_eq!(partial_row.output_tokens, Some(15));
+    assert_eq!(partial_row.input_tokens, None);
+    assert_eq!(partial_row.cache_read_tokens, None);
+    assert_eq!(partial_row.total_tokens, None);
+    assert_eq!(partial_row.cost_usd, None);
+    assert!(
+        insert_usage_event(&conn, &partial_row).expect("insert partial"),
+        "the strictly newer partial snapshot is applied"
+    );
+    let stored_partial = |column: &str| -> Option<rusqlite::types::Value> {
+        conn.query_row(
+            &format!(
+                "SELECT {column} FROM usage_events
+                         WHERE instance_id = 'ins_partial_buckets'
+                           AND scope = 'turn' AND scope_id = 'msg_partial_buckets'"
+            ),
+            [],
+            |r| r.get::<_, Option<rusqlite::types::Value>>(0),
+        )
+        .unwrap()
+    };
+    let as_int = |value: Option<rusqlite::types::Value>| match value {
+        Some(rusqlite::types::Value::Integer(n)) => Some(n),
+        Some(_) => panic!("expected INTEGER"),
+        None => None,
+    };
+    assert_eq!(
+        as_int(stored_partial("output_tokens")),
+        Some(15),
+        "the downward correction applies"
+    );
+    assert_eq!(
+        as_int(stored_partial("input_tokens")),
+        Some(100),
+        "the retained input survives the merge"
+    );
+    assert_eq!(
+        as_int(stored_partial("cache_read_tokens")),
+        Some(30),
+        "the retained cache_read survives"
+    );
+    assert_eq!(
+        as_int(stored_partial("total_tokens")),
+        Some(145),
+        "the total is derived from the merged KNOWN baskets (100+30+0+15)"
+    );
+    let bill: Option<String> = conn
+        .query_row(
+            "SELECT cost_usd FROM usage_events
+             WHERE instance_id = 'ins_partial_buckets'
+               AND scope = 'turn' AND scope_id = 'msg_partial_buckets'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        bill, full_row.cost_usd,
+        "the partial frame reports no bill, so the stored bill is retained \
+         (an unreported cost never erases a known one) rather than priced on zeros"
+    );
+}

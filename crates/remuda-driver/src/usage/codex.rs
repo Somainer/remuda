@@ -121,19 +121,31 @@ impl CodexUsage {
 }
 
 /// Map a Codex usage object onto normalized buckets.
+///
+/// Presence is preserved (c-ctxusage r15 item 5): an omitted bucket is
+/// Unknown, and the uncached derivation (input includes cache) requires the
+/// total and both cache buckets to be reported — otherwise the uncached
+/// bucket is Unknown. The absent 1-hour write tier is a structural zero for
+/// this provider, not an omission.
 fn counters(usage: &serde_json::Value) -> TokenCounters {
-    let input = usage["input_tokens"].as_u64().unwrap_or(0);
-    let cached = usage["cached_input_tokens"].as_u64().unwrap_or(0);
-    let write = usage["cache_write_input_tokens"].as_u64().unwrap_or(0);
+    let known = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
+    let input = known("input_tokens");
+    let cached = known("cached_input_tokens");
+    let write = known("cache_write_input_tokens");
     // input_tokens includes cache; never let a sparse/odd record go negative.
-    let uncached = input.saturating_sub(cached).saturating_sub(write);
+    let uncached = match (input, cached, write) {
+        (Some(total), Some(cached), Some(write)) => {
+            Some(total.saturating_sub(cached).saturating_sub(write))
+        }
+        _ => None,
+    };
     TokenCounters {
         uncached_input: uncached,
-        output: usage["output_tokens"].as_u64().unwrap_or(0),
+        output: known("output_tokens"),
         cache_read: cached,
         // Single provider tier; the table prices writes at the input rate.
         cache_write_5m: write,
-        cache_write_1h: 0,
+        cache_write_1h: Some(0),
     }
 }
 
@@ -179,9 +191,9 @@ mod tests {
         assert_eq!(event.turn_id.as_deref(), Some("turn-1"));
         assert_eq!(event.request_id.as_deref(), Some("resp_1"));
         assert_eq!(event.model.as_deref(), Some("gpt-5.4"));
-        assert_eq!(event.tokens.uncached_input, 90);
-        assert_eq!(event.tokens.cache_read, 10);
-        assert_eq!(event.tokens.output, 20);
+        assert_eq!(event.tokens.uncached_input, Some(90));
+        assert_eq!(event.tokens.cache_read, Some(10));
+        assert_eq!(event.tokens.output, Some(20));
         assert_eq!(event.reasoning_tokens, Some(5));
         assert!(event.cost_usd.is_some());
     }
@@ -211,8 +223,8 @@ mod tests {
         .unwrap();
         let event = CodexUsage::new().on_record(&snapshot).expect("event");
         assert_eq!(event.source, UsageSource::CodexTokenCount);
-        assert_eq!(event.tokens.uncached_input, 450);
-        assert_eq!(event.tokens.output, 100);
+        assert_eq!(event.tokens.uncached_input, Some(450));
+        assert_eq!(event.tokens.output, Some(100));
     }
 
     #[test]

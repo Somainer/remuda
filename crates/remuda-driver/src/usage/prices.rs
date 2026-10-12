@@ -50,14 +50,25 @@ pub struct ModelPrice {
 
 impl ModelPrice {
     /// Estimate the USD cost of `tokens` against this card.
+    ///
+    /// `None` when ANY billing bucket is unknown: an omitted counter is
+    /// Unknown, never zero, so it must never be silently priced for free
+    /// (c-ctxusage r15 item 5).
     #[must_use]
-    pub fn estimate(&self, tokens: &TokenCounters) -> f64 {
-        (tokens.uncached_input as f64 * self.input_usd_per_mtok
-            + tokens.output as f64 * self.output_usd_per_mtok
-            + tokens.cache_read as f64 * self.cache_read_usd_per_mtok
-            + tokens.cache_write_5m as f64 * self.cache_write_5m_usd_per_mtok
-            + tokens.cache_write_1h as f64 * self.cache_write_1h_usd_per_mtok)
-            / 1_000_000.0
+    pub fn estimate(&self, tokens: &TokenCounters) -> Option<f64> {
+        let uncached_input = tokens.uncached_input? as f64;
+        let output = tokens.output? as f64;
+        let cache_read = tokens.cache_read? as f64;
+        let cache_write_5m = tokens.cache_write_5m? as f64;
+        let cache_write_1h = tokens.cache_write_1h? as f64;
+        Some(
+            (uncached_input * self.input_usd_per_mtok
+                + output * self.output_usd_per_mtok
+                + cache_read * self.cache_read_usd_per_mtok
+                + cache_write_5m * self.cache_write_5m_usd_per_mtok
+                + cache_write_1h * self.cache_write_1h_usd_per_mtok)
+                / 1_000_000.0,
+        )
     }
 }
 
@@ -65,37 +76,101 @@ impl ModelPrice {
 /// split. Extractors are responsible for mapping provider-specific shapes
 /// (for example subtracting cache from a total-including-cache input) onto
 /// this struct before estimation.
+///
+/// Every bucket is `Option<u64>`: a field the native record OMITTED is
+/// Unknown (`None`), never a fabricated zero (protocol §5.5). A structural
+/// zero the provider genuinely reports (a TTL tier it does not bill) is
+/// `Some(0)`. Totals and pricing are Unknown while any constituent bucket
+/// is Unknown (c-ctxusage r15 item 5).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenCounters {
     /// Fresh (uncached) input tokens.
-    pub uncached_input: u64,
+    pub uncached_input: Option<u64>,
     /// Generated output tokens, including reasoning/thinking tokens.
-    pub output: u64,
+    pub output: Option<u64>,
     /// Prompt-cache read tokens.
-    pub cache_read: u64,
+    pub cache_read: Option<u64>,
     /// Cache-write tokens billed at the short-TTL rate.
-    pub cache_write_5m: u64,
+    pub cache_write_5m: Option<u64>,
     /// Cache-write tokens billed at the long-TTL rate.
-    pub cache_write_1h: u64,
+    pub cache_write_1h: Option<u64>,
 }
 
 impl TokenCounters {
-    /// All cache writes regardless of TTL.
+    /// Build a counter set in which EVERY bucket was reported (a
+    /// fully-known record). Structural zeros go through here as `Some(0)`.
     #[must_use]
-    pub fn cache_write(&self) -> u64 {
-        self.cache_write_5m + self.cache_write_1h
+    #[allow(clippy::too_many_arguments)]
+    pub fn known(
+        uncached_input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write_5m: u64,
+        cache_write_1h: u64,
+    ) -> Self {
+        Self {
+            uncached_input: Some(uncached_input),
+            output: Some(output),
+            cache_read: Some(cache_read),
+            cache_write_5m: Some(cache_write_5m),
+            cache_write_1h: Some(cache_write_1h),
+        }
     }
 
-    /// Input-side tokens across every bucket.
-    #[must_use]
-    pub fn total_input(&self) -> u64 {
-        self.uncached_input + self.cache_read + self.cache_write()
+    /// Add two optional counts when folding separate model calls: a bucket
+    /// reported by only one side is taken as that side's value (the
+    /// unreported call contributes nothing to the bucket), and Unknown
+    /// survives only when NEITHER side reported it. Never a fabricated zero.
+    fn add_bucket(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(a + b),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        }
     }
 
-    /// All tokens counted by the table.
+    /// Sum a fixed set of buckets into one count that is Known only while
+    /// EVERY member is reported; a single omission makes the aggregate
+    /// Unknown (a partial total is not a number).
+    fn all_known_sum<'a>(buckets: impl IntoIterator<Item = &'a Option<u64>>) -> Option<u64> {
+        let mut total = 0u64;
+        for bucket in buckets {
+            total = total.checked_add(*bucket.as_ref()?)?;
+        }
+        Some(total)
+    }
+
+    /// Per-bucket sum of two counter sets, Unknown propagating.
     #[must_use]
-    pub fn total(&self) -> u64 {
-        self.total_input() + self.output
+    pub fn merge_counts(self, other: &Self) -> Self {
+        Self {
+            uncached_input: Self::add_bucket(self.uncached_input, other.uncached_input),
+            output: Self::add_bucket(self.output, other.output),
+            cache_read: Self::add_bucket(self.cache_read, other.cache_read),
+            cache_write_5m: Self::add_bucket(self.cache_write_5m, other.cache_write_5m),
+            cache_write_1h: Self::add_bucket(self.cache_write_1h, other.cache_write_1h),
+        }
+    }
+
+    /// All cache writes regardless of TTL; Unknown unless both TTL buckets
+    /// are reported.
+    #[must_use]
+    pub fn cache_write(&self) -> Option<u64> {
+        Self::all_known_sum([&self.cache_write_5m, &self.cache_write_1h])
+    }
+
+    /// Input-side tokens across every bucket; Unknown unless every input
+    /// bucket is reported.
+    #[must_use]
+    pub fn total_input(&self) -> Option<u64> {
+        Self::all_known_sum([&self.uncached_input, &self.cache_read, &self.cache_write()])
+    }
+
+    /// All tokens counted by the table; Unknown unless every bucket is
+    /// reported.
+    #[must_use]
+    pub fn total(&self) -> Option<u64> {
+        Self::all_known_sum([&self.total_input(), &self.output])
     }
 }
 
@@ -322,7 +397,7 @@ pub fn lookup(model_id: &str) -> Option<&'static ModelPrice> {
 /// Estimate cost for `model_id`; `None` when the family is not in the table.
 #[must_use]
 pub fn estimate_cost(model_id: &str, tokens: &TokenCounters) -> Option<f64> {
-    lookup(model_id).map(|price| price.estimate(tokens))
+    lookup(model_id).and_then(|price| price.estimate(tokens))
 }
 
 #[cfg(test)]
@@ -382,24 +457,23 @@ mod tests {
     fn cost_is_the_weighted_sum_over_mtok() {
         // 1e6 uncached input + 1e6 output on Haiku = $1 + $5 = $6.
         let price = lookup("claude-haiku-4-5").unwrap();
-        let tokens = TokenCounters {
-            uncached_input: 1_000_000,
-            output: 1_000_000,
-            ..TokenCounters::default()
-        };
-        assert!((price.estimate(&tokens) - 6.0).abs() < 1e-9);
+        let tokens = TokenCounters::known(1_000_000, 1_000_000, 0, 0, 0);
+        assert!((price.estimate(&tokens).unwrap() - 6.0).abs() < 1e-9);
 
         // TTL split is billed at different rates.
-        let tokens = TokenCounters {
-            cache_write_5m: 1_000_000,
-            ..TokenCounters::default()
-        };
-        assert!((price.estimate(&tokens) - 1.25).abs() < 1e-9);
-        let tokens = TokenCounters {
-            cache_write_1h: 1_000_000,
-            ..TokenCounters::default()
-        };
-        assert!((price.estimate(&tokens) - 2.00).abs() < 1e-9);
+        let tokens = TokenCounters::known(0, 0, 0, 1_000_000, 0);
+        assert!((price.estimate(&tokens).unwrap() - 1.25).abs() < 1e-9);
+        let tokens = TokenCounters::known(0, 0, 0, 0, 1_000_000);
+        assert!((price.estimate(&tokens).unwrap() - 2.00).abs() < 1e-9);
+
+        // An omitted bucket is never priced for free (c-ctxusage r15 item 5).
+        assert_eq!(
+            price.estimate(&TokenCounters {
+                output: Some(1_000_000),
+                ..TokenCounters::default()
+            }),
+            None
+        );
     }
 
     #[test]
@@ -417,15 +491,23 @@ mod tests {
 
     #[test]
     fn counters_aggregate_buckets() {
+        let t = TokenCounters::known(1, 2, 3, 4, 5);
+        assert_eq!(t.cache_write(), Some(9));
+        assert_eq!(t.total_input(), Some(13));
+        assert_eq!(t.total(), Some(15));
+    }
+
+    #[test]
+    fn an_omitted_bucket_makes_every_aggregate_unknown() {
         let t = TokenCounters {
-            uncached_input: 1,
-            output: 2,
-            cache_read: 3,
-            cache_write_5m: 4,
-            cache_write_1h: 5,
+            uncached_input: Some(1),
+            output: Some(2),
+            cache_read: Some(3),
+            cache_write_5m: Some(4),
+            cache_write_1h: None,
         };
-        assert_eq!(t.cache_write(), 9);
-        assert_eq!(t.total_input(), 13);
-        assert_eq!(t.total(), 15);
+        assert_eq!(t.cache_write(), None);
+        assert_eq!(t.total_input(), None);
+        assert_eq!(t.total(), None, "Unknown never collapses to a zero");
     }
 }

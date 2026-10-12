@@ -2194,4 +2194,84 @@ describe("Outbox", () => {
       });
     }
   });
+
+  it("GATE22 item 3: a timer-path lock request that rejects persistently while reads succeed spends the bounded delivery budget with growing delays and surfaces exhaustion, then wakes no more", async () => {
+    // Pre-fix fireLeaseWake lumped a rejected navigator.locks.request
+    // together with a failed READ and called refreshDurableRecovering(1):
+    // reads succeed, so the immediate successful read reconciled a fresh
+    // 0 ms deliver wake every time — hot retries forever, no budget spent, no
+    // surfaced exhaustion. Post-fix the lock failure is attributed to the
+    // instance AS A DELIVERY FAILURE: the one wake backs off
+    // 250 ms·2^(n-1) capped at 5 s, stops at CLAIM_WAKE_MAX_FAILURES and
+    // fires the exhausted surface exactly once; no further wakes.
+    vi.useFakeTimers();
+    vi.setSystemTime(800_000);
+    const I = "ins_g22_i3";
+    const originalNavigator = globalThis.navigator;
+    const requestTimes: number[] = [];
+    let requestCount = 0;
+    const locks = {
+      query: async () => ({ held: [] }),
+      request: vi.fn(() => {
+        requestCount += 1;
+        requestTimes.push(Date.now());
+        return Promise.reject(new Error("g22-i3 lock request rejected"));
+      }),
+    };
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks } });
+    try {
+      const store = new MemStorage();
+      const pPut = store.put(rec({ commandId: "cmd_g22_i3", instanceId: I, createdAt: 1_000 }));
+      await vi.advanceTimersByTimeAsync(5);
+      await pPut;
+
+      const box = await Outbox.load(store, "owner_g22_i3");
+      const exhausted = vi.fn();
+      const recovered = vi.fn();
+      const claimWake = vi.fn();
+      box.onReadRecoveryExhausted = exhausted;
+      box.onReadRecoveryRecovered = recovered;
+      box.onClaimWake = claimWake;
+      // Boot reconciliation arms the row's one 0 ms deliver wake.
+      await box.refreshDurable();
+      expect(box.pendingLeaseWakeups()).toEqual(["cmd_g22_i3"]);
+
+      const t0 = Date.now();
+      // Far beyond every bounded delay (12 fires end around 38 s).
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      // Exactly the bounded number of lock attempts, the first immediate.
+      expect(requestCount).toBe(CLAIM_WAKE_MAX_FAILURES);
+      expect(requestTimes[0]).toBe(t0);
+      // Delays GROW (strictly) and respect the 5 s cap.
+      const gaps = requestTimes.slice(1).map((t, i) => t - requestTimes[i]!);
+      for (let i = 1; i < gaps.length; i += 1) {
+        expect(gaps[i]! >= gaps[i - 1]!).toBe(true);
+      }
+      for (const g of gaps) expect(g).toBeLessThanOrEqual(CLAIM_WAKE_MAX_RETRY_MS);
+      expect(gaps[0]).toBe(CLAIM_WAKE_BASE_RETRY_MS);
+      // Exhaustion surfaced exactly once (at the final attempt); the read
+      // envelope was never charged and never recovered.
+      expect(exhausted).toHaveBeenCalledTimes(1);
+      expect(recovered).not.toHaveBeenCalled();
+      expect(box.isReadRecoveryExhausted()).toBe(false);
+      expect(box.isDeliveryExhausted(I)).toBe(true);
+      // No armed wake and no guarded-delivery handoff remain.
+      expect(box.pendingLeaseWakeups()).toEqual([]);
+      expect(claimWake).not.toHaveBeenCalled();
+      // The row is untouched durably (never claimed: the lock never entered).
+      expect(store.map.get("cmd_g22_i3")?.state).toBe("pending");
+
+      // Another long interval: no further attempts/wakes at all.
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(requestCount).toBe(CLAIM_WAKE_MAX_FAILURES);
+      expect(exhausted).toHaveBeenCalledTimes(1);
+      expect(box.pendingLeaseWakeups()).toEqual([]);
+
+      box.dispose();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
 });

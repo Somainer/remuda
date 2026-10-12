@@ -689,6 +689,13 @@ export class Outbox {
    */
   private deliveryFailures = new Map<Id, number>();
   /**
+   * Instances whose bounded DELIVERY budget is spent (gate 22 item 3): a
+   * timer path whose lock request keeps rejecting (or the no-Web-Locks lease
+   * wait keeps timing out) while reads succeed reaches the surfaced exhausted
+   * state and arms no further wake until a real POST (or teardown) clears it.
+   */
+  private deliveryExhausted = new Set<Id>();
+  /**
    * Per-FLUSH suppression of 0 ms delivery wakes (c-reconnfu gate 21 item 1):
    * each guarded flush receives a TOKEN scoped to the instances ITS pass read.
    * The count is REFERENCE-COUNTED because flushes overlap (a timer fires
@@ -773,13 +780,19 @@ export class Outbox {
    */
   onHeldLease: ((instanceId: Id) => void) | null = null;
   /**
-   * Fired ONCE when authoritative durable reads have failed for the whole
-   * bounded envelope (gate 21 item 3): the Outbox has stopped scheduling
-   * retries and surfaces this explicit state; the store tells the user and
-   * relies on a later fresh trigger (manual/online flush, rearm, reload).
+   * Fired ONCE per spent bounded envelope when automatic recovery has
+   * stopped: authoritative durable READS failing for the whole read-retry
+   * envelope (gate 21 item 3), or an instance's DELIVERY attempts (timer
+   * lock requests that keep rejecting while reads succeed, gate 22 item 3)
+   * spending their budget. The store tells the user and relies on a later
+   * fresh trigger (manual/online flush, rearm, reload, or a later POST).
    */
   onReadRecoveryExhausted: (() => void) | null = null;
-  /** Fired when a read succeeds after the exhausted latch, so the store can clear its surface. */
+  /**
+   * Fired when the condition behind a surfaced exhausted latch cleared (a
+   * successful read after read exhaustion, or a real POST after delivery
+   * exhaustion), so the store can clear its surface.
+   */
   onReadRecoveryRecovered: (() => void) | null = null;
 
   private constructor(storage: OutboxStorage, owner?: Id) {
@@ -1121,6 +1134,7 @@ export class Outbox {
     this.readRecoveryFailures = 0;
     this.readRecoveryExhausted = false;
     this.deliveryFailures.clear();
+    this.deliveryExhausted.clear();
     this.deliveryPasses.clear();
     this.deliverySuppressed.clear();
     this.storeRetryPending.clear();
@@ -1148,17 +1162,35 @@ export class Outbox {
 
   /**
    * Record a delivery attempt that could not make progress on the instance
-   * (durable read failure, claim-transaction abort, contended mutex): the
-   * next deliver wake for its rows backs off instead of firing immediately.
-   * Bounded by CLAIM_WAKE_MAX_FAILURES.
+   * (durable read failure, claim-transaction abort, contended mutex, or a
+   * timer-path lock request that rejects): the next deliver wake for its rows
+   * backs off instead of firing immediately. Bounded by
+   * CLAIM_WAKE_MAX_FAILURES; spending the bound surfaces the explicit
+   * exhausted state ONCE ({@link onReadRecoveryExhausted}) — with the lock
+   * persistently rejecting while reads succeed, no wake is armed past it, so
+   * without the surfaced latch the stop was silent (gate 22 item 3).
    */
   noteDeliveryFailure(instanceId: Id) {
-    this.deliveryFailures.set(instanceId, (this.deliveryFailures.get(instanceId) ?? 0) + 1);
+    const failures = (this.deliveryFailures.get(instanceId) ?? 0) + 1;
+    this.deliveryFailures.set(instanceId, failures);
+    if (failures >= CLAIM_WAKE_MAX_FAILURES && !this.deliveryExhausted.has(instanceId)) {
+      this.deliveryExhausted.add(instanceId);
+      this.onReadRecoveryExhausted?.();
+    }
   }
 
   /** A row of the instance was actually POSTed: clear its failure backoff. */
   noteDeliveryProgress(instanceId: Id) {
+    const wasExhausted = this.deliveryExhausted.delete(instanceId);
     this.deliveryFailures.delete(instanceId);
+    // Mirror the read-repair signal so the store clears the surfaced state
+    // after the lock/storage condition that exhausted delivery clears.
+    if (wasExhausted) this.onReadRecoveryRecovered?.();
+  }
+
+  /** Test visibility: delivery on this instance spent its bounded budget. */
+  isDeliveryExhausted(instanceId: Id): boolean {
+    return this.deliveryExhausted.has(instanceId);
   }
 
   /**
@@ -1318,19 +1350,34 @@ export class Outbox {
    */
   private async fireLeaseWake(commandId: Id, instanceId: Id) {
     if (this.disposed || this.unloading) return;
-    let durable: OutboxRecord[];
+    let durable: OutboxRecord[] | undefined;
+    let lockEntered = false;
     try {
       await this.runUnderInstanceLock(instanceId, async () => {
+        lockEntered = true;
         durable = await this.readDurable();
         if (!this.disposed && !this.unloading) {
           this.applyLeaseWakeReconcile(durable, { firingCommandId: commandId });
         }
       });
     } catch {
-      // The lock request itself failed (deadlock/SecurityError) or its read
-      // rejected: the bounded read-retry keeps recovery responsibility and
-      // ends in the same central reconciliation.
-      await this.refreshDurableRecovering(1);
+      // Gate 22 item 3: distinguish a LOCK failure (navigator.locks.request
+      // rejected before the callback ran, or the no-Web-Locks lease wait
+      // timed out) from a failed READ under an acquired lock. The lock
+      // failure is attributed to the instance AS A DELIVERY FAILURE — reads
+      // still succeed, so charging the read envelope would never spend the
+      // delivery budget or surface exhaustion. The authoritative read below
+      // re-enters the central reconciliation, which arms the one backed-off
+      // deliver wake; at the bounded cap nothing is armed and the exhausted
+      // state is surfaced (no further wakes).
+      if (lockEntered) {
+        // Lock acquired: the read (or reconcile) rejected — bounded,
+        // lifetime-aware read recovery ends in the same reconcile.
+        await this.refreshDurableRecovering(1);
+        return;
+      }
+      this.noteDeliveryFailure(instanceId);
+      await this.refreshDurableRecovering(0);
       return;
     }
     if (this.disposed || this.unloading) return;

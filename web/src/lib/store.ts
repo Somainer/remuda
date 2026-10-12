@@ -775,7 +775,7 @@ class HubStore {
         // surface the explicit state; a later manual/online flush, the
         // unload-cancel rearm or a reload restarts the chain.
         box.onReadRecoveryExhausted = () => {
-          this.toast("待发队列读取连续失败，已暂停自动重试；网络或浏览器存储恢复后将在下次发送时继续");
+          this.toast("待发队列连续读取或投递失败，已暂停自动重试；恢复后将在下次发送时继续");
         };
         this.emit({ outboxPending: box.pendingCount() });
         if (opened.degraded) this.toast("本机无法可靠保存待发消息（存储不可用）");

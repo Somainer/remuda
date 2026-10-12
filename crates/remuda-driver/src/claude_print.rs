@@ -8099,3 +8099,154 @@ mod backlog_accounting_tests {
         assert_eq!(b.occupied(), (1, cost));
     }
 }
+
+/// ma-sdk-state r14 item 3 (directive (d)): on a multi-threaded runtime an
+/// ordinary emission that reserved consumer capacity while parked on a full
+/// channel must never land AFTER the terminal observation, however the
+/// terminal send races the slot freeing. Observations already queued ahead of
+/// the terminal are preserved.
+#[cfg(test)]
+mod emission_ordering_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn is_terminal(obs: &Observation) -> bool {
+        match &obs.body {
+            ObservationPayload::Lifecycle(payload) => match payload.as_ref() {
+                LifecyclePayload::Native(native) => {
+                    native.native_name == "session"
+                        && matches!(
+                            &native.status,
+                            Knowledge::Known { value } if value == "exited"
+                        )
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// One stress iteration: tiny channel, one terminal slot pre-reserved, many
+    /// ordinary emitters, a fast drainer freeing slots continuously, and the
+    /// terminal fired once ordinary traffic is provably flowing. Returns the
+    /// number of observations received AFTER the terminal (must be zero).
+    async fn one_terminal_race_iteration(iter: usize) -> usize {
+        const CAP: usize = 4;
+        const EMITTERS: usize = 8;
+        const PER_EMITTER: usize = 2_000;
+        // Fire the terminal once this many ordinary observations drained.
+        const FIRE_AFTER: usize = 24;
+
+        let inner = build_inner(None, DriverKind::ClaudePrint);
+        let (tx, mut rx) = mpsc::channel::<Observation>(CAP);
+        let exit_permit = tx
+            .clone()
+            .try_reserve_owned()
+            .expect("the terminal slot reserves");
+        {
+            let mut emission = inner.emission.lock().await;
+            emission.tx = Some(tx);
+            emission.terminal_sent = false;
+        }
+        *inner.exit_permit.lock().await = Some(exit_permit);
+
+        let ordinary = {
+            let mut mapper = inner.mapper.lock().await;
+            mapper
+                .lifecycle(
+                    LifecycleTopic::Session,
+                    "x-ordinary",
+                    Knowledge::Known { value: "s".into() },
+                    "ok",
+                    false,
+                )
+                .expect("ordinary observation")
+        };
+
+        let drained_before_terminal = std::sync::Arc::new(tokio::sync::Notify::new());
+        let ordinary_seen = std::sync::Arc::new(AtomicUsize::new(0));
+
+        // Fast drainer: frees slots as fast as it can, which is exactly what
+        // lets a parked ordinary send compete with the terminal send.
+        let drainer_inner = Arc::clone(&inner);
+        let drainer_notify = std::sync::Arc::clone(&drained_before_terminal);
+        let drainer_seen = std::sync::Arc::clone(&ordinary_seen);
+        let drainer = tokio::spawn(async move {
+            let mut terminal_index: Option<usize> = None;
+            let mut after = 0usize;
+            let mut total = 0usize;
+            let mut preserved_before = 0usize;
+            while let Some(obs) = rx.recv().await {
+                total += 1;
+                if is_terminal(&obs) {
+                    assert!(terminal_index.is_none(), "iteration {iter}: terminal twice");
+                    terminal_index = Some(total);
+                    continue;
+                }
+                match terminal_index {
+                    None => preserved_before += 1,
+                    Some(_) => after += 1,
+                }
+                if drainer_seen.fetch_add(1, Ordering::AcqRel) + 1 == FIRE_AFTER {
+                    drainer_notify.notify_waiters();
+                }
+            }
+            (preserved_before, after)
+        });
+
+        // Emitters hammer the ordinary path on parallel OS threads.
+        let mut emitters = Vec::new();
+        for _ in 0..EMITTERS {
+            let inner = Arc::clone(&inner);
+            let obs = ordinary.clone();
+            emitters.push(tokio::spawn(async move {
+                for _ in 0..PER_EMITTER {
+                    emit_all(&inner, vec![obs.clone()]).await.expect("emit_all");
+                }
+            }));
+        }
+
+        // Wait for ordinary traffic to actually flow (parked senders exist),
+        // then fire the terminal on yet another thread.
+        drained_before_terminal.notified().await;
+        let terminal_inner = Arc::clone(&inner);
+        let terminal = tokio::spawn(async move { emit_exit(&terminal_inner, "exited").await });
+        tokio::time::timeout(Duration::from_secs(10), terminal)
+            .await
+            .unwrap_or_else(|_| panic!("iteration {iter}: terminal send bound"))
+            .expect("terminal task")
+            .expect("terminal emitted");
+
+        for handle in emitters {
+            tokio::time::timeout(Duration::from_secs(10), handle)
+                .await
+                .unwrap_or_else(|_| panic!("iteration {iter}: emitter bound"))
+                .expect("emitter task");
+        }
+        // Seal and drop the sender so the drainer reaches channel EOF.
+        inner.emission.lock().await.tx = None;
+        drop(drainer_inner);
+        let (preserved, after) = tokio::time::timeout(Duration::from_secs(10), drainer)
+            .await
+            .unwrap_or_else(|_| panic!("iteration {iter}: drainer bound"))
+            .expect("drainer task");
+        assert!(
+            preserved >= FIRE_AFTER,
+            "iteration {iter}: observations queued before the terminal are preserved"
+        );
+        after
+    }
+
+    /// Run the race repeatedly: a single reordered delivery in ANY iteration
+    /// fails the test (directive (d) must hold under real thread parallelism).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn nothing_ordinary_follows_the_terminal_under_multithreaded_contention() {
+        for iter in 0..20 {
+            let after = one_terminal_race_iteration(iter).await;
+            assert_eq!(
+                after, 0,
+                "iteration {iter}: {after} ordinary observations landed AFTER the terminal"
+            );
+        }
+    }
+}

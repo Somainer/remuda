@@ -4394,7 +4394,10 @@ class HubStore {
    * completion id and its mapper suppresses unchanged observations.
    */
   private armEffortReconciliation(instanceId: Id, nonce: number) {
+    // A replaced request's configure can resolve AFTER the newer request
+    // armed its own slot: never let a stale nonce overwrite it.
     const existing = this.effortReconcileTimers.get(instanceId);
+    if (existing && existing.nonce > nonce) return;
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => {
       void this.runEffortReconciliation(instanceId, nonce);

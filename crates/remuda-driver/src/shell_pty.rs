@@ -1599,38 +1599,69 @@ impl ShellPtyDriver {
     /// shutdown block.
     async fn stop_promoted_writer_before_retire(&self) -> DriverResult<()> {
         let state = self.state().await?;
-        // The exit waiter polls try_wait and could race the ladder's own
-        // death evidence; it is not the drain and is not needed here.
-        if let Some(mut waiter) = self.waiter.lock().await.take() {
-            waiter.abort();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut waiter).await;
-        }
         // From here the poller only tail-reads the bound transcript; it does
         // not demote or finish the hydrator on an epoch boundary.
         self.live_drain.arm_close();
         let outcome = self.stop_tree(&state, true).await;
-        // Now that the writer is verified gone the poller may observe the
-        // closed epoch; close's poller-shutdown block retires it next.
-        state.closed.store(true, Ordering::SeqCst);
+
+        // Test-only fault (P1, c-ctxusage r16 item 5): synthesize a writer
+        // that survives the ladder so the retryable-incomplete path is
+        // exercised deterministically.
+        let force_incomplete = self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            .is_some_and(crate::test_faults::FaultState::take_promoted_stop_incomplete);
+
+        // P1 (c-ctxusage r16 item 5): the hydrator is retired and close
+        // ownership dropped ONLY when the writer's process group is verified
+        // gone. A survivor — or a ladder that could not verify — makes close
+        // return a RETRYABLE error now, with state.closed left clear and the
+        // poller, hydrator, exit waiter and sender untouched, so monitoring
+        // continues (including a natural-exit observation) and a later append
+        // is still delivered; the next close retries.
         match outcome {
-            Ok(outcome) if outcome.group_gone => {
+            Ok(outcome) if outcome.group_gone && !force_incomplete => {
+                // Now that the writer is verified gone the poller may observe
+                // the closed epoch; close's poller-shutdown block retires it
+                // next. The exit waiter is cancelled only here — on the failed
+                // path it stays live as part of the continued monitoring.
+                state.closed.store(true, Ordering::SeqCst);
+                if let Some(mut waiter) = self.waiter.lock().await.take() {
+                    waiter.abort();
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), &mut waiter).await;
+                }
                 tracing::info!(
                     rung = outcome.rung.label(),
                     pgid = outcome.pgid,
                     "promoted pty process group stopped before hydrator retirement"
                 );
+                Ok(())
             }
             Ok(outcome) => {
-                tracing::error!(
+                tracing::warn!(
                     rung = outcome.rung.label(),
                     pgid = outcome.pgid,
                     survivors = ?outcome.survivors,
-                    "stop-incomplete: the promoted process group outlived SIGKILL"
+                    forced = force_incomplete,
+                    "stop-incomplete: the promoted process group is not verified gone; \
+                     close stays live and is retryable"
                 );
+                Err(DriverError::WriterStillLive(format!(
+                    "stop ladder rung {} left live group members: {:?}",
+                    outcome.rung.label(),
+                    outcome.survivors
+                )))
             }
-            Err(error) => tracing::error!(%error, "promoted pty stop ladder failed"),
+            Err(error) => {
+                tracing::warn!(%error, "promoted pty stop ladder failed; close stays live");
+                Err(DriverError::WriterStillLive(format!(
+                    "stop ladder could not verify the process group: {error}"
+                )))
+            }
         }
-        Ok(())
     }
 
     async fn stop_tree(
@@ -2796,6 +2827,26 @@ impl Driver for ShellPtyDriver {
     /// not, that is journaled as `stop-incomplete`; §5.3 step 4 forbids
     /// reporting `exited` over a process tree that is still there.
     async fn close(&self) -> DriverResult<DriverAck> {
+        // Is a promoted native agent live in the foreground? The native writer
+        // must be verified gone BEFORE anything is torn down.
+        //
+        // P1 (c-ctxusage r16 item 5): when the promoted writer survives the
+        // stop ladder (or the ladder cannot verify it),
+        // stop_promoted_writer_before_retire returns a RETRYABLE
+        // WriterStillLive error. This early return must happen before the
+        // effort/model/permission queues, the events sender or the poller are
+        // touched: the hydrator and transcript monitoring stay live, close
+        // ownership is retained, the writer's later append is still delivered,
+        // and the next close() re-runs the verification and completes the
+        // teardown.
+        let promoted = self
+            .promoted
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false);
+        if promoted {
+            self.stop_promoted_writer_before_retire().await?;
+        }
         // §9.1: stop the effort switch before the PTY it types into goes away.
         self.effort_queue.lock().await.close();
         if let Some(worker) = self.effort_worker.lock().await.take() {
@@ -2811,20 +2862,11 @@ impl Driver for ShellPtyDriver {
             worker.abort();
         }
         self.events_tx.lock().await.take();
-        // Is a promoted native agent live in the foreground? In that case the
-        // native writer is stopped FIRST and its termination append drained
-        // while the poller/hydrator/sender are still live; the promoter is
-        // retired only after the process group is verified gone
-        // (c-ctxusage r15 item 7). A plain login shell keeps the old order:
-        // retire the promoter, then stop the group.
-        let promoted = self
-            .promoted
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false);
-        if promoted {
-            self.stop_promoted_writer_before_retire().await?;
-        }
+        // The promoted writer was stopped and verified with the poller,
+        // hydrator and sender still live above; the promoter is retired only
+        // below, after the final drain (c-ctxusage r15 item 7). A plain login
+        // shell instead retires the promoter here and stops its group at the
+        // end of close.
         // c-ctxusage r4 item 2: cooperative poller shutdown. Signal closure
         // first, then give the poller one window to read the final append and
         // publish its last turn via `finish()` (an assistant record with usage

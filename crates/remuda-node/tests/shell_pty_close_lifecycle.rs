@@ -600,3 +600,145 @@ async fn promoted_close_drains_the_writers_termination_append_before_hydrator_re
         "the fake writer appended the termination record to the transcript"
     );
 }
+
+/// P1 (c-ctxusage r16 item 5): a promoted close whose stop ladder cannot
+/// verify the writer's process group gone must NOT retire the hydrator or
+/// drop close ownership — it returns a RETRYABLE error, keeps transcript
+/// monitoring live (the SIGINT-flushed termination append is still
+/// delivered), and a subsequent close completes after the group is really
+/// gone. The first attempt's failure is injected deterministically; the
+/// second attempt runs the real verification against the now-dead group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_incomplete_promoted_close_stays_live_and_a_retry_completes() {
+    use remuda_driver::test_faults::TranscriptFaults;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let workspace = root.join("workspace");
+    let native_home = root.join("home");
+    let instance_dir = root.join("instance");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&native_home).unwrap();
+    let install = root.join("opt/bin");
+    std::fs::create_dir_all(&install).unwrap();
+    let binary = install.join("claude");
+    std::fs::copy(ensure_workspace_bin("fake-harness"), &binary).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let events_path = root.join("harness-events.jsonl");
+
+    let transcript = remuda_driver::claude_transcript::project_dir(&native_home, &workspace)
+        .join(format!("{SESSION_ID}.jsonl"));
+    seed_transcript(&transcript, 20);
+
+    let mut options = ShellPtyOptions::agent(
+        workspace.clone(),
+        AgentKind::Claude,
+        AgentLaunch {
+            profile: Box::new(profile()),
+            launch_dir: instance_dir.join("launch"),
+            native_home: native_home.clone(),
+            binary: Some(binary),
+            origin: LaunchOrigin::Human,
+            native_home_managed: true,
+            settings_overlay: None,
+        },
+    );
+    options.emulator = true;
+    options.pin_native_home = true;
+    options.claude_home = Some(native_home.clone());
+    options
+        .extra_env
+        .insert("FAKE_HARNESS_DIALECT_VERSION".into(), "modern".into());
+    options.extra_env.insert(
+        "FAKE_HARNESS_EVENTS_OUT".into(),
+        events_path.to_string_lossy().into_owned(),
+    );
+    // The native writer appends one final record on SIGINT, then exits.
+    options
+        .extra_env
+        .insert("FAKE_HARNESS_APPEND_ON_SIGNAL".into(), "1".into());
+    options.hooks = Some(HookConfig {
+        instance_dir,
+        relay_binary: relay_bin(),
+        tui: remuda_driver::TuiMode::Default,
+    });
+    let driver = ShellPtyDriver::new(options);
+
+    let faults = TranscriptFaults::new();
+    // The FIRST promoted close reports the writer still live after the ladder.
+    faults.arm_promoted_stop_incomplete(1);
+    driver.set_test_faults(faults.clone());
+
+    let handle = driver
+        .start(spec_for(&workspace, DriverKind::ShellPty))
+        .await
+        .expect("start");
+    let mut events_rx = handle.into_events();
+    let term_count = Arc::new(AtomicUsize::new(0));
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
+    let drainer_count = Arc::clone(&term_count);
+    let drainer = tokio::spawn(async move {
+        while let Some(observation) = events_rx.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+                && native.native_name == "transcript_bound"
+                && let Some(tx) = bound_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+            if let ObservationPayload::Usage(payload) = &observation.body
+                && payload.scope_id == TERMINATION_MSG_ID
+            {
+                drainer_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(20), bound_rx)
+        .await
+        .expect("the seeded replay never bound")
+        .expect("bound oneshot closed without firing");
+
+    // Attempt 1: the ladder really runs (the writer appends and exits), but
+    // verification is injected as incomplete. The close must surface the
+    // RETRYABLE WriterStillLive error rather than reporting success.
+    let first = tokio::time::timeout(Duration::from_secs(15), driver.close())
+        .await
+        .expect("the first close hung past its bound");
+    assert!(
+        matches!(first, Err(remuda_driver::DriverError::WriterStillLive(_))),
+        "an unverified promoted close is retryable, got {first:?}"
+    );
+
+    // The hydrator/poller/sender were never retired: the writer's SIGINT
+    // append is still delivered through the live channel.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while term_count.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        term_count.load(Ordering::SeqCst),
+        1,
+        "the termination append is delivered while the close is incomplete"
+    );
+
+    // Attempt 2: the group is really gone, so the verification succeeds and
+    // the teardown completes.
+    tokio::time::timeout(Duration::from_secs(15), driver.close())
+        .await
+        .expect("the retried close hung past its bound")
+        .expect("the retried close completes once the writer is verified gone");
+
+    driver.abort_event_workers_for_test().await;
+    tokio::time::timeout(Duration::from_secs(30), drainer)
+        .await
+        .expect("event channel never closed after the retried close")
+        .expect("event drainer panicked");
+    assert_eq!(
+        term_count.load(Ordering::SeqCst),
+        1,
+        "the termination usage is delivered exactly once across both attempts"
+    );
+}

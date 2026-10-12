@@ -118,6 +118,12 @@ pub(crate) struct FaultState {
     /// close is genuinely in flight without any timing inference.
     close_phase_calls: Mutex<u64>,
     close_phase_calls_cv: Condvar,
+    /// Remaining promoted-close attempts that must report the native writer
+    /// STILL LIVE after the stop ladder (P1, c-ctxusage r16 item 5): one
+    /// decremented failure per close attempt, so the first close returns the
+    /// retryable `WriterStillLive` error without retiring the hydrator, and a
+    /// retried close runs the real verification and completes.
+    promoted_stop_incomplete_attempts: AtomicU64,
 }
 
 /// A parked phase must never wait forever on a test that forgot to release:
@@ -165,6 +171,7 @@ impl FaultState {
             close_tail_gate: Mutex::new(None),
             close_phase_calls: Mutex::new(0),
             close_phase_calls_cv: Condvar::new(),
+            promoted_stop_incomplete_attempts: AtomicU64::new(0),
         })
     }
 
@@ -366,6 +373,19 @@ impl FaultState {
         }
     }
 
+    /// Consume one armed promoted stop-incomplete attempt (P1,
+    /// c-ctxusage r16 item 5). Returns true while the current promoted close
+    /// must synthesize a writer-that-survived-the-ladder outcome.
+    pub(crate) fn take_promoted_stop_incomplete(&self) -> bool {
+        self.promoted_stop_incomplete_attempts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                // An explicit block: `then_some(n - 1)` would evaluate `n - 1`
+                // eagerly even when n is 0 and panic on underflow.
+                if n > 0 { Some(n - 1) } else { None }
+            })
+            .is_ok_and(|previous| previous > 0)
+    }
+
     /// Acknowledge that the streaming flusher exited. A test holding a
     /// producer past close uses this to prove the flusher did not quit while
     /// final frames were still pending.
@@ -520,6 +540,17 @@ impl TranscriptFaults {
     pub fn arm_close_probe_failures(&self, attempts: u32) {
         self.inner
             .close_probe_failures
+            .store(u64::from(attempts), Ordering::SeqCst);
+    }
+
+    /// Make the next `attempts` promoted closes report the native writer as
+    /// STILL LIVE after the stop ladder (P1, c-ctxusage r16 item 5): each such
+    /// close returns the retryable `WriterStillLive` error without retiring
+    /// the hydrator or dropping close ownership; the following close runs the
+    /// real verification and completes.
+    pub fn arm_promoted_stop_incomplete(&self, attempts: u32) {
+        self.inner
+            .promoted_stop_incomplete_attempts
             .store(u64::from(attempts), Ordering::SeqCst);
     }
 

@@ -927,11 +927,14 @@ fn execute_land(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
     report.reference = Some(reference.clone());
     let onto = args.onto.as_deref().context("--land requires --onto")?;
     let (base, verified) = record(report, "preflight", || {
-        let base = resolve_onto(&repo, onto)?;
+        // Resolve the CURRENT local main up front only for the unpinned path.
         // When the caller pins the captured merge (the Node always does for a
-        // granted land), load the IMMUTABLE report for that exact tuple rather
-        // than the `<base>.json` latest pointer, so a second verification of
-        // the same branch/base cannot substitute what gets landed.
+        // granted land), the verified base comes from the immutable report —
+        // loading the report must NOT be conditioned on current main: a local
+        // main move between verify and land is a confirmed CAS move (classified
+        // by the land step as `base_moved(expected, current)`), not a generic
+        // report-load failure (r14 item 6).
+        let current_base = resolve_onto(&repo, onto)?;
         let verified = match args.report.as_deref() {
             Some(pinned) => {
                 let loaded = reports::load_by_merged(&repo, &reference, pinned)?;
@@ -939,14 +942,21 @@ fn execute_land(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
                     loaded.merged.as_deref() == Some(pinned),
                     "immutable report for {pinned} does not name that merge"
                 );
+                loaded
+            }
+            None => {
+                let loaded = reports::load(&repo, &reference, &current_base)?;
                 ensure!(
-                    loaded.base.as_deref() == Some(base.as_str()),
-                    "pinned report was verified on a different base; re-verify before landing"
+                    loaded.base.as_deref() == Some(current_base.as_str()),
+                    "verification report was for a different base; re-verify before landing"
                 );
                 loaded
             }
-            None => reports::load(&repo, &reference, &base)?,
         };
+        let base = verified
+            .base
+            .clone()
+            .context("verification report has no base")?;
         ensure!(
             verified.exit_code == 0 && verified.merged.is_some(),
             "verification report for {} on {base} is not a passing gate",

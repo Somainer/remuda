@@ -1321,3 +1321,50 @@ exit 1
     assert_eq!(repo.main(), merged, "local main keeps the landed merge");
     let _ = base;
 }
+
+/// r14 item 6: local main moving between verification and the land is a
+/// structured `base_moved(expected, current)` (exit 2), not an ordinary
+/// `gate_failed` (exit 1). The pinned report is loaded first; the land CAS then
+/// detects the current main and reports BOTH shas.
+#[test]
+fn a_local_main_move_between_verify_and_land_is_base_moved_with_both_shas() {
+    let repo = Repo::new();
+    // Verify onto the current base and pin the captured merge.
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+    let base = repo.base.clone();
+
+    // Another commit lands on LOCAL main directly (no remote move yet).
+    let newer = commit_file(
+        &repo.root,
+        "post-verify main move.txt",
+        "a coordinator landed this after verification\n",
+    );
+    assert_eq!(repo.main(), newer);
+    assert_ne!(newer, base);
+
+    // Land the pinned merge: the update-ref CAS fails because main is no longer
+    // at the pinned base — classified base_moved, with BOTH expected and the
+    // real current sha, never an opaque gate_failed.
+    let (output, report) = repo.merge(&["--land", "--onto", "main", "--report", &merged], &[]);
+    assert_exit(&output, &report, 2);
+    assert_eq!(report["status"], "base_moved", "{report}");
+    assert_eq!(
+        report["base"],
+        json!(base),
+        "pinned expected base retained: {report}"
+    );
+    assert_eq!(
+        report["currentMain"],
+        json!(newer),
+        "currentMain must name the real moved local main: {report}"
+    );
+    assert_eq!(
+        report["pushed"], false,
+        "a moved base is never pushed: {report}"
+    );
+
+    // Local main is untouched; the merge was not forced through.
+    assert_eq!(repo.main(), newer);
+}

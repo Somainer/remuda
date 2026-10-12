@@ -77,17 +77,18 @@ async function startFollowing(
     windowFromSeq: "1",
     reachedAfterSeq: true,
   } as never);
-  let deliver!: (observation: Observation) => void;
+  let deliverBatch!: (observations: Observation[]) => void;
   vi.spyOn(api, "eventsSubscribe").mockImplementation(async (_j, _a, onBatch) => {
-    deliver = (observation: Observation) =>
+    const send = (observations: Observation[]) =>
       onBatch({
         subscriptionId: `sub_${instance.id}`,
         journalId: instance.journalId,
-        fromSeq: observation.seq,
-        toSeq: observation.seq,
-        durableSeq: observation.seq,
-        events: [observation],
+        fromSeq: observations[0]!.seq,
+        toSeq: observations[observations.length - 1]!.seq,
+        durableSeq: observations[observations.length - 1]!.seq,
+        events: observations,
       });
+    deliverBatch = (observations: Observation[]) => send(observations);
     return subscription(instance);
   });
   await hubStore.follow(instance.id);
@@ -98,15 +99,20 @@ async function startFollowing(
   // matching monotonic timestamp so the journal never sees a gap.
   let delivered = 1;
   const tsFor = (n: number) => `2026-10-06T00:0${n}:00.000Z`;
+  const stamp = (observation: Observation) => {
+    delivered += 1;
+    // Keep an explicit envelope observedAt (effort/lifecycle payloads share
+    // one host clock in production); only synthesize one when absent.
+    const observedAt = observation.observedAt ?? tsFor(delivered);
+    return { ...observation, seq: String(delivered), observedAt };
+  };
   const ctx = {
     instance,
-    receive: (observation: Observation) => {
-      delivered += 1;
-      // Keep an explicit envelope observedAt (effort/lifecycle payloads share
-      // one host clock in production); only synthesize one when absent.
-      const observedAt = observation.observedAt ?? tsFor(delivered);
-      deliver({ ...observation, seq: String(delivered), observedAt });
-    },
+    receive: (observation: Observation) => deliverBatch([stamp(observation)]),
+    // r16 item 4: deliver several journal events in ONE follow/catch-up batch.
+    // The JournalClient flushes them in ascending seq order; the store must
+    // fold activity and effort lifecycles in that same order.
+    receiveBatch: (observations: Observation[]) => deliverBatch(observations.map(stamp)),
   };
   return ctx;
 }
@@ -3047,6 +3053,75 @@ it("r15 item 1: an observer pending created from a queued edge while waiting-int
   expect(typeof exited?.leftQueueAt, "the deadline starts at authoritative idle").toBe("number");
   await advanceEffortReconcile(14_999);
   expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
+  await advanceEffortReconcile(2);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");
+});
+
+it("r16 item 4: activity and the queued edge folded out of order in ONE batch must not idle-initialise the pending", async () => {
+  // The observer tab is idle when the follow/catch-up batch arrives; the
+  // batch carries, in JOURNAL ORDER, a full-instance snapshot parking the
+  // session on waiting-interaction and then the driver's effort-queued:low
+  // lifecycle. Folding the effort edge against the PRE-batch idle activity
+  // started the 15 s deadline immediately while the driver was blocked.
+  const ctx = await startFollowing("r16-item4-batch-order");
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const baseline: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "low", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [baseline] } as never);
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  const entityActivity = (value: "waiting-interaction" | "idle", observedAt: string): Observation =>
+    ({
+      eventId: `evt_act_entity_${value}_${observedAt}`,
+      instanceId: ctx.instance.id,
+      journalId: "x",
+      seq: "0",
+      kind: "lifecycle",
+      source: { channel: "runtime" },
+      observedAt,
+      payload: {
+        type: "entity",
+        entityType: "instance",
+        entityId: ctx.instance.id,
+        entity: {
+          id: ctx.instance.id,
+          activity: { state: "known", value },
+          activityEvidenceEventIds: [],
+          nativeRef: ctx.instance.nativeRef,
+          updatedAt: observedAt,
+        },
+      },
+    }) as unknown as Observation;
+
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
+
+  // Both events arrive together, activity evidence FIRST in journal order.
+  ctx.receiveBatch([
+    entityActivity("waiting-interaction", "2026-09-16T00:00:05.000Z"),
+    configureLifecycle(0, "effort-queued:low", ctx.instance.id, "2026-09-16T00:00:05.500Z"),
+  ]);
+  const pending = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pending?.source).toBe("lifecycle");
+  expect(pending?.queued, "the chip keeps 排队中 behind the interaction").toBe(true);
+  expect(pending?.leftQueueAt, "the batch's waiting-interaction evidence blocks the deadline").toBeNull();
+
+  // Held blocked for longer than the 15 s bound: no deadline fires.
+  await advanceEffortReconcile(15_001);
+  expect(hubStore.effortPendingOf(ctx.instance.id), "still queued, never unconfirmed while blocked").not.toBeNull();
+  expect(toast).not.toHaveBeenCalled();
+
+  // A later batch releases the session: authoritative idle starts the FULL
+  // post-idle window from this instant.
+  ctx.receiveBatch([entityActivity("idle", "2026-09-16T00:00:30.000Z")]);
+  const exited = hubStore.effortPendingOf(ctx.instance.id);
+  expect(typeof exited?.leftQueueAt, "the full deadline window starts only on idle").toBe("number");
+  await advanceEffortReconcile(14_999);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
+  expect(toast).not.toHaveBeenCalled();
   await advanceEffortReconcile(2);
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
   expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");

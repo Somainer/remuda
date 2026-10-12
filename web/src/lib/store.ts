@@ -3458,6 +3458,22 @@ class HubStore {
         // §9.1: live effort edges update the effective level immediately —
         // the slider reflects the transcript, not the optimistic request.
         for (const event of fresh) {
+          // c-effortread r16 item 4: fold THIS event's activity evidence
+          // BEFORE its lifecycle reducers, in journal (seq) order. One
+          // follow/catch-up batch can carry both a full-instance snapshot
+          // parking the session on waiting-interaction and a later
+          // effort-queued edge; folding the edge against the PRE-batch idle
+          // activity initialised the execution deadline immediately while the
+          // driver was blocked. The per-event emit commits the activity into
+          // state (and its queue-exit fold) so the effort reducer below reads
+          // the batch's own activity in order; the post-loop emission replays
+          // the whole range over the already-final projection (skipped or
+          // value-identical, so no rollback).
+          const nextInstances = applyInstanceActivity(this.state.instances, [event]);
+          const activityChanged = nextInstances.some(
+            (row, index) => row !== this.state.instances[index],
+          );
+          if (activityChanged) this.emit({ instances: nextInstances });
           this.noteEffortObservation(instanceId, event);
           this.noteEffortLifecycle(instanceId, event);
           this.noteModelObservation(instanceId, event, true);

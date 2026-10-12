@@ -979,7 +979,6 @@ fn eligible_flow_predicate(outer: &str, matched: &str) -> String {
 
 /// True when instance `instance_expr` has at least one eligible flow row
 /// (see [`eligible_flow_predicate`]). Legacy NULL-scope Turn rows count.
-#[allow(dead_code)] // r9 item 5 wires it into the stock decision
 fn has_eligible_flow_sql(instance_expr: &str) -> String {
     format!(
         "EXISTS (
@@ -1042,25 +1041,25 @@ fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate:
             SELECT DISTINCT instance_id FROM usage_events
             WHERE {stock_predicate} AND scope = 'session' AND scope_id IS NOT NULL
          ),
-         r7_message_instances AS (
-            SELECT DISTINCT instance_id FROM usage_events
-            WHERE {stock_predicate} AND scope = 'message'
-         ),
-         r8_turn_instances AS (
-            SELECT DISTINCT instance_id FROM usage_events
-            WHERE {stock_predicate} AND scope = 'turn' AND scope_id IS NOT NULL
-         ),
-         r8_flow_only_stock_instances AS (
-            -- r8 stock rule (refined per-call in r9 item 5): session stock
-            -- counts only for instances with neither message nor modern turn.
-            SELECT DISTINCT instance_id FROM usage_events
-            WHERE {stock_predicate} AND scope = 'session'
-              AND instance_id NOT IN (SELECT instance_id FROM r7_message_instances)
-              AND instance_id NOT IN (SELECT instance_id FROM r8_turn_instances)
+         r9_stock_only_instances AS (
+            -- r9 item 5: session stock counts ONLY for instances with no
+            -- eligible flow (legacy NULL-scope Turns included).
+            SELECT DISTINCT s.instance_id FROM usage_events s
+            WHERE {stock_predicate} AND s.scope = 'session'
+              AND NOT EXISTS (
+                  SELECT 1 FROM usage_events f
+                  WHERE f.instance_id = s.instance_id
+                    AND {flow_exists_f}
+              )
          ),
          r5_eligible_stock AS (
-            SELECT instance_id, scope_id, cost FROM (
-                SELECT instance_id, scope_id,
+            -- The single LATEST cumulative point per (instance, scope_id):
+            -- tokens AND cost come from these rows only (r9 item 5), never
+            -- summed over the whole cumulative history (stock 10 then 30 is
+            -- 30, not 40). Legacy NULL-scope rows participate only when the
+            -- instance has no scoped rows at all.
+            SELECT instance_id, scope_id, cost, rowid AS stock_rowid FROM (
+                SELECT instance_id, scope_id, rowid,
                        CAST(cost_usd AS REAL) AS cost,
                        ROW_NUMBER() OVER (
                            PARTITION BY instance_id, scope_id ORDER BY seq DESC
@@ -1093,27 +1092,34 @@ fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate:
          )
          SELECT COUNT(*),
                 -- r9 items 4/5: ONE token representation per call — the
-                -- shared eligible-flow relation; session stock ONLY for
-                -- instances with no eligible flow. Cumulative Session
-                -- history is never summed onto flow.
+                -- shared eligible-flow relation; session stock contributes
+                -- ONLY its latest per-scope rows for instances with no
+                -- eligible flow. Cumulative Session history is never summed
+                -- onto flow.
                 COALESCE(SUM(CASE
                     WHEN usage_events.scope = 'session'
-                         AND usage_events.instance_id
-                             IN (SELECT instance_id FROM r8_flow_only_stock_instances)
+                         AND usage_events.rowid IN (
+                             SELECT stock_rowid FROM r5_eligible_stock
+                             WHERE instance_id IN (
+                                 SELECT instance_id FROM r9_stock_only_instances))
                          THEN total_tokens
                     {flow_total}
                 END), 0),
                 COALESCE(SUM(CASE
                     WHEN usage_events.scope = 'session'
-                         AND usage_events.instance_id
-                             IN (SELECT instance_id FROM r8_flow_only_stock_instances)
+                         AND usage_events.rowid IN (
+                             SELECT stock_rowid FROM r5_eligible_stock
+                             WHERE instance_id IN (
+                                 SELECT instance_id FROM r9_stock_only_instances))
                          THEN input_tokens
                     {flow_input}
                 END), 0),
                 COALESCE(SUM(CASE
                     WHEN usage_events.scope = 'session'
-                         AND usage_events.instance_id
-                             IN (SELECT instance_id FROM r8_flow_only_stock_instances)
+                         AND usage_events.rowid IN (
+                             SELECT stock_rowid FROM r5_eligible_stock
+                             WHERE instance_id IN (
+                                 SELECT instance_id FROM r9_stock_only_instances))
                          THEN output_tokens
                     {flow_output}
                 END), 0),
@@ -1128,6 +1134,7 @@ fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate:
                    AND flow.scope != 'session'
                    AND {flow_cost})
          FROM usage_events WHERE {outer_predicate}",
+        flow_exists_f = eligible_flow_predicate("f", "fm"),
         flow_total = flow_case_arm("total_tokens"),
         flow_input = flow_case_arm("input_tokens"),
         flow_output = flow_case_arm("output_tokens"),
@@ -1670,20 +1677,6 @@ fn kind_fallback(kind: &str) -> (Option<i64>, bool) {
     }
 }
 
-/// Per-bucket coverage: do the additive flow sums cover (reach) every bucket
-/// the authoritative cumulative session snapshot reports? `None` incoming
-/// imposes no constraint. A flow total below the session stock means
-/// incomplete coverage (a tail bound mid-session / interrupted replay), so
-/// the cumulative total is used instead (c-usagefu (b)). r9 item 5 removes
-/// this fallback.
-fn bucket_covers(flow: Option<i64>, session: Option<i64>) -> bool {
-    match (flow, session) {
-        (_, None) => true,
-        (Some(flow), Some(session)) => flow >= session,
-        (None, Some(_)) => false,
-    }
-}
-
 /// Session-wide totals of one rollup query.
 struct RollupTotals {
     turns: i64,
@@ -1780,6 +1773,14 @@ pub fn rollup_instance(
         return Ok(None);
     }
 
+    // r9 item 5: does the instance have ANY eligible flow row? The decision
+    // includes legacy NULL-scope Turns.
+    let has_eligible_flow: bool = conn.query_row(
+        &format!("SELECT {}", has_eligible_flow_sql("?1")),
+        params![instance_id],
+        |row| row.get(0),
+    )?;
+
     // The cumulative stock exists only for session-emitting harnesses.
     let (stock, _stock_scoped) = if totals.has_session {
         latest_session_stock(conn, instance_id)?
@@ -1787,14 +1788,10 @@ pub fn rollup_instance(
         (SessionStock::default(), false)
     };
 
-    // Totals (r8 coverage rule): flow sums when they cover the authoritative
-    // stock in every reported bucket (or when there is no stock), else the
-    // current stock. r9 item 5 replaces this with a strict flow-exists rule.
-    let use_flow = !totals.has_session
-        || (bucket_covers(totals.turn_input, stock.input)
-            && bucket_covers(totals.turn_output, stock.output)
-            && bucket_covers(totals.turn_cache_read, stock.cache_read)
-            && bucket_covers(totals.turn_cache_write, stock.cache_write));
+    // Totals: eligible flow whenever any exists; the latest stock ONLY when
+    // the instance/session is flow-less. Never flow + stock, never a
+    // smaller-flow stock fallback (r9 items 4/5).
+    let use_flow = !totals.has_session || has_eligible_flow;
     let (session_input, session_output, cache_read, cache_creation) = if use_flow {
         (
             totals.turn_input,
@@ -4225,9 +4222,9 @@ mod tests {
 
     #[test]
     fn codex_mixed_turn_and_session_rows_use_one_stock_flow_rule() {
-        // Two per-call Turn flows only PARTIALLY cover a cumulative Session
-        // snapshot (300/120): the r8 coverage rule keeps the authoritative
-        // stock for totals, while rates use the flow alone.
+        // r9 items 4/5: eligible per-call Turn flow plus a cumulative
+        // Session snapshot that covers more calls. The flow sums win and
+        // the stock is never a fallback; rates come from the flow alone.
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         let now = time::OffsetDateTime::now_utc();
@@ -4298,12 +4295,15 @@ mod tests {
         let rollup = rollup_fold(&conn, "ins_mix", "codex", None)
             .unwrap()
             .unwrap();
+        // r9 items 4/5: eligible flow exists, so the cumulative stock is
+        // NEVER used as a smaller-flow fallback — totals are the flow sums
+        // (200/100), even when the session snapshot reports more.
         assert_eq!(
             rollup.session_input_tokens,
-            Some(300),
-            "partial turn coverage falls back to authoritative stock"
+            Some(200),
+            "eligible flow sum, never the larger cumulative stock fallback"
         );
-        assert_eq!(rollup.session_output_tokens, Some(120));
+        assert_eq!(rollup.session_output_tokens, Some(100));
         assert_eq!(rollup.turns, 2);
         // Context basket = the latest TURN call (input 100), never the
         // cumulative session total (which would be 300+).

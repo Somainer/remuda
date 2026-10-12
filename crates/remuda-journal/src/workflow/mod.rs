@@ -223,6 +223,17 @@ impl WorkflowJournalTailer {
         self.tails.values().map(FileTail::resume).collect()
     }
 
+    /// Test-only: number of live failure-settlement covers armed for `agent`
+    /// on the journal at `journal_path`, so retirement driven by a real
+    /// [`Self::poll`] fold can be asserted without the test touching the
+    /// cover set itself.
+    #[cfg(test)]
+    pub(crate) fn cover_count(&self, journal_path: &Path, agent: &str) -> usize {
+        self.tails
+            .get(journal_path)
+            .map_or(0, |tail| tail.covers().for_agent(agent).count())
+    }
+
     /// Register a run from its PostToolUse(Workflow) hook and emit its first
     /// `workflow.run` observation immediately (synchronously — this is what
     /// keeps the first observation inside the launch budget).
@@ -1709,39 +1720,6 @@ impl RunState {
         };
         text.contains("TaskStop") && text.contains(task_id)
     }
-
-    /// Test-only minimal run carrying the supplied members, for driving
-    /// [`Self::fold_journal_line`] directly.
-    #[cfg(test)]
-    fn test_with_members(native_id: &str, members: Vec<MemberState>) -> Self {
-        Self {
-            native_id: native_id.to_owned(),
-            dir: PathBuf::new(),
-            task_id: None,
-            tool_call_native: None,
-            script: None,
-            script_path: None,
-            script_source: None,
-            script_loaded: false,
-            main_transcript: None,
-            terminal: None,
-            grace: 0,
-            finished: false,
-            members,
-            attempts: HashMap::new(),
-            member_revs: HashMap::new(),
-            phases: Vec::new(),
-            run_rev: 0,
-            last_run_sig: None,
-            last_emitted_note: None,
-            emitted_phase: HashMap::new(),
-            emitted_member: HashMap::new(),
-            note: None,
-            missing_polls: 0,
-            launched_ms: None,
-            force_member_refresh: HashSet::new(),
-        }
-    }
 }
 
 impl MemberState {
@@ -1975,174 +1953,289 @@ fn workflow_native_id(journal_path: &Path) -> String {
 #[cfg(test)]
 mod r9_cover_fold_tests {
     use super::*;
-    use crate::cover::{Cover, CoverKind, CoverSet, FileId};
-    use crate::util::digest_of;
-    use remuda_protocol::Id;
+    use remuda_protocol::{HostId, Id, InstanceId, Knowledge};
+    use std::io::Write;
 
-    const W: u64 = 100;
-    const FILE: FileId = FileId { dev: 7, ino: 99 };
+    /// Consumed prefix: a1's first attempt started then failed; the cursor is
+    /// at W after the first poll.
+    const PREFIX: &str = "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n\
+{\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n";
 
-    fn failed_placeholder(agent_id: &str) -> MemberState {
-        let mut member = MemberState::new_placeholder(agent_id.to_owned());
-        member.state = WorkflowState::Failed;
-        member.stopped = true;
-        member
+    /// A real on-disk run with a launched, once-polled tailer.
+    struct Harness {
+        // Held to keep the temp tree alive for the whole test.
+        #[allow(dead_code)]
+        tmp: tempfile::TempDir,
+        run_dir: PathBuf,
+        tailer: WorkflowJournalTailer,
+        w: u64,
     }
 
-    fn cursor(line: &[u8], generation: u64, offset: u64) -> FileCursor {
-        FileCursor {
-            file_identity: Id::new("obj").unwrap(),
-            file_generation: U64(generation),
-            offset: U64(offset),
-            length: U64(line.len() as u64),
-            digest: digest_of(line),
-        }
-    }
+    impl Harness {
+        fn new(run_id: &str) -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = tmp.path().join("session");
+            let run_dir = session.join("subagents/workflows").join(run_id);
+            std::fs::create_dir_all(&run_dir).unwrap();
+            std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+            std::fs::write(run_dir.join("agent-a2.jsonl"), "{}\n").unwrap();
+            std::fs::write(run_dir.join("journal.jsonl"), PREFIX).unwrap();
+            let w = PREFIX.len() as u64;
 
-    fn pending(prefix: &[u8]) -> Cover {
-        Cover::pending("a1", FILE, 1, W, W + prefix.len() as u64, prefix.to_vec())
-    }
-
-    fn complete(line: &[u8]) -> Cover {
-        Cover::complete("a1", FILE, 1, W, line)
-    }
-
-    #[test]
-    fn a_pending_tail_completed_as_another_members_result_retires_on_its_owner() {
-        // r9 item 5 (r8 item 5 NOT MET): the retirement lives in the fold
-        // loop's per-line note_consumed, not in the started branch. A pending
-        // "{" completing as another member's RESULT record retires the
-        // original owner's cover the moment that line is consumed.
-        let mut run =
-            RunState::test_with_members("wf_r9_result_retire", vec![failed_placeholder("a1")]);
-        let mut covers = CoverSet::new();
-        covers.arm("a1", vec![pending(br#"{"#)]);
-
-        let result = br#"{"type":"result","key":"v2:k2","agentId":"a2"}"#;
-        run.fold_journal_line(result, &cursor(result, 1, W), Some(&covers));
-        covers.note_consumed(1, W);
-
-        assert_eq!(covers.for_agent("a1").count(), 0, "a1's cover is retired");
-        let a1 = run
-            .members
-            .iter()
-            .find(|member| member.agent_id == "a1")
-            .unwrap();
-        assert_eq!(a1.state, WorkflowState::Failed, "a1's outcome is untouched");
-
-        // With the cover gone, a byte-identical a1 start reusing the position
-        // is not settled by it.
-        let started = br#"{"type":"started","key":"v2:k","agentId":"a1"}"#;
-        assert!(!covers.settles("a1", 1, W, &digest_of(started), started));
-    }
-
-    #[test]
-    fn a_cover_retires_when_any_record_type_consumes_its_position() {
-        // r9 item 5: the r8 retirement sweep ran only in the started branch; a
-        // pending "{" that completed as another member's result/failed never
-        // retired the original owner's cover. Retirement now happens per
-        // consumed line for EVERY record type and both cover kinds.
-        for record_type in ["result", "failed"] {
-            for armed in [
-                pending(br#"{"#),
-                complete(br#"{"type":"started","key":"v2:k","agentId":"a1"}"#),
-            ] {
-                let kind = armed.kind;
-                let mut run = RunState::test_with_members(
-                    "wf_r9_any_type_retire",
-                    vec![failed_placeholder("a1")],
-                );
-                let mut covers = CoverSet::new();
-                covers.arm("a1", vec![armed]);
-
-                let line =
-                    format!("{{\"type\":\"{record_type}\",\"key\":\"v2:k2\",\"agentId\":\"a2\"}}");
-                run.fold_journal_line(
-                    line.as_bytes(),
-                    &cursor(line.as_bytes(), 1, W),
-                    Some(&covers),
-                );
-                covers.note_consumed(1, W);
-                assert_eq!(
-                    covers.for_agent("a1").count(),
-                    0,
-                    "{record_type} at the position retires a1's {kind:?} cover"
-                );
+            let ctx = MapContext::claude_file(
+                InstanceId::new(),
+                Id::new("obj").unwrap(),
+                HostId::new(),
+                "sess",
+                SourceChannel::WorkflowJournal,
+            );
+            let mut tailer = WorkflowJournalTailer::new(&session, ctx);
+            tailer
+                .launch(WorkflowLaunch {
+                    run_id: run_id.into(),
+                    task_id: Some("t1".into()),
+                    tool_call_id: Some("tc".into()),
+                    transcript_dir: Some(run_dir.clone()),
+                    script_path: None,
+                    script_source: None,
+                })
+                .unwrap();
+            let envelopes = tailer.poll().unwrap();
+            assert_eq!(
+                states_for(&envelopes, "a1").last().copied(),
+                Some(WorkflowState::Failed),
+                "a1's first attempt ends Failed and is consumed through W"
+            );
+            Self {
+                tmp,
+                run_dir,
+                tailer,
+                w,
             }
         }
+
+        /// Absolute path of the run's journal.jsonl.
+        fn journal(&self) -> PathBuf {
+            self.run_dir.join("journal.jsonl")
+        }
+
+        /// Append raw bytes to the journal.
+        fn append(&self, bytes: &[u8]) {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(self.journal())
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+        }
+
+        /// Append a complete JSONL line.
+        fn append_line(&self, line: &str) {
+            self.append(line.as_bytes());
+            self.append(b"\n");
+        }
+
+        /// Shrink the journal back to `len` bytes.
+        fn truncate(&self, len: u64) {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(self.journal())
+                .unwrap();
+            file.set_len(len).unwrap();
+        }
+
+        /// Register a member from its SubagentStart hook (so its journal
+        /// records fold onto an existing member).
+        fn member_started(&mut self, agent: &str) {
+            self.tailer
+                .agent_event(
+                    agent,
+                    true,
+                    Some(&self.run_dir.join(format!("agent-{agent}.jsonl"))),
+                )
+                .unwrap();
+        }
+
+        /// Drive the real StopFailure entry, which arms covers from its peek.
+        fn agent_failed(&mut self, agent: &str) {
+            self.member_started(agent);
+            self.tailer
+                .agent_failed(
+                    agent,
+                    Some(&self.run_dir.join(format!("agent-{agent}.jsonl"))),
+                )
+                .unwrap();
+        }
+
+        fn poll(&mut self) -> Vec<Envelope> {
+            self.tailer.poll().unwrap()
+        }
+
+        fn live_covers(&self, agent: &str) -> usize {
+            self.tailer.cover_count(&self.journal(), agent)
+        }
     }
 
+    fn states_for(envelopes: &[Envelope], agent: &str) -> Vec<WorkflowState> {
+        envelopes
+            .iter()
+            .filter_map(|env| match &env.body {
+                ObservationPayload::WorkflowMember(m)
+                    if m.native_agent_id
+                        == Knowledge::Known {
+                            value: agent.into(),
+                        } =>
+                {
+                    Some(m.state)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// r9 item 5 (r8 item 5 NOT MET), driven through the REAL tailer in r10:
+    /// the failure peek arms a pending "{" for a1; an append-only write
+    /// completes it at the SAME offset as ANOTHER member's result. The cover
+    /// must be retired by the poll fold's per-line consumption (not by the
+    /// test), a1's Failed outcome is untouched, and a later genuine retry
+    /// resurrects.
     #[test]
-    fn a_cover_retires_when_a_later_record_consumes_past_its_position() {
-        // Consumption at ANY offset at/after the cover retires it: the fold
-        // loop calls note_consumed for every line, so a record the cover does
-        // not even relate to still spends it once the read cursor passes.
-        let mut covers = CoverSet::new();
-        covers.arm("a1", vec![pending(br#"{"#)]);
-        covers.note_consumed(1, W + 80);
-        assert_eq!(covers.for_agent("a1").count(), 0);
+    fn a_pending_tail_completed_as_another_members_result_retires_on_its_owner() {
+        let mut h = Harness::new("wf_r10_result_retire");
+        h.append(b"{");
+        h.agent_failed("a1");
+        assert_eq!(
+            h.live_covers("a1"),
+            1,
+            "the failure peek armed the pending cover"
+        );
+
+        // Complete the lone brace at W as a2's RESULT, append-only: the first
+        // byte stays "{", so the cover survives the open and only the fold's
+        // consumption at W can retire it.
+        h.append(b"\"type\":\"result\",\"key\":\"v2:k2\",\"agentId\":\"a2\"}\n");
+        let envelopes = h.poll();
+        assert_eq!(
+            h.live_covers("a1"),
+            0,
+            "the real poll fold retires the cover when a2's result consumes W"
+        );
+        assert!(
+            states_for(&envelopes, "a1")
+                .iter()
+                .all(|state| *state == WorkflowState::Failed),
+            "a1's outcome is untouched by another member's result"
+        );
+
+        // A genuine retry at the later offset is no longer settled.
+        h.append_line(
+            "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"genuine\"}",
+        );
+        assert_eq!(
+            states_for(&h.poll(), "a1").last().copied(),
+            Some(WorkflowState::Running),
+            "the retry after the retired cover is genuine"
+        );
     }
 
+    /// r9 item 5 through the real tailer: every record type that consumes the
+    /// cover's position retires the pending cover.
+    #[test]
+    fn a_cover_retires_when_any_record_type_consumes_its_position() {
+        for record_type in ["result", "failed"] {
+            let mut h = Harness::new("wf_r10_any_type_retire");
+            // a2 exists so its result/failed folds onto a2 instead of becoming
+            // a run-level event.
+            h.member_started("a2");
+            h.append(b"{");
+            h.agent_failed("a1");
+            assert_eq!(h.live_covers("a1"), 1, "{record_type}: armed");
+
+            h.append(
+                format!("\"type\":\"{record_type}\",\"key\":\"v2:k2\",\"agentId\":\"a2\"}}\n")
+                    .as_bytes(),
+            );
+            let envelopes = h.poll();
+            assert_eq!(
+                h.live_covers("a1"),
+                0,
+                "{record_type} at the position retires a1's pending cover via the real fold"
+            );
+            assert!(
+                states_for(&envelopes, "a1")
+                    .iter()
+                    .all(|state| *state == WorkflowState::Failed),
+                "{record_type}: a1's outcome is untouched"
+            );
+        }
+    }
+
+    /// The settled attempt folds Failed and is retired as it is consumed; a
+    /// genuine retry appended AFTER it in the SAME poll resurrects. The cover
+    /// set observed after the real poll must be empty.
     #[test]
     fn the_covered_start_stays_failed_and_a_later_start_resurrects_in_one_fold() {
-        let mut run =
-            RunState::test_with_members("wf_r9_cover_fold", vec![failed_placeholder("a1")]);
-        let mut covers = CoverSet::new();
-        let attempt2 = br#"{"type":"started","key":"v2:k","agentId":"a1"}"#;
-        covers.arm("a1", vec![complete(attempt2)]);
+        let mut h = Harness::new("wf_r10_cover_fold");
+        h.append(b"{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}");
+        h.agent_failed("a1");
+        assert_eq!(h.live_covers("a1"), 1, "a complete cover is armed at W");
 
-        // The settled attempt at the cover folds first: Failed held.
-        run.fold_journal_line(attempt2, &cursor(attempt2, 1, W), Some(&covers));
-        covers.note_consumed(1, W);
-        assert_eq!(
-            run.members
-                .iter()
-                .find(|member| member.agent_id == "a1")
-                .unwrap()
-                .state,
-            WorkflowState::Failed
+        // Terminate the covered record, then append the genuine retry before
+        // polling: both fold in one poll.
+        h.append(b"\n");
+        h.append_line(
+            "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"retry\"}",
         );
-
-        // A genuine retry appended after the covered record, same poll.
-        let attempt3 = br#"{"type":"started","key":"v2:k","agentId":"a1","label":"retry"}"#;
-        let offset3 = W + attempt2.len() as u64 + 1;
-        run.fold_journal_line(attempt3, &cursor(attempt3, 1, offset3), Some(&covers));
+        let states = states_for(&h.poll(), "a1");
         assert_eq!(
-            run.members
-                .iter()
-                .find(|member| member.agent_id == "a1")
-                .unwrap()
-                .state,
-            WorkflowState::Running
+            *states.first().expect("an a1 observation while folding"),
+            WorkflowState::Failed,
+            "the settled attempt stays Failed"
         );
+        assert_eq!(
+            *states.last().expect("an a1 observation while folding"),
+            WorkflowState::Running,
+            "the genuine retry at the later offset resurrects in the same poll"
+        );
+        assert_eq!(h.live_covers("a1"), 0, "the consumed cover is retired");
     }
 
+    /// A pending a1 cover whose position is rewritten into a2's start does not
+    /// settle a2, leaves a1 Failed, and a genuine a1 retry afterwards runs.
     #[test]
     fn a_pending_completion_of_another_agent_does_not_settle() {
-        let mut run =
-            RunState::test_with_members("wf_r9_other_agent", vec![failed_placeholder("a1")]);
-        let mut covers = CoverSet::new();
-        covers.arm("a1", vec![pending(br#"{"type":"started","agentId"#)]);
+        let mut h = Harness::new("wf_r10_other_agent");
+        h.append(b"{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"");
+        h.agent_failed("a1");
+        assert_eq!(h.live_covers("a1"), 1);
 
-        // The trailing record resolves to a2's start: the started fold routes
-        // it to a2 and the cover (keyed to a1) never settles a2; consuming
-        // the position retires a1's cover anyway.
-        let line = br#"{"type":"started","key":"v2:k","agentId":"a2"}"#;
-        run.fold_journal_line(line, &cursor(line, 1, W), Some(&covers));
-        covers.note_consumed(1, W);
-        assert_eq!(covers.for_agent("a1").count(), 0);
-        assert!(run.members.iter().any(|member| member.agent_id == "a2"));
+        // Rewrite the torn tail at W into a2's complete start.
+        h.truncate(h.w);
+        h.append_line("{\"type\":\"started\",\"key\":\"v2:k2\",\"agentId\":\"a2\"}");
+        let envelopes = h.poll();
         assert_eq!(
-            run.members
+            h.live_covers("a1"),
+            0,
+            "the rewritten position retires a1's cover on the open/fold"
+        );
+        assert!(
+            states_for(&envelopes, "a2").contains(&WorkflowState::Running),
+            "the record at W folds as a2's own start"
+        );
+        assert!(
+            states_for(&envelopes, "a1")
                 .iter()
-                .find(|member| member.agent_id == "a1")
-                .unwrap()
-                .state,
-            WorkflowState::Failed
+                .all(|state| *state == WorkflowState::Failed),
+            "a1 stays Failed"
+        );
+
+        h.append_line(
+            "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"genuine\"}",
         );
         assert_eq!(
-            covers.for_agent("a1").next().map(|c| c.kind),
-            None::<CoverKind>
+            states_for(&h.poll(), "a1").last().copied(),
+            Some(WorkflowState::Running),
+            "a1's later retry is genuine"
         );
     }
 }

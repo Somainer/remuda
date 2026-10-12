@@ -406,6 +406,15 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                 true
             }
         };
+        // r13 item 3: this authenticated session is over. Whatever its
+        // staleness, any pre-grant gate run dispatched on EXACTLY it has lost
+        // the only carrier allowed to run it; requeue/finish those rows so a
+        // replacement session (or a later reconnect) can retry instead of the
+        // job sitting Running forever. Landing rows keep occupancy and are
+        // settled by the bounded Landing reconciliation.
+        if let Some(generation) = session_generation {
+            crate::gatequeue::recover_ended_session(&state, &host_id, generation).await;
+        }
         if stale {
             // D-048: tear down relay streams this link owned. A vanished proxy
             // host ends streams with via-host-offline and blocks routed
@@ -556,7 +565,7 @@ pub(crate) async fn handle_node_method(
                 state.broadcast_settlement(&settlement);
             }
             reconcile_lost_instances(state, &host.host_id, &params).await?;
-            let generation = state
+            let inserted = state
                 .nodes
                 .insert(
                     host.host_id.clone(),
@@ -568,7 +577,7 @@ pub(crate) async fn handle_node_method(
                     ),
                 )
                 .await;
-            *session_generation = Some(generation);
+            *session_generation = Some(inserted.generation);
             let watermarks = state
                 .store
                 .list_instance_watermarks(host.host_id.clone())
@@ -862,13 +871,32 @@ pub(crate) async fn handle_node_method(
                 .map_err(|error| {
                     HubError::BadRequest(format!("invalid gate.authorize params: {error}"))
                 })?;
+            // The requesting socket must be the host's CURRENT authenticated
+            // session. A superseded socket (a replacement carrier connected
+            // while this one stayed open) is refused here even though it is
+            // still readable — its authority was revoked at takeover.
+            let socket_session = session_generation.unwrap_or(0);
+            if socket_session == 0
+                || !state
+                    .nodes
+                    .is_current_session(host_id.as_str(), socket_session)
+                    .await
+            {
+                let result = serde_json::to_value(remuda_protocol::GateAuthorizeResult {
+                    authorized: false,
+                    generation: typed.generation,
+                    state: Some("session-superseded".into()),
+                })
+                .map_err(|error| HubError::Internal(error.to_string()))?;
+                return Ok(Some(result));
+            }
             let auth = state
                 .store
                 .gate_dispatch_authorized(
                     &typed.job_id,
                     host_id.as_str(),
                     typed.generation,
-                    session_generation.unwrap_or(0),
+                    socket_session,
                 )
                 .await
                 .map_err(crate::http::map_store)?;
@@ -901,6 +929,26 @@ pub(crate) async fn handle_node_method(
             {
                 return Err(HubError::Forbidden);
             }
+            // Revoked-session fence: only the host's CURRENT carrier session may
+            // take a grant. A paused frame on a socket a replacement carrier
+            // superseded is refused even when job/generation/host still match,
+            // in BOTH the already-Landing and the Running → Landing branches.
+            let socket_session = session_generation.unwrap_or(0);
+            if socket_session == 0
+                || !state
+                    .nodes
+                    .is_current_session(host_id.as_str(), socket_session)
+                    .await
+            {
+                let result = serde_json::to_value(remuda_protocol::GateLandGrantResult {
+                    granted: false,
+                    generation: typed.generation,
+                    state: Some("session-superseded".into()),
+                    landing_in_progress: false,
+                })
+                .map_err(|error| HubError::Internal(error.to_string()))?;
+                return Ok(Some(result));
+            }
             let grant = state
                 .store
                 .gate_land_grant(
@@ -909,7 +957,7 @@ pub(crate) async fn handle_node_method(
                     typed.generation,
                     &typed.session_epoch,
                     &typed.merge_sha,
-                    session_generation.unwrap_or(0),
+                    socket_session,
                 )
                 .await
                 .map_err(crate::http::map_store)?;

@@ -464,6 +464,13 @@ async fn supervise(state: AppState, host: ManagedHost) {
         let started = Instant::now();
         let mut generation = None;
         let result = connect_once(&state, &host, &record, &client, &mut generation).await;
+        // r13 item 3: requeue/finish any pre-grant run dispatched on EXACTLY
+        // this ended session, even when it has already been superseded (a
+        // replaced daemon closing still owns the runs it dispatched). Landing
+        // rows keep occupancy and are settled separately.
+        if let Some(generation) = generation {
+            crate::gatequeue::recover_ended_session(&state, &host.id, generation).await;
+        }
         if let Some(generation) = generation
             && !state.nodes.remove_generation(&host.id, generation).await
         {

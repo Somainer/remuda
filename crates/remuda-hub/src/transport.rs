@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -457,10 +458,26 @@ struct NodeSlot {
     link: Arc<dyn NodeTransport>,
 }
 
+/// Result of registering a carrier session.
+pub(crate) struct InsertedSession {
+    /// The NON-REUSED authenticated session identity minted for this socket.
+    /// A new, globally-unique value is handed out on every registration, even
+    /// when the host had fully disappeared in between (so it can never equal a
+    /// superseded socket's identity).
+    pub(crate) generation: u64,
+}
+
 /// Connected Node transports, keyed by host id.
 #[derive(Clone, Default)]
 pub struct ConnectedNodes {
     inner: Arc<Mutex<HashMap<String, NodeSlot>>>,
+    /// Process-wide monotonic session identity. Deliberately NOT keyed by host:
+    /// a per-host counter restarted at 1 after a removal would hand a brand-new
+    /// socket the same identity a superseded socket used, so a paused frame on
+    /// the old socket would match the persisted dispatch/grant identity again.
+    /// A globally unique id makes every session distinct for the life of this
+    /// Hub process.
+    next_session: Arc<AtomicU64>,
 }
 
 impl ConnectedNodes {
@@ -504,15 +521,30 @@ impl ConnectedNodes {
         link.notify(method, params).await
     }
 
-    /// Record a live session. Returns a generation used to retire only this session.
-    pub async fn insert(&self, host_id: String, link: Arc<dyn NodeTransport>) -> u64 {
+    /// Record a live session. Mints a fresh, never-reused session identity
+    /// (process-wide monotonic) and reports whether it superseded a still-live
+    /// session for the same host. The returned generation retires only this
+    /// session in [`Self::remove_generation`].
+    pub(crate) async fn insert(
+        &self,
+        host_id: String,
+        link: Arc<dyn NodeTransport>,
+    ) -> InsertedSession {
         let mut inner = self.inner.lock().await;
-        let generation = inner
-            .get(&host_id)
-            .map(|slot| slot.generation.wrapping_add(1))
-            .unwrap_or(1);
+        let generation = self.next_session.fetch_add(1, AtomicOrdering::Relaxed) + 1;
         inner.insert(host_id, NodeSlot { generation, link });
-        generation
+        InsertedSession { generation }
+    }
+
+    /// True iff `session` is the CURRENT live session registered for this host.
+    /// A superseded-but-still-open socket holds a stale generation and fails
+    /// this check even though it remains connected at the TCP layer.
+    pub async fn is_current_session(&self, host_id: &str, session: u64) -> bool {
+        self.inner
+            .lock()
+            .await
+            .get(host_id)
+            .is_some_and(|slot| slot.generation == session)
     }
 
     /// Drop the live session (does not kill the native Node process).
@@ -572,6 +604,52 @@ impl ConnectedNodes {
     /// Host ids with a live Node session.
     pub async fn host_ids(&self) -> Vec<String> {
         self.inner.lock().await.keys().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn dead_link() -> Arc<dyn NodeTransport> {
+        Arc::new(ScriptedTransport::new(None))
+    }
+
+    /// r13 item 3: session identities are process-wide monotonic and are NEVER
+    /// reused after a host fully disconnects. The old per-host counter reset to
+    /// 1 once the slot was removed, so a fresh socket inherited the exact
+    /// identity a superseded socket used and could match a persisted grant.
+    #[tokio::test]
+    async fn session_identities_are_never_reused_after_removal() {
+        let nodes = ConnectedNodes::default();
+        let a = nodes.insert("h".into(), dead_link()).await.generation;
+        assert!(nodes.is_current_session("h", a).await);
+
+        // Full disconnect: the host slot is removed.
+        assert!(nodes.remove_generation("h", a).await);
+        assert!(!nodes.is_current_session("h", a).await);
+
+        // A brand-new socket for the same host must NOT draw `a` again.
+        let b = nodes.insert("h".into(), dead_link()).await.generation;
+        assert_ne!(a, b, "session identity reused after removal");
+        assert!(nodes.is_current_session("h", b).await);
+        assert!(
+            !nodes.is_current_session("h", a).await,
+            "old session revived"
+        );
+
+        // Takeover while the first socket is still open: a third session
+        // supersedes b; b is no longer current even though it never closed.
+        let c = nodes.insert("h".into(), dead_link()).await.generation;
+        assert_ne!(b, c);
+        assert!(nodes.is_current_session("h", c).await);
+        assert!(!nodes.is_current_session("h", b).await);
+        assert!(!nodes.is_current_session("h", a).await);
+
+        // Different hosts draw independent values from the same global counter.
+        let d = nodes.insert("other".into(), dead_link()).await.generation;
+        assert_ne!(c, d);
     }
 }
 

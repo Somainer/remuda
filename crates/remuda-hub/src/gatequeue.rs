@@ -2027,6 +2027,38 @@ pub(crate) async fn reconcile(state: &AppState) {
     }
 }
 
+/// Reconcile a host's gate jobs when an authenticated carrier session ENDS
+/// (its socket/SSH link dropped). A pre-grant (`running`/`canceling`) job the
+/// Hub dispatched on EXACTLY that session has lost the only carrier allowed to
+/// run it: re-enter the queue (a `canceling` one finishes canceled) so a fresh
+/// session can pick it up, rather than strand it Running forever. Keyed to the
+/// CLOSED session specifically, so a takeover (new session while the old socket
+/// is still open) does NOT yank a still-verifying run off its lane — that run's
+/// grant is fenced by current-session checks and it is requeued here only once
+/// its own socket actually closes.
+///
+/// `landing` rows are deliberately not requeued: the grant authorized a push
+/// that may be in flight, so they keep occupancy and are settled by the
+/// bounded Landing reconciliation against the remote.
+pub(crate) async fn recover_ended_session(state: &AppState, host_id: &str, session: u64) {
+    if session == 0 {
+        return;
+    }
+    let recovered = state.store.recover_ended_gate_jobs(host_id, session).await;
+    let Ok(jobs) = recovered else {
+        return;
+    };
+    for job in &jobs {
+        if job.state == GateJobState::Canceled {
+            journal(state, &job.requested_by, "gate.canceled", job).await;
+            drop_job_refs(state, job).await;
+        }
+    }
+    if !jobs.is_empty() {
+        schedule_once(state);
+    }
+}
+
 /// Resolve one Landing row left by a restart. Best-effort read-only probe to
 /// the lane host, then a single terminal write.
 async fn settle_landing_after_restart(state: &AppState, job: &GateJob) {
@@ -2823,6 +2855,69 @@ impl Store {
                 params![job_id, i64::try_from(session).unwrap_or(0)],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    /// r13 item 3: when a carrier session ends, requeue the host's `running`
+    /// jobs (and finish its `canceling` jobs) that were dispatched on EXACTLY
+    /// that session. One writer job; `landing` rows are excluded by the
+    /// caller's occupancy guarantee. Returns the recovered rows for journaling.
+    pub(crate) async fn recover_ended_gate_jobs(
+        &self,
+        host_id: &str,
+        ended_session: u64,
+    ) -> Result<Vec<GateJob>, crate::store::StoreError> {
+        let host_id = host_id.to_owned();
+        self.run_named("recover_ended_gate_jobs", move |conn| {
+            let mut recovered = Vec::new();
+            let stale: Vec<(String, String)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id, doc_json FROM gate_jobs
+                      WHERE json_extract(doc_json, '$.hostId') = ?1
+                        AND json_extract(doc_json, '$.state') IN ('running','canceling')
+                        AND dispatch_session IS NOT NULL
+                        AND dispatch_session = ?2",
+                )?;
+                let rows = stmt.query_map(
+                    params![host_id, i64::try_from(ended_session).unwrap_or(0)],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (id, text) in stale {
+                let Ok(mut job) = serde_json::from_str::<GateJob>(&text) else {
+                    continue;
+                };
+                let now = now();
+                let cancelling = job.state == GateJobState::Canceling;
+                if cancelling {
+                    job.state = GateJobState::Canceled;
+                    job.finished_at = Some(now_ts());
+                    if job.error.is_none() {
+                        job.error = Some(
+                            "carrier changed before the run registered; finished canceled".into(),
+                        );
+                    }
+                    job.reason = Some("canceled; carrier session changed".into());
+                } else {
+                    job.state = GateJobState::Queued;
+                    job.started_at = None;
+                    job.host_id = None;
+                    job.lane_id = None;
+                    job.error = Some("carrier session changed while running; re-queued".into());
+                }
+                let doc = serde_json::to_string(&job)?;
+                conn.execute(
+                    "UPDATE gate_jobs
+                        SET doc_json = ?1, state = ?2, lane_id = NULL,
+                            dispatch_session = NULL, revision = revision + 1, updated_at = ?3
+                      WHERE id = ?4",
+                    params![doc, job.state.as_str(), now, id],
+                )?;
+                recovered.push(job);
+            }
+            Ok(recovered)
         })
         .await
     }

@@ -44,8 +44,16 @@ zeroize = "1.9"
 # reach everything the session started, and `std` can only signal a direct
 # child. Unix-only, matching the `tcgetpgrp` identity path this pairs with;
 # `remuda-node` already depends on the same version for its access probe.
+# The "event" feature supplies the safe kqueue wrapper for the r15 item-2
+# child-exit wait on macOS.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.28", features = ["process", "signal"] }
+nix = { version = "0.28", features = ["process", "signal", "event"] }
+
+# r15 item 2: the event-driven child-exit wait parks on pidfd/poll (safe
+# wrappers; the workspace forbids `unsafe`, and nix 0.28 has no pidfd
+# binding). Linux devboxes only — the macOS arm uses nix's kqueue above.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["process", "event"] }
 
 [dev-dependencies]
 # Enable the test-only surface (`StdoutMapper`) for this crate's own

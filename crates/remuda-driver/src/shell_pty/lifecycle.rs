@@ -145,25 +145,28 @@ pub fn group_alive(pgid: i32) -> bool {
 }
 
 /// What the host can establish about one child process BEFORE its parent
-/// reaps it (ma-sdk-state r14 item 4).
+/// reaps it (ma-sdk-state r14 item 4; r15 item 2).
 ///
 /// The distinction between "missing" and "unknown" is load-bearing: an
 /// unreadable `/proc` on Linux must never be read as death (the r13 test
 /// helper mapped every read error to "gone", which is always true on macOS
-/// where `/proc` does not exist).
+/// where `/proc` does not exist), and signal 0 alone must never be read as
+/// liveness on macOS — it succeeds for an unreaped zombie, which the pre-close
+/// SIGKILL proofs must be able to see (r15 item 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildDisposition {
     /// No such process: it exited and has already been reaped (or the pid is
     /// stale). Signal 0 returns `ESRCH` (Linux also: `/proc/<pid>` is ENOENT).
     Gone,
-    /// Dead but not yet reaped by its parent: Linux `/proc` state `Z`/`X`/`x`.
+    /// Dead but not yet reaped by its parent: Linux `/proc` state `Z`/`X`/`x`;
+    /// a non-Linux unix `ps` row in state `Z`/`E`/`?Es`.
     Zombie,
     /// Still running.
     Alive,
     /// The information is unavailable (unreadable `/proc` for a reason other
-    /// than ENOENT, `EPERM` from signal 0, or a non-Linux platform whose only
-    /// probe cannot see zombie state). Callers that need proof of death keep
-    /// waiting rather than treating this as gone.
+    /// than ENOENT, `EPERM` from signal 0, or a `ps` table that does not show
+    /// the pid). Callers that need proof of death keep waiting rather than
+    /// treating this as gone.
     Unknown,
 }
 
@@ -207,16 +210,72 @@ fn classify_linux_stat(stat: &str) -> ChildDisposition {
     }
 }
 
-/// Establish one child's disposition (ma-sdk-state r14 item 4).
+/// Classify a child on a unix WITHOUT `/proc` (macOS, *BSD) from a signal-0
+/// probe result and the child's `ps` state row, if `ps` showed one
+/// (ma-sdk-state r15 item 2).
+///
+/// Signal 0 alone is NOT liveness evidence on these platforms: `kill(pid, 0)`
+/// succeeds for an unreaped zombie exactly as for a running process, which is
+/// what made the old arm answer `Alive` for a SIGKILLed child and drove the
+/// pre-close death proofs into their full timeout and panic. The rules are:
+///
+/// * signal 0 `ESRCH` (whatever `ps` saw) → [`ChildDisposition::Gone`];
+/// * signal 0 `Ok` plus a `ps` row with a dead-state letter (`Z`, `E`,
+///   `?Es`, … — [`state_is_dead`]) → [`ChildDisposition::Zombie`];
+/// * signal 0 `Ok` plus a live row → [`ChildDisposition::Alive`];
+/// * signal 0 `Ok` with NO row (the `ps` invocation failed or the table does
+///   not show the pid) → [`ChildDisposition::Unknown`]: existence without a
+///   state is unavailable information, never liveness;
+/// * signal 0 `EPERM`/any other error → [`ChildDisposition::Unknown`].
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+pub(crate) fn classify_ps_child(
+    signal0: Result<(), nix::errno::Errno>,
+    ps_state: Option<&str>,
+) -> ChildDisposition {
+    match signal0 {
+        Err(nix::errno::Errno::ESRCH) => ChildDisposition::Gone,
+        Ok(()) => match ps_state {
+            Some(state) if state_is_dead(state) => ChildDisposition::Zombie,
+            Some(_) => ChildDisposition::Alive,
+            None => ChildDisposition::Unknown,
+        },
+        // EPERM: the pid exists but we may not signal it — ps rows for it
+        // cannot be trusted to establish liveness under the same restriction,
+        // and every other signal error is equally inconclusive.
+        Err(_) => ChildDisposition::Unknown,
+    }
+}
+
+/// Read one pid's state letter from `ps -o pid=,stat= -p <pid>` output.
+/// Split out from the invocation so the macOS classification has a
+/// host-independent unit test with injected output.
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+pub(crate) fn parse_ps_pid_state(bytes: &[u8], wanted: i32) -> Option<String> {
+    for line in String::from_utf8_lossy(bytes).lines() {
+        let mut parts = line.split_whitespace();
+        let Some(pid) = parts.next().and_then(|value| value.parse::<i32>().ok()) else {
+            continue;
+        };
+        let state = parts.next().unwrap_or("");
+        if pid == wanted {
+            return Some(state.to_owned());
+        }
+    }
+    None
+}
+
+/// Establish one child's disposition (ma-sdk-state r14 item 4; r15 items 2/3).
 ///
 /// * **Linux**: `/proc/<pid>/stat` distinguishes a live child from an
 ///   unreaped zombie — exactly the state a SIGKILLed child sits in before its
-///   parent's `wait()` — and ENOENT means reaped/gone. Any other read failure
+///   parent's `wait()` — and ENOENT means reaped/gone. Any read failure,
+///   INCLUDING ENOENT (a chroot or mount namespace can hide all of `/proc`),
 ///   is confirmed against signal 0 instead of being assumed to be death.
-/// * **macOS/other unix**: there is no `/proc`; signal 0 is the available
-///   probe. `ESRCH` is gone/reaped, `Ok` means the process EXISTS (live or an
-///   unreaped zombie — signal 0 cannot tell them apart on this platform), and
-///   `EPERM` is unknown. Callers requiring gone/zombie evidence keep waiting.
+/// * **macOS/other unix**: there is no `/proc`; signal 0 asks the kernel
+///   whether the pid exists and `ps` supplies the state signal 0 cannot:
+///   `ESRCH` is gone/reaped, a dead-state row (`Z`/`E`/`?Es`) is an unreaped
+///   zombie, a live row is alive, and anything less conclusive is unknown.
+///   Callers requiring gone/zombie evidence keep waiting.
 #[must_use]
 pub fn child_disposition(pid: i32) -> ChildDisposition {
     if pid <= 0 {
@@ -230,17 +289,36 @@ pub fn child_disposition(pid: i32) -> ChildDisposition {
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
-            Ok(()) => ChildDisposition::Alive,
-            Err(nix::errno::Errno::ESRCH) => ChildDisposition::Gone,
-            Err(_) => ChildDisposition::Unknown,
-        }
+        let signal0 = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
+        // `ps` can add nothing on a confirming ESRCH; for every other answer
+        // the state row is what separates a zombie from a live process.
+        let ps_state = if matches!(signal0, Err(nix::errno::Errno::ESRCH)) {
+            None
+        } else {
+            ps_child_state(pid)
+        };
+        classify_ps_child(signal0, ps_state.as_deref())
     }
     #[cfg(not(unix))]
     {
         let _ = pid;
         ChildDisposition::Unknown
     }
+}
+
+/// Invoke `ps` for one pid's state row on a non-Linux unix (ma-sdk-state
+/// r15 item 2). Returns `None` when `ps` cannot be run, fails, or shows no
+/// row — all indistinguishable cases the classifier reads as unknown.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ps_child_state(pid: i32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "pid=,stat=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_ps_pid_state(&output.stdout, pid)
 }
 
 /// Whether a single process (by pid, not group) is still running.
@@ -268,6 +346,106 @@ pub fn process_alive(pid: i32) -> bool {
         let _ = pid;
         false
     }
+}
+
+/// Wait (event-driven, no poll/sleep) for a process the caller did NOT fork
+/// to exit, then confirm the disposition reads [`ChildDisposition::Gone`] or
+/// [`ChildDisposition::Zombie`] (ma-sdk-state r15 item 2).
+///
+/// The pre-close SIGKILL proofs watch the DRIVER's direct child, so
+/// `waitpid(2)` returns `ECHILD` and a `/proc`-state poll with a sleep was the
+/// only option; the kernel instead offers a termination event:
+///
+/// * **Linux**: `pidfd_open(2)` + `poll(2)` (`POLLIN` on exit, kernel ≥5.3).
+///   The fd becomes readable at the zombie transition for a non-child too.
+/// * **macOS/BSD**: a `kqueue` `EVFILT_PROC`/`NOTE_EXIT` registration.
+///
+/// Returns `false` on timeout, on an unsupported host (`pidfd_open` absent),
+/// or when the final classifier read is still inconclusive — the caller's
+/// named bound is the terminator either way. Blocking work runs off the async
+/// worker threads.
+#[cfg(any(test, feature = "test-stub"))]
+pub async fn wait_child_exit(pid: i32, timeout: Duration) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let join = tokio::task::spawn_blocking(move || wait_child_exit_blocking(pid, timeout));
+    join.await.unwrap_or_default()
+}
+
+#[cfg(all(any(test, feature = "test-stub"), unix, target_os = "linux"))]
+fn wait_child_exit_blocking(pid: i32, timeout: Duration) -> bool {
+    // A pidfd is a pollable fd that becomes readable when the process EXITS
+    // (the zombie transition included), even when it is not ours to reap, so
+    // the wait parks in the kernel instead of polling /proc on a timer.
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    use rustix::process::{Pid, PidfdFlags, pidfd_open};
+
+    let Some(target) = Pid::from_raw(pid) else {
+        return false;
+    };
+    let fd = match pidfd_open(target, PidfdFlags::empty()) {
+        Ok(fd) => fd,
+        // ESRCH: it is already gone. Anything else (ENOSYS on a pre-5.3
+        // kernel, EPERM) has no event source here: one classifier read rather
+        // than a sleep, and a live/unknown answer fails the bound honestly.
+        Err(rustix::io::Errno::SRCH) => {
+            return matches!(
+                child_disposition(pid),
+                ChildDisposition::Gone | ChildDisposition::Zombie
+            );
+        }
+        Err(_) => return false,
+    };
+    let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+    let deadline = Timespec::try_from(timeout).ok();
+    let ready = poll(&mut fds, deadline.as_ref()).is_ok_and(|n| n == 1);
+    ready
+        && matches!(
+            child_disposition(pid),
+            ChildDisposition::Gone | ChildDisposition::Zombie
+        )
+}
+
+#[cfg(all(any(test, feature = "test-stub"), unix, not(target_os = "linux")))]
+fn wait_child_exit_blocking(pid: i32, timeout: Duration) -> bool {
+    // The macOS/BSD equivalent of the pidfd wait: an EVFILT_PROC/NOTE_EXIT
+    // registration delivers when the watched process exits. nix's safe
+    // kqueue wrapper is used because the workspace forbids `unsafe`; same-uid
+    // processes (our own test children) are watchable though not reaped by us.
+    use nix::sys::event::{EventFilter, EventFlag, FilterFlag, KEvent, Kqueue};
+
+    let Ok(kq) = Kqueue::new() else {
+        return false;
+    };
+    let change = KEvent::new(
+        pid as nix::libc::uintptr_t,
+        EventFilter::EVFILT_PROC,
+        EventFlag::EV_ADD | EventFlag::EV_ENABLE,
+        FilterFlag::NOTE_EXIT,
+        0,
+        0,
+    );
+    let mut events = [KEvent::new(
+        0,
+        EventFilter::EVFILT_PROC,
+        EventFlag::empty(),
+        FilterFlag::empty(),
+        0,
+        0,
+    )];
+    let deadline = Some(nix::libc::timespec {
+        tv_sec: timeout.as_secs() as nix::libc::time_t,
+        tv_nsec: timeout.subsec_nanos() as nix::libc::c_long,
+    });
+    // A delivered NOTE_EXIT and a changelist EV_ERROR (the process was
+    // already gone) both return 1; 0 is the timeout.
+    let fired = matches!(kq.kevent(&[change], &mut events, deadline), Ok(1));
+    fired
+        && matches!(
+            child_disposition(pid),
+            ChildDisposition::Gone | ChildDisposition::Zombie
+        )
 }
 
 /// One member of a process group as read from the host process table.
@@ -1110,6 +1288,48 @@ mod tests {
         assert!(outcome.survivors.is_empty());
         assert_eq!(outcome.rung, StopRung::AlreadyGone);
     }
+
+    /// r15 item 2: the event-driven child-exit wait parks for the kernel
+    /// termination event and reads a SIGKILLed (still unreaped) child as
+    /// gone/zombie, while a bound against a LIVE process returns false without
+    /// a panic. The killed child is this test's own (the integration tests
+    /// cover the non-child driver-child case); the pidfd/kqueue event fires at
+    /// the zombie transition either way.
+    #[cfg(all(unix, target_os = "linux"))]
+    #[test]
+    fn the_event_wait_notices_a_sigkilled_child_and_times_out_a_live_one() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            // A live child: the bound must elapse and answer false.
+            let mut live = std::process::Command::new("/bin/sh")
+                .args(["-c", "exec sleep 30"])
+                .spawn()
+                .expect("spawn");
+            let live_pid = i32::try_from(live.id()).expect("pid");
+            let start = std::time::Instant::now();
+            assert!(
+                !wait_child_exit(live_pid, Duration::from_millis(200)).await,
+                "a live child does not satisfy the exit wait"
+            );
+            assert!(start.elapsed() >= Duration::from_millis(180));
+
+            // SIGKILL it, leave it unreaped: the kernel event (pidfd readable)
+            // must fire while it is still a zombie.
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(live_pid),
+                Some(nix::sys::signal::Signal::SIGKILL),
+            )
+            .expect("kill");
+            assert!(
+                wait_child_exit(live_pid, Duration::from_secs(5)).await,
+                "the SIGKILLed child is seen gone/zombie from the exit event"
+            );
+            let _ = live.wait();
+        });
+    }
 }
 
 /// ma-sdk-state r14 item 4: the child-disposition classifier distinguishes a
@@ -1190,6 +1410,93 @@ mod child_disposition_tests {
             disposition,
             ChildDisposition::Alive,
             "an impossible pid must never look alive"
+        );
+    }
+}
+
+/// ma-sdk-state r15 item 2: the non-Linux unix classifier. These run on EVERY
+/// host with injected inputs (the macOS `ps` invocation itself cannot run on
+/// the Linux devbox; the coordinator compiles that arm on macOS), which is
+/// exactly why the classification is split out of the `ps` call.
+#[cfg(all(test, unix))]
+mod ps_child_disposition_tests {
+    use super::*;
+
+    #[test]
+    fn esrch_is_gone_whatever_ps_saw() {
+        assert_eq!(
+            classify_ps_child(Err(nix::errno::Errno::ESRCH), None),
+            ChildDisposition::Gone
+        );
+        // A stale row must not outrank the kernel's "no such process".
+        assert_eq!(
+            classify_ps_child(Err(nix::errno::Errno::ESRCH), Some("Ss")),
+            ChildDisposition::Gone
+        );
+    }
+
+    #[test]
+    fn a_dead_ps_row_with_signal0_ok_is_a_zombie_not_alive() {
+        // The r15 finding: kill(pid,0) succeeds for an unreaped zombie, so the
+        // old Ok(()) => Alive arm misclassified SIGKILLed children on macOS.
+        for dead in ["Z", "Z+", "E", "Es", "?Es", "?E"] {
+            assert_eq!(
+                classify_ps_child(Ok(()), Some(dead)),
+                ChildDisposition::Zombie,
+                "{dead:?} is a dead-but-unreaped process"
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_ps_row_with_signal0_ok_is_alive() {
+        for live in ["Ss", "Ss+", "?Ss", "R+", "S"] {
+            assert_eq!(
+                classify_ps_child(Ok(()), Some(live)),
+                ChildDisposition::Alive,
+                "{live:?} is a running process"
+            );
+        }
+    }
+
+    #[test]
+    fn no_ps_row_while_the_pid_exists_is_unknown_never_alive() {
+        // `ps` failed or the table did not show the pid: existence without
+        // state is unavailable information.
+        assert_eq!(classify_ps_child(Ok(()), None), ChildDisposition::Unknown);
+    }
+
+    #[test]
+    fn eperm_is_unknown_even_with_a_live_looking_row() {
+        assert_eq!(
+            classify_ps_child(Err(nix::errno::Errno::EPERM), Some("Ss")),
+            ChildDisposition::Unknown
+        );
+        assert_eq!(
+            classify_ps_child(Err(nix::errno::Errno::EPERM), None),
+            ChildDisposition::Unknown
+        );
+    }
+
+    #[test]
+    fn ps_pid_state_is_parsed_from_ps_o_output() {
+        // macOS `ps -o pid=,stat= -p <pid>` shape (leading spaces, state
+        // letters with the `?` no-tty marker).
+        let out = b"\n  4242 ?Es\n  9999 ?Ss\n";
+        assert_eq!(
+            parse_ps_pid_state(out, 4242).as_deref(),
+            Some("?Es"),
+            "the exiting leader's own row"
+        );
+        assert_eq!(
+            parse_ps_pid_state(out, 9999).as_deref(),
+            Some("?Ss"),
+            "an unrelated row is selectable by pid"
+        );
+        assert_eq!(
+            parse_ps_pid_state(out, 7),
+            None,
+            "a pid absent from the table yields no row"
         );
     }
 }

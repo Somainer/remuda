@@ -113,42 +113,28 @@ fn process_alive(pid: &str) -> bool {
     remuda_driver::shell_pty::lifecycle::group_alive(pid)
 }
 
-/// Whether the direct child has received its fatal signal: reaped/gone OR an
-/// unreaped zombie/dead (ma-sdk-state r14 item 4). Signal-0 liveness answers
-/// yes for an unreaped zombie, which is exactly the state a SIGKILLed child
-/// sits in before `close` reaps it, so Linux inspects `/proc` state directly;
-/// the classifier distinguishes a missing child from UNAVAILABLE information
-/// (`Unknown` here means "keep waiting", never "gone" — the r13 helper treated
-/// any unreadable `/proc` as death, which is always the answer on macOS where
-/// `/proc` does not exist).
-fn child_gone_or_zombie(pid: &str) -> bool {
-    let Ok(pid) = pid.parse::<i32>() else {
-        return false;
-    };
-    matches!(
-        remuda_driver::shell_pty::lifecycle::child_disposition(pid),
-        remuda_driver::shell_pty::lifecycle::ChildDisposition::Gone
-            | remuda_driver::shell_pty::lifecycle::ChildDisposition::Zombie
-    )
-}
-
-/// ma-sdk-state r14 item 2/4: the ONE named bounded wait every pre-close
-/// fatal-signal death assertion goes through (the no-inline-sleep rule).
-/// `Alive` keeps polling; `Unknown` (unreadable `/proc`/`EPERM`, or a platform
-/// whose only probe cannot distinguish a zombie) also keeps polling rather
-/// than being mistaken for death. The transition to gone/zombie is external
-/// kernel state with no driver acknowledgement, so a short poll interval is
-/// unavoidable — it lives inside this named helper, never at a call site — and
-/// the overall deadline is the named bound.
+/// ma-sdk-state r14 item 2/4; r15 item 2: the ONE named bounded wait every
+/// pre-close fatal-signal death assertion goes through (the no-inline-sleep
+/// rule). `Alive` keeps polling; `Unknown` (unreadable `/proc`/`EPERM`, or a
+/// platform whose only probe cannot distinguish a zombie) also keeps polling
+/// rather than being mistaken for death.
+///
+/// r15 item 2 replaces the 25 ms `/proc` sleep-poll with a KERNEL EVENT: on
+/// Linux a `pidfd` becomes readable at the zombie transition (the watched
+/// child is the driver's, not the test's, so `waitpid` is unavailable), and
+/// on macOS the equivalent is a `kqueue` `EVFILT_PROC`/`NOTE_EXIT` — the
+/// waiter parks in the kernel for up to this named bound and never sleeps or
+/// spins. The bound is the terminator; the final classifier read still has to
+/// say Gone or Zombie.
 async fn wait_child_gone_or_zombie(pid: &str, timeout: Duration) {
-    let deadline = std::time::Instant::now() + timeout;
-    while !child_gone_or_zombie(pid) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the overflow SIGKILL delivered to the flooding child ({pid})"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    let Ok(pid) = pid.parse::<i32>() else {
+        panic!("the launch ack carried a non-numeric pid: {pid:?}");
+    };
+    let confirmed = remuda_driver::shell_pty::lifecycle::wait_child_exit(pid, timeout).await;
+    assert!(
+        confirmed,
+        "the overflow SIGKILL delivered to the flooding child ({pid})"
+    );
 }
 
 fn prompt(text: &str) -> DriverInput {

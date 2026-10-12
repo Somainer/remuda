@@ -317,8 +317,30 @@ async function keepHubBlockedByRoutes(context: import('@playwright/test').Browse
   await context.setOffline(false);
 }
 
-async function unblockHub(context: import('@playwright/test').BrowserContext) {
+/**
+ * Restore Hub reachability after a FULL browser outage (blockHub set the
+ * browser offline, so the real recovery also fires window `online`). Unroutes
+ * /v1 and lifts emulation, then synthesises the `online` event the browser
+ * would fire on a genuine offline->online transition — that drives resume ->
+ * live -> outbox flush immediately rather than waiting the reconnect backoff.
+ */
+async function unblockHubAfterBrowserOffline(page: import('@playwright/test').Page) {
+  const context = page.context();
   await context.setOffline(false);
+  await context.unroute(V1);
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+}
+
+/**
+ * Restore Hub reachability for a HUB-ONLY outage: the browser stayed online
+ * the whole time (the document had to keep loading during the offline reload),
+ * so there is NO window `online` event to synthesise — emitting one would
+ * reset the connection backoff and hide the real reconnect path. Recovery is
+ * routes-only; the app must reconnect on its own bounded backoff
+ * (connection MAX_BACKOFF_MS = 30 s), which is why callers wait long enough
+ * to cover one max-backoff interval plus resume/flush.
+ */
+async function unblockHubRoutesOnly(context: import('@playwright/test').BrowserContext) {
   await context.unroute(V1);
 }
 
@@ -446,7 +468,7 @@ test("offline sends are queued and delivered exactly once after reconnect", asyn
   ).length;
   expect(seedSends).toBe(0);
 
-  await unblockHub(page.context());
+  await unblockHubAfterBrowserOffline(page);
   await expect(banner).toHaveCount(0, { timeout: 20_000 });
 
   // Exactly one Hub command row per id …
@@ -499,11 +521,14 @@ test("an offline-queued message survives a reload while the Hub is still off and
   // And nothing reached the Hub yet (independent read, 200 required).
   expect((await hubCommands(api, instanceId)).filter((c) => c.operation === "instance.send")).toHaveLength(0);
 
-  // Reconnect: the restored row delivers exactly once under the same id.
-  await unblockHub(page.context());
-  await expect(page.getByTestId("journal-banner")).toHaveCount(0, { timeout: 20_000 });
+  // Reconnect by ROUTES ALONE (Hub-only outage; the browser never went
+  // offline, so no synthetic "online" event). The app reconnects on its
+  // bounded backoff (connection MAX_BACKOFF_MS = 30 s); wait long enough to
+  // cover one max-backoff interval plus resume/flush rather than racing it.
+  await unblockHubRoutesOnly(page.context());
+  await expect(page.getByTestId("journal-banner")).toHaveCount(0, { timeout: 45_000 });
   await expect
-    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
+    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 45_000 })
     .toBe(1);
   await expect
     .poll(
@@ -511,7 +536,7 @@ test("an offline-queued message survives a reload while the Hub is still off and
         (await hubCommands(api, instanceId)).filter(
           (c) => c.operation === "instance.send" && c.id === commandId,
         ).length,
-      { timeout: 30_000 },
+      { timeout: 45_000 },
     )
     .toBe(1);
   await expectDelivered(page, commandId);

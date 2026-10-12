@@ -444,7 +444,15 @@ function effortLifecycleRequest(word: string): EffortLifecycleRequest {
   // Normalize the toggle spelling: "ultracode on/off" with any single
   // separator (the command itself uses a space) → "ultracode:on|off".
   const normalized = word.trim().toLowerCase().replace(/^ultracode[\s:_-]+(on|off)$/, "ultracode:$1");
-  if (normalized === "ultracode" || normalized === "ultracode:on") {
+  // c-effortread r15 item 2: the BARE word is the coupled build's xhigh-tier
+  // command WITH the flag (D-056, driver `EffortRequest::from_level`), not a
+  // flag-only toggle. Returning only {ultracode:true} targeted the default
+  // high tier and a fresh {xhigh, on} read-back could never settle it. The
+  // normalized "ultracode:on" (the decoupled toggle) moves the flag only.
+  if (normalized === "ultracode") {
+    return { name: "xhigh", ultracode: true };
+  }
+  if (normalized === "ultracode:on") {
     return { ultracode: true };
   }
   if (normalized === "ultracode:off") {
@@ -509,7 +517,12 @@ function effortLifecycleMatches(
   const bareCoupled = normalizedWordIsBareUltracode(word);
   if (request.name !== undefined) {
     if (request.name !== pending.name) return false;
-    if (pending.ultracode) return false;
+    // A plain level word asserts nothing about the flag, so it cannot
+    // identify a pending that moves the flag — the bare coupled word
+    // asserts BOTH axes (r15 item 2), so it is exempt.
+    if (request.ultracode === undefined && pending.ultracode && !bareCoupled) {
+      return false;
+    }
   }
   if (request.ultracode !== undefined) {
     if (request.ultracode !== pending.ultracode) return false;
@@ -1866,8 +1879,10 @@ class HubStore {
           source: "lifecycle",
           // Synthesized from the driver's own queued word; it is its own
           // command-word identity, so leave the client prediction null and
-          // match via the two-axis fallback.
-          commandWord: null,
+          // match via the two-axis fallback. The coupled bare word moves
+          // BOTH axes (r15 item 2): keep the word itself so the echo
+          // settlement knows the level and the flag are both in play.
+          commandWord: wireMovesBoth ? lowerWord : null,
           afterReplacement: false,
           // Idle-at-receipt arms the bound immediately; a working session arms
           // it from the working→idle evidence.

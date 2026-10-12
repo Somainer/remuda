@@ -3052,6 +3052,31 @@ it("r15 item 1: an observer pending created from a queued edge while waiting-int
   expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");
 });
 
+it("r15 item 2: a bare coupled effort-queued:ultracode keeps xhigh/on identity and settles from a fresh xhigh/on read-back", async () => {
+  const ctx = await startFollowing("r15-item2-bare-ultracode");
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const baseline: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "high", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [baseline] } as never);
+
+  ctx.receive(effortEvent(2, "high", false, "slash", "2026-09-15T23:59:57.000Z"));
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
+  // On a coupled build the bare lifecycle word IS the xhigh-tier-plus-flag
+  // command (the driver journals exactly "/effort ultracode").
+  ctx.receive(configureLifecycle(3, "effort-queued:ultracode", ctx.instance.id, "2026-09-16T00:00:05.000Z"));
+  const pending = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pending?.source).toBe("lifecycle");
+  expect(pending?.name, "the bare command targets xhigh, not the default high").toBe("xhigh");
+  expect(pending?.ultracode, "it carries the flag ON as its second axis").toBe(true);
+
+  // A fresh post-queue read-back of {xhigh, on} settles BOTH axes immediately.
+  ctx.receive(effortEvent(4, "xhigh", true, "remuda", "2026-09-16T00:00:10.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id), "fresh xhigh/on read-back settles it").toBeNull();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)).toMatchObject({ name: "xhigh", ultracode: true });
+});
+
 it("r13 item 3: an observer-tab legacy pending with a silent no-op completes unconfirmed at its bound", async () => {
   const ctx = await startFollowing("r13-item3-observer-noop");
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);

@@ -8097,8 +8097,8 @@ mod turn_reservation_wakeup_tests {
         let reservation = TurnReservation::shared(0, "msg-cancel-before-wait".to_string());
         // Cancel first; only afterwards does the (worker) side await.
         reservation.cancel();
-        let committed = bounded_ticket_wait(reservation.wait_for_commit(), "a cancel racing ahead")
-            .await;
+        let committed =
+            bounded_ticket_wait(reservation.wait_for_commit(), "a cancel racing ahead").await;
         assert!(!committed, "a cancel resolves the ticket as not-committed");
     }
 

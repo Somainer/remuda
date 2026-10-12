@@ -13,7 +13,24 @@ use std::{
 /// How long a stopped agent may take to leave its pane before the pane is
 /// closed anyway. The Instance is already gone from the Hub's point of view,
 /// so waiting longer only leaks panes into the operator's Herdr session.
-const AGENT_EXIT_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const AGENT_EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// Bounded wait for a forced pane close to be reflected by Herdr (the close
+/// RPC itself removes the agent synchronously, so the first verification poll
+/// normally confirms it).
+const FORCE_EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// Verified outcome of the stop phase ([`PtyResource::interrupt`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InterruptOutcome {
+    /// No owned workspace was present: there was no native writer to stop.
+    Absent,
+    /// The native writer was observed to leave within the grace.
+    ExitedGracefully,
+    /// The grace elapsed (or status RPCs failed during shutdown) without an
+    /// observed exit; the writer was force-terminated and its exit verified.
+    ForceTerminated,
+}
 
 /// A workspace created exclusively for one Node instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,15 +72,22 @@ impl PtyResource {
     /// transcript drain and [`Self::reap`] only afterwards
     /// (c-ctxusage r12 item 1).
     ///
-    /// Best effort throughout: the caller reaps either way, so a Herdr RPC
-    /// failure here must not abort reclamation.
-    pub async fn interrupt(&self) -> DriverResult<()> {
+    /// Returns a VERIFIED outcome (c-ctxusage r13 item 1): when the writer has
+    /// not left by the grace — or the status RPCs fail during Herdr's shutdown
+    /// window — it is force-terminated (the agent pane is closed, reaping the
+    /// foreground process group) and its exit is verified, still while every
+    /// other pane/tab/workspace and the caller's collector stay alive. The
+    /// drain that follows therefore never races a live writer's final append.
+    pub(crate) async fn interrupt(&self, grace: Duration) -> DriverResult<InterruptOutcome> {
         let client = self.client();
         if !self.owned_workspace_present(&client).await? {
-            return Ok(());
+            return Ok(InterruptOutcome::Absent);
         }
-        self.interrupt_agent(&client).await;
-        Ok(())
+        if self.await_polite_exit(&client, grace).await {
+            return Ok(InterruptOutcome::ExitedGracefully);
+        }
+        self.force_terminate(&client).await?;
+        Ok(InterruptOutcome::ForceTerminated)
     }
 
     /// Phase 2 of close: close and verify every pane, tab and the workspace
@@ -110,13 +134,13 @@ impl PtyResource {
     /// The interrupt is a courtesy with a bounded grace: an agent that ignores
     /// `ctrl+c` must not keep a pane alive, because the Instance is already
     /// gone as far as the Hub is concerned and the pane would be an orphan in
-    /// the operator's Herdr session forever. After the grace the panes are
+    /// the operator's Herdr session forever. After the grace the agent pane is
     /// closed explicitly — closing the tab alone is not enough, since
     /// `pane.split` may have landed the agent outside the recorded tab.
     ///
     /// Success proves carrier removal, never task success.
     pub async fn close(&self) -> DriverResult<()> {
-        self.interrupt().await?;
+        self.interrupt(AGENT_EXIT_GRACE).await?;
         self.reap().await
     }
 
@@ -154,12 +178,14 @@ impl PtyResource {
         Ok(panes)
     }
 
-    /// Ask the agent to exit, and wait a bounded time for it to do so.
-    ///
-    /// Best effort throughout: the caller closes the panes either way, so a
-    /// Herdr RPC failure here must not abort reclamation.
-    async fn interrupt_agent(&self, client: &Client) {
-        let grace = async {
+    /// Ask the agent to exit, and wait the bounded grace for it to do so.
+    /// Returns true only when the agent was OBSERVED leaving: a timeout or a
+    /// Herdr RPC failure (the shutdown window refuses every non-ping method)
+    /// reports false, so the caller force-terminates and verifies instead of
+    /// draining against a writer that may still be alive (c-ctxusage r13
+    /// item 1).
+    async fn await_polite_exit(&self, client: &Client, grace: Duration) -> bool {
+        let grace_run = async {
             let _ = client
                 .pane_send_keys(&self.pane_id, vec!["ctrl+c".into()])
                 .await;
@@ -194,7 +220,43 @@ impl PtyResource {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         };
-        let _ = tokio::time::timeout(AGENT_EXIT_GRACE, grace).await;
+        matches!(tokio::time::timeout(grace, grace_run).await, Ok(Ok(())))
+    }
+
+    /// Close the AGENT pane — reaping its foreground process group — and
+    /// VERIFY, bounded, that Herdr no longer reports either the agent or the
+    /// pane. Every other pane, the tab and the workspace stay alive, as do the
+    /// caller's collector and observation sender: the final transcript drain
+    /// runs only after this returns (c-ctxusage r13 item 1). The subsequent
+    /// [`Self::reap`] tolerates the pane already being gone.
+    async fn force_terminate(&self, client: &Client) -> DriverResult<()> {
+        // Best effort: the verification snapshot is authoritative even if this
+        // RPC was refused, and closing an already-gone pane stays harmless.
+        let _ = client.pane_close(&self.pane_id).await;
+        let verify = async {
+            loop {
+                let snapshot = client.session_snapshot().await?;
+                let agent_gone = !snapshot
+                    .agents
+                    .iter()
+                    .any(|agent| agent.pane_id == self.pane_id);
+                let pane_gone = !snapshot
+                    .panes
+                    .iter()
+                    .any(|pane| pane.pane_id == self.pane_id);
+                if agent_gone && pane_gone {
+                    return Ok::<_, remuda_herdr::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        match tokio::time::timeout(FORCE_EXIT_GRACE, verify).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(super::claude_pty::map_herdr(error)),
+            Err(_) => Err(DriverError::InvalidLaunchSpec(
+                "native writer survived forced termination".into(),
+            )),
+        }
     }
 }
 
@@ -293,16 +355,18 @@ impl PtyResources {
         Ok(())
     }
 
-    /// Phase 1 of close: interrupt every owned native writer and wait a bound
-    /// for it to leave, keeping the panes/workspaces alive so the caller can
-    /// drain the interrupted turn's final transcript append before reaping
-    /// (c-ctxusage r12 item 1).
-    pub async fn interrupt(&self) -> DriverResult<()> {
+    /// Phase 1 of close: stop every owned native writer with a VERIFIED exit
+    /// (force-terminating any that outlive the grace), keeping the
+    /// panes/workspaces alive so the caller can drain the interrupted turn's
+    /// final transcript append before reaping (c-ctxusage r12 item 1 / r13
+    /// item 1). Returns each resource's verified stop outcome, in stop order.
+    pub async fn interrupt(&self, grace: Duration) -> DriverResult<Vec<InterruptOutcome>> {
         let resources = self.resources.lock().await;
+        let mut outcomes = Vec::with_capacity(resources.len());
         for resource in resources.iter().rev() {
-            resource.interrupt().await?;
+            outcomes.push(resource.interrupt(grace).await?);
         }
-        Ok(())
+        Ok(outcomes)
     }
 
     /// Phase 2 of close: tear down and verify every pane/tab/workspace and
@@ -326,7 +390,7 @@ impl PtyResources {
     }
 
     pub async fn close(&self) -> DriverResult<()> {
-        self.interrupt().await?;
+        self.interrupt(AGENT_EXIT_GRACE).await?;
         self.reap().await
     }
 }

@@ -83,6 +83,11 @@ pub(crate) struct FaultState {
     /// Overrides the bounded pending queue capacity so a test can make a
     /// normal-sized replay batch exceed it. 0 means production capacity.
     pending_capacity: AtomicU64,
+    /// Overrides the native stop-phase grace ([`AGENT_EXIT_GRACE`]) so a test
+    /// that models a writer outliving Ctrl-C reaches forced termination
+    /// deterministically without the production 2 s wait (c-ctxusage r13
+    /// item 1). Milliseconds; 0 means the production grace.
+    agent_exit_grace_ms: AtomicU64,
 }
 
 /// A parked phase must never wait forever on a test that forgot to release:
@@ -120,6 +125,7 @@ impl FaultState {
             skip_cooperative_finalise: AtomicBool::new(false),
             close_timeout_ms: AtomicU64::new(0),
             pending_capacity: AtomicU64::new(0),
+            agent_exit_grace_ms: AtomicU64::new(0),
         })
     }
 
@@ -299,6 +305,14 @@ impl FaultState {
         }
     }
 
+    /// The injected native stop-phase grace override (c-ctxusage r13 item 1).
+    pub(crate) fn agent_exit_grace(&self) -> Option<Duration> {
+        match self.agent_exit_grace_ms.load(Ordering::SeqCst) {
+            0 => None,
+            millis => Some(Duration::from_millis(millis)),
+        }
+    }
+
     /// Whether the flusher has already exited.
     #[cfg(feature = "test-faults")]
     fn flusher_exited_now(&self) -> bool {
@@ -370,6 +384,16 @@ impl TranscriptFaults {
         self.inner
             .pending_capacity
             .store(capacity as u64, Ordering::SeqCst);
+    }
+
+    /// Shorten the native stop-phase grace so a writer that does not finish on
+    /// Ctrl-C reaches bounded forced termination quickly (c-ctxusage r13
+    /// item 1; production grace is used otherwise).
+    pub fn arm_agent_exit_grace(&self, grace: Duration) {
+        self.inner.agent_exit_grace_ms.store(
+            grace.as_millis().min(u128::from(u64::MAX)) as u64,
+            Ordering::SeqCst,
+        );
     }
 
     /// Open the gate and let every parked blocking phase proceed.

@@ -131,6 +131,16 @@ pub struct FakeHerdrOptions {
     /// File whose contents are appended to `interrupt_transcript` on the first
     /// live-agent ctrl+c.
     pub interrupt_record_file: Option<PathBuf>,
+    /// Delayed-writer model (c-ctxusage r13 item 1): a LIVE agent that
+    /// receives ctrl+c neither appends nor terminates — it stays in the agent
+    /// list past the reclamation grace. Closing its pane (`pane.close`, the
+    /// forced-termination path) appends `force_close_record_file` to this
+    /// transcript — modelling the writer flushing its final record on the
+    /// forced SIGHUP/SIGTERM — and then removes the agent.
+    pub force_close_transcript: Option<PathBuf>,
+    /// File whose contents are appended to `force_close_transcript` when a
+    /// still-live agent pane is force-closed.
+    pub force_close_record_file: Option<PathBuf>,
 }
 
 impl FakeHerdrOptions {
@@ -145,6 +155,8 @@ impl FakeHerdrOptions {
             exit_after_unavailable: false,
             interrupt_transcript: None,
             interrupt_record_file: None,
+            force_close_transcript: None,
+            force_close_record_file: None,
         }
     }
 
@@ -181,6 +193,21 @@ impl FakeHerdrOptions {
     ) -> Self {
         self.interrupt_transcript = Some(transcript.into());
         self.interrupt_record_file = Some(record_file.into());
+        self
+    }
+
+    /// Model a DELAYED writer (c-ctxusage r13 item 1): ctrl+c neither appends
+    /// nor terminates — the agent outlives the reclamation grace; its final
+    /// record is flushed only when its pane is force-closed, after which it is
+    /// gone from the agent list.
+    #[must_use]
+    pub fn force_close_appends_record(
+        mut self,
+        transcript: impl Into<PathBuf>,
+        record_file: impl Into<PathBuf>,
+    ) -> Self {
+        self.force_close_transcript = Some(transcript.into());
+        self.force_close_record_file = Some(record_file.into());
         self
     }
 }
@@ -258,6 +285,12 @@ impl FakeHerdrServer {
         }
         if let Some(record_file) = &options.interrupt_record_file {
             command.env("FAKE_HERDR_INTERRUPT_RECORD", record_file);
+        }
+        if let Some(transcript) = &options.force_close_transcript {
+            command.env("FAKE_HERDR_FORCE_CLOSE_TRANSCRIPT", transcript);
+        }
+        if let Some(record_file) = &options.force_close_record_file {
+            command.env("FAKE_HERDR_FORCE_CLOSE_RECORD", record_file);
         }
 
         let mut child = command
@@ -426,6 +459,14 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         .ok()
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
+    let force_close_transcript = std::env::var("FAKE_HERDR_FORCE_CLOSE_TRANSCRIPT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let force_close_record_file = std::env::var("FAKE_HERDR_FORCE_CLOSE_RECORD")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -516,6 +557,8 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             exit_after_unavailable,
             interrupt_transcript,
             interrupt_record_file,
+            force_close_transcript,
+            force_close_record_file,
         }));
     }
     Err(FakeHerdrError::Args(format!(
@@ -624,6 +667,8 @@ async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
         options.exit_after_unavailable,
         options.interrupt_transcript,
         options.interrupt_record_file,
+        options.force_close_transcript,
+        options.force_close_record_file,
     )));
     // Only the scripted shutdown window (`exit_after_unavailable`) stops the
     // accept loop. Parent death is handled by the outer `parent_watch`
@@ -678,9 +723,14 @@ struct State {
     /// agent (the native-writer-finishes-on-Ctrl-C-C test model).
     interrupt_transcript: Option<PathBuf>,
     interrupt_record_file: Option<PathBuf>,
+    /// Delayed-writer model: ctrl+c leaves the agent alive; the final record
+    /// is appended (and the agent removed) only on the pane's force close.
+    force_close_transcript: Option<PathBuf>,
+    force_close_record_file: Option<PathBuf>,
 }
 
 impl State {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         script: FakeHerdrScript,
         agent_start_delay: Duration,
@@ -688,6 +738,8 @@ impl State {
         exit_after_unavailable: bool,
         interrupt_transcript: Option<PathBuf>,
         interrupt_record_file: Option<PathBuf>,
+        force_close_transcript: Option<PathBuf>,
+        force_close_record_file: Option<PathBuf>,
     ) -> Self {
         Self {
             script,
@@ -709,6 +761,8 @@ impl State {
             onboarding_step: HashMap::new(),
             interrupt_transcript,
             interrupt_record_file,
+            force_close_transcript,
+            force_close_record_file,
         }
     }
 
@@ -1118,6 +1172,10 @@ fn pane_close(st: &mut State, params: &Value) -> Result<Value, (&'static str, St
         .get("pane_id")
         .and_then(Value::as_str)
         .ok_or(("invalid_request", "missing pane_id".into()))?;
+    // Delayed-writer model (c-ctxusage r13 item 1): forcing the pane closed is
+    // the native writer's last chance to flush the interrupted turn's record,
+    // and it terminates with the pane. remove_pane below drops the agent.
+    force_close_live_agent(st, pane_id);
     remove_pane(st, pane_id);
     emit(
         st,
@@ -1125,6 +1183,31 @@ fn pane_close(st: &mut State, params: &Value) -> Result<Value, (&'static str, St
         json!({"type":"pane_exited","pane_id": pane_id, "workspace_id": "w1"}),
     );
     ok()
+}
+
+/// Append the force-close record for a pane that still hosts a LIVE agent,
+/// modelling the writer flushing its final record on the forced
+/// SIGHUP/SIGTERM before the pane reaps it. Fires once: only while the agent
+/// is live, so a reap's redundant close of the already-gone pane appends
+/// nothing.
+fn force_close_live_agent(st: &mut State, pane_id: &str) {
+    if !st.agents.values().any(|agent| agent.pane_id == pane_id) {
+        return;
+    }
+    if let (Some(transcript), Some(record_file)) =
+        (&st.force_close_transcript, &st.force_close_record_file)
+        && let Ok(record) = std::fs::read_to_string(record_file)
+    {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(transcript)
+            && file.write_all(record.as_bytes()).is_ok()
+        {
+            let _ = file.sync_all();
+        }
+    }
 }
 
 fn remove_pane(st: &mut State, pane_id: &str) {
@@ -1188,7 +1271,14 @@ fn pane_send_keys(st: &mut State, params: &Value) -> Result<Value, (&'static str
 /// record to the transcript and terminate (leave the agent list; the pane
 /// reverts to its root shell). Fires only for a pane that still has a live
 /// agent, so the courtesy double-tap appends exactly once.
+///
+/// Delayed-writer model (c-ctxusage r13 item 1): when the final record is
+/// delivered on the forced pane close instead, ctrl+c is a no-op — the agent
+/// stays in the list past the reclamation grace.
 fn interrupt_live_agent(st: &mut State, pane_id: &str) {
+    if st.force_close_transcript.is_some() {
+        return;
+    }
     if !st.agents.values().any(|agent| agent.pane_id == pane_id) {
         return;
     }

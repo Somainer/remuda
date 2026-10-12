@@ -1207,14 +1207,24 @@ impl Driver for ClaudePtyDriver {
         if let Some(task) = live.catalog_task.take() {
             task.abort();
         }
-        // c-ctxusage r12 item 1: stop the native writer FIRST and wait a bound
-        // for it to leave, while the transcript collector and observation
-        // sender stay alive. Claude appends the interrupted turn's usage
-        // record WHILE HANDLING Ctrl-C; signalling only after the final drain
-        // (the old order) let that append land past the pump's retirement and
-        // lost it. The final drain below reads the append; the panes and the
+        // c-ctxusage r12 item 1 / r13 item 1: stop the native writer FIRST and
+        // wait for a VERIFIED exit while the transcript collector and
+        // observation sender stay alive. Claude appends the interrupted turn's
+        // usage record WHILE HANDLING Ctrl-C; signalling only after the final
+        // drain (the old order) let that append land past the pump's
+        // retirement and lost it. A writer still alive when the grace ends is
+        // force-terminated and its exit verified BEFORE the drain below, so the
+        // drain never races a live writer's final append; the panes and the
         // workspace are reaped only after that.
-        self.resources.interrupt().await?;
+        let agent_exit_grace = self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            .and_then(crate::test_faults::FaultState::agent_exit_grace)
+            .unwrap_or(crate::pty_resource::AGENT_EXIT_GRACE);
+        let stop_outcomes = self.resources.interrupt(agent_exit_grace).await?;
+        tracing::debug!(?stop_outcomes, "claude-pty close: native writers stopped");
         // c-ctxusage r4 item 2: cooperative transcript shutdown — signal, let
         // the pump read the final append and publish a finalised last turn,
         // then wait one poll window before forcing the issue.

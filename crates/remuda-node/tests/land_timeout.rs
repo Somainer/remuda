@@ -734,3 +734,111 @@ fi
         "SIGTERM-ignoring verify descendant wrote its late marker after cancel"
     );
 }
+
+/// r14 item 9: a land child that exits nonzero WITHOUT a structured verdict
+/// must keep the drained stderr (a remote rejection/error) in the failure —
+/// the stderr handle is consumed by the concurrent pump, so without the
+/// captured-lines fallback the reason came back empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_nonzero_land_exit_with_only_stderr_records_the_drained_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin.git");
+    Command::new("git")
+        .args(["init", "--bare", "-b", "main"])
+        .arg(&origin)
+        .status()
+        .unwrap();
+    let seed = dir.path().join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    git(&seed, &["init", "-b", "main"]);
+    git(&seed, &["config", "user.email", "t@example.com"]);
+    git(&seed, &["config", "user.name", "T"]);
+    std::fs::write(seed.join("f.txt"), "base\n").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-q", "-m", "init"]);
+    git(&seed, &["checkout", "-q", "-b", "wt/land/stderr"]);
+    std::fs::write(seed.join("f.txt"), "task\n").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-q", "-m", "task"]);
+    git(
+        &seed,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&seed, &["push", "-q", "origin", "main", "wt/land/stderr"]);
+
+    let lane = dir.path().join("lane");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            lane.to_str().unwrap(),
+        ],
+    );
+    git(&lane, &["config", "user.email", "t@example.com"]);
+    git(&lane, &["config", "user.name", "T"]);
+    git(&lane, &["fetch", "-q", "origin"]);
+    let target = dir.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+
+    let bin = dir.path().join("fake-land-stderr.sh");
+    let script = r#"#!/bin/bash
+set -eu
+branch=""; onto="main"; mode=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --onto) onto="$2"; shift 2;;
+    --land) mode=land; shift;;
+    --gate) mode=gate; shift;;
+    --no-push) shift;;
+    --repo|--target-dir) shift 2;;
+    --*) shift;;
+    merge) shift;;
+    *) if [ -z "$branch" ]; then branch="$1"; fi; shift;;
+  esac
+done
+if [ "$mode" = "gate" ]; then
+  git fetch -q origin
+  git checkout -qB "$onto" "origin/$onto"
+  base=$(git rev-parse "$onto"); head=$(git rev-parse "origin/$branch")
+  git merge -q --no-ff "origin/$branch" -m "merge $branch"
+  printf '{"exitCode":0,"status":"verified","base":"%s","head":"%s","merged":"%s"}\n' "$base" "$head" "$(git rev-parse HEAD)"
+else
+  # Nonzero land exit with ONLY stderr (no structured verdict on stdout).
+  echo "remote: error: GH013: main is protected against forced pushes" >&2
+  echo "fatal: the remote end rejected the update" >&2
+  exit 1
+fi
+"#;
+    std::fs::write(&bin, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let node = DevNode::new(&DevServerConfig::loopback(0)).unwrap();
+    node.gate_test_set_authorizer(std::sync::Arc::new(GrantAll))
+        .await;
+
+    let params = json!({
+        "jobId": "gjb_land_stderr", "laneId": "lane1",
+        "repoPath": lane.to_string_lossy(),
+        "targetDir": target.to_string_lossy(),
+        "branch": "wt/land/stderr", "baseBranch": "main",
+        "mode": "land", "web": "never", "push": true, "generation": 1,
+        "binary": bin.to_string_lossy(),
+    });
+    let reply = tokio::time::timeout(
+        Duration::from_secs(30),
+        node.dispatch_gate_rpc("gate.run", &params),
+    )
+    .await
+    .expect("gate.run hung")
+    .expect("gate.run errored");
+
+    assert_eq!(reply["status"], json!("failed"), "{reply}");
+    let error = reply["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("GH013") && error.contains("rejected the update"),
+        "the drained land stderr must be retained in the failure reason: {error}"
+    );
+}

@@ -1852,14 +1852,25 @@ impl DevNode {
             // print far more than one pipe buffer; never reading it blocked the
             // land child forever (deadlock) — the exact failure the verify child
             // already guarded against with its own stderr pump.
-            let land_stderr_task = land_child.stderr.take().map(|stderr| {
+            //
+            // r14 item 9: the drained lines are ALSO accumulated (the child's
+            // stderr handle is consumed by this pump, so the waited Output's
+            // stderr is always empty). A nonzero land exit then reports the
+            // captured remote rejection/error text instead of a blank reason.
+            let captured_stderr: Arc<std::sync::Mutex<Vec<String>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut land_stderr_task = land_child.stderr.take().map(|stderr| {
                 let node = self.clone();
                 let job_id = request.job_id.clone();
                 let generation = request.generation;
+                let captured = captured_stderr.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncBufReadExt, BufReader};
                     let mut lines = BufReader::new(stderr).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
+                        if let Ok(mut buffer) = captured.lock() {
+                            buffer.push(line.clone());
+                        }
                         let _ = node.gate_registry().events.send(GateEventParams {
                             job_id: job_id.clone(),
                             generation,
@@ -1884,6 +1895,14 @@ impl DevNode {
                     _ = tokio::time::sleep(land_budget) => Err(()),
                 }
             };
+            // On a normal child exit, join the stderr pump FIRST so every
+            // rejected/error line is in `captured_stderr` before the verdict
+            // arms read it (the Output's own stderr is empty — see above).
+            if matches!(land_outcome, Ok(Some(_)))
+                && let Some(task) = land_stderr_task.take()
+            {
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            }
             match land_outcome {
                 Err(()) => {
                     // The budget expired. Terminate the WHOLE land group
@@ -1945,11 +1964,27 @@ impl DevNode {
                         }
                         _ => {
                             result.status = "failed".into();
-                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            // Prefer the child's own stderr; fall back to the
+                            // lines the concurrent pump drained (r14 item 9) —
+                            // the Output's stderr is empty because that handle
+                            // was consumed by the pump.
+                            let drained_stderr = captured_stderr
+                                .lock()
+                                .map(|lines| lines.join("\n"))
+                                .unwrap_or_default();
+                            let stderr_text = {
+                                let direct =
+                                    String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                                if direct.is_empty() {
+                                    drained_stderr
+                                } else {
+                                    direct
+                                }
+                            };
                             result.error = Some(format!(
                                 "land failed after grant (exit {:?}): {}",
                                 output.status.code(),
-                                stderr.trim()
+                                stderr_text.trim()
                             ));
                         }
                     }

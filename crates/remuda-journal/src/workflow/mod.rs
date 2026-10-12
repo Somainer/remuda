@@ -1470,36 +1470,6 @@ impl RunState {
                     // force one file-catch-up convergence emission.
                     self.force_member_refresh.insert(agent_id.clone());
                 }
-                // r6 item 1 / r7 items 1+3 / r8 item 1: each boundary is
-                // spent once the fold reaches its position — this record
-                // itself (whether it matched by digest, fallback or the
-                // pending position) or a journal rotation (different
-                // generation). A Pending boundary whose digest-bound fallback
-                // is reached drops only the fallback and stays armed for the
-                // trailing record. A genuinely newer start at a LATER offset
-                // that resurrects clears everything via the `>=` comparison.
-                // Empty polls never reach here and therefore keep it armed.
-                if let Some(mut cover) = member.failure_watermark.take() {
-                    let retain = match &mut cover {
-                        UnreadCover::Complete(mark) => {
-                            cursor.file_generation.0 == mark.generation
-                                && cursor.offset.0 < mark.offset
-                        }
-                        UnreadCover::Pending(boundary) => {
-                            if let Some(mark) = boundary.fallback.as_ref()
-                                && !(cursor.file_generation.0 == mark.generation
-                                    && cursor.offset.0 < mark.offset)
-                            {
-                                boundary.fallback = None;
-                            }
-                            cursor.file_generation.0 == boundary.generation
-                                && cursor.offset.0 < boundary.offset
-                        }
-                    };
-                    if retain {
-                        member.failure_watermark = Some(cover);
-                    }
-                }
                 // This journal `started` has now been consumed by THIS member,
                 // regardless of whether it resurrected it or was held terminal;
                 // a subsequent newer attempt is then eligible as a real retry.
@@ -1513,6 +1483,43 @@ impl RunState {
                     && let Some(phase) = value.get("phase").and_then(Value::as_str)
                 {
                     self.assign_phase(&agent_id, phase.to_owned());
+                }
+                // r6 item 1 / r7 items 1+3 / r8 items 1+5: every boundary is
+                // spent once the fold reaches its position — a journal
+                // rotation (different generation), the record itself (whether
+                // it matched by digest, fallback or the pending position), or
+                // a start at a LATER offset. This sweeps EVERY member: a
+                // Pending boundary whose trailing record completes as ANOTHER
+                // agent's start is consumed at its position by that other
+                // member and must be retired on the original member too, not
+                // left armed to be re-armed on every later poll. A Pending
+                // boundary whose digest-bound fallback is reached drops only
+                // the fallback and stays armed for the trailing record. Empty
+                // polls never reach here and therefore keep boundaries armed.
+                let folded_generation = cursor.file_generation.0;
+                let folded_offset = cursor.offset.0;
+                for other in &mut self.members {
+                    let Some(mut cover) = other.failure_watermark.take() else {
+                        continue;
+                    };
+                    let retain = match &mut cover {
+                        UnreadCover::Complete(mark) => {
+                            folded_generation == mark.generation && folded_offset < mark.offset
+                        }
+                        UnreadCover::Pending(boundary) => {
+                            if let Some(mark) = boundary.fallback.as_ref()
+                                && !(folded_generation == mark.generation
+                                    && folded_offset < mark.offset)
+                            {
+                                boundary.fallback = None;
+                            }
+                            folded_generation == boundary.generation
+                                && folded_offset < boundary.offset
+                        }
+                    };
+                    if retain {
+                        other.failure_watermark = Some(cover);
+                    }
                 }
             }
             "result" => {
@@ -1875,6 +1882,39 @@ impl RunState {
         };
         text.contains("TaskStop") && text.contains(task_id)
     }
+
+    /// Test-only minimal run carrying the supplied members, for driving
+    /// [`Self::fold_journal_line`] directly.
+    #[cfg(test)]
+    fn test_with_members(native_id: &str, members: Vec<MemberState>) -> Self {
+        Self {
+            native_id: native_id.to_owned(),
+            dir: PathBuf::new(),
+            task_id: None,
+            tool_call_native: None,
+            script: None,
+            script_path: None,
+            script_source: None,
+            script_loaded: false,
+            main_transcript: None,
+            terminal: None,
+            grace: 0,
+            finished: false,
+            members,
+            attempts: HashMap::new(),
+            member_revs: HashMap::new(),
+            phases: Vec::new(),
+            run_rev: 0,
+            last_run_sig: None,
+            last_emitted_note: None,
+            emitted_phase: HashMap::new(),
+            emitted_member: HashMap::new(),
+            note: None,
+            missing_polls: 0,
+            launched_ms: None,
+            force_member_refresh: HashSet::new(),
+        }
+    }
 }
 
 impl MemberState {
@@ -2104,4 +2144,123 @@ fn workflow_native_id(journal_path: &Path) -> String {
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "wf_unknown".into())
+}
+
+#[cfg(test)]
+mod r8_boundary_retire_tests {
+    use super::*;
+    use crate::source::{FileId, PendingBoundary, UnreadCover, UnreadStart};
+    use crate::util::digest_of;
+    use remuda_protocol::Id;
+
+    const W: u64 = 100;
+    const FILE: FileId = FileId { dev: 7, ino: 99 };
+
+    fn failed_member_with(agent_id: &str, watermark: Option<UnreadCover>) -> MemberState {
+        let mut member = MemberState::new_placeholder(agent_id.to_owned());
+        member.state = WorkflowState::Failed;
+        member.stopped = true;
+        member.failure_watermark = watermark;
+        member
+    }
+
+    fn cursor(line: &[u8], generation: u64, offset: u64) -> FileCursor {
+        FileCursor {
+            file_identity: Id::new("obj").unwrap(),
+            file_generation: U64(generation),
+            offset: U64(offset),
+            length: U64(line.len() as u64),
+            digest: digest_of(line),
+        }
+    }
+
+    fn pending() -> UnreadCover {
+        UnreadCover::Pending(PendingBoundary {
+            generation: 1,
+            offset: W,
+            extent: W + 33,
+            file_id: FILE,
+            prefix: br#"{"type":"started","key":"v2:k","#.to_vec(),
+            fallback: None,
+        })
+    }
+
+    fn complete() -> UnreadCover {
+        let line = br#"{"type":"started","key":"v2:k","agentId":"a1"}"#;
+        UnreadCover::Complete(UnreadStart {
+            generation: 1,
+            offset: W,
+            digest: digest_of(line),
+            extent: W + line.len() as u64 + 1,
+            file_id: FILE,
+        })
+    }
+
+    #[test]
+    fn a_pending_boundary_completed_as_another_agent_retires_on_its_owner() {
+        let mut run = RunState::test_with_members(
+            "wf_r8_retire",
+            vec![failed_member_with("a1", Some(pending()))],
+        );
+        let line = br#"{"type":"started","key":"v2:k","agentId":"a2"}"#;
+        run.fold_journal_line(line, &cursor(line, 1, W));
+
+        let a1 = run
+            .members
+            .iter()
+            .find(|member| member.agent_id == "a1")
+            .unwrap();
+        assert!(
+            a1.failure_watermark.is_none(),
+            "the boundary is consumed at its position by a2's record and must retire on a1"
+        );
+        assert_eq!(a1.state, WorkflowState::Failed, "a1's outcome is untouched");
+        assert!(
+            run.members.iter().any(|member| member.agent_id == "a2"),
+            "the other agent's member was created by the fold"
+        );
+    }
+
+    #[test]
+    fn a_pending_boundary_retires_on_rotation_another_member_consumes() {
+        let mut run = RunState::test_with_members(
+            "wf_r8_retire_rotate",
+            vec![failed_member_with("a1", Some(pending()))],
+        );
+        // New generation: a2's start at offset 0 is the first folded record.
+        let line = br#"{"type":"started","key":"v2:k2","agentId":"a2"}"#;
+        run.fold_journal_line(line, &cursor(line, 2, 0));
+
+        assert!(
+            run.members
+                .iter()
+                .find(|member| member.agent_id == "a1")
+                .unwrap()
+                .failure_watermark
+                .is_none(),
+            "a rotation observed while another member's record folds retires a1's boundary"
+        );
+    }
+
+    #[test]
+    fn a_complete_cover_retires_when_another_member_reaches_its_position() {
+        let mut run = RunState::test_with_members(
+            "wf_r8_retire_complete",
+            vec![failed_member_with("a1", Some(complete()))],
+        );
+        // A different record at the covered position (digest mismatch, routed
+        // to a2) still spends the boundary on the original member.
+        let line = br#"{"type":"started","key":"v2:k","agentId":"a2"}"#;
+        run.fold_journal_line(line, &cursor(line, 1, W));
+
+        assert!(
+            run.members
+                .iter()
+                .find(|member| member.agent_id == "a1")
+                .unwrap()
+                .failure_watermark
+                .is_none(),
+            "a Complete cover reached at its position by another member also retires"
+        );
+    }
 }

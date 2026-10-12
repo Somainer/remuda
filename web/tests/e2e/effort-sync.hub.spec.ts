@@ -465,21 +465,51 @@ test("a model refusal disables only the switch, never ends the session", async (
   await page.keyboard.press("Escape");
 });
 
-test("a queued level shows 排队中; a degraded verdict clears the indicator", async ({ page }) => {
+test("a queued level shows 排队中; a same-id degraded verdict clears the indicator", async ({ page }) => {
   const instanceId = await createSession(page, "effort queue and reject");
   await clearApprovals(page, instanceId);
   await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?");
 
-  await postEffortConfigure(page, instanceId, { name: "__queued__:xhigh", ultracode: false, index: 3 });
+  // c-effortread r12 item 2: the request id is the ONLY thing that can clear
+  // a pending. The composer always mints one; queue and the later degraded
+  // verdict here carry the SAME id (one request that queues then is dismissed).
+  await postEffortConfigure(page, instanceId, {
+    name: "__queued__:xhigh",
+    ultracode: false,
+    index: 3,
+    requestId: "e2e-queue-degrade",
+  });
   await expect(page.getByTestId("model-effort-pending")).toHaveText("排队中", { timeout: 10_000 });
   await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-pending", "queued");
+
+  await postEffortConfigure(page, instanceId, {
+    name: "__degrade__:xhigh:dialog-kept",
+    ultracode: false,
+    index: 3,
+    requestId: "e2e-queue-degrade",
+  });
+  await expect(page.getByTestId("model-effort-pending")).toHaveCount(0, { timeout: 10_000 });
+});
+
+test("an id-less degraded verdict with no matching id leaves the queued indicator pending", async ({ page }) => {
+  const instanceId = await createSession(page, "effort idless degrade");
+  await clearApprovals(page, instanceId);
+  await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?");
+
+  // Older driver (no request ids): the queued lifecycle synthesises an
+  // observer pending; a later id-less degraded verdict — even word-matching —
+  // cannot name the request, so it must neither clear nor roll it back. The
+  // request stays pending for its bounded reconciliation instead.
+  await postEffortConfigure(page, instanceId, { name: "__queued__:max", ultracode: false, index: 4 });
+  await expect(page.getByTestId("model-effort-pending")).toHaveText("排队中", { timeout: 10_000 });
 
   await postEffortConfigure(page, instanceId, {
     name: "__degrade__:max:dialog-kept",
     ultracode: false,
     index: 4,
   });
-  await expect(page.getByTestId("model-effort-pending")).toHaveCount(0, { timeout: 10_000 });
+  await expect(page.getByTestId("model-effort-pending")).toHaveCount(1, { timeout: 10_000 });
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-effort-pending", "queued");
 });
 
 });

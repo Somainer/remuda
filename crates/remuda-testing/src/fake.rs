@@ -310,10 +310,20 @@ impl Session {
             "control_request" => self.handle_control_request(&incoming),
             "control_response" => Ok(None),
             "user" => {
-                if self.flags.replay_user_messages {
+                // ma-sdk-state r13 item 2 fixture: keep DRAINING prompts (the
+                // write completes and its commit lands) but emit NOTHING back,
+                // not even the inbound-user echo — one queued turn_started per
+                // prompt accumulates behind a wedged publication worker and
+                // only reservation admission can bound it.
+                let silent = std::env::var("FAKE_CLAUDE_SILENT_PROMPTS").is_ok_and(|v| v == "1")
+                    && self.saw_initialize;
+                if !silent && self.flags.replay_user_messages {
                     emit(&incoming)?;
                 }
                 self.append_transcript(&incoming)?;
+                if silent {
+                    return Ok(None);
+                }
                 self.play_turn(lines)?;
                 Ok(None)
             }

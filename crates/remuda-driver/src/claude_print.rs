@@ -553,13 +553,16 @@ pub struct Inner {
     /// stays UNBOUNDED so the reader never parks on a queue send (a blocked
     /// prompt write cannot stop stdout draining), but FRAME admission goes
     /// through [`PublishQueue`], which caps the backlog by items AND bytes
-    /// (ma-sdk-state r12 item 1): a flooding child whose frames cannot be
-    /// published is shut down with a diagnostic instead of growing Node memory
-    /// without limit. Control jobs (reserve tickets, EOF, test fences) bypass
-    /// the caps, so cancellation and close never depend on frame admission. The
-    /// reader always keeps draining stdout into the bounded backlog even while
-    /// a stdin write is blocked, and `close`/`cancel` stay reachable (neither
-    /// needs this queue to make progress).
+    /// (ma-sdk-state r12 item 1), and RESERVE-ticket admission reserves a fixed
+    /// charge under the same caps before its book entry opens (r13 item 2): a
+    /// flooding child, or one whose prompts keep landing while publication is
+    /// wedged, is shut down with a diagnostic instead of growing Node memory
+    /// without limit. The terminal EOF and test fences bypass the caps, so
+    /// natural-EOF sealing and close never depend on frame admission; cancelling
+    /// a queued reservation enqueues nothing and is independent of admission
+    /// too. The reader always keeps draining stdout into the bounded backlog
+    /// even while a stdin write is blocked, and `close`/`cancel` stay reachable
+    /// (neither needs this queue to make progress).
     publish: Mutex<Option<PublishQueue>>,
     /// Serializes prompt sends: each send enqueues its reservation ticket,
     /// opens the mapper book, awaits its write, and commits strictly one after
@@ -1274,8 +1277,14 @@ impl Driver for ClaudePrintDriver {
                 // the writer accepts UserWrite cancels the write (the prompt
                 // never executes). After acceptance the returned future is a
                 // detached completion that survives the caller (r8 item 1).
-                let completion =
-                    prepare_prompt_write(&self.inner, writer, content, client_message_id).await?;
+                let completion = prepare_prompt_write(
+                    &self.inner,
+                    writer,
+                    content,
+                    client_message_id,
+                    self.carrier_name(),
+                )
+                .await?;
                 completion
                     .await
                     .map_err(|_| DriverError::ControlUnavailable)?
@@ -1615,6 +1624,7 @@ async fn prepare_prompt_write(
     writer: ProcessWriter,
     content: UserContent,
     client_message_id: String,
+    carrier: &'static str,
 ) -> DriverResult<WriteCompletion> {
     // test-stub: note a caller reaching the write_seq lock (r10 item 3: a test
     // acknowledges the NEXT caller queued behind a suspended one).
@@ -1646,9 +1656,37 @@ async fn prepare_prompt_write(
     if inner.closed.load(Ordering::SeqCst) {
         return Err(DriverError::ControlUnavailable);
     }
-    if admission.is_none() {
+    let Some(publisher) = admission.as_ref() else {
         return Err(DriverError::ControlUnavailable);
+    };
+
+    // ma-sdk-state r13 item 2: Reserve tickets are bounded by the SAME item/byte
+    // caps as frames, and the charge is reserved HERE — before the book entry
+    // opens. A child that keeps reading prompts while the publication worker is
+    // blocked on an undrained RunHandle otherwise queues one ticket (and one
+    // outstanding turn) per prompt without limit. A breach runs the same
+    // overflow shutdown as a frame flood; natural EOF (StdoutEof) and
+    // cancellation bypass this gate entirely.
+    if let Err(kind) = publisher.reserve_slot() {
+        match kind {
+            BacklogAdmitError::Closed => return Err(DriverError::ControlUnavailable),
+            BacklogAdmitError::Overflow {
+                items,
+                bytes,
+                frame_bytes,
+            } => {
+                // The shutdown takes the publish mutex itself; release it first.
+                drop(admission);
+                shutdown_for_backlog_overflow(inner, items, bytes, frame_bytes, carrier).await;
+                return Err(DriverError::ControlUnavailable);
+            }
+        }
     }
+    // The ticket charge is live from here until either the ticket is queued (the
+    // worker then releases it when the Reserve job drains) or this function
+    // leaves before queueing — including a caller aborted on the mapper-lock
+    // await — in which case the guard's Drop gives the charge back.
+    let mut charge = Some(ReservationChargeGuard::new(inner.clone()));
 
     // Open the book entry and enqueue its Reserve ticket with NO await between
     // opening and insertion WHILE holding admission: the mapper await is the
@@ -1698,10 +1736,18 @@ async fn prepare_prompt_write(
     drop(admission);
     if send_failed {
         // The publisher is closed (close in progress): no worker will ever
-        // visit this ticket. Roll the just-opened entry back directly.
+        // visit this ticket. Roll the just-opened entry back and return the
+        // reserved backlog charge — no job is queued to release it.
         guard.take().unwrap().fail_without_ticket().await;
+        drop(charge.take().expect("charge guard before the failed send"));
         return Err(DriverError::ControlUnavailable);
     }
+    // The ticket is queued, so its charge is released by the worker when the
+    // Reserve job drains — defuse the local guard before the worker can.
+    charge
+        .take()
+        .expect("charge guard after the successful send")
+        .defuse();
     // The ticket is queued; Drop from here on only has to wake the worker.
     guard
         .as_mut()
@@ -1940,6 +1986,18 @@ const PUBLICATION_BACKLOG_MAX_ITEMS: usize = 16_384;
 /// never comes near either.
 const PUBLICATION_BACKLOG_MAX_BYTES: usize = 128 * 1024 * 1024;
 
+/// Fixed charge of one queued [`PublishJob::Reserve`] ticket against the SAME
+/// item/byte pool as frames (ma-sdk-state r13 item 2): the queued job itself,
+/// the [`TurnReservation`] the worker parks on, and the outstanding
+/// [`RootTurn`] book entry kept until the turn's result maps. A child that
+/// keeps reading prompts (so writes complete) while the publication worker is
+/// wedged on an undrained RunHandle would otherwise accumulate tickets and
+/// outstanding turns without limit — every one emitting one `turn_started` the
+/// consumer never takes.
+const RESERVATION_BACKLOG_COST: usize = std::mem::size_of::<PublishJob>()
+    + std::mem::size_of::<TurnReservation>()
+    + std::mem::size_of::<RootTurn>();
+
 /// Why a frame was refused admission to the publication backlog.
 #[derive(Debug, PartialEq, Eq)]
 enum BacklogAdmitError {
@@ -2053,13 +2111,16 @@ pub struct BacklogSnapshot {
 }
 
 /// Admission gate around the otherwise-unbounded publication channel
-/// (ma-sdk-state r12 item 1).
+/// (ma-sdk-state r12 item 1; r13 item 2).
 ///
-/// FRAME jobs pass through the byte/item caps; CONTROL jobs
-/// (reserve tickets, the terminal EOF, test fences) always pass as long as the
-/// channel is open so prompt cancellation, natural-EOF sealing and close never
-/// wait on frame backlog admission — the bounded backlog must not recreate the
-/// shutdown deadlock an unbounded queue was chosen to avoid.
+/// FRAME jobs and Reserve tickets pass through the shared byte/item caps
+/// (tickets reserve a fixed charge via [`PublishQueue::reserve_slot`] BEFORE
+/// their turn-book entry opens); the remaining CONTROL jobs (the terminal EOF,
+/// test fences) always pass as long as the channel is open so natural-EOF
+/// sealing and close never wait on backlog admission — the bounded backlog must
+/// not recreate the shutdown deadlock an unbounded queue was chosen to avoid.
+/// Cancelling an already-queued reservation enqueues nothing and therefore
+/// stays independent of admission too.
 #[derive(Clone)]
 struct PublishQueue {
     tx: mpsc::UnboundedSender<PublishJob>,
@@ -2144,8 +2205,47 @@ impl PublishQueue {
         Ok(())
     }
 
-    /// Admit a CONTROL job (reserve ticket / terminal EOF / test fence) without
-    /// consulting the frame caps. Fails only when the channel is closed.
+    /// Reserve one Reserve-ticket slot under the shared item/byte caps
+    /// (ma-sdk-state r13 item 2), BEFORE the turn-book entry exists. On
+    /// refusal the provisional charge has already been returned; on success
+    /// the caller owns the charge and must either queue the ticket (the worker
+    /// releases it when the job drains) or hand it back through
+    /// [`BacklogMetrics::release_charge`] if the ticket never makes it in.
+    fn reserve_slot(&self) -> Result<(), BacklogAdmitError> {
+        if self.metrics.overflowed.load(Ordering::Acquire) {
+            return Err(BacklogAdmitError::Closed);
+        }
+        let items_now = self.metrics.items.fetch_add(1, Ordering::AcqRel) + 1;
+        let bytes_now = self
+            .metrics
+            .bytes
+            .fetch_add(RESERVATION_BACKLOG_COST, Ordering::AcqRel)
+            .saturating_add(RESERVATION_BACKLOG_COST);
+        let limit_items = self.metrics.limit_items.load(Ordering::Acquire);
+        let limit_bytes = self.metrics.limit_bytes.load(Ordering::Acquire);
+        if items_now > limit_items || bytes_now > limit_bytes {
+            self.metrics.release_charge(1, RESERVATION_BACKLOG_COST);
+            let items = self.metrics.items.load(Ordering::Acquire);
+            let bytes = self.metrics.bytes.load(Ordering::Acquire);
+            return Err(BacklogAdmitError::Overflow {
+                items,
+                bytes,
+                frame_bytes: RESERVATION_BACKLOG_COST,
+            });
+        }
+        self.metrics
+            .items_high
+            .fetch_max(items_now, Ordering::AcqRel);
+        self.metrics
+            .bytes_high
+            .fetch_max(bytes_now, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Admit a CONTROL job (terminal EOF / test fence) without consulting the
+    /// frame caps. Fails only when the channel is closed. Reserve tickets do
+    /// NOT go through here: they reserve a fixed charge under the shared caps
+    /// via [`Self::reserve_slot`] before their book entry is opened.
     fn admit_control(&self, job: PublishJob) -> Result<(), mpsc::error::SendError<PublishJob>> {
         self.tx.send(job)
     }
@@ -2400,6 +2500,43 @@ async fn rollback_without_ticket(inner: &Arc<Inner>, seq: u64) {
     }
     #[cfg(feature = "test-stub")]
     test_barrier::note_rollback_without_ticket_done(&inner.barrier);
+}
+
+/// Owns the provisional backlog charge of one reservation between its
+/// reservation under the caps (before the book entry opens) and the successful
+/// queueing of its Reserve ticket (ma-sdk-state r13 item 2). Defused once the
+/// ticket is queued — from then on the publication worker releases the charge
+/// when the Reserve job drains. Any other exit (closed/overflow check passed but
+/// the ticket send failed, or the caller aborted while parked on the mapper
+/// lock) drops this guard and gives the charge straight back, so a reservation
+/// that never queued cannot occupy backlog.
+struct ReservationChargeGuard {
+    inner: Arc<Inner>,
+    defused: bool,
+}
+
+impl ReservationChargeGuard {
+    fn new(inner: Arc<Inner>) -> Self {
+        Self {
+            inner,
+            defused: false,
+        }
+    }
+
+    /// The ticket is queued; its charge now belongs to the worker's release.
+    fn defuse(mut self) {
+        self.defused = true;
+    }
+}
+
+impl Drop for ReservationChargeGuard {
+    fn drop(&mut self) {
+        if !self.defused {
+            self.inner
+                .backlog
+                .release_charge(1, RESERVATION_BACKLOG_COST);
+        }
+    }
 }
 
 /// Owns one turn's [`TurnReservation`] for the lifetime of a prompt write
@@ -3325,10 +3462,14 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
         // fully handled (mapped AND its observations handed to the events
         // channel); a worker parked on a full events channel keeps the frame
         // counted, which is exactly the memory it is still holding.
-        let frame_charge = if let PublishJob::Frame(frame) = &job {
-            Some(frame_backlog_cost(frame))
-        } else {
-            None
+        // r13 item 2: a Reserve ticket's fixed charge is held the same way
+        // until the ticket is fully handled (start emitted, or cancelled and
+        // rolled back at its position), so queued tickets stay counted while
+        // the worker is wedged ahead of them.
+        let frame_charge = match &job {
+            PublishJob::Frame(frame) => Some(frame_backlog_cost(frame)),
+            PublishJob::Reserve { .. } => Some(RESERVATION_BACKLOG_COST),
+            _ => None,
         };
         let result = match job {
             PublishJob::Frame(frame) => {

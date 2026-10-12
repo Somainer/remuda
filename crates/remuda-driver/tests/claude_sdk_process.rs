@@ -1149,6 +1149,129 @@ async fn a_publication_backlog_overflow_shuts_the_session_down_bounded_with_a_di
     );
 }
 
+/// ma-sdk-state r13 item 2: a child that keeps READING prompts but emits no
+/// stdout cannot grow Reserve tickets (and outstanding turn-book entries)
+/// without bound when nobody drains the RunHandle. Each committed ticket emits
+/// one `turn_started`; once the 255 ordinary observation slots are full the
+/// publication worker parks in emit and every later ticket queues. Reservation
+/// admission is bounded by the same caps as frames: the (cap+1)th reserve is
+/// refused, the overflow shutdown fires, and the high-water marks never cross
+/// either cap.
+#[tokio::test]
+async fn a_silent_prompt_flood_is_bounded_by_reservation_admission() {
+    // Above 255 so the worker is provably parked in emit (the ordinary slots
+    // are all turn_starteds) before reservation charges reach the cap.
+    const ITEM_CAP: usize = 256;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_SILENT_PROMPTS".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+
+    // Armed for the overflow acknowledgement; open every gate immediately so
+    // arming alone does not park write commits (the barrier defaults to
+    // holding) — commits must flow for the tickets to accumulate.
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.release();
+
+    // Never drain the handle while the flood runs: the committed tickets emit
+    // turn_starteds that fill the ordinary slots, the worker parks in emit, and
+    // the tickets behind it stay charged. Sequential sends are enough — the
+    // write completes when the child reads the prompt, independent of the
+    // wedged worker.
+    let d = driver.clone();
+    let sender = tokio::spawn(async move {
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for n in 0..2000usize {
+            let id = format!("msg-silent-{n}");
+            match d.send(prompt_id("silent turn", &id)).await {
+                Ok(_) => accepted += 1,
+                Err(_) => {
+                    rejected += 1;
+                    break;
+                }
+            }
+        }
+        (accepted, rejected)
+    });
+
+    // ACKNOWLEDGED overflow: the note is set after the kill and the terminal
+    // delivery, so the refusal is the bounded one (not a closed-race).
+    barrier
+        .wait_until_backlog_overflow(Duration::from_secs(30))
+        .await;
+
+    let (accepted, rejected) = join_bounded(
+        sender,
+        Duration::from_secs(10),
+        "the silent-prompt flood sender",
+    )
+    .await;
+    assert!(
+        rejected >= 1,
+        "the prompt past the reserve cap is rejected: {accepted} accepted"
+    );
+    // 255 starts occupy the ordinary slots when the worker parks; the cap is
+    // reached by queued tickets behind that parked one.
+    assert!(
+        accepted >= ITEM_CAP,
+        "tickets accumulated to the reservation cap before the refusal: {accepted}"
+    );
+
+    // The reserved terminal permit delivers the diagnostic past the wedged
+    // ordinary channel.
+    let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+        seen.iter().any(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+    })
+    .await;
+    let terminal = all
+        .iter()
+        .find(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+        .expect("the session ends with the publication_backlog_overflow diagnostic");
+    assert_eq!(lifecycle_status(terminal), Some("failed"));
+    assert_eq!(lifecycle_named(terminal), Some("session"));
+    let snapshot = driver.publication_backlog_for_test();
+    assert!(snapshot.overflowed, "the driver reports the overflow once");
+    assert!(
+        snapshot.items_high <= ITEM_CAP,
+        "ticket backlog crossed the item cap: {} > {ITEM_CAP}",
+        snapshot.items_high
+    );
+    assert!(
+        snapshot.bytes_high <= BYTE_CAP,
+        "ticket backlog crossed the byte cap: {} > {BYTE_CAP}",
+        snapshot.bytes_high
+    );
+
+    drop(barrier);
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close after the reservation overflow",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close after the reservation overflow")
+    .expect("close ack");
+    let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+}
+
 /// Item 4: a reader from a previous launch must never emit into the next one.
 ///
 /// `close` joins or aborts the reader before it returns, and `start` re-arms

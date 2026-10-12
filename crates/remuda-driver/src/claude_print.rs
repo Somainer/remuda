@@ -3243,18 +3243,28 @@ impl TranscriptMapper {
                     }
                     VerdictFront::Unowned | VerdictFront::Empty => None,
                 };
-                // c-effortread r17 item 1: the verdict answers an UNOWNED
-                // place while a LATER owned switch B is still waiting for ITS
-                // OWN verdict (the classic case: an unread pre-floor same-word
-                // slash, whose accepted verdict lands after B armed). Fold the
-                // transcript level/flag only — B's armed attribution is
-                // preserved and the edge is never labelled Remuda — and emit
-                // NO settlement-eligible observation: an id-less effective
-                // projection here would journal before B's verdict and settle
-                // B in the store through the legacy value fallback (and a
-                // later dismissal would toast against the cleared request).
-                // B settles only when its OWN id-bearing verdict arrives.
-                if matches!(front, VerdictFront::Unowned) && self.owned_switch_outstanding() {
+                // c-effortread r17 item 1 / r18 item 1 (coordinator ruling):
+                // the verdict answers an UNOWNED place while ANY Remuda switch
+                // is still ARMED on the bridge — regardless of whether a later
+                // OWNED slot remains in this FIFO. The r17 guard fired only
+                // with an owned slot still queued, so two cases fell through
+                // and emitted an id-less projection that settled B via the
+                // store's value fallback: B's OWN slash stored Unowned after a
+                // failed floor stat (the failed-floor case), and an older
+                // pre-floor accept read BEFORE B's own slash acquired its owned
+                // slot. While the bridge has ANY pending switch, fold the
+                // transcript level/flag only: the edge is never labelled
+                // Remuda, NO settlement-eligible observation is emitted and
+                // the bridge's observed selection is NOT refreshed. B settles
+                // only from its own id-bearing verdict, or ends through its
+                // own bounded path. (r18 item 3 latches the folded state
+                // separately so its edge can be published once the bridge is
+                // idle.)
+                let armed_switch_pending = self
+                    .effort_bridge
+                    .as_ref()
+                    .is_some_and(|bridge| bridge.has_pending());
+                if matches!(front, VerdictFront::Unowned) && armed_switch_pending {
                     self.effort.note_unowned_stdout(&stdout);
                     return Ok(Vec::new());
                 }
@@ -3331,10 +3341,13 @@ impl TranscriptMapper {
                 // pairs with its own slash generation, never a newer armed
                 // request's (r11 item 1). r16 item 2: an unowned front slot
                 // (pre-floor/human slash) is consumed here without touching a
-                // later owned request. r17 item 1: when such an unowned refusal
-                // lands while a later owned switch is still outstanding it
-                // folds NOTHING into the tracker — its awaiting/attribution
-                // belongs to that owned switch and must survive.
+                // later owned request. r17 item 1 / r18 item 1: when such an
+                // unowned refusal lands while ANY switch is still armed on the
+                // bridge it folds NOTHING — not even when no owned FIFO slot
+                // remains (the failed-floor case, or the verdict read before
+                // B's slash acquired its owned slot): the armed request's
+                // attribution survives and it ends through its own bounded
+                // path, never from this id-less refusal.
                 let front = self.pop_front_verdict_slot();
                 let paired = match &front {
                     VerdictFront::Owned(generation, request) => {
@@ -3342,8 +3355,11 @@ impl TranscriptMapper {
                     }
                     VerdictFront::Unowned | VerdictFront::Empty => None,
                 };
-                let unowned_while_armed =
-                    matches!(front, VerdictFront::Unowned) && self.owned_switch_outstanding();
+                let unowned_while_armed = matches!(front, VerdictFront::Unowned)
+                    && self
+                        .effort_bridge
+                        .as_ref()
+                        .is_some_and(|bridge| bridge.has_pending());
                 if !unowned_while_armed {
                     self.effort.note_stdout(&stdout, paired.is_some());
                 }
@@ -3378,17 +3394,6 @@ impl TranscriptMapper {
             Some(EffortSlashSlot::Unowned { .. }) => VerdictFront::Unowned,
             None => VerdictFront::Empty,
         }
-    }
-
-    /// c-effortread r17 item 1: whether a LATER owned switch is still waiting
-    /// for its own verdict after the front slot was just popped. An unowned
-    /// verdict landing in this window must not take that switch's attribution
-    /// or emit settlement-eligible evidence; the owned request settles only
-    /// from its own id-bearing verdict.
-    fn owned_switch_outstanding(&self) -> bool {
-        self.effort_armed
-            .iter()
-            .any(|slot| matches!(slot, EffortSlashSlot::Owned(..)))
     }
 
     /// c-effortread r16 item 2: remove the foremost outstanding NON-SWITCH

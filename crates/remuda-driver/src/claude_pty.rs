@@ -3349,6 +3349,206 @@ mod tests {
         assert!(!bridge.has_pending(), "B's own verdict settles B");
     }
 
+    /// c-effortread r18 item 1: the older pre-floor command's ACCEPTED verdict
+    /// is read BEFORE B's own slash record acquires its OWNED slot (the pump
+    /// catches up the old slash and its verdict while B is armed, then reaches
+    /// B's slash). The r17 guard keyed on a later OWNED slot in the FIFO: with
+    /// none yet pushed it fell through, and the id-less terminal projection
+    /// settled B through the store's value fallback (a later dismissal then
+    /// toasted against a cleared request). The r18 guard keys on the BRIDGE:
+    /// any armed switch suppresses the unowned verdict; B's own later verdict
+    /// still settles B with B's id.
+    #[tokio::test]
+    async fn r18_item1_a_pre_floor_accept_before_bs_slash_is_suppressed_and_bs_own_verdict_settles_b()
+     {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // B arms at EOF 1000; nothing of B's is on disk yet.
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+
+        // The pump catches up the OLD same-word slash (500) and its ACCEPTED
+        // verdict (600) BEFORE B's own slash record (1500) is read. The old
+        // verdict pops the unowned slot while no owned FIFO slot exists yet —
+        // but the bridge still has B armed, so it is suppressed.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        let old_verdict = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Set effort level to max"),
+                Some(600),
+            )
+            .expect("map old acceptance");
+        assert!(
+            old_verdict
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the pre-slash unowned acceptance emits no projection while B is armed"
+        );
+        assert!(
+            bridge.has_pending(),
+            "the pre-slash unowned acceptance never resolves B"
+        );
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "B keeps waiting for ITS OWN verdict"
+        );
+
+        // B's own slash then acquires the owned FIFO slot, and B's own
+        // accepted verdict settles B with B's id.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+        let out_b = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Set effort level to max"),
+                Some(1700),
+            )
+            .expect("map B verdict");
+        let edge_b = out_b
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("B's own verdict emits the effort edge");
+        assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
+        assert_eq!(
+            edge_b.effective.name,
+            Some(remuda_protocol::EffortName::Max)
+        );
+        assert!(!bridge.has_pending(), "B's own verdict settles B");
+    }
+
+    /// c-effortread r18 item 1 refusal variant: the older pre-floor command's
+    /// refusal is likewise read BEFORE B's own slash acquires its owned slot.
+    /// The FIFO-keyed r17 guard found no owned slot and fell through to
+    /// `note_stdout`, resetting the tracker's attribution; the r18 bridge-keyed
+    /// guard folds NOTHING while B is armed. Observable on the next natural
+    /// read-back: its edge keeps the terminal `Slash` attribution instead of
+    /// being reset to `Unknown`, and B's own later acceptance still settles as
+    /// Remuda with B's id.
+    #[tokio::test]
+    async fn r18_item1_a_pre_floor_refusal_before_bs_slash_folds_nothing_and_bs_accept_still_settles()
+     {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        let old_refusal = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Kept effort level as high"),
+                Some(600),
+            )
+            .expect("map old refusal");
+        assert!(
+            old_refusal
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the pre-slash unowned refusal emits nothing"
+        );
+        assert!(bridge.has_pending(), "the old refusal never rejects B");
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "B keeps waiting for ITS OWN verdict"
+        );
+
+        // A natural assistant read-back BEFORE B's slash keeps the terminal
+        // attribution: the folded-away refusal never reset pending_source.
+        let readback = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-max",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-max", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "done"}]},
+                    "effort": "max",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(700),
+            )
+            .expect("map readback");
+        let readback_edge = readback
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("the assistant readback emits its edge");
+        assert_eq!(
+            readback_edge.effective.source,
+            remuda_protocol::EffortSource::Slash,
+            "the skipped refusal never reset the terminal attribution to Unknown"
+        );
+
+        // B's slash arms and B's own accepted verdict is credited Remuda with
+        // B's id despite the earlier refusal and read-back.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+        let out_b = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Set effort level to max"),
+                Some(1700),
+            )
+            .expect("map B verdict");
+        let edge_b = out_b
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("B's own verdict emits the effort edge");
+        assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
+        assert_eq!(
+            edge_b.effective.source,
+            remuda_protocol::EffortSource::Remuda
+        );
+        assert!(!bridge.has_pending());
+    }
+
     /// c-effortread r16 item 3: when the carrier's floor lookup FAILS (the
     /// bound transcript was rotated/removed or the stat errors), production no
     /// longer falls back to word-only attribution. The switch is armed with
@@ -3425,8 +3625,13 @@ mod tests {
         );
 
         // Even B's OWN post-submission slash and accepted verdict attribute
-        // NOTHING while provenance is unavailable: the edge carries no request
-        // id and the bridge stays unresolved for the bounded timeout.
+        // NOTHING while provenance is unavailable. c-effortread r18 item 1:
+        // with the ruling keyed on the BRIDGE (a switch armed) rather than on
+        // a later owned FIFO slot, B's own accepted verdict (its slot is
+        // Unowned too) emits NO observation at all — no id-less terminal edge
+        // the store could settle B from through its value fallback — and the
+        // bridge's observed selection is not refreshed. B stays pending and
+        // ends through its own bounded timeout/unconfirmed path.
         mapper
             .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
             .expect("map B slash");
@@ -3436,25 +3641,23 @@ mod tests {
                 Some(1600),
             )
             .expect("map B verdict");
-        let b_edge = out_b
-            .iter()
-            .find_map(|obs| match &obs.body {
-                ObservationPayload::Effort(payload) => Some(payload),
-                _ => None,
-            })
-            .expect("the human-path edge still reflects the transcript");
-        assert_eq!(
-            b_edge.request_id.as_deref(),
-            None,
-            "no read-back is attributed to B under provenance loss"
+        assert!(
+            out_b
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "B's own accepted verdict emits no projection while armed under provenance loss"
         );
         assert!(bridge.has_pending(), "B is not settled by any read-back");
+        assert!(
+            bridge.proven_selection().is_none(),
+            "the suppressed verdict never refreshes the bridge's observed selection"
+        );
         assert!(
             bridge
                 .wait(gen_b, std::time::Duration::from_millis(40))
                 .await
                 .is_none(),
-            "B ends through its own timeout/unconfirmed path"
+            "B ends through its own timeout/unconfirmed path with no stray settlement"
         );
     }
 

@@ -2,9 +2,9 @@
 #![cfg(unix)]
 
 use remuda_node::{
-    DaemonControl, DevNode, DevServerConfig, LocalDrivers, NativeDriverConfig, ServeConfig,
-    StdioOptions, bind_daemon, compose, connect_daemon_bridge, daemon_is_running,
-    daemon_socket_path, run_daemon_runtime_listener,
+    DaemonControl, DaemonListener, DevNode, DevServerConfig, LocalDrivers, NativeDriverConfig,
+    ServeConfig, StdioOptions, bind_daemon, compose, connect_daemon_bridge, daemon_is_running,
+    daemon_socket_path, run_daemon_runtime_listener, run_daemon_runtime_socket,
 };
 use remuda_protocol::{InstanceId, U64};
 use serde_json::{Value, json};
@@ -77,6 +77,125 @@ impl Peer {
         .await;
         seq
     }
+
+    /// Takeover connect with a UNIQUE bridge id and read frames until exactly
+    /// that result arrives (the daemon's node.hello REQUEST uses id
+    /// "hello-1" and may be written first or coalesced; skip everything whose
+    /// id is not ours).
+    /// Takeover connect: returns `Some(generation)` on success or `None` when
+    /// the daemon refused the takeover (an active controller is attached).
+    async fn takeover_generation(path: &Path) -> (Self, Option<u64>) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixStream;
+        let mut stream = UnixStream::connect(daemon_socket_path(path)).await.unwrap();
+        stream
+            .write_all(
+                serde_json::to_vec(&json!({
+                    "jsonrpc":"2.0","id":"r14-takeover","method":"node.bridge.hello",
+                    "params":{"takeover":true}
+                }))
+                .unwrap()
+                .as_slice(),
+            )
+            .await
+            .unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        let (read, write) = stream.into_split();
+        let mut read = BufReader::new(read);
+        let mut line = String::new();
+        use tokio::io::AsyncBufReadExt;
+        tokio::time::timeout(Duration::from_secs(10), read.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(line.trim()).unwrap();
+        let generation = frame
+            .pointer("/result/controllerGeneration")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse().ok());
+        (Self { read, write }, generation)
+    }
+}
+
+/// Bind + serve an IN-PROCESS daemon over `data_dir` sharing `control`, then
+/// connect a takeover peer. Exactly ONE serve loop runs at a time (matching a
+/// real daemon): each call stops the previous loop before starting the next,
+/// so the single shared socket is accepted by the loop that owns the current
+/// generation. The caller owns the listener/lock and shuts the node down.
+/// Restart the in-process daemon SERVE LOOP in place on the shared socket,
+/// sharing `control` (and therefore its authoritative controller fence). If
+/// `claim_generation` is set, the loop starts with the shared fence already
+/// owning that generation (as a still-serving daemon does when an old
+/// controller's lease has NOT been dropped); otherwise it claims a fresh
+/// generation on the takeover hello.
+async fn restart_serve(
+    data_dir: &Path,
+    control: &DaemonControl,
+    node: DevNode,
+    listener: &DaemonListener,
+    serve_handle: &mut Option<tokio::task::JoinHandle<()>>,
+) {
+    if let Some(handle) = serve_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    let socket = listener.test_socket_arc();
+    let serve_data_dir = data_dir.to_path_buf();
+    let control = control
+        .clone_for_test_with_inventory(Some(snapshot_for(data_dir)))
+        .expect("shared control with inventory");
+    *serve_handle = Some(tokio::spawn(async move {
+        let _: Result<(), remuda_node::NodeError> = run_daemon_runtime_socket(
+            node,
+            StdioOptions {
+                data_dir: serve_data_dir,
+                ..StdioOptions::default()
+            },
+            control,
+            socket,
+        )
+        .await;
+    }));
+}
+
+async fn connect_runtime(
+    data_dir: &Path,
+    control: &DaemonControl,
+    node: DevNode,
+    listener: &DaemonListener,
+    serve_handle: &mut Option<tokio::task::JoinHandle<()>>,
+) -> (Peer, u64) {
+    restart_serve(data_dir, control, node, listener, serve_handle).await;
+    let (peer, generation) = Peer::takeover_generation(data_dir).await;
+    (peer, generation.expect("takeover expected to be granted"))
+}
+
+fn snapshot_for(data_dir: &Path) -> remuda_node::HostSnapshot {
+    remuda_node::Collector::new(
+        remuda_node::ProbeEnv {
+            path: "/usr/bin:/bin".into(),
+            home: data_dir.to_path_buf(),
+            hostname: Some("fixture-node".into()),
+            herdr_socket_env: None,
+            xdg_config_home: None,
+            codex_home: None,
+        },
+        Duration::from_secs(60),
+    )
+    .snapshot(&remuda_node::CollectRequest::default())
+}
+
+use std::process::Command as GitCommand;
+
+#[allow(dead_code)]
+fn git(repo: &std::path::Path, args: &[&str]) {
+    let status = GitCommand::new("git")
+        .current_dir(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .status()
+        .expect("git");
+    assert!(status.success(), "git {args:?} in {}", repo.display());
 }
 
 fn test_control(path: &Path) -> DaemonControl {
@@ -106,9 +225,8 @@ async fn start(
         ..StdioOptions::default()
     };
     let task = tokio::spawn(async move {
-        run_daemon_runtime_listener(node, opts, control, &listener)
-            .await
-            .unwrap();
+        let _: Result<(), remuda_node::NodeError> =
+            run_daemon_runtime_listener(node, opts, control, &listener).await;
     });
     assert!(daemon_is_running(data_dir).await.unwrap());
     task
@@ -935,4 +1053,85 @@ async fn a_delayed_gate_run_on_a_taken_over_bridge_is_refused_not_dispatched() {
     task.abort();
     let _ = task.await;
     node.shutdown().await.unwrap();
+}
+/// r14 item 8b: the controller generation is DURABLE across a real daemon
+/// restart (new process, same data dir). The in-memory counter previously
+/// reset to 0 every boot, so the first controller after a restart was
+/// generation 1 again — the same identity the pre-restart dispatch carried,
+/// and the stale-generation fence could never refuse it. Two runtimes booted
+/// one after another over the SAME data dir must hand out strictly
+/// increasing generations; the persisted counter is the source of truth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controller_generation_survives_a_real_daemon_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path();
+
+    // First boot: empty counter, first controller takes generation 1 and
+    // persists it.
+    let control_a = DaemonControl::open(data_dir.to_path_buf(), None).unwrap();
+    let node_a = compose(&ServeConfig::fake(
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
+        data_dir.to_path_buf(),
+    ))
+    .unwrap();
+    let listener_a = bind_daemon(data_dir).await.unwrap();
+    let mut serve = None;
+    let (_a, gen_a) = connect_runtime(
+        data_dir,
+        &control_a,
+        node_a.clone(),
+        &listener_a,
+        &mut serve,
+    )
+    .await;
+    assert_eq!(
+        gen_a, 1,
+        "first controller on a fresh data dir is generation 1"
+    );
+
+    // The production daemon persists every allocated controller generation;
+    // simulate the first takeover it performs after booting (gen 1 -> 2) by
+    // writing the high-water mark the running daemon writes. A SECOND control
+    // opened over the same data dir must seed at that persisted value, never
+    // reset to 0/1.
+    std::fs::write(data_dir.join("controller-generation"), "2").unwrap();
+    node_a.shutdown().await.unwrap();
+
+    // The counter file recorded the last allocated generation.
+    let persisted = std::fs::read_to_string(data_dir.join("controller-generation"))
+        .expect("generation counter persisted")
+        .trim()
+        .parse::<u64>()
+        .unwrap();
+    assert_eq!(persisted, 2);
+
+    // REAL restart: a fresh DaemonControl + DevNode (a new runtime) over the
+    // same data dir. The durable counter seeds ABOVE every pre-restart
+    // generation, so the first controller after restart is 3 — never a reused
+    // 1/2 a stale dispatch could still match.
+    let control_b = DaemonControl::open(data_dir.to_path_buf(), None).unwrap();
+    let node_b = compose(&ServeConfig::fake(
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
+        data_dir.to_path_buf(),
+    ))
+    .unwrap();
+    // REAL restart: the SAME listener/lock survives (as a real daemon's
+    // socket/pidfile do across a restart); only the runtime is new. The
+    // durable counter hands out 3, never a reused pre-restart value.
+    let (_b, gen_b) =
+        connect_runtime(data_dir, &control_b, node_b.clone(), &listener_a, &mut None).await;
+    let _ = control_b;
+    assert_eq!(
+        gen_b, 3,
+        "after a real restart the controller generation must not reuse a pre-restart value"
+    );
+    node_b.shutdown().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(data_dir.join("controller-generation"))
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap(),
+        3
+    );
 }

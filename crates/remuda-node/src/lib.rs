@@ -88,6 +88,8 @@ pub fn computer_use_evaluate(
 pub fn computer_use_default_client_path() -> Option<std::path::PathBuf> {
     computer_use::default_client_path()
 }
+#[cfg(all(unix, feature = "test-faults"))]
+pub use daemon::run_daemon_runtime_socket;
 #[cfg(unix)]
 pub use daemon::{
     DaemonControl, DaemonListener, DaemonWssLease, bind_daemon, connect_daemon_bridge,

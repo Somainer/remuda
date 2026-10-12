@@ -262,7 +262,7 @@ pub async fn connect_daemon_bridge(
     Ok(stream)
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Controller {
     generation: u64,
     active: bool,
@@ -275,6 +275,9 @@ struct Shared {
     acked: Mutex<HashMap<String, u64>>,
     epoch: Id,
     inventory: Option<crate::HostSnapshot>,
+    /// Data dir holding the durable controller-generation counter. Empty in
+    /// in-process tests (no persistence; generations reset with the process).
+    data_dir: PathBuf,
 }
 
 /// Controller fence shared by local bridges and the outbound WSS connection.
@@ -290,15 +293,76 @@ impl DaemonControl {
     /// Create a fence with an already collected inventory, avoiding PATH probes
     /// during controller handshakes when the composition root has a snapshot.
     pub fn with_inventory(inventory: Option<crate::HostSnapshot>) -> Result<Self, NodeError> {
+        Self::open(PathBuf::new(), inventory)
+    }
+
+    /// Build the fence with a durable controller-generation counter in the data
+    /// dir, so a controller generation survives a real daemon restart: a new
+    /// process starts ABOVE every generation the prior process ever handed out,
+    /// and a pre-restart dispatch can never be current again (r14 item 8b).
+    pub fn open(
+        data_dir: PathBuf,
+        inventory: Option<crate::HostSnapshot>,
+    ) -> Result<Self, NodeError> {
         let (changed, _) = watch::channel(0);
+        let generation = if data_dir.as_os_str().is_empty() {
+            0
+        } else {
+            read_controller_generation(&data_dir)
+        };
         Ok(Self(Arc::new(Shared {
-            controller: StdMutex::new(Controller::default()),
+            controller: StdMutex::new(Controller {
+                generation,
+                ..Controller::default()
+            }),
             changed,
             dispatch: Arc::new(Mutex::new(())),
             acked: Mutex::new(HashMap::new()),
             epoch: Id::new("epoch")?,
             inventory,
+            data_dir,
         })))
+    }
+
+    /// Test-only: share the same durable fence with a second in-process
+    /// runtime (modeling a restart over one data dir).
+    #[cfg(feature = "test-faults")]
+    #[doc(hidden)]
+    pub fn clone_for_test(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+
+    /// Test-only: clone the durable fence but swap in a pre-collected
+    /// inventory, so the test runtime never runs the (slow, environment-bound)
+    /// host probes before completing a controller handshake.
+    #[cfg(feature = "test-faults")]
+    #[doc(hidden)]
+    pub fn clone_for_test_with_inventory(
+        &self,
+        inventory: Option<crate::HostSnapshot>,
+    ) -> Result<Self, NodeError> {
+        let controller = self
+            .0
+            .controller
+            .lock()
+            .map_err(|_| NodeError::StorePoisoned)?
+            .clone();
+        let acked = self
+            .0
+            .acked
+            .try_lock()
+            .map(|map| map.clone())
+            .unwrap_or_default();
+        let inner = Arc::new(Shared {
+            controller: StdMutex::new(controller),
+            changed: self.0.changed.clone(),
+            dispatch: Arc::new(Mutex::new(())),
+            acked: Mutex::new(acked),
+            epoch: self.0.epoch.clone(),
+            inventory,
+            data_dir: self.0.data_dir.clone(),
+        });
+        Ok(Self(inner))
     }
 
     /// Wait until no bridge is attached, then acquire the primary WSS controller.
@@ -412,6 +476,55 @@ impl DaemonWssFence {
     }
 }
 
+/// Persisted controller-generation counter file within the daemon data dir.
+fn controller_generation_file(data_dir: &Path) -> PathBuf {
+    data_dir.join("controller-generation")
+}
+
+/// Read the durable controller generation (0 when absent/unreadable). It makes
+/// a controller generation survive a real daemon restart, so no pre-restart
+/// controller identity can be current again after a new process boots.
+fn read_controller_generation(data_dir: &Path) -> u64 {
+    std::fs::read_to_string(controller_generation_file(data_dir))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn persist_controller_generation(data_dir: &Path, generation: u64) {
+    if data_dir.as_os_str().is_empty() {
+        return;
+    }
+    let _ = std::fs::write(controller_generation_file(data_dir), generation.to_string());
+}
+
+/// Read the optional `controllerGeneration` a bridge frame names (string or
+/// number). A stale value names a pre-restart controller.
+fn frame_controller_generation(params: &Value) -> Option<u64> {
+    params
+        .get("controllerGeneration")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            params
+                .get("controllerGeneration")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse().ok())
+        })
+}
+
+/// Whether a frame claiming controller generation `claimed` is stale against
+/// the daemon's CURRENT generation. An absent claim is not checked (normal
+/// stdio/WSS carriers do not name one).
+fn is_stale_controller_frame(shared: &Shared, params: &Value) -> bool {
+    frame_controller_generation(params).is_some_and(|claimed| {
+        shared
+            .controller
+            .lock()
+            .map(|controller| claimed != controller.generation)
+            .unwrap_or(true)
+    })
+}
+
 struct SocketGuard {
     /// Real bound socket (in the per-user runtime dir when redirected).
     socket: PathBuf,
@@ -442,7 +555,8 @@ impl Drop for SocketGuard {
 /// Disconnecting any controller drops its transport only; the composition root
 /// remains responsible for calling `DevNode::shutdown` on process termination.
 pub async fn run_daemon_runtime_opts(node: DevNode, opts: StdioOptions) -> Result<(), NodeError> {
-    run_daemon_runtime_controlled(node, opts, DaemonControl::new()?).await
+    let control = DaemonControl::open(opts.data_dir.clone(), None)?;
+    run_daemon_runtime_controlled(node, opts, control).await
 }
 
 /// Serve a daemon sharing controller fencing with its outbound WSS link.
@@ -457,7 +571,7 @@ pub async fn run_daemon_runtime_controlled(
 
 /// Reserved socket and pidfile; dropping it removes both paths.
 pub struct DaemonListener {
-    listener: UnixListener,
+    listener: Arc<UnixListener>,
     _socket: SocketGuard,
     _lock: nix::fcntl::Flock<std::fs::File>,
 }
@@ -528,13 +642,66 @@ pub async fn bind_daemon(data_dir: &Path) -> Result<DaemonListener, NodeError> {
         NodeError::InvalidConfig(format!("daemon socket discovery link: {error}"))
     })?;
     Ok(DaemonListener {
-        listener,
+        listener: Arc::new(listener),
         _socket,
         _lock: lock,
     })
 }
 
 /// Serve a socket reserved before native runtime initialization.
+impl DaemonListener {
+    /// Test-only: a shareable handle to the bound socket, so multiple
+    /// in-process runtimes (a second controller and a post-restart runtime)
+    /// accept on the SAME listener while the owning `DaemonListener` keeps the
+    /// lock.
+    #[cfg(feature = "test-faults")]
+    #[doc(hidden)]
+    pub fn test_socket_arc(&self) -> Arc<UnixListener> {
+        Arc::clone(&self.listener)
+    }
+}
+
+/// Test-only: serve the daemon accept loop on an already-bound, shared
+/// socket (the `DaemonListener` lock stays with the caller).
+#[cfg(feature = "test-faults")]
+pub async fn run_daemon_runtime_socket(
+    node: DevNode,
+    opts: StdioOptions,
+    control: DaemonControl,
+    socket: std::sync::Arc<UnixListener>,
+) -> Result<(), NodeError> {
+    let shared = control.0;
+    // Test runtime: register THIS accept loop's generation with the fence so a
+    // connection it accepts is never fenced by a newer generation (matching a
+    // single-loop daemon, where accept and generation changes share a state).
+    // This test loop is claiming a controller generation on behalf of the
+    // bridge it will accept; model the single-loop daemon's ordering by
+    // marking the shared fence active at the next generation before the
+    // takeover hello increments it again would be wrong — instead the loop
+    // simply registers as the live controller owner is handled by
+    // accept_controller's own hello. No extra claim needed: accept_controller
+    // reads/writes the shared controller, and the loop only serves
+    // connections whose generation matches the one accept_controller assigns.
+    // (Kept as a no-op marker to document the intent.)
+    let _ = &shared;
+    let mut sessions = JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = socket.accept() => {
+                let (stream, _) = accepted?;
+                let (node, opts, shared) = (node.clone(), opts.clone(), shared.clone());
+                sessions.spawn(async move {
+                    if let Err(error) = accept_controller(node, opts, shared, stream).await {
+                        tracing::debug!(%error, "daemon controller disconnected");
+                    }
+                });
+            }
+            _ = sessions.join_next(), if !sessions.is_empty() => {}
+        }
+    }
+}
+
+/// Serve the daemon accept loop over a reserved [`DaemonListener`].
 pub async fn run_daemon_runtime_listener(
     node: DevNode,
     opts: StdioOptions,
@@ -596,6 +763,7 @@ async fn accept_controller(
             controller.generation += 1;
             controller.active = true;
             shared.changed.send_replace(controller.generation);
+            persist_controller_generation(&shared.data_dir, controller.generation);
             Some(controller.generation)
         }
     };
@@ -641,18 +809,24 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         return Ok(());
     }
     let enrollment = enroll::load_or_create(&opts.data_dir)?;
-    let request = CollectRequest {
-        labels: opts.labels.clone(),
-        max_instances: opts.max_instances,
-        herdr_socket: None,
-    };
     let snapshot = match &shared.inventory {
         Some(snapshot) => snapshot.clone(),
-        None => tokio::select! {
-            _ = changed.changed() => return Ok(()),
-            result = tokio::task::spawn_blocking(move || collect(&request)) => result
-                .map_err(|error|NodeError::Driver(format!("inventory task failed: {error}")))?,
-        },
+        None => {
+            // Real CLI probes can take minutes in a constrained environment;
+            // move an owned request onto the blocking pool so the select can
+            // still race the controller watch.
+            let request = CollectRequest {
+                labels: opts.labels.clone(),
+                max_instances: opts.max_instances,
+                herdr_socket: None,
+            };
+            let collect_future = tokio::task::spawn_blocking(move || collect(&request));
+            tokio::select! {
+                _ = changed.changed() => return Ok(()),
+                result = collect_future => result
+                    .map_err(|error| NodeError::Driver(format!("inventory task failed: {error}")))?,
+            }
+        }
     };
     let label = opts.display_label.as_deref().unwrap_or(&snapshot.hostname);
     let mut params = hubnode::stdio_hello_params(
@@ -888,6 +1062,20 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 let request = hubnode::decode_request(&frame)?;
                 let id = request.id.unwrap_or(Value::Null);
                 let params = request.params.unwrap_or(json!({}));
+                // r14 item 8b: a dispatch frame that still names a pre-restart
+                // controller generation is refused outright — it never executes
+                // and can never push. The frame reaches the NEW process (its
+                // controller bridge connected after the restart) but is not
+                // current authority.
+                if is_stale_controller_frame(shared, &params) {
+                    let response = hubnode::rpc_error(
+                        id,
+                        -32009,
+                        "dispatch carried a stale controller generation; daemon restarted",
+                    );
+                    let _ = long_tx.send(response).await;
+                    continue;
+                }
                 // A long carrier method (gate run/then/land/unpin, worker
                 // provision/remove, instance close, worktree/SCM read) parks for
                 // minutes and does unbounded blocking work. Awaiting it on this

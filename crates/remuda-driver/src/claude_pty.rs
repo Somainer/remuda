@@ -1177,11 +1177,15 @@ impl Driver for ClaudePtyDriver {
             self.resources.close().await?;
             return Ok(DriverAck::not_dispatched());
         };
-        if live.closed {
-            drop(inner);
-            self.resources.close().await?;
-            return Ok(DriverAck::not_dispatched());
-        }
+        // c-ctxusage r13 item 2: `live.closed` is NOT a completion marker and
+        // must NOT short-circuit a retried close. An earlier close can fail
+        // AFTER marking closed — the native ownership probe may be refused
+        // during Herdr's shutdown window — with the transcript finalisation,
+        // the verified stop and the reap still pending. Every phase below is
+        // idempotent (queue closes are flag sets, task handles are taken once
+        // and abort is repeatable), so a repeated close resumes at the first
+        // unfinished phase and completes it; the live handle is dropped only
+        // at the very end, after the reap is verified.
         live.closed = true;
         live.interaction_task.abort();
         live.effort_queue.close();
@@ -1216,13 +1220,32 @@ impl Driver for ClaudePtyDriver {
         // force-terminated and its exit verified BEFORE the drain below, so the
         // drain never races a live writer's final append; the panes and the
         // workspace are reaped only after that.
-        let agent_exit_grace = self
-            .test_faults
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_deref()
-            .and_then(crate::test_faults::FaultState::agent_exit_grace)
-            .unwrap_or(crate::pty_resource::AGENT_EXIT_GRACE);
+        //
+        // c-ctxusage r13 item 2: this phase can fail on the ownership probe
+        // (Herdr refusing session.snapshot in its shutdown window). The error
+        // propagates WITHOUT marking the rest of close done, so a retried
+        // close runs the verified stop, the drain and the reap instead of
+        // skipping them on the stale `live.closed` flag.
+        // Read every injected fault decision as OWNED values before the first
+        // await: the std MutexGuard is !Send and must not live across the
+        // stop-phase await below.
+        let (probe_fails, agent_exit_grace) = {
+            let faults = self
+                .test_faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let probe_fails = faults
+                .as_deref()
+                .is_some_and(crate::test_faults::FaultState::take_close_probe_failure);
+            let grace = faults
+                .as_deref()
+                .and_then(crate::test_faults::FaultState::agent_exit_grace)
+                .unwrap_or(crate::pty_resource::AGENT_EXIT_GRACE);
+            (probe_fails, grace)
+        };
+        if probe_fails {
+            return Err(DriverError::ControlUnavailable);
+        }
         let stop_outcomes = self.resources.interrupt(agent_exit_grace).await?;
         tracing::debug!(?stop_outcomes, "claude-pty close: native writers stopped");
         // c-ctxusage r4 item 2: cooperative transcript shutdown — signal, let

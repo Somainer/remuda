@@ -88,6 +88,11 @@ pub(crate) struct FaultState {
     /// deterministically without the production 2 s wait (c-ctxusage r13
     /// item 1). Milliseconds; 0 means the production grace.
     agent_exit_grace_ms: AtomicU64,
+    /// Remaining close calls whose native stop-phase ownership probe must
+    /// fail, modelling Herdr refusing `session.snapshot` during its shutdown
+    /// window (c-ctxusage r13 item 2): one decremented failure per close
+    /// attempt, so a retried close probes cleanly.
+    close_probe_failures: AtomicU64,
 }
 
 /// A parked phase must never wait forever on a test that forgot to release:
@@ -126,6 +131,7 @@ impl FaultState {
             close_timeout_ms: AtomicU64::new(0),
             pending_capacity: AtomicU64::new(0),
             agent_exit_grace_ms: AtomicU64::new(0),
+            close_probe_failures: AtomicU64::new(0),
         })
     }
 
@@ -313,6 +319,22 @@ impl FaultState {
         }
     }
 
+    /// Consume one injected close-time ownership-probe failure, if any remain
+    /// (c-ctxusage r13 item 2). Models `resources.interrupt()`'s Herdr probe
+    /// returning an error on THIS close attempt so the call returns before the
+    /// native writer is stopped; a retried close probes cleanly.
+    pub(crate) fn take_close_probe_failure(&self) -> bool {
+        self.close_probe_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                if remaining > 0 {
+                    Some(remaining - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+    }
+
     /// Whether the flusher has already exited.
     #[cfg(feature = "test-faults")]
     fn flusher_exited_now(&self) -> bool {
@@ -394,6 +416,16 @@ impl TranscriptFaults {
             grace.as_millis().min(u128::from(u64::MAX)) as u64,
             Ordering::SeqCst,
         );
+    }
+
+    /// Make the next `attempts` close calls fail the native ownership probe
+    /// once each — returning before the writer is stopped — modelling Herdr
+    /// refusing `session.snapshot` in its shutdown window (c-ctxusage r13
+    /// item 2). A later close retries the phase and probes cleanly.
+    pub fn arm_close_probe_failures(&self, attempts: u32) {
+        self.inner
+            .close_probe_failures
+            .store(u64::from(attempts), Ordering::SeqCst);
     }
 
     /// Open the gate and let every parked blocking phase proceed.

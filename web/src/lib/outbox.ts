@@ -1042,7 +1042,10 @@ export class Outbox {
       outcome = await this.runUnderInstanceLock(instanceId, async () => {
       let durable: OutboxRecord[];
       try {
-        durable = await this.refreshFromStorage();
+        // Gate 18 item 3: this read reconciles OTHER tracked wakes too; pass
+        // the firing id so its own command is never handed off twice (the
+        // critical section below returns X's authoritative outcome).
+        durable = await this.refreshFromStorage(commandId);
       } catch {
         return { kind: "failure" } satisfies Outcome;
       }
@@ -1243,14 +1246,14 @@ export class Outbox {
     return await fn(instanceId, deliverable);
   }
 
-  private async refreshFromStorage(): Promise<OutboxRecord[]> {
+  private async refreshFromStorage(firingCommandId?: Id): Promise<OutboxRecord[]> {
     const durable = (await this.storage.all()).filter((r) => commandIdFromKey(r.commandId));
     // Gate 13 item 3: check lifetime RIGHT after the storage read and BEFORE
     // touching the cache — a dispose while all() was suspended must not import
     // changed rows (and must not re-arm a wake) into a tearing-down Outbox.
     if (this.disposed) return [];
     for (const rec of durable) this.cache.set(rec.commandId, rec);
-    this.reconcileClaimWakeups(durable);
+    this.reconcileClaimWakeups(durable, firingCommandId);
     return durable;
   }
 
@@ -1269,7 +1272,7 @@ export class Outbox {
    * document is not actively delivering get an expiry wake. Rows this
    * document is POSTing are skipped (activeDeliveries).
    */
-  private reconcileClaimWakeups(durable: OutboxRecord[]) {
+  private reconcileClaimWakeups(durable: OutboxRecord[], firingCommandId?: Id) {
     if (this.disposed) return;
     const byId = new Map(durable.map((r) => [r.commandId, r]));
     for (const [id, entry] of [...this.claimWakeups]) {
@@ -1283,8 +1286,16 @@ export class Outbox {
       if (lease.owner !== this.owner) {
         // Ownership changed to a foreign owner: HAND OFF to the store's
         // foreign-lease scheduler (gate 16 item 2). Adopting here too would
-        // run two schedulers for one lease.
+        // run two schedulers for one lease. Gate 18 item 3: this handoff must
+        // ALSO run on the RECONCILIATION path — a snapshot read on one
+        // command's timer (X terminal) is the only thing that observes
+        // ANOTHER tracked command Y being re-claimed by a crashed foreign
+        // owner at deadline T2; cancelling Y's wake here without the handoff
+        // left Y inflight with no recovery clock. The firing command itself is
+        // deduplicated: its own critical section owns the authoritative
+        // outcome for it (and may hand it off there).
         this.clearClaimWakeup(id);
+        if (id !== firingCommandId) this.onForeignLeaseHandoff?.(fresh);
         continue;
       }
       // Same-owner replacement lease — adopt (future deadline armed, overdue

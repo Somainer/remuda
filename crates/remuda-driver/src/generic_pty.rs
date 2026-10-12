@@ -395,7 +395,6 @@ impl GenericPtyDriver {
         // instance created. A launch failure drops the guard and records the
         // close; success hands one clone to the adapter and keeps one here.
         let instance_key = uuid::Uuid::new_v4().to_string();
-        let launched_at = time::OffsetDateTime::now_utc();
         // c-usagefu r12 item 2 (Ruling A2'): for a codex launch the pending
         // DISCOVERY window is opened TOGETHER with the lifetime and BEFORE the
         // agent process starts — not when the file adapter is constructed.
@@ -406,19 +405,29 @@ impl GenericPtyDriver {
         // prompt evidence) this registered-but-not-yet-adapted launch's later
         // discovery decision still needs. The window is handed to the adapter
         // below; a launch failure drops both it and the lifetime here.
+        //
+        // c-usagefu r14 item 2 (Ruling L1): for codex the launch boundary is
+        // sampled INSIDE the registration critical section and returned on the
+        // bundle — the value handed to the adapter below. Other harnesses do
+        // not register, so their floor is sampled here at the same decision
+        // point.
         let lifetime;
         let mut pending_window;
+        let launched_at;
         if preset.id.eq_ignore_ascii_case("codex") {
             // The lifetime AND the pending-discovery window are one bundle
-            // registered BEFORE the process starts (r12 item 2, Ruling A2').
+            // registered BEFORE the process starts (r12 item 2, Ruling A2');
+            // the bundle's boundary was sampled inside the LAUNCH_REGISTRATION
+            // critical section (r14 item 2, Ruling L1).
             let pending = crate::adapters::codex_discovery::register_pending_launch(
                 std::path::Path::new(&recipe.cwd),
                 &instance_key,
-                Some(launched_at),
             );
+            launched_at = pending.launched_at;
             lifetime = Some(pending.lifetime);
             pending_window = Some(pending.window);
         } else {
+            launched_at = time::OffsetDateTime::now_utc();
             lifetime = None;
             pending_window = None;
         }

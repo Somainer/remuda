@@ -1661,9 +1661,12 @@ fn a_pending_launch_window_survives_another_window_releasing_before_adapter_buil
 
     // B registers its lifetime AND its pending discovery window as the one
     // pre-launch bundle BEFORE the process starts; the adapter is built only
-    // much further below.
+    // much further below. The boundary is sampled inside the registration
+    // critical section (r14 L1); pin it to t2 for this deterministic timeline.
+    crate::adapters::codex_discovery::set_test_launch_boundary(Path::new(cwd), t2);
     let b_pending =
-        crate::adapters::codex_discovery::register_pending_launch(Path::new(cwd), INST_B, Some(t2));
+        crate::adapters::codex_discovery::register_pending_launch(Path::new(cwd), INST_B);
+    let t_boundary = b_pending.launched_at;
     let b_lifetime = b_pending.lifetime;
     let b_window = b_pending.window;
     send_fixture_prompt(
@@ -1700,7 +1703,7 @@ fn a_pending_launch_window_survives_another_window_releasing_before_adapter_buil
         home: home.path().to_path_buf(),
         cwd: PathBuf::from(cwd),
         pid: None,
-        launched_at: Some(t2),
+        launched_at: Some(t_boundary),
     })
     .with_lifetime(b_lifetime.witness())
     .with_window(b_window)
@@ -1821,17 +1824,16 @@ fn a_window_releasing_inside_a_pending_launch_registration_cannot_prune_its_inte
         "C's closed interval is retained while A's window is open"
     );
 
-    // Arm the barrier, then run B's registration on another thread.
+    // Arm the barrier, then run B's registration on another thread. The
+    // boundary is sampled inside registration (r14 L1); pin it to t_b.
+    crate::adapters::codex_discovery::set_test_launch_boundary(Path::new(cwd), t_b);
     let barrier = PendingLaunchBarrier::arm(Path::new(cwd));
     let (tx, rx) = std::sync::mpsc::channel();
     let builder = std::thread::Builder::new()
         .name("r13-item1-pending-launch".into())
         .spawn(move || {
-            let pending = crate::adapters::codex_discovery::register_pending_launch(
-                Path::new(cwd),
-                INST_B,
-                Some(t_b),
-            );
+            let pending =
+                crate::adapters::codex_discovery::register_pending_launch(Path::new(cwd), INST_B);
             tx.send(pending).unwrap();
         })
         .unwrap();
@@ -1898,6 +1900,129 @@ fn a_window_releasing_inside_a_pending_launch_registration_cannot_prune_its_inte
         "B must not bind FC: the interval pruned inside its registration still overlaps"
     );
     assert!(b.binding().is_none());
+}
+
+#[test]
+fn a_launch_blocked_before_the_lock_samples_its_boundary_after_a_close_and_refuses_the_rollout() {
+    // c-usagefu r14 item 2 (Ruling L1): the production launch boundary is
+    // sampled INSIDE the LAUNCH_REGISTRATION critical section together with
+    // the lifetime insert and window retention, and THAT boundary is returned
+    // to the adapter.
+    //
+    // Timeline:
+    //   A's window is the cwd's only one (A's own interval long closed).
+    //   C launched earlier, still live.
+    //   B decides to launch and registers, but is parked BEFORE taking
+    //      LAUNCH_REGISTRATION — it holds neither a lifetime nor a window.
+    //   while B is parked: FC (B's matching prompt) is written and C closes.
+    //   A's deferred cleanup drops its window: with B holding nothing it is
+    //      genuinely the last window, so C's closed interval is pruned.
+    //   only now does B take the lock and sample its boundary — AFTER FC and
+    //      after C's close.
+    //
+    // With a caller-sampled boundary (the pre-L1 shape), B's floor predated
+    // FC: the prune had removed C, B was sole-live, and the matching prompt
+    // bound a rollout created while a since-closed instance was actually
+    // running. B's REAL discover() must now refuse FC on the strict resume
+    // floor.
+    use crate::adapters::codex_discovery::{LifetimeGuardClock as _, PendingLaunchBarrier};
+
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r14-item2-boundary";
+    let prompt = "B r14 item2 launch prompt";
+    let rfc = |at: OffsetDateTime| at.format(&Rfc3339).unwrap();
+
+    // A: the window whose release lands while B is parked pre-lock. A's own
+    // interval closed in the past, so it can never be the census blocker.
+    let a = launch_adapter_keyed(
+        home.path(),
+        cwd,
+        OffsetDateTime::now_utc() - time::Duration::seconds(30),
+        INST_A,
+    );
+    a.close_lifetime_at(OffsetDateTime::now_utc() - time::Duration::seconds(20));
+
+    // C launched earlier, still live while B decides.
+    let c_guard = crate::adapters::codex_discovery::begin_lifetime(
+        Path::new(cwd),
+        INST_C,
+        Some(OffsetDateTime::now_utc() - time::Duration::seconds(5)),
+    );
+
+    // B registers on another thread and parks before the lock.
+    let barrier = PendingLaunchBarrier::arm_pre_lock(Path::new(cwd));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let builder = std::thread::Builder::new()
+        .name("r14-item2-pending-launch".into())
+        .spawn(move || {
+            let pending =
+                crate::adapters::codex_discovery::register_pending_launch(Path::new(cwd), INST_B);
+            tx.send(pending).unwrap();
+        })
+        .unwrap();
+    barrier.wait_before_lock();
+    assert!(
+        !crate::adapters::codex_discovery::census_contains(Path::new(cwd), INST_B),
+        "parked before the lock: B has registered no lifetime yet"
+    );
+
+    // FC is written AFTER B decided to launch, then C closes. Whole-second
+    // RFC3339 timestamps bound both sides of the ordering: sleep long enough
+    // that FC cannot share B's decision second...
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let fc_started = OffsetDateTime::now_utc();
+    write_rollout_prompt_at(home.path(), "FC-r14-item2", cwd, &rfc(fc_started), prompt);
+    c_guard.close_lifetime_at(OffsetDateTime::now_utc());
+    drop(c_guard);
+
+    // A's last-window release lands while B holds nothing: it prunes C and
+    // clears prompt evidence, exactly the r13 race. Joined deterministically.
+    let releaser = std::thread::Builder::new()
+        .name("r14-item2-release".into())
+        .spawn(move || drop(a))
+        .unwrap();
+    releaser.join().unwrap();
+    assert!(
+        !crate::adapters::codex_discovery::census_contains(Path::new(cwd), INST_C),
+        "A really released as the last window and pruned C"
+    );
+
+    // ...and release B far enough past FC's timestamp second that the boundary
+    // it samples inside the lock is strictly AFTER FC and after C's close.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    barrier.release_pre_lock();
+    let b_pending = rx.recv().unwrap();
+    builder.join().unwrap();
+    assert!(
+        crate::adapters::codex_discovery::census_contains(Path::new(cwd), INST_B),
+        "B registered its lifetime once it took the lock"
+    );
+
+    // B dispatched the matching prompt only after registering (the last-window
+    // release cleared the cwd's earlier evidence).
+    send_fixture_prompt(Path::new(cwd), INST_B, prompt, OffsetDateTime::now_utc());
+
+    // The adapter receives the EXACT boundary registration returned.
+    let b_lifetime = b_pending.lifetime;
+    let b_window = b_pending.window;
+    let mut b = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: PathBuf::from(cwd),
+        pid: None,
+        launched_at: Some(b_pending.launched_at),
+    })
+    .with_lifetime(b_lifetime.witness())
+    .with_window(b_window)
+    .with_instance_key(Some(INST_B.to_owned()));
+    assert!(
+        !b.discover().unwrap(),
+        "B must not bind FC: its in-lock boundary is after FC's creation and C's close"
+    );
+    assert!(b.binding().is_none());
+    assert!(
+        b_pending.launched_at > fc_started,
+        "the returned boundary is the in-lock sample after FC's creation"
+    );
 }
 
 #[test]

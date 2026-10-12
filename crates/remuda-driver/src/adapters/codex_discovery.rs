@@ -337,6 +337,13 @@ pub(crate) fn begin_lifetime(
 pub(crate) struct PendingCodexLaunch {
     pub(crate) lifetime: LifetimeGuard,
     pub(crate) window: DiscoveryWindow,
+    /// The exact agent.start boundary sampled INSIDE the LAUNCH_REGISTRATION
+    /// critical section (c-usagefu r14 item 2, Ruling L1). The launch site and
+    /// the adapter MUST use THIS value, never one sampled before registration:
+    /// a launch blocked on the registration lock while the world moves (a
+    /// rollout is written and closed, the last window released) must make its
+    /// discovery floor decision from the moment it actually registered.
+    pub(crate) launched_at: OffsetDateTime,
 }
 
 /// Register a codex launch's lifetime AND its pending-discovery window as one
@@ -350,15 +357,30 @@ pub(crate) struct PendingCodexLaunch {
 /// intervals (and cleared prompt evidence) the not-yet-windowed launch's later
 /// discovery decision needed. The coordination lock in [`LAUNCH_REGISTRATION`]
 /// is held across both halves and across the test barrier between them.
-pub(crate) fn register_pending_launch(
-    cwd: &Path,
-    owner: &str,
-    launched_at: Option<OffsetDateTime>,
-) -> PendingCodexLaunch {
+/// c-usagefu r14 item 2 (Ruling L1): the launch boundary is sampled INSIDE
+/// this critical section — after acquiring [`LAUNCH_REGISTRATION`], together
+/// with the lifetime insert and window retention — and returned on the bundle
+/// for the caller and the adapter. A boundary sampled by the caller before
+/// taking the lock could predate a close that completed while this launch was
+/// queued for the lock, letting the launch bind a rollout created in that
+/// window over a since-closed interval the prune had just discarded.
+pub(crate) fn register_pending_launch(cwd: &Path, owner: &str) -> PendingCodexLaunch {
+    // Test barrier (cfg(test)): parks BEFORE the coordination lock is taken,
+    // so a regression can delay the boundary sample until a rollout was
+    // written and closed and the last window released while this launch was
+    // queued. A no-op in production builds.
+    #[cfg(test)]
+    pending_launch_pre_lock_barrier(cwd);
     let _registration = LAUNCH_REGISTRATION
         .lock()
         .expect("codex launch registration");
-    let lifetime = begin_lifetime(cwd, owner, launched_at);
+    // L1: the boundary IS the critical-section entry instant. Tests may pin a
+    // one-shot boundary for deterministic timelines; production always samples.
+    #[cfg(test)]
+    let launched_at = take_test_launch_boundary(cwd).unwrap_or_else(OffsetDateTime::now_utc);
+    #[cfg(not(test))]
+    let launched_at = OffsetDateTime::now_utc();
+    let lifetime = begin_lifetime(cwd, owner, Some(launched_at));
     // Test barrier (cfg(test)): parks BETWEEN the lifetime insert and the
     // window open WHILE HOLDING the coordination lock, so a barrier-controlled
     // regression can drive another window's release into exactly this gap. In
@@ -366,7 +388,11 @@ pub(crate) fn register_pending_launch(
     #[cfg(test)]
     pending_launch_test_barrier(cwd);
     let window = DiscoveryWindow::open(cwd, owner);
-    PendingCodexLaunch { lifetime, window }
+    PendingCodexLaunch {
+        lifetime,
+        window,
+        launched_at,
+    }
 }
 
 #[cfg(test)]
@@ -374,18 +400,11 @@ static PENDING_LAUNCH_BARRIER: std::sync::LazyLock<
     std::sync::Mutex<Option<std::sync::Arc<PendingLaunchBarrier>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
-/// Barrier parking [`register_pending_launch`] between the lifetime insert and
-/// the window open, while it still holds [`LAUNCH_REGISTRATION`]. Arm with
-/// [`PendingLaunchBarrier::arm`]; the parking thread blocks in
-/// [`Self::wait_to_enter`] until registration reached the barrier, and
-/// [`Self::release`] lets the registration finish. On drop the barrier
-/// disarms itself so a later test never parks unexpectedly.
+/// One parked point of [`register_pending_launch`]. A disabled stage passes
+/// straight through; an armed one marks arrival and blocks until released.
 #[cfg(test)]
-#[allow(dead_code)]
-pub(crate) struct PendingLaunchBarrier {
-    /// Only registrations for THIS canonical cwd park (parallel tests share
-    /// the process and the static slot).
-    cwd: PathBuf,
+struct BarrierStage {
+    enabled: bool,
     entered: std::sync::Mutex<bool>,
     entered_cv: std::sync::Condvar,
     proceed: std::sync::Mutex<bool>,
@@ -393,27 +412,28 @@ pub(crate) struct PendingLaunchBarrier {
 }
 
 #[cfg(test)]
-impl PendingLaunchBarrier {
-    /// Arm the global park for registrations in `cwd` only (parallel tests
-    /// sharing the process never park on another test's barrier); the returned
-    /// guard disarms on drop.
-    pub(crate) fn arm(cwd: &Path) -> std::sync::Arc<Self> {
-        let barrier = std::sync::Arc::new(Self {
-            cwd: canonical(cwd),
+impl BarrierStage {
+    fn armed() -> Self {
+        Self {
+            enabled: true,
             entered: std::sync::Mutex::new(false),
             entered_cv: std::sync::Condvar::new(),
             proceed: std::sync::Mutex::new(false),
             proceed_cv: std::sync::Condvar::new(),
-        });
-        *PENDING_LAUNCH_BARRIER
-            .lock()
-            .expect("pending launch barrier") = Some(std::sync::Arc::clone(&barrier));
-        barrier
+        }
     }
 
-    /// Registration thread: mark itself INSIDE the critical section (lifetime
-    /// inserted, window not yet open), then block until [`Self::release`].
-    fn park(&self) {
+    fn disabled() -> Self {
+        let mut stage = Self::armed();
+        stage.enabled = false;
+        stage
+    }
+
+    /// Registration thread: announce arrival, then block until released.
+    fn reach(&self) {
+        if !self.enabled {
+            return;
+        }
         {
             let mut entered = self
                 .entered
@@ -434,8 +454,7 @@ impl PendingLaunchBarrier {
         }
     }
 
-    /// Block until a registration thread has entered the barrier.
-    pub(crate) fn wait_to_enter(&self) {
+    fn wait_entered(&self) {
         let mut entered = self
             .entered
             .lock()
@@ -448,8 +467,7 @@ impl PendingLaunchBarrier {
         }
     }
 
-    /// Let the parked registration finish (its window opens immediately after).
-    pub(crate) fn release(&self) {
+    fn release(&self) {
         let mut proceed = self
             .proceed
             .lock()
@@ -459,14 +477,105 @@ impl PendingLaunchBarrier {
     }
 }
 
+/// Barrier parking [`register_pending_launch`]. Two independent stages:
+/// - the PRE-LOCK stage (arm with [`Self::arm_pre_lock`]) fires BEFORE the
+///   LAUNCH_REGISTRATION lock is taken and the boundary sampled;
+/// - the BETWEEN stage (arm with [`Self::arm`]) fires inside the lock between
+///   the lifetime insert and the window open (the r13 item 1 gap).
+///
+/// Only registrations for the armed canonical cwd park (parallel tests share
+/// the process and the static slot). On drop the barrier releases every parked
+/// registration and disarms itself so a later test never parks unexpectedly.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) struct PendingLaunchBarrier {
+    /// Only registrations for THIS canonical cwd park (parallel tests share
+    /// the process and the static slot).
+    cwd: PathBuf,
+    /// Before LAUNCH_REGISTRATION is acquired (and before the boundary sample).
+    before_lock: BarrierStage,
+    /// Between the lifetime insert and the window open, holding the lock.
+    between: BarrierStage,
+}
+
+#[cfg(test)]
+impl PendingLaunchBarrier {
+    /// Arm the BETWEEN stage (r13 item 1): registration parks inside the lock
+    /// after inserting its lifetime and before opening its window.
+    pub(crate) fn arm(cwd: &Path) -> std::sync::Arc<Self> {
+        Self::arm_stage(cwd, false, true)
+    }
+
+    /// Arm the PRE-LOCK stage (r14 item 2, Ruling L1): registration parks
+    /// BEFORE taking LAUNCH_REGISTRATION and before sampling its boundary.
+    pub(crate) fn arm_pre_lock(cwd: &Path) -> std::sync::Arc<Self> {
+        Self::arm_stage(cwd, true, false)
+    }
+
+    fn arm_stage(cwd: &Path, pre_lock: bool, between: bool) -> std::sync::Arc<Self> {
+        let barrier = std::sync::Arc::new(Self {
+            cwd: canonical(cwd),
+            before_lock: if pre_lock {
+                BarrierStage::armed()
+            } else {
+                BarrierStage::disabled()
+            },
+            between: if between {
+                BarrierStage::armed()
+            } else {
+                BarrierStage::disabled()
+            },
+        });
+        *PENDING_LAUNCH_BARRIER
+            .lock()
+            .expect("pending launch barrier") = Some(std::sync::Arc::clone(&barrier));
+        barrier
+    }
+
+    /// Block until a registration thread has entered the PRE-LOCK stage.
+    pub(crate) fn wait_before_lock(&self) {
+        self.before_lock.wait_entered();
+    }
+
+    /// Release the PRE-LOCK stage: the registration then takes the lock and
+    /// samples its boundary.
+    pub(crate) fn release_pre_lock(&self) {
+        self.before_lock.release();
+    }
+
+    /// Block until a registration thread has entered the BETWEEN stage.
+    pub(crate) fn wait_to_enter(&self) {
+        self.between.wait_entered();
+    }
+
+    /// Let the parked registration finish (its window opens immediately after).
+    pub(crate) fn release(&self) {
+        self.between.release();
+    }
+}
+
 #[cfg(test)]
 impl Drop for PendingLaunchBarrier {
     fn drop(&mut self) {
-        // Release any parked registration and disarm the global slot.
-        self.release();
+        // Release any parked registration at either stage and disarm the slot.
+        self.before_lock.release();
+        self.between.release();
         *PENDING_LAUNCH_BARRIER
             .lock()
             .expect("pending launch barrier") = None;
+    }
+}
+
+#[cfg(test)]
+fn pending_launch_pre_lock_barrier(cwd: &Path) {
+    let armed = PENDING_LAUNCH_BARRIER
+        .lock()
+        .expect("pending launch barrier")
+        .as_ref()
+        .filter(|barrier| barrier.cwd == canonical(cwd))
+        .map(std::sync::Arc::clone);
+    if let Some(barrier) = armed {
+        barrier.before_lock.reach();
     }
 }
 
@@ -479,8 +588,32 @@ fn pending_launch_test_barrier(cwd: &Path) {
         .filter(|barrier| barrier.cwd == canonical(cwd))
         .map(std::sync::Arc::clone);
     if let Some(barrier) = armed {
-        barrier.park();
+        barrier.between.reach();
     }
+}
+
+/// One-shot deterministic launch boundary for [`register_pending_launch`]
+/// tests (r12 item 2 keeps an exact timeline). Keyed by canonical cwd so
+/// parallel tests never share it; consumed on read.
+#[cfg(test)]
+static TEST_LAUNCH_BOUNDARIES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, OffsetDateTime>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn set_test_launch_boundary(cwd: &Path, at: OffsetDateTime) {
+    TEST_LAUNCH_BOUNDARIES
+        .lock()
+        .expect("test launch boundaries")
+        .insert(canonical(cwd), at);
+}
+
+#[cfg(test)]
+fn take_test_launch_boundary(cwd: &Path) -> Option<OffsetDateTime> {
+    TEST_LAUNCH_BOUNDARIES
+        .lock()
+        .expect("test launch boundaries")
+        .remove(&canonical(cwd))
 }
 /// Called when the cwd's LAST discovery window closes: no attribution decision
 /// is then pending, and Ruling A2 (c-usagefu r11 item 5) bounds the registry

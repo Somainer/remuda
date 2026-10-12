@@ -53,6 +53,7 @@ nix = { version = "0.28", features = ["process", "fs", "signal", "inotify"] }
 plist = { version = "1.10.1", default-features = false }
 
 [dev-dependencies]
+libc = "0.2"
 portable-pty.workspace = true
 remuda-driver = { workspace = true, features = ["test-stub", "test-faults"] }
 remuda-hub.workspace = true

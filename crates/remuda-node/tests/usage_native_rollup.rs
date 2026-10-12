@@ -56,12 +56,13 @@ fn remuda_relay_bin(root: &Path) -> std::path::PathBuf {
 }
 
 /// Event-driven waiter for a durable turn row (c-ctxusage r15: replaces the
-/// 250 ms HTTP poll). A blocking thread watches `hub.sqlite` with inotify
-/// (IN_CLOSE_WRITE / IN_MODIFY on every Hub writer transaction) and
-/// re-checks the durable predicate after each filesystem event, so no
-/// wall-clock sleep is involved — the usage commit itself is the wake. A
-/// bounded poll inside inotify's deadline is the safety bound, not the
-/// mechanism; the loop also returns immediately once the row exists.
+/// 250 ms HTTP poll). A blocking thread watches `hub.sqlite` with the
+/// platform's filesystem event facility — inotify on Linux, an
+/// EVFILT_VNODE kqueue on macOS/BSDs (c-ctxusage r16 item 7) — and re-checks
+/// the durable predicate after each filesystem event, so no wall-clock sleep
+/// is involved: the usage commit itself is the wake. A bounded poll inside
+/// the watch deadline is the safety bound, not the mechanism; the loop also
+/// returns immediately once the row exists.
 struct UsageWaiter(std::thread::JoinHandle<bool>);
 
 impl UsageWaiter {
@@ -138,9 +139,116 @@ impl UsageWaiter {
         }))
     }
 
-    /// Non-Linux fallback: bounded, infrequent check (the gated e2e and CI
-    /// run on Linux; this keeps the test compiling elsewhere).
-    #[cfg(not(target_os = "linux"))]
+    /// kqueue fallback (macOS/BSDs): an event-driven watch with no sleeps —
+    /// `EVFILT_VNODE` on the database directory, the db file and its lazily
+    /// created `-wal` file (c-ctxusage r16 item 7). Mirrors the Linux waiter:
+    /// the directory watch covers create/rename (the db/-wal appear lazily),
+    /// the file watches cover extend/write/delete; the predicate is re-checked
+    /// after every event, with a deadline-bounded `kevent` timeout only as
+    /// the safety bound.
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    fn spawn(db_path: PathBuf, instance_id: String) -> Self {
+        Self(std::thread::spawn(move || {
+            let Ok(conn) = rusqlite::Connection::open(&db_path) else {
+                return false;
+            };
+            let kq = unsafe { libc::kqueue() };
+            if kq < 0 {
+                return false;
+            }
+            use std::os::fd::AsRawFd;
+            let parent = db_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let wal_path = db_path.with_extension("sqlite-wal");
+
+            // Add one EVFILT_VNODE watch. Missing files (the lazy -wal) are
+            // simply skipped and (re)armed after every wake. A duplicate ADD of
+            // an existing ident/filter re-arms the same watch. The opened fd
+            // is intentionally kept open (forgotten) for the watch lifetime.
+            // The `kevent` fields are assigned directly rather than via the
+            // libc `EV_SET` macro, which not every libc release exports.
+            let add_watch = |path: &Path, fflags: u32| {
+                let Ok(fd) = std::fs::File::open(path) else {
+                    return;
+                };
+                let change = libc::kevent {
+                    ident: fd.as_raw_fd() as libc::uintptr_t,
+                    filter: libc::EVFILT_VNODE,
+                    // EV_ADD | EV_CLEAR: edge-style, one event per batch.
+                    flags: (libc::EV_ADD | libc::EV_CLEAR) as u16,
+                    fflags,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                };
+                unsafe {
+                    std::mem::forget(fd);
+                    let mut event: libc::kevent = std::mem::zeroed();
+                    let _ = libc::kevent(kq, &change, 1, &mut event, 0, std::ptr::null());
+                }
+            };
+            // Directory: entries added/removed/renamed (lazy -wal creation).
+            add_watch(&parent, libc::NOTE_WRITE);
+            // Database file: growth/writes, unlink or rename.
+            add_watch(
+                &db_path,
+                libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_DELETE | libc::NOTE_RENAME,
+            );
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(45);
+            loop {
+                if turn_row_exists(&conn, &instance_id) {
+                    return true;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                let mut timeout = libc::timespec {
+                    tv_sec: remaining.as_secs() as libc::time_t,
+                    tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
+                };
+                let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+                let ready =
+                    unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, &mut timeout) };
+                if ready == 0 {
+                    return false; // deadline reached
+                }
+                if ready < 0 {
+                    let errno = std::io::Error::last_os_error().raw_os_error();
+                    if errno == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return false;
+                }
+                // The WAL may be created lazily by the first transaction;
+                // (re)arm its file watch after every wake. Missing files are
+                // ignored until they exist.
+                add_watch(
+                    &wal_path,
+                    libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_DELETE | libc::NOTE_RENAME,
+                );
+            }
+        }))
+    }
+
+    /// Fallback for platforms with neither inotify nor kqueue (the gated e2e
+    /// and CI run on Linux/macOS; this keeps the test compiling elsewhere).
+    #[cfg(not(any(
+        target_os = "linux",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )))]
     fn spawn(db_path: PathBuf, instance_id: String) -> Self {
         Self(std::thread::spawn(move || {
             let Ok(conn) = rusqlite::Connection::open(&db_path) else {

@@ -1414,18 +1414,84 @@ fn two_prompted_panes_each_bind_their_own_file() {
     assert_eq!(b.binding().map(|x| x.session_id.as_str()), Some("B-file"));
 }
 
-// c-usagefu r6 item 2 ---------------------------------------------------------
+// c-usagefu r6 item 2 / r9 item 8 --------------------------------------------
+
+/// Ownership probe that rendezvouses two real discover() scans at one race
+/// file: each scanner blocks in the gate until the test releases its pid, so
+/// BOTH adapters have selected the same candidate before either claims.
+struct RaceProbe {
+    state: std::sync::Arc<RaceState>,
+    pid: u32,
+    race_file: PathBuf,
+    /// Post-race ownership (the loser's own later file).
+    extra: std::sync::Mutex<std::collections::HashMap<PathBuf, std::collections::HashSet<u32>>>,
+}
+
+struct RaceState {
+    arrived: std::sync::Mutex<u32>,
+    all_arrived: std::sync::Condvar,
+    released: std::sync::Mutex<std::collections::HashSet<u32>>,
+    gate_changed: std::sync::Condvar,
+}
+
+impl RaceProbe {
+    fn hold_extra(&self, path: &Path, pid: u32) {
+        let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.extra
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key)
+            .or_default()
+            .insert(pid);
+    }
+}
+
+impl crate::adapters::codex_ownership::RolloutOwnership for RaceProbe {
+    fn file_held_in_tree(&self, path: &Path, root: u32) -> bool {
+        let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if key == self.race_file {
+            // Rendezvous: signal arrival, then wait for the test to release
+            // THIS scanner — this is the point both scans share, after
+            // candidate selection and before claim_session.
+            {
+                let mut arrived = self
+                    .state
+                    .arrived
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *arrived += 1;
+                self.state.all_arrived.notify_all();
+            }
+            let _released = self
+                .state
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _released = self
+                .state
+                .gate_changed
+                .wait_while(_released, |set| !set.contains(&self.pid))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            return root == self.pid;
+        }
+        self.extra
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .is_some_and(|pids| pids.contains(&root))
+    }
+}
 
 #[test]
-fn a_claim_loser_keeps_discovering_and_never_takes_the_winners_file() {
-    // r8 item 8: BOTH adapters run their REAL discover() scan of the same
-    // candidates before either binds (no bind_for_test). The loser scans the
-    // winner's file while it is still unclaimed and rejects it on the
-    // process-ownership tier; the winner then binds its own pid-held file. The
-    // loser stays identity-empty, never takes the winner's file (even after
-    // the winner closes), then binds its own process-held rollout.
+fn two_real_scans_race_one_claim_and_the_loser_binds_its_own_file() {
+    // r9 item 8: two adapters run their REAL discover() scans and BOTH select
+    // the same unclaimed candidate W before either claims (a genuine claim
+    // race, not a pre-claim gate rejection). The winner's claim commits
+    // first; the loser's claim_session returns false, so it must keep NO
+    // identity (confirmed/discovered/binding all empty), never take W even
+    // after the winner closes, and then discover/bind its own file L.
     let home = tempfile::tempdir().unwrap();
-    let cwd = "/projects/r8-loser";
+    let cwd = "/projects/r9-item8-race";
     let now = OffsetDateTime::now_utc();
     let floor = now - time::Duration::seconds(5);
     let rfc = now.format(&Rfc3339).unwrap();
@@ -1433,52 +1499,119 @@ fn a_claim_loser_keeps_discovering_and_never_takes_the_winners_file() {
     write_rollout_prompt_at(home.path(), "W", cwd, &rfc, "winner words");
     let dir = home.path().join("sessions/2026/09/14");
     let winner_path = dir.join("rollout-W.jsonl");
-    let (probe_a, roots_a) = fake_ownership(6001);
-    let (probe_b, roots_b) = fake_ownership(6002);
+    let race_file = winner_path
+        .canonicalize()
+        .unwrap_or_else(|_| winner_path.to_path_buf());
+
+    let state = std::sync::Arc::new(RaceState {
+        arrived: std::sync::Mutex::new(0),
+        all_arrived: std::sync::Condvar::new(),
+        released: std::sync::Mutex::new(std::collections::HashSet::new()),
+        gate_changed: std::sync::Condvar::new(),
+    });
+    let probe_a = std::sync::Arc::new(RaceProbe {
+        state: std::sync::Arc::clone(&state),
+        pid: 6001,
+        race_file: race_file.clone(),
+        extra: std::sync::Mutex::new(std::collections::HashMap::new()),
+    });
+    let probe_b = std::sync::Arc::new(RaceProbe {
+        state: std::sync::Arc::clone(&state),
+        pid: 6002,
+        race_file,
+        extra: std::sync::Mutex::new(std::collections::HashMap::new()),
+    });
+    let roots_a = std::sync::Arc::new(std::sync::Mutex::new(vec![6001u32]));
+    let roots_b = std::sync::Arc::new(std::sync::Mutex::new(vec![6002u32]));
 
     // Both adapters exist and are unbound BEFORE any discover() call.
-    let mut a =
-        launch_with_fake_ownership(home.path(), cwd, floor, INST_A, 6001, &probe_a, &roots_a);
-    let mut b =
-        launch_with_fake_ownership(home.path(), cwd, floor, INST_B, 6002, &probe_b, &roots_b);
+    let mut a = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: PathBuf::from(cwd),
+        pid: None,
+        launched_at: Some(floor),
+    })
+    .with_lifetime(crate::adapters::codex_discovery::begin_lifetime(
+        Path::new(cwd),
+        INST_A,
+        floor,
+    ))
+    .with_instance_key(Some(INST_A.into()))
+    .with_ownership(
+        probe_a.clone() as std::sync::Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>,
+        Some(std::sync::Arc::clone(&roots_a)),
+    );
+    let mut b = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: PathBuf::from(cwd),
+        pid: None,
+        launched_at: Some(floor),
+    })
+    .with_lifetime(crate::adapters::codex_discovery::begin_lifetime(
+        Path::new(cwd),
+        INST_B,
+        floor,
+    ))
+    .with_instance_key(Some(INST_B.into()))
+    .with_ownership(
+        probe_b.clone() as std::sync::Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>,
+        Some(std::sync::Arc::clone(&roots_b)),
+    );
     assert!(a.confirmed.is_none() && a.discovered.is_none() && a.binding().is_none());
     assert!(b.confirmed.is_none() && b.discovered.is_none() && b.binding().is_none());
 
-    // The winner's process holds W open; the loser's does not.
-    probe_a.hold(&winner_path, 6001);
+    // Both real scans run concurrently; the probes block them after they have
+    // BOTH selected W. Release the WINNER first, then the loser: the loser's
+    // claim_session races the already-committed winner claim and fails.
+    std::thread::scope(|scope| {
+        let winner = scope.spawn(|| a.discover().unwrap());
+        let loser = scope.spawn(|| b.discover().unwrap());
 
-    // r8 item 8: the LOSER scans first, through its REAL discover() path,
-    // while W is still UNCLAIMED — no bind_for_test pre-binding the winner.
-    // B's process tree does not hold W, so B must reject the candidate on
-    // the ownership tier itself rather than on a claim it found there.
-    assert!(
-        !b.discover().unwrap(),
-        "loser does not bind a file its process never held, though unclaimed"
-    );
+        {
+            let mut arrived = state
+                .arrived
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while *arrived < 2 {
+                arrived = state
+                    .all_arrived
+                    .wait(arrived)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+        state
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(6001);
+        state.gate_changed.notify_all();
+        assert!(winner.join().expect("winner thread"), "winner claims W");
+
+        state
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(6002);
+        state.gate_changed.notify_all();
+        assert!(
+            !loser.join().expect("loser thread"),
+            "the loser's claim fails and it stays unbound"
+        );
+    });
+
+    // The loser carries no identity from the failed claim.
     assert!(b.confirmed.is_none(), "loser confirmed stays empty");
     assert!(b.discovered.is_none(), "loser discovered stays empty");
     assert!(b.binding().is_none(), "loser never bound W");
-    assert!(
-        !crate::adapters::codex_discovery::claim_is_present_any_owner(
-            &crate::adapters::codex_discovery::canonical_claim_key(&winner_path)
-        ),
-        "the loser's rejected scan left no claim on W"
-    );
-
-    // Only now does the winner scan and claim its own process-held file.
-    assert!(
-        a.discover().unwrap(),
-        "winner binds its own process-held file"
+    assert_eq!(
+        crate::adapters::codex_discovery::claimed_owner_of(&winner_path).as_deref(),
+        Some(INST_A),
+        "W is claimed by the winner alone"
     );
     assert_eq!(a.binding().map(|x| x.session_id.as_str()), Some("W"));
-    // B scanned the same candidate through the real path and lost.
-    assert!(!b.discover().unwrap());
-    assert!(b.confirmed.is_none(), "loser confirmed stays empty");
-    assert!(b.discovered.is_none(), "loser discovered stays empty");
-    assert!(b.binding().is_none(), "loser never bound W");
 
-    // After A closes B still cannot take A's file (claim outlives A and B's
-    // process never held it).
+    // After the winner closes, the loser still cannot take W (the claim
+    // outlives the close and the loser's process never held it).
     drop(a);
     assert!(!b.discover().unwrap());
     assert!(
@@ -1486,15 +1619,20 @@ fn a_claim_loser_keeps_discovering_and_never_takes_the_winners_file() {
         "closing the winner transfers nothing"
     );
 
-    // B's own rollout appears and is held by B's pid → binds.
+    // The loser's own rollout appears and is held by its pid -> binds.
     write_rollout_prompt_at(home.path(), "L", cwd, &rfc, "loser words");
     let loser_path = dir.join("rollout-L.jsonl");
-    probe_b.hold(&loser_path, 6002);
+    probe_b.hold_extra(&loser_path, 6002);
     assert!(b.discover().unwrap());
     assert_eq!(
         b.binding().map(|x| x.session_id.as_str()),
         Some("L"),
         "the loser binds its own rollout, never W"
+    );
+    assert_eq!(
+        crate::adapters::codex_discovery::claimed_owner_of(&winner_path).as_deref(),
+        Some(INST_A),
+        "W remains the winner's"
     );
 }
 

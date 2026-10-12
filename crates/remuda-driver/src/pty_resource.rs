@@ -22,6 +22,14 @@ pub(crate) const AGENT_EXIT_GRACE: Duration = Duration::from_secs(2);
 /// event-driven wait (the pane's exit event resolves it early), never a sleep.
 const RE_TAP_WAIT: Duration = Duration::from_millis(150);
 
+/// Bounded `events.subscribe` handshake for the close sequence. A server that
+/// accepts the connection but never acknowledges must not pin the close
+/// phase forever: after this bound the close aborts with a RETRYABLE carrier
+/// error and releases its ownership, so another close (or a restarted
+/// carrier) can re-run the audit instead of wedging the instance
+/// (c-ctxusage r15 item 6).
+const SUBSCRIBE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Bounded wait for a forced pane close to be reflected by Herdr (the close
 /// RPC itself removes the agent synchronously, so the first verification poll
 /// normally confirms it).
@@ -144,15 +152,33 @@ impl PtyResource {
         // Subscribe BEFORE signalling: subscriptions are frozen at request
         // time and the pane still exists, so the foreground-exit event caused
         // by the first Ctrl-C (polite path) or by pane.close (force path)
-        // cannot be missed. The same stream drives both waits.
-        let mut events = self
-            .client()
-            .subscribe(vec![
+        // cannot be missed. The same stream drives both waits. The handshake
+        // itself is bounded: a carrier that accepts but never acks must
+        // release the close phase as a retryable error (c-ctxusage r15 item 6).
+        let mut events = match tokio::time::timeout(
+            SUBSCRIBE_HANDSHAKE_TIMEOUT,
+            self.client().subscribe(vec![
                 Subscription::pane_exited(),
                 Subscription::global("pane.closed"),
-            ])
-            .await
-            .map_err(super::claude_pty::map_herdr)?;
+            ]),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(remuda_herdr::Error::Timeout { .. })) => {
+                Err(DriverError::CarrierUnavailable(format!(
+                    "events.subscribe handshake timed out before stopping pane {}",
+                    self.pane_id
+                )))?
+            }
+            Ok(Err(err)) => return Err(super::claude_pty::map_herdr(err)),
+            Err(_) => {
+                return Err(DriverError::CarrierUnavailable(format!(
+                    "events.subscribe handshake timed out after {:?} before stopping pane {}",
+                    SUBSCRIBE_HANDSHAKE_TIMEOUT, self.pane_id
+                )));
+            }
+        };
         if self.await_polite_exit(&client, &mut events, grace).await {
             return Ok(InterruptOutcome::ExitedGracefully);
         }

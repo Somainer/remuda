@@ -159,6 +159,11 @@ pub struct FakeHerdrOptions {
     ///   state is swapped first and the close is then processed against the
     ///   replacement boot — the gap-race model that kills the foreign pane.
     pub restart_barrier_on_close: bool,
+    /// Accept an `events.subscribe` connection but never send the
+    /// subscription_started ack (c-ctxusage r15 item 6). The connection parks
+    /// forever; other connections keep being served. Models a carrier wedged
+    /// during the polite-stop subscribe handshake.
+    pub subscribe_never_acks: bool,
 }
 
 /// Creation label the simulated restart hands the reused `w1` workspace to.
@@ -181,6 +186,7 @@ impl FakeHerdrOptions {
             force_close_record_file: None,
             restart_reuses_ids_on_ctrlc: false,
             restart_barrier_on_close: false,
+            subscribe_never_acks: false,
         }
     }
 
@@ -256,6 +262,15 @@ impl FakeHerdrOptions {
     #[must_use]
     pub fn restart_barrier_on_close(mut self) -> Self {
         self.restart_barrier_on_close = true;
+        self
+    }
+
+    /// Accept `events.subscribe` connections but never acknowledge them
+    /// (c-ctxusage r15 item 6). The closer's bounded handshake must give up
+    /// retryably rather than pin the close phase forever.
+    #[must_use]
+    pub fn subscribe_never_acks(mut self) -> Self {
+        self.subscribe_never_acks = true;
         self
     }
 }
@@ -345,6 +360,9 @@ impl FakeHerdrServer {
         }
         if options.restart_barrier_on_close {
             command.env("FAKE_HERDR_RESTART_BARRIER_ON_CLOSE", "1");
+        }
+        if options.subscribe_never_acks {
+            command.env("FAKE_HERDR_SUBSCRIBE_NEVER_ACKS", "1");
         }
 
         let mut child = command
@@ -525,6 +543,8 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
     let mut restart_barrier_on_close = std::env::var("FAKE_HERDR_RESTART_BARRIER_ON_CLOSE")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
+    let mut subscribe_never_acks = std::env::var("FAKE_HERDR_SUBSCRIBE_NEVER_ACKS")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -579,6 +599,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             "--exit-after-unavailable" => exit_after_unavailable = true,
             "--restart-reuses-ids-on-ctrlc" => restart_reuses_ids_on_ctrlc = true,
             "--restart-barrier-on-close" => restart_barrier_on_close = true,
+            "--subscribe-never-acks" => subscribe_never_acks = true,
             "--session" | "--takeover" => {
                 if args[i] == "--session" {
                     i += 1;
@@ -621,6 +642,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             force_close_record_file,
             restart_reuses_ids_on_ctrlc,
             restart_barrier_on_close,
+            subscribe_never_acks,
         }));
     }
     Err(FakeHerdrError::Args(format!(
@@ -733,6 +755,7 @@ async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
         options.force_close_record_file,
         options.restart_reuses_ids_on_ctrlc,
         options.restart_barrier_on_close,
+        options.subscribe_never_acks,
     )));
     // Only the scripted shutdown window (`exit_after_unavailable`) stops the
     // accept loop. Parent death is handled by the outer `parent_watch`
@@ -799,6 +822,8 @@ struct State {
     restart_barrier_on_close: bool,
     /// The close barrier fires once.
     close_barrier_done: bool,
+    /// Accept events.subscribe but never acknowledge it (r15 item 6).
+    subscribe_never_acks: bool,
     /// Bumped by the simulated restart; surfaced in `ping` capabilities.
     server_generation: u32,
 }
@@ -816,6 +841,7 @@ impl State {
         force_close_record_file: Option<PathBuf>,
         restart_on_ctrlc: bool,
         restart_barrier_on_close: bool,
+        subscribe_never_acks: bool,
     ) -> Self {
         Self {
             script,
@@ -843,6 +869,7 @@ impl State {
             restart_done: false,
             restart_barrier_on_close,
             close_barrier_done: false,
+            subscribe_never_acks,
             server_generation: 1,
         }
     }
@@ -923,6 +950,28 @@ async fn handle_conn(
             }
         }
         if req.method == "events.subscribe" {
+            // c-ctxusage r15 item 6: the wedged-carrier model. Only the
+            // close-path lifecycle handshake (pane.exited / pane.closed)
+            // parks; other subscriptions the driver uses at startup
+            // (pane.agent_status_changed) keep working, so the instance can
+            // come up normally before the close handshake wedges.
+            if lock_state(&state)?.subscribe_never_acks {
+                let closes = req
+                    .params
+                    .get("subscriptions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|subs| {
+                        subs.iter().any(|sub| {
+                            matches!(
+                                sub.get("type").and_then(Value::as_str),
+                                Some("pane.exited" | "pane.closed")
+                            )
+                        })
+                    });
+                if closes {
+                    futures::future::pending::<()>().await;
+                }
+            }
             handle_subscribe(&req, &mut writer, &state).await?;
             return Ok(());
         }

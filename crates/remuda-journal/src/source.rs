@@ -132,7 +132,7 @@ pub struct UnreadStart {
     /// File generation the record belongs to (normalised against the open
     /// file by the peek).
     pub generation: u64,
-    /// Byte offset of the record's first byte.
+    /// Byte offset of the record's first byte, in the normalised generation.
     pub offset: u64,
     /// Digest of the record bytes — the same digest [`Self::poll`] puts on
     /// the folded `FileCursor`, so the watermark can bind to the exact
@@ -141,6 +141,53 @@ pub struct UnreadStart {
     /// File length at peek time. The record's bytes live below this extent;
     /// a later same-generation file no longer than `offset` discarded them.
     pub extent: u64,
+}
+
+/// What a live-failure peek found at the newest unread position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnreadCover {
+    /// A complete `started` record on disk (terminated, or awaiting only its
+    /// newline). Bound by record digest.
+    Complete(UnreadStart),
+    /// A trailing record still TORN INSIDE its bytes at peek time that
+    /// already declares a `started` (its identity may still be incomplete).
+    /// Only a generation-scoped boundary is known; the record's identity is
+    /// matched against the failing member when the record completes, and the
+    /// boundary is retired once consumed or invalidated.
+    Pending {
+        /// Generation the partial record is being written in.
+        generation: u64,
+        /// Byte offset of the partial record's first byte.
+        offset: u64,
+        /// File length observed at peek time.
+        extent: u64,
+    },
+}
+
+impl UnreadCover {
+    /// Generation the covered record belongs to.
+    pub fn generation(&self) -> u64 {
+        match self {
+            UnreadCover::Complete(mark) => mark.generation,
+            UnreadCover::Pending { generation, .. } => *generation,
+        }
+    }
+
+    /// Start offset of the covered record.
+    pub fn offset(&self) -> u64 {
+        match self {
+            UnreadCover::Complete(mark) => mark.offset,
+            UnreadCover::Pending { offset, .. } => *offset,
+        }
+    }
+
+    /// File extent observed while arming the cover.
+    pub fn extent(&self) -> u64 {
+        match self {
+            UnreadCover::Complete(mark) => mark.extent,
+            UnreadCover::Pending { extent, .. } => *extent,
+        }
+    }
 }
 
 /// An opened journal after rotation normalisation: `rest` is the unread
@@ -218,36 +265,37 @@ impl FileTail {
         self.offset
     }
 
-    /// Find the NEWEST complete `started` record for `agent_id` in the
-    /// still-unread tail — its position, digest and the file extent observed
-    /// while finding it ([`UnreadStart`]) — or `None`. Matches on `agentId`
-    /// (falling back to `key`, for records that omit `agentId`).
+    /// Find the NEWEST unread `started` for `agent_id` as an [`UnreadCover`]
+    /// — or `None`. A terminated record, or a trailing newline-free segment
+    /// that already parses whole, is a digest-bound [`UnreadCover::Complete`];
+    /// a trailing segment torn INSIDE its JSON that already declares a
+    /// `started` arms an [`UnreadCover::Pending`] boundary (identity is
+    /// verified by the caller once the record completes). Matches on
+    /// `agentId`, falling back to `key` for records that omit it.
     ///
     /// Does NOT consume records, but it DOES apply the same rotation
     /// normalisation against the opened file as [`Self::poll`] (a
     /// replace/truncate or prefix rewrite since the last poll starts a fresh
     /// generation here too), so positions are reported in the generation the
     /// next fold will use. A live StopFailure uses the result as a terminal
-    /// watermark: only starts at or before that position, and at the
+    /// watermark: only starts at or before that position, and at a Complete
     /// position only with the SAME record digest, are the failure's own
     /// settled attempt; a start at a later offset is a genuine retry and must
     /// resurrect the member even when both fold in the same poll.
     ///
     /// Completeness agrees with [`Self::poll`] on every terminated record, but
-    /// it ALSO recognises a trailing newline-free segment that already parses
-    /// as a complete `started`. Such a record is on disk in full — only its
-    /// terminating newline is missing — and a StopFailure arriving in that
-    /// window settles that attempt. [`Self::poll`] consumes nothing on the
-    /// first polls, so the caller must keep the watermark armed through those
-    /// empty polls until the record (completed by its newline) is actually
-    /// consumed. Skipping the unterminated segment here would leave that
-    /// ordering unprotected.
+    /// the peek ALSO covers records the poll cannot consume yet: a complete
+    /// record awaiting only its newline (Complete), and a record torn inside
+    /// its JSON (Pending). [`Self::poll`] consumes nothing on the first polls,
+    /// so the caller keeps the cover armed through those empty polls until the
+    /// record is actually consumed. Skipping the incomplete tail here would
+    /// leave a StopFailure arriving mid-write unprotected.
     ///
     /// The observed file length is remembered so a later poll can invalidate
-    /// the watermark when the unread suffix it covered was discarded by a
+    /// the cover when the unread suffix it covered was discarded by a
     /// truncate that did not bump the generation (see
     /// [`Self::extent_discarded`]).
-    pub fn unread_start(&mut self, agent_id: &str) -> Result<Option<UnreadStart>, Error> {
+    pub fn unread_start(&mut self, agent_id: &str) -> Result<Option<UnreadCover>, Error> {
         // Normalise against the OPENED file (a replace/truncate since the
         // last poll starts a new generation here, not only later in poll), so
         // the watermark binds to the generation its record will actually fold
@@ -286,28 +334,36 @@ impl FileTail {
             record_start(line, start, &mut newest);
             start = i + 1;
         }
-        // Trailing newline-free segment: a complete record awaiting only its
-        // terminating newline (see the method docs).
+        // Trailing newline-free segment: either a complete record awaiting
+        // only its newline, or a record torn inside its JSON (Pending).
         if start < rest.len() {
             let mut line = &rest[start..];
             if let Some(without_cr) = line.strip_suffix(b"\r") {
                 line = without_cr;
             }
-            record_start(line, start, &mut newest);
+            if serde_json::from_slice::<serde_json::Value>(line).is_ok() {
+                record_start(line, start, &mut newest);
+            } else if partial_started_prefix(line, agent_id) {
+                return Ok(Some(UnreadCover::Pending {
+                    generation: self.generation,
+                    offset: self.offset + start as u64,
+                    extent: len,
+                }));
+            }
         }
-        Ok(newest)
+        Ok(newest.map(UnreadCover::Complete))
     }
 
     /// Whether an unread suffix observed by [`Self::unread_start`] has since
     /// been discarded while the generation stayed the same: an intervening
     /// poll of the truncated file saw it shrink to a length at or below the
-    /// record's start offset. The caller uses this to retire a watermark
-    /// before a reused position can be mistaken for the settled record.
-    pub fn extent_discarded(&self, mark: &UnreadStart) -> bool {
-        self.generation == mark.generation
+    /// record's start offset. The caller uses this to retire a cover before a
+    /// reused position can be mistaken for the settled record.
+    pub fn extent_discarded(&self, cover: &UnreadCover) -> bool {
+        self.generation == cover.generation()
             && self
                 .last_len
-                .is_some_and(|last| last < mark.extent && last <= mark.offset)
+                .is_some_and(|last| last < cover.extent() && last <= cover.offset())
     }
 
     /// Persistable cursor.
@@ -432,5 +488,157 @@ impl FileTail {
         file.read_exact(&mut buf)?;
         self.prefix_digest = Some(digest_of(&buf));
         Ok(())
+    }
+}
+
+/// Whether a trailing segment that does NOT yet parse as JSON is a torn
+/// `started` record for `agent_id` — a generation-scoped boundary worth
+/// covering before the rest of the record lands.
+///
+/// Only complete `"key":"value"` string pairs already on disk are inspected,
+/// so a tear anywhere (even inside a pair) is tolerated. `type` must be
+/// present and equal `started`. Identity: a complete `agentId` pair must
+/// equal `agent_id`; if the `agentId` key is present but its value is still
+/// torn, the identity is undecided and the boundary is armed anyway (the
+/// caller verifies identity once the record completes); with no `agentId`
+/// key at all, the `key` fallback must equal `agent_id`. A fully resolved
+/// different identity returns false.
+fn partial_started_prefix(line: &[u8], agent_id: &str) -> bool {
+    let mut i = line
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(line.len());
+    if i >= line.len() || line[i] != b'{' {
+        return false;
+    }
+    i += 1;
+    let mut record_type: Option<String> = None;
+    let mut agent_id_value: Option<String> = None;
+    let mut agent_id_key_seen = false;
+    let mut key_value: Option<String> = None;
+    // Read `"key":"value"` pairs (all journal fields are strings) until the
+    // object closes or the torn end stops a pair from being read whole.
+    loop {
+        while i < line.len() && line[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= line.len() || line[i] == b'}' {
+            break;
+        }
+        if line[i] != b'"' {
+            break;
+        }
+        let Some((pair_key, next)) = read_json_string(&line[i..]) else {
+            break;
+        };
+        i += next;
+        while i < line.len() && line[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= line.len() || line[i] != b':' {
+            break;
+        }
+        i += 1;
+        while i < line.len() && line[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= line.len() || line[i] != b'"' {
+            // The agentId key was read but its string value is the torn part.
+            if pair_key == "agentId" {
+                agent_id_key_seen = true;
+            }
+            break;
+        }
+        let Some((value, next)) = read_json_string(&line[i..]) else {
+            if pair_key == "agentId" {
+                agent_id_key_seen = true;
+            }
+            break;
+        };
+        i += next;
+        match pair_key.as_str() {
+            "type" => record_type = Some(value),
+            "agentId" => agent_id_value = Some(value),
+            "key" => key_value = Some(value),
+            _ => {}
+        }
+        while i < line.len() && line[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match line.get(i) {
+            Some(b',') => i += 1,
+            Some(b'}') => break,
+            _ => break,
+        }
+    }
+    if record_type.as_deref() != Some("started") {
+        return false;
+    }
+    match agent_id_value {
+        Some(value) => value == agent_id,
+        None if agent_id_key_seen => true,
+        None => key_value.as_deref() == Some(agent_id),
+    }
+}
+
+/// Parse ONE JSON string (the slice begins at its opening quote), returning
+/// its decoded value and the number of input bytes consumed through the
+/// closing quote. `None` when the closing quote has not been written yet
+/// (the record is torn). Escape sequences are followed so a backslash
+/// inside the torn tail is not mistaken for termination.
+fn read_json_string(input: &[u8]) -> Option<(String, usize)> {
+    debug_assert_eq!(input.first(), Some(&b'"'));
+    let mut value: Vec<u8> = Vec::new();
+    let mut escaped = false;
+    for (index, byte) in input.iter().enumerate().skip(1) {
+        if escaped {
+            value.push(*byte);
+            escaped = false;
+        } else if *byte == b'\\' {
+            value.push(b'\\');
+            escaped = true;
+        } else if *byte == b'"' {
+            return Some((String::from_utf8_lossy(&value).into_owned(), index + 1));
+        } else {
+            value.push(*byte);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod torn_start_tests {
+    use super::partial_started_prefix;
+
+    #[test]
+    fn torn_inside_json_identity_edges() {
+        // Full agentId, closing brace missing -> the failing agent's record.
+        assert!(partial_started_prefix(
+            br#"{"type":"started","key":"v2:k","agentId":"a1""#,
+            "a1"
+        ));
+        // Torn inside the agentId VALUE: identity undecided, armed anyway.
+        assert!(partial_started_prefix(
+            br#"{"type":"started","key":"v2:k","agentId":"a"#,
+            "a1"
+        ));
+        // A complete DIFFERENT agentId is not this member's record.
+        assert!(!partial_started_prefix(
+            br#"{"type":"started","key":"v2:k","agentId":"a2""#,
+            "a1"
+        ));
+        // type not yet present/complete -> not a started record.
+        assert!(!partial_started_prefix(br#"{"type":"faile"#, "a1"));
+        assert!(!partial_started_prefix(br#"nonsense {"#, "a1"));
+        // key fallback before the agentId key is written.
+        assert!(partial_started_prefix(
+            br#"{"type":"started","key":"a1","agentI"#,
+            "a1"
+        ));
+        // Escaped quote inside an in-progress value never terminates early.
+        assert!(!partial_started_prefix(
+            br#"{"type":"started","key":"a\"x","#,
+            "a1"
+        ));
     }
 }

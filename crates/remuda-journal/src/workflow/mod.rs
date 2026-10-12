@@ -31,7 +31,7 @@ pub use script::{AgentCallSite, MatchedCall, WorkflowScript};
 use crate::Error;
 use crate::claude::{NativeIds, envelope as file_envelope, opaque};
 use crate::envelope::Envelope;
-use crate::source::{FileTail, MapContext, Source, SourceResume, UnreadStart};
+use crate::source::{FileTail, MapContext, Source, SourceResume, UnreadCover};
 use crate::util::{known, parse_timestamp, timestamp_from_unix_ms, timestamp_now, unknown};
 use remuda_protocol::{
     Completeness, FileCursor, ObservationPayload, OpaqueReason, SourceChannel, Timestamp, U64,
@@ -100,7 +100,7 @@ pub struct WorkflowJournalTailer {
     /// fold suppresses resurrection only for that exact record (and earlier
     /// catch-up positions), until it is consumed, the journal rotates, or the
     /// covered unread suffix is discarded by an in-place truncate.
-    failure_watermarks: HashMap<String, UnreadStart>,
+    failure_watermarks: HashMap<String, UnreadCover>,
     /// Main session transcript path. Every run adopts an end-anchored tail at
     /// registration, so a run launched minutes after the SessionStart bind
     /// never re-reads pre-launch transcript bytes.
@@ -168,7 +168,7 @@ struct MemberState {
     /// earlier position, or AT the position only with the same digest, and
     /// clears the watermark once that position is passed, the journal
     /// rotates, or the covered suffix was discarded by an in-place truncate.
-    failure_watermark: Option<UnreadStart>,
+    failure_watermark: Option<UnreadCover>,
     state: WorkflowState,
     label: Option<String>,
     phase: Option<String>,
@@ -505,7 +505,7 @@ impl WorkflowJournalTailer {
             // consumed by the fold only when the exact record it covers is
             // read, so it is armed afresh here on every poll (re-arming the
             // same member with the same mark is a no-op).
-            let armed: Vec<(String, UnreadStart)> = self
+            let armed: Vec<(String, UnreadCover)> = self
                 .failure_watermarks
                 .iter()
                 .filter(|(agent_id, _)| {
@@ -1389,20 +1389,29 @@ impl RunState {
                 //   different agent id already bumped (started(k,a0) then
                 //   started(k,a1) counts the key to 2, but a1 never consumed
                 //   a start).
-                // r6 item 1 / r7 item 1: it also must not fire when this start
-                // record is covered by the terminal watermark of a live
+                // r6 item 1 / r7 items 1+3: it also must not fire when this
+                // start record is covered by the terminal watermark of a live
                 // StopFailure — an earlier catch-up position in the same
-                // generation, or the settled record AT its position, which
-                // must additionally carry the SAME record digest. A different
-                // record reusing the offset (in-place truncate + rewrite) or a
-                // start at a later offset, including one folded later in the
-                // SAME poll, is a genuine retry and resurrects. Same-attempt
-                // folds and a placeholder's own first start never downgrade a
-                // terminal outcome.
-                let settled_by_watermark = member.failure_watermark.as_ref().is_some_and(|mark| {
-                    cursor.file_generation.0 == mark.generation
-                        && (cursor.offset.0 < mark.offset
-                            || (cursor.offset.0 == mark.offset && cursor.digest == mark.digest))
+                // generation, or the settled record AT its position. A
+                // Complete cover additionally requires the SAME record digest
+                // (a different record reusing the offset via in-place
+                // truncate+rewrite is a genuine retry); a Pending boundary
+                // armed from a record torn INSIDE its JSON has no digest yet,
+                // so its agent identity is matched now that the record is
+                // whole (this fold only reaches the member the record routes
+                // to). A start at a later offset, including one folded later
+                // in the SAME poll, resurrects.
+                let settled_by_watermark = member.failure_watermark.as_ref().is_some_and(|cover| {
+                    cursor.file_generation.0 == cover.generation()
+                        && (cursor.offset.0 < cover.offset()
+                            || (cursor.offset.0 == cover.offset()
+                                && match cover {
+                                    UnreadCover::Complete(mark) => cursor.digest == mark.digest,
+                                    // Boundary captured mid-write; verify
+                                    // the completed record's identity is
+                                    // this member before covering it.
+                                    UnreadCover::Pending { .. } => agent_id == member.agent_id,
+                                }))
                 });
                 let genuine_retry =
                     is_newer_attempt && member.consumed_journal_start && !settled_by_watermark;
@@ -1416,16 +1425,16 @@ impl RunState {
                     // force one file-catch-up convergence emission.
                     self.force_member_refresh.insert(agent_id.clone());
                 }
-                // r6 item 1 / r7 item 1: the watermark is spent once the fold
+                // r6 item 1 / r7 items 1+3: the cover is spent once the fold
                 // reaches its position — this record itself (cursor at the
-                // watermark, whether it matched by digest or reused the
-                // offset), or a journal rotation (different generation). A
-                // genuinely newer start at a LATER offset that resurrects also
-                // clears it via the `>=` comparison. Empty polls never reach
-                // here and therefore keep it armed.
-                if let Some(mark) = member.failure_watermark.as_ref()
-                    && (cursor.file_generation.0 != mark.generation
-                        || cursor.offset.0 >= mark.offset)
+                // boundary, whether it matched by digest, identity or reused
+                // the offset), or a journal rotation (different generation).
+                // A genuinely newer start at a LATER offset that resurrects
+                // also clears it via the `>=` comparison. Empty polls never
+                // reach here and therefore keep it armed.
+                if let Some(cover) = member.failure_watermark.as_ref()
+                    && (cursor.file_generation.0 != cover.generation()
+                        || cursor.offset.0 >= cover.offset())
                 {
                     member.failure_watermark = None;
                 }
@@ -1506,7 +1515,7 @@ impl RunState {
 
     /// r5-r7 item 2: arm [`MemberState::failure_watermark`] on the named
     /// members from the tailer's live-StopFailure marks.
-    fn arm_failure_watermarks(&mut self, armed: &[(String, UnreadStart)]) {
+    fn arm_failure_watermarks(&mut self, armed: &[(String, UnreadCover)]) {
         for member in &mut self.members {
             if let Some((_, watermark)) = armed
                 .iter()

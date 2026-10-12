@@ -1394,3 +1394,150 @@ fn a_replaced_shorter_journal_before_failure_is_normalised_by_the_peek() {
         "a start appended after the settled attempt is a genuine retry in the new generation"
     );
 }
+
+/// c-cardsettle-fu2 r7 item 3 (r6 brief item 2 NOT MET): covering only a
+/// newline-missing record is not enough. Attempt 2's start can be torn
+/// INSIDE its JSON when the live failure arrives — bytes present up to the
+/// agentId, with no closing brace and no newline. No poll consumes them, but
+/// the peek must capture a generation-scoped PENDING boundary there; once
+/// the record completes (closing brace + newline), its agent identity is
+/// matched against the failing member and the settled attempt stays Failed.
+#[test]
+fn a_start_torn_inside_its_json_at_failure_time_stays_covered() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_r7_tornjson";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    // Attempt 1: started then failed, both folded on the first poll.
+    std::fs::write(
+        run_dir.join("journal.jsonl"),
+        "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n\
+         {\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n",
+    )
+    .unwrap();
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        bodies(tailer.poll().unwrap())
+            .iter()
+            .rev()
+            .find_map(|body| match body {
+                ObservationPayload::WorkflowMember(m)
+                    if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+                {
+                    Some(m.state)
+                }
+                _ => None,
+            })
+            .expect("a1 observed"),
+        WorkflowState::Failed,
+        "attempt 1 ends Failed"
+    );
+
+    // Attempt 2's start, torn INSIDE the JSON: full agentId, no closing
+    // brace, no newline.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        write!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\""
+        )
+        .unwrap();
+    }
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+
+    // First poll consumes nothing — the record is still unparseable.
+    assert!(
+        bodies(tailer.poll().unwrap())
+            .iter()
+            .filter_map(|body| match body {
+                ObservationPayload::WorkflowMember(m)
+                    if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+                {
+                    Some(m.state)
+                }
+                _ => None,
+            })
+            .all(|state| state == WorkflowState::Failed),
+        "the torn JSON folds nothing; a1 stays Failed"
+    );
+
+    // Complete the record: closing brace + newline.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(journal, "}}").unwrap();
+    }
+    let completed: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        completed
+            .iter()
+            .all(|state| *state == WorkflowState::Failed),
+        "the JSON-torn start is the settled attempt once completed: {completed:?}"
+    );
+
+    // A genuinely newer attempt appended afterwards resurrects.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}}"
+        )
+        .unwrap();
+    }
+    let final_state = bodies(tailer.poll().unwrap())
+        .iter()
+        .rev()
+        .find_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .expect("a1 observed after attempt 3");
+    assert_eq!(
+        final_state,
+        WorkflowState::Running,
+        "a start after the covered record is a genuine retry"
+    );
+}

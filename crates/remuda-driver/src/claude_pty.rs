@@ -3843,6 +3843,62 @@ mod tests {
         .to_string()
     }
 
+    /// c-effortread r21: the `/effort` slash builder with an explicit record
+    /// version. `map_record_at` feeds every record's own `version` to the
+    /// tracker gate, so the coupled 2.1.272 scenario cannot reuse the
+    /// 2.1.289-hardcoded builders above (the gate would flip to decoupled).
+    fn r21_effort_slash_line_v(uuid: &str, word: &str, version: &str) -> String {
+        json!({
+            "type": "user",
+            "uuid": uuid,
+            "sessionId": "effort-session",
+            "version": version,
+            "message": {
+                "role": "user",
+                "content": format!(
+                    "<command-name>/effort</command-name>\n<command-message>effort</command-message>\n\
+                     <command-args>{word}</command-args>"
+                )
+            }
+        })
+        .to_string()
+    }
+
+    /// c-effortread r21: the `<local-command-stdout>` verdict builder with an
+    /// explicit record version (see [`Self::r21_effort_slash_line_v`]).
+    fn r21_effort_stdout_line_v(uuid: &str, body: &str, version: &str) -> String {
+        json!({
+            "type": "user",
+            "uuid": uuid,
+            "sessionId": "effort-session",
+            "version": version,
+            "message": {
+                "role": "user",
+                "content": format!("<local-command-stdout>{body}</local-command-stdout>")
+            }
+        })
+        .to_string()
+    }
+
+    /// c-effortread r21: a `/model` accepted verdict carrying the
+    /// ` with `<level>` effort` clause, with an explicit record version.
+    fn r21_model_stdout_line_v(uuid: &str, level: &str, version: &str) -> String {
+        json!({
+            "type": "user",
+            "uuid": uuid,
+            "sessionId": "effort-session",
+            "version": version,
+            "message": {
+                "role": "user",
+                "content": format!(
+                    "<local-command-stdout>Set model to `Opus 5.5` and saved as your default \
+                     for new sessions with `{level}` effort</local-command-stdout>"
+                )
+            }
+        })
+        .to_string()
+    }
+
     /// c-effortread r19 item 2 ruling B, scenario (a): the suppressed stash is
     /// ONE latest slot. With high published and B=max armed, a suppressed
     /// `/effort max` acceptance is overwritten by a later suppressed
@@ -4702,6 +4758,161 @@ mod tests {
         assert!(
             r19_effort_edges(&after).is_empty(),
             "effective stays {{high, off}}; max is never published"
+        );
+    }
+
+    /// c-effortread r21 item 1 ruling B″(1) on a COUPLED 2.1.272 build: with
+    /// `{xhigh, on}` published and B=max armed, a suppressed older unowned
+    /// plain `Set effort level to xhigh` verdict is positive flag-OFF
+    /// evidence (a coupled plain-level accept positively clears the flag).
+    /// A following `/model` verdict carrying the `xhigh` effort clause is a
+    /// level-only read-back: its flag must come from the POSITIVE LATCH
+    /// (`{xhigh, off}` publishes exactly once), not from the published
+    /// `{xhigh, on}` fallback — otherwise the read-back dedups, clears the
+    /// stashes and B's Kept leaves the UI at "ultracode on". B's later Kept
+    /// emits nothing stale.
+    #[tokio::test]
+    async fn r21_item1_coupled_suppressed_plain_off_then_model_clause_publishes_xhigh_off_once() {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let instance_id = InstanceId::new();
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            instance_id.clone(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.272".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // The {xhigh, on} baseline: a human coupled /effort ultracode and its
+        // verdict while the bridge is idle (normal path).
+        mapper
+            .map_line_at(
+                &r21_effort_slash_line_v("cmd-ultra", "ultracode", "2.1.272"),
+                Some(400),
+            )
+            .expect("map human ultracode slash");
+        let baseline = mapper
+            .map_line_at(
+                &r21_effort_stdout_line_v(
+                    "out-ultra",
+                    "Set effort level to ultracode (this session only): xhigh + dynamic workflows \
+                     enabled.",
+                    "2.1.272",
+                ),
+                Some(450),
+            )
+            .expect("map coupled ultracode accept");
+        assert_eq!(
+            r19_effort_edges(&baseline),
+            vec![(Some(remuda_protocol::EffortName::Xhigh), Some(true), None)],
+            "the published baseline is {{xhigh, on}}"
+        );
+
+        // B=max armed; the older pre-floor /effort max's plain xhigh verdict
+        // lands first and is suppressed while B is armed.
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+        mapper
+            .map_line_at(
+                &r21_effort_slash_line_v("cmd-old", "max", "2.1.272"),
+                Some(500),
+            )
+            .expect("map old slash");
+        mapper
+            .map_line_at(
+                &r21_effort_slash_line_v("cmd-b", "max", "2.1.272"),
+                Some(1500),
+            )
+            .expect("map B slash");
+        let suppressed = mapper
+            .map_line_at(
+                &r21_effort_stdout_line_v(
+                    "out-old",
+                    "Set effort level to xhigh (saved as your default for new sessions): …",
+                    "2.1.272",
+                ),
+                Some(1600),
+            )
+            .expect("map suppressed plain xhigh accept");
+        assert!(
+            r19_effort_edges(&suppressed).is_empty(),
+            "the old plain xhigh/off acceptance stays suppressed"
+        );
+        assert!(bridge.has_pending());
+
+        // The /model verdict's `xhigh` effort clause: level-only read-back
+        // that publishes {xhigh, off} EXACTLY ONCE from the positive latch.
+        let model = mapper
+            .map_line_at(
+                &r21_model_stdout_line_v("mdl-xhigh", "xhigh", "2.1.272"),
+                Some(1700),
+            )
+            .expect("map /model verdict with the xhigh effort clause");
+        assert_eq!(
+            r19_effort_edges(&model),
+            vec![(Some(remuda_protocol::EffortName::Xhigh), Some(false), None)],
+            "exactly one {{xhigh, off}} publication, from the positive flag-off latch"
+        );
+
+        // B is Kept: the dropped stash must never publish and B records its
+        // own rejection.
+        let dismissed = mapper
+            .map_line_at(
+                &r21_effort_stdout_line_v("out-b", "Kept effort level as max", "2.1.272"),
+                Some(1800),
+            )
+            .expect("map B refusal");
+        assert!(
+            r19_effort_edges(&dismissed).is_empty(),
+            "nothing stale publishes after B's Kept"
+        );
+        assert!(matches!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .expect("B recorded the rejection"),
+            crate::effort::Readback::Rejected { .. }
+        ));
+        let suppressed_id = remuda_protocol::effort_record_event_id(
+            instance_id.as_id().as_str(),
+            remuda_protocol::EFFORT_STDOUT_NATIVE,
+            "out-old",
+            remuda_protocol::EffortName::Xhigh,
+        );
+        for out in [&suppressed, &model, &dismissed] {
+            assert!(
+                out.iter().all(|obs| obs.event_id != suppressed_id),
+                "the suppressed xhigh/off edge id is never emitted"
+            );
+        }
+        // Effective stays {xhigh, off}: a following xhigh assistant record
+        // agrees and dedups.
+        let after = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-xhigh",
+                    "sessionId": "effort-session",
+                    "version": "2.1.272",
+                    "message": {"id": "msg-xhigh", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "done"}]},
+                    "effort": "xhigh",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(1900),
+            )
+            .expect("map assistant xhigh");
+        assert!(
+            r19_effort_edges(&after).is_empty(),
+            "effective stays {{xhigh, off}}; the on state never returns"
         );
     }
 

@@ -1161,6 +1161,21 @@ impl EffortTracker {
                 if self.ultracode_pending || (self.flag == Some(true) && name == EffortName::Xhigh)
                 {
                     Some(true)
+                } else if let Some(flag) = self.flag {
+                    // c-effortread r21 ruling B″(1): a POSITIVELY LATCHED flag
+                    // wins over the last PUBLISHED tuple; the published flag is
+                    // a fallback used ONLY when no positive flag evidence
+                    // exists (the tuple dedupes, it never fills or overrides
+                    // evidence). A suppressed unowned plain-level acceptance
+                    // latches flag-OFF while a switch is armed, and a later
+                    // level-only read-back (an assistant record or the /model
+                    // effort clause) supersedes its tuple only in the deferred
+                    // slot — the positive off evidence stays, so `{xhigh, off}`
+                    // publishes even though the last published tuple is
+                    // `{xhigh, on}`. On coupled builds the flag presents on
+                    // only at the xhigh ultracode level, the same gate the
+                    // arm above enforces.
+                    Some(flag && name == EffortName::Xhigh)
                 } else {
                     self.last
                         .filter(|last| last.name == name)
@@ -2443,6 +2458,78 @@ mod tests {
         );
         // A repeated same-level status stays silent.
         assert!(tracker.note_status(parsed).is_none());
+    }
+
+    #[test]
+    fn r21_item1_a_suppressed_plain_off_latch_beats_the_published_xhigh_on_fallback() {
+        // c-effortread r21 ruling B″(1), COUPLED 2.1.272: the last published
+        // tuple is {xhigh, on} and B=max is armed. An older unowned plain
+        // "Set effort level to xhigh" verdict (positive flag-OFF on coupled)
+        // is suppressed, latching the flag off. The level-only /model effort
+        // clause at xhigh must then publish {xhigh, OFF}: the positively
+        // latched flag wins over the published-state fallback. Previously the
+        // coupled branch fell back to the published flag-on, the read-back
+        // equalled the published tuple and only cleared the stashes, so B's
+        // Kept published nothing and the UI stayed "ultracode on".
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.272");
+        tracker.note_slash("ultracode", false);
+        tracker
+            .note_stdout(
+                "Set effort level to ultracode (this session only): xhigh + dynamic …",
+                false,
+            )
+            .expect("the {xhigh, on} baseline publishes");
+        assert_eq!(
+            tracker.last_observed(),
+            Some(ObservedEffort {
+                name: EffortName::Xhigh,
+                ultracode: Some(true),
+            })
+        );
+        // B=max armed; the older unowned plain xhigh accept is suppressed but
+        // positively latches the flag off.
+        tracker.note_slash("max", true);
+        let accept = tracker
+            .note_unowned_stdout(
+                "Set effort level to xhigh (saved as your default for new sessions): …",
+            )
+            .expect("the suppressed plain xhigh accept is handed back");
+        assert_eq!(
+            accept.observed,
+            ObservedEffort {
+                name: EffortName::Xhigh,
+                ultracode: Some(false),
+            }
+        );
+        // The /model verdict's level-only effort clause at xhigh: the positive
+        // flag-OFF latch beats the published {xhigh, on} fallback.
+        let edge = tracker
+            .observe_level(EffortName::Xhigh, EffortSource::Slash)
+            .expect("{xhigh, off} publishes");
+        assert_eq!(
+            edge.0,
+            ObservedEffort {
+                name: EffortName::Xhigh,
+                ultracode: Some(false),
+            }
+        );
+        assert!(tracker.deferred_observation().is_none());
+        // B refuses: nothing folds, nothing stale surfaces.
+        assert!(
+            tracker
+                .note_stdout("Kept effort level as max", true)
+                .is_none()
+        );
+        assert_eq!(
+            tracker.last_observed(),
+            Some(ObservedEffort {
+                name: EffortName::Xhigh,
+                ultracode: Some(false),
+            })
+        );
+        // A following xhigh assistant record agrees with the published tuple.
+        assert!(tracker.observe(Some("xhigh"), None).is_none());
     }
 
     #[test]

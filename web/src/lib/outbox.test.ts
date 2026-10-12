@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  CLAIM_WAKE_BASE_RETRY_MS,
+  CLAIM_WAKE_MAX_FAILURES,
+  CLAIM_WAKE_MAX_RETRY_MS,
   instanceDeliveryLockName,
   LEASE_TTL_MS,
   newCommandId,
@@ -681,6 +684,116 @@ describe("Outbox", () => {
       expect(hook).toHaveBeenCalledTimes(1);
       a.dispose();
       b.dispose();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
+  it("GATE21 item 3: persistently failing reads use growing bounded delays, stop with an explicit exhausted state, and a fresh read recovers", async () => {
+    // Before gate 21 item 3 every scheduled retry re-entered at attempt 0, so a
+    // permanently broken durable backend was polled at a flat 250 ms forever
+    // with no surfaced state. The failure count must now carry across attempts
+    // (250 ms·2^(n-1) capped at 5 s, CLAIM_WAKE_MAX_FAILURES reads), the chain
+    // must stop and fire onReadRecoveryExhausted exactly once, and a later
+    // successful fresh read clears the latch.
+    vi.useFakeTimers();
+    vi.setSystemTime(400_000);
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
+    class FlakyStorage extends MemStorage {
+      reads = 0;
+      times: number[] = [];
+      failing = false;
+      override async all() {
+        if (this.failing) {
+          this.reads += 1;
+          this.times.push(Date.now());
+          throw new Error("persistent IDB failure");
+        }
+        return await super.all();
+      }
+    }
+    try {
+      const storage = new FlakyStorage();
+      const box = await Outbox.load(storage, "owner_g21_item3");
+      storage.failing = true;
+      const exhausted = vi.fn();
+      const recovered = vi.fn();
+      box.onReadRecoveryExhausted = exhausted;
+      box.onReadRecoveryRecovered = recovered;
+      expect(box.isReadRecoveryExhausted()).toBe(false);
+
+      void box.refreshDurableRecovering(0);
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(60_000); // far beyond the capped chain
+
+      // Bounded: exactly CLAIM_WAKE_MAX_FAILURES real read attempts, then stop.
+      expect(storage.reads).toBe(CLAIM_WAKE_MAX_FAILURES);
+      expect(box.isReadRecoveryExhausted()).toBe(true);
+      expect(exhausted).toHaveBeenCalledTimes(1);
+      expect(recovered).not.toHaveBeenCalled();
+
+      // Delays between attempts grow exponentially and then cap at 5 s.
+      const gaps = storage.times.slice(1).map((t, i) => t - storage.times[i]!);
+      for (let i = 1; i < gaps.length; i += 1) {
+        expect(gaps[i]!).toBeGreaterThanOrEqual(gaps[i - 1]!);
+      }
+      expect(gaps[0]).toBe(CLAIM_WAKE_BASE_RETRY_MS);
+      expect(gaps[gaps.length - 1]).toBe(CLAIM_WAKE_MAX_RETRY_MS);
+
+      // No silent retries after the envelope, even far past the cap.
+      const readsAtStop = storage.reads;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(storage.reads).toBe(readsAtStop);
+
+      // A FRESH trigger (a later user/online flush) restarts the chain; the
+      // first successful read clears the latch and fires recovery.
+      storage.failing = false;
+      await box.refreshDurableRecovering(0);
+      expect(box.isReadRecoveryExhausted()).toBe(false);
+      expect(recovered).toHaveBeenCalledTimes(1);
+      box.dispose();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
+  it("GATE21 item 3: the bounded read-retry chain is cancelled on unload/disposal — no reads and no exhaustion afterwards", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(450_000);
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
+    class FlakyStorage extends MemStorage {
+      reads = 0;
+      failing = false;
+      override async all() {
+        if (this.failing) {
+          this.reads += 1;
+          throw new Error("persistent IDB failure");
+        }
+        return await super.all();
+      }
+    }
+    try {
+      const storage = new FlakyStorage();
+      const box = await Outbox.load(storage, "owner_g21_item3_cancel");
+      storage.failing = true;
+      const exhausted = vi.fn();
+      box.onReadRecoveryExhausted = exhausted;
+
+      void box.refreshDurableRecovering(0);
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(300); // immediate read + one 250 ms retry
+      expect(storage.reads).toBe(2);
+
+      // Genuine teardown cancels the chain mid-backoff.
+      box.cancelAllWakesForUnload();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(storage.reads).toBe(2);
+      expect(exhausted).not.toHaveBeenCalled();
+      box.dispose();
     } finally {
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });

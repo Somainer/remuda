@@ -707,7 +707,19 @@ export class Outbox {
    * fire or store flush). The retry ends in the SAME central reconciliation;
    * teardown/dispose cancels it. `promise` lets concurrent callers coalesce.
    */
-  private readRetry: { failures: number; handle: ReturnType<typeof setTimeout>; promise: Promise<OutboxRecord[] | null> } | null = null;
+  private readRetry: {
+    failures: number;
+    handle: ReturnType<typeof setTimeout> | null;
+    promise: Promise<OutboxRecord[] | null>;
+  } | null = null;
+  /**
+   * Consecutive failed authoritative read attempts in the current recovery
+   * chain (c-reconnfu gate 21 item 3): the backoff grows with this count
+   * instead of re-entering at attempt 0 after every scheduled retry.
+   */
+  private readRecoveryFailures = 0;
+  /** Latched once the bounded read-retry envelope is exhausted; cleared by a successful read. */
+  private readRecoveryExhausted = false;
   /**
    * Set by {@link dispose}. A deadline callback already suspended inside
    * storage.all()/reclaimInflight when dispose() ran can resume afterwards;
@@ -749,6 +761,15 @@ export class Outbox {
    * pass; the store's arm is idempotent.
    */
   onHeldLease: ((instanceId: Id) => void) | null = null;
+  /**
+   * Fired ONCE when authoritative durable reads have failed for the whole
+   * bounded envelope (gate 21 item 3): the Outbox has stopped scheduling
+   * retries and surfaces this explicit state; the store tells the user and
+   * relies on a later fresh trigger (manual/online flush, rearm, reload).
+   */
+  onReadRecoveryExhausted: (() => void) | null = null;
+  /** Fired when a read succeeds after the exhausted latch, so the store can clear its surface. */
+  onReadRecoveryRecovered: (() => void) | null = null;
 
   private constructor(storage: OutboxStorage, owner?: Id) {
     this.storage = storage;
@@ -1036,9 +1057,11 @@ export class Outbox {
     for (const entry of this.leaseWakeups.values()) clearTimeout(entry.handle);
     this.leaseWakeups.clear();
     if (this.readRetry) {
-      clearTimeout(this.readRetry.handle);
+      if (this.readRetry.handle) clearTimeout(this.readRetry.handle);
       this.readRetry = null;
     }
+    this.readRecoveryFailures = 0;
+    this.readRecoveryExhausted = false;
     this.deliveryFailures.clear();
     this.deliveryPasses.clear();
     this.deliverySuppressed.clear();
@@ -1400,30 +1423,72 @@ export class Outbox {
   /**
    * Authoritative read + central reconcile with a BOUNDED, lifetime-aware
    * retry when storage rejects: the failed read keeps recovery responsibility
-   * (250 ms·2^(n-1) capped at 5 s, CLAIM_WAKE_MAX_FAILURES attempts) and the
-   * retry ENDS IN THE SAME central reconciliation — a deliverable row never
-   * loses its only wake to a one-shot IndexedDB error. Concurrent callers
-   * coalesce onto the one retry chain.
+   * and the retry ENDS IN THE SAME central reconciliation — a deliverable row
+   * never loses its only wake to a one-shot IndexedDB error. Concurrent
+   * callers coalesce onto the one retry chain.
+   *
+   * The consecutive-failure count is carried ACROSS retry attempts (gate 21
+   * item 3): delays grow 250 ms·2^(n-1) capped at 5 s, and after
+   * CLAIM_WAKE_MAX_FAILURES real read attempts the chain stops and surfaces
+   * an explicit exhausted state ({@link onReadRecoveryExhausted}) instead of
+   * re-entering at attempt 0 forever. A later fresh trigger (failures=0), a
+   * user/online flush, an unload-cancel rearm or a reload tries again; the
+   * first successful read clears the latch.
    *
    * `failures` is the count of consecutive failures the CALLER already
    * observed (a timer fire or the flush passes 1); 0 attempts a fresh read
-   * immediately. Resolves null when disposed or the budget is exhausted (a
-   * later user/online flush, unload-cancel rearm or reload re-enters fresh).
+   * immediately. Resolves null when disposed or the budget is exhausted.
    */
   async refreshDurableRecovering(failures = 0): Promise<OutboxRecord[] | null> {
     if (this.disposed || this.unloading) return null;
     if (this.readRetry) return await this.readRetry.promise;
-    if (failures === 0) {
+    if (failures === 0) return await this.attemptReadRecovery(0);
+    return await this.scheduleReadRetry(failures);
+  }
+
+  /** One authoritative read attempt carrying `failures` prior failures. */
+  private attemptReadRecovery(failures: number): Promise<OutboxRecord[] | null> {
+    if (this.disposed || this.unloading) return Promise.resolve(null);
+    const entry: {
+      failures: number;
+      handle: ReturnType<typeof setTimeout> | null;
+      promise: Promise<OutboxRecord[] | null>;
+    } = { failures, handle: null, promise: undefined as never };
+    entry.promise = (async () => {
       try {
         const rows = await this.readDurable();
         if (this.disposed) return null;
+        if (this.readRecoveryFailures !== 0 || this.readRecoveryExhausted) {
+          this.readRecoveryFailures = 0;
+          this.readRecoveryExhausted = false;
+          this.onReadRecoveryRecovered?.();
+        }
         this.applyLeaseWakeReconcile(rows);
         return rows;
       } catch {
-        return await this.refreshDurableRecovering(1);
+        if (this.disposed || this.unloading) return null;
+        return await this.scheduleReadRetry(failures + 1);
+      } finally {
+        if (this.readRetry === entry) this.readRetry = null;
       }
+    })();
+    this.readRetry = entry; // coalesce concurrent callers on the live attempt
+    return entry.promise;
+  }
+
+  /** Schedule the next bounded read attempt, or surface the exhausted state. */
+  private scheduleReadRetry(failures: number): Promise<OutboxRecord[] | null> {
+    if (this.disposed || this.unloading) return Promise.resolve(null);
+    this.readRecoveryFailures = failures;
+    if (failures >= CLAIM_WAKE_MAX_FAILURES) {
+      // The bounded envelope is spent: no more silent 250 ms re-entries. The
+      // state is explicit so the store surfaces it; a fresh trigger restarts.
+      if (!this.readRecoveryExhausted) {
+        this.readRecoveryExhausted = true;
+        this.onReadRecoveryExhausted?.();
+      }
+      return Promise.resolve(null);
     }
-    if (failures >= CLAIM_WAKE_MAX_FAILURES) return null;
     const delay = Math.min(CLAIM_WAKE_MAX_RETRY_MS, CLAIM_WAKE_BASE_RETRY_MS * 2 ** (failures - 1));
     const entry: {
       failures: number;
@@ -1432,14 +1497,29 @@ export class Outbox {
     } = { failures, handle: undefined as never, promise: undefined as never };
     entry.promise = new Promise<OutboxRecord[] | null>((resolve) => {
       entry.handle = setTimeout(() => {
-        this.readRetry = null;
-        void this.refreshDurableRecovering(0).then(resolve, () => resolve(null));
+        if (this.readRetry === entry) this.readRetry = null;
+        void this.attemptReadRecovery(failures).then(resolve, () => resolve(null));
       }, delay);
       // Published inside the executor so concurrent callers coalesce onto
       // this chain before the scheduled read.
       this.readRetry = entry;
     });
-    return await entry.promise;
+    return entry.promise;
+  }
+
+  /** Consecutive failed authoritative read attempts in the current chain. */
+  readRecoveryFailureCount(): number {
+    return this.readRecoveryFailures;
+  }
+
+  /** True after the bounded read-retry envelope was exhausted (until recovery). */
+  isReadRecoveryExhausted(): boolean {
+    return this.readRecoveryExhausted;
+  }
+
+  /** Delay (ms) the next read retry waits after `failures` consecutive failures. */
+  readRetryDelay(failures: number): number {
+    return Math.min(CLAIM_WAKE_MAX_RETRY_MS, CLAIM_WAKE_BASE_RETRY_MS * 2 ** Math.max(0, failures - 1));
   }
 
   /**
@@ -1456,6 +1536,8 @@ export class Outbox {
     this.activeDeliveries.clear();
     this.onClaimWake = null;
     this.onHeldLease = null;
+    this.onReadRecoveryExhausted = null;
+    this.onReadRecoveryRecovered = null;
   }
 
   isFlushing(instanceId: Id): boolean {

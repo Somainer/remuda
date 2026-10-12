@@ -770,6 +770,13 @@ class HubStore {
         box.onHeldLease = (instanceId) => {
           if (!this.pageIsUnloading) this.scheduleHeldRetry(instanceId);
         };
+        // Gate 21 item 3: persistent durable-read failures stop after the
+        // bounded envelope instead of re-entering at attempt 0 forever —
+        // surface the explicit state; a later manual/online flush, the
+        // unload-cancel rearm or a reload restarts the chain.
+        box.onReadRecoveryExhausted = () => {
+          this.toast("待发队列读取连续失败，已暂停自动重试；网络或浏览器存储恢复后将在下次发送时继续");
+        };
         this.emit({ outboxPending: box.pendingCount() });
         if (opened.degraded) this.toast("本机无法可靠保存待发消息（存储不可用）");
         // Rows left inflight by a closed tab are due immediately.

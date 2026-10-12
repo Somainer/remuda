@@ -2165,3 +2165,154 @@ fn truncating_the_lone_brace_keeps_the_intact_complete_cover_peek() {
         "the different retry at Z is genuine: {folded:?}"
     );
 }
+
+/// c-cardsettle-fu2 r9 item 3: growth of a pending record observed on a later
+/// poll must be tracked. At the failure peek the torn tail is just "{" at W.
+/// The same write continues growing on the next poll (the cover grows with
+/// it); after an empty poll the writer shrinks the file back to the original
+/// extent (keeping "{"), the next poll observes that, and a DIFFERENT retry
+/// then completes the surviving brace. Without growth tracking the boundary
+/// still matches at W and the genuine retry is held Failed; with it, the
+/// shrink through the grown extent invalidates the cover and the retry
+/// resurrects.
+#[test]
+fn a_pending_record_that_grew_then_shrank_back_invalidates_its_cover() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_r9_grow_shrink";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    let prefix = "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n\
+{\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n";
+    std::fs::write(run_dir.join("journal.jsonl"), prefix).unwrap();
+    let w = prefix.len() as u64;
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Failed),
+        "attempt 1 ends Failed and is consumed through W"
+    );
+
+    // Failure peek sees only the lone "{" of attempt 2.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        write!(journal, "{{").unwrap();
+    }
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+
+    // The same trailing write GROWS on a later poll (still no newline).
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        write!(
+            journal,
+            "\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\""
+        )
+        .unwrap();
+    }
+    let grown_poll: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        grown_poll
+            .iter()
+            .all(|state| *state == WorkflowState::Failed),
+        "the grown record still folds nothing; a1 stays Failed: {grown_poll:?}"
+    );
+
+    // An empty poll (the writer is stalled mid-record).
+    let empty_poll: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        empty_poll
+            .iter()
+            .all(|state| *state == WorkflowState::Failed),
+        "nothing folds: {empty_poll:?}"
+    );
+
+    // Shrink back to the ORIGINAL extent: only "{" survives at W.
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        file.set_len(w + 1).unwrap();
+    }
+    let shrink_poll: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        shrink_poll
+            .iter()
+            .all(|state| *state == WorkflowState::Failed),
+        "the one-byte remnant folds nothing; a1 stays Failed: {shrink_poll:?}"
+    );
+
+    // A DIFFERENT genuine retry completes the surviving brace.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(
+            journal,
+            "\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"genuine-r9-grow\"}}"
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Running),
+        "the shrink removed grown bytes: the cover is gone and the different retry is genuine"
+    );
+}

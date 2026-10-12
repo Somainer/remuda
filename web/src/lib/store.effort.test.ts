@@ -50,6 +50,7 @@ function subscription(instance: Instance) {
 async function startFollowing(
   idSuffix: string,
   activity: Instance["activity"] = { state: "known", value: "idle" },
+  driver: Instance["driver"] = "claude-print",
 ) {
   // Pin Date (only Date — real timers keep running) before every fixture
   // timestamp so a client request's send time (pending.at, the r12 item 3
@@ -62,6 +63,7 @@ async function startFollowing(
     id: `ins_effort_store_${idSuffix}`,
     journalId: `obj_effort_store_${idSuffix}`,
     kind: "claude",
+    driver,
     effortName: null,
     effortIndex: null,
     effortUltracode: null,
@@ -2713,6 +2715,85 @@ async function advanceEffortReconcile(ms: number) {
   await Promise.resolve();
   await Promise.resolve();
 }
+
+/**
+ * A Node-validated native turn activity event (the same shape the follow
+ * socket carries for a shell-pty instance). r13 item 2: the working→idle
+ * transition is the ONLY authority on a queued request leaving the queue.
+ */
+function activityEvent(
+  activity: "working" | "idle",
+  instanceId = "x",
+  nativeName = "Stop",
+): Observation {
+  return {
+    eventId: `evt_act_${nativeName}_${activity}`,
+    instanceId,
+    journalId: "x",
+    seq: "0",
+    kind: "lifecycle",
+    source: { channel: "runtime" },
+    payload: {
+      type: "native",
+      nativeName,
+      status: { state: "known", value: activity },
+      relatedIds: { remudaActivity: activity },
+    },
+  } as unknown as Observation;
+}
+
+it("r13 item 2: the bound starts on working → idle evidence, so a no-op after the turn ends unconfirmed", async () => {
+  const ctx = await startFollowing("r13-item2-idle", { state: "known", value: "working" }, "shell-pty");
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // The id-less driver keeps projecting the unchanged baseline.
+  const baseline: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "low", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
+  };
+  let listCalls = 0;
+  vi.spyOn(api, "instanceList").mockImplementation(async () => {
+    listCalls += 1;
+    return { items: [baseline] } as never;
+  });
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
+  const p = hubStore.setEffort(ctx.instance.id, { index: 1, name: "low", kind: "claude", ultracode: false });
+  await advanceEffortReconcile(0);
+  await p;
+  const listsAfterPost = listCalls;
+  const queued = hubStore.effortPendingOf(ctx.instance.id);
+  expect(queued?.queued, "sent while a turn is running").toBe(true);
+  expect(queued?.leftQueueAt).toBeNull();
+
+  // The first bound expires WITH the turn still running: the request has not
+  // left the queue, so no read-back is attempted and no outcome is surfaced.
+  await advanceEffortReconcile(15_001);
+  expect(listCalls, "never reconcile a request still in the queue").toBe(listsAfterPost);
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
+  expect(toast).not.toHaveBeenCalled();
+
+  // Current activity evidence ends the turn: the queued flag clears and the
+  // request-owned 15 s bound starts at the idle instant.
+  ctx.receive(activityEvent("idle", ctx.instance.id, "interrupted"));
+  const exited = hubStore.effortPendingOf(ctx.instance.id);
+  expect(exited?.queued, "the idle evidence tracks the exit from the queue").toBe(false);
+  expect(typeof exited?.leftQueueAt).toBe("number");
+
+  // Before the post-idle bound elapses: still a silent pending, no read-back.
+  await advanceEffortReconcile(14_999);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
+  expect(toast).not.toHaveBeenCalled();
+
+  // At the post-idle bound the fresh read-back still has no newer evidence:
+  // explicit unconfirmed instead of the 30-minute silent pending.
+  await advanceEffortReconcile(2);
+  expect(listCalls, "the read-back happens only after the queue exit").toBeGreaterThan(listsAfterPost);
+  expect(hubStore.effortPendingOf(ctx.instance.id), "unconfirmed ends the pending").toBeNull();
+  expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");
+});
 
 it("r12 item 5: an id-less accepted no-op surfaces an explicit unconfirmed outcome at the bound", async () => {
   const ctx = await startFollowing("r12-item5-unconfirmed", { state: "known", value: "idle" });

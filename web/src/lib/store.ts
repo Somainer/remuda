@@ -185,6 +185,15 @@ export type EffortPending = {
    * `null` for wire-owned pendings synthesized from the word itself.
    */
   commandWord: string | null;
+  /**
+   * c-effortread r13 item 2: wall-clock ms at which CURRENT ACTIVITY EVIDENCE
+   * showed this request leaving the driver queue (working → idle). The bounded
+   * reconciliation is anchored HERE, not at the immutable `queued` snapshot
+   * taken at send time: a request queued behind a running turn gets its full
+   * request-owned bound only AFTER the turn ends. Null while the turn is still
+   * running; an idle-at-send request initializes it to the send time.
+   */
+  leftQueueAt: number | null;
 };
 
 /**
@@ -1040,7 +1049,7 @@ class HubStore {
    */
   private effortReconcileTimers = new Map<
     Id,
-    { nonce: number; timer: ReturnType<typeof setTimeout>; extended: boolean }
+    { nonce: number; timer: ReturnType<typeof setTimeout> }
   >();
 
   subscribe = (listener: Listener) => {
@@ -1053,8 +1062,44 @@ class HubStore {
   getSnapshot = () => this.state;
 
   private emit(patch: Partial<HubState>) {
-    this.state = { ...this.state, ...patch };
+    // c-effortread r13 item 2: current activity evidence (live follow native
+    // turn events or full-instance entity snapshots) is the ONLY authority on
+    // a queued request leaving the driver queue. A pending stamped `queued` at
+    // send time while a turn was running keeps that stale flag forever; when
+    // the evidence moves working → idle, flip that exact pending (nonce
+    // guarded) and anchor its reconciliation bound to NOW. Doing this inside
+    // the same emission keeps listeners from ever seeing the split state.
+    let queueExits: Map<Id, number> | null = null;
+    if (patch.instances) {
+      for (const next of patch.instances) {
+        if (next.activity?.state !== "known" || next.activity.value !== "idle") continue;
+        const prev = this.state.instances.find((row) => row.id === next.id);
+        if (prev?.activity?.state !== "known" || prev.activity.value !== "working") continue;
+        const pending = this.state.effortPending[next.id];
+        if (pending?.queued) (queueExits ??= new Map()).set(next.id, pending.nonce);
+      }
+    }
+    let merged = patch;
+    if (queueExits?.size) {
+      const atExit = Date.now();
+      const pendingNext = { ...(patch.effortPending ?? this.state.effortPending) };
+      for (const [id, nonce] of queueExits) {
+        const pending = pendingNext[id];
+        if (!pending || pending.nonce !== nonce || !pending.queued) {
+          queueExits.delete(id);
+          continue;
+        }
+        pendingNext[id] = { ...pending, queued: false, leftQueueAt: atExit };
+      }
+      if (queueExits.size) merged = { ...patch, effortPending: pendingNext };
+    }
+    this.state = { ...this.state, ...merged };
     for (const listener of this.listeners) listener();
+    // Re-arm the request-owned bound for every request that just left its
+    // queue (full window from the idle instant, same nonce ownership rules).
+    if (queueExits?.size) {
+      for (const [id, nonce] of queueExits) this.armEffortReconciliation(id, nonce);
+    }
   }
 
   /**
@@ -1768,6 +1813,9 @@ class HubStore {
           // match via the two-axis fallback.
           commandWord: null,
           afterReplacement: false,
+          // The wire edge proves the request is queued RIGHT NOW; r13 item 3
+          // arms its reconciliation, which the working→idle evidence anchors.
+          leftQueueAt: null,
         };
         this.emit({ effortNonces: { ...this.state.effortNonces, [instanceId]: nonce } });
       }
@@ -4425,15 +4473,18 @@ class HubStore {
     const timer = setTimeout(() => {
       void this.runEffortReconciliation(instanceId, nonce);
     }, EFFORT_UNCONFIRMED_BOUND_MS);
-    this.effortReconcileTimers.set(instanceId, { nonce, timer, extended: false });
+    this.effortReconcileTimers.set(instanceId, { nonce, timer });
   }
 
   /**
    * Bound expiry for one effort request: request a FRESH post-command
    * read-back (the durable projection folds through the strict legacy
    * fallback), then either let the settle stand or surface an explicit
-   * "unconfirmed" outcome. A request still queued behind a running turn gets
-   * one bounded extension; after that the long-turn max-age backstop owns it.
+   * "unconfirmed" outcome. The bound is request-owned FROM THE MOMENT THE
+   * REQUEST LEFT THE DRIVER QUEUE (r13 item 2): a request still behind a
+   * running turn waits for the working→idle activity evidence (which re-arms
+   * the slot) instead of burning its bound in the queue; a genuinely long
+   * turn is owned by the 30-minute max-age backstop.
    */
   private async runEffortReconciliation(instanceId: Id, nonce: number) {
     const slot = this.effortReconcileTimers.get(instanceId);
@@ -4444,11 +4495,28 @@ class HubStore {
       if (slot?.nonce === nonce) this.effortReconcileTimers.delete(instanceId);
       return;
     }
-    if (pendingNow.queued && slot && !slot.extended) {
+    if (pendingNow.queued) {
+      // Still behind the running turn: no read-back is even possible yet.
+      // Wait; the working→idle activity evidence flips `queued` and re-arms a
+      // fresh full bound. Never refresh and never declare unconfirmed while
+      // queued — the long-turn max-age backstop bounds the total wait.
       const timer = setTimeout(() => {
         void this.runEffortReconciliation(instanceId, nonce);
       }, EFFORT_UNCONFIRMED_BOUND_MS);
-      this.effortReconcileTimers.set(instanceId, { nonce, timer, extended: true });
+      this.effortReconcileTimers.set(instanceId, { nonce, timer });
+      return;
+    }
+    // The request owns its bound from when it left the queue (an idle-send
+    // request initializes that to the send time). A timer that was armed
+    // BEFORE a late activity exit must not fire early: reschedule the
+    // remainder instead of reconciling on a partial window.
+    const boundStart = pendingNow.leftQueueAt ?? pendingNow.at;
+    const elapsed = Date.now() - boundStart;
+    if (elapsed < EFFORT_UNCONFIRMED_BOUND_MS) {
+      const timer = setTimeout(() => {
+        void this.runEffortReconciliation(instanceId, nonce);
+      }, EFFORT_UNCONFIRMED_BOUND_MS - elapsed);
+      this.effortReconcileTimers.set(instanceId, { nonce, timer });
       return;
     }
     // One fresh authoritative read-back: an id-less success settles here via
@@ -4460,9 +4528,13 @@ class HubStore {
       return;
     }
     if (after.queued) {
-      // Still queued after the extension (a genuinely long turn): leave the
-      // chip to the 30-minute backstop rather than calling it unconfirmed.
-      this.effortReconcileTimers.delete(instanceId);
+      // A queued edge re-queued the request during the read-back: the
+      // activity-exit evidence will re-arm the bound; wait rather than ending
+      // it unconfirmed against a request the driver has not run yet.
+      const timer = setTimeout(() => {
+        void this.runEffortReconciliation(instanceId, nonce);
+      }, EFFORT_UNCONFIRMED_BOUND_MS);
+      this.effortReconcileTimers.set(instanceId, { nonce, timer });
       return;
     }
     // No fresh evidence within the bound: stop the silent 切换中 explicitly.
@@ -4499,6 +4571,7 @@ class HubStore {
     // can be matched even when a decoupled TIER move carries the flag — the
     // driver then types the plain level word with flag=true in the payload.
     const commandWord = predictDriverCommandWord(effort, axis, instance, this.state, instanceId);
+    const now = Date.now();
     // The coupled bare `ultracode` word moves BOTH axes. The decoupled toggle
     // moves only the flag and a plain tier word only the level (r10 item 4:
     // the other axis is driven by its OWN configure, so axes this request
@@ -4514,7 +4587,11 @@ class HubStore {
       name: effort.name,
       ultracode: effort.ultracode === true,
       queued: busy,
-      at: Date.now(),
+      at: now,
+      // r13 item 2: an idle-sent request starts its reconciliation bound at
+      // the send time; a queued one starts it when activity shows it leaving
+      // the queue.
+      leftQueueAt: busy ? null : now,
       // The pre-request baseline is kept SEPARATE from the queued lifecycle
       // time (r10 item 1): an id-less read-back settles only when newer than
       // BOTH and matching the requested axis.

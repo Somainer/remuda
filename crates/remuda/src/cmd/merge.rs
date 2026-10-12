@@ -786,6 +786,19 @@ fn execute_inner(
         }
     }
     if verify_onto {
+        // The gate verified the merge against the `--onto` base captured at
+        // preflight. When the base is local main itself, re-read it AFTER the
+        // gate: another coordinator may have advanced local main while the
+        // checks ran, which would make this a stale-base verification. Surface
+        // that as base_moved(expected, current) instead of persisting a
+        // "verified" report a later --land would only reject. An explicit sha
+        // base is caller-pinned and not checked here.
+        if args.onto.as_deref() == Some("main") {
+            let current_main = resolve(&repo, "refs/heads/main")?;
+            if current_main != expected {
+                return Err(MergeStop::BaseMoved(expected.clone(), current_main).into());
+            }
+        }
         // Verification only: the report (persisted by execute) is the claim.
         // Advancing main is a separate `--land` compare-and-swap.
         return Ok(());
@@ -804,17 +817,35 @@ fn execute_inner(
     })?;
     report.main_updated = true;
     if !args.no_push {
-        record(report, "push", || {
-            // Push exactly the verified commit even if another coordinator moves
-            // local main immediately after our successful CAS. Never force-push.
-            git(
-                &repo,
-                &["push", "origin", &format!("{merged}:refs/heads/main")],
-            )
-        })?;
+        record(report, "push", || push_main_cas(&repo, &merged, &expected))?;
         report.pushed = true;
     }
     Ok(())
+}
+
+/// Push the verified merge to origin main as a compare-and-swap against the
+/// base the merge was built on. A successful push needs no lease because the
+/// merge is a strict descendant of `expected`. If the push is rejected, fetch
+/// origin and classify it: when remote main has advanced past `expected`
+/// (an ORIGIN-only move the local checkout had not seen) return
+/// `MergeStop::BaseMoved(expected, remote)` with the real current remote main;
+/// any other failure stays a normal error.
+fn push_main_cas(repo: &Path, merged: &str, expected: &str) -> Result<()> {
+    let output = git_output(
+        repo,
+        &["push", "origin", &format!("{merged}:refs/heads/main")],
+    )?;
+    if output.status.success() {
+        return Ok(());
+    }
+    // Best-effort refresh; keep the original push error if fetch itself fails.
+    if let Ok(remote) = git(repo, &["fetch", "-q", "origin"])
+        .and_then(|_| resolve(repo, "refs/remotes/origin/main"))
+        && remote != expected
+    {
+        return Err(MergeStop::BaseMoved(expected.to_owned(), remote).into());
+    }
+    successful(&output)
 }
 
 fn branch_ref(branch: &str) -> Result<String> {
@@ -949,12 +980,7 @@ fn execute_land(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
         ],
     );
     if !args.no_push {
-        record(report, "push", || {
-            git(
-                &repo,
-                &["push", "origin", &format!("{merged}:refs/heads/main")],
-            )
-        })?;
+        record(report, "push", || push_main_cas(&repo, &merged, &base))?;
         report.pushed = true;
     }
     Ok(())

@@ -676,6 +676,86 @@ fn concurrent_main_update_loses_cas_without_pushing() {
 }
 
 #[test]
+fn local_main_advancing_during_an_onto_main_verify_is_base_moved() {
+    // r13 item 7(a): verifying `--gate --onto main` while local main advances
+    // must report base_moved(expected, current) from the VERDICT rather than
+    // persisting a "verified" report pinned to the stale base.
+    let repo = Repo::new();
+    // A forward commit for main to move to during the gate (the topic tip).
+    let concurrent = repo.branch_commit.clone();
+    let (output, report) = repo.merge(
+        &["--gate", "--onto", "main", "--no-push"],
+        &[("REMUDA_TEST_GATE_CAS", &concurrent)],
+    );
+    assert_exit(&output, &report, 2);
+    assert_eq!(report["status"], "base_moved", "{report}");
+    assert_eq!(
+        report["base"], repo.base,
+        "expected base is retained: {report}"
+    );
+    assert_eq!(
+        report["currentMain"], concurrent,
+        "current main is reported: {report}"
+    );
+    // Nothing was pushed and the checkout main really did advance.
+    assert_eq!(report["pushed"], false);
+    assert_eq!(repo.remote_main(), repo.base);
+    assert_eq!(repo.main(), concurrent);
+    repo.assert_cleaned();
+}
+
+#[test]
+fn origin_only_main_advance_at_land_push_is_base_moved_with_remote_current() {
+    // r13 item 7(b): local main still equals the pinned base at --land, but
+    // ORIGIN main advanced (an origin-only move the coordinator checkout never
+    // fetched). The local update-ref CAS succeeds but the push is rejected; the
+    // CLI must fetch, classify it base_moved(base, remote), and never push.
+    let repo = Repo::new();
+    // 1. Verify the merge onto main (no push) and capture the pinned tuple.
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+    assert_eq!(verified["base"], repo.base);
+
+    // 2. Advance ONLY the remote from a throwaway clone; local main stays base.
+    let side = repo.root.parent().unwrap().join("origin-side-clone");
+    git(
+        &repo.root,
+        &[
+            "clone",
+            "-q",
+            &repo.origin.to_string_lossy(),
+            &side.to_string_lossy(),
+        ],
+    );
+    git(&side, &["config", "user.email", "t@example.com"]);
+    git(&side, &["config", "user.name", "T"]);
+    fs::write(side.join("remote-only.txt"), "from another coordinator\n").unwrap();
+    git(&side, &["add", "--", "remote-only.txt"]);
+    git(&side, &["commit", "-q", "-m", "remote-only main advance"]);
+    git(&side, &["push", "-q", "origin", "main"]);
+    let remote_current = git(&repo.origin, &["rev-parse", "main"]);
+    assert_ne!(remote_current, repo.base);
+    assert_eq!(
+        repo.main(),
+        repo.base,
+        "local main still at the pinned base"
+    );
+
+    // 3. Land the immutable report: the push must be classified base_moved.
+    let (output, report) = repo.merge(&["--land", "--onto", "main", "--report", &merged], &[]);
+    assert_exit(&output, &report, 2);
+    assert_eq!(report["status"], "base_moved", "{report}");
+    assert_eq!(report["base"], repo.base, "{report}");
+    assert_eq!(
+        report["currentMain"], remote_current,
+        "currentMain must name the remote tip, not a generic error: {report}"
+    );
+    // The rejected push did not move origin; it still holds the other commit.
+    assert_eq!(repo.remote_main(), remote_current);
+}
+
+#[test]
 fn staged_source_changes_are_refused_before_creating_a_worktree() {
     let repo = Repo::new();
     fs::write(repo.source.join("staged.txt"), "unfinished\n").unwrap();

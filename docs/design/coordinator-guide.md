@@ -281,11 +281,40 @@ queued → running → (only via gate.landGrant) → landing → landed
   self-serializing, throttled reconciler does a read-only `gate.resolveLanding`
   probe — `git fetch` + `merge-base --is-ancestor` of the **exact granted merge**
   against the remote base: present → settle `landed` (journal `gate.landed`,
-  run `--then`, drop pins); absent → keep `landing` until the bounded recovery
-  window (`gateLandingRecoveryMs`, default 12 min: the Node land budget plus
-  reconnect grace) elapses, then settle `failed` with an explicit
-  "unconfirmed after the recovery window" reason. Nothing is ever re-dispatched
-  or re-pushed by the reconciler.
+  run `--then`, drop pins); absent → the row STAYS `landing` — see the R1–R4
+  outcome rules below; it is never force-settled failed merely because a window
+  elapsed. Nothing is ever re-dispatched or re-pushed by the reconciler.
+- **Outcome rules (R1–R4, 2026-10-13): an unestablished outcome is never a
+  verdict.**
+  - **R1 — unknown is never failure.** An expired recovery window does NOT
+    settle a Landing failed. A row whose outcome cannot be established that
+    old stays `landing` and holding occupancy; it is surfaced to the operator
+    (job API + a `gate.landing-unknown` journal entry) and is resolvable only
+    by an explicit operator action (R4) or by an established remote fact.
+  - **R2 — authority is current.** Only the CURRENT granted session/attempt
+    (host, authenticated carrier socket generation, and `(attempts, merge)` on
+    the writer) may settle a Landing. A probe/verdict from an older generation
+    never settles a newer attempt; a Finished from a session the Hub no longer
+    considers current is stood down; only the live current session settles.
+  - **R3 — session ids never repeat, even across Hub restarts.** The carrier
+    session id is `(boot_epoch << 32) | per-boot counter`; the boot epoch is a
+    persisted monotonic counter in the Hub SQLite DB seeded on boot. The Node
+    durable daemon keeps its own persisted controller generation in its data
+    dir, so a new process hands out an id above every id the prior process
+    issued.
+  - **R4 — a failed/absent/requeue verdict needs an established fact.** A
+    non-`landed` outcome requires either provable absence of the granted merge
+    on remote main AND a verified-dead land process group (the Node durably
+    fences its land group at grant and attests `absent` only after
+    TERM→bounded-wait→whole-group-KILL and an ESRCH group check), or the
+    explicit operator-resolution endpoint (`POST
+    /v1/projects/{id}/gate/jobs/{jobId}/resolve`, body
+    `{"resolution":"failed"|"requeue"}`), which records the operator, device and
+    reason and clears lane occupancy on requeue.
+  A failed land push (`merge --land`) fetches origin FIRST and only reports a
+  failure when the exact merge is absent; a push whose acknowledgement was lost
+  is resolved against the remote before any verdict and a merge that landed
+  with the lost ack is reported `landed`, never failed or base-moved.
 - **Land timeout is synchronous and reported uncertain.** If a granted land child
   overruns its budget, the Node terminates its **whole process group** before
   returning: SIGTERM the group, boundedly wait for every non-zombie member

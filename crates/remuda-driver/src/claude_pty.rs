@@ -5028,6 +5028,204 @@ mod tests {
         );
     }
 
+    /// c-effortread r22 ruling S through production `map_line_at` on a
+    /// decoupled 2.1.289 build:
+    /// (a) high published from STATUS, B=max armed, an older unowned
+    ///     "Set effort level to max" acceptance suppressed while B waits: a
+    ///     later status reporting medium PUBLISHES medium — the suppressed
+    ///     acceptance never protected the status-only level.
+    /// (b) an ordinary accepted verdict max publishes max; a later status
+    ///     reporting xhigh with no assistant record PUBLISHES xhigh — verdicts
+    ///     carry no clamping precedence.
+    /// (c) an assistant-established high: a status reporting medium yields on
+    ///     the LEVEL (its positive flag-off latch may edge, never medium).
+    #[tokio::test]
+    async fn r22_item1_suppressed_accept_keeps_status_movable_verdict_yields_only_assistant_holds()
+    {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        // (a) the suppressed acceptance does not protect a status-only level.
+        let instance_id = InstanceId::new();
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            instance_id,
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        mapper
+            .map_line_at(&effort_slash_line("cmd-status-high", "status"), Some(400))
+            .expect("map the first status slash");
+        let high = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status-high",
+                    "Current effort level: high (Comprehensive implementation with extensive \
+                     testing and documentation)",
+                ),
+                Some(420),
+            )
+            .expect("map the high status");
+        assert_eq!(
+            r19_effort_edges(&high),
+            vec![(Some(remuda_protocol::EffortName::High), Some(false), None)],
+            "(a) high is published by the first status"
+        );
+
+        // B=max armed; the older pre-floor /effort max verdict lands first and
+        // is suppressed while B is armed.
+        let _gen_b = bridge.arm_with_floor(
+            EffortRequest::from_level("max")
+                .expect("max")
+                .with_request_id(Some("req-b")),
+            Some(SubmissionProvenance::Floor(1000)),
+        );
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map the old slash");
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B's slash");
+        let suppressed = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-old",
+                    "Set effort level to max (saved as your default for new sessions): …",
+                ),
+                Some(1600),
+            )
+            .expect("map the suppressed max acceptance");
+        assert!(
+            r19_effort_edges(&suppressed).is_empty(),
+            "(a) the old max acceptance stays suppressed; high remains published"
+        );
+        assert!(bridge.has_pending());
+
+        // A status reporting medium while B waits: medium PUBLISHES.
+        mapper
+            .map_line_at(
+                &effort_slash_line("cmd-status-medium", "status"),
+                Some(1700),
+            )
+            .expect("map the second status slash");
+        let medium = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status-medium",
+                    "Current effort level: medium (Balanced, for everyday work)",
+                ),
+                Some(1720),
+            )
+            .expect("map the medium status");
+        assert_eq!(
+            r19_effort_edges(&medium),
+            vec![(Some(remuda_protocol::EffortName::Medium), Some(false), None)],
+            "(a) the status moves the status-only level past the suppression; no request settles"
+        );
+
+        // (b) an accepted verdict yields to a later status read-back.
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        );
+        mapper
+            .map_line_at(&effort_slash_line("cmd-max", "max"), Some(400))
+            .expect("map the human max slash");
+        let max_edge = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-max",
+                    "Set effort level to max (saved as your default for new sessions): …",
+                ),
+                Some(420),
+            )
+            .expect("map the accepted max verdict");
+        assert_eq!(
+            r19_effort_edges(&max_edge),
+            vec![(Some(remuda_protocol::EffortName::Max), None, None)],
+            "(b) the verdict publishes max"
+        );
+        mapper
+            .map_line_at(&effort_slash_line("cmd-status-xhigh", "status"), Some(500))
+            .expect("map the status slash");
+        let xhigh = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status-xhigh",
+                    "Current effort level: xhigh (Maximum reasoning, workflows enabled)",
+                ),
+                Some(520),
+            )
+            .expect("map the xhigh status");
+        assert_eq!(
+            r19_effort_edges(&xhigh),
+            vec![(Some(remuda_protocol::EffortName::Xhigh), Some(false), None)],
+            "(b) a status replaces the verdict-published max; verdicts have no clamping precedence"
+        );
+
+        // (c) only an assistant-established level makes the status yield.
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        );
+        let established = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "on it"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(400),
+            )
+            .expect("map the assistant high record");
+        assert_eq!(
+            r19_effort_edges(&established),
+            vec![(Some(remuda_protocol::EffortName::High), None, None)],
+            "(c) the assistant record establishes high"
+        );
+        mapper
+            .map_line_at(&effort_slash_line("cmd-status-yield", "status"), Some(500))
+            .expect("map the yielding status slash");
+        let yields = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status-yield",
+                    "Current effort level: medium (Balanced, for everyday work)",
+                ),
+                Some(520),
+            )
+            .expect("map the yielding status");
+        let levels: Vec<_> = r19_effort_edges(&yields)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        assert!(
+            !levels.contains(&Some(remuda_protocol::EffortName::Medium)),
+            "(c) the status never publishes medium: {levels:?}"
+        );
+    }
+
     /// c-effortread r16 item 3: when the carrier's floor lookup FAILS (the
     /// bound transcript was rotated/removed or the stat errors), production no
     /// longer falls back to word-only attribution. The switch is armed with

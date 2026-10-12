@@ -523,24 +523,35 @@ pub fn classify_effort_slash(args: &str, semantics: EffortSemantics) -> EffortSl
     }
 }
 
-/// Which evidence established the level in [`EffortTracker::last`]
-/// (c-effortread r21 ruling B″(2)). A `/effort status|current` read-back is
-/// authoritative for the FLAG but only REPORTS the level: when the level is
-/// known from status alone a later status's resolved level (e.g.
-/// `Effort level: auto (currently …)`) replaces it, whereas a level a
-/// verdict/assistant/model channel established wins (the launch-case status
-/// vs assistant-record disagreement).
+/// Which channel published the level in [`EffortTracker::last`]
+/// (c-effortread r22 ruling S). It describes the source of the PUBLISHED
+/// level and changes ONLY when a level is actually published, set to the
+/// channel that published it.
+///
+/// A `/effort status|current` read-back is authoritative for the FLAG but
+/// only REPORTS the level: a status's resolved level (e.g. `Effort level:
+/// auto (currently …)`) replaces a level whose source is [`Status`] or
+/// [`Verdict`], but yields to a level published by an assistant/model
+/// read-back ([`Assistant`], the model-clamping precedence). A suppressed
+/// (unpublished) acceptance never changes the source — not even when the
+/// acceptance latched a different level into the deferred slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum LevelSource {
-    /// No level established yet.
+pub enum LevelSource {
+    /// No level published yet.
     #[default]
     None,
-    /// The level is known only from `/effort status|current` output.
+    /// The published level came from a `/effort status|current` read-back.
+    /// Another status read-back may replace it.
     Status,
-    /// The level was established by change evidence: an accepted verdict
-    /// (including a suppressed one later published), an assistant/model
-    /// read-back, or the `/model` verdict's effort clause.
-    Evidence,
+    /// The published level came from an accepted `/effort` verdict —
+    /// including a suppressed acceptance when `publish_deferred` releases it.
+    /// Verdicts carry NO clamping precedence: a later status read-back may
+    /// replace the level.
+    Verdict,
+    /// The published level came from an assistant record or a `/model`
+    /// verdict's effort clause. Only this source outranks a later status
+    /// read-back (the launch-case status vs assistant-record disagreement).
+    Assistant,
 }
 
 /// Transcript-side effective-effort state: dedup and source attribution.
@@ -554,8 +565,9 @@ pub struct EffortTracker {
     /// Coupled/decoupled, learned from transcript `version` fields.
     semantics: EffortSemantics,
     last: Option<ObservedEffort>,
-    /// c-effortread r21 ruling B″(2): which channel established the level in
-    /// `last`; decides whether a status read-back may replace that level.
+    /// c-effortread r22 ruling S: which channel published the level in
+    /// `last`; changes ONLY when a level is published. Decides whether a
+    /// status read-back may replace that level.
     level_source: LevelSource,
     pending_source: EffortSource,
     /// Coupled builds only: a `/effort ultracode` slash record armed xhigh +
@@ -644,6 +656,14 @@ impl EffortTracker {
     #[must_use]
     pub fn last_observed(&self) -> Option<ObservedEffort> {
         self.last
+    }
+
+    /// c-effortread r22 ruling S: the channel that published the level in
+    /// [`Self::last_observed`]. Carried across a demote/re-promotion so a
+    /// level that was status-only stays movable by a later status.
+    #[must_use]
+    pub fn level_source(&self) -> LevelSource {
+        self.level_source
     }
 
     /// Mark effective effort read-back as unavailable for the rest of the
@@ -744,7 +764,9 @@ impl EffortTracker {
         // The seeded tuple was an established effective state; treat its level
         // as evidence-backed so a later status read-back yields to it (the
         // fresh tracker cannot know status alone established it).
-        self.level_source = LevelSource::Evidence;
+        // c-effortread r22 item 2 carries the ORIGINAL source instead; until
+        // then Assistant preserves the r21 protection (status always yields).
+        self.level_source = LevelSource::Assistant;
         // `source` is mapper-owned bookkeeping; preserve the seeded source so
         // the next observation is attributed consistently.
         self.pending_source = source;
@@ -952,7 +974,11 @@ impl EffortTracker {
         // c-effortread r20 ruling B′: the owned accept flows through the one
         // shared authoritative reconcile (latch + clear deferred + dedupe
         // against the last PUBLISHED tuple).
-        self.level_source = LevelSource::Evidence;
+        // c-effortread r22 ruling S: the accepted verdict PUBLISHES its
+        // level, so the source is Verdict. A verdict carries no clamping
+        // precedence — a later status read-back may replace this level; only
+        // an assistant/model read-back outranks a status.
+        self.level_source = LevelSource::Verdict;
         let edge = self.reconcile_authoritative(observed, source);
         if edge.is_some() {
             self.pending_source = EffortSource::Unknown;
@@ -993,10 +1019,12 @@ impl EffortTracker {
             ultracode: flag,
         };
         let changes_published = self.last != Some(observed);
-        // The accepted verdict is level evidence even while its edge is held:
-        // a status read-back that follows must yield to the transcript level
-        // the verdict established, not to a level an earlier status reported.
-        self.level_source = LevelSource::Evidence;
+        // c-effortread r22 ruling S: this acceptance is SUPPRESSED
+        // (unpublished): latch the flag and stash the deferred state, but do
+        // NOT touch level_source. The channel of the published level stays
+        // exactly what it was — a status-only high is not protected by the
+        // suppressed max, so a later status may still move it. The source
+        // becomes Verdict only if/when publish_deferred releases the slot.
         self.deferred = Some(observed);
         UnownedAccept {
             observed,
@@ -1019,9 +1047,10 @@ impl EffortTracker {
     ) -> Option<(ObservedEffort, EffortSource)> {
         let edge = self.last != Some(observed);
         self.last = Some(observed);
-        // The stashed acceptance was a real verdict: its published level is
-        // evidence-backed (c-effortread r21 ruling B″(2)).
-        self.level_source = LevelSource::Evidence;
+        // The released stashed acceptance was a real /effort verdict: its
+        // level is published now, so the source is Verdict (c-effortread r22
+        // ruling S) — a later status read-back may replace it.
+        self.level_source = LevelSource::Verdict;
         // Keep the latched flag consistent with the published value even when
         // the slot was overwritten after the flag was last latched.
         if let Some(flag) = observed.ultracode {
@@ -1056,13 +1085,14 @@ impl EffortTracker {
     /// awaiting switch and is never attributed to one ([`EffortSource::Unknown`]
     /// ): it reports the current state rather than changing it.
     ///
-    /// c-effortread r21 ruling B″(2): status is authoritative for the FLAG
-    /// but only REPORTS the level. The reported level replaces a level that
-    /// was established ONLY by earlier status output (`Current effort
-    /// level: high` followed by `Effort level: auto (currently medium)` after
-    /// `/effort auto`); it yields to a level a verdict/assistant/model channel
-    /// established for the current process (the two can disagree — launch
-    /// case g — and the assistant level wins).
+    /// c-effortread r22 ruling S (supersedes r21 ruling B″(2)): status is
+    /// authoritative for the FLAG but only REPORTS the level. The reported
+    /// level replaces a level whose source is Status OR Verdict (a verdict
+    /// carries no clamping precedence); it yields ONLY to a level published
+    /// by an assistant/model read-back (`Assistant` — the launch case g,
+    /// where the two can disagree and the assistant level wins). A suppressed
+    /// acceptance never protects the published level: it leaves the source
+    /// unchanged, so a status moves a status-only level right past it.
     ///
     /// c-effortread r20 ruling B′: status is an AUTHORITATIVE read-back like
     /// the other channels and goes through the one shared reconcile, whether
@@ -1081,9 +1111,9 @@ impl EffortTracker {
         if let Some(flag) = parsed.ultracode {
             self.flag = Some(flag);
         }
-        let established_by_evidence = self.level_source == LevelSource::Evidence;
+        let established_by_assistant = self.level_source == LevelSource::Assistant;
         let name = match self.last {
-            Some(last) if established_by_evidence => last.name,
+            Some(last) if established_by_assistant => last.name,
             _ => parsed.name,
         };
         let observed = ObservedEffort {
@@ -1091,7 +1121,10 @@ impl EffortTracker {
             ultracode: self.flag,
         };
         let edge = self.reconcile_authoritative(observed, EffortSource::Unknown);
-        if !established_by_evidence {
+        // When the status actually carried the published level its channel
+        // is Status; while yielding to Assistant the source stays exactly
+        // what it was (changes happen only on publication).
+        if !established_by_assistant {
             self.level_source = LevelSource::Status;
         }
         edge
@@ -1193,9 +1226,10 @@ impl EffortTracker {
         }
         let ultracode = self.assistant_flag(name);
         let observed = ObservedEffort { name, ultracode };
-        // An assistant/model read-back establishes the level; a later status
-        // yields to it (c-effortread r21 ruling B″(2)).
-        self.level_source = LevelSource::Evidence;
+        // c-effortread r22 ruling S: an assistant/model read-back publishes
+        // the level with source Assistant — the ONLY channel a later status
+        // read-back yields to (model-clamping precedence).
+        self.level_source = LevelSource::Assistant;
         // c-effortread r20 ruling B′: one shared authoritative reconcile. The
         // suppressed slot is superseded even when this emits nothing (the
         // read-back equals the last published state).
@@ -2658,6 +2692,123 @@ mod tests {
         );
         // A repeated status keeps yielding: no level edge, no settlement.
         assert!(tracker.note_status(status_auto_medium).is_none());
+    }
+
+    #[test]
+    fn r22_item1_level_source_tracks_the_publishing_channel() {
+        // c-effortread r22 ruling S: a suppressed acceptance leaves the
+        // source of the PUBLISHED level alone; an ordinary accepted verdict
+        // publishes with source Verdict and a later status may replace it;
+        // only an assistant/model read-back sets Assistant and makes a
+        // status yield.
+        fn status(level: &str) -> ObservedEffort {
+            match parse_effort_stdout(
+                &format!("Current effort level: {level} (resolved level)"),
+                EffortSemantics::Decoupled,
+            ) {
+                EffortStdout::Status(parsed) => parsed,
+                other => panic!("{other:?}"),
+            }
+        }
+        let accept_max = "Set effort level to max (saved as your default for new sessions): …";
+
+        // (a) status-published high, B armed, suppressed max: a later status
+        // reporting medium PUBLISHES medium — the suppressed acceptance did
+        // not protect the status-only high.
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.289");
+        tracker
+            .note_status(status("high"))
+            .expect("the first status publishes high");
+        assert_eq!(tracker.level_source(), LevelSource::Status);
+        tracker.note_slash("max", true);
+        let suppressed = tracker
+            .note_unowned_stdout(accept_max)
+            .expect("the suppressed acceptance latches a deferred state");
+        assert!(suppressed.changes_published);
+        assert_eq!(
+            tracker.last_observed().map(|observed| observed.name),
+            Some(EffortName::High),
+            "the suppressed acceptance publishes nothing"
+        );
+        assert_eq!(
+            tracker.level_source(),
+            LevelSource::Status,
+            "a suppressed (unpublished) acceptance never changes LevelSource"
+        );
+        let medium = tracker
+            .note_status(status("medium"))
+            .expect("a status moves the status-only level right past the suppression");
+        assert_eq!(medium.0.name, EffortName::Medium);
+        assert_eq!(tracker.level_source(), LevelSource::Status);
+
+        // (b) an ordinary accepted verdict max publishes with source Verdict;
+        // a later status reporting xhigh, with NO assistant record, PUBLISHES
+        // xhigh — verdicts carry no clamping precedence.
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.289");
+        tracker.note_slash("max", false);
+        tracker
+            .note_stdout(accept_max, false)
+            .expect("the human verdict publishes max");
+        assert_eq!(tracker.level_source(), LevelSource::Verdict);
+        let xhigh = tracker
+            .note_status(status("xhigh"))
+            .expect("a status replaces a verdict-published level");
+        assert_eq!(xhigh.0.name, EffortName::Xhigh);
+        assert_eq!(tracker.level_source(), LevelSource::Status);
+
+        // (c) an assistant-established high stays: a status reporting medium
+        // yields and publishes nothing (model-clamping precedence kept).
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.289");
+        tracker
+            .observe(Some("high"), None)
+            .expect("the assistant read-back publishes high");
+        assert_eq!(tracker.level_source(), LevelSource::Assistant);
+        // The status may latch its positive flag-OFF (a flag edge), but while
+        // yielding it must never publish the medium LEVEL.
+        if let Some((observed, _)) = tracker.note_status(status("medium")) {
+            assert_eq!(
+                observed.name,
+                EffortName::High,
+                "the status yields on the level even when its flag latch edges"
+            );
+        }
+        assert_eq!(
+            tracker.last_observed().map(|observed| observed.name),
+            Some(EffortName::High)
+        );
+        assert_eq!(tracker.level_source(), LevelSource::Assistant);
+
+        // (d) a suppressed acceptance released via publish_deferred
+        // publishes with source Verdict, so a later status may move it.
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.289");
+        tracker.note_slash("max", true);
+        tracker
+            .note_unowned_stdout(accept_max)
+            .expect("the acceptance is suppressed while B is armed");
+        assert_eq!(tracker.level_source(), LevelSource::None);
+        tracker
+            .note_stdout("Kept effort level as max", true)
+            .is_none();
+        let deferred = tracker
+            .deferred_observation()
+            .expect("the stashed acceptance survived B's refusal");
+        let released = tracker
+            .publish_deferred(deferred)
+            .expect("the end-of-switch release publishes the stashed max");
+        assert_eq!(released.0.name, EffortName::Max);
+        assert_eq!(
+            tracker.level_source(),
+            LevelSource::Verdict,
+            "a deferred acceptance is a Verdict publication when released"
+        );
+        assert!(
+            tracker.note_status(status("medium")).is_some(),
+            "the released verdict level yields to a later status"
+        );
     }
 
     #[test]

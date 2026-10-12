@@ -199,17 +199,65 @@ fn assert_elapsed<T>(r: Result<T, tokio::time::error::Elapsed>, what: &str) {
     }
 }
 
-/// ma-sdk-state r12 items 3/4: join a spawned task that calls a NAMED bounded
-/// helper and require it to PANIC within `join_bound` with the helper's named
-/// timeout message (`name_fragment` must appear in the panic payload).
+/// ma-sdk-state r12 items 3/4: the ONE named bounded wait every spawned join
+/// (scheduling tests) and the spawned-join bound proof go through. The
+/// timeout lives HERE, not at any call site: remove it and a withheld
+/// completion hangs until the outer harness command timeout (the r12 item 4
+/// RED), with no local wrapper to terminate things sooner.
+async fn wait_bounded<F: std::future::Future>(
+    future: F,
+    timeout: Duration,
+    what: &str,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    // `what` names the awaited thing at every call site's expect/panic; keep it
+    // out of the body so the helper itself stays a thin timeout wrapper.
+    let _ = what;
+    tokio::time::timeout(timeout, future).await
+}
+
+/// Scheduling-site convenience: a spawned send/holder join under the shared
+/// named bound; the panic message names the awaited task `what`.
+async fn join_bounded<T: std::fmt::Debug + Send>(
+    task: tokio::task::JoinHandle<T>,
+    timeout: Duration,
+    what: &str,
+) -> T {
+    wait_bounded(task, timeout, what)
+        .await
+        .unwrap_or_else(|_| panic!("bounded test wait timed out: waiting for {what} to finish"))
+        .expect("the spawned task completed without panicking")
+}
+
+/// ma-sdk-state r12 item 4: recv until the events channel closes (None), in
+/// ONE overall named bound — a 5 s quiet period must never be read as EOF.
+/// Shared by the natural-EOF scheduling test and the recv-None bound proof;
+/// returns the collected tail on success or Elapsed when close is withheld.
+async fn drain_until_closed(
+    handle: &mut remuda_driver::RunHandle,
+    timeout: Duration,
+) -> Result<Vec<Observation>, tokio::time::error::Elapsed> {
+    let mut out = Vec::new();
+    let drain = async {
+        while let Some(obs) = handle.recv().await {
+            out.push(obs);
+        }
+        out
+    };
+    tokio::time::timeout(timeout, drain).await
+}
+
+/// ma-sdk-state r12 item 4: join a task that calls a NAMED bounded helper and
+/// require it to PANIC with the helper's own named timeout message
+/// (`name_fragment` must appear in the panic payload). There is deliberately
+/// NO local timeout around this join: the helper's internal bound is the
+/// terminator in GREEN; with that bound removed (RED) the join hangs until the
+/// outer harness command timeout, which is the required failure mode.
 async fn expect_named_timeout_panic<T: Send + std::fmt::Debug>(
     task: tokio::task::JoinHandle<T>,
     name_fragment: &str,
-    join_bound: Duration,
 ) {
-    let panic = tokio::time::timeout(join_bound, task)
+    let panic = task
         .await
-        .expect("the bounded-helper task finishes (panicking) within the join bound")
         .expect_err("the named bounded wait must panic when its release is withheld");
     let payload = panic.into_panic();
     let message = payload
@@ -218,7 +266,7 @@ async fn expect_named_timeout_panic<T: Send + std::fmt::Debug>(
         .or_else(|| payload.downcast_ref::<&'static str>().copied())
         .unwrap_or("");
     assert!(
-        message.contains("bounded test wait timed out") && message.contains(name_fragment),
+        message.contains(name_fragment),
         "named bounded-wait panic expected to mention {name_fragment:?}, got: {message}"
     );
 }
@@ -1066,25 +1114,25 @@ async fn a_publication_backlog_overflow_shuts_the_session_down_bounded_with_a_di
     // it. The parked send unblocks with an error once the killed child's pipes
     // close.
     drop(barrier);
-    let send_result = tokio::time::timeout(Duration::from_secs(10), parked_send)
-        .await
-        .expect("parked send resolves after the overflow kill")
-        .expect("send task joined");
+    let send_result = join_bounded(
+        parked_send,
+        Duration::from_secs(10),
+        "the overflow-parked send",
+    )
+    .await;
     assert!(
         send_result.is_err(),
         "a write the killed child never drained surfaces an error: {send_result:?}"
     );
-    tokio::time::timeout(Duration::from_secs(10), driver.close())
-        .await
-        .expect("close completes after the overflow shutdown")
-        .expect("close ack");
-    let mut tail = Vec::new();
-    let drain = async {
-        while let Some(obs) = handle.recv().await {
-            tail.push(obs);
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), drain)
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(10),
+        "close after the overflow",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close after the overflow")
+    .expect("close ack");
+    let tail = drain_until_closed(&mut handle, Duration::from_secs(5))
         .await
         .expect("the RunHandle reaches recv=None after close");
     assert!(
@@ -1921,10 +1969,7 @@ async fn a_deferred_result_emits_exactly_one_ordered_settlement_when_b_real_writ
     // A is deferred; stdin is closed. Release B's pre-accept gate: its REAL
     // write fails (EPIPE), so the ordered rollback emits the one correction.
     barrier.release_write_ack();
-    let b_result = tokio::time::timeout(Duration::from_secs(5), sends)
-        .await
-        .expect("sends task within 5s")
-        .expect("sends task joined");
+    let b_result = join_bounded(sends, Duration::from_secs(5), "the chained A/B sends").await;
     assert!(
         b_result.is_err(),
         "B's real write fails on the closed stdin"
@@ -1979,10 +2024,8 @@ async fn cancelling_a_pre_accept_b_publishes_a_deferred_a_settle() {
         .wait_until_result_parked(Duration::from_secs(5))
         .await;
     barrier.release_send();
-    tokio::time::timeout(Duration::from_secs(5), send_a)
+    join_bounded(send_a, Duration::from_secs(5), "send_a")
         .await
-        .expect("send_a task within 5s")
-        .expect("send_a joined")
         .expect("A acked");
 
     // B reserves, then parks pre-accept (writer has not accepted it).
@@ -2103,15 +2146,10 @@ async fn aborting_a_suspended_b_does_not_let_c_result_pop_a_phantom_b() {
 
     // Bounded joins: C completes and X releases (both acknowledge the schedule
     // actually played out).
-    tokio::time::timeout(Duration::from_secs(5), send_c)
+    join_bounded(send_c, Duration::from_secs(5), "send_c")
         .await
-        .expect("send_c task within 5s")
-        .expect("send_c joined")
         .expect("C sends after B aborted");
-    tokio::time::timeout(Duration::from_secs(5), seq_holder)
-        .await
-        .expect("write_seq holder within 5s")
-        .expect("holder task");
+    join_bounded(seq_holder, Duration::from_secs(5), "the write_seq holder").await;
 
     // C's single turn starts and settles as C (index 0, settledRootTurn) — its
     // result did not pop a phantom B leaving C outstanding.
@@ -2161,10 +2199,8 @@ async fn aborting_while_parked_on_the_publish_mutex_leaves_no_phantom_reservatio
         .wait_until_result_parked(Duration::from_secs(5))
         .await;
     barrier.release_send();
-    tokio::time::timeout(Duration::from_secs(5), send_a)
+    join_bounded(send_a, Duration::from_secs(5), "send_a")
         .await
-        .expect("send_a task within 5s")
-        .expect("send_a joined")
         .expect("A acked");
 
     // Hold the publish mutex (a concurrent fence/close does the same), then
@@ -2194,12 +2230,13 @@ async fn aborting_while_parked_on_the_publish_mutex_leaves_no_phantom_reservatio
     // C completes normally; its result (second user frame the child sees)
     // settles C itself at result index 1.
     let dc = driver.clone();
-    tokio::time::timeout(
-        Duration::from_secs(5),
+    wait_bounded(
         dc.send(prompt_id("second", "msg-c")),
+        Duration::from_secs(5),
+        "the post-abort C send",
     )
     .await
-    .expect("C send within 5s")
+    .expect("bounded test wait timed out: waiting for the post-abort C send")
     .expect("C sends after B aborted");
     // The send ack means WRITTEN, not answered: acknowledge C's result is
     // mapped before fencing so the fence cannot overtake C's live frames.
@@ -2266,10 +2303,8 @@ async fn cancelling_b_emits_a_settlement_at_its_ticket_position_before_c_starts(
         .wait_until_result_parked(Duration::from_secs(5))
         .await;
     barrier.release_send();
-    tokio::time::timeout(Duration::from_secs(5), send_a)
+    join_bounded(send_a, Duration::from_secs(5), "send_a")
         .await
-        .expect("send_a task within 5s")
-        .expect("send_a joined")
         .expect("A acked");
 
     // B reserves and parks pre-accept (writer never accepts its prompt).
@@ -2302,10 +2337,8 @@ async fn cancelling_b_emits_a_settlement_at_its_ticket_position_before_c_starts(
     // C parked at the pre-ack gate; open it so C writes and the fake answers
     // turn 2 while the worker is STILL parked at B's cancelled ticket.
     barrier.release_write_ack();
-    tokio::time::timeout(Duration::from_secs(5), send_c)
+    join_bounded(send_c, Duration::from_secs(5), "send_c")
         .await
-        .expect("send_c task within 5s")
-        .expect("send_c joined")
         .expect("C writes and commits after B cancelled");
     // r11 item 4(a): ACKNOWLEDGE C's result frame is ENQUEUED (reader side,
     // count 2: A then C) before provoking the natural EOF — the EOF must queue
@@ -2377,19 +2410,16 @@ async fn cancelling_b_emits_a_settlement_at_its_ticket_position_before_c_starts(
         "A's correction precedes the natural session exit: {all:?}"
     );
 
-    // r11 item 4(c): close seals the events channel; collect the tail to recv
-    // None inside ONE overall timeout and REQUIRE the None to arrive — a 5 s
-    // quiet period must never be mistaken for EOF.
+    // r11 item 4(c); r12 items 3/4: close seals the events channel; the SAME
+    // shared `drain_until_closed` the bound proof withholds collects the tail
+    // to recv None inside ONE overall named bound — a quiet period is never
+    // mistaken for EOF.
     drop(barrier);
     let _ = driver.close().await;
-    let drain_to_none = async {
-        while let Some(obs) = handle.recv().await {
-            all.push(obs);
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), drain_to_none)
+    let tail = drain_until_closed(&mut handle, Duration::from_secs(5))
         .await
         .expect("events channel reaches recv=None after natural EOF and close");
+    all.extend(tail);
 
     // Re-locate exited in the completed sequence and demand it be the LAST
     // observation: nothing — no correction, no result — follows the terminal
@@ -2439,10 +2469,8 @@ async fn cancelling_a_newer_c_while_older_b_is_active_does_not_release_a_deferre
         .wait_until_result_parked(Duration::from_secs(5))
         .await;
     barrier.release_send();
-    tokio::time::timeout(Duration::from_secs(5), send_a)
+    join_bounded(send_a, Duration::from_secs(5), "send_a")
         .await
-        .expect("send_a task within 5s")
-        .expect("send_a joined")
         .expect("A acked");
     // A committed: the worker emitted start_A and is parked after it with the
     // worker gate STILL shut — result_A (queued ahead of B's ticket) is not
@@ -2478,15 +2506,9 @@ async fn cancelling_a_newer_c_while_older_b_is_active_does_not_release_a_deferre
     barrier
         .wait_until_reserves_enqueued(3, Duration::from_secs(5))
         .await;
-    let b = tokio::time::timeout(Duration::from_secs(5), send_b)
-        .await
-        .expect("send_b task within 5s")
-        .expect("send_b joined");
+    let b = join_bounded(send_b, Duration::from_secs(5), "send_b").await;
     assert!(b.is_ok(), "B writes and commits: {b:?}");
-    let c = tokio::time::timeout(Duration::from_secs(5), send_c)
-        .await
-        .expect("send_c task within 5s")
-        .expect("send_c joined");
+    let c = join_bounded(send_c, Duration::from_secs(5), "send_c").await;
     assert!(c.is_err(), "C's forced-fault write fails: {c:?}");
     // B is now COMMITTED (mid-turn) before A's result is released.
 
@@ -2580,10 +2602,8 @@ async fn natural_stdout_eof_seals_reservation_admission_and_emits_nothing_after_
     barrier.release_send();
     // A commits: start_A is published and the worker parks post-start (worker
     // gate shut by default) BEFORE mapping result_A.
-    tokio::time::timeout(Duration::from_secs(5), send_a)
+    join_bounded(send_a, Duration::from_secs(5), "send_a")
         .await
-        .expect("send_a task within 5s")
-        .expect("send_a joined")
         .expect("A acked");
 
     // The one-turn fake finishes its script and exits naturally: the reader
@@ -2595,9 +2615,13 @@ async fn natural_stdout_eof_seals_reservation_admission_and_emits_nothing_after_
         .wait_until_stdout_eof_queued(Duration::from_secs(5))
         .await;
 
-    let b = tokio::time::timeout(Duration::from_secs(5), driver.send(prompt("late b")))
-        .await
-        .expect("B admission attempt resolves within 5s");
+    let b = wait_bounded(
+        driver.send(prompt("late b")),
+        Duration::from_secs(5),
+        "late B admission",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for late B admission to resolve");
     assert!(
         matches!(&b, Err(DriverError::ControlUnavailable)),
         "B loses the race to the EOF seal and is refused: {b:?}"
@@ -2754,12 +2778,13 @@ async fn aborting_before_the_writer_accepts_never_writes_the_prompt() {
 
     // A second, normal prompt must run: proves the cancelled reservation was
     // rolled back cleanly (one start, one settle) and the first never wrote.
-    tokio::time::timeout(
-        Duration::from_secs(5),
+    wait_bounded(
         driver.send(prompt_id("the real prompt", "msg-real")),
+        Duration::from_secs(5),
+        "the post-abort follow-up send",
     )
     .await
-    .expect("follow-up send within 5s")
+    .expect("bounded test wait timed out: waiting for the follow-up send")
     .expect("the follow-up send succeeds");
     let obs = collect_until(&mut handle, Duration::from_secs(5), |seen| {
         seen.iter()
@@ -2867,12 +2892,13 @@ async fn aborting_inside_the_real_writer_window_keeps_the_accepted_turn_ordered_
     );
 
     // A normal follow-up turn B.
-    tokio::time::timeout(
-        Duration::from_secs(5),
+    wait_bounded(
         driver.send(prompt_id("second", "msg-b")),
+        Duration::from_secs(5),
+        "the follow-up B send",
     )
     .await
-    .expect("B send within 5s")
+    .expect("bounded test wait timed out: waiting for the follow-up B send")
     .expect("B sends");
     let b = collect_until(&mut handle, Duration::from_secs(5), |seen| {
         turn_done_count(seen) >= 1
@@ -2896,144 +2922,181 @@ async fn aborting_inside_the_real_writer_window_keeps_the_accepted_turn_ordered_
     driver.close().await.expect("close");
 }
 
-/// ma-sdk-state r11 item 5 — bound proof, class SPAWNED-TASK JOIN.
+/// ma-sdk-state r11 item 5 / r12 item 4 — bound proof, class SPAWNED-TASK JOIN.
 ///
-/// A send parked forever at the pre-ack gate makes the bounded JoinHandle
-/// join (`timeout(..).expect("… within 5s")` at every `send_*` join site)
-/// fail Elapsed FAST with a named bound; without the wrap the binary hangs
-/// until the outer harness timeout. The gate is released only afterwards, so
-/// the parked send then completes cleanly and close reaps the child.
+/// A send parked forever at the pre-accept gate is awaited through the SAME
+/// named `wait_bounded` helper every scheduling join uses. With the release
+/// withheld it fails Elapsed FAST at the helper's bound; releasing the gate
+/// then lets the SAME send complete cleanly, and close reaps the child. The
+/// RED switch is the bound inside `wait_bounded` only: removed, this test
+/// hangs until the outer harness command timeout.
 #[tokio::test]
-async fn bound_proof_a_parked_spawned_task_join_fails_fast_with_a_named_bound() {
+async fn bound_proof_a_parked_send_join_fails_fast_at_the_named_bound_then_completes_on_release() {
     let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
     let driver = std::sync::Arc::new(driver);
     let handle = driver.start(spec).await.expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
 
-    // Gate shut from write #1: the send parks pre-accept and never releases.
+    // Gate shut from write #1: the send parks pre-accept and stays parked.
+    // Run the send in a task relaying its result over a oneshot: the receiver
+    // is awaitable by reference, so the SAME send can be bounded once while
+    // withheld and awaited again after the release.
     let barrier = driver.arm_write_commit_barrier();
     barrier.park_from_write(1);
+    let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
     let d = driver.clone();
-    let parked = tokio::spawn(async move { d.send(prompt("parked forever")).await });
+    tokio::spawn(async move {
+        let _ = result_tx.send(d.send(prompt("parked then released")).await);
+    });
     barrier
         .wait_until_write_parked(Duration::from_secs(5))
         .await;
 
-    let joined = tokio::time::timeout(Duration::from_millis(300), parked).await;
-    assert_elapsed(joined, "the parked spawned-task join");
+    // WITHHOLD: the shared named bound fires.
+    let elapsed = wait_bounded(
+        &mut result_rx,
+        Duration::from_millis(300),
+        "the parked send",
+    )
+    .await;
+    assert_elapsed(elapsed, "the parked send join");
 
+    // RELEASE: the same send completes successfully (the fake answers turn 1).
     drop(barrier);
-    drop(handle);
-    let _ = driver.close().await;
-}
-
-/// ma-sdk-state r11 item 5 — bound proof, class BARRIER WAIT (internal
-/// deadline). A count that cannot be reached makes the helper panic FAST with
-/// its named deadline message; with the deadline removed the helper loops
-/// forever and the outer harness timeout kills the binary.
-#[tokio::test]
-async fn bound_proof_a_barrier_wait_fails_fast_with_its_named_deadline_message() {
-    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
-    let driver = std::sync::Arc::new(driver);
-    let handle = driver.start(spec).await.expect("start");
-    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
-
-    let barrier = driver.arm_write_commit_barrier();
-    // No reservation is ever enqueued, so count 99 is unreachable; the helper
-    // must panic AT its 300 ms internal deadline with the named message.
-    let waiter = tokio::spawn(async move {
-        barrier
-            .wait_until_reserves_enqueued(99, Duration::from_millis(300))
-            .await;
-    });
-    let join = tokio::time::timeout(Duration::from_secs(5), waiter)
+    let result = wait_bounded(&mut result_rx, Duration::from_secs(5), "the parked send")
         .await
-        .expect("the barrier waiter finishes (panicking) within 5s");
-    let panic = join.expect_err("the internal deadline must panic, not return");
-    let payload = panic.into_panic();
-    let message = payload
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| payload.downcast_ref::<&'static str>().copied())
-        .unwrap_or("");
+        .expect("bounded test wait timed out: waiting for the released send to finish")
+        .expect("the send task relayed its result");
     assert!(
-        message.contains("timed out waiting for 99 reservations"),
-        "named barrier deadline message: {message}"
+        result.is_ok(),
+        "the released parked send completes: {result:?}"
     );
 
     drop(handle);
     let _ = driver.close().await;
 }
 
-/// ma-sdk-state r11 item 5 — bound proof, class GATE WAIT IN SELECT.
-/// The real writer gate is closed but no write is ever issued, so
-/// `wait_until_parked` never resolves; the bound around it fails Elapsed FAST.
+/// ma-sdk-state r11 item 5 / r12 item 4 — bound proof, class BARRIER WAIT.
+///
+/// The barrier count helpers carry their own named internal deadline — there
+/// is no test-local timeout here, so a withheld count must panic with the
+/// helper's named message; with that deadline removed the helper loops
+/// forever and the OUTER harness command timeout is the terminator (the RED).
+/// Releasing the withheld condition (a reservation actually enqueuing) then
+/// makes the same helper return.
 #[tokio::test]
-async fn bound_proof_the_writer_gate_park_wait_fails_fast_when_no_write_arrives() {
-    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
-    let handle = driver.start(spec).await.expect("start");
-    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
-
-    let gate = driver.bounded_write_window(Duration::from_secs(5)).await;
-    gate.close();
-    // r12 item 4 rewrites this to the shared bounded gate wait; this still
-    // exercises the raw wire wait under the external bound.
-    let parked = tokio::time::timeout(Duration::from_millis(300), gate.wait_until_parked()).await;
-    assert_elapsed(parked, "the writer gate wait_until_parked");
-
-    drop(handle);
-    let _ = driver.close().await;
-}
-
-/// ma-sdk-state r11 item 5 — bound proof, class MUTEX/FENCE ACQUISITION
-/// (r11 item 4d). With the publish mutex held by a parked task, both the
-/// mutex-hold helper and the fence enqueue fail their bounds Elapsed FAST.
-#[tokio::test]
-async fn bound_proof_contended_mutex_and_fence_acquisitions_fail_fast_with_named_bounds() {
+async fn bound_proof_a_barrier_count_wait_fails_at_its_named_deadline_then_returns_on_release() {
     let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
     let driver = std::sync::Arc::new(driver);
     let handle = driver.start(spec).await.expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
 
-    // Holder acquires the publish mutex and parks; acknowledge acquisition so
-    // the contention is established, not hoped for.
+    let barrier = std::sync::Arc::new(driver.arm_write_commit_barrier());
+    // WITHHOLD: nothing has reserved yet, so a wait for count 1 must panic AT
+    // its internal 300 ms deadline. No local timeout wraps this join.
+    let waiter_barrier = barrier.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_barrier
+            .wait_until_reserves_enqueued(1, Duration::from_millis(300))
+            .await;
+    });
+    expect_named_timeout_panic(waiter, "timed out waiting for 1 reservations").await;
+
+    // RELEASE: open every barrier gate (the send's post-ack hold, the worker
+    // gate, …) while keeping the barrier handle for the acknowledged count; one
+    // normal send then enqueues its Reserve ticket and completes.
+    barrier.release();
+    let d = driver.clone();
+    let send = tokio::spawn(async move { d.send(prompt("the releasing turn")).await });
+    barrier
+        .wait_until_reserves_enqueued(1, Duration::from_secs(5))
+        .await;
+    join_bounded(send, Duration::from_secs(5), "the releasing send")
+        .await
+        .expect("the releasing send is acked");
+
+    drop(barrier);
+    drop(handle);
+    let _ = driver.close().await;
+}
+
+/// ma-sdk-state r11 item 5 / r12 item 4 — bound proof, class WRITER GATE WAIT.
+///
+/// The scheduling tests and this proof use the SAME wire helper
+/// `wait_until_parked_bounded`. With the gate closed and no write issued the
+/// helper panics at its named bound; once a real write arrives (release
+/// condition) the same helper returns and the write completes on `open`.
+#[tokio::test]
+async fn bound_proof_the_writer_gate_park_wait_fails_named_then_returns_when_a_write_arrives() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let driver = std::sync::Arc::new(driver);
+    let handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let gate = driver.bounded_write_window(Duration::from_secs(5)).await;
+    gate.close();
+
+    // WITHHOLD: no write is issued, so the bounded gate wait panics named.
+    let waiter_gate = gate.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_gate
+            .wait_until_parked_bounded(Duration::from_millis(300))
+            .await;
+    });
+    expect_named_timeout_panic(waiter, "waiting for the writer to park in its window").await;
+
+    // RELEASE the condition: a send reaches the closed gate; the SAME bounded
+    // helper now returns (acknowledged), then opening the gate completes it.
+    let d = driver.clone();
+    let send = tokio::spawn(async move { d.send(prompt("gated write")).await });
+    gate.wait_until_parked_bounded(Duration::from_secs(5)).await;
+    gate.open();
+    join_bounded(send, Duration::from_secs(5), "the gated send")
+        .await
+        .expect("the gated send completes after the gate opens");
+
+    drop(handle);
+    let _ = driver.close().await;
+}
+
+/// ma-sdk-state r11 item 5 / r12 item 4 — bound proof, class MUTEX/FENCE
+/// ACQUISITION. A parked holder withholds the publish mutex: BOTH named
+/// helpers the scheduling tests use (bounded mutex hold, bounded fence
+/// enqueue) panic at their named bounds. The holder released, both helpers
+/// then acquire/enqueue and complete (the fence drains and signals).
+#[tokio::test]
+async fn bound_proof_contended_mutex_and_fence_acquisitions_fail_named_then_complete_on_release() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let driver = std::sync::Arc::new(driver);
+    let handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Holder acquires the publish mutex and parks until the test releases it;
+    // acknowledge acquisition. An explicit release (not abort) makes the
+    // guard-drop-and-handover deterministic: the holder task is awaited to
+    // completion before the release half reacquires.
     let (acq_tx, acq_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let d = driver.clone();
     let holder = tokio::spawn(async move {
         let _hold = d
             .bounded_hold_publish_mutex_for_test(Duration::from_secs(5))
             .await;
-        acq_tx
-            .send(())
-            .expect("acknowledge holder acquired the mutex");
-        std::future::pending::<()>().await;
+        acq_tx.send(()).expect("acknowledge holder acquired");
+        let _ = release_rx.await;
     });
-    tokio::time::timeout(Duration::from_secs(5), acq_rx)
-        .await
-        .expect("holder acquisition within 5s")
-        .expect("oneshot");
+    acq_rx.await.expect("holder acquisition acknowledged");
 
-    // r12 item 3: the contended acquisitions go through the SAME named
-    // bounded helpers the scheduling tests use; their named timeout failure is
-    // a panic caught here (r12 item 4 adds the release/completion half).
+    // WITHHOLD: the shared helpers panic at their named 300 ms bounds.
     let d = driver.clone();
     let hold_waiter = tokio::spawn(async move {
-        // Bind the guard inside the task: it borrows the driver moved into
-        // this future, so it must not escape the spawned scope.
         let _hold = d
             .bounded_hold_publish_mutex_for_test(Duration::from_millis(300))
             .await;
     });
-    expect_named_timeout_panic(
-        hold_waiter,
-        "acquiring the publication mutex hold",
-        Duration::from_secs(5),
-    )
-    .await;
+    expect_named_timeout_panic(hold_waiter, "acquiring the publication mutex hold").await;
     let d = std::sync::Arc::clone(&driver);
     let fence_waiter = tokio::spawn(async move {
-        // The returned receiver is itself awaitable; it is irrelevant once the
-        // named bounded enqueue wait has been exercised, so drop it here.
         let _rx = d
             .bounded_publication_fence(Duration::from_millis(300))
             .await;
@@ -3041,23 +3104,43 @@ async fn bound_proof_contended_mutex_and_fence_acquisitions_fail_fast_with_named
     expect_named_timeout_panic(
         fence_waiter,
         "enqueuing a publication fence (publish mutex)",
-        Duration::from_secs(5),
     )
     .await;
 
-    holder.abort();
+    // RELEASE: let the holder drop its guard and wait for the holder task to
+    // finish so the handover is acknowledged, not hoped for.
+    release_tx.send(()).expect("release the holder");
+    wait_bounded(holder, Duration::from_secs(5), "the mutex holder task")
+        .await
+        .expect("bounded test wait timed out: waiting for the holder task to finish")
+        .expect("the holder task exits after release");
+    // Both shared helpers now complete — the mutex hold acquires (then drops),
+    // and a freshly enqueued fence drains and signals through the live worker.
+    {
+        let _hold = driver
+            .bounded_hold_publish_mutex_for_test(Duration::from_secs(5))
+            .await;
+    }
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
+    wait_bounded(fence, Duration::from_secs(5), "the released fence signal")
+        .await
+        .expect("the released publication fence signals after the holder drops")
+        .expect("the released fence signals");
+
     drop(handle);
     let _ = driver.close().await;
 }
 
-/// ma-sdk-state r11 item 5 — bound proof, class OVERALL recv-NONE DRAIN
-/// (r11 item 4c). The one-turn fake exits naturally (so `exited` arrives), but
-/// close is WITHHELD, so recv never returns None. The drain-to-None wrapped in
-/// ONE overall timeout must fail Elapsed FAST with its named bound — a
-/// per-recv quiet loop would instead return silently and read "no tail" as
-/// EOF.
+/// ma-sdk-state r11 item 5 / r12 item 4 — bound proof, class OVERALL
+/// recv-NONE DRAIN (r11 item 4c). The one-turn fake exits naturally (so
+/// `exited` arrives), but close is WITHHELD: recv never returns None and the
+/// shared `drain_until_closed` helper fails Elapsed at its ONE overall bound.
+/// Closing (the release) then lets the same drain complete — a quiet-period
+/// loop would instead have returned silently and read "no tail" as EOF.
 #[tokio::test]
-async fn bound_proof_the_recv_none_drain_fails_fast_when_close_is_withheld() {
+async fn bound_proof_the_recv_none_drain_fails_named_then_completes_after_close() {
     let mut env = BTreeMap::new();
     env.insert("FAKE_CLAUDE_EXIT_WHEN_SCRIPT_DONE".into(), "1".into());
     let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
@@ -3065,10 +3148,14 @@ async fn bound_proof_the_recv_none_drain_fails_fast_when_close_is_withheld() {
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
 
     // One ordinary prompt: the one-turn fake answers and then exits naturally.
-    tokio::time::timeout(Duration::from_secs(5), driver.send(prompt("the only turn")))
-        .await
-        .expect("prompt send within 5s")
-        .expect("the prompt is written");
+    wait_bounded(
+        driver.send(prompt("the only turn")),
+        Duration::from_secs(5),
+        "the only prompt",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for the only prompt")
+    .expect("the prompt is written");
 
     // The natural exited observation arrives (its own acknowledged wait).
     let before = collect_until(&mut handle, Duration::from_secs(5), |seen| {
@@ -3080,11 +3167,22 @@ async fn bound_proof_the_recv_none_drain_fails_fast_when_close_is_withheld() {
         lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("exited")
     }));
 
-    // close WITHHELD: the channel is never sealed, so this recv-until-None
-    // drain must hit its ONE overall bound rather than ending quietly.
-    let drain_to_none = async { while handle.recv().await.is_some() {} };
-    let drained = tokio::time::timeout(Duration::from_millis(300), drain_to_none).await;
-    assert_elapsed(drained, "the recv-None drain with close withheld");
+    // WITHHOLD close: the shared drain must fail at its overall 300 ms bound.
+    let drained = drain_until_closed(&mut handle, Duration::from_millis(300)).await;
+    assert_elapsed(
+        drained.map(|_| ()),
+        "the recv-None drain with close withheld",
+    );
 
+    // RELEASE: close seals the channel; the same drain completes.
     driver.close().await.expect("close");
+    let tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the recv-None drain completes after close");
+    assert!(
+        tail.iter()
+            .all(|o| !(lifecycle_named(o) == Some("session")
+                && lifecycle_status(o) == Some("exited"))),
+        "close seals without a duplicate terminal exit: {tail:?}"
+    );
 }

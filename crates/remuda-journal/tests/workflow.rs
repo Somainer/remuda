@@ -1275,3 +1275,122 @@ fn a_truncated_and_reused_start_offset_is_not_the_settled_record() {
         "a different record at the reused offset is a genuine retry, not the settled attempt"
     );
 }
+
+/// c-cardsettle-fu2 r7 item 2: the failure-time peek used an unchecked cached
+/// offset/generation and only poll normalised rotation. After attempt 1 is
+/// consumed, the journal is REPLACED by a shorter file holding only attempt
+/// 2's complete start (length below the consumed offset). The live
+/// SubagentStart + StopFailure then arrive before any poll observes the
+/// replacement. The peek must normalise the rotation against the OPENED
+/// file (fresh generation at offset 0) and bind the watermark to THAT
+/// generation, so the poll which rotates the cursor folds attempt 2 as the
+/// settled start (Failed), not as a genuine retry.
+#[test]
+fn a_replaced_shorter_journal_before_failure_is_normalised_by_the_peek() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_r7_replace";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    // Attempt 1: a deliberately LONG started+failed prefix so the later
+    // replacement file is shorter than the consumed cursor.
+    std::fs::write(
+        run_dir.join("journal.jsonl"),
+        "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"the-first-long-attempt\"}\n\
+         {\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n",
+    )
+    .unwrap();
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        bodies(tailer.poll().unwrap())
+            .iter()
+            .rev()
+            .find_map(|body| match body {
+                ObservationPayload::WorkflowMember(m)
+                    if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+                {
+                    Some(m.state)
+                }
+                _ => None,
+            })
+            .expect("a1 observed"),
+        WorkflowState::Failed,
+        "attempt 1 ends Failed and its prefix is consumed"
+    );
+
+    // Replace the journal in place with ONLY attempt 2's complete start —
+    // shorter than the consumed offset — BEFORE the live failure (no poll in
+    // between to normalise it).
+    std::fs::write(
+        run_dir.join("journal.jsonl"),
+        "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n",
+    )
+    .unwrap();
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+
+    // This poll is the first to see the replacement. The peek already
+    // normalised the new generation and armed the watermark at offset 0.
+    let replaced: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        replaced.iter().all(|state| *state == WorkflowState::Failed),
+        "attempt 2's start in the replaced shorter file is the settled attempt: {replaced:?}"
+    );
+
+    // A genuinely newer attempt appended to the new file still resurrects.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}}"
+        )
+        .unwrap();
+    }
+    let final_state = bodies(tailer.poll().unwrap())
+        .iter()
+        .rev()
+        .find_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .expect("a1 observed after attempt 3");
+    assert_eq!(
+        final_state,
+        WorkflowState::Running,
+        "a start appended after the settled attempt is a genuine retry in the new generation"
+    );
+}

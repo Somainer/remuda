@@ -143,6 +143,14 @@ pub struct UnreadStart {
     pub extent: u64,
 }
 
+/// An opened journal after rotation normalisation: `rest` is the unread
+/// content from the effective cursor in the effective generation.
+struct OpenedTail {
+    file: File,
+    len: u64,
+    rest: Vec<u8>,
+}
+
 impl FileTail {
     /// Start at offset 0 with a fresh file identity.
     pub fn new(path: impl Into<PathBuf>) -> Result<Self, Error> {
@@ -215,8 +223,12 @@ impl FileTail {
     /// while finding it ([`UnreadStart`]) — or `None`. Matches on `agentId`
     /// (falling back to `key`, for records that omit `agentId`).
     ///
-    /// Does NOT advance the cursor. A live StopFailure uses the result as a
-    /// terminal watermark: only starts at or before that position, and at the
+    /// Does NOT consume records, but it DOES apply the same rotation
+    /// normalisation against the opened file as [`Self::poll`] (a
+    /// replace/truncate or prefix rewrite since the last poll starts a fresh
+    /// generation here too), so positions are reported in the generation the
+    /// next fold will use. A live StopFailure uses the result as a terminal
+    /// watermark: only starts at or before that position, and at the
     /// position only with the SAME record digest, are the failure's own
     /// settled attempt; a start at a later offset is a genuine retry and must
     /// resurrect the member even when both fold in the same poll.
@@ -236,16 +248,13 @@ impl FileTail {
     /// truncate that did not bump the generation (see
     /// [`Self::extent_discarded`]).
     pub fn unread_start(&mut self, agent_id: &str) -> Result<Option<UnreadStart>, Error> {
-        let mut file = match File::open(&self.path) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(err.into()),
-            Ok(file) => file,
+        // Normalise against the OPENED file (a replace/truncate since the
+        // last poll starts a new generation here, not only later in poll), so
+        // the watermark binds to the generation its record will actually fold
+        // in.
+        let Some(OpenedTail { rest, len, .. }) = self.open_normalised()? else {
+            return Ok(None);
         };
-        let len = file.metadata()?.len();
-        self.last_len = Some(len);
-        file.seek(SeekFrom::Start(self.offset))?;
-        let mut rest = Vec::new();
-        file.read_to_end(&mut rest)?;
         let mut newest: Option<UnreadStart> = None;
         let mut start = 0usize;
         let record_start = |line: &[u8], at: usize, newest: &mut Option<UnreadStart>| {
@@ -314,20 +323,9 @@ impl FileTail {
 
     /// Read every newly completed JSONL line. Incomplete trailing lines wait.
     pub fn poll(&mut self) -> Result<Vec<(Vec<u8>, FileCursor)>, Error> {
-        let mut file = match File::open(&self.path) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(err.into()),
-            Ok(file) => file,
+        let Some(OpenedTail { mut file, rest, .. }) = self.open_normalised()? else {
+            return Ok(Vec::new());
         };
-        let len = file.metadata()?.len();
-        // Remember the observed extent before rotation normalisation, so a
-        // later arm can tell that unread bytes it covered were discarded
-        // (including by a truncate that DID bump the generation).
-        self.last_len = Some(len);
-        self.detect_rotation(&mut file, len)?;
-        file.seek(SeekFrom::Start(self.offset))?;
-        let mut rest = Vec::new();
-        file.read_to_end(&mut rest)?;
         let mut lines = Vec::new();
         let mut start = 0usize;
         for (i, byte) in rest.iter().enumerate() {
@@ -356,6 +354,32 @@ impl FileTail {
         self.offset += start as u64;
         self.refresh_prefix(&mut file)?;
         Ok(lines)
+    }
+
+    /// Open the journal and apply the SAME rotation / effective-cursor
+    /// normalisation that the folding poll uses, before any unread bytes are
+    /// located: a file shorter than the cursor, or one whose consumed prefix
+    /// was rewritten, starts a new generation at offset 0. This is shared by
+    /// the live-failure peek and [`Self::poll`] so a watermark armed from the
+    /// peek binds to the generation its record will actually fold in, rather
+    /// than to a stale cached generation/offset beyond EOF. Returns `None`
+    /// when the file does not exist yet.
+    fn open_normalised(&mut self) -> Result<Option<OpenedTail>, Error> {
+        let mut file = match File::open(&self.path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+            Ok(file) => file,
+        };
+        let len = file.metadata()?.len();
+        // Remember the observed extent before rotation normalisation, so a
+        // later arm/poll can tell that unread bytes it covered were discarded
+        // (including by a truncate that DID bump the generation).
+        self.last_len = Some(len);
+        self.detect_rotation(&mut file, len)?;
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut rest = Vec::new();
+        file.read_to_end(&mut rest)?;
+        Ok(Some(OpenedTail { file, len, rest }))
     }
 
     fn detect_rotation(&mut self, file: &mut File, len: u64) -> Result<(), Error> {

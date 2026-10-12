@@ -8430,6 +8430,15 @@ mod emission_ordering_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    /// The ONE named bound for every await in the terminal-ordering stress
+    /// test (ma-sdk-state r15 item 5): no inline `tokio::time::timeout` at the
+    /// scheduling/join sites.
+    async fn bounded_race_wait<F: std::future::Future>(future: F, what: &str) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .unwrap_or_else(|_| panic!("bounded test wait timed out: {what}"))
+    }
+
     fn is_terminal(obs: &Observation) -> bool {
         match &obs.body {
             ObservationPayload::Lifecycle(payload) => match payload.as_ref() {
@@ -8444,6 +8453,39 @@ mod emission_ordering_tests {
             },
             _ => false,
         }
+    }
+
+    /// Trigger half of the FIRE_AFTER acknowledgement (ma-sdk-state r15 item 5).
+    ///
+    /// A retained [`oneshot`], not a `Notify`: the drainer thread can reach
+    /// FIRE_AFTER and signal BEFORE the firing thread registers its wait, and
+    /// `Notify::notify_waiters` stores nothing — that single notification is
+    /// lost and the test hangs forever. The oneshot retains the signal and the
+    /// later receive completes immediately.
+    #[derive(Clone)]
+    struct FireTrigger {
+        tx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    }
+
+    impl FireTrigger {
+        fn fire(&self) {
+            if let Some(tx) = self.tx.lock().expect("fire gate lock").take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    /// Create the FIRE_AFTER acknowledgement: a one-shot trigger the drainer
+    /// fires once and a receiver the firing thread awaits under its named
+    /// bound.
+    fn fire_gate() -> (FireTrigger, tokio::sync::oneshot::Receiver<()>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (
+            FireTrigger {
+                tx: std::sync::Arc::new(std::sync::Mutex::new(Some(tx))),
+            },
+            rx,
+        )
     }
 
     /// One stress iteration: tiny channel, one terminal slot pre-reserved, many
@@ -8489,12 +8531,12 @@ mod emission_ordering_tests {
                 .expect("ordinary observation")
         };
 
-        let drained_before_terminal = std::sync::Arc::new(tokio::sync::Notify::new());
+        // Retained FIRE_AFTER acknowledgement (see [`fire_gate`]).
+        let (fire, fire_rx) = fire_gate();
         let ordinary_seen = std::sync::Arc::new(AtomicUsize::new(0));
 
         // Fast drainer: frees slots as fast as it can, which is exactly what
         // lets a parked ordinary send compete with the terminal send.
-        let drainer_notify = std::sync::Arc::clone(&drained_before_terminal);
         let drainer_seen = std::sync::Arc::clone(&ordinary_seen);
         let drainer = tokio::spawn(async move {
             let mut terminal_index: Option<usize> = None;
@@ -8513,7 +8555,7 @@ mod emission_ordering_tests {
                     Some(_) => after += 1,
                 }
                 if drainer_seen.fetch_add(1, Ordering::AcqRel) + 1 == FIRE_AFTER {
-                    drainer_notify.notify_waiters();
+                    fire.fire();
                 }
             }
             (preserved_before, after)
@@ -8533,39 +8575,63 @@ mod emission_ordering_tests {
             }));
         }
 
-        // Wait for ordinary traffic to actually flow (parked senders exist),
-        // then fire the terminal on yet another thread.
-        drained_before_terminal.notified().await;
+        // Wait for the RETAINED FIRE_AFTER acknowledgement (the drainer may
+        // have fired it on another worker thread before this point), then fire
+        // the terminal on yet another thread.
+        bounded_race_wait(
+            async { fire_rx.await.expect("the FIRE_AFTER acknowledgement") },
+            "the retained FIRE_AFTER drain acknowledgement",
+        )
+        .await;
         let terminal_inner = Arc::clone(&inner);
         let terminal_launch = Arc::clone(&launch);
         let terminal =
             tokio::spawn(
                 async move { emit_exit(&terminal_inner, &terminal_launch, "exited").await },
             );
-        tokio::time::timeout(Duration::from_secs(10), terminal)
+        bounded_race_wait(terminal, "iteration {iter}: terminal send")
             .await
-            .unwrap_or_else(|_| panic!("iteration {iter}: terminal send bound"))
             .expect("terminal task")
             .expect("terminal emitted");
 
         for handle in emitters {
-            tokio::time::timeout(Duration::from_secs(10), handle)
+            bounded_race_wait(handle, "iteration {iter}: emitter bound")
                 .await
-                .unwrap_or_else(|_| panic!("iteration {iter}: emitter bound"))
                 .expect("emitter task");
         }
         // Seal and drop the sender so the drainer reaches channel EOF.
         launch.emission.lock().await.tx = None;
         drop(launch);
-        let (preserved, after) = tokio::time::timeout(Duration::from_secs(10), drainer)
+        let (preserved, after) = bounded_race_wait(drainer, "iteration {iter}: drainer bound")
             .await
-            .unwrap_or_else(|_| panic!("iteration {iter}: drainer bound"))
             .expect("drainer task");
         assert!(
             preserved >= FIRE_AFTER,
             "iteration {iter}: observations queued before the terminal are preserved"
         );
         after
+    }
+
+    /// ma-sdk-state r15 item 5: the drainer can win the thread schedule and
+    /// reach FIRE_AFTER BEFORE the firing thread awaits the acknowledgement —
+    /// on a multi-thread runtime this actually happens. Signalling before the
+    /// wait must not be lost: with the old `Notify::notify_waiters` it stored
+    /// no permit and the (named-bounded) wait hung; the retained oneshot
+    /// completes immediately.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_fire_acknowledgement_is_retained_when_signalled_before_the_wait() {
+        let (fire, fire_rx) = fire_gate();
+        // Deterministically reproduce the winning schedule: signal first.
+        fire.fire();
+        bounded_race_wait(
+            async {
+                fire_rx
+                    .await
+                    .expect("the retained pre-wait acknowledgement")
+            },
+            "a FIRE_AFTER acknowledgement signalled before the wait",
+        )
+        .await;
     }
 
     /// Run the race repeatedly: a single reordered delivery in ANY iteration

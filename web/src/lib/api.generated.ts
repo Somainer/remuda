@@ -1870,6 +1870,7 @@ export interface components {
             forwarded: boolean;
             hostId: string;
             idempotencyKey: string | null;
+            initiator?: components["schemas"]["Initiator"] | null;
             instanceId: string | null;
             operation: string;
             payload: {
@@ -2137,6 +2138,16 @@ export interface components {
         HostWorkspacePath: {
             /** @description Absolute path on the Node, within its configured workspace roots */
             path: string;
+        };
+        /** @description D-057 §7.1: the Hub-stamped initiator of an Agent-initiated mutation, derived from the authenticating device's bound instance and forwarded to Nodes. The authenticating device id stays Hub-only and is not part of this shape. Absent for Human/Bot callers. */
+        Initiator: {
+            /**
+             * Format: int64
+             * @description Chapter generation at authentication time; a fence bumps the lineage's live generation.
+             */
+            generation: number;
+            instanceId: string;
+            lineageId: string;
         };
         InstanceCommands: {
             commands: components["schemas"]["CommandRecord"][];
@@ -4008,6 +4019,7 @@ export interface operations {
                             hostId?: string | null;
                             id?: string;
                             keepLogs?: boolean;
+                            landingSessionEpoch?: string | null;
                             laneId?: string | null;
                             logObjectId?: string | null;
                             mergeSha?: string | null;
@@ -4019,7 +4031,7 @@ export interface operations {
                             requestedBy?: string;
                             startedAt?: string | null;
                             /** @enum {string} */
-                            state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                            state?: "queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled";
                             steps?: {
                                 [key: string]: unknown;
                             }[];
@@ -5510,6 +5522,7 @@ export interface operations {
                             hostId?: string | null;
                             id?: string;
                             keepLogs?: boolean;
+                            landingSessionEpoch?: string | null;
                             laneId?: string | null;
                             logObjectId?: string | null;
                             mergeSha?: string | null;
@@ -5521,7 +5534,7 @@ export interface operations {
                             requestedBy?: string;
                             startedAt?: string | null;
                             /** @enum {string} */
-                            state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                            state?: "queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled";
                             steps?: {
                                 [key: string]: unknown;
                             }[];
@@ -5579,6 +5592,7 @@ export interface operations {
                         hostId?: string | null;
                         id?: string;
                         keepLogs?: boolean;
+                        landingSessionEpoch?: string | null;
                         laneId?: string | null;
                         logObjectId?: string | null;
                         mergeSha?: string | null;
@@ -5590,7 +5604,7 @@ export interface operations {
                         requestedBy?: string;
                         startedAt?: string | null;
                         /** @enum {string} */
-                        state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                        state?: "queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled";
                         steps?: {
                             [key: string]: unknown;
                         }[];
@@ -5636,6 +5650,7 @@ export interface operations {
                         hostId?: string | null;
                         id?: string;
                         keepLogs?: boolean;
+                        landingSessionEpoch?: string | null;
                         laneId?: string | null;
                         logObjectId?: string | null;
                         mergeSha?: string | null;
@@ -5647,7 +5662,7 @@ export interface operations {
                         requestedBy?: string;
                         startedAt?: string | null;
                         /** @enum {string} */
-                        state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                        state?: "queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled";
                         steps?: {
                             [key: string]: unknown;
                         }[];
@@ -5698,6 +5713,7 @@ export interface operations {
                         hostId?: string | null;
                         id?: string;
                         keepLogs?: boolean;
+                        landingSessionEpoch?: string | null;
                         laneId?: string | null;
                         logObjectId?: string | null;
                         mergeSha?: string | null;
@@ -5709,7 +5725,7 @@ export interface operations {
                         requestedBy?: string;
                         startedAt?: string | null;
                         /** @enum {string} */
-                        state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                        state?: "queued" | "running" | "landing" | "passed" | "failed" | "landed" | "canceling" | "canceled";
                         steps?: {
                             [key: string]: unknown;
                         }[];

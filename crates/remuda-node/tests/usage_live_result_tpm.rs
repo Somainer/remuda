@@ -144,11 +144,15 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
 
     // Cost-only frame: no usage buckets at all, just a corrected bill.
     let third = usage_for(None, Some(0.75));
+    // The clock the FIRST frame stamped (live receipt time); every later frame
+    // here is the SAME source position (result_index 0 -> revision 1), so the
+    // clock must stay on it.
+    let first_clock = String::from(first.observed_at.clone());
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate(&conn).unwrap();
 
-    for (seq, observation) in [first, second].into_iter().enumerate() {
+    for (seq, observation) in [first.clone(), second].into_iter().enumerate() {
         let record = JournalRecord {
             instance_id: "ins_partial_merge".into(),
             seq: seq as i64 + 1,
@@ -239,4 +243,80 @@ fn a_partial_result_frame_merges_over_known_counters_end_to_end() {
         "cost-only update keeps the retained output"
     );
     assert_eq!(total, Some(120), "cost-only update keeps the derived total");
+
+    // c-ctxusage r14 item 4: a cost-only correction never rewrites the turn
+    // clock — the stored observed_at is still the FIRST frame's receipt time,
+    // even though the cost-only frame carried its own (later) native time.
+    let clock: String = conn
+        .query_row(
+            "SELECT observed_at FROM usage_events \
+             WHERE instance_id = 'ins_partial_merge' AND scope = 'turn' AND scope_id = '1:0'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        clock, first_clock,
+        "the cost-only update must not move the turn clock"
+    );
+
+    // Replay the FIRST frame after the cost-only update: same result scope and
+    // revision 1 (an equal source position), now carrying a smaller output
+    // (10 < 20) and an older bill (0.5 < 0.75). An equal position changes
+    // NOTHING — no counter, no cost, no clock.
+    let replayed_first = JournalRecord {
+        instance_id: "ins_partial_merge".into(),
+        seq: 4,
+        event_id: "evt_partial_replay_first".into(),
+        observed_at: "2020-01-01T00:00:00.000Z".into(),
+        event: serde_json::to_value(&first).unwrap(),
+    };
+    let replay_row = project_usage_event(&replayed_first, None, None).expect("projects replay");
+    assert_eq!(
+        replay_row.metric_revision, 1,
+        "the print result replays at revision 1"
+    );
+    assert!(
+        !insert_usage_event(&conn, &replay_row).expect("replay insert"),
+        "replaying the first frame at an equal position must change nothing"
+    );
+    let (input, output, total, cost, clock): (
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT input_tokens, output_tokens, total_tokens, cost_usd, observed_at FROM \
+             usage_events WHERE instance_id = 'ins_partial_merge' AND scope = 'turn' AND \
+             scope_id = '1:0'",
+            [],
+            |r| {
+                Ok((
+                    r.get(0).unwrap(),
+                    r.get(1).unwrap(),
+                    r.get(2).unwrap(),
+                    r.get(3).unwrap(),
+                    r.get(4).unwrap(),
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(input, Some(100), "input retained");
+    assert_eq!(
+        output,
+        Some(20),
+        "the equal-position output decrease is frozen"
+    );
+    assert_eq!(total, Some(120), "derived total retained");
+    assert_eq!(
+        cost.as_deref(),
+        Some("0.75"),
+        "the equal-position replay must not roll the bill back"
+    );
+    assert_eq!(
+        clock, first_clock,
+        "the equal-position replay must not move the clock"
+    );
 }

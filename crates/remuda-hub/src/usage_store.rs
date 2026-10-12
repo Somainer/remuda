@@ -548,26 +548,29 @@ struct StoredSnapshot {
 /// Insert or revise a Turn-scoped snapshot (one revision-replaced row per
 /// assistant message id).
 ///
-/// Revision authority (c-ctxusage r13 item 3): a NEWER snapshot for the same
-/// `(instance, scope, scope_id)` is the source's correction and replaces every
-/// bucket it explicitly reports even when the value moves DOWN (output 20 →
-/// 15), keeping buckets it does not report; an OLDER snapshot never overrides
-/// anything; an EQUAL-revision snapshot may only fill an unreported bucket or
-/// advance a reported one (the replay-safe monotone rule). Derived totals are
-/// recomputed from the merged basket. Cumulative SESSION snapshots have their
-/// own monotone acceptance path and are intentionally not governed here.
+/// Turn authority — replay-stable source positions (c-ctxusage r14 items 2-4):
+/// `metric_revision` carries the source's REPLAY-STABLE position of the record
+/// that produced the snapshot (a session-qualified transcript record index),
+/// never a per-mapper publication counter. The Hub treats it as an authority
+/// WATERMARK per `(instance, turn scope, scope_id)`:
 ///
-/// Cost (c-ctxusage r13 item 4): a frame that does not REPORT a cost leaves
-/// the stored one in place — an unreported cost means "not reported", never
-/// zero, so a token-only partial update never erases a known cost. An
-/// explicitly reported cost on an equal-or-newer revision is authoritative on
-/// its own, so a cost-only frame updates the row without any token growth; an
-/// older-revision cost is frozen with the rest of the snapshot.
+/// * a snapshot at a STRICTLY NEWER position is applied wholesale — every
+///   bucket it explicitly reports replaces the stored one, a smaller value
+///   allowed; buckets it does not report are retained; the derived total is
+///   recomputed; a reported cost replaces the stored bill while an unreported
+///   cost keeps it; the turn clock moves with the newer snapshot (an ingest
+///   fallback still never overwrites a native time). The watermark is
+///   persisted EVEN when every value is unchanged;
+/// * an EQUAL-position snapshot may only FILL an unreported bucket or advance
+///   a reported one upward (the replay-safe monotone merge for repeated
+///   print/result deliveries); a reported decrease, an attached cost and the
+///   clock are all frozen;
+/// * an OLDER-position snapshot changes nothing.
 ///
-/// Independently, a NATIVE observation repairs a stored ingest-fallback
-/// provenance even when counters are identical AND the timestamp string
-/// equals the fallback (r11 item 5); an ingest fallback never overwrites a
-/// native time (c-ctxusage r4 item 5).
+/// A COST-ONLY frame (no token baskets reported) is a billing correction on a
+/// separate channel: it updates the bill alone, never counters it did not come
+/// with and never the turn clock, regardless of position. Cumulative SESSION
+/// snapshots have their own monotone acceptance path and are not governed here.
 fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
     let stored: Option<StoredSnapshot> = conn
         .query_row(
@@ -600,112 +603,118 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
     };
 
     let incoming = SnapshotCounters::of(row);
-    let counters_change = if row.metric_revision > stored.revision {
-        // A STRICTLY NEWER snapshot is authoritative and advances the watermark
-        // EVEN when every counter it reports is unchanged: the source position
-        // itself must persist, so a later stale position is rejected against
-        // the new high-water mark (c-ctxusage r14 item 3). Any REPORTED basket
-        // that differs wins, downwards included; unreported baskets are
-        // retained below. The derived total is excluded — it is recomputed
-        // after the merge.
-        true
-    } else if row.metric_revision < stored.revision {
-        // A stale revision never overrides a newer correction.
-        false
-    } else {
-        // Equal revision (the common print/result case): accept a fill or an
-        // advance, reject any reported decrease.
-        let (grew, decreased) = incoming.growth_against(&stored.counters);
-        grew && !decreased
-    };
-    // An explicitly reported cost is authoritative on an equal-or-newer
-    // revision even when no token bucket moved (a cost-only update); a frame
-    // with no reported cost contributes nothing here and keeps the stored one
-    // via the merge below. An older revision's cost is frozen with its
-    // counters.
-    let cost_change = row.metric_revision >= stored.revision
-        && row.cost_usd.is_some()
-        && row.cost_usd != stored.cost_usd;
-    // Independently, a NATIVE observation repairs a stored ingest-fallback
-    // PROVENANCE even when the counters and timestamp string are unchanged:
-    // the native source carrying the exact fallback string still proves the
-    // time was native rather than assumed, so the inequality of the strings
-    // is not required (c-ctxusage r11 item 5). An ingest fallback never
-    // overwrites a native time.
-    let time_repair = row.observed_at_source == "native" && stored.observed_at_source != "native";
+    let reports_counters = incoming.token_baskets().iter().any(Option::is_some);
 
-    if !counters_change && !cost_change && !time_repair {
+    // COST-ONLY correction: no snapshot counters at all. It is on a separate
+    // channel from turn authority — it never authorizes counters it did not
+    // come with and never rewrites the turn clock (c-ctxusage r14 item 4).
+    if !reports_counters {
+        if row.cost_usd.is_some() && row.cost_usd != stored.cost_usd {
+            conn.execute(
+                "UPDATE usage_events SET cost_usd = ?1
+                 WHERE instance_id = ?2 AND scope = 'turn' AND scope_id = ?3",
+                params![row.cost_usd, row.instance_id, row.scope_id],
+            )?;
+            return Ok(true);
+        }
         return Ok(false);
     }
 
-    if counters_change || cost_change {
-        // r12 item 2: merge unreported incoming buckets with the retained
-        // counters so a partial frame (e.g. a later print result carrying only
-        // output_tokens) never erases a known counter; derive the total from
-        // the merged basket when the incoming row did not report one. r13
-        // item 4: the same merge for cost — an unreported incoming cost keeps
-        // the known one instead of overwriting it with NULL.
+    if row.metric_revision < stored.revision {
+        // A stale source position never overrides a newer one: no counters, no
+        // cost, no clock.
+        return Ok(false);
+    }
+
+    if row.metric_revision == stored.revision {
+        // Repeated delivery of the SAME source position (two print/result
+        // frames for one result): only a fill of an unreported bucket or an
+        // advance of a reported one is accepted. A decrease, the attached cost
+        // and the clock stay frozen.
+        let (grew, decreased) = incoming.growth_against(&stored.counters);
+        if !grew || decreased {
+            return Ok(false);
+        }
         let merged = incoming.merged_over(&stored.counters);
-        let merged_cost = row.cost_usd.clone().or_else(|| stored.cost_usd.clone());
-        let observed_at =
-            if row.observed_at_source == "native" || stored.observed_at_source != "native" {
-                row.observed_at.clone()
-            } else {
-                stored.observed_at.clone()
-            };
-        let observed_at_source =
-            if row.observed_at_source == "native" || stored.observed_at_source != "native" {
-                row.observed_at_source.clone()
-            } else {
-                stored.observed_at_source.clone()
-            };
         conn.execute(
             "UPDATE usage_events SET
                 seq = ?1,
-                profile_id = ?2,
-                model = ?3,
-                mode = ?4,
-                metric_revision = ?5,
-                total_tokens = ?6,
-                input_tokens = ?7,
-                output_tokens = ?8,
-                cache_read_tokens = ?9,
-                cache_write_tokens = ?10,
-                cost_usd = ?11,
-                accounting = ?12,
-                observed_at = ?13,
-                observed_at_source = ?14
-             WHERE instance_id = ?15 AND scope = 'turn' AND scope_id = ?16",
+                total_tokens = ?2,
+                input_tokens = ?3,
+                output_tokens = ?4,
+                cache_read_tokens = ?5,
+                cache_write_tokens = ?6
+             WHERE instance_id = ?7 AND scope = 'turn' AND scope_id = ?8",
             params![
                 row.seq,
-                row.profile_id,
-                row.model,
-                row.mode,
-                row.metric_revision,
                 merged.total,
                 merged.input,
                 merged.output,
                 merged.cache_read,
                 merged.cache_write,
-                merged_cost,
-                row.accounting,
-                observed_at,
-                observed_at_source,
                 row.instance_id,
                 row.scope_id,
             ],
         )?;
-    } else {
-        // Time-only repair: identical counters, just the authoritative time.
-        conn.execute(
-            "UPDATE usage_events SET
-                seq = ?1,
-                observed_at = ?2,
-                observed_at_source = 'native'
-             WHERE instance_id = ?3 AND scope = 'turn' AND scope_id = ?4",
-            params![row.seq, row.observed_at, row.instance_id, row.scope_id],
-        )?;
+        return Ok(true);
     }
+
+    // STRICTLY NEWER source position: authoritative. Merge unreported incoming
+    // buckets with the retained counters (a partial frame never erases a known
+    // bucket), and an unreported cost keeps the known bill; derive the total
+    // from the merged basket when the incoming row did not report one.
+    let merged = incoming.merged_over(&stored.counters);
+    let merged_cost = row.cost_usd.clone().or_else(|| stored.cost_usd.clone());
+    // The turn clock follows the newer snapshot, except an ingest fallback
+    // never overwrites a native time (c-ctxusage r4 item 5).
+    let (observed_at, observed_at_source) =
+        if row.observed_at_source == "native" || stored.observed_at_source != "native" {
+            (row.observed_at.clone(), row.observed_at_source.clone())
+        } else {
+            (
+                stored.observed_at.clone(),
+                stored.observed_at_source.clone(),
+            )
+        };
+    // Persist unconditionally: the watermark advances EVEN when every counter
+    // and the bill are unchanged, so a later stale position is rejected against
+    // the new high-water mark (c-ctxusage r14 item 3).
+    conn.execute(
+        "UPDATE usage_events SET
+            seq = ?1,
+            profile_id = ?2,
+            model = ?3,
+            mode = ?4,
+            metric_revision = ?5,
+            total_tokens = ?6,
+            input_tokens = ?7,
+            output_tokens = ?8,
+            cache_read_tokens = ?9,
+            cache_write_tokens = ?10,
+            cost_usd = ?11,
+            accounting = ?12,
+            observed_at = ?13,
+            observed_at_source = ?14
+         WHERE instance_id = ?15 AND scope = 'turn' AND scope_id = ?16",
+        params![
+            row.seq,
+            row.profile_id,
+            row.model,
+            row.mode,
+            row.metric_revision,
+            merged.total,
+            merged.input,
+            merged.output,
+            merged.cache_read,
+            merged.cache_write,
+            merged_cost,
+            row.accounting,
+            observed_at,
+            observed_at_source,
+            row.instance_id,
+            row.scope_id,
+        ],
+    )?;
     Ok(true)
 }
 
@@ -2802,11 +2811,13 @@ mod tests {
         );
     }
 
-    /// r4 item 5: a replay with IDENTICAL counters but the correct historical
-    /// native time repairs an ingest-fallback observed_at — lastTurnAt becomes
-    /// historical and the rate windows empty — with no counter change.
+    /// c-ctxusage r4 item 5 / r14 items 3-4: a NEWER source position with
+    /// IDENTICAL counters but the correct historical native time repairs an
+    /// ingest-fallback observed_at — lastTurnAt becomes historical and the
+    /// rate windows empty — with no counter change. An equal-position replay
+    /// would be frozen; the clock follows only a strictly newer snapshot.
     #[test]
-    fn unchanged_counters_replay_repairs_native_time_and_empties_windows() {
+    fn unchanged_counters_at_a_newer_position_repair_native_time_and_empty_windows() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         // First delivery: no nativeAt — observed_at is the ingest fallback
@@ -2863,13 +2874,15 @@ mod tests {
             "totals still count ingest rows"
         );
 
-        // Replay: identical counters, now with the real historical native time.
+        // Newer source position: identical counters, now with the real
+        // historical native time. The watermark advances and the clock is
+        // repaired.
         let historical = scoped_record(
             2,
             "ins_r5",
             "turn",
             Some("msg-x"),
-            1,
+            2,
             250,
             0,
             0,
@@ -2878,7 +2891,7 @@ mod tests {
         );
         assert!(
             insert(&conn, &historical),
-            "a native time repair is accepted despite identical counters"
+            "a newer native snapshot is applied even with identical counters"
         );
         let (at, source): (String, String) = conn
             .query_row(
@@ -2906,13 +2919,13 @@ mod tests {
         assert_eq!(rollup.session_input_tokens, Some(250), "counters unchanged");
     }
 
-    /// c-ctxusage r11 item 5: a native replay with identical counters whose
-    /// native timestamp string is EQUAL to the stored ingest timestamp must
-    /// still repair provenance - the source changes ingest -> native. The old
-    /// inequality requirement meant a native observation carrying exactly the
-    /// fallback string left the row falsely marked ingest.
+    /// c-ctxusage r14 items 3/4: an equal-position replay changes NOTHING, even
+    /// a native one carrying the exact fallback timestamp — provenance is part
+    /// of the turn clock and an equal source position never rewrites it. A
+    /// STRICTLY NEWER native position repairs the stored ingest-fallback
+    /// provenance, after which another identical newer frame is a no-op.
     #[test]
-    fn an_equal_timestamp_native_replay_still_repairs_provenance() {
+    fn an_equal_position_native_replay_is_frozen_a_newer_one_repairs() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         // First delivery carries no nativeAt: observed_at is the ingest
@@ -2940,10 +2953,11 @@ mod tests {
             .unwrap();
         assert_eq!(source_before, "ingest");
 
-        // Native replay: identical counters, native timestamp EQUAL to the
-        // stored ingest fallback string.
+        // Native replay at the SAME source position, native timestamp EQUAL to
+        // the stored ingest fallback string: frozen, clock and provenance
+        // untouched.
         let at = "2026-09-15T00:00:00.000Z";
-        let repaired = scoped_record(
+        let equal = scoped_record(
             2,
             "ins_r11t5",
             "turn",
@@ -2956,8 +2970,43 @@ mod tests {
             Some(at),
         );
         assert!(
+            !insert(&conn, &equal),
+            "an equal-position native replay must not rewrite the clock"
+        );
+        let (observed_at, source, seq): (String, String, i64) = conn
+            .query_row(
+                "SELECT observed_at, observed_at_source, seq FROM usage_events
+                 WHERE instance_id='ins_r11t5' AND scope_id='msg-eq'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap())),
+            )
+            .unwrap();
+        let _ = observed_at;
+        assert_eq!(
+            source, "ingest",
+            "an equal position never repairs provenance"
+        );
+        assert_eq!(seq, 1, "the frozen replay must not adopt its seq");
+        // The timestamp STRING happens to equal the fallback; what proves the
+        // freeze is that provenance is still ingest (checked above): no clock
+        // rewrite occurred at an equal position.
+
+        // A STRICTLY NEWER position carrying the native time repairs it.
+        let repaired = scoped_record(
+            3,
+            "ins_r11t5",
+            "turn",
+            Some("msg-eq"),
+            2,
+            250,
+            0,
+            0,
+            0,
+            Some(at),
+        );
+        assert!(
             insert(&conn, &repaired),
-            "an equal-timestamp native replay is a provenance repair, not a freeze"
+            "a newer native snapshot repairs the provenance"
         );
         let (observed, source, seq): (String, String, i64) = conn
             .query_row(
@@ -2968,19 +3017,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(observed, at);
-        assert_eq!(
-            source, "native",
-            "provenance repaired despite equal strings"
-        );
-        assert_eq!(seq, 2, "the repair adopts the replay's seq");
+        assert_eq!(source, "native", "the newer position repairs provenance");
+        assert_eq!(seq, 3, "the repair adopts the replay's seq");
 
-        // A subsequent identical NATIVE replay is a genuine no-op.
+        // A subsequent identical native replay at the same repaired position
+        // is a genuine no-op.
         let again = scoped_record(
-            3,
+            4,
             "ins_r11t5",
             "turn",
             Some("msg-eq"),
-            1,
+            2,
             250,
             0,
             0,
@@ -2989,10 +3036,9 @@ mod tests {
         );
         assert!(
             !insert(&conn, &again),
-            "native -> native with identical counters/time changes nothing"
+            "native -> native at the same position with identical counters/time changes nothing"
         );
     }
-
     /// c-ctxusage r14 item 3: the turn authority is a watermark that advances
     /// on a STRICTLY NEWER position even when the counters are unchanged.
     /// Sequence from the ruling: rev 1 / output 20, then rev 3 / output 20
@@ -3070,6 +3116,7 @@ mod tests {
         assert_eq!(revision, 3, "the watermark persisted at 3");
         assert_eq!(output, Some(20), "output stays 20 after the stale frame");
     }
+
     /// r4 item 7b: the REAL 2.1.289 fixture replayed by a fresh mapper into a
     /// real migrated store TWICE must converge durably: the same 24 turn rows
     /// with the same counters after each pass (the second pass is a

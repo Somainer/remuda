@@ -978,8 +978,9 @@ pub enum BudgetStatus {
     Stop,
 }
 
-/// c-usagefu r10 Ruling B (items 4/5): ONE shared eligible-FLOW relation by
-/// CALL identity, used by the rollup, both aggregates and the TPM windows.
+/// c-usagefu r11 Ruling B1 (replaces the r10 timestamp-window rule): ONE
+/// shared eligible-FLOW relation by CALL identity, used by the rollup, both
+/// aggregates and the TPM windows.
 ///
 /// Each native turn is counted EITHER from its Turn row OR from its Message
 /// rows, never both.
@@ -989,9 +990,13 @@ pub enum BudgetStatus {
 ///   turn (see [`turn_fully_covered_sql`]). When coverage is partial — e.g. a
 ///   pre-fix accepted usage record without a response id was never emitted as
 ///   a Message — the Turn is counted and that turn's Messages are dropped.
-/// * A LEGACY Message has no `turn_id` (pre-r6 wrote one Message + one Turn per
-///   call). It is counted only when NO Turn row covers its time window; where
-///   a covering Turn exists the Turn is counted and the legacy Message dropped.
+/// * A LEGACY Message has no `turn_id` (pre-r6 codex emitted a Turn for EVERY
+///   call alongside the attribution-less Message). B1 needs NO clocks: when
+///   the instance has ANY Turn row at all, every legacy Message is dropped;
+///   when the instance has NO Turn rows whatsoever, its legacy Messages are
+///   all counted. There is no timestamp window and no cross-clock comparison,
+///   so an unrelated legacy Message is never kept (turns exist) or dropped
+///   (no turns) because of how far apart the clocks are.
 /// * A Turn row is counted only when its modern Messages do NOT provably cover
 ///   it completely. A legacy-covered turn therefore always counts (its
 ///   Messages are the link-less legacy kind).
@@ -1019,11 +1024,6 @@ fn eligible_flow_predicate(outer: &str) -> String {
                  SELECT 1 FROM usage_events _ef_lt
                  WHERE _ef_lt.instance_id = {outer}.instance_id
                    AND _ef_lt.scope = 'turn'
-                   AND datetime({outer}.observed_at)
-                       BETWEEN datetime(_ef_lt.observed_at,
-                                       '-{LEGACY_TURN_LOOKBACK_SECS} seconds')
-                           AND datetime(_ef_lt.observed_at,
-                                       '+{LEGACY_TURN_SLACK_SECS} seconds')
              )
          )
          OR ({outer}.scope = 'turn' AND NOT ({cover_linked_turn})))"
@@ -1082,13 +1082,6 @@ fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
     }
     conds.join(" AND ")
 }
-
-/// A response usage record is written DURING the turn, up to the whole turn
-/// duration before the end-of-turn Turn snapshot. Bound how far before a Turn
-/// row a link-less legacy Message may sit and still describe that same call.
-const LEGACY_TURN_LOOKBACK_SECS: i64 = 600;
-/// Small clock-skew slack after the Turn snapshot.
-const LEGACY_TURN_SLACK_SECS: i64 = 5;
 
 /// True when instance `instance_expr` has at least one eligible flow row
 /// (see [`eligible_flow_predicate`]). Legacy NULL-scope Turn rows count.
@@ -2448,6 +2441,89 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(rollup.session_output_tokens, Some(150));
+    }
+
+    #[test]
+    fn legacy_messages_are_dropped_when_the_instance_has_any_turn_even_hours_away() {
+        // c-usagefu r11 item 6 (Ruling B1, no clocks): pre-r6 codex emitted a
+        // Turn for EVERY call alongside its attribution-less Message, so for an
+        // instance that has ANY Turn row a Message without turn_id is NEVER
+        // counted — no matter how far its timestamp sits from a Turn. The r10
+        // rule kept a legacy Message when no Turn fell inside its ±10 min
+        // window, which let an "unrelated"-looking legacy Message on a
+        // turn-bearing instance bill a second time.
+        //
+        // Actual old-schema database, migrated: one Turn at noon and a legacy
+        // Message the same evening (five hours later, far outside the old
+        // window). Only the Turn counts.
+        let conn = open_old_dual_schema();
+        conn.execute_batch(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode,
+                 output_tokens, cost_usd, observed_at, observed_at_source,
+                 profile_id, model)
+             VALUES
+                ('ins_b1_turns', 1, 'turn', 't1', 't1', 'snapshot',
+                 100, '0.10', '2030-01-01T12:00:00.000Z', 'native',
+                 'pvp_b1', 'gpt-5.4'),
+                ('ins_b1_turns', 2, 'message', 'r-late', NULL, 'snapshot',
+                 70, '0.07', '2030-01-01T17:00:00.000Z', 'native',
+                 'pvp_b1', 'gpt-5.4');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        let agg = aggregate_instance(&conn, "ins_b1_turns").unwrap();
+        assert_eq!(
+            agg.output_tokens, 100,
+            "Turns only: the five-hours-away legacy Message is NOT billed"
+        );
+        assert!(
+            (agg.cost_usd - 0.10).abs() < 1e-9,
+            "the Message cost is dropped too"
+        );
+        let rollup = rollup_fold(&conn, "ins_b1_turns", "codex", Some("gpt-5.4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_output_tokens, Some(100));
+    }
+
+    #[test]
+    fn an_instance_with_no_turns_at_all_counts_every_legacy_message() {
+        // c-usagefu r11 item 6 (Ruling B1): the other side of the rule. An
+        // instance whose old-schema database holds ONLY link-less legacy
+        // Messages (no Turn rows whatsoever) counts ALL of them, whatever their
+        // timestamps — there is no time window that could drop one. Two
+        // Messages a day apart both bill.
+        let conn = open_old_dual_schema();
+        conn.execute_batch(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode,
+                 output_tokens, cost_usd, observed_at, observed_at_source,
+                 profile_id, model)
+             VALUES
+                ('ins_b1_msgs', 1, 'message', 'r1', NULL, 'snapshot',
+                 40, '0.04', '2030-01-01T08:00:00.000Z', 'native',
+                 'pvp_b1m', 'gpt-5.4'),
+                ('ins_b1_msgs', 2, 'message', 'r2', NULL, 'snapshot',
+                 60, '0.06', '2030-01-02T08:00:00.000Z', 'native',
+                 'pvp_b1m', 'gpt-5.4');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        let agg = aggregate_instance(&conn, "ins_b1_msgs").unwrap();
+        assert_eq!(
+            agg.output_tokens, 100,
+            "a turn-less instance counts both legacy Messages, a day apart"
+        );
+        assert!((agg.cost_usd - 0.10).abs() < 1e-9);
+        let supply = aggregate_supply(&conn, "pvp_b1m", "gpt-5.4").unwrap();
+        assert_eq!(supply.output_tokens, 100);
+        let rollup = rollup_fold(&conn, "ins_b1_msgs", "codex", Some("gpt-5.4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_output_tokens, Some(100));
     }
 
     #[test]

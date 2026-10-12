@@ -3549,6 +3549,247 @@ mod tests {
         assert!(!bridge.has_pending());
     }
 
+    /// c-effortread r18 item 3: the suppressed unowned acceptance must not
+    /// consume the effective-state update permanently. Sequence: high is
+    /// published; an older pre-floor `/effort max` is accepted and suppressed
+    /// while B is armed; B's own dialog is dismissed (Kept); the deferred max
+    /// edge is then published under the ORIGINAL verdict record's event id;
+    /// the later assistant max read-back dedups.
+    #[tokio::test]
+    async fn r18_item3_a_suppressed_pre_floor_accept_is_published_after_bs_refusal_under_its_own_record_id()
+     {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let instance_id = InstanceId::new();
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            instance_id.clone(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // Published baseline high.
+        mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "on it"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(400),
+            )
+            .expect("map baseline");
+
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+
+        // The old acceptance is suppressed: nothing emitted yet.
+        let suppressed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Set effort level to max"),
+                Some(1600),
+            )
+            .expect("map old acceptance");
+        assert!(
+            suppressed
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the old acceptance stays suppressed while B is armed"
+        );
+        assert!(bridge.has_pending());
+
+        // B's OWN dialog is dismissed (Kept). B rejects and the deferred max
+        // edge publishes on the same mapper call, id-less and terminal-side.
+        let dismissed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Kept effort level as max"),
+                Some(1700),
+            )
+            .expect("map B refusal");
+        let deferred_edge = dismissed
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some((obs, payload)),
+                _ => None,
+            })
+            .expect("the suppressed max edge publishes after B's refusal");
+        let (observation, payload) = deferred_edge;
+        assert_eq!(payload.request_id.as_deref(), None, "never relabelled B");
+        assert_eq!(
+            payload.effective.name,
+            Some(remuda_protocol::EffortName::Max)
+        );
+        assert_eq!(
+            payload.effective.source,
+            remuda_protocol::EffortSource::Slash
+        );
+        // Live-vs-journal parity: the deferred edge keeps the ORIGINAL verdict
+        // record's deterministic id.
+        assert_eq!(
+            observation.event_id,
+            remuda_protocol::effort_record_event_id(
+                instance_id.as_id().as_str(),
+                remuda_protocol::EFFORT_STDOUT_NATIVE,
+                "out-old",
+                remuda_protocol::EffortName::Max,
+            )
+        );
+        assert!(!bridge.has_pending(), "B's refusal ends B");
+        let verdict = bridge
+            .wait(gen_b, std::time::Duration::from_millis(40))
+            .await
+            .expect("B recorded the rejection");
+        assert!(matches!(verdict, crate::effort::Readback::Rejected { .. }));
+
+        // Assistant records now report max: the value is already published, so
+        // this read-back is a dedup and emits no second edge.
+        let after = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-max",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-max", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "done"}]},
+                    "effort": "max",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(1800),
+            )
+            .expect("map assistant max");
+        assert!(
+            after
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the already-published max read-back is a dedup, not a second edge"
+        );
+    }
+
+    /// c-effortread r18 item 3 read-back variant: the armed switch B ends
+    /// through its bounded timeout WITHOUT any verdict reaching the mapper
+    /// (failed-floor attribution), and the next authoritative assistant
+    /// read-back reports the suppressed value. Because suppression no longer
+    /// latches the last published state, that same-value read-back EMITS the
+    /// deferred effective edge instead of being swallowed as an unchanged
+    /// dedup — while B itself stays unresolved by the read-back.
+    #[tokio::test]
+    async fn r18_item3_after_a_suppressed_accept_the_next_same_value_readback_emits_while_b_stays_pending()
+     {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "on it"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(400),
+            )
+            .expect("map baseline");
+
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
+        // The pump catches up the old slash and its acceptance BEFORE B's own
+        // slash record is read: its edge is suppressed and stashed.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        let suppressed = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Set effort level to max"),
+                Some(600),
+            )
+            .expect("map old acceptance");
+        assert!(
+            suppressed
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "suppressed while B is armed"
+        );
+
+        // B never produces a mappable verdict (bounded path). Assistant
+        // records now report max — the same-value read-back EMITS the edge the
+        // suppression withheld (its own assistant message id).
+        let readback = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-max",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-max", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "done"}]},
+                    "effort": "max",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(700),
+            )
+            .expect("map assistant max");
+        let edge = readback
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("the same-value read-back publishes the deferred max");
+        assert_eq!(edge.effective.name, Some(remuda_protocol::EffortName::Max));
+        assert_eq!(edge.effective.source, remuda_protocol::EffortSource::Slash);
+        assert_eq!(edge.request_id.as_deref(), None);
+        // The read-back never resolves B: an assistant record is not B's
+        // verdict; B ends through its own bounded path.
+        assert!(bridge.has_pending());
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "B stays pending for its bounded timeout"
+        );
+    }
+
     /// c-effortread r16 item 3: when the carrier's floor lookup FAILS (the
     /// bound transcript was rotated/removed or the stat errors), production no
     /// longer falls back to word-only attribution. The switch is armed with

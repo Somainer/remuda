@@ -536,6 +536,16 @@ pub struct EffortTracker {
     /// journal file tailer replays history on purpose and never engages this
     /// gate, so the default is `true`.
     current_process: bool,
+    /// c-effortread r18 item 3: the effective state an UNOWNED accepted
+    /// verdict latched while an armed Remuda switch was still outstanding.
+    /// It is kept SEPARATE from [`Self::last`] (the last PUBLISHED state):
+    /// the mapper suppresses that verdict's edge, but the transcript really
+    /// changed and the value must not be swallowed by edge dedup — it is
+    /// published once the armed switch ends (a refusal/timeout, drained by
+    /// the mapper) or on the next authoritative same-value read-back
+    /// (`observe_level` sees it differ from `last` and emits). Only the
+    /// LATEST suppressed acceptance is held; its source is terminal-side.
+    deferred: Option<ObservedEffort>,
 }
 
 impl Default for EffortTracker {
@@ -548,6 +558,7 @@ impl Default for EffortTracker {
             flag: None,
             awaiting: None,
             current_process: true,
+            deferred: None,
         }
     }
 }
@@ -623,8 +634,18 @@ impl EffortTracker {
         self.flag = None;
         self.awaiting = None;
         self.ultracode_pending = false;
+        self.deferred = None;
         self.current_process = false;
         cleared
+    }
+
+    /// c-effortread r18 item 3: the latest effective state latched by a
+    /// suppressed unowned acceptance but not yet published. The mapper stashes
+    /// each suppressed verdict's own edge separately; this lets it drop stashes
+    /// once another channel has published/superseded the deferred state.
+    #[must_use]
+    pub fn deferred_observation(&self) -> Option<ObservedEffort> {
+        self.deferred
     }
 
     /// Learn the semantics from one transcript record's `version` field. A
@@ -672,6 +693,7 @@ impl EffortTracker {
         self.flag = ultracode;
         self.ultracode_pending = false;
         self.awaiting = None;
+        self.deferred = None;
         self.current_process = true;
     }
 
@@ -790,15 +812,19 @@ impl EffortTracker {
         }
     }
 
-    /// c-effortread r17 item 1: fold a verdict that answers an UNOWNED slash
-    /// slot (an older pre-floor same-word command, or a human `/effort`) while
-    /// a LATER armed Remuda switch is still waiting for ITS OWN verdict. The
-    /// transcript effect (`last`/`flag`) is latched so the owned switch's
-    /// later verdict reads current state, but the armed attribution
+    /// c-effortread r17 item 1 / r18 item 3: fold a verdict that answers an
+    /// UNOWNED slash slot (an older pre-floor same-word command, or a human
+    /// `/effort`) while a LATER armed Remuda switch is still waiting for ITS
+    /// OWN verdict. An accepted verdict latches its level/flag into the
+    /// DEFERRED slot, NOT `last` (the last published state): the mapper
+    /// suppresses the edge now and publishes it via
+    /// [`Self::publish_deferred`] once the armed switch ends, or lets the next
+    /// authoritative same-value read-back emit it. The armed attribution
     /// (`awaiting`, `pending_source`, `ultracode_pending`) is left completely
     /// untouched: the verdict is never relabelled Remuda and a refusal of the
-    /// unowned command can never disarm the owned switch. The caller emits no
-    /// settlement-eligible observation while the owned switch is outstanding.
+    /// unowned command can never disarm the owned switch. Returns the latched
+    /// edge (terminal-side [`EffortSource::Slash`]) when it differs from the
+    /// last published state, so the caller can stash it for deferred publish.
     pub fn note_unowned_stdout(&mut self, stdout: &str) -> Option<(ObservedEffort, EffortSource)> {
         if !self.current_process {
             return None;
@@ -846,6 +872,10 @@ impl EffortTracker {
             source = EffortSource::Remuda;
         }
         self.awaiting = None;
+        // B's own verdict is the authority: any state an unowned verdict
+        // latched while B was armed is superseded/published by THIS verdict
+        // (c-effortread r18 item 3) and must not be re-emitted afterwards.
+        self.deferred = None;
         let observed = ObservedEffort {
             name: parsed.name,
             ultracode: flag,
@@ -866,6 +896,15 @@ impl EffortTracker {
     /// The edge is always terminal-side ([`EffortSource::Slash`]) — an owned
     /// switch waiting for its own verdict is never credited (or disarmed) by a
     /// verdict that answers a different slash.
+    ///
+    /// c-effortread r18 item 3: the latched state is held in `deferred`, NOT
+    /// in `last`. The mapper publishes NO observation for this verdict, so
+    /// writing `last` would make the next same-value authoritative read-back
+    /// look like an unchanged dedup and the effective state would never be
+    /// published at all (a suppressed pre-floor max acceptance followed by B's
+    /// Kept and max assistant records). The deferred state is published by
+    /// [`Self::publish_deferred`] once the armed switch ends, or emitted by the
+    /// next authoritative read-back in [`Self::observe_level`].
     fn apply_unowned_accept(
         &mut self,
         parsed: ObservedEffort,
@@ -882,8 +921,24 @@ impl EffortTracker {
             name: parsed.name,
             ultracode: flag,
         };
+        let differs = self.last != Some(observed);
+        self.deferred = Some(observed);
+        differs.then_some((observed, EffortSource::Slash))
+    }
+
+    /// c-effortread r18 item 3: publish one stashed suppressed acceptance once
+    /// the armed switch has ended (its refusal/timeout). Latches `observed` as
+    /// the last published state exactly like a normally emitted verdict edge;
+    /// returns the terminal-side edge when it differs from what was last
+    /// published (the mapper replays its stashed verdicts in FIFO order, so a
+    /// later identical value dedups here as everywhere else).
+    pub fn publish_deferred(
+        &mut self,
+        observed: ObservedEffort,
+    ) -> Option<(ObservedEffort, EffortSource)> {
         let edge = self.last != Some(observed);
         self.last = Some(observed);
+        self.deferred = None;
         edge.then_some((observed, EffortSource::Slash))
     }
 
@@ -909,7 +964,16 @@ impl EffortTracker {
         };
         let edge = self.last != Some(observed);
         self.last = Some(observed);
-        edge.then_some((observed, EffortSource::Unknown))
+        if edge {
+            // An authoritative status read-back differing from the last
+            // published state supersedes any suppressed acceptance held for
+            // later (r18 item 3). A same-value status settles nothing and must
+            // not swallow a deferred newer value.
+            self.deferred = None;
+            Some((observed, EffortSource::Unknown))
+        } else {
+            None
+        }
     }
 
     /// Feed the `ultra_effort_enter|exit` attachment riding the next prompt.
@@ -999,6 +1063,10 @@ impl EffortTracker {
         if edge {
             self.pending_source = EffortSource::Unknown;
             self.ultracode_pending = false;
+            // r18 item 3: this authoritative read-back differing from the last
+            // PUBLISHED state emits now — including when it matches a value a
+            // suppressed unowned acceptance latched — and supersedes it.
+            self.deferred = None;
             Some((observed, source))
         } else {
             None
@@ -1873,6 +1941,105 @@ mod tests {
             .observe(Some("max"), None)
             .expect("the unowned refusal never disarmed B");
         assert_eq!(owned.1, EffortSource::Remuda);
+    }
+
+    #[test]
+    fn a_suppressed_acceptance_defers_its_edge_until_published_after_the_switch_ends() {
+        // c-effortread r18 item 3: an unowned acceptance folds the transcript
+        // level into a DEFERRED slot without touching the last PUBLISHED
+        // state; the edge comes out via publish_deferred once the armed switch
+        // ends (here: B refused), and a second publish is a dedup no-op.
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.272");
+        tracker.observe(Some("high"), None);
+        // The old command is a (human/pre-floor) slash, so the latched edge
+        // carries terminal Slash attribution; nothing is armed as Remuda.
+        tracker.note_slash("max", false);
+        let latched = tracker
+            .note_unowned_stdout("Set effort level to max")
+            .expect("max differs from the published high");
+        assert_eq!(latched.0.name, EffortName::Max);
+        assert_eq!(latched.1, EffortSource::Slash);
+        // The last PUBLISHED state is still high: suppression consumed
+        // nothing.
+        assert_eq!(
+            tracker.last_observed().map(|observed| observed.name),
+            Some(EffortName::High)
+        );
+        assert_eq!(
+            tracker.deferred_observation().map(|observed| observed.name),
+            Some(EffortName::Max)
+        );
+        // B refuses (Kept) — the refusal folds nothing of max; the deferred
+        // edge is now published.
+        assert!(
+            tracker
+                .note_stdout("Kept effort level as high", true)
+                .is_none()
+        );
+        let published = tracker
+            .publish_deferred(latched.0)
+            .expect("the deferred max is published after B ends");
+        assert_eq!(published.0.name, EffortName::Max);
+        assert_eq!(published.1, EffortSource::Slash);
+        assert_eq!(
+            tracker.last_observed().map(|observed| observed.name),
+            Some(EffortName::Max)
+        );
+        assert!(tracker.deferred_observation().is_none());
+        // Re-publishing the same value is a dedup no-op.
+        assert!(tracker.publish_deferred(latched.0).is_none());
+    }
+
+    #[test]
+    fn a_suppressed_acceptance_is_emitted_by_the_next_same_value_readback() {
+        // r18 item 3 alternative: when the armed switch ends on its bounded
+        // timeout without a verdict through this mapper, the next
+        // authoritative assistant read-back at the suppressed value must EMIT
+        // (it still differs from the last published state), not be swallowed
+        // as an unchanged dedup. A later same-value read then dedups.
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.272");
+        tracker.observe(Some("high"), None);
+        tracker.note_slash("max", false);
+        tracker
+            .note_unowned_stdout("Set effort level to max")
+            .expect("deferred max latched");
+        assert_eq!(
+            tracker.last_observed().map(|observed| observed.name),
+            Some(EffortName::High),
+            "suppression never publishes"
+        );
+        // Assistant records then report max (B timed out unconfirmed): the
+        // same-value read-back emits the edge the suppression withheld.
+        let readback = tracker
+            .observe(Some("max"), None)
+            .expect("the same-value read-back emits");
+        assert_eq!(readback.0.name, EffortName::Max);
+        assert_eq!(readback.1, EffortSource::Slash);
+        assert!(tracker.deferred_observation().is_none());
+        assert!(
+            tracker.observe(Some("max"), None).is_none(),
+            "the next max read is a dedup"
+        );
+        // A newer different read-back supersedes a still-deferred value:
+        // deferred is dropped and its edge never comes out later.
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.272");
+        tracker.observe(Some("high"), None);
+        tracker.note_slash("max", false);
+        tracker.note_unowned_stdout("Set effort level to max");
+        let xhigh = tracker
+            .observe(Some("xhigh"), None)
+            .expect("newer authoritative read-back emits");
+        assert_eq!(xhigh.0.name, EffortName::Xhigh);
+        assert!(tracker.deferred_observation().is_none());
+        // The mapper drops its stashed edge on this supersession, so it never
+        // calls publish_deferred again; the published state stays xhigh.
+        assert_eq!(
+            tracker.last_observed().map(|observed| observed.name),
+            Some(EffortName::Xhigh)
+        );
     }
 
     #[test]

@@ -2586,6 +2586,19 @@ enum VerdictFront {
     Empty,
 }
 
+/// c-effortread r18 item 3: one edge an unowned accepted verdict WOULD have
+/// published, stashed while an armed switch is still outstanding. The edge is
+/// held with ITS OWN verdict record's deterministic event id and raw stdout,
+/// so when the armed switch ends (refusal/timeout) the deferred publish
+/// derives the SAME id the journal tailer derives for that record — the live
+/// mapper and durable replay converge on one event instead of the value being
+/// swallowed by edge dedup.
+struct DeferredEffortEdge {
+    observed: remuda_protocol::ObservedEffort,
+    event_id: EventId,
+    raw: Option<String>,
+}
+
 /// Transcript-to-observations mapper for a live claude-pty session.
 pub struct TranscriptMapper {
     mapper: Mapper,
@@ -2606,6 +2619,9 @@ pub struct TranscriptMapper {
     /// pairs with ITS OWN slash — never with a newer owned request B typed
     /// while A's verdict was outstanding.
     effort_armed: std::collections::VecDeque<EffortSlashSlot>,
+    /// c-effortread r18 item 3: edges of suppressed unowned acceptances, in
+    /// verdict order, awaiting the armed switch's end to be published.
+    deferred_effort_edges: std::collections::VecDeque<DeferredEffortEdge>,
     /// c-effortread r12 item 1: test-only one-shot seam fired immediately
     /// after a `/effort` slash takes its single pending snapshot. It lets a
     /// unit test deterministically time the request out and arm a newer one
@@ -2669,6 +2685,7 @@ impl TranscriptMapper {
             effort,
             effort_bridge: None,
             effort_armed: std::collections::VecDeque::new(),
+            deferred_effort_edges: std::collections::VecDeque::new(),
             #[cfg(test)]
             effort_slash_snapshot_hook: None,
             model: remuda_protocol::ModelTracker::new(),
@@ -3223,6 +3240,7 @@ impl TranscriptMapper {
         stdout: String,
         verdict: remuda_protocol::EffortStdout,
     ) -> DriverResult<Vec<Observation>> {
+        let mut observations = Vec::new();
         match verdict {
             remuda_protocol::EffortStdout::Accepted(parsed) => {
                 // c-effortread r11 item 1: this verdict answers the OLDEST
@@ -3265,11 +3283,32 @@ impl TranscriptMapper {
                     .as_ref()
                     .is_some_and(|bridge| bridge.has_pending());
                 if matches!(front, VerdictFront::Unowned) && armed_switch_pending {
-                    self.effort.note_unowned_stdout(&stdout);
+                    // r18 item 3: the folded state is NOT published now, but
+                    // the verdict's own edge is stashed with its record event
+                    // id and published once the armed switch ends (or emitted
+                    // by the next authoritative same-value read-back), so a
+                    // suppressed pre-floor acceptance can no longer consume the
+                    // effective update permanently.
+                    if let Some((observed, _)) = self.effort.note_unowned_stdout(&stdout) {
+                        let event_id = self.effort_event_id(
+                            value,
+                            observed.name,
+                            remuda_protocol::EFFORT_STDOUT_NATIVE,
+                        );
+                        self.deferred_effort_edges.push_back(DeferredEffortEdge {
+                            observed,
+                            event_id,
+                            raw: Some(stdout.clone()),
+                        });
+                    }
                     return Ok(Vec::new());
                 }
                 let from_remuda = paired.is_some();
                 let edge = self.effort.note_stdout(&stdout, from_remuda);
+                // B's OWN verdict (or an idle-bridge human verdict) is the
+                // authority and publishes/supersedes anything a suppressed
+                // unowned acceptance had latched (r18 item 3).
+                self.deferred_effort_edges.clear();
                 if let Some((generation, _)) = &paired
                     && let Some(bridge) = &self.effort_bridge
                 {
@@ -3281,32 +3320,31 @@ impl TranscriptMapper {
                     bridge.resolve(*generation, settled);
                 }
                 if let Some((observed, source)) = edge {
-                    return self.effort_observation(
+                    observations = self.effort_observation(
                         value,
                         observed,
                         source,
                         Some(stdout),
                         remuda_protocol::EFFORT_STDOUT_NATIVE,
                         paired.as_ref(),
-                    );
-                }
-                // c-effortread r11 item 2: an accepted verdict that changes
-                // NOTHING (the switch targeted the state already in effect)
-                // produces no tracker edge, but it IS request-specific
-                // completion evidence for the armed command that typed it.
-                // Emit the post-latch observation stamped with THAT request so
-                // the web can settle the moved axes from the id; without it a
-                // no-op switch would stay 切换中 until the pending max age.
-                if paired.is_some() {
+                    )?;
+                } else if paired.is_some() {
+                    // c-effortread r11 item 2: an accepted verdict that changes
+                    // NOTHING (the switch targeted the state already in effect)
+                    // produces no tracker edge, but it IS request-specific
+                    // completion evidence for the armed command that typed it.
+                    // Emit the post-latch observation stamped with THAT request so
+                    // the web can settle the moved axes from the id; without it a
+                    // no-op switch would stay 切换中 until the pending max age.
                     let observed = self.effort.last_observed().unwrap_or(parsed);
-                    return self.effort_observation(
+                    observations = self.effort_observation(
                         value,
                         observed,
                         EffortSource::Remuda,
                         Some(stdout),
                         remuda_protocol::EFFORT_STDOUT_NATIVE,
                         paired.as_ref(),
-                    );
+                    )?;
                 }
             }
             remuda_protocol::EffortStdout::Status(_) => {
@@ -3321,14 +3359,19 @@ impl TranscriptMapper {
                     .and_then(|bridge| bridge.pending())
                     .is_some();
                 if let Some((observed, source)) = self.effort.note_stdout(&stdout, from_remuda) {
-                    return self.effort_observation(
+                    // The authoritative status edge supersedes any stashed
+                    // suppressed acceptance (r18 item 3).
+                    if self.effort.deferred_observation().is_none() {
+                        self.deferred_effort_edges.clear();
+                    }
+                    observations = self.effort_observation(
                         value,
                         observed,
                         source,
                         Some(stdout),
                         remuda_protocol::EFFORT_STATUS_NATIVE,
                         None,
-                    );
+                    )?;
                 }
             }
             remuda_protocol::EffortStdout::Kept
@@ -3376,7 +3419,42 @@ impl TranscriptMapper {
                 self.prune_front_non_switch_slot();
             }
         }
-        Ok(Vec::new())
+        // c-effortread r18 item 3: once NO switch is armed on the bridge (an
+        // owned verdict resolved/rejected it above, B ended through its
+        // bounded path and this is a later verdict, or no bridge exists),
+        // publish the edges of suppressed unowned acceptances in verdict
+        // order, each under ITS OWN verdict record's event id (live-vs-journal
+        // parity). While a switch remains armed the stash stays held and the
+        // next authoritative read-back emits instead.
+        let bridge_idle = self
+            .effort_bridge
+            .as_ref()
+            .is_none_or(|bridge| !bridge.has_pending());
+        if bridge_idle && !self.deferred_effort_edges.is_empty() {
+            let stashed = std::mem::take(&mut self.deferred_effort_edges);
+            for stashed_edge in stashed {
+                let DeferredEffortEdge {
+                    observed: stashed_observed,
+                    event_id,
+                    raw,
+                } = stashed_edge;
+                if let Some((observed, source)) = self.effort.publish_deferred(stashed_observed) {
+                    let mut emitted = self.effort_observation(
+                        value,
+                        observed,
+                        source,
+                        raw,
+                        remuda_protocol::EFFORT_STDOUT_NATIVE,
+                        None,
+                    )?;
+                    if let Some(first) = emitted.first_mut() {
+                        first.event_id = event_id;
+                    }
+                    observations.append(&mut emitted);
+                }
+            }
+        }
+        Ok(observations)
     }
 
     /// c-effortread r16 item 2 / r17 item 1: pop the front verdict-order slot.
@@ -3530,6 +3608,12 @@ impl TranscriptMapper {
         let Some((observed, source)) = self.effort.observe(effort, per_turn) else {
             return Ok(Vec::new());
         };
+        // r18 item 3: an authoritative assistant read-back that emitted just
+        // published (or superseded) the state a suppressed unowned acceptance
+        // had latched; its stashed edges are consumed and dropped.
+        if self.effort.deferred_observation().is_none() {
+            self.deferred_effort_edges.clear();
+        }
         let raw = effort
             .filter(|value| !value.is_empty())
             .or(per_turn.filter(|value| !value.is_empty()))

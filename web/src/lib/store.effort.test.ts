@@ -3187,6 +3187,48 @@ it("r15 item 3: a provably newer queued lifecycle replaces the lifecycle-owned p
   expect(hubStore.effortPendingOf(ctx.instance.id), "B completing clears the pending").toBeNull();
 });
 
+it("r16 item 5: equal-millisecond queued lifecycles are ordered by journal seq (A → B → B completes)", async () => {
+  const ctx = await startFollowing("r16-item5-equal-ms");
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const baseline: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "low", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [baseline] } as never);
+
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
+  // Protocol timestamps have millisecond resolution: A (journal seq N) and B
+  // (seq N+1) carry the SAME observedAt. Timestamp-only ordering cannot tell
+  // them apart and left the observer tracking A.
+  const sameMs = "2026-09-16T00:00:05.000Z";
+  ctx.receive(configureLifecycleFor(3, "effort-queued:low", "req-a", ctx.instance.id, sameMs));
+  const aSeq = hubStore.effortPendingOf(ctx.instance.id)?.queuedSeq;
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toMatchObject({
+    name: "low",
+    requestId: "req-a",
+    source: "lifecycle",
+  });
+
+  // B journals in the SAME millisecond but a strictly later journal seq.
+  ctx.receive(configureLifecycleFor(4, "effort-queued:max", "req-b", ctx.instance.id, sameMs));
+  const b = hubStore.effortPendingOf(ctx.instance.id);
+  expect(b, "the later seq replaces A despite the equal timestamp").toMatchObject({
+    name: "max",
+    requestId: "req-b",
+    source: "lifecycle",
+  });
+  expect(BigInt(b?.queuedSeq ?? "0"), "B carries its own later journal seq").toBeGreaterThan(
+    BigInt(aSeq ?? "0"),
+  );
+
+  // B executes and its applied verdict completes the tracked request. The
+  // strictly-timestamp older-replacement rejection is covered by the r15
+  // item 3 case above (a later edge describing an older request).
+  ctx.receive(configureLifecycleFor(6, "effort-applied:max", "req-b", ctx.instance.id, sameMs));
+  expect(hubStore.effortPendingOf(ctx.instance.id), "B completing clears the pending").toBeNull();
+});
+
 it("r13 item 3: an observer-tab legacy pending with a silent no-op completes unconfirmed at its bound", async () => {
   const ctx = await startFollowing("r13-item3-observer-noop");
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);

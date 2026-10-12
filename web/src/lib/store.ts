@@ -152,6 +152,15 @@ export type EffortPending = {
    * that edge arrives. Kept separately from the pre-request baseline.
    */
   queuedObservedAt: string | null;
+  /**
+   * c-effortread r16 item 5: the JOURNAL SEQ of THIS request's own
+   * `effort-queued` lifecycle (lifecycle-owned pendings only). Protocol
+   * timestamps have millisecond resolution, so two queued lifecycles emitted
+   * in the same millisecond tie on {@link queuedObservedAt}; the journal seq
+   * is the total order that disambiguates them. Null on client-owned
+   * pendings (their nonce/afterReplacement protection does not use this).
+   */
+  queuedSeq: string | null;
   /** Level axis confirmed by a newer projection. */
   levelSettled: boolean;
   /** Switch axis confirmed by a newer projection. */
@@ -266,6 +275,30 @@ function effortAwaitsQueueExit(activity: Instance["activity"] | undefined): bool
     activity?.state === "known" &&
     (activity.value === "working" || activity.value === "waiting-interaction")
   );
+}
+
+/**
+ * c-effortread r15 item 3 / r16 item 5: whether an incoming `effort-queued`
+ * lifecycle edge is provably NEWER than the lifecycle-owned pending's own
+ * queued edge. The primary order is the millisecond observedAt; protocol
+ * timestamps have millisecond resolution (crates/remuda-protocol scalar
+ * Timestamp), so two edges emitted within one millisecond tie and fall back
+ * to the journal SEQ — the hub's total order (later seq wins, an older/equal
+ * seq never replaces). Callers must have validated both timestamps finite.
+ */
+function lifecycleEdgeIsNewer(
+  incomingMs: number,
+  incomingSeq: string,
+  establishedMs: number,
+  establishedSeq: string,
+): boolean {
+  if (incomingMs > establishedMs) return true;
+  if (incomingMs < establishedMs) return false;
+  try {
+    return BigInt(incomingSeq) > BigInt(establishedSeq);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1837,6 +1870,11 @@ class HubStore {
           // stamp on either side) is rejected: order unknown fails closed.
           // Client-owned pendings and their nonce/afterReplacement
           // protection never enter this path.
+          // c-effortread r16 item 5: protocol timestamps are milliseconds, so
+          // two queued lifecycles in the SAME millisecond tie on observedAt;
+          // the journal SEQ is the total order and a strictly later seq still
+          // proves the incoming edge newer, while an equal ms with an older or
+          // missing seq is rejected.
           const incomingMs = queuedThreshold != null ? Date.parse(queuedThreshold) : Number.NaN;
           const establishedMs =
             current.queuedObservedAt != null ? Date.parse(current.queuedObservedAt) : Number.NaN;
@@ -1844,7 +1882,8 @@ class HubStore {
             current.source === "lifecycle" &&
             Number.isFinite(incomingMs) &&
             Number.isFinite(establishedMs) &&
-            incomingMs > establishedMs;
+            current.queuedSeq != null &&
+            lifecycleEdgeIsNewer(incomingMs, observation.seq, establishedMs, current.queuedSeq);
           if (!replacesLifecycle) return;
           // Fall through and synthesize the replacement pending from the
           // newer edge exactly like a fresh observer-side create below.
@@ -1892,6 +1931,8 @@ class HubStore {
           at: atCreate,
           baselineObservedAt: existingView?.observedAt ?? null,
           queuedObservedAt: queuedThreshold,
+          // r16 item 5: journal ordering provenance for equal-ms lifecycles.
+          queuedSeq: String(observation.seq),
       // Axes this request does not move need no proof; every axis the
       // request MOVES starts UNSETTLED even when the current projection
       // already shows the requested value (c-effortread r11 item 2): a queued
@@ -1940,6 +1981,21 @@ class HubStore {
         (!Number.isFinite(establishedQueuedMs) || incomingQueuedMs > establishedQueuedMs)
           ? queuedThreshold
           : current.queuedObservedAt;
+      // r16 item 5: keep the queued SEQ monotonic in tandem with the queued
+      // instant (newer ms, or the greater seq within one millisecond) so a
+      // later duplicate/re-queue edge never lets a future replacement compare
+      // against stale ordering provenance.
+      const stampedSeq =
+        Number.isFinite(incomingQueuedMs) &&
+        (!Number.isFinite(establishedQueuedMs) ||
+          lifecycleEdgeIsNewer(
+            incomingQueuedMs,
+            String(observation.seq),
+            establishedQueuedMs,
+            current.queuedSeq ?? "0",
+          ))
+          ? String(observation.seq)
+          : current.queuedSeq;
       // A lifecycle-created entry carries the queue state derived from current
       // activity; a queued edge for an EXISTING request really did re-queue it:
       // if a turn is now running again — or the session parked on a
@@ -1960,6 +2016,7 @@ class HubStore {
                 ...current,
                 queued: true,
                 queuedObservedAt: stamped,
+                queuedSeq: stampedSeq,
                 ...(requeuedBehindTurn ? { leftQueueAt: null } : {}),
               },
         },
@@ -4773,6 +4830,9 @@ class HubStore {
       // BOTH and matching the requested axis.
       baselineObservedAt: currentView?.observedAt ?? null,
       queuedObservedAt: null,
+      // Client pendings order via the nonce/afterReplacement protection, not
+      // a lifecycle seq (r16 item 5).
+      queuedSeq: null,
       // Axes this request does not move need no proof; every MOVED axis
       // starts unsettled even when the projection already shows the target
       // (c-effortread r11 item 2): pre-settling let a queued B that targeted

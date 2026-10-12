@@ -22,6 +22,7 @@ import {
   mkdir,
   mkdtemp,
   open,
+  readFile,
   realpath,
   rm,
   stat,
@@ -372,17 +373,33 @@ test("native transcript usage drives the context chip through the real promoted 
     );
 
     await rawKeys(page, id, "NATIVEUSAGE probe");
-    // Wait for the prompt body to be read and painted BEFORE the CR: a body
-    // and CR landing in one harness PTY read are treated as a paste, so the
-    // two writes must be separated by an observed condition, not a fixed
-    // delay. The renderer-independent xterm buffer is that observation - the
-    // draft is visible there regardless of canvas/webgl/DOM rendering.
+    // Wait for the harness to consume the body bytes into its composer
+    // draft BEFORE the CR: body+CR landing in one harness PTY read are
+    // treated as a paste and never submit. The events log records
+    // draft_update only once that read batch has returned, so the CR written
+    // afterwards lands in a strictly later read - an observed condition
+    // instead of a fixed delay (c-ctxusage r11 item 6).
     await expect
       .poll(
-        async () =>
-          (
-            await page.evaluate(() => window.__ttyLab?.bufferText() ?? "")
-          ).includes("NATIVEUSAGE probe"),
+        async () => {
+          try {
+            const log = await readFile(eventsFile, "utf8");
+            return log.split("\n").some((line) => {
+              if (!line) return false;
+              const event = JSON.parse(line) as {
+                event?: string;
+                text?: unknown;
+              };
+              return (
+                event.event === "draft_update" &&
+                typeof event.text === "string" &&
+                event.text.includes("NATIVEUSAGE probe")
+              );
+            });
+          } catch {
+            return false;
+          }
+        },
         { timeout: 20_000, intervals: [100, 250] },
       )
       .toBe(true);

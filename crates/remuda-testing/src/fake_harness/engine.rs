@@ -877,11 +877,20 @@ impl Engine {
             match rx.recv_timeout(timeout) {
                 Ok(inputs) if inputs.is_empty() => break, // EOF
                 Ok(inputs) => {
+                    let draft_before = self.draft.clone();
                     for input in inputs {
                         self.handle_input(input);
                         if self.should_exit {
                             break;
                         }
+                    }
+                    // Observable "the body bytes of this PTY read have been
+                    // consumed into the composer draft": a driver separating a
+                    // prompt body from its submitting CR can wait on this event
+                    // instead of a fixed delay (the CR written afterwards lands
+                    // in a strictly later read).
+                    if self.draft != draft_before {
+                        self.event("draft_update", json!({ "text": self.draft }));
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}

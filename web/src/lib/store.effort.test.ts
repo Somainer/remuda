@@ -206,46 +206,71 @@ it("a terminal-side ultracode switch parks the slider on xhigh with the flag", a
 
 it("our pending level push-down clears when the read-back lands", async () => {
   const ctx = await startFollowing("pending");
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  // r18 item 2: an id-less read-back settles only a session whose driver is
-  // explicitly legacy (an older build); an unknown session fails closed.
-  hubStore.setEffortIdCapabilityForTest(ctx.instance.id, "legacy");
-
-  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 3, false));
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+  // r19 item 1: only THIS request's own id echo settles the push-down.
+  const posted = hubStore.setEffort(ctx.instance.id, effortAt("claude", 3, false));
+  const id = posts[0]?.requestId!;
+  await posted;
   expect(hubStore.effortPendingOf(ctx.instance.id)?.name).toBe("xhigh");
-  ctx.receive(effortEvent(2, "xhigh", false, "remuda"));
+  ctx.receive(
+    effortEvent(2, "xhigh", false, "remuda", undefined, {
+      requested: { name: "xhigh", ultracode: false },
+      requestId: id,
+    }),
+  );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("xhigh");
 });
 
 it("a level push-down and a flag push-down each settle their own axis", async () => {
   const ctx = await startFollowing("axes");
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  // Both read-backs here are id-less edges from an explicitly older driver.
-  hubStore.setEffortIdCapabilityForTest(ctx.instance.id, "legacy");
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+  // Both read-backs carry the request's OWN id (r19 item 1).
 
   // Gesture 1: tier drag to xhigh (decoupled: the plain level word leaves the
   // orthogonal flag untouched, so this request moves ONLY the level).
-  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 3, false));
+  const level = hubStore.setEffort(ctx.instance.id, effortAt("claude", 3, false));
+  const idLevel = posts[0]?.requestId!;
+  await level;
   const pending0 = hubStore.effortPendingOf(ctx.instance.id);
   expect(pending0).toMatchObject({ name: "xhigh", axis: "tier" });
   expect(pending0?.levelSettled).toBe(false);
   expect(pending0?.flagSettled).toBe(true);
 
   // The level read-back settles the tier request.
-  ctx.receive(effortEvent(2, "xhigh", null, "remuda"));
+  ctx.receive(
+    effortEvent(2, "xhigh", null, "remuda", undefined, {
+      requested: { name: "xhigh", ultracode: false },
+      requestId: idLevel,
+    }),
+  );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 
   // Gesture 2: flip the orthogonal switch on at xhigh — a flag-ONLY request;
   // the level axis starts settled (it is not moving).
-  await hubStore.setUltracode(ctx.instance.id, true);
+  const flag = hubStore.setUltracode(ctx.instance.id, true);
+  const idFlag = posts[1]?.requestId!;
+  await flag;
   const pendingFlag = hubStore.effortPendingOf(ctx.instance.id);
   expect(pendingFlag).toMatchObject({ name: "xhigh", ultracode: true, axis: "flag" });
   expect(pendingFlag?.levelSettled).toBe(true);
   expect(pendingFlag?.flagSettled).toBe(false);
 
   // The attachment reports the flag on: the flag request settles.
-  ctx.receive(effortEvent(3, "xhigh", true, "remuda"));
+  ctx.receive(
+    effortEvent(3, "xhigh", true, "remuda", undefined, {
+      requested: { name: "xhigh", ultracode: true },
+      requestId: idFlag,
+    }),
+  );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
@@ -336,10 +361,16 @@ it("a clamped level named by THIS request's echo settles the tier request; an un
 
 it("a clamped level with NO echo and a non-matching value never settles a request", async () => {
   const ctx = await startFollowing("clamp-flag-stale");
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  // r18 item 2: the id-less read-backs here model an explicitly legacy driver.
-  hubStore.setEffortIdCapabilityForTest(ctx.instance.id, "legacy");
-  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false)); // max
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+  // r19 item 1: the id-less read-backs here settle NOTHING for an unknown
+  // request; only the request's own id verdict settles.
+  const posted = hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false)); // max
+  const id = posts[0]?.requestId!;
+  await posted;
   // A high projection with nothing tying it to the max request could be a
   // terminal-side switch to high: it must not settle the max pending.
   ctx.receive(effortEvent(2, "high", null, "slash"));
@@ -347,28 +378,45 @@ it("a clamped level with NO echo and a non-matching value never settles a reques
   expect(stillPending?.levelSettled).toBe(false);
   expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
 
-  // The genuine max read-back then settles it.
-  ctx.receive(effortEvent(3, "max", false, "remuda"));
+  // The genuine max read-back, stamped with THIS request's id, settles it.
+  ctx.receive(
+    effortEvent(3, "max", false, "remuda", undefined, {
+      requested: { name: "max", ultracode: false },
+      requestId: id,
+    }),
+  );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
-it("while queued the entry shows queued until a strictly newer read-back", async () => {
+it("while queued the entry shows queued until its own id read-back", async () => {
   const ctx = await startFollowing("queued", { state: "known", value: "working" });
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
 
-  // A pre-existing projection at a DIFFERENT level stamps the threshold and
-  // leaves the level axis unproven.
+  // A pre-existing terminal projection at a DIFFERENT level.
   ctx.receive(effortEvent(1, "high", false, "slash", "2026-09-16T00:05:00.000Z"));
-  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false));
-  // The queued edge is THIS request's own threshold (after the 00:05
-  // projection, before the 00:06 read-back).
-  const lifecycle = configureLifecycle(3, "effort-queued:max", "x", "2026-09-16T00:05:30.000Z");
-  ctx.receive(lifecycle);
+  const posted = hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false));
+  const id = posts[0]?.requestId!;
+  await posted;
+  // The request's OWN id-bearing queued edge proves the queue.
+  ctx.receive(
+    configureLifecycleFor(3, "effort-queued:max", id, "x", "2026-09-16T00:05:30.000Z"),
+  );
   expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
-  // An older-than-threshold read-back must not settle a queued request.
+  // An id-less projection (another client / an unowned verdict) never settles,
+  // however fresh.
   ctx.receive(effortEvent(2, "max", false, "remuda", "2026-09-16T00:02:00.000Z"));
   expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
-  ctx.receive(effortEvent(6, "max", false, "remuda", "2026-09-16T00:06:00.000Z"));
+  // B's own id-bearing read-back settles.
+  ctx.receive(
+    effortEvent(6, "max", false, "remuda", "2026-09-16T00:06:00.000Z", {
+      requested: { name: "max", ultracode: false },
+      requestId: id,
+    }),
+  );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
@@ -436,18 +484,27 @@ it("a stale queued lifecycle for a replaced request is dropped (A→B race)", as
 
 it("item 3: request A's read-back never settles B — queued threshold and the requested echo", async () => {
   const ctx = await startFollowing("ab-readback", { state: "known", value: "working" });
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
 
   // A switches to xhigh while the agent works.
-  await hubStore.setEffort(ctx.instance.id, { index: 3, name: "xhigh", kind: "claude", ultracode: false });
-  ctx.receive(configureLifecycle(2, "effort-queued:xhigh", "x", "2026-10-08T12:00:01.000Z"));
+  const aPost = hubStore.setEffort(ctx.instance.id, { index: 3, name: "xhigh", kind: "claude", ultracode: false });
+  const idA = posts[0]?.requestId!;
+  await aPost;
+  ctx.receive(configureLifecycleFor(2, "effort-queued:xhigh", idA, "x", "2026-10-08T12:00:01.000Z"));
   // B replaces A before the idle point.
-  await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
-  ctx.receive(configureLifecycle(3, "effort-queued:max", "x", "2026-10-08T12:00:03.000Z"));
+  const bPost = hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+  const idB = posts[1]?.requestId!;
+  await bPost;
+  ctx.receive(configureLifecycleFor(3, "effort-queued:max", idB, "x", "2026-10-08T12:00:03.000Z"));
   expect(hubStore.effortPendingOf(ctx.instance.id)).toMatchObject({ name: "max", queued: true });
 
-  // A's verdict lands at 12:00:02 — BEFORE B's own queued edge — and echoes
-  // A's axes. It updates the projection but must not settle B's indicator.
+  // A's verdict lands at 12:00:02 — BEFORE B's own queued edge — id-less (an
+  // unowned terminal-side projection). It updates the projection but must not
+  // settle B's indicator.
   ctx.receive({
     eventId: "evt_a_readback",
     instanceId: "x",
@@ -474,7 +531,8 @@ it("item 3: request A's read-back never settles B — queued threshold and the r
   expect(pendingAfterA?.name, "B keeps its own indicator through A's read-back").toBe("max");
   expect(pendingAfterA?.levelSettled).not.toBe(true);
 
-  // B's own verdict (echoes B's axes, newer than B's queued edge) settles.
+  // B's own verdict (echoes B's id and axes, newer than B's queued edge)
+  // settles.
   ctx.receive({
     eventId: "evt_b_readback",
     instanceId: "x",
@@ -487,6 +545,7 @@ it("item 3: request A's read-back never settles B — queued threshold and the r
       kind: "effort",
       payload: {
         requested: { name: "max", ultracode: false },
+        requestId: idB,
         effective: {
           name: "max",
           ultracode: false,
@@ -631,18 +690,27 @@ it("an id-less degraded verdict whose word differs from the queued one can never
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
   // Driver reports queued on xhigh (a configure posted outside this UI, so
-  // the pending is synthesized from the id-less lifecycle)...
-  ctx.receive(configureLifecycle(2, "effort-queued:xhigh", ctx.instance.id, "2026-10-12T02:00:00.000Z"));
+  // the pending is synthesized from the wire lifecycle), carrying the other
+  // client's echoed request id...
+  const queuedRequestId = "effreq-wire-xhigh";
+  ctx.receive(
+    configureLifecycleFor(2, "effort-queued:xhigh", queuedRequestId, ctx.instance.id, "2026-10-12T02:00:00.000Z"),
+  );
   expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
   const queuedId = hubStore.effortPendingOf(ctx.instance.id)?.requestId!;
-  // ...then an id-less rejection of a DIFFERENT word (max). The word alone
+  expect(queuedId).toBe(queuedRequestId);
+  // ...then an ID-LESS rejection of a DIFFERENT word (max). The word alone
   // cannot tell a stale verdict from this request's, so it neither clears nor
   // rolls back; the request awaits its bounded reconciliation.
   ctx.receive(configureLifecycle(3, "effort-degraded:max:dialog-kept", ctx.instance.id, "2026-10-12T02:01:00.000Z"));
   expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(queuedId);
-  // A fresh read-back matching the queued request is the one id-less path
-  // that settles it.
-  ctx.receive(effortEvent(4, "xhigh", true, "remuda", "2026-10-12T02:02:00.000Z"));
+  // Only a read-back carrying THIS request's id settles it (r19 item 1).
+  ctx.receive(
+    effortEvent(4, "xhigh", true, "remuda", "2026-10-12T02:02:00.000Z", {
+      requested: { name: "xhigh", ultracode: true },
+      requestId: queuedRequestId,
+    }),
+  );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
@@ -721,22 +789,48 @@ it("r9 item 7: a null poll never lowers the withdrawal watermark; a stale level 
   ).toBeNull();
 });
 
-it("a poll projection settles the push-down without a live event", async () => {
+it("r19 item 1: a poll projection never settles a push-down without the request's own id (gapped live frame)", async () => {
+  // r18 allowed a durable poll to settle an in-flight request BY VALUE for a
+  // session seeded "legacy". r19 ruling A removes the value fallback
+  // outright: a durable record carries no request id, so a matching poll
+  // (even one that beats or gaps the live follow frames) leaves B pending;
+  // B settles only when its own id-bearing live frame arrives, otherwise its
+  // bounded unconfirmed path ends it.
   const ctx = await startFollowing("poll-settle");
-  // r18 item 2: a durable poll settles an in-flight request by value only when
-  // the session driver is explicitly legacy.
-  hubStore.setEffortIdCapabilityForTest(ctx.instance.id, "legacy");
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [] } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+
+  const posted = hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false));
+  const id = posts[0]?.requestId!;
+  await posted;
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(id);
+
+  // A routine poll projects the accepted max — no live frame, no request id.
   const projected: Instance = {
     ...ctx.instance,
     effortEffective: { name: "max", ultracode: false, source: "remuda", observedAt: "2026-09-21T00:00:01.000Z" },
   };
   vi.spyOn(api, "instanceList").mockResolvedValue({ items: [projected] } as never);
-  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-
-  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false));
-  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  await hubStore.refresh();
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
+  expect(
+    hubStore.effortPendingOf(ctx.instance.id),
+    "the id-less durable projection never settles B",
+  ).not.toBeNull();
+
+  // The gapped own-id live frame settles it.
+  ctx.receive(
+    effortEvent(5, "max", false, "remuda", "2026-09-21T00:00:02.000Z", {
+      requested: { name: "max", ultracode: false },
+      requestId: id,
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
 it("the level mismatch still leaves the slider on the requested max (clamp)", async () => {
@@ -771,24 +865,32 @@ it("an older poll projection cannot overwrite the newer effective", async () => 
 });
 
 it("c-effortui: a poll between request A and request B cannot clear B's pending", async () => {
-  // The replaced-request provenance bug: setEffort stamps each request with
-  // the freshest effective observedAt. Request A settles at t002; request B
-  // is made right after, and a poll that returns A's read-back (t002) must
-  // not settle B — only a strictly newer projection may.
+  // The replaced-request provenance bug: request A settles at t002; request B
+  // is made right after, and a poll that returns A's read-back (t002) must not
+  // settle B. r19 item 1 makes this unconditional: a durable poll carries no
+  // request id at all, so B settles only on its own id-bearing live frame.
   const ctx = await startFollowing("ab-threshold");
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  // r18 item 2: both read-backs are id-less (older driver); the time bounds
-  // still keep A's poll from settling B.
-  hubStore.setEffortIdCapabilityForTest(ctx.instance.id, "legacy");
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
 
-  // Request A (high) settles via its own live edge.
-  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 2, false));
-  ctx.receive(effortEvent(2, "high", false, "remuda", "2026-09-16T00:02:00.000Z"));
+  // Request A (high) settles via its own id-bearing live edge.
+  const aPost = hubStore.setEffort(ctx.instance.id, effortAt("claude", 2, false));
+  const idA = posts[0]?.requestId!;
+  await aPost;
+  ctx.receive(
+    effortEvent(2, "high", false, "remuda", "2026-09-16T00:02:00.000Z", {
+      requested: { name: "high", ultracode: false },
+      requestId: idA,
+    }),
+  );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe("2026-09-16T00:02:00.000Z");
 
   // A poll now returns A's read-back (same timestamp) while request B is in
-  // flight. B's threshold is t002; an equal-or-older projection proves nothing.
+  // flight. It proves nothing for B.
   const stale: Instance = {
     ...ctx.instance,
     effortEffective: { name: "high", ultracode: false, source: "remuda", observedAt: "2026-09-16T00:02:00.000Z" },
@@ -796,18 +898,31 @@ it("c-effortui: a poll between request A and request B cannot clear B's pending"
   vi.spyOn(api, "instanceList").mockResolvedValue({ items: [stale] } as never);
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
 
-  await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false)); // B: max
+  const bPost = hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false)); // B: max
+  const idB = posts[1]?.requestId!;
+  await bPost;
   expect(hubStore.effortPendingOf(ctx.instance.id)?.name).toBe("max");
-
-  // B's own newer read-back settles it.
+  // Even a FRESHER poll carrying max settles nothing without B's id.
   const settled: Instance = {
     ...ctx.instance,
     effortEffective: { name: "max", ultracode: false, source: "remuda", observedAt: "2026-09-16T00:03:00.000Z" },
   };
   vi.spyOn(api, "instanceList").mockResolvedValue({ items: [settled] } as never);
   await hubStore.refresh();
-  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
+  expect(
+    hubStore.effortPendingOf(ctx.instance.id),
+    "a poll never settles B without its own id",
+  ).not.toBeNull();
+
+  // B's own id-bearing live frame settles it.
+  ctx.receive(
+    effortEvent(5, "max", false, "remuda", "2026-09-16T00:03:01.000Z", {
+      requested: { name: "max", ultracode: false },
+      requestId: idB,
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
 it("a failed configure rolls back only the still-current request and never rejects", async () => {
@@ -885,42 +1000,57 @@ it("a replaced request's late HTTP SUCCESS does not overwrite the newer choice",
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
 });
 
-it("a null baseline with no queued stamp: only a matching value settles the cold request", async () => {
+it("a null baseline with no queued stamp: an id-less projection never settles; the request's own id does", async () => {
   const ctx = await startFollowing("null-threshold");
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  // r18 item 2: id-less read-backs settle only an explicitly legacy session.
-  hubStore.setEffortIdCapabilityForTest(ctx.instance.id, "legacy");
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
   // No effective state exists yet (baseline null, queued stamp not yet seen).
   // Cold flag-ON request at the default high tier.
-  await hubStore.setUltracode(ctx.instance.id, true);
+  const posted = hubStore.setUltracode(ctx.instance.id, true);
+  const id = posts[0]?.requestId!;
+  await posted;
   expect(hubStore.effortPendingOf(ctx.instance.id)?.baselineObservedAt).toBeNull();
   expect(hubStore.effortPendingOf(ctx.instance.id)?.queuedObservedAt).toBeNull();
 
   // A terminal-side observation reporting the flag OFF is someone/something
-  // else's state, not our request — even with no time stamps it must settle
-  // nothing (matching tier alone never confirms the flag, r10 item 2).
+  // else's state, not our request — matching tier alone never confirms the
+  // flag, and the id-less frame settles nothing anyway.
   ctx.receive(effortEvent(2, "high", false, "slash"));
   const pending = hubStore.effortPendingOf(ctx.instance.id);
   expect(pending).not.toBeNull();
   expect(pending?.flagSettled).toBe(false);
 
-  // A matching positive ON read-back settles the flag.
-  ctx.receive(effortEvent(3, "high", true, "remuda"));
+  // The request's own id-bearing positive ON read-back settles the flag.
+  ctx.receive(
+    effortEvent(3, "high", true, "remuda", undefined, {
+      requested: { name: "high", ultracode: true },
+      requestId: id,
+    }),
+  );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
 
 it("a degraded lifecycle for replaced request A never reverts/clears request B", async () => {
   const ctx = await startFollowing("degraded-after-replace");
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
   const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
   // A = xhigh, replaced immediately by B = max before either settles.
   await hubStore.setEffort(ctx.instance.id, effortAt("claude", 3, false));
   await hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false));
+  const idB = posts[1]?.requestId!;
   expect(hubStore.effortPendingOf(ctx.instance.id)?.name).toBe("max");
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
 
-  // A's level-degraded verdict (names xhigh) lands while B is in flight.
+  // A's level-degraded verdict (id-less, names xhigh) lands while B is in
+  // flight.
   ctx.receive(configureLifecycle(3, "effort-degraded:xhigh:no-readback-within-window", ctx.instance.id));
 
   // B survives intact: still optimistic max, still pending, no stale toast.
@@ -929,8 +1059,13 @@ it("a degraded lifecycle for replaced request A never reverts/clears request B",
   expect(hubStore.effortRefusalOf(ctx.instance.id)).toBeNull();
   expect(toast).not.toHaveBeenCalled();
 
-  // B's own read-back then settles normally.
-  ctx.receive(effortEvent(4, "max", false, "remuda"));
+  // B's own id-bearing read-back then settles normally.
+  ctx.receive(
+    effortEvent(4, "max", false, "remuda", undefined, {
+      requested: { name: "max", ultracode: false },
+      requestId: idB,
+    }),
+  );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
 });
@@ -1763,14 +1898,14 @@ it("r6 item 8a: an out-of-order withdrawal (older observedAt) never deletes the 
   expect(hubStore.effortReadbackWithdrawnOf(ctx.instance.id)).toBe(true);
 });
 
-it("an identical poll still settles queued effort left by a historical onPrepend replay (c-perffu r2)", async () => {
+it("a poll never settles queued effort left by a historical onPrepend replay; its own id frame does (c-perffu r2 / r19 item 1)", async () => {
   // End state of an ascending load-earlier (onPrepend) replay: first the
   // newer remuda effective edge folds (with no push-down in flight yet, it
   // lands as a terminal-side switch), THEN the configure row journaled after
   // it is replayed as queued — so pending exists while the effective map
-  // already carries the newer read-back. The next poll returns that SAME
-  // record; pending settlement must run independently of effective-record
-  // equality (r1 had nested it inside the effective fold gate).
+  // already carries the newer read-back. Since r19 item 1 a durable poll
+  // carries no request id and settles NOTHING; the replayed request's own id
+  // live frame is the only thing that clears it.
   const ctx = await startFollowing("r2-replay");
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
@@ -1786,15 +1921,17 @@ it("an identical poll still settles queued effort left by a historical onPrepend
     },
   } as unknown as Observation);
   // The queued configure row, journaled AFTER the effective edge, replayed
-  // last: pending re-appears over the already-newer effective.
-  ctx.receive(configureLifecycle(4, "effort-queued:max", ctx.instance.id));
+  // last: pending re-appears over the already-newer effective. The wire edge
+  // carries the other client's echoed request id.
+  const queuedRequestId = "effreq-replay-max";
+  ctx.receive(
+    configureLifecycleFor(4, "effort-queued:max", queuedRequestId, ctx.instance.id),
+  );
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(newerAt);
   expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
 
   // An IDENTICAL durable projection (fresh object, equal content/observedAt)
-  // showing XHIGH while the queued request asked for MAX: r10 identity — a
-  // non-matching value cannot confirm the request, so the queued indicator
-  // survives even though the projection is newer.
+  // showing XHIGH while the queued request asked for MAX never settles it.
   vi.spyOn(api, "instanceList").mockResolvedValue({
     items: [
       {
@@ -1808,8 +1945,8 @@ it("an identical poll still settles queued effort left by a historical onPrepend
   expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(newerAt);
 
-  // A later poll carrying the matching MAX level (strictly newer than the
-  // pre-request baseline) settles independently of effective-record equality.
+  // A later poll carrying the matching MAX level still cannot settle: a
+  // durable record carries no request id (r19 item 1).
   const maxAt = "2026-09-22T00:04:00Z";
   vi.spyOn(api, "instanceList").mockResolvedValue({
     items: [
@@ -1820,8 +1957,20 @@ it("an identical poll still settles queued effort left by a historical onPrepend
     ],
   } as never);
   await hubStore.refresh();
-  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
   expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
+  expect(
+    hubStore.effortPendingOf(ctx.instance.id),
+    "the matching poll never settles without the request's own id",
+  ).not.toBeNull();
+
+  // The request's own id-bearing live frame settles it.
+  ctx.receive(
+    effortEvent(5, "max", false, "remuda", "2026-09-22T00:04:01Z", {
+      requested: { name: "max", ultracode: false },
+      requestId: queuedRequestId,
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
 it("a load-earlier replay hydrates observations but never queues; a live queued switch survives it and settles on a current poll (c-perffu r4-2 merge)", async () => {
@@ -1916,8 +2065,10 @@ it("a load-earlier replay hydrates observations but never queues; a live queued 
   expect(hubStore.effortEffectiveOf(id)?.observedAt).toBe("2026-09-16T00:05:00.000Z");
   expect(hubStore.effortPendingOf(id)).toBeNull();
 
-  // The genuinely in-flight request arrives LIVE and queues.
-  deliverLive(configureLifecycle(6, "effort-queued:max", id, "2026-09-16T00:14:00.000Z"));
+  // The genuinely in-flight request arrives LIVE and queues, carrying the
+  // other client's echoed request id.
+  const liveRequestId = "effreq-prepend-max";
+  deliverLive(configureLifecycleFor(6, "effort-queued:max", liveRequestId, id, "2026-09-16T00:14:00.000Z"));
   expect(hubStore.effortPendingOf(id)?.queued).toBe(true);
 
   // A stale poll carrying a read-back OLDER than the queued request
@@ -1940,7 +2091,8 @@ it("a load-earlier replay hydrates observations but never queues; a live queued 
 
   // A read-back at the SAME parsed instant as the queued request (the durable
   // record truncates milliseconds) could be the state the previous command
-  // left behind: r11 item 4 requires STRICTLY newer, so it stays pending.
+  // left behind — and a durable record carries no request id anyway (r19
+  // item 1), so it stays pending.
   vi.spyOn(api, "instanceList").mockResolvedValue({
     items: [
       {
@@ -1957,7 +2109,8 @@ it("a load-earlier replay hydrates observations but never queues; a live queued 
   await hubStore.refresh();
   expect(hubStore.effortPendingOf(id)).not.toBeNull();
 
-  // A STRICTLY later read-back naming the requested level settles it.
+  // A STRICTLY later durable read-back naming the requested level STILL does
+  // not settle: a poll carries no request id (r19 item 1).
   vi.spyOn(api, "instanceList").mockResolvedValue({
     items: [
       {
@@ -1972,6 +2125,16 @@ it("a load-earlier replay hydrates observations but never queues; a live queued 
     ],
   } as never);
   await hubStore.refresh();
+  expect(hubStore.effortEffectiveOf(id)?.name).toBe("max");
+  expect(hubStore.effortPendingOf(id)).not.toBeNull();
+
+  // The request's own id-bearing live frame settles it.
+  deliverLive(
+    effortEvent(7, "max", false, "remuda", "2026-09-16T00:15:01.000Z", {
+      requested: { name: "max", ultracode: false },
+      requestId: liveRequestId,
+    }),
+  );
   expect(hubStore.effortPendingOf(id)).toBeNull();
 });
 
@@ -2462,20 +2625,21 @@ it("r12 item 2: id-less applied/degraded lifecycles never clear an observer tab'
   const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
 
   // Another client's configure, observed from THIS tab only over the wire:
-  // baseline flag ON, then an ID-LESS queued edge synthesizes a lifecycle
-  // pending for an OFF switch.
+  // baseline flag ON, then a queued edge (echoing the other client's request
+  // id) synthesizes a lifecycle pending for an OFF switch.
+  const wireRequestId = "effreq-wire-ultra-off";
   ctx.receive(effortEvent(2, "high", true, "slash", "2026-10-12T00:00:00.000Z"));
   ctx.receive(
-    configureLifecycle(3, "effort-queued:ultracode off", ctx.instance.id, "2026-10-12T00:01:00.000Z"),
+    configureLifecycleFor(3, "effort-queued:ultracode off", wireRequestId, ctx.instance.id, "2026-10-12T00:01:00.000Z"),
   );
   const queued = hubStore.effortPendingOf(ctx.instance.id);
   expect(queued?.source).toBe("lifecycle");
   expect(queued?.ultracode).toBe(false);
   const queuedId = queued?.requestId!;
+  expect(queuedId).toBe(wireRequestId);
 
   // An id-less APPLIED edge with the same word cannot name the request: it
-  // may be a replaced request A's stale verdict. It must not clear B's view;
-  // legacy success arrives only through the strict read-back fallback.
+  // may be a replaced request A's stale verdict. It must not clear B's view.
   ctx.receive(
     configureLifecycle(4, "effort-applied:ultracode off", ctx.instance.id, "2026-10-12T00:02:00.000Z"),
   );
@@ -2495,14 +2659,15 @@ it("r12 item 2: id-less applied/degraded lifecycles never clear an observer tab'
   expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId, "id-less dialog-kept keeps B pending").toBe(queuedId);
   expect(toast).not.toHaveBeenCalled();
 
-  // The strict legacy read-back fallback (fresh echo, past both bounds, value
-  // matches the moved flag) is still the ONE id-less path that settles.
+  // The request's OWN id-bearing read-back (fresh, value matches the moved
+  // flag) is the one path that settles it (r19 item 1).
   ctx.receive(
     effortEvent(7, "high", false, "remuda", "2026-10-12T00:05:00.000Z", {
       requested: { ultracode: false },
+      requestId: wireRequestId,
     }),
   );
-  expect(hubStore.effortPendingOf(ctx.instance.id), "the strict read-back fallback settles B").toBeNull();
+  expect(hubStore.effortPendingOf(ctx.instance.id), "the own-id read-back settles B").toBeNull();
 });
 
 it("r12 item 2: an id-less genuine refusal is recorded but never clears an observer tab's lifecycle pending", async () => {
@@ -2581,7 +2746,13 @@ it("r11 item 4: an older driver's clamped max echo (id-less) never settles queue
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
-it("r12 item 3: an id-less queued edge is C's lower bound — A's stale max read-back cannot settle C", async () => {
+it("r19 item 1: backlogged id-less queued edges and read-backs never bind or settle C; only C's own id does", async () => {
+  // c-effortread r12 item 3 / r19 item 1: the older "id-less queued edge is a
+  // trusted lower bound / matching read-back settles" rule is gone. A
+  // backlogged id-less queued edge (a replaced request A's delayed frame
+  // after A→B→C) is simply dropped for a client pending and stamps nothing; a
+  // matching id-less read-back, even a fresh one, settles nothing. C binds
+  // and settles only on its OWN id evidence.
   const ctx = await startFollowing("r12-item3-queued-bound", { state: "known", value: "working" });
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
   const posts: ({ requestId?: string })[] = [];
@@ -2594,7 +2765,7 @@ it("r12 item 3: an id-less queued edge is C's lower bound — A's stale max read
   ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
 
   // A drags to max and executes; before it reads back the user picks low (B)
-  // and then max (C). The driver is older: every queued edge is ID-LESS.
+  // and then max (C).
   const aPost = hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
   await hubStore.setEffort(ctx.instance.id, { index: 2, name: "low", kind: "claude", ultracode: false });
   await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
@@ -2602,15 +2773,13 @@ it("r12 item 3: an id-less queued edge is C's lower bound — A's stale max read
   const idC = posts[2]?.requestId!;
   expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idC);
 
-  // B's id-less queued edge is word-mismatched and dropped; C itself
-  // replaced B, so r13 item 1 makes C's own same-word id-less queued edge
-  // ambiguous (A was also max): it must NOT bind — C falls back to its own
-  // client send time as the legacy lower bound.
+  // The backlog flushes two ID-LESS queued edges (low, then same-word max).
+  // Neither binds a client pending or stamps its queued time.
   ctx.receive(configureLifecycle(3, "effort-queued:low", ctx.instance.id, "2026-09-16T00:00:10.000Z"));
   ctx.receive(configureLifecycle(4, "effort-queued:max", ctx.instance.id, "2026-09-16T00:00:30.000Z"));
   expect(
     hubStore.effortPendingOf(ctx.instance.id)?.queuedObservedAt,
-    "an ambiguous same-word edge after A→B→C never binds",
+    "an id-less backlog edge never binds a client request",
   ).toBeNull();
 
   // A's DELAYED max read-back (T0): post-baseline, value matches C, but older
@@ -2625,31 +2794,49 @@ it("r12 item 3: an id-less queued edge is C's lower bound — A's stale max read
   expect(c?.requestId).toBe(idC);
   expect(c?.levelSettled).toBe(false);
 
-  // A genuinely fresh read-back past C's queued bound settles.
+  // Even a genuinely FRESH id-less matching read-back settles nothing now.
   ctx.receive(
     effortEvent(6, "max", false, "remuda", "2026-09-16T00:00:45.000Z", {
       requested: { name: "max", ultracode: false },
     }),
   );
+  expect(
+    hubStore.effortPendingOf(ctx.instance.id),
+    "a fresh id-less read-back never settles an unknown request",
+  ).not.toBeNull();
+
+  // C's own id-bearing queued edge binds and its own verdict settles it.
+  ctx.receive(
+    configureLifecycleFor(7, "effort-queued:max", idC, ctx.instance.id, "2026-09-16T00:00:46.000Z"),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queuedObservedAt).toBe("2026-09-16T00:00:46.000Z");
+  ctx.receive(
+    effortEvent(8, "max", false, "remuda", "2026-09-16T00:00:47.000Z", {
+      requested: { name: "max", ultracode: false },
+      requestId: idC,
+    }),
+  );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
-it("r12 item 3: with no queued edge the client send time is the legacy lower bound", async () => {
+it("r19 item 1: with no queued edge an id-less read-back never settles; the request's own id does", async () => {
   const ctx = await startFollowing("r12-item3-send-bound", { state: "known", value: "working" });
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  // r18 item 2: the session driver is known legacy from a PRIOR request
-  // (capability persists), even though THIS request gets no queued frame.
-  hubStore.setEffortIdCapabilityForTest(ctx.instance.id, "legacy");
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
 
   ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
   const aPost = hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
   await hubStore.setEffort(ctx.instance.id, { index: 2, name: "low", kind: "claude", ultracode: false });
   await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
   await aPost;
+  const idC = posts[2]?.requestId!;
 
-  // No queued edge at all (older driver). A read-back produced BEFORE C even
-  // left the client (clock pins the send at 00:00:00) cannot settle C.
+  // No queued edge at all. A read-back produced BEFORE C even left the client
+  // (clock pins the send at 00:00:00) cannot settle C.
   ctx.receive(
     effortEvent(3, "max", false, "remuda", "2026-09-15T23:59:59.000Z", {
       requested: { name: "max", ultracode: false },
@@ -2657,10 +2844,23 @@ it("r12 item 3: with no queued edge the client send time is the legacy lower bou
   );
   expect(hubStore.effortPendingOf(ctx.instance.id), "pre-send read-back stays pending").not.toBeNull();
 
-  // Post-send fresh evidence settles through the strict fallback.
+  // A post-send FRESH id-less matching read-back STILL settles nothing (r19
+  // item 1: a missing id is not legacy evidence).
   ctx.receive(
     effortEvent(4, "max", false, "remuda", "2026-09-16T00:00:05.000Z", {
       requested: { name: "max", ultracode: false },
+    }),
+  );
+  expect(
+    hubStore.effortPendingOf(ctx.instance.id),
+    "a fresh id-less read-back never settles C",
+  ).not.toBeNull();
+
+  // C's own id-bearing verdict settles.
+  ctx.receive(
+    effortEvent(5, "max", false, "remuda", "2026-09-16T00:00:06.000Z", {
+      requested: { name: "max", ultracode: false },
+      requestId: idC,
     }),
   );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
@@ -2691,16 +2891,20 @@ it("r12 item 3: a wire pending with no parseable queued bound fails closed", asy
   ).not.toBeNull();
 });
 
-it("r13 item 1: a delayed same-word A edge after A→B→C never lowers C's send-time bound", async () => {
+it("r19 item 1: a delayed same-word id-less A edge after A→B→C never binds or settles C; C's own id does", async () => {
   const ctx = await startFollowing("r13-item1-backlog", { state: "known", value: "working" });
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
 
   // Baseline low at T0, before A.
   ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:50.000Z"));
 
-  // A=max executes at T1 (23:59:55 client time); its id-less queued edge and
-  // its max read-back are delayed in the delivery backlog.
+  // A=max executes at T1 (23:59:55 client time); its queued edge and its max
+  // read-back are delayed in the delivery backlog.
   vi.setSystemTime(new Date("2026-09-15T23:59:55.000Z"));
   const aPost = hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
   // The user changes their mind twice at T3: B=low then C=max (same word as A).
@@ -2708,62 +2912,79 @@ it("r13 item 1: a delayed same-word A edge after A→B→C never lowers C's send
   await hubStore.setEffort(ctx.instance.id, { index: 2, name: "low", kind: "claude", ultracode: false });
   await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
   await aPost;
+  const idC = posts[2]?.requestId!;
   const c = hubStore.effortPendingOf(ctx.instance.id);
   expect(c?.afterReplacement, "C replaced B").toBe(true);
 
-  // The backlog flushes A's QUEUED edge first: same word ("max"), but its
-  // stamp T1 (23:59:56) is older than C's send and C is a replacement — the
-  // edge is ambiguous and must neither claim C nor stamp its bound.
+  // The backlog flushes A's QUEUED edge first: same word ("max"), ID-LESS. It
+  // can be A's stale edge and r19 item 1 makes every id-less edge claim
+  // nothing on a client pending — it is dropped, never replacing C or
+  // stamping its bound.
   ctx.receive(configureLifecycle(3, "effort-queued:max", ctx.instance.id, "2026-09-15T23:59:56.000Z"));
   expect(
     hubStore.effortPendingOf(ctx.instance.id)?.nonce,
     "A's stale queued edge never replaces C",
   ).toBe(c?.nonce);
 
-  // Then A's delayed max read-back at T2 (23:59:59): post-baseline and value
-  // matches C, but older than C's own send time (T3 = 00:00:10). It must stay
-  // a veto — before the fix the stamped T1 bound let this settle C.
+  // Then A's delayed id-less max read-back at T2 (23:59:59): value matches C
+  // but it has no request id — it must stay a veto.
   ctx.receive(
     effortEvent(4, "max", false, "remuda", "2026-09-15T23:59:59.000Z", {
       requested: { name: "max", ultracode: false },
     }),
   );
   const pending = hubStore.effortPendingOf(ctx.instance.id);
-  expect(pending, "A's stale read-back never settles C").not.toBeNull();
+  expect(pending, "A's stale id-less read-back never settles C").not.toBeNull();
   expect(pending?.nonce).toBe(c?.nonce);
   expect(pending?.levelSettled).toBe(false);
   expect(
     pending?.queuedObservedAt,
-    "an ambiguous word-only edge after A→B→C never lowers the send-time bound",
+    "an id-less word-only edge never binds the client request",
   ).toBeNull();
 
-  // A genuinely fresh read-back produced AFTER C left the client settles it
-  // through the strict fallback.
+  // A genuinely FRESH id-less matching read-back produced AFTER C left the
+  // client still settles nothing (r19 item 1).
   ctx.receive(
     effortEvent(5, "max", false, "remuda", "2026-09-16T00:00:30.000Z", {
       requested: { name: "max", ultracode: false },
     }),
   );
+  expect(
+    hubStore.effortPendingOf(ctx.instance.id),
+    "a fresh id-less read-back never settles C",
+  ).not.toBeNull();
+
+  // C's own id-bearing verdict settles it.
+  ctx.receive(
+    effortEvent(6, "max", false, "remuda", "2026-09-16T00:00:31.000Z", {
+      requested: { name: "max", ultracode: false },
+      requestId: idC,
+    }),
+  );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
-it("r14 item 1: an older same-word queued edge never lowers an observer pending's established bound", async () => {
+it("r14 item 1 / r19 item 1: an older same-word queued edge never lowers an observer pending; an id-less read-back never settles it", async () => {
   const ctx = await startFollowing("r14-item1-monotonic", { state: "known", value: "idle" });
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
 
   // Observer baseline low at T0; this tab only watches the wire.
   ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:50.000Z"));
 
-  // B's id-less effort-queued:max arrives at T3 and establishes the pending's
-  // queued bound (T0 < T1 < T2 < T3).
-  ctx.receive(configureLifecycle(3, "effort-queued:max", ctx.instance.id, "2026-09-16T00:00:30.000Z"));
+  // Another client's effort-queued:max arrives at T3 carrying its echoed
+  // request id and establishes the pending's queued bound.
+  const wireRequestId = "effreq-r14-max";
+  ctx.receive(
+    configureLifecycleFor(3, "effort-queued:max", wireRequestId, ctx.instance.id, "2026-09-16T00:00:30.000Z"),
+  );
   const b = hubStore.effortPendingOf(ctx.instance.id);
   expect(b?.source).toBe("lifecycle");
+  expect(b?.requestId).toBe(wireRequestId);
   expect(b?.queuedObservedAt).toBe("2026-09-16T00:00:30.000Z");
 
-  // The backlog then flushes the REPLACED request A's delayed edge: same word
-  // ("max"), an id-less observer edge matches by word, but its stamp T1 is
-  // OLDER than the established bound.
+  // The backlog then flushes the REPLACED request A's delayed ID-LESS edge:
+  // same word ("max"), it matches the lifecycle pending by word, but its
+  // stamp T1 is OLDER than the established bound.
   ctx.receive(configureLifecycle(4, "effort-queued:max", ctx.instance.id, "2026-09-16T00:00:10.000Z"));
   const stillB = hubStore.effortPendingOf(ctx.instance.id);
   expect(stillB?.nonce).toBe(b?.nonce);
@@ -2772,22 +2993,35 @@ it("r14 item 1: an older same-word queued edge never lowers an observer pending'
     "the older edge never replaces the established queued bound",
   ).toBe("2026-09-16T00:00:30.000Z");
 
-  // A's matching max read-back at T2 is newer than the baseline (T0) and value
-  // matches, but OLDER than B's queued bound (T3): it must never settle B.
+  // A's matching id-less max read-back at T2 settles NOTHING — an id-less
+  // projection is never own-id evidence for the pending (r19 item 1).
   ctx.receive(
     effortEvent(5, "max", false, "remuda", "2026-09-16T00:00:20.000Z", {
       requested: { name: "max", ultracode: false },
     }),
   );
   const vetoed = hubStore.effortPendingOf(ctx.instance.id);
-  expect(vetoed, "A's read-back between the two edges never settles B").not.toBeNull();
+  expect(vetoed, "A's id-less read-back never settles B").not.toBeNull();
   expect(vetoed?.nonce).toBe(b?.nonce);
   expect(vetoed?.levelSettled).toBe(false);
 
-  // A genuinely fresh read-back AFTER B's bound settles through the fallback.
+  // A genuinely FRESH id-less read-back AFTER B's bound still settles
+  // nothing.
   ctx.receive(
     effortEvent(6, "max", false, "remuda", "2026-09-16T00:00:45.000Z", {
       requested: { name: "max", ultracode: false },
+    }),
+  );
+  expect(
+    hubStore.effortPendingOf(ctx.instance.id),
+    "a fresh id-less read-back never settles B",
+  ).not.toBeNull();
+
+  // The pending's own id-bearing read-back settles it.
+  ctx.receive(
+    effortEvent(7, "max", false, "remuda", "2026-09-16T00:00:46.000Z", {
+      requested: { name: "max", ultracode: false },
+      requestId: wireRequestId,
     }),
   );
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
@@ -3173,16 +3407,29 @@ it("r15 item 2: a bare coupled effort-queued:ultracode keeps xhigh/on identity a
   ctx.receive(effortEvent(2, "high", false, "slash", "2026-09-15T23:59:57.000Z"));
   vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
   // On a coupled build the bare lifecycle word IS the xhigh-tier-plus-flag
-  // command (the driver journals exactly "/effort ultracode").
-  ctx.receive(configureLifecycle(3, "effort-queued:ultracode", ctx.instance.id, "2026-09-16T00:00:05.000Z"));
+  // command (the driver journals exactly "/effort ultracode"), carrying the
+  // other client's echoed request id.
+  const wireRequestId = "effreq-r15-ultracode";
+  ctx.receive(
+    configureLifecycleFor(3, "effort-queued:ultracode", wireRequestId, ctx.instance.id, "2026-09-16T00:00:05.000Z"),
+  );
   const pending = hubStore.effortPendingOf(ctx.instance.id);
   expect(pending?.source).toBe("lifecycle");
   expect(pending?.name, "the bare command targets xhigh, not the default high").toBe("xhigh");
   expect(pending?.ultracode, "it carries the flag ON as its second axis").toBe(true);
 
-  // A fresh post-queue read-back of {xhigh, on} settles BOTH axes immediately.
-  ctx.receive(effortEvent(4, "xhigh", true, "remuda", "2026-09-16T00:00:10.000Z"));
-  expect(hubStore.effortPendingOf(ctx.instance.id), "fresh xhigh/on read-back settles it").toBeNull();
+  // An id-less fresh read-back of {xhigh, on} settles NOTHING (r19 item 1)...
+  ctx.receive(effortEvent(4, "xhigh", true, "remuda", "2026-09-16T00:00:09.000Z"));
+  expect(hubStore.effortPendingOf(ctx.instance.id), "an id-less read-back never settles").not.toBeNull();
+
+  // ...but the request's OWN id-bearing read-back settles BOTH axes.
+  ctx.receive(
+    effortEvent(5, "xhigh", true, "remuda", "2026-09-16T00:00:10.000Z", {
+      requested: { name: "xhigh", ultracode: true },
+      requestId: wireRequestId,
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id), "own-id xhigh/on read-back settles it").toBeNull();
   expect(hubStore.effortEffectiveOf(ctx.instance.id)).toMatchObject({ name: "xhigh", ultracode: true });
 });
 
@@ -3367,12 +3614,14 @@ it("r12 item 5: an id-less accepted no-op surfaces an explicit unconfirmed outco
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("low");
 });
 
-it("r13 item 4: a genuine live driver projection settles the id-less request; the bound never re-reads the Hub DB", async () => {
+it("r13 item 4 / r19 item 1: a genuine live projection settles only with the request's own id; the bound never re-reads the Hub DB", async () => {
   const ctx = await startFollowing("r13-item4-live", { state: "known", value: "idle" });
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
-  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  // r18 item 2: the id-less no-op driver is an explicitly legacy session.
-  hubStore.setEffortIdCapabilityForTest(ctx.instance.id, "legacy");
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
   // The stored Hub record stays the unchanged baseline for the WHOLE test:
   // the bound must not treat a re-read of it as fresh evidence.
   const baseline: Instance = {
@@ -3389,20 +3638,32 @@ it("r13 item 4: a genuine live driver projection settles the id-less request; th
   ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
   vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
   const p = hubStore.setEffort(ctx.instance.id, { index: 1, name: "low", kind: "claude", ultracode: false });
+  const id = posts[0]?.requestId!;
   await advanceEffortReconcile(0);
   await p;
   const listsAfterPost = listCalls;
   expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
 
-  // The real driver projects the post-command read-back through the LIVE
-  // follow journal (the production channel), strictly newer than the send and
-  // matching the requested axis. It settles through the strict fallback.
+  // A live post-command read-back WITHOUT the request id settles nothing even
+  // though it is fresh and matches the requested axis (r19 item 1).
   ctx.receive(
     effortEvent(3, "low", false, "remuda", "2026-09-16T00:00:05.000Z", {
       requested: { name: "low", ultracode: false },
     }),
   );
-  expect(hubStore.effortPendingOf(ctx.instance.id), "the live projection settles").toBeNull();
+  expect(
+    hubStore.effortPendingOf(ctx.instance.id),
+    "the id-less live projection never settles",
+  ).not.toBeNull();
+
+  // The request's OWN id-bearing read-back settles it.
+  ctx.receive(
+    effortEvent(4, "low", false, "remuda", "2026-09-16T00:00:06.000Z", {
+      requested: { name: "low", ultracode: false },
+      requestId: id,
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id), "the own-id live projection settles").toBeNull();
 
   // The bound fires later into a no-op and performs NO database re-read; a
   // settled request is never reported unconfirmed.
@@ -3691,56 +3952,6 @@ it("r18 item 2: an instance-list poll before B's id-bearing queued frame never s
   expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
 });
 
-it("r18 item 2: an id-less driver lifecycle marks the session legacy and the value fallback settles; a later id frame upgrades it", async () => {
-  // The legacy branch is now opt-in by EVIDENCE: an id-less queued lifecycle
-  // (an older driver / the e2e fake node) marks the session explicitly legacy,
-  // so the strict value fallback settles the pending; a later id-bearing frame
-  // upgrades the session monotonically and never downgrades again.
-  const ctx = await startFollowing("r18-item2-legacy-then-id", { state: "known", value: "working" });
-  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
-  const posts: ({ requestId?: string })[] = [];
-  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
-    posts.push(extras?.effort ?? {});
-    return {} as never;
-  });
-
-  // Baseline high; the driver journals an ID-LESS queued lifecycle (old build).
-  ctx.receive(effortEvent(2, "high", false, "slash", "2026-10-12T00:00:00.000Z"));
-  vi.useFakeTimers({ now: new Date("2026-10-12T00:00:01.000Z") });
-  const p = hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false)); // max
-  await p;
-  ctx.receive(
-    configureLifecycle(3, "effort-queued:max", ctx.instance.id, "2026-10-12T00:00:02.000Z"),
-  );
-  expect(hubStore.effortIdCapability(ctx.instance.id)).toBe("legacy");
-  expect(hubStore.effortPendingOf(ctx.instance.id)?.idCapability).toBe("legacy");
-
-  // A matching, strictly newer id-less read-back settles the legacy request.
-  ctx.receive(effortEvent(4, "max", false, "slash", "2026-10-12T00:00:05.000Z"));
-  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
-
-  // The driver was upgraded: the next request's id-bearing queued frame
-  // upgrades the session; a following id-less projection can never downgrade
-  // it nor settle the new request.
-  const p2 = hubStore.setEffort(ctx.instance.id, effortAt("claude", 3, false)); // xhigh
-  const idC = posts[1]?.requestId!;
-  await p2;
-  expect(hubStore.effortPendingOf(ctx.instance.id)?.idCapability, "legacy does not pre-settle C").toBe("legacy");
-  ctx.receive(
-    configureLifecycleFor(5, "effort-queued:xhigh", idC, ctx.instance.id, "2026-10-12T00:00:06.000Z"),
-  );
-  expect(hubStore.effortIdCapability(ctx.instance.id)).toBe("id-capable");
-  ctx.receive(effortEvent(6, "xhigh", false, "slash", "2026-10-12T00:00:07.000Z"));
-  expect(hubStore.effortIdCapability(ctx.instance.id), "id-less evidence never downgrades").toBe("id-capable");
-  expect(hubStore.effortPendingOf(ctx.instance.id), "id-less projection never settles once upgraded").not.toBeNull();
-  ctx.receive(
-    effortEvent(7, "xhigh", false, "remuda", "2026-10-12T00:00:08.000Z", {
-      requested: { name: "xhigh", ultracode: false },
-      requestId: idC,
-    }),
-  );
-  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
-});
 
 it("r17 item 2: an idle snapshot followed by a busy snapshot in ONE batch cancels the idle-armed 15 s timer", async () => {
   // One follow/catch-up batch carries, in journal order, an idle snapshot and
@@ -3817,4 +4028,64 @@ it("r17 item 2: an idle snapshot followed by a busy snapshot in ONE batch cancel
   await advanceEffortReconcile(2);
   expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
   expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");
+});
+
+it("r19 item 1: another client's id-less request leaves the session unknown; A's value on an early poll keeps B pending until B's own id frame", async () => {
+  // c-effortread r19 ruling A: a missing request id is NOT legacy-driver
+  // evidence — the current driver emits an id-less lifecycle whenever the
+  // configure omitted its OPTIONAL requestId (e.g. ANOTHER CLIENT). So another
+  // client's id-less request A must leave a fresh session UNKNOWN, and an
+  // instance-list poll carrying A's value (matching B too) with an observation
+  // time newer than B's send can never settle B by value before B's own
+  // id-bearing frame arrives. B settles only on its own id, and that frame
+  // proves the whole session id-capable.
+  const ctx = await startFollowing("r19-item1-another-client", { state: "known", value: "idle" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const posts: ({ requestId?: string })[] = [];
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async (_id, _perm, extras) => {
+    posts.push(extras?.effort ?? {});
+    return {} as never;
+  });
+  expect(hubStore.effortIdCapability(ctx.instance.id)).toBe("unknown");
+
+  // Baseline high; then ANOTHER CLIENT's request A produces an id-less queued
+  // lifecycle (this tab only sees it on the wire). It synthesises the
+  // observer pending but proves NOTHING about driver id capability.
+  ctx.receive(effortEvent(2, "high", false, "slash", "2026-10-11T23:59:57.000Z"));
+  ctx.receive(
+    configureLifecycle(3, "effort-queued:max", ctx.instance.id, "2026-10-12T00:00:01.000Z"),
+  );
+  expect(hubStore.effortIdCapability(ctx.instance.id), "an id-less lifecycle is not legacy evidence").toBe("unknown");
+
+  // The Hub poll already projects A's max at T+5s. The UI submits B (also
+  // max) at T0; setEffort's own post-configure refresh folds that poll.
+  const polledMax: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "max", ultracode: false, source: "remuda", observedAt: "2026-10-12T00:00:05.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [polledMax] } as never);
+  vi.useFakeTimers({ now: new Date("2026-10-12T00:00:00.000Z") });
+  const posted = hubStore.setEffort(ctx.instance.id, effortAt("claude", 4, false));
+  const idB = posts[0]?.requestId!;
+  await posted;
+
+  // The view moved to A's max, but B stays pending: the session is still
+  // unknown and the id-less poll value can never settle it.
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
+  const pendingAfterPoll = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pendingAfterPoll, "A's value on a poll never settles an unknown B").not.toBeNull();
+  expect(pendingAfterPoll?.requestId).toBe(idB);
+  expect(pendingAfterPoll?.levelSettled).toBe(false);
+  expect(hubStore.effortIdCapability(ctx.instance.id)).toBe("unknown");
+
+  // B's own id-bearing accepted verdict settles B and marks the whole session
+  // id-capable (monotonic — it persists for every later request).
+  ctx.receive(
+    effortEvent(5, "max", false, "remuda", "2026-10-12T00:00:06.000Z", {
+      requested: { name: "max", ultracode: false },
+      requestId: idB,
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.effortIdCapability(ctx.instance.id)).toBe("id-capable");
 });

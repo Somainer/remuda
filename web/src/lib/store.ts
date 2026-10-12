@@ -122,12 +122,12 @@ export type EffortPending = {
   /** Per-instance nonce identifying one switch; stale lifecycles are dropped. */
   nonce: number;
   /**
-   * Per-request id (c-effortread r10 items 1–4) minted for THIS switch and
-   * carried web → Hub → Node → driver. Lifecycle edges and the requested echo
-   * settle/clear this pending ONLY when they carry the same id. The id-less
-   * fallback (older drivers, durable poll records) may settle only from a
-   * read-back newer than BOTH {@link baselineObservedAt} and
-   * {@link queuedObservedAt} whose value matches the requested axis.
+   * Per-request id (c-effortread r10 items 1–4 / r19 item 1) minted for THIS
+   * switch and carried web → Hub → Node → driver. Lifecycle edges and the
+   * requested echo settle/clear this pending ONLY when they carry the same
+   * id. An id-less projection settles NOTHING — a missing id is not
+   * legacy-driver evidence — so an unknown request otherwise waits for its
+   * bounded unconfirmed outcome.
    */
   requestId: string;
   /** Axis this switch moves ("flag" = orthogonal toggle, "tier" = level). */
@@ -141,10 +141,11 @@ export type EffortPending = {
   /** Wall-clock ms the pending state was entered (stale-state safety net). */
   at: number;
   /**
-   * Effective `observedAt` of the newest projection BEFORE this request. The
-   * id-less fallback must be strictly newer than BOTH this baseline and the
-   * request's own queued time (c-effortread r10 item 1): an unchanged older
-   * poll at T0 must not settle a request queued at T1.
+   * Effective `observedAt` of the newest projection BEFORE this request.
+   * Records the pre-switch baseline this request was made against
+   * (c-effortread r10 item 1); since r19 item 1 settlement is own-id only and
+   * no longer compares read-back times against it, it is retained as
+   * provenance metadata.
    */
   baselineObservedAt: string | null;
   /**
@@ -176,11 +177,11 @@ export type EffortPending = {
   source: "client" | "lifecycle";
   /**
    * c-effortread r13 item 1: this client request replaced an earlier
-   * in-flight request (A→B→C). An ID-LESS queued edge that matches only the
-   * command WORD is then ambiguous — it can be the replaced request A's
-   * delayed edge with C's same word — and is never allowed to bind this
-   * pending's legacy lower bound. The request fails closed to its own send
-   * time until its bounded reconciliation ends it.
+   * in-flight request (A→B→C). It records replacement provenance for the
+   * request's nonce/debug state. Since r19 item 1 an ID-LESS edge settles
+   * NOTHING regardless, so the word-ambiguity guard that used this flag to
+   * reject a same-word queued bound is moot; the request fails closed on its
+   * own id evidence until its bounded reconciliation ends it.
    */
   afterReplacement: boolean;
   /**
@@ -195,21 +196,21 @@ export type EffortPending = {
    */
   commandWord: string | null;
   /**
-   * c-effortread r18 item 2: the per-SESSION driver id-capability captured for
-   * THIS request — "unknown" / "id-capable" / "explicitly legacy". It is a
-   * persisted fact about the session's driver, carried across requests, NOT
-   * inferred from this request's own first queued frame:
-   *  - unknown: no capability evidence yet (a fresh session, or a poll that
-   *    arrives before the first lifecycle frame). The request settles ONLY on
-   *    its own id-bearing evidence, or via its bounded unconfirmed outcome —
-   *    never from an id-less matching projection or an instance-list poll.
-   *  - id-capable: an edge carrying a real effort request id was seen in this
-   *    session. Monotonic: later id-less evidence (an unowned verdict the
+   * c-effortread r18 item 2 / r19 item 1: the per-SESSION driver id-capability
+   * captured for THIS request — "unknown" or "id-capable". It is a persisted
+   * fact about the session's driver, carried across requests, NOT inferred
+   * from this request's own first queued frame:
+   *  - unknown: no own-id evidence yet (a fresh session, another client's
+   *    id-less configure, or a poll that arrives before the first id-bearing
+   *    frame). The request settles ONLY on its own id-bearing evidence, or via
+   *    its bounded unconfirmed outcome — never from an id-less matching
+   *    projection or an instance-list poll. An ID-LESS lifecycle is NOT legacy
+   *    evidence: the current driver emits one whenever the incoming configure
+   *    omitted its optional requestId (another client), so capability is
+   *    unknown until proven.
+   *  - id-capable: an edge carrying a real effort request id ECHOED BY THIS
+   *    SESSION was seen. Monotonic: an id-less edge (an unowned verdict the
    *    mapper could not pair, provenance loss) never downgrades it.
-   *  - legacy: the driver explicitly produced an id-less lifecycle (an older
-   *    driver / the e2e fake node). Only legacy requests may settle through
-   *    the id-less legacy echo matcher and the strict read-back VALUE
-   *    FALLBACK.
    */
   idCapability: EffortDriverIdCapability;
   /**
@@ -239,16 +240,17 @@ export type UltraRefusal = {
 };
 
 /**
- * c-effortread r18 item 2: per-SESSION knowledge of whether the driver
- * handling the session echoes the configure's per-request effort id on its
- * lifecycle/verdict frames.
- *  - unknown: no evidence yet. Fail closed: only own-id evidence settles.
- *  - id-capable: an id-bearing edge was seen; monotonic, never downgraded by
+ * c-effortread r18 item 2 / r19 item 1: per-SESSION knowledge of whether the
+ * driver handling the session echoes the configure's per-request effort id on
+ * its lifecycle/verdict frames.
+ *  - unknown: no own-id evidence yet. Fail closed: only own-id evidence
+ *    settles. An id-less lifecycle is NOT legacy evidence — the current driver
+ *    emits one whenever the configure omitted its optional requestId (another
+ *    client) — so it leaves the capability unchanged.
+ *  - id-capable: an own-id echo was seen; monotonic, never downgraded by
  *    later id-less evidence.
- *  - legacy: an explicitly ID-LESS driver lifecycle was seen (older driver /
- *    e2e fake node); the id-less echo matcher and value fallback apply.
  */
-export type EffortDriverIdCapability = "unknown" | "id-capable" | "legacy";
+export type EffortDriverIdCapability = "unknown" | "id-capable";
 
 /** Parse of an effort lifecycle status word into its two axes. */
 type EffortLifecycleRequest = {
@@ -1054,40 +1056,33 @@ class HubStore {
    */
   private settledEffortPushdown = new Map<Id, string>();
   /**
-   * c-effortread r18 item 2: instanceId → this session driver's known
-   * id-capability, persisted ACROSS requests. Absent is "unknown". An
-   * id-bearing edge upgrades to "id-capable" monotonically (never downgraded
-   * by a later id-less projection); an explicitly id-less driver LIFECYCLE
-   * marks "legacy" and may itself be upgraded by later id evidence. Only this
-   * per-session fact decides whether the id-less legacy echo matcher / value
-   * fallback may settle a request — never a per-request flag that resets to
-   * permissive on every send.
+   * c-effortread r18 item 2 / r19 item 1: instanceId → this session driver's
+   * known id-capability, persisted ACROSS requests. Absent is "unknown". Only
+   * an edge carrying a real own-id echo upgrades the session to "id-capable",
+   * monotonically. An id-less lifecycle proves NOTHING (the current driver
+   * emits one whenever the configure omitted its optional requestId — e.g.
+   * another client), so it can never mark, settle, or downgrade the session:
+   * unknown requests fail closed on their own id evidence or their bounded
+   * unconfirmed path.
    */
   private effortDriverId = new Map<Id, EffortDriverIdCapability>();
 
-  /** The session driver's known id-capability ("unknown" until evidence). */
+  /** The session driver's known id-capability ("unknown" until own-id proof). */
   effortIdCapability(instanceId: Id): EffortDriverIdCapability {
     return this.effortDriverId.get(instanceId) ?? "unknown";
   }
 
   /**
-   * Record one piece of per-session driver id evidence. `true` is an edge
-   * carrying a real effort request id (id-capable, monotonic); `false` is an
-   * explicitly id-less driver lifecycle frame (legacy). Returns the resulting
-   * capability.
+   * Record one piece of per-session driver id evidence. Only an edge carrying
+   * a real effort request id proves the driver id-capable (monotonic); an
+   * id-less edge is ignored. Returns the resulting capability.
    */
   private noteEffortDriverId(
     instanceId: Id,
-    echoesId: boolean,
+    carriesId: boolean,
   ): EffortDriverIdCapability {
-    const next: EffortDriverIdCapability = echoesId ? "id-capable" : "legacy";
-    const prev = this.effortDriverId.get(instanceId) ?? "unknown";
-    if (next === "id-capable" || prev === "unknown") {
-      this.effortDriverId.set(instanceId, next);
-      return next;
-    }
-    // An established id-capable session never downgrades on id-less evidence.
-    return prev;
+    if (carriesId) this.effortDriverId.set(instanceId, "id-capable");
+    return this.effortDriverId.get(instanceId) ?? "unknown";
   }
   /**
    * The effortEffective each instance carried on the LAST Hub poll (null =
@@ -1310,23 +1305,19 @@ class HubStore {
    * reads). Returns the updated pending entry, or null when BOTH axes have
    * settled and the indicator must be cleared.
    *
-   * Request identity (c-effortread r10 items 1–4) — a pending request is
-   * settled ONLY by:
-   *  1. a requested echo carrying THIS request's id (the driver echoed the
-   *     configure nonce). An echo that carries ANOTHER id names a replaced
-   *     request and is rejected outright — matching tier or a newer clock can
-   *     never promote it; or
-   *  2. an id-less legacy echo (older driver) whose REQUESTED values name
-   *     this request, whose effective VALUES exactly match every moved axis,
-   *     and whose read-back is strictly newer than both bounds (r11 item 4:
-   *     it can never authorize a clamped or opposite outcome); or
-   *  3. no echo at all (older driver / durable poll record): a `remuda`
-   *     read-back strictly newer than BOTH the pre-request baseline and the
-   *     request's own queued time, whose value matches the requested axis.
-   *     An unchanged older poll (`{high,false}@T0`) can therefore never settle
-   *     an ON request queued at T1 (item 1), a mismatching OFF verdict can
-   *     never settle a queued ON (item 2), and an instant EQUAL to the queued
-   *     time settles nothing (item 4).
+   * Request identity (c-effortread r10 items 1–4 / r19 item 1 ruling A) — a
+   * pending request is settled ONLY by a requested echo carrying THIS
+   * request's id (the driver echoed the configure nonce):
+   *  1. an echo that carries ANOTHER id names a replaced request and is
+   *     rejected outright — matching tier or a newer clock can never promote
+   *     it;
+   *  2. an ID-LESS projection settles NOTHING, however fresh or well matched.
+   *     A missing id is not legacy-driver evidence: the current driver emits
+   *     an id-less lifecycle whenever the configure omitted its optional
+   *     requestId (another client), so an unknown session fails closed and
+   *     waits for its own id evidence or its bounded unconfirmed path. A
+   *     clamped or opposite outcome is therefore settled (and rendered as the
+   *     delivered mismatch) only from the request's own id echo.
    */
   private settleEffortAxes(
     instanceId: Id,
@@ -1338,7 +1329,7 @@ class HubStore {
       typeof requestedEcho?.requestId === "string" && requestedEcho.requestId.trim()
         ? requestedEcho.requestId
         : null;
-    // Rule 1: a verdict that explicitly names ANOTHER request is never ours.
+    // An echo that explicitly names ANOTHER request is never ours.
     const namesOtherRequest = echoId !== null && echoId !== pending.requestId;
     const echoNamesThisRequest = echoId !== null && echoId === pending.requestId;
     // c-effortread r11 item 2: an echo carrying a different request id is an
@@ -1346,115 +1337,35 @@ class HubStore {
     // already settled (and so an untouched-but-settled axis can never combine
     // with it into the `levelSettled && flagSettled` clear).
     if (namesOtherRequest) return pending;
-    // Rule 2: an id-less legacy echo confirms this request only when it
-    // EXPLICITLY names every axis the request moves with the matching value.
-    // Matching the tier alone can never confirm a flag operation, and a
-    // mismatching echo (A OFF arriving over queued B ON) is a veto even though
-    // its tier happens to match.
+
     const movesBothEcho = pending.commandWord === "ultracode";
-    const echoMovesLevel = movesBothEcho || pending.axis !== "flag";
-    const echoMovesFlag = movesBothEcho || pending.axis === "flag";
-    const echoLevelMatch =
-      !echoMovesLevel ||
-      (requestedEcho?.name !== undefined && requestedEcho.name === pending.name);
-    const echoFlagMatch =
-      !echoMovesFlag ||
-      (requestedEcho?.ultracode !== undefined &&
-        requestedEcho.ultracode === pending.ultracode);
-    const legacyEchoNamesRequest =
-      echoId === null && requestedEcho !== undefined && echoLevelMatch && echoFlagMatch;
+    const movesLevel = movesBothEcho || pending.axis !== "flag";
+    const movesFlag = movesBothEcho || pending.axis === "flag";
 
-    // Rule 3: no id and no echo — the read-back must be STRICTLY newer than
-    // BOTH the pre-request baseline AND the request's own queued time. An
-    // instant EQUAL to the queued time settles nothing (c-effortread r11 item
-    // 4): it can be the state A left behind, same-second on a clock that
-    // truncates milliseconds. The observed VALUE must also match the moved
-    // axes exactly.
-    const postBaseline =
-      pending.baselineObservedAt == null ||
-      Date.parse(view.observedAt) > Date.parse(pending.baselineObservedAt);
-    // c-effortread r12 item 3: the legacy fallback needs a TRUSTWORTHY
-    // request-specific lower bound. An id-less queued edge used to be
-    // discarded for a client request, leaving this bound null and treating
-    // the check as vacuously satisfied — so A's delayed read-back (newer than
-    // only the pre-request baseline) settled the newer request C. The bound
-    // is now, in order: THIS request's driver-queued observedAt (host clock),
-    // or — when the older driver journals no usable queued edge — the
-    // client's own send time (the driver could not have produced THIS
-    // request's outcome before the POST left). A wire pending whose queued
-    // stamp is unparseable has NEITHER: fail closed and stay pending for the
-    // bounded reconciliation (r12 item 5).
-    //
-    // c-effortread r13 item 1: the bound is REQUEST-OWNED and an unidentified
-    // event may never LOWER it. A delayed word-only queued edge (the replaced
-    // request A's stale edge after an A→B→C sequence) carries a host stamp
-    // older than this client's send time; taking the queued stamp alone let it
-    // lower C's bound and let A's read-back settle C. For a client request the
-    // bound is therefore the MAX of the queued stamp and the send time.
-    const queuedStampMs =
-      pending.queuedObservedAt != null &&
-      Number.isFinite(Date.parse(pending.queuedObservedAt))
-        ? Date.parse(pending.queuedObservedAt)
-        : null;
-    const queuedBoundMs =
-      pending.source === "client"
-        ? Math.max(pending.at, queuedStampMs ?? Number.NEGATIVE_INFINITY)
-        : queuedStampMs;
-    const strictlyAfterQueued =
-      queuedBoundMs != null && Date.parse(view.observedAt) > queuedBoundMs;
-    const inWindow = postBaseline && strictlyAfterQueued;
-
-    const movesLevel = echoMovesLevel;
-    const movesFlag = echoMovesFlag;
-    const viewLevelMatches = !movesLevel || view.name === pending.name;
-    const viewFlagMatches =
-      !movesFlag ||
-      (effortFlagSettles(view.ultracode) && view.ultracode === pending.ultracode);
-
-    // Only an echo carrying THIS request's id may authorize a clamped or
-    // opposite outcome (it is rendered as the delivered mismatch). An id-less
-    // legacy echo settles only when its requested values name the request,
-    // its effective VALUES exactly match every moved axis, and BOTH time
-    // bounds hold; any other id-less echo stays a veto (the no-echo fallback
-    // requires NO echo at all, so a stale/non-matching echo cannot ride it).
-    const ownEcho = echoNamesThisRequest;
     // An echo naming THIS request is itself id-capability proof for the whole
     // session (e.g. the verdict echo arrives before the queued edge was
     // folded). Record it before any settlement return so even a request fully
     // settled by this echo upgrades the session and every later request fails
     // closed on id-less projections.
+    const ownEcho = echoNamesThisRequest;
     if (ownEcho) this.noteEffortDriverId(instanceId, true);
-    // c-effortread r17 item 1 / r18 item 2: id-less settlement exists ONLY
-    // for a session whose driver is EXPLICITLY LEGACY. An unknown session
-    // (nothing proves the driver echoes ids yet — e.g. an instance-list poll
-    // arriving before the request's id-bearing queued frame) and an
-    // id-capable session both fail closed and wait for the request's own id
-    // evidence or its bounded unconfirmed path. Previously every new client
-    // request reset this to "legacy-ish", so a matching poll before the queued
-    // frame settled B by value.
-    const legacySession = pending.idCapability === "legacy";
-    const legacyEchoSettles =
-      legacySession &&
-      legacyEchoNamesRequest &&
-      inWindow &&
-      viewLevelMatches &&
-      viewFlagMatches;
-    const valueFallback = legacySession && requestedEcho === undefined && inWindow;
-    const ours = ownEcho || legacyEchoSettles || valueFallback;
+    // c-effortread r19 item 1: with the legacy capability gone there is no
+    // id-less echo matcher and no value fallback — only THIS request's own id
+    // echo settles. Everything else leaves the pending untouched (the bounded
+    // unconfirmed path ends an unknown request that never gets own-id proof).
+    const ours = ownEcho;
 
     let { levelSettled, flagSettled } = pending;
     if (ours && !levelSettled && movesLevel) {
       // An echo that names this request settles the level even on a clamped
-      // value; a legacy echo and the value fallback need an exact level match.
-      if (ownEcho || view.name === pending.name) {
-        levelSettled = true;
-      }
+      // value (it is rendered as the delivered mismatch).
+      levelSettled = true;
     }
     if (ours && !flagSettled && movesFlag) {
       const definitive = effortFlagSettles(view.ultracode);
       // A definitive flag value from our own verdict settles (an opposite
-      // value is the delivered refusal); legacy/fallback need an exact match.
-      if (definitive && (ownEcho || view.ultracode === pending.ultracode)) {
+      // value is the delivered refusal).
+      if (definitive) {
         flagSettled = true;
       }
     }
@@ -1953,17 +1864,18 @@ class HubStore {
     const edgeId =
       typeof edgeRequestId === "string" && edgeRequestId.trim() ? edgeRequestId : null;
     const current = this.state.effortPending[instanceId];
-    // c-effortread r18 item 2: EVERY driver lifecycle frame is per-SESSION
-    // capability evidence — an id-bearing frame proves the driver echoes
-    // per-request ids (id-capable, monotonic); an id-less one marks the
-    // session driver explicitly legacy. The fact persists across requests, so
-    // a later request starts from the known capability instead of every new
-    // client request resetting to the permissive value fallback.
+    // c-effortread r18 item 2 / r19 item 1: only an id-bearing lifecycle
+    // frame is per-SESSION capability evidence — it proves the driver echoes
+    // per-request ids (id-capable, monotonic). An id-less frame proves NOTHING:
+    // the current driver emits one whenever the configure omitted its OPTIONAL
+    // requestId (e.g. ANOTHER CLIENT), so the capability (and a fresh session)
+    // stays unknown and an unknown request keeps failing closed on its own id
+    // evidence. The fact persists across requests.
     const frameCapability = this.noteEffortDriverId(instanceId, edgeId !== null);
     if (current && current.idCapability !== frameCapability) {
       // The pending snapshots the capability at arm time; keep the in-flight
-      // entry consistent with what this frame proved (an unknown pending
-      // downgrades to legacy on an id-less driver frame).
+      // entry consistent with what this frame proved (an id-bearing frame
+      // upgrades an unknown pending to id-capable).
       this.emit({
         effortPending: {
           ...this.state.effortPending,
@@ -1995,22 +1907,13 @@ class HubStore {
         // `effort-queued` for request A after the user replaced it with B
         // carries a different id/axes and is dropped — it must never overwrite
         // B's pending indicator nor stamp B's queued time (A→B race).
-        // c-effortread r13 item 1: an ID-LESS queued edge never claims
-        // ownership, and with exactly one outstanding request (this
-        // per-instance pending) whose exact command word the edge repeats,
-        // its observedAt IS a trustworthy request-specific LOWER BOUND for
-        // that request — stamp it so a read-back at or before it cannot
-        // settle. A different word is a replaced request's stale edge and is
-        // dropped without stamping. After an AMBIGUOUS REPLACEMENT (this
-        // request itself replaced an earlier one, A→B→C) the word is no
-        // longer unique — the same-word edge can be A's delayed edge — so it
-        // is never bound and the request fails closed on its own send time.
-        const stampsLegacyQueuedBound =
-          edgeId === null &&
-          current.source === "client" &&
-          !current.afterReplacement &&
-          effortLifecycleMatches(current, parsed.word, "queued");
-        if (!edgeBelongsTo(current, "queued") && !stampsLegacyQueuedBound) {
+        // c-effortread r19 item 1: an ID-LESS queued edge claims NOTHING and
+        // stamps nothing on a client request — a missing id is not legacy
+        // evidence (another client's configure omitted its requestId), and the
+        // id-less value fallback it used to bound is gone. It is simply
+        // dropped for a client-owned pending; a request settles only on its
+        // own id evidence or its bounded unconfirmed path.
+        if (!edgeBelongsTo(current, "queued")) {
           // c-effortread r15 item 3: a PROVABLY NEWER queued lifecycle (its
           // observedAt is strictly later in journal order than the pending's
           // own queued stamp) replaces a LIFECYCLE-owned pending — the driver
@@ -2069,12 +1972,12 @@ class HubStore {
         // authoritative idle.
         const busyNow = effortAwaitsQueueExit(instance?.activity);
         const atCreate = Date.now();
-        // The wire lifecycle is explicit per-session capability evidence
-        // (r18 item 2): an id-bearing queued edge proves id-capable; an
-        // id-less one is an explicitly legacy driver. This persists across
-        // requests, so a later client request in the same session starts from
-        // the proven capability instead of resetting to permissive.
-        const lifecycleCapability = this.noteEffortDriverId(instanceId, edgeId !== null);
+        // The wire lifecycle carries capability only when it bears an id
+        // (r18 item 2 / r19 item 1): an id-bearing queued edge proves
+        // id-capable; an id-less one (another client's configure) leaves the
+        // session unknown. This persists across requests (frameCapability was
+        // recorded at lifecycle entry).
+        const lifecycleCapability = frameCapability;
         current = {
           nonce,
           requestId: edgeId ?? `lifecycle:${nonce}`,
@@ -2100,15 +2003,13 @@ class HubStore {
       levelSettled: !wireMovesLevel,
       flagSettled: !wireMovesFlag,
           source: "lifecycle",
-          // Synthesized from the driver's own queued word; it is its own
-          // command-word identity, so leave the client prediction null and
-          // match via the two-axis fallback. The coupled bare word moves
-          // BOTH axes (r15 item 2): keep the word itself so the echo
-          // settlement knows the level and the flag are both in play.
+          // Synthesized from the driver's own queued word; the coupled bare
+          // word moves BOTH axes (r15 item 2): keep the word itself so
+          // own-id settlement knows the level and the flag are both in play.
           commandWord: wireMovesBoth ? lowerWord : null,
           afterReplacement: false,
           // Capability proven by THIS queued edge: id-bearing → id-capable;
-          // an id-less wire lifecycle is an explicitly legacy driver.
+          // an id-less wire lifecycle (another client) leaves it unknown.
           idCapability: lifecycleCapability,
           // Idle-at-receipt arms the bound immediately; a working session arms
           // it from the working→idle evidence.
@@ -2122,14 +2023,14 @@ class HubStore {
       // unparseable timestamp leaves a previous stamp untouched.
       //
       // c-effortread r14 item 1: the accepted bound is MONOTONIC for every
-      // pending source. An observer/lifecycle pending bound by an id-less edge
+      // pending source. An observer/lifecycle pending bound by an edge
       // at T3 (B's own effort-queued:max) must not be REPLACED by a delayed
       // older same-word edge at T1 (the replaced request A's backlogged
       // queued edge): with T0 < T1 < T2 < T3, taking T1 let A's matching
       // read-back at T2 settle B. Keep the NEWEST VALID instant of the
-      // existing stamp and the incoming edge. The client send-time floor
-      // (settleEffortAxes) and the ambiguous-replacement rejection
-      // (stampsLegacyQueuedBound) are unchanged.
+      // existing stamp and the incoming edge. (Only an edge that names the
+      // pending by id, or matches a lifecycle pending by word, reaches here;
+      // an id-less edge for a client pending was dropped above.)
       const incomingQueuedMs =
         queuedThreshold != null ? Date.parse(queuedThreshold) : Number.NaN;
       const establishedQueuedMs =
@@ -2186,12 +2087,14 @@ class HubStore {
         },
       });
       if (createdFromWire) {
-        // c-effortread r13 item 3: the observer tab's legacy pending gets the
-        // same bounded, request-owned reconciliation as a client request,
-        // owned by ITS nonce (a newer edge replaces; settlement/cleanup of a
-        // stale nonce is a no-op). A silent id-less no-op or an unusable
-        // queued timestamp ends in the explicit unconfirmed outcome instead of
-        // sitting on 切换中 for the 30-minute max age.
+        // c-effortread r13 item 3 / r19 item 1: the observer tab's id-less
+        // wire pending gets the same bounded, request-owned reconciliation as
+        // a client request, owned by ITS nonce (a newer edge replaces;
+        // settlement/cleanup of a stale nonce is a no-op). With the value
+        // fallback gone an id-less wire request can never settle, so a silent
+        // no-op or an unusable queued timestamp ends in the explicit
+        // unconfirmed outcome instead of sitting on 切换中 for the 30-minute
+        // max age.
         this.armEffortReconciliation(instanceId, current.nonce);
       }
       return;
@@ -2203,8 +2106,9 @@ class HubStore {
       // even when the pending was synthesized from a wire lifecycle — an
       // observer tab's lifecycle pending is its view of another client's
       // queued request B, and an id-less applied with the same word can be a
-      // replaced request A's stale verdict. Legacy success settles only
-      // through the strict read-back fallback (settleEffortAxes), never here.
+      // replaced request A's stale verdict. An id-less success settles only
+      // on the request's OWN id verdict/echo; with none, the pending ends
+      // through its bounded unconfirmed path, never here.
       if (edgeId === null || edgeId !== current.requestId) return;
       // The driver reported acceptance: the projected read-back is the source
       // of truth, but clear the indicator now rather than leaving it on 切换中
@@ -2225,12 +2129,12 @@ class HubStore {
     //  - an edge carrying a request id: it mutates the pending ONLY when the
     //    id is the current one. Request A's timeout/cancellation can never
     //    delete or roll back newer request B.
-    //  - id-less edge (older driver): it can NEVER clear or roll back a
-    //    pending, not even a lifecycle-synthesized one (that pending is an
-    //    observer tab's view of a queued request B, and the same word cannot
-    //    distinguish B from a replaced A). Legacy success settles only through
-    //    the strict read-back fallback; the request otherwise stays pending
-    //    until its bounded reconciliation (r12 item 5).
+    //  - id-less edge: it can NEVER clear or roll back a pending, not even a
+    //    lifecycle-synthesized one (that pending is an observer tab's view of
+    //    a queued request B, and the same word cannot distinguish B from a
+    //    replaced A). An id-less success settles only on the request's own id
+    //    evidence; otherwise the request stays pending until its bounded
+    //    reconciliation (r12 item 5, r19 item 1).
     //  - genuine ultracode refusals (model/workflow) are environment evidence:
     //    they are recorded and disable the switch regardless, but mutate the
     //    pending ONLY when they are this request's verdict.
@@ -2585,8 +2489,8 @@ class HubStore {
 
   /**
    * Test-only: seed the per-session driver id-capability that a real
-   * id-bearing/id-less lifecycle frame would have established (c-effortread
-   * r18 item 2).
+   * id-bearing lifecycle/echo would have established (c-effortread r18 item 2
+   * / r19 item 1).
    */
   setEffortIdCapabilityForTest(instanceId: Id, capability: EffortDriverIdCapability): void {
     this.effortDriverId.set(instanceId, capability);
@@ -4847,11 +4751,12 @@ class HubStore {
   }
 
   /**
-   * c-effortread r12 item 5: arm the bounded, request-owned reconciliation for
-   * one client configure. New drivers settle the request from its echoed id
-   * well before the bound, at which point the timer fires into a no-op. An
-   * ID-LESS older driver needs this path: its accepted no-op emits no
-   * completion id and its mapper suppresses unchanged observations.
+   * c-effortread r12 item 5 / r19 item 1: arm the bounded, request-owned
+   * reconciliation for one client configure. A current driver settles the
+   * request from its echoed id well before the bound, at which point the timer
+   * fires into a no-op. A request whose own id evidence never arrives (lost
+   * frames, provenance failure) needs this path: it is never settled by an
+   * id-less projection and ends explicitly unconfirmed.
    */
   private armEffortReconciliation(instanceId: Id, nonce: number) {
     // A replaced request's configure can resolve AFTER the newer request
@@ -4868,12 +4773,13 @@ class HubStore {
   /**
    * Bound expiry for one effort request. The protocol has no operation to
    * query the driver's current effort (r13 item 4), so this never re-reads
-   * anything: a genuine post-command projection arrives over the live journal
-   * or the routine poll and settles through the strict legacy fallback before
-   * the deadline; otherwise the request ends in the explicit "unconfirmed"
-   * outcome. The bound is request-owned FROM THE MOMENT THE REQUEST COULD RUN
-   * (r13 item 2/3 — a client request at the working→idle evidence, a wire
-   * pending at receipt when idle): a request still behind a running turn
+   * anything: a genuine post-command projection carrying the request's OWN id
+   * arrives over the live journal or the routine poll and settles before the
+   * deadline (r19 item 1: an id-less projection settles nothing); otherwise
+   * the request ends in the explicit "unconfirmed" outcome. The bound is
+   * request-owned FROM THE MOMENT THE REQUEST COULD RUN (r13 item 2/3 — a
+   * client request at the working→idle evidence, a wire pending at receipt
+   * when idle): a request still behind a running turn
    * (`leftQueueAt == null`) waits instead of burning its bound in the queue;
    * the 30-minute max-age backstop bounds the total wait.
    */
@@ -5016,9 +4922,10 @@ class HubStore {
       source: "client",
       commandWord,
       afterReplacement,
-      // Per-session capability, carried across requests (r18 item 2): an
-      // unknown session fails closed on id-less evidence; only an explicitly
-      // legacy session keeps the value fallback.
+      // Per-session capability, carried across requests (r18 item 2 / r19
+      // item 1): an unknown session fails closed on id-less evidence and
+      // settles only on this request's own id echo; only a proven id-capable
+      // session is marked as such up front.
       idCapability: this.effortIdCapability(instanceId),
     };
     this.settledEffortPushdown.delete(instanceId);

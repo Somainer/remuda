@@ -464,6 +464,71 @@ where
     }
 }
 
+/// How often the stop-incomplete termination watcher rechecks the survivor
+/// process group (c-usagefu r13 item 3).
+pub(super) const TERMINATION_WATCH_POLL: Duration = Duration::from_millis(250);
+
+/// Upper bound a stop-incomplete teardown watches a survivor that outlived
+/// SIGKILL before giving up. SIGKILL cannot be caught, so a process still here
+/// after the ladder is blocked in the kernel (uninterruptible IO) or an
+/// unreaped zombie its parent cannot collect; it almost always clears within
+/// seconds, but the watch is bounded so a wedged host cannot leave a polling
+/// task on this Node forever. Past the bound the census guards are dropped
+/// WITHOUT a recorded close (same as a Node shutdown): a false close is worse
+/// than an interval that stays live until the Node restarts.
+pub(super) const TERMINATION_WATCH_BOUND: Duration = Duration::from_secs(300);
+
+/// Spawn the bounded watcher that owns codex census lifetime guards after a
+/// STOP-INCOMPLETE teardown (c-usagefu r13 item 3).
+///
+/// The stop ladder's contract forbids reporting the group gone while a
+/// survivor is still there, so the census interval must stay LIVE; r12 simply
+/// `mem::forget`-ed the guards, which abandoned the intervals for the whole
+/// Node lifetime and blocked same-cwd prompt-only discovery even after the
+/// survivor actually exited. The watcher polls the survivor process identity
+/// and closes every guard ONLY after confirmed exit — after that ordinary
+/// last-window pruning applies. Its guards' Drop is suppressed, so an abort
+/// on Node shutdown or a bounded expiry drops them without recording a false
+/// close.
+pub(super) fn spawn_termination_watch(
+    mut guards: Vec<crate::adapters::codex_discovery::LifetimeGuard>,
+    pgid: Option<i32>,
+    survivors: Vec<i32>,
+) {
+    for guard in &guards {
+        guard.suppress_drop_close();
+    }
+    tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        loop {
+            if !termination_watch_alive(pgid, &survivors) {
+                for guard in &guards {
+                    guard.close_interval();
+                }
+                return;
+            }
+            if started.elapsed() >= TERMINATION_WATCH_BOUND {
+                // Never confirmed dead inside the bound: drop WITHOUT closing.
+                guards.clear();
+                return;
+            }
+            tokio::time::sleep(TERMINATION_WATCH_POLL).await;
+        }
+    });
+}
+
+/// Whether the stop-incomplete survivor identity is still running. A process
+/// group is preferred: [`group_has_live_member`] is zombie-aware, so a dead
+/// leader waiting for reap already counts as gone. With no group (the ladder
+/// itself errored before learning one) the named survivor pids are probed
+/// directly.
+fn termination_watch_alive(pgid: Option<i32>, survivors: &[i32]) -> bool {
+    if let Some(pgid) = pgid.filter(|pgid| *pgid > 0) {
+        return group_has_live_member(pgid);
+    }
+    survivors.iter().any(|pid| process_alive(*pid))
+}
+
 /// Pids in `pgid` that are still running (not zombies), for a
 /// `stop-incomplete` diagnostic.
 ///

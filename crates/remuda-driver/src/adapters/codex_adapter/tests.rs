@@ -1729,6 +1729,53 @@ fn a_pending_launch_window_survives_another_window_releasing_before_adapter_buil
 }
 
 #[test]
+fn a_termination_watcher_guard_dropped_without_a_confirmed_exit_stays_live() {
+    // c-usagefu r13 item 3: a guard handed to the bounded termination watcher
+    // is closed ONLY by the explicit confirmed-exit close. When the watcher is
+    // aborted (Node shutdown) or its bound expires, dropping the owner guard
+    // must NOT record a close — a false close is worse than an interval that
+    // stays live until the Node restarts. An explicit close before the drop is
+    // still recorded exactly once.
+    use crate::adapters::codex_discovery::LifetimeGuardClock as _;
+
+    let cwd = "/projects/r13-item3-drop";
+    let guard = crate::adapters::codex_discovery::begin_lifetime(
+        Path::new(cwd),
+        "abandoned-owner",
+        Some(OffsetDateTime::now_utc()),
+    );
+    guard.suppress_drop_close();
+    let closed_at = OffsetDateTime::now_utc() + time::Duration::seconds(5);
+    guard.close_lifetime_at(closed_at);
+    drop(guard);
+    assert!(
+        crate::adapters::codex_discovery::census_lifetime_is_live(
+            Path::new(cwd),
+            "abandoned-owner"
+        ),
+        "Drop after suppress_drop_close records no close even with a test clock set"
+    );
+
+    // The explicit confirmed-exit path still closes, and only once.
+    let guard2 = crate::adapters::codex_discovery::begin_lifetime(
+        Path::new(cwd),
+        "confirmed-owner",
+        Some(OffsetDateTime::now_utc()),
+    );
+    guard2.suppress_drop_close();
+    guard2.close_lifetime_at(closed_at);
+    guard2.close_interval();
+    assert!(
+        !crate::adapters::codex_discovery::census_lifetime_is_live(
+            Path::new(cwd),
+            "confirmed-owner"
+        ),
+        "confirmed exit closes the interval despite drop suppression"
+    );
+    drop(guard2);
+}
+
+#[test]
 fn a_window_releasing_inside_a_pending_launch_registration_cannot_prune_its_interval() {
     // c-usagefu r13 item 1: register_pending_launch must register the launch
     // boundary, the lifetime AND the window retention as ONE critical section

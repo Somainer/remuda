@@ -526,6 +526,11 @@ pub struct ShellPtyDriver {
     interrupt_pid: Arc<AtomicI32>,
     interrupt_screen_markers: Arc<std::sync::Mutex<promotion::InterruptBaseline>>,
     seq: Arc<AtomicU64>,
+    /// c-usagefu r13 item 3 test seam: when set, close() substitutes this
+    /// ladder outcome (a stop-incomplete with a survivor process identity the
+    /// regression controls) for the real one after the ladder has run.
+    #[cfg(test)]
+    test_stop_outcome: std::sync::Mutex<Option<StopOutcome>>,
 }
 
 impl ShellPtyDriver {
@@ -575,6 +580,8 @@ impl ShellPtyDriver {
                 promotion::InterruptBaseline::default(),
             )),
             seq: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            test_stop_outcome: std::sync::Mutex::new(None),
         }
     }
 
@@ -2862,11 +2869,24 @@ impl Driver for ShellPtyDriver {
         // ladder working rather than as an unexplained crash.
         state.closed.store(true, Ordering::SeqCst);
         let outcome = self.stop_tree(&state).await;
+        // Test seam: force the stop-incomplete outcome (with the survivor
+        // process identity to watch) while leaving the real ladder run.
+        #[cfg(test)]
+        let mut outcome = outcome;
+        #[cfg(test)]
+        if let Some(forced) = self
+            .test_stop_outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            outcome = Ok(forced);
+        }
         if let Some(waiter) = self.waiter.lock().await.take() {
             waiter.abort();
         }
         let mut group_gone = false;
-        match outcome {
+        match &outcome {
             Ok(outcome) if outcome.group_gone => {
                 group_gone = true;
                 tracing::info!(
@@ -2891,14 +2911,17 @@ impl Driver for ShellPtyDriver {
         // in flight must find a live census. This covers BOTH the
         // driver-launched cohort and every promoted-codex interval the poller
         // handed the session (r12 item 1: a demotion never closes one). When
-        // the group is NOT gone (stop-incomplete: a survivor outlived SIGKILL),
-        // leave the intervals live rather than record a false close: forget
-        // every owner so even its Drop safety net cannot close it.
+        // the group is NOT gone (stop-incomplete: a survivor outlived SIGKILL)
+        // the guards are handed to a BOUNDED termination watcher that closes
+        // them only after the survivor identity is confirmed gone (r13 item 3);
+        // r12 mem::forget-ed them instead, which blocked same-cwd discovery for
+        // the rest of the Node lifetime.
+        let mut unconfirmed = Vec::new();
         if let Some(lifetime) = self.codex_lifetime.lock().await.take() {
             if group_gone {
                 lifetime.close_interval();
             } else {
-                std::mem::forget(lifetime);
+                unconfirmed.push(lifetime);
             }
         }
         let promoted_guards = self
@@ -2911,8 +2934,15 @@ impl Driver for ShellPtyDriver {
             if group_gone {
                 lifetime.close_interval();
             } else {
-                std::mem::forget(lifetime);
+                unconfirmed.push(lifetime);
             }
+        }
+        if !group_gone && !unconfirmed.is_empty() {
+            let (pgid, survivors) = match &outcome {
+                Ok(outcome) => (outcome.pgid, outcome.survivors.clone()),
+                Err(_) => (Some(state.pgid.load(Ordering::SeqCst)), Vec::new()),
+            };
+            lifecycle::spawn_termination_watch(unconfirmed, pgid, survivors);
         }
         Ok(DriverAck::not_dispatched())
     }
@@ -4836,6 +4866,172 @@ mod tests {
             crate::adapters::codex_discovery::census_contains(&cwd, owner),
             "the closed interval is retained for pending discovery decisions"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stop_incomplete_interval_closes_when_the_survivor_exits_and_a_later_launch_discovers()
+     {
+        // c-usagefu r13 item 3: on stop-incomplete r12 mem::forget-ed the codex
+        // census guards, abandoning the native AND promoted intervals forever:
+        // the survivor usually dies seconds after the SIGKILL ladder gave up,
+        // but same-cwd prompt-only discovery stayed blocked until the Node
+        // restarted. The guards now go to a BOUNDED termination watcher that
+        // closes each interval only after the survivor process identity is
+        // confirmed gone; afterwards an ordinary later same-cwd launch is the
+        // sole live instance and discovers normally.
+        use crate::adapters::FileSignalAdapter as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+
+        // The survivor: a REAL process in its OWN group, the identity a
+        // stop-incomplete outcome would name. It keeps running through close()
+        // (the watcher never signals it); the test kills it afterwards.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let survivor_pid = i32::try_from(child.id()).unwrap();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        assert!(
+            lifecycle::group_has_live_member(survivor_pid),
+            "the external survivor is live in its own process group"
+        );
+
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        let driver = ShellPtyDriver::new(options);
+        let _run = driver.spawn().await.expect("spawns");
+
+        // The driver-owned (native launch) cohort AND a promoted (unknown
+        // boundary) cohort, exactly as production registers them.
+        let native_owner = "r13-item3-native";
+        let promoted_owner = "r13-item3-promoted";
+        *driver.codex_lifetime.lock().await =
+            Some(crate::adapters::codex_discovery::begin_lifetime(
+                &cwd,
+                native_owner,
+                Some(time::OffsetDateTime::now_utc()),
+            ));
+        driver.promoted_codex_lifetimes.lock().unwrap().push(
+            crate::adapters::codex_discovery::begin_lifetime(&cwd, promoted_owner, None),
+        );
+
+        // Force the stop-incomplete outcome AFTER the real ladder runs, naming
+        // the external survivor group (whose process is genuinely still live).
+        *driver.test_stop_outcome.lock().unwrap() = Some(lifecycle::StopOutcome {
+            rung: lifecycle::StopRung::Kill,
+            group_gone: false,
+            pgid: Some(survivor_pid),
+            survivors: vec![survivor_pid],
+        });
+        Driver::close(&driver).await.unwrap();
+
+        // The survivor outlives the ladder: both intervals must stay LIVE under
+        // the watcher (the r12 mem::forget would have abandoned — also live
+        // forever; the distinction is what happens after the survivor exits).
+        for _ in 0..20 {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, native_owner),
+                "native interval stays live while the survivor is still running"
+            );
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, promoted_owner),
+                "promoted interval stays live while the survivor is still running"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // The survivor exits — kernel reaps it via the waiter thread; its
+        // /proc state goes Z then vanishes. The watcher polls at 250 ms.
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(survivor_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let native_closed =
+                !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, native_owner);
+            let promoted_closed =
+                !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, promoted_owner);
+            if native_closed && promoted_closed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the watcher must close both intervals once the survivor exit is confirmed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            crate::adapters::codex_discovery::census_contains(&cwd, native_owner),
+            "the closed native interval is retained until the last window prunes"
+        );
+
+        // A LATER, same-cwd launch: its floor is after the confirmed close, so
+        // the retained closed intervals cannot overlap [launch, creation].
+        let next_home = tempfile::tempdir().unwrap();
+        let floor = time::OffsetDateTime::now_utc() + time::Duration::milliseconds(500);
+        let next_owner = "r13-item3-next";
+        let mut next = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+            home: next_home.path().to_path_buf(),
+            cwd: cwd.clone(),
+            pid: None,
+            launched_at: Some(floor),
+        })
+        .with_instance_key(Some(next_owner.to_owned()));
+        let prompt = "r13 item 3 later launch prompt";
+        crate::adapters::codex_discovery::record_input(&cwd, next_owner, prompt);
+        let started = floor + time::Duration::seconds(1);
+        let date_dir = format!(
+            "{:04}/{:02}/{:02}",
+            started.year(),
+            u8::from(started.month()),
+            started.day()
+        );
+        let month_dir = next_home.path().join("sessions").join(date_dir);
+        std::fs::create_dir_all(&month_dir).unwrap();
+        let started_rfc = started
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        std::fs::write(
+            month_dir.join("rollout-r13item3.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{started_rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"r13item3\",\"session_id\":\"r13item3\",\"cwd\":\"{}\",\"timestamp\":\"{started_rfc}\"}}}}\n\
+                 {{\"timestamp\":\"{started_rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+
+        // Wait until the floor is in the past, then run the REAL discovery
+        // (the public poll entry point runs discover).
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let observed = next.poll().unwrap();
+        assert!(
+            next.binding().is_some(),
+            "the later same-cwd launch is sole-live and discovers its rollout; \
+             emitted {observed:?}"
+        );
+
+        // Its window was the cwd's last: dropping it prunes the watcher-closed
+        // intervals (ordinary retention rules apply once closed).
+        drop(next);
+        let prune_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let pruned = !crate::adapters::codex_discovery::census_contains(&cwd, native_owner)
+                && !crate::adapters::codex_discovery::census_contains(&cwd, promoted_owner);
+            if pruned {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < prune_deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     /// A driver whose PTY runs an inert process, carrying `kind` as its

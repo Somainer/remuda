@@ -164,6 +164,14 @@ struct LifetimeGuardInner {
     /// Set once the interval has been closed, so an explicit close followed by
     /// owner Drop cannot move the recorded close time later.
     closed: std::sync::atomic::AtomicBool,
+    /// Whether owner Drop may record a close. True for a normally-held owner;
+    /// set false when the owner guard is handed to the bounded termination
+    /// watcher (c-usagefu r13 item 3): a teardown that never CONFIRMED the
+    /// process exit (the watcher is aborted on Node shutdown, or its bound
+    /// expires with a survivor still alive) must drop the guard WITHOUT
+    /// recording a false close. An explicit [`LifetimeGuard::close_interval`]
+    /// after confirmed exit bypasses this flag.
+    drop_closes: std::sync::atomic::AtomicBool,
     /// Test clock: when set, the close is recorded at this time instead of
     /// wall-clock now, so regressions can place launches/closes on a
     /// deterministic timeline.
@@ -188,6 +196,18 @@ impl LifetimeGuard {
     /// exactly one owner per cohort).
     pub(crate) fn close_interval(&self) {
         self.record_close();
+    }
+
+    /// Transfer this owner guard to the bounded termination watcher used on a
+    /// stop-incomplete teardown (c-usagefu r13 item 3): owner Drop must then
+    /// never record a close the process never confirmed — task abort on Node
+    /// shutdown and the watcher's bounded expiry both drop the guard without
+    /// closing. [`Self::close_interval`] stays effective for the
+    /// confirmed-exit path.
+    pub(crate) fn suppress_drop_close(&self) {
+        self.inner
+            .drop_closes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn record_close(&self) {
@@ -231,8 +251,16 @@ impl Drop for LifetimeGuard {
     fn drop(&mut self) {
         // Safety net only: a normal teardown already called close_interval()
         // after the stop ladder (the AtomicBool then makes this a no-op). A
-        // witness drop never closes.
-        self.record_close();
+        // witness drop never closes, and a guard the termination watcher owns
+        // closes ONLY via an explicit confirmed-exit close_interval (r13 item
+        // 3): its drop after abort/expiry records nothing.
+        if self
+            .inner
+            .drop_closes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.record_close();
+        }
     }
 }
 
@@ -287,6 +315,7 @@ pub(crate) fn begin_lifetime(
             owner: owner.to_owned(),
             epoch,
             closed: std::sync::atomic::AtomicBool::new(false),
+            drop_closes: std::sync::atomic::AtomicBool::new(true),
             #[cfg(test)]
             closed_at: std::sync::Mutex::new(None),
         }),

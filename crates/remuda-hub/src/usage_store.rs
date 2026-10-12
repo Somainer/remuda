@@ -147,44 +147,136 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     //   replay points are frozen in Rust by their cumulative counters, not by a
     //   one-row unique index. The old shared index collapsed both scopes, so it
     //   is dropped on every prior schema.
-    // c-usagefu r8 item 3: before creating the unique Message index, collapse
-    // any existing duplicate Message rows (same instance_id, scope, scope_id)
-    // left by pre-r8 replays. Set-based and idempotent.
-    //
-    // Step 1 (before deleting): backfill turn_id on the surviving row from any
-    // sibling that carried a better (non-NULL) value.
-    conn.execute_batch(
+    // c-usagefu r9 item 3: duplicate Message rows are consolidated into ONE
+    // survivor per durable key (instance_id, scope, scope_id) carrying the
+    // best counters/cost/attribution any sibling brought; the rest are
+    // deleted and the unique indexes created — ALL in one transaction, so a
+    // crash between delete and index creation can never leave a partially
+    // collapsed database. Idempotent.
+    consolidate_message_duplicates(conn)?;
+    Ok(())
+}
+
+/// Collapse pre-r9 duplicate Message rows (same instance_id, scope,
+/// scope_id) into a single survivor each, then create the dedupe indexes —
+/// in ONE transaction (c-usagefu r9 item 3).
+///
+/// The survivor is the FIRST write (lowest rowid, preserving ingest
+/// ordering); every nullable attribute is upgraded with the best value ANY
+/// sibling carried:
+/// - counters/cost/profile/model: the first non-NULL value (a later replay
+///   with known counters repairs the ingest-time row that lacked them);
+/// - turn id: any non-NULL sibling;
+/// - observed_at: the sibling's native time when one exists (an
+///   ingest-stamped first row is repaired by the native replay), never the
+///   reverse;
+/// - revision: the maximum.
+///
+/// A second run changes nothing: one row per key makes the UPDATE/DELETE
+/// no-ops and the index creates are `IF NOT EXISTS`.
+fn consolidate_message_duplicates(conn: &Connection) -> rusqlite::Result<()> {
+    // migrate() holds only `&Connection`; the migration runs once at DB open
+    // on a single connection (no concurrent writers), so an unchecked
+    // transaction is sound and still gives atomic commit/rollback.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
         "UPDATE usage_events
-         SET turn_id = (
-             SELECT m2.turn_id FROM usage_events m2
-             WHERE m2.instance_id = usage_events.instance_id
-               AND m2.scope = 'message'
-               AND m2.scope_id = usage_events.scope_id
-               AND m2.turn_id IS NOT NULL
-             LIMIT 1
-         )
+         SET profile_id = COALESCE(profile_id,
+             (SELECT m2.profile_id FROM usage_events m2
+              WHERE m2.instance_id = usage_events.instance_id
+                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                AND m2.profile_id IS NOT NULL LIMIT 1)),
+             model = COALESCE(model,
+             (SELECT m2.model FROM usage_events m2
+              WHERE m2.instance_id = usage_events.instance_id
+                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                AND m2.model IS NOT NULL LIMIT 1)),
+             turn_id = COALESCE(turn_id,
+             (SELECT m2.turn_id FROM usage_events m2
+              WHERE m2.instance_id = usage_events.instance_id
+                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                AND m2.turn_id IS NOT NULL LIMIT 1)),
+             metric_revision = (
+                 SELECT MAX(m2.metric_revision) FROM usage_events m2
+                 WHERE m2.instance_id = usage_events.instance_id
+                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id),
+             total_tokens = COALESCE(total_tokens,
+             (SELECT m2.total_tokens FROM usage_events m2
+              WHERE m2.instance_id = usage_events.instance_id
+                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                AND m2.total_tokens IS NOT NULL LIMIT 1)),
+             input_tokens = COALESCE(input_tokens,
+             (SELECT m2.input_tokens FROM usage_events m2
+              WHERE m2.instance_id = usage_events.instance_id
+                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                AND m2.input_tokens IS NOT NULL LIMIT 1)),
+             output_tokens = COALESCE(output_tokens,
+             (SELECT m2.output_tokens FROM usage_events m2
+              WHERE m2.instance_id = usage_events.instance_id
+                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                AND m2.output_tokens IS NOT NULL LIMIT 1)),
+             cache_read_tokens = COALESCE(cache_read_tokens,
+             (SELECT m2.cache_read_tokens FROM usage_events m2
+              WHERE m2.instance_id = usage_events.instance_id
+                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                AND m2.cache_read_tokens IS NOT NULL LIMIT 1)),
+             cache_write_tokens = COALESCE(cache_write_tokens,
+             (SELECT m2.cache_write_tokens FROM usage_events m2
+              WHERE m2.instance_id = usage_events.instance_id
+                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                AND m2.cache_write_tokens IS NOT NULL LIMIT 1)),
+             cost_usd = COALESCE(cost_usd,
+             (SELECT m2.cost_usd FROM usage_events m2
+              WHERE m2.instance_id = usage_events.instance_id
+                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                AND m2.cost_usd IS NOT NULL LIMIT 1)),
+             native_context_window = COALESCE(native_context_window,
+             (SELECT m2.native_context_window FROM usage_events m2
+              WHERE m2.instance_id = usage_events.instance_id
+                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                AND m2.native_context_window IS NOT NULL LIMIT 1)),
+             observed_at = CASE
+                 WHEN observed_at_source = 'native' THEN observed_at
+                 WHEN EXISTS (
+                     SELECT 1 FROM usage_events m2
+                     WHERE m2.instance_id = usage_events.instance_id
+                       AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                       AND m2.observed_at_source = 'native')
+                 THEN (
+                     SELECT m2.observed_at FROM usage_events m2
+                     WHERE m2.instance_id = usage_events.instance_id
+                       AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                       AND m2.observed_at_source = 'native'
+                     LIMIT 1)
+                 ELSE observed_at END,
+             observed_at_source = CASE
+                 WHEN observed_at_source = 'native' THEN 'native'
+                 WHEN EXISTS (
+                     SELECT 1 FROM usage_events m2
+                     WHERE m2.instance_id = usage_events.instance_id
+                       AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                       AND m2.observed_at_source = 'native')
+                 THEN 'native'
+                 ELSE observed_at_source END
          WHERE scope = 'message' AND scope_id IS NOT NULL
-           AND turn_id IS NULL
+           AND rowid IN (
+               SELECT MIN(rowid) FROM usage_events
+               WHERE scope = 'message' AND scope_id IS NOT NULL
+               GROUP BY instance_id, scope, scope_id)
            AND EXISTS (
-             SELECT 1 FROM usage_events m3
-             WHERE m3.instance_id = usage_events.instance_id
-               AND m3.scope = 'message'
-               AND m3.scope_id = usage_events.scope_id
-               AND m3.turn_id IS NOT NULL
-           );",
-    )?;
-    // Step 2: delete every duplicate except the lowest rowid (first write).
-    conn.execute_batch(
-        "DELETE FROM usage_events
+               SELECT 1 FROM usage_events m3
+               WHERE m3.instance_id = usage_events.instance_id
+                 AND m3.scope = 'message' AND m3.scope_id = usage_events.scope_id
+                 AND m3.rowid != usage_events.rowid);
+
+         DELETE FROM usage_events
          WHERE scope = 'message' AND scope_id IS NOT NULL
            AND rowid NOT IN (
                SELECT MIN(rowid) FROM usage_events
                WHERE scope = 'message' AND scope_id IS NOT NULL
-               GROUP BY instance_id, scope, scope_id
-           );",
-    )?;
-    conn.execute_batch(
-        "DROP INDEX IF EXISTS usage_events_scope_dedupe;
+               GROUP BY instance_id, scope, scope_id);
+
+         DROP INDEX IF EXISTS usage_events_scope_dedupe;
          CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
              ON usage_events(instance_id, scope, scope_id)
              WHERE scope = 'turn' AND scope_id IS NOT NULL;
@@ -195,7 +287,7 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
              ON usage_events(instance_id, scope, scope_id)
              WHERE scope = 'message' AND scope_id IS NOT NULL;",
     )?;
-    Ok(())
+    tx.commit()
 }
 
 /// Inserts a usage projection.
@@ -1838,13 +1930,15 @@ mod tests {
 
     #[test]
     fn migration_consolidates_duplicate_message_rows_idempotently() {
-        // c-usagefu r8 item 3: a pre-r8 DB holds duplicate Message rows from
-        // byte-0 replays. migrate() collapses them (one per instance/scope/
-        // scope_id), backfills the best turn_id onto the survivor, and a
-        // second migrate() is a no-op.
+        // c-usagefu r9 item 3: a pre-r9 DB holds duplicate Message rows from
+        // byte-0 replays. The FIRST write is an ingest-time row with unknown
+        // counters/cost and no turn id; a LATER replay carries the native
+        // time, turn id and known counters/cost. migrate() must consolidate
+        // the durable key to ONE survivor with every best attribute, delete
+        // the rest and create the unique index in a single transaction.
         let conn = Connection::open_in_memory().unwrap();
-        // Minimal table that already has scope_id + turn_id columns (the
-        // duplicate problem arose after r7 added them but before r8's
+        // Minimal table that already has scope_id + turn_id + source columns
+        // (the duplicate problem arose after r7 added them but before r9's
         // consolidation); no unique index yet.
         conn.execute_batch(
             "CREATE TABLE usage_events (
@@ -1871,48 +1965,123 @@ mod tests {
              );",
         )
         .unwrap();
-        // Three duplicates for response r1 (seqs 1,2,3): seq 1 lacks turn_id,
-        // seq 2 has it; an unrelated r2 row; and a duplicate r2.
+        // r1: seq 1 first (ingest time, everything unknown); seq 2 the later
+        // replay (native time, turn id, known counters/cost). r2 single row.
         conn.execute_batch(
             "INSERT INTO usage_events
-                (instance_id, seq, scope, scope_id, turn_id, mode, output_tokens, observed_at)
+                (instance_id, seq, scope, scope_id, turn_id, mode,
+                 total_tokens, input_tokens, output_tokens,
+                 cache_read_tokens, cache_write_tokens, cost_usd,
+                 observed_at, observed_at_source, profile_id, model)
              VALUES
-                ('ins_dup', 1, 'message', 'r1', NULL, 'snapshot', 10000, '2026-09-15T00:00:00Z'),
-                ('ins_dup', 2, 'message', 'r1', 't1',  'snapshot', 10000, '2026-09-15T00:00:00Z'),
-                ('ins_dup', 3, 'message', 'r1', 't1',  'snapshot', 10000, '2026-09-15T00:00:00Z'),
-                ('ins_dup', 4, 'message', 'r2', 't2',  'snapshot', 20000, '2026-09-15T00:00:00Z'),
-                ('ins_dup', 5, 'message', 'r2', 't2',  'snapshot', 20000, '2026-09-15T00:00:00Z');",
+                ('ins_dup', 1, 'message', 'r1', NULL, 'snapshot',
+                 NULL, NULL, NULL, NULL, NULL, NULL,
+                 '2026-09-15T00:00:00.000Z', 'ingest', NULL, NULL),
+                ('ins_dup', 2, 'message', 'r1', 't1', 'snapshot',
+                 155, 40, 10, 100, 5, '0.10',
+                 '2026-09-15T00:00:05.000Z', 'native', 'pvp_dup', 'gpt-5.4'),
+                ('ins_dup', 3, 'message', 'r2', 't2', 'snapshot',
+                 210, 60, 20, 150, 7, '0.20',
+                 '2026-09-15T00:00:10.000Z', 'native', 'pvp_dup', 'gpt-5.4');",
         )
         .unwrap();
 
         migrate(&conn).unwrap();
 
-        let (n, survivors): (i64, i64) = conn
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "r1 and r2 each survive once (was 3)");
+        // The COMPLETE surviving r1 row: first write's seq, later replay's
+        // every attribute.
+        #[derive(Debug, PartialEq)]
+        struct R1Survivor {
+            seq: i64,
+            profile_id: Option<String>,
+            model: Option<String>,
+            turn_id: Option<String>,
+            total: Option<i64>,
+            input: Option<i64>,
+            output: Option<i64>,
+            cache_read: Option<i64>,
+            cache_write: Option<i64>,
+            cost: Option<String>,
+            observed_at: String,
+            source: String,
+        }
+        let r1 = conn
             .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(output_tokens),0) FROM usage_events",
+                "SELECT seq, profile_id, model, turn_id,
+                        total_tokens, input_tokens, output_tokens,
+                        cache_read_tokens, cache_write_tokens, cost_usd,
+                        observed_at, observed_at_source
+                 FROM usage_events WHERE scope_id='r1'",
+                [],
+                |r| {
+                    Ok(R1Survivor {
+                        seq: r.get(0)?,
+                        profile_id: r.get(1)?,
+                        model: r.get(2)?,
+                        turn_id: r.get(3)?,
+                        total: r.get(4)?,
+                        input: r.get(5)?,
+                        output: r.get(6)?,
+                        cache_read: r.get(7)?,
+                        cache_write: r.get(8)?,
+                        cost: r.get(9)?,
+                        observed_at: r.get(10)?,
+                        source: r.get(11)?,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(r1.seq, 1, "the first write's row is the survivor");
+        assert_eq!(r1.profile_id.as_deref(), Some("pvp_dup"));
+        assert_eq!(r1.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(r1.turn_id.as_deref(), Some("t1"), "best turn_id");
+        assert_eq!(r1.total, Some(155), "known total from the later replay");
+        assert_eq!(r1.input, Some(40));
+        assert_eq!(r1.output, Some(10));
+        assert_eq!(r1.cache_read, Some(100));
+        assert_eq!(r1.cache_write, Some(5));
+        assert_eq!(r1.cost.as_deref(), Some("0.10"), "known cost not lost");
+        assert_eq!(
+            r1.observed_at, "2026-09-15T00:00:05.000Z",
+            "native time replaces the ingest time"
+        );
+        assert_eq!(r1.source, "native");
+        // r2 untouched.
+        let (r2_out, r2_cost): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT output_tokens, cost_usd FROM usage_events WHERE scope_id='r2'",
                 [],
                 |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
             )
             .unwrap();
-        assert_eq!(n, 2, "r1 and r2 each survive once (was 5)");
-        assert_eq!(survivors, 30_000, "10000 + 20000, not 50000");
-        // The survivor for r1 is seq 1 with turn_id backfilled from seq 2.
-        let (seq, turn): (i64, Option<String>) = conn
-            .query_row(
-                "SELECT seq, turn_id FROM usage_events WHERE scope_id='r1'",
-                [],
-                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
-            )
-            .unwrap();
-        assert_eq!(seq, 1);
-        assert_eq!(turn.as_deref(), Some("t1"), "best turn_id backfilled");
+        assert_eq!(r2_out, Some(20));
+        assert_eq!(r2_cost.as_deref(), Some("0.20"));
 
-        // Idempotent: second migrate changes nothing.
+        // Idempotent: a second migrate changes nothing (count + r1 values).
         migrate(&conn).unwrap();
         let n2: i64 = conn
             .query_row("SELECT COUNT(*) FROM usage_events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n2, 2);
+        let r1_recheck: (Option<String>, Option<i64>, String) = conn
+            .query_row(
+                "SELECT turn_id, total_tokens, observed_at FROM usage_events WHERE scope_id='r1'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(
+            r1_recheck,
+            (
+                Some("t1".to_string()),
+                Some(155),
+                "2026-09-15T00:00:05.000Z".to_string()
+            )
+        );
 
         // The unique index exists and rejects a new duplicate.
         let dup_insert = conn.execute(

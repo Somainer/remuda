@@ -3289,33 +3289,15 @@ async fn mark_forward_intent_rechecks_the_stamp_on_the_row() {
 #[tokio::test]
 async fn a_stale_attempts_verdict_is_dropped_after_a_requeue() {
     let (ctx, _node) = Ctx::boot().await.unwrap();
-    let job_id = queued_job(&ctx).await;
-    // Claim twice the way a real scheduler re-dispatch does after a
-    // base-moved requeue: running at attempt 2.
+    let job_id = queued_land_job(&ctx).await;
+    // Claim attempt 1, then a REAL base-moved verdict requeues it and the
+    // scheduler claims attempt 2 (no SQL writes to gate state).
     let _ = ctx
         .hub
         .test_claim_gate_job(&job_id, "lane1", &ctx.host)
         .await
         .unwrap();
-    // Force the base-moved path: attempt 1 -> Queued (attempts becomes 2).
-    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
-    db.execute(
-        "UPDATE gate_jobs SET state = 'queued',
-            doc_json = json_set(json_set(doc_json, '$.state','queued'),
-                                '$.startedAt', NULL)
-          WHERE id = ?1",
-        rusqlite::params![job_id],
-    )
-    .unwrap();
-    drop(db);
-    let _ = ctx
-        .hub
-        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
-        .await
-        .unwrap();
-    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-    assert_eq!(doc["state"], json!("running"), "{doc}");
-    assert_eq!(doc["attempts"], json!(2), "{doc}");
+    genuine_requeue_to_attempt_two(&ctx, &job_id).await;
 
     // The OLD attempt's verdict arrives late. It must be dropped entirely
     // (no state change, no log reference) rather than applied to attempt 2.
@@ -3435,27 +3417,14 @@ async fn an_rpc_failure_for_attempt_one_does_not_fail_running_attempt_two() {
 #[tokio::test]
 async fn a_stale_attempts_step_event_does_not_overwrite_the_current_steps() {
     let (ctx, node) = Ctx::boot().await.unwrap();
-    let job_id = queued_job(&ctx).await;
-    // claim 1, requeue, claim 2.
+    let job_id = queued_land_job(&ctx).await;
+    // claim 1, then a REAL base-moved verdict requeues and claims attempt 2.
     let _ = ctx
         .hub
         .test_claim_gate_job(&job_id, "lane1", &ctx.host)
         .await
         .unwrap();
-    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
-    db.execute(
-        "UPDATE gate_jobs SET state='queued',
-            doc_json = json_set(json_set(doc_json,'$.state','queued'),'$.startedAt',NULL)
-          WHERE id = ?1",
-        rusqlite::params![job_id],
-    )
-    .unwrap();
-    drop(db);
-    let _ = ctx
-        .hub
-        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
-        .await
-        .unwrap();
+    genuine_requeue_to_attempt_two(&ctx, &job_id).await;
 
     // A current-attempt (2) step lands.
     node.send_raw(json!({
@@ -3487,16 +3456,36 @@ async fn a_stale_attempts_step_event_does_not_overwrite_the_current_steps() {
             "step": { "name": "cargo-test", "status": "ok", "durationMs": 9999 },
         },
     }));
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-    let step = &doc["steps"][0];
-    assert_eq!(step["name"], json!("cargo-test"));
-    assert_eq!(
-        step["status"],
-        json!("running"),
-        "stale attempt-1 step must not overwrite attempt-2 step: {doc}"
-    );
-    assert_eq!(step["durationMs"], json!(0), "{doc}");
+    // A raw sleep cannot prove the stale step was ignored: assert the step
+    // STAYS attempt-2's on every read across a bounded deadline (an accepted
+    // step applies well within it), the bounded stability idiom the
+    // production wait helpers use — no sleep-based evidence.
+    node.send_raw(json!({
+        "jsonrpc": "2.0",
+        "method": "gate.event",
+        "params": {
+            "jobId": job_id,
+            "generation": 1,
+            "kind": "step",
+            "step": { "name": "cargo-test", "status": "ok", "durationMs": 9999 },
+        },
+    }));
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+        let step = &doc["steps"][0];
+        assert_eq!(step["name"], json!("cargo-test"));
+        assert_eq!(
+            step["status"],
+            json!("running"),
+            "stale attempt-1 step must not overwrite attempt-2 step: {doc}"
+        );
+        assert_eq!(step["durationMs"], json!(0), "{doc}");
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// r12 item 8: after a GENUINE base-moved requeue claims attempt 2, attempt

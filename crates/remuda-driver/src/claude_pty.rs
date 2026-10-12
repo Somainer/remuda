@@ -1465,6 +1465,19 @@ fn spawn_transcript_pump(
     // native_at) and pops only after a successful send, so no frame is ever
     // duplicated or lost between the async flusher and the abort path.
     let gate: TranscriptGate = Arc::new(crate::producer_gate::ProducerGate::new());
+    // c-ctxusage r12 item 6: the Claude PTY path gets the same terminal-yield
+    // acknowledgement the shell promoter has: when the abort residual's
+    // terminal parks in its claim behind the elected cooperative owner, it
+    // acknowledges that state, so a close-abort regression can wait on the
+    // second terminal's existence instead of inferring "flusher alive" from
+    // an elapsed 500 ms window. Inert in production (faults is None).
+    #[cfg(feature = "test-faults")]
+    if let Some(faults) = faults.as_ref() {
+        let yield_faults = Arc::clone(faults);
+        gate.set_terminal_yield_hook(std::sync::Arc::new(move || {
+            yield_faults.note_abort_terminal_waiting();
+        }));
+    }
     let flush_notify = Arc::new(Notify::new());
     // Test-only shrink (c-ctxusage r9 item 1): a normal replay batch then
     // exceeds the capacity and exercises the notify-before-park ordering.

@@ -446,13 +446,16 @@ async fn claude_pty_abort_mid_cooperative_finish_still_delivers_final_usage_once
     );
 
     // The abort guard must NOT have stopped the flusher while the cooperative
-    // finish still owns the hydrator behind the shared in-flight flag. The
-    // drainer keeps the channel empty, so a buggy guard that set stop here
-    // lets the flusher drain and exit within the window; the fixed flusher
-    // stays alive because stop is never set until the parked finish parks.
+    // finish still owns the hydrator. POSITIVE acknowledgement (c-ctxusage
+    // r12 item 6): the abort residual's second terminal REGISTERED and parked
+    // in its claim behind the elected cooperative owner - the flusher cannot
+    // have retired while a registered producer is still owed a decision. This
+    // replaces the old negative inference ("no flusher exit for 500 ms"),
+    // which both depended on an elapsed window and proved nothing if the
+    // second terminal never registered.
     assert!(
-        !faults.wait_flusher_exit_for(Duration::from_millis(500)),
-        "the flusher exited while the cooperative finish was still in flight"
+        faults.wait_abort_terminal_waiting_for(Duration::from_secs(30)),
+        "the abort terminal never registered/waited behind the elected owner"
     );
     assert_eq!(
         final_count.load(AtomicOrdering::SeqCst),

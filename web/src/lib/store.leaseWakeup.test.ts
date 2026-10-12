@@ -142,6 +142,80 @@ it("a cancelled beforeunload re-arms the cleared lease wake without flushing", a
   }
 });
 
+it("GATE21 item 4: a cancelled navigation whose rearm read rejects once re-arms through the bounded recovery and a later timer still POSTs", async () => {
+  // The cancelled-beforeunload self-reset used to perform ONE bare durable
+  // read: a one-shot rejection there lost every lease wake permanently (until
+  // an unrelated flush). It now goes through the bounded, lifetime-aware
+  // recovery — the rejected read retries at 250 ms, reconciles and re-arms;
+  // the re-armed wake's later fire still delivers.
+  vi.useFakeTimers();
+  try {
+    const { api, hubStore } = await fresh();
+    await boot(api, hubStore);
+    const internal = internalOf(hubStore);
+    const send = vi.spyOn(api, "instanceSend").mockResolvedValue({
+      relatedCommandIds: [],
+      command: {
+        commandId: COMMAND,
+        id: COMMAND,
+        state: "queued",
+        dispatch: "not-dispatched",
+        resolution: "clear",
+      } as Awaited<ReturnType<Api["instanceSend"]>>["command"],
+    });
+
+    writeRows(foreignInflightRow(Date.now() + 10_000));
+    await internal.flushAllOutbox();
+    expect(internal.outbox.pendingLeaseWakeups()).toEqual([COMMAND]);
+
+    // The self-reset's authoritative read (#1 after the cancel) rejects ONCE;
+    // every later read is the real backend. onClaimWake reads before
+    // rearmLeaseWakeups runs, so arm the one-shot off the setTimeout(0) reset
+    // by counting reads while unloading has already been cleared.
+    const box = internal.outbox as unknown as {
+      readDurable: () => Promise<unknown>;
+    };
+    const realRead = box.readDurable.bind(box) as () => Promise<unknown>;
+    let cancelled = false;
+    let postResetReads = 0;
+    vi.spyOn(box, "readDurable").mockImplementation(function (this: unknown) {
+      if (!cancelled) return realRead.call(this);
+      postResetReads += 1;
+      if (postResetReads === 1) {
+        return Promise.reject(new Error("g21-item4 one-shot rearm read failure"));
+      }
+      return realRead.call(this);
+    });
+
+    window.dispatchEvent(new Event("beforeunload"));
+    expect(internal.outbox.pendingLeaseWakeups()).toEqual([]);
+    cancelled = true;
+    await vi.advanceTimersByTimeAsync(0); // reset task runs; read #1 rejects
+    expect(hubStore.pageIsUnloadingForTest).toBe(false);
+    // Still no wake: the bounded retry is due 250 ms out.
+    expect(internal.outbox.pendingLeaseWakeups()).toEqual([]);
+    expect(send).not.toHaveBeenCalled();
+
+    // The bounded recovery read succeeds and re-arms the one lease wake.
+    await vi.advanceTimersByTimeAsync(250);
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    expect(internal.outbox.pendingLeaseWakeups()).toEqual([COMMAND]);
+    expect(send).not.toHaveBeenCalled();
+
+    // The re-armed wake still fires at lease expiry and delivers.
+    await vi.advanceTimersByTimeAsync(9_750);
+    for (let i = 0; i < 40 && send.mock.calls.length === 0; i += 1) {
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+    }
+    expect(send).toHaveBeenCalledTimes(1);
+
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it("a genuine reload: the beforeunload self-reset task never flushes and pagehide disarms", async () => {
   // Chromium runs beforeunload's setTimeout(0) ~0.1 ms BEFORE pagehide: the
   // self-reset must clear only the flag, never flush (an inflight lease

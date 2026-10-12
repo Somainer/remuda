@@ -1620,17 +1620,22 @@ class HubStore {
    * row the prompt sat open past; that wake's fire → guarded flush is itself
    * blocked while pageIsUnloading stays set (a real pagehide cancels all
    * wakes via cancelAllWakesForUnload).
+   *
+   * c-reconnfu gate 21 item 4: a read that rejects ONCE here used to give up
+   * permanently and lease recovery was lost (until an unrelated flush). The
+   * read now goes through the BOUNDED, lifetime-aware recovery chain:
+   * growing backoff, central reconciliation on success, a real pagehide
+   * cancelling every timer, and an explicit exhausted surface at the limit.
    */
   private async rearmLeaseWakeups() {
     const box = this.outbox;
     if (!box || this.pageIsUnloading) return;
-    const durable = await box.readDurable().catch(() => null);
-    // A real pagehide can land while the read was suspended (the reset task
-    // runs ~immediately before pagehide during a genuine reload): a torn-down
-    // page imports the rows but applies NO reconciliation, so it arms no
-    // timer.
-    if (!durable || this.pageIsUnloading) return;
-    box.applyLeaseWakeReconcile(durable);
+    const rows = await box.refreshDurableRecovering(0);
+    // A real pagehide can land while the read/retry was suspended (the reset
+    // task runs ~immediately before pagehide during a genuine reload): a
+    // torn-down page applies no reconciliation, arms no timer — the bounded
+    // chain itself was cancelled by cancelAllWakesForUnload.
+    if (!rows || this.pageIsUnloading) return;
   }
 
   get outboxUnavailable(): boolean {

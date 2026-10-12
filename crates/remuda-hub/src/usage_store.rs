@@ -78,7 +78,25 @@ pub struct UsageEventRow {
 /// schema: the `scope_id` partial unique index is created only AFTER the
 /// column is guaranteed to exist, so a pre-delivery database (no scope_id
 /// column) upgrades instead of failing to open.
+///
+/// c-usagefu r14 item 1 (Ruling M1): a usage migration must NEVER make the
+/// Hub unable to start. The ENTIRE migration — table/column DDL, the
+/// scope-id journal backfill, duplicate consolidation and every unique
+/// index — runs in ONE transaction; any error rolls ALL of it back to the
+/// previously-openable shape. SQLite DDL is transactional, so an
+/// `ALTER TABLE`/`CREATE INDEX` that never committed is gone too. The
+/// caller (the store opener) logs a migration error and opens on the old
+/// shape instead of propagating it.
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    run_migrations(&tx)?;
+    tx.commit()
+}
+
+/// All usage migration steps, in order. Runs inside [`migrate`]'s single
+/// transaction: every helper here must do its work on `conn` WITHOUT opening
+/// a nested transaction.
+fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS usage_events (
             instance_id TEXT NOT NULL,
@@ -162,9 +180,15 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // c-usagefu r9 item 3: duplicate Message rows are consolidated into ONE
     // survivor per durable key (instance_id, scope, scope_id) carrying the
     // best counters/cost/attribution any sibling brought; the rest are
-    // deleted and the unique indexes created — ALL in one transaction, so a
-    // crash between delete and index creation can never leave a partially
-    // collapsed database. Idempotent.
+    // deleted and the unique indexes created — ALL in the migration's ONE
+    // transaction, so a crash between delete and index creation can never
+    // leave a partially collapsed database. Idempotent.
+    //
+    // c-usagefu r14 item 1 (Ruling M1): BEFORE any unique index over
+    // (instance_id, scope_id) is created, turn rows the journal backfill
+    // keyed alike are made index-safe — identical buckets collapse to the
+    // highest seq, disagreeing ones return to the legacy NULL-scope path.
+    reconcile_duplicate_turn_keys(conn)?;
     consolidate_message_duplicates(conn)?;
     Ok(())
 }
@@ -217,9 +241,70 @@ fn backfill_scope_ids_from_journal(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Make backfilled `turn` rows safe for the
+/// `(instance_id, scope, scope_id)` unique index (c-usagefu r14 item 1,
+/// Ruling M1).
+///
+/// origin/main wrote codex Turn rows without persisting `scope_id`, and the
+/// backfill above recovers it from the durable journal. Two distinct writes
+/// can recover the SAME key on a real main-shaped database:
+///
+/// * a promoted instance re-tailed after a demotion/resume re-emits the
+///   SAME native turn snapshot at a new journal seq: every token bucket is
+///   identical, and the call must be counted exactly once. Such a group is
+///   collapsed to the HIGHEST seq (the latest tail), the other rows deleted;
+/// * two genuinely different result frames recover the same scope id while
+///   reporting DIFFERENT counters (degenerate ids, e.g. both mapped to
+///   `"0"`). They are different calls: nothing is merged. Every row of such
+///   a group has its `scope_id` cleared back to NULL, so the rows stay on
+///   the legacy NULL-scope path — each keeps counting once, and they never
+///   collide with the unique index.
+///
+/// Agreement is on the five TOKEN buckets only, compared NULL-safely with
+/// `IS` (a byte-zero re-tail carries the identical sparse bucket set). Cost
+/// is a priced projection, never a call identity. Runs inside the migration
+/// transaction; idempotent — a second migration finds neither a disagreeing
+/// sibling nor a non-keeper duplicate.
+fn reconcile_duplicate_turn_keys(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "UPDATE usage_events
+         SET scope_id = NULL
+         WHERE scope = 'turn' AND scope_id IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM usage_events d
+               WHERE d.instance_id = usage_events.instance_id
+                 AND d.scope = 'turn'
+                 AND d.scope_id = usage_events.scope_id
+                 AND d.rowid <> usage_events.rowid
+                 AND (d.total_tokens     IS NOT usage_events.total_tokens
+                   OR d.input_tokens     IS NOT usage_events.input_tokens
+                   OR d.output_tokens    IS NOT usage_events.output_tokens
+                   OR d.cache_read_tokens  IS NOT usage_events.cache_read_tokens
+                   OR d.cache_write_tokens IS NOT usage_events.cache_write_tokens));
+
+         DELETE FROM usage_events
+         WHERE scope = 'turn' AND scope_id IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM usage_events s
+               WHERE s.instance_id = usage_events.instance_id
+                 AND s.scope = 'turn'
+                 AND s.scope_id = usage_events.scope_id
+                 AND s.rowid <> usage_events.rowid)
+           AND seq <> (
+               SELECT MAX(h.seq) FROM usage_events h
+               WHERE h.instance_id = usage_events.instance_id
+                 AND h.scope = 'turn'
+                 AND h.scope_id = usage_events.scope_id);",
+    )?;
+    Ok(())
+}
+
 /// Collapse pre-r9 duplicate Message rows (same instance_id, scope,
-/// scope_id) into a single survivor each, then create the dedupe indexes —
-/// in ONE transaction (c-usagefu r9 item 3).
+/// scope_id) into a single survivor each, then create the dedupe indexes.
+///
+/// Runs inside [`migrate`]'s single transaction (c-usagefu r14 item 1,
+/// Ruling M1): it opens no transaction of its own and a failure anywhere
+/// (including the unique-index creates) rolls the WHOLE migration back.
 ///
 /// The survivor is the FIRST write (lowest rowid, preserving ingest
 /// ordering). Ruling C1 (c-usagefu r10 item 3; r11 item 8), made EXACT by
@@ -243,17 +328,12 @@ fn backfill_scope_ids_from_journal(conn: &Connection) -> rusqlite::Result<()> {
 /// A second run changes nothing: one row per key makes the UPDATE/DELETE
 /// no-ops and the index creates are `IF NOT EXISTS`.
 fn consolidate_message_duplicates(conn: &Connection) -> rusqlite::Result<()> {
-    // migrate() holds only `&Connection`; the migration runs once at DB open
-    // on a single connection (no concurrent writers), so an unchecked
-    // transaction is sound and still gives atomic commit/rollback.
-    //
     // C1' (r12 item 5): the accounting assignments are generated from one
     // shared "highest revision first" fragment. The top revision is resolved
     // FIRST; every counter/cost column and the accounting authority come only
     // from rows AT that revision (newest rowid among them), and a NULL is
     // repaired only by a non-NULL sibling at the SAME revision — an older
     // revision's known value never fills it.
-    let tx = conn.unchecked_transaction()?;
     let top_revision = "(
                  SELECT MAX(m3.metric_revision) FROM usage_events m3
                  WHERE m3.instance_id = usage_events.instance_id
@@ -363,8 +443,8 @@ fn consolidate_message_duplicates(conn: &Connection) -> rusqlite::Result<()> {
              ON usage_events(instance_id, scope, scope_id)
              WHERE scope = 'message' AND scope_id IS NOT NULL;"
     );
-    tx.execute_batch(&batch)?;
-    tx.commit()
+    conn.execute_batch(&batch)?;
+    Ok(())
 }
 
 /// Inserts a usage projection.
@@ -3749,6 +3829,380 @@ mod tests {
             "5 m per-minute average likewise counts each call once"
         );
         assert_eq!(rollup.tpm_in_60s, Some(expected_input));
+    }
+
+    /// Create main's REAL `usage_events` + `journal` tables (origin/main
+    /// schema: no scope_id/turn_id/metric_revision columns) in `conn`.
+    fn create_main_shaped_usage_tables(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE journal (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (instance_id, seq)
+             );
+             CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (instance_id, seq)
+             );",
+        )
+        .unwrap();
+    }
+
+    /// Insert a Turn row EXACTLY as origin/main's codex insert path wrote it
+    /// (no scope_id/turn_id persisted) plus the durable journal row whose
+    /// payload retains the scopeId main dropped.
+    fn insert_main_turn_with_journal(
+        conn: &Connection,
+        instance_id: &str,
+        seq: i64,
+        scope_id_in_journal: &str,
+        r: &UsageEventRow,
+        at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                instance_id,
+                seq,
+                format!("je-{seq}"),
+                json!({"kind":"usage","payload":{"scope":"turn","scopeId":scope_id_in_journal}})
+                    .to_string(),
+                at,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, mode,
+                 total_tokens, input_tokens, output_tokens,
+                 cache_read_tokens, cache_write_tokens, cost_usd,
+                 accounting, observed_at)
+             VALUES (?1, ?2, ?3, ?4, 'turn', 'snapshot', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                instance_id,
+                seq,
+                r.profile_id,
+                r.model,
+                r.total_tokens,
+                r.input_tokens,
+                r.output_tokens,
+                r.cache_read_tokens,
+                r.cache_write_tokens,
+                r.cost_usd,
+                r.accounting,
+                at,
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Project one codex turn's real per-call counters through the REAL
+    /// adapter, exactly as the r13 main-shape regression does: main's Turn
+    /// snapshot counters equal the per-turn token_usage_record totals.
+    fn real_codex_turn_counters(
+        home: &Path,
+        session_id: &str,
+        turn: &str,
+        input: u64,
+        output: u64,
+        at: &str,
+    ) -> UsageEventRow {
+        use remuda_driver::adapters::{
+            AdapterHome, CodexAdapter, FileSignalAdapter, StampCtx, stamp,
+        };
+        use remuda_protocol::ObservationPayload;
+        use std::io::Write;
+        let codex_home = home.join(".codex");
+        let date_dir = codex_home.join("sessions/2026/10/13");
+        std::fs::create_dir_all(&date_dir).unwrap();
+        let rollout = date_dir.join(format!("rollout-{session_id}.jsonl"));
+        let total = input + output;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&rollout)
+            .unwrap();
+        writeln!(
+            file,
+            "{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"session_id\":\"{session_id}\",\"cwd\":\"/w\",\"timestamp\":\"2026-10-13T00:00:00.000Z\"}}}}"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{{\"ordinal\":1,\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"{turn}\",\"model\":\"gpt-5.4\"}}}}"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{{\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"{turn}\"}}}}"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{{\"ordinal\":3,\"timestamp\":\"{at}\",\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"{turn}\",\"response_id\":\"{turn}-r\",\"usage\":{{\"input_tokens\":{input},\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":{output},\"reasoning_output_tokens\":0,\"total_tokens\":{total}}}}}}}"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{{\"ordinal\":4,\"timestamp\":\"{at}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"{turn}\"}}}}"
+        )
+        .unwrap();
+        let mut probe = CodexAdapter::new(AdapterHome {
+            home: codex_home,
+            cwd: "/w".into(),
+            pid: None,
+            launched_at: None,
+        });
+        probe.bind_rollout(session_id, rollout);
+        let observed = probe.poll().unwrap();
+        let stamp_ctx = StampCtx {
+            instance_id: remuda_protocol::InstanceId::new(),
+            host_id: remuda_protocol::HostId::new(),
+            journal_id: remuda_protocol::Id::new("obj").unwrap(),
+            run_id: remuda_protocol::RunId::new(),
+            session_id: session_id.into(),
+        };
+        observed
+            .iter()
+            .enumerate()
+            .find_map(|(i, obs)| match &obs.payload {
+                ObservationPayload::Usage(_) => {
+                    let stamped = stamp(&stamp_ctx, i as u64 + 1, obs).unwrap();
+                    let rec = JournalRecord {
+                        instance_id: "probe".into(),
+                        seq: i as i64 + 1,
+                        event_id: stamped.event_id.as_id().as_str().to_owned(),
+                        event: serde_json::to_value(&stamped).unwrap(),
+                        observed_at: at.to_owned(),
+                    };
+                    let row = project_usage_event(&rec, Some("pvp_r14"), Some("gpt-5.4")).unwrap();
+                    (row.scope == "message").then_some(row)
+                }
+                _ => None,
+            })
+            .expect("the turn emits one durable Message observation")
+    }
+
+    #[test]
+    fn main_shaped_identically_bucketed_retail_turn_rows_collapse_to_the_highest_seq() {
+        // c-usagefu r14 item 1 (Ruling M1), regression (a): a promoted
+        // instance re-tailed after a demotion/resume makes origin/main write
+        // TWO Turn rows for the SAME codex turn id at different journal
+        // seqs — the same call, every token bucket identical. Main persisted
+        // no scope_id; the journal backfill recovers the same scopeId for
+        // both, which made the new unique index creation fail and brick the
+        // Hub open. The migration must instead collapse them to the HIGHEST
+        // seq and count the call exactly once.
+        let home = tempfile::tempdir().unwrap();
+        let at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let row = real_codex_turn_counters(home.path(), "r14m1a", "t1", 1000, 100, &at);
+        let expected_output = row.output_tokens.unwrap();
+        let expected_input = row.input_tokens.unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        create_main_shaped_usage_tables(&conn);
+        // The same call projected twice — main's promoted re-tail at seq 5.
+        insert_main_turn_with_journal(&conn, "ins_r14m1a", 1, "t1", &row, &at);
+        insert_main_turn_with_journal(&conn, "ins_r14m1a", 5, "t1", &row, &at);
+
+        migrate(&conn).unwrap();
+
+        let survivors: Vec<(i64, Option<String>)> = {
+            let mut stmt = conn
+                .prepare("SELECT seq, scope_id FROM usage_events ORDER BY seq")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            survivors,
+            vec![(5, Some("t1".to_string()))],
+            "identical buckets collapse to one survivor at the highest seq"
+        );
+        let agg = aggregate_instance(&conn, "ins_r14m1a").unwrap();
+        assert_eq!(agg.input_tokens, expected_input);
+        assert_eq!(
+            agg.output_tokens, expected_output,
+            "the re-tailed call is counted exactly once"
+        );
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r14m1a",
+                kind: "codex",
+                spec_model: Some("gpt-5.4"),
+                effective_model: None,
+                profile_id: Some("pvp_r14"),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rollup.turns, 1, "one turn, counted once");
+    }
+
+    #[test]
+    fn main_shaped_turn_rows_sharing_a_scope_id_with_different_buckets_return_to_null_scope() {
+        // c-usagefu r14 item 1 (Ruling M1), regression (b): two genuinely
+        // DIFFERENT result frames recover the SAME scopeId (a degenerate id,
+        // both mapped to "0") while reporting different token buckets. They
+        // are two calls and must NOT be merged: every row of the group has
+        // its scope_id cleared back to NULL, so both stay on the legacy
+        // NULL-scope path, the unique index creates, and each call counts
+        // exactly once.
+        let home = tempfile::tempdir().unwrap();
+        let at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let one = real_codex_turn_counters(home.path(), "r14m1b1", "ta", 1000, 100, &at);
+        // A separate home/rollout for the second call: same degenerate
+        // scopeId in the JOURNAL, different real counters.
+        let home2 = tempfile::tempdir().unwrap();
+        let two = real_codex_turn_counters(home2.path(), "r14m1b2", "tb", 2000, 200, &at);
+        let expected_output = one.output_tokens.unwrap() + two.output_tokens.unwrap();
+        let expected_input = one.input_tokens.unwrap() + two.input_tokens.unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        create_main_shaped_usage_tables(&conn);
+        insert_main_turn_with_journal(&conn, "ins_r14m1b", 1, "0", &one, &at);
+        insert_main_turn_with_journal(&conn, "ins_r14m1b", 5, "0", &two, &at);
+
+        migrate(&conn).unwrap();
+
+        let rows: Vec<(i64, Option<String>)> = {
+            let mut stmt = conn
+                .prepare("SELECT seq, scope_id FROM usage_events ORDER BY seq")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            rows,
+            vec![(1, None), (5, None)],
+            "disagreeing buckets are never merged; both rows return to legacy NULL scope"
+        );
+        let agg = aggregate_instance(&conn, "ins_r14m1b").unwrap();
+        assert_eq!(agg.input_tokens, expected_input);
+        assert_eq!(
+            agg.output_tokens, expected_output,
+            "two different calls each counted once, nothing merged or doubled"
+        );
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r14m1b",
+                kind: "codex",
+                spec_model: Some("gpt-5.4"),
+                effective_model: None,
+                profile_id: Some("pvp_r14"),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rollup.turns, 2, "each NULL-scope turn counts as one call");
+    }
+
+    #[test]
+    fn a_failed_usage_migration_rolls_back_and_the_hub_store_still_opens() {
+        // c-usagefu r14 item 1 (Ruling M1), regression (c): a failure late in
+        // the migration (here the unique-index name collides with an object
+        // already in the database, so CREATE UNIQUE INDEX errors AFTER the
+        // backfill and collapse ran) must roll the WHOLE migration back —
+        // including the ALTER TABLE-added columns — and the Hub store must
+        // still open, repeatedly, on the old shape. The collision is a
+        // committed pre-existing table, so it reproduces on every reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hub.sqlite");
+        let at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        {
+            let pre = Connection::open(&db_path).unwrap();
+            create_main_shaped_usage_tables(&pre);
+            let row = real_codex_turn_counters(
+                tempfile::tempdir().unwrap().path(),
+                "r14m1c",
+                "t1",
+                1000,
+                100,
+                &at,
+            );
+            insert_main_turn_with_journal(&pre, "ins_r14m1c", 1, "t1", &row, &at);
+            insert_main_turn_with_journal(&pre, "ins_r14m1c", 5, "t1", &row, &at);
+            // Sabotage the unique-index create that runs LAST in the
+            // migration batch.
+            pre.execute_batch("CREATE TABLE usage_events_turn_dedupe(x TEXT NOT NULL);")
+                .unwrap();
+        }
+
+        // The opener logs the failure and opens anyway — twice, since the
+        // collision persists across reopens.
+        let store = crate::store::Store::open(dir.path())
+            .expect("Hub store opens despite the failed, rolled-back migration");
+        drop(store);
+        let _store2 = crate::store::Store::open(dir.path())
+            .expect("a reopen opens on the legacy shape as well");
+        drop(_store2);
+
+        // Full rollback: the old shape is untouched — no scope_id column was
+        // added (the ALTER TABLE rolled back with the failed transaction),
+        // neither dedupe index exists, and both original rows survive.
+        let check = Connection::open(&db_path).unwrap();
+        let columns: i64 = check
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('usage_events')
+                 WHERE name IN ('scope_id','turn_id','metric_revision')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            columns, 0,
+            "the schema-changing migration fully rolled back"
+        );
+        let dedupe_indexes: i64 = check
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index'
+                   AND name IN ('usage_events_turn_dedupe','usage_events_message_dedupe')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dedupe_indexes, 0, "no unique index was committed");
+        let row_count: i64 = check
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE instance_id='ins_r14m1c'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            row_count, 2,
+            "neither original row was collapsed or deleted"
+        );
     }
 
     #[test]

@@ -7245,7 +7245,16 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     crate::supply::migrate(&conn)?;
     crate::workers::migrate(&conn)?;
     crate::gatequeue::migrate(&conn)?;
-    crate::usage_store::migrate(&conn)?;
+    // c-usagefu r14 item 1 (Ruling M1): a failed usage migration must never
+    // brick Hub startup. The migration is one transaction and rolls back to
+    // the previously-openable shape on any error; log it and open. Usage
+    // accounting degrades until a successful migration, but the Hub serves.
+    if let Err(error) = crate::usage_store::migrate(&conn) {
+        tracing::error!(
+            %error,
+            "usage_events migration failed and rolled back; opening on the legacy usage shape"
+        );
+    }
     migrate_provider_models(&conn)?;
     crate::store_tickets::migrate(&conn)?;
     dedup_duplicate_hosts(&conn)?;

@@ -111,7 +111,7 @@ pub struct SourceResume {
 }
 
 /// Byte-offset JSONL tail with rotation / prefix-rewrite detection.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FileTail {
     path: PathBuf,
     identity: Id,
@@ -131,10 +131,19 @@ pub struct FileTail {
     /// EVERY open by poll or peek revalidates the whole set against the
     /// opened file before any record is folded.
     covers: CoverSet,
+    /// Test-only seam fired on EVERY open AFTER the stat/rotation check and
+    /// BEFORE the unread bytes are read, so a test can deterministically
+    /// append bytes inside the metadata()/read_to_end() window.
+    #[cfg(test)]
+    after_stat_before_read: Option<OpenGapHook>,
 }
 
 /// Completed JSONL lines with their file cursors, as a poll folds them.
 type PolledLines = Vec<(Vec<u8>, FileCursor)>;
+
+/// Test-only seam fired inside an open between the stat and the unread read.
+#[cfg(test)]
+type OpenGapHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
 
 /// An opened journal after rotation normalisation: `rest` is the unread
 /// content from the effective cursor in the effective generation.
@@ -142,6 +151,20 @@ struct OpenedTail {
     file: File,
     rest: Vec<u8>,
     file_id: FileId,
+}
+
+impl std::fmt::Debug for FileTail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileTail")
+            .field("path", &self.path)
+            .field("identity", &self.identity)
+            .field("generation", &self.generation)
+            .field("offset", &self.offset)
+            .field("last_len", &self.last_len)
+            .field("file_id", &self.file_id)
+            .field("covers", &self.covers)
+            .finish()
+    }
 }
 
 impl FileTail {
@@ -156,6 +179,8 @@ impl FileTail {
             last_len: None,
             file_id: None,
             covers: CoverSet::new(),
+            #[cfg(test)]
+            after_stat_before_read: None,
         })
     }
 
@@ -180,6 +205,8 @@ impl FileTail {
             last_len: None,
             file_id: None,
             covers: CoverSet::new(),
+            #[cfg(test)]
+            after_stat_before_read: None,
         })
     }
 
@@ -194,6 +221,8 @@ impl FileTail {
             last_len: None,
             file_id: None,
             covers: CoverSet::new(),
+            #[cfg(test)]
+            after_stat_before_read: None,
         }
     }
 
@@ -325,6 +354,20 @@ impl FileTail {
         &self.covers
     }
 
+    /// Test-only: install a hook fired inside each open between the stat and
+    /// the unread-bytes read, so bytes appended in that window are read by the
+    /// SAME open. Deterministic stand-in for the metadata/read race.
+    #[cfg(test)]
+    pub(crate) fn set_open_gap_hook(&mut self, hook: impl Fn(&Path) + Send + Sync + 'static) {
+        self.after_stat_before_read = Some(std::sync::Arc::new(hook));
+    }
+
+    /// Test-only: remove the open-gap hook.
+    #[cfg(test)]
+    pub(crate) fn clear_open_gap_hook(&mut self) {
+        self.after_stat_before_read = None;
+    }
+
     /// Retire covers whose record the fold just reached (any member, any
     /// record type). Called by the workflow fold after EACH consumed line, in
     /// fold order, so a start appended after the covered record still
@@ -401,7 +444,7 @@ impl FileTail {
             Ok(file) => file,
         };
         let metadata = file.metadata()?;
-        let len = metadata.len();
+        let stat_len = metadata.len();
         let opened_id = FileId {
             dev: metadata.dev(),
             ino: metadata.ino(),
@@ -411,11 +454,24 @@ impl FileTail {
         // open so detect_rotation (and the cover revalidation below) can act
         // before any record is folded.
         let replaced = self.file_id.is_some_and(|id| id != opened_id);
-        self.detect_rotation(&mut file, len, replaced)?;
+        self.detect_rotation(&mut file, stat_len, replaced)?;
         let rest_base = self.offset;
+        // Test seam: bytes appended here land between the stat above and the
+        // read below, i.e. inside the real metadata/read race window.
+        #[cfg(test)]
+        if let Some(hook) = &self.after_stat_before_read {
+            hook(&self.path);
+        }
         file.seek(SeekFrom::Start(rest_base))?;
         let mut rest = Vec::new();
         file.read_to_end(&mut rest)?;
+        // Validation AND growth must use the extent of the byte SNAPSHOT just
+        // read (rest_base + rest.len()), not the stat length: bytes appended
+        // between metadata() and read_to_end() are in `rest` and pending tails
+        // must grow over them in this observation, or a later shrink back to
+        // the stat extent would be missed and a different retry wrongly
+        // covered.
+        let len = rest_base + rest.len() as u64;
         // Remember the observed extent and identity for the next open.
         self.last_len = Some(len);
         self.file_id = Some(opened_id);
@@ -734,5 +790,110 @@ mod torn_start_tests {
             br#"{"type":"\"failed\"","key":"v2:k","agentId":"a1""#,
             "a1"
         ));
+    }
+}
+
+#[cfg(test)]
+mod open_snapshot_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const PREFIX: &[u8] = br#"{"type":"started","key":"v2:k","agentId":"a1"}
+{"type":"failed","key":"v2:k","agentId":"a1"}
+"#;
+
+    /// c-cardsettle-fu2 r10 item 3: bytes appended between metadata() and
+    /// read_to_end() of one open are in the byte snapshot, so a pending cover
+    /// must GROW over them using rest_base + rest.len(), not the earlier stat
+    /// length. With growth recorded, the writer shrinking back to the armed
+    /// extent invalidates the cover and the later different retry is not
+    /// settled by it.
+    #[test]
+    fn bytes_appended_between_stat_and_read_grow_the_pending_cover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        std::fs::write(&path, PREFIX).unwrap();
+        let w = PREFIX.len() as u64;
+
+        let mut tail = FileTail::new(&path).unwrap();
+        assert_eq!(tail.poll().unwrap().len(), 2, "prefix consumed");
+        assert_eq!(tail.offset(), w);
+
+        // The failure peek arms a pending cover over the lone brace.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{")
+            .unwrap();
+        assert_eq!(tail.unread_start("a1").unwrap().len(), 1);
+
+        // Next open: the stat still sees W+1, but the continuation is appended
+        // inside the stat/read window and read by the SAME open.
+        let grown = br#""type":"started","key":"v2:k","agentId":"a1""#;
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_in = fired.clone();
+        tail.set_open_gap_hook(move |path| {
+            if !fired_in.swap(true, Ordering::SeqCst) {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .unwrap()
+                    .write_all(grown)
+                    .unwrap();
+            }
+        });
+        assert!(tail.poll().unwrap().is_empty(), "no newline yet");
+        tail.clear_open_gap_hook();
+        assert!(fired.load(Ordering::SeqCst), "the gap hook fired");
+
+        let cover = tail
+            .covers()
+            .for_agent("a1")
+            .next()
+            .expect("the cover survives the growth");
+        assert_eq!(
+            cover.extent,
+            w + 1 + grown.len() as u64,
+            "the cover grew over the bytes read between stat and read_to_end"
+        );
+        assert!(cover.bytes.ends_with(grown));
+
+        // Writer shrinks back to the ORIGINAL armed extent (just "{").
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(w + 1).unwrap();
+        drop(file);
+        assert!(tail.poll().unwrap().is_empty());
+        assert!(
+            tail.covers().for_agent("a1").next().is_none(),
+            "the shrink through the GROWN extent invalidates the cover"
+        );
+
+        // A DIFFERENT retry completes the surviving brace; the retired cover
+        // must not settle it.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                b"\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"genuine\"}\n",
+            )
+            .unwrap();
+        let lines = tail.poll().unwrap();
+        assert_eq!(lines.len(), 1);
+        let (line, cursor) = &lines[0];
+        assert_eq!(cursor.offset.0, w);
+        assert!(
+            !tail.covers().settles(
+                "a1",
+                cursor.file_generation.0,
+                cursor.offset.0,
+                &cursor.digest,
+                line
+            ),
+            "the different retry is genuine, not settled by the retired cover"
+        );
     }
 }

@@ -173,10 +173,13 @@ pub enum ChildDisposition {
 /// Classify one direct child from its Linux `/proc/<pid>/stat` contents and a
 /// signal-0 probe result.
 ///
-/// `stat` is the raw read result: ENOENT means gone; ANY OTHER read error
-/// falls through to the signal-0 probe and can only ever yield
-/// [`ChildDisposition::Gone`] on a confirming `ESRCH` — existence (`Ok`)
-/// under an unreadable `/proc` is [`ChildDisposition::Unknown`], never death.
+/// EVERY `/proc` read failure — INCLUDING `NotFound` — falls through to the
+/// signal-0 probe. ENOENT normally means the pid was reaped, but inside a
+/// chroot or mount namespace `/proc/<pid>` is absent while the child is very
+/// much alive, so the read result alone is never death:
+/// [`ChildDisposition::Gone`] requires a confirming `ESRCH`, while existence
+/// (`Ok`) or `EPERM` under an unreadable `/proc` is
+/// [`ChildDisposition::Unknown`] (r15 item 3).
 #[cfg(target_os = "linux")]
 pub(crate) fn classify_linux_child(
     stat: std::io::Result<String>,
@@ -184,11 +187,12 @@ pub(crate) fn classify_linux_child(
 ) -> ChildDisposition {
     match stat {
         Ok(text) => classify_linux_stat(&text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ChildDisposition::Gone,
         Err(_) => match signal0 {
-            // The process exists but /proc would not say in what state: that is
-            // unavailable information, not evidence of death.
+            // The process exists (or /proc itself is hidden from this
+            // namespace) but /proc would not say in what state: unavailable
+            // information, not evidence of death.
             Ok(()) | Err(nix::errno::Errno::EPERM) => ChildDisposition::Unknown,
+            // ENOENT plus a confirming ESRCH is the normal reaped/gone case.
             Err(nix::errno::Errno::ESRCH) => ChildDisposition::Gone,
             Err(_) => ChildDisposition::Unknown,
         },
@@ -268,9 +272,9 @@ pub(crate) fn parse_ps_pid_state(bytes: &[u8], wanted: i32) -> Option<String> {
 ///
 /// * **Linux**: `/proc/<pid>/stat` distinguishes a live child from an
 ///   unreaped zombie — exactly the state a SIGKILLed child sits in before its
-///   parent's `wait()` — and ENOENT means reaped/gone. Any read failure,
-///   INCLUDING ENOENT (a chroot or mount namespace can hide all of `/proc`),
-///   is confirmed against signal 0 instead of being assumed to be death.
+///   parent's `wait()`. Any read failure, INCLUDING ENOENT (a chroot or mount
+///   namespace can hide all of `/proc` while the child lives), is confirmed
+///   against signal 0: gone needs a matching `ESRCH`.
 /// * **macOS/other unix**: there is no `/proc`; signal 0 asks the kernel
 ///   whether the pid exists and `ps` supplies the state signal 0 cannot:
 ///   `ESRCH` is gone/reaped, a dead-state row (`Z`/`E`/`?Es`) is an unreaped
@@ -1362,10 +1366,26 @@ mod child_disposition_tests {
     }
 
     #[test]
-    fn a_missing_proc_entry_is_gone() {
+    fn a_missing_proc_entry_is_gone_only_with_a_confirming_esrch() {
         assert_eq!(
             classify_linux_child(ioerr(ErrorKind::NotFound), Err(nix::errno::Errno::ESRCH)),
             ChildDisposition::Gone
+        );
+    }
+
+    #[test]
+    fn a_hidden_proc_notfound_while_signal0_succeeds_is_unknown() {
+        // r15 item 3: inside a chroot or mount namespace /proc/<pid> is
+        // ENOENT while the child is alive. ENOENT is a /proc read error like
+        // any other — existence (Ok) or EPERM must read Unknown, never Gone.
+        assert_eq!(
+            classify_linux_child(ioerr(ErrorKind::NotFound), Ok(())),
+            ChildDisposition::Unknown,
+            "ENOENT + a live signal-0 answer: /proc is hidden, not the child gone"
+        );
+        assert_eq!(
+            classify_linux_child(ioerr(ErrorKind::NotFound), Err(nix::errno::Errno::EPERM)),
+            ChildDisposition::Unknown
         );
     }
 

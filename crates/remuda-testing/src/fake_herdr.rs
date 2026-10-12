@@ -159,6 +159,12 @@ pub struct FakeHerdrOptions {
     ///   state is swapped first and the close is then processed against the
     ///   replacement boot — the gap-race model that kills the foreign pane.
     pub restart_barrier_on_close: bool,
+    /// 1-based ordinal of the `pane.close` the restart barrier fires on
+    /// (c-ctxusage r16 item 1). Default 1 keeps the r15 behaviour (the first
+    /// close). Set 2 for the force-then-reap model: the forced pane.close
+    /// (interrupt phase) completes, and the barrier fires on the reap phase's
+    /// first pane.close instead.
+    pub restart_barrier_close_ordinal: u32,
     /// Accept an `events.subscribe` connection but never send the
     /// subscription_started ack (c-ctxusage r15 item 6). The connection parks
     /// forever; other connections keep being served. Models a carrier wedged
@@ -186,6 +192,7 @@ impl FakeHerdrOptions {
             force_close_record_file: None,
             restart_reuses_ids_on_ctrlc: false,
             restart_barrier_on_close: false,
+            restart_barrier_close_ordinal: 1,
             subscribe_never_acks: false,
         }
     }
@@ -262,6 +269,16 @@ impl FakeHerdrOptions {
     #[must_use]
     pub fn restart_barrier_on_close(mut self) -> Self {
         self.restart_barrier_on_close = true;
+        self
+    }
+
+    /// Fire the restart barrier on the NTH `pane.close` instead of the first
+    /// (c-ctxusage r16 item 1). Models a replacement server appearing during
+    /// REAP after the interrupt phase's forced pane.close already succeeded.
+    #[must_use]
+    pub fn restart_barrier_on_nth_close(mut self, ordinal: u32) -> Self {
+        self.restart_barrier_on_close = true;
+        self.restart_barrier_close_ordinal = ordinal.max(1);
         self
     }
 
@@ -360,6 +377,10 @@ impl FakeHerdrServer {
         }
         if options.restart_barrier_on_close {
             command.env("FAKE_HERDR_RESTART_BARRIER_ON_CLOSE", "1");
+            command.env(
+                "FAKE_HERDR_RESTART_BARRIER_CLOSE_ORDINAL",
+                options.restart_barrier_close_ordinal.to_string(),
+            );
         }
         if options.subscribe_never_acks {
             command.env("FAKE_HERDR_SUBSCRIBE_NEVER_ACKS", "1");
@@ -543,6 +564,12 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
     let mut restart_barrier_on_close = std::env::var("FAKE_HERDR_RESTART_BARRIER_ON_CLOSE")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
+    let mut restart_barrier_close_ordinal: u32 =
+        std::env::var("FAKE_HERDR_RESTART_BARRIER_CLOSE_ORDINAL")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1)
+            .max(1);
     let mut subscribe_never_acks = std::env::var("FAKE_HERDR_SUBSCRIBE_NEVER_ACKS")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
     let mut positional = Vec::new();
@@ -599,6 +626,18 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             "--exit-after-unavailable" => exit_after_unavailable = true,
             "--restart-reuses-ids-on-ctrlc" => restart_reuses_ids_on_ctrlc = true,
             "--restart-barrier-on-close" => restart_barrier_on_close = true,
+            "--restart-barrier-nth-close" => {
+                restart_barrier_on_close = true;
+                i += 1;
+                restart_barrier_close_ordinal = args
+                    .get(i)
+                    .ok_or_else(|| {
+                        FakeHerdrError::Args("missing --restart-barrier-nth-close".into())
+                    })?
+                    .parse::<u32>()
+                    .map_err(|_| FakeHerdrError::Args("bad --restart-barrier-nth-close".into()))?
+                    .max(1);
+            }
             "--subscribe-never-acks" => subscribe_never_acks = true,
             "--session" | "--takeover" => {
                 if args[i] == "--session" {
@@ -642,6 +681,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             force_close_record_file,
             restart_reuses_ids_on_ctrlc,
             restart_barrier_on_close,
+            restart_barrier_close_ordinal,
             subscribe_never_acks,
         }));
     }
@@ -755,6 +795,7 @@ async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
         options.force_close_record_file,
         options.restart_reuses_ids_on_ctrlc,
         options.restart_barrier_on_close,
+        options.restart_barrier_close_ordinal,
         options.subscribe_never_acks,
     )));
     // Only the scripted shutdown window (`exit_after_unavailable`) stops the
@@ -820,6 +861,10 @@ struct State {
     restart_done: bool,
     /// Restart barrier on the close path (c-ctxusage r15 item 1).
     restart_barrier_on_close: bool,
+    /// 1-based ordinal of the pane.close the barrier fires on (r16 item 1).
+    close_barrier_ordinal: u32,
+    /// pane.close calls seen since boot, compared against the ordinal.
+    pane_closes_seen: u32,
     /// The close barrier fires once.
     close_barrier_done: bool,
     /// Accept events.subscribe but never acknowledge it (r15 item 6).
@@ -841,6 +886,7 @@ impl State {
         force_close_record_file: Option<PathBuf>,
         restart_on_ctrlc: bool,
         restart_barrier_on_close: bool,
+        close_barrier_ordinal: u32,
         subscribe_never_acks: bool,
     ) -> Self {
         Self {
@@ -868,6 +914,8 @@ impl State {
             restart_on_ctrlc,
             restart_done: false,
             restart_barrier_on_close,
+            close_barrier_ordinal,
+            pane_closes_seen: 0,
             close_barrier_done: false,
             subscribe_never_acks,
             server_generation: 1,
@@ -985,18 +1033,25 @@ async fn handle_conn(
             let delay = lock_state(&state)?.agent_start_delay;
             tokio::time::sleep(delay).await;
         }
-        // c-ctxusage r15 item 1: restart barrier between the ownership audit
-        // and the destructive close. Fires once. On a connection that served
-        // the audit snapshot, the boot is replaced (state swapped to the
-        // foreign-labelled reuse) and the dying server's connection is closed
-        // WITHOUT processing pane.close: the close never lands. On a
+        // c-ctxusage r15 item 1 / r16 item 1: restart barrier between the
+        // ownership audit and the destructive close. Fires once, on the
+        // configured pane.close ordinal (default the first; r16 uses the
+        // second to model the replacement appearing during REAP, after the
+        // interrupt phase's forced close already succeeded). On a connection
+        // that served the audit snapshot, the boot is replaced (state swapped
+        // to the foreign-labelled reuse) and the dying server's connection is
+        // closed WITHOUT processing pane.close: the close never lands. On a
         // one-RPC-per-call client the close lands against the replacement
         // boot and removes the foreign pane — the race this guard exists to
         // make unrepresentable.
         if req.method == "pane.close" {
             let kill_conn_after_swap = {
                 let mut st = lock_state(&state)?;
-                if st.restart_barrier_on_close && !st.close_barrier_done {
+                st.pane_closes_seen = st.pane_closes_seen.saturating_add(1);
+                if st.restart_barrier_on_close
+                    && !st.close_barrier_done
+                    && st.pane_closes_seen >= st.close_barrier_ordinal
+                {
                     let pane_id = req
                         .params
                         .get("pane_id")
@@ -1522,13 +1577,22 @@ fn simulate_restart_with_id_reuse(st: &mut State, wanted_pane_id: &str) {
     let root = blank_pane(&ws_id, &tab_id, &root_id, "/tmp/foreign-work", true);
     st.screens.insert(root_id.clone(), "$ \n".to_string());
     st.panes.insert(root_id, root);
-    // Deterministic ids restart at w1:p1: allocate until the fresh boot has
-    // handed out the SAME pane id the predecessor's agent lived on (it was a
-    // split pane — root shell p1, agent p2). Bounded, so an unexpected id
-    // shape still leaves the foreign agent live on a real pane.
+    // Deterministic ids restart at w1:p1: the fresh boot hands its root shell
+    // to p1 and starts its own live agent on p2 — the SAME split layout the
+    // predecessor used. When the barrier fires on a FORCED agent-pane close
+    // the wanted id is that pane (p2); when it fires on a REAP close the
+    // wanted id is the surviving root pane p1, and the foreign agent must
+    // still land canonically on p2 (c-ctxusage r16 item 1). Allocate until
+    // the wanted id; bounded, so an unexpected id shape still leaves the
+    // foreign agent live on a real pane.
+    let target_pane_id = if wanted_pane_id == "w1:p1" {
+        "w1:p2"
+    } else {
+        wanted_pane_id
+    };
     let mut agent_pane_id = st.alloc_pane(&ws_id);
     for _ in 0..16 {
-        if agent_pane_id == wanted_pane_id {
+        if agent_pane_id == target_pane_id {
             break;
         }
         let extra = blank_pane(&ws_id, &tab_id, &agent_pane_id, "/tmp/foreign-work", false);

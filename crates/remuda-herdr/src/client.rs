@@ -489,6 +489,84 @@ impl PersistentClient {
         )
         .await
     }
+
+    /// `tab.close` on the held connection. Same uncertain-outcome rule as
+    /// [`Self::pane_close`]: never replayed on another connection.
+    pub async fn tab_close(&mut self, tab_id: impl Into<String>) -> Result<OkResult, Error> {
+        self.typed(
+            "tab.close",
+            serde_json::to_value(TabTarget {
+                tab_id: tab_id.into(),
+            })?,
+            "ok",
+        )
+        .await
+    }
+
+    /// `workspace.close` on the held connection. Same uncertain-outcome rule
+    /// as [`Self::pane_close`].
+    pub async fn workspace_close(
+        &mut self,
+        workspace_id: impl Into<String>,
+    ) -> Result<OkResult, Error> {
+        self.typed(
+            "workspace.close",
+            json!({"workspace_id": workspace_id.into()}),
+            "ok",
+        )
+        .await
+    }
+
+    /// `pane.send_keys` on the held connection. Used for the polite-stop
+    /// Ctrl-C: a disconnect after the write means the keystroke may have
+    /// reached a dying server and the close outcome is unknown.
+    pub async fn pane_send_keys(
+        &mut self,
+        pane_id: impl Into<String>,
+        keys: Vec<String>,
+    ) -> Result<OkResult, Error> {
+        self.typed(
+            "pane.send_keys",
+            serde_json::to_value(PaneSendKeysParams {
+                pane_id: pane_id.into(),
+                keys,
+            })?,
+            "ok",
+        )
+        .await
+    }
+
+    /// `pane.send_text` on the held connection. The polite-stop shell `exit`
+    /// is destructive (it closes the foreground shell), so the same
+    /// uncertain-outcome rule applies.
+    pub async fn pane_send_text(
+        &mut self,
+        pane_id: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<OkResult, Error> {
+        self.typed(
+            "pane.send_text",
+            serde_json::to_value(PaneSendTextParams {
+                pane_id: pane_id.into(),
+                text: text.into(),
+            })?,
+            "ok",
+        )
+        .await
+    }
+
+    /// `pane.process_info` on the held connection.
+    pub async fn pane_process_info(
+        &mut self,
+        pane_id: Option<String>,
+    ) -> Result<PaneProcessInfoResult, Error> {
+        self.typed(
+            "pane.process_info",
+            serde_json::to_value(PaneProcessInfoParams { pane_id })?,
+            "pane_process_info",
+        )
+        .await
+    }
 }
 
 async fn read_events(

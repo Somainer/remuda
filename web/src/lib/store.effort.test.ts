@@ -2644,3 +2644,114 @@ it("r12 item 3: a wire pending with no parseable queued bound fails closed", asy
     "no trustworthy lower bound: fail closed, stay pending",
   ).not.toBeNull();
 });
+
+async function advanceEffortReconcile(ms: number) {
+  // Full fake timers (Date stays pinned at the startFollowing clock) so the
+  // 15 s bounded reconciliation is deterministic and instant.
+  await vi.advanceTimersByTimeAsync(ms);
+  // Let the reconciliation's awaited refresh settle.
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+it("r12 item 5: an id-less accepted no-op surfaces an explicit unconfirmed outcome at the bound", async () => {
+  const ctx = await startFollowing("r12-item5-unconfirmed", { state: "known", value: "idle" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // The id-less driver never projects anything newer: every list fold returns
+  // the unchanged baseline, which its mapper would have suppressed anyway.
+  const baseline: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "low", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [baseline] } as never);
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+  // Full fake timers from the request onward (Date keeps the pinned value).
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
+  const p = hubStore.setEffort(ctx.instance.id, { index: 1, name: "low", kind: "claude", ultracode: false });
+  await advanceEffortReconcile(0);
+  await p;
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.name, "the no-op request starts pending").toBe("low");
+
+  // Before the bounded reconciliation: still a silent pending.
+  await advanceEffortReconcile(14_999);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
+  expect(toast).not.toHaveBeenCalled();
+
+  // At the bound the fresh read-back still shows no newer evidence: surface
+  // unconfirmed instead of waiting the 30-minute max age.
+  await advanceEffortReconcile(2);
+  expect(hubStore.effortPendingOf(ctx.instance.id), "unconfirmed ends the pending").toBeNull();
+  const message = toast.mock.calls[0]?.[0] ?? "";
+  expect(message, "the outcome is explicitly labelled unconfirmed").toContain("未确认");
+  // No refusal evidence and the no-op targeted the observed state: the chosen
+  // selection is kept rather than rolled back.
+  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("low");
+});
+
+it("r12 item 5: a fresh post-command read-back at the bound settles the id-less request (no unconfirmed)", async () => {
+  const ctx = await startFollowing("r12-item5-readback", { state: "known", value: "idle" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const baseline: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "low", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
+  };
+  let listed: Instance = baseline;
+  vi.spyOn(api, "instanceList").mockImplementation(async () => ({ items: [listed] }) as never);
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
+  const p = hubStore.setEffort(ctx.instance.id, { index: 1, name: "low", kind: "claude", ultracode: false });
+  await advanceEffortReconcile(0);
+  await p;
+  expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
+
+  // The bound arrives and requests a FRESH read-back: it now carries newer,
+  // value-matching evidence and settles through the strict fallback.
+  listed = {
+    ...ctx.instance,
+    effortEffective: { name: "low", ultracode: false, source: "remuda", observedAt: "2026-09-16T00:00:20.000Z" },
+  };
+  await advanceEffortReconcile(15_001);
+  expect(hubStore.effortPendingOf(ctx.instance.id), "the fresh read-back settles").toBeNull();
+  expect(toast, "a settled request is never reported unconfirmed").not.toHaveBeenCalled();
+});
+
+it("r12 item 5: a still-queued request gets one bounded extension and is never called unconfirmed", async () => {
+  const ctx = await startFollowing("r12-item5-queued", { state: "known", value: "working" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const baseline: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "low", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
+  };
+  let listCalls = 0;
+  vi.spyOn(api, "instanceList").mockImplementation(async () => {
+    listCalls += 1;
+    return { items: [baseline] } as never;
+  });
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
+  const p = hubStore.setEffort(ctx.instance.id, { index: 1, name: "low", kind: "claude", ultracode: false });
+  await advanceEffortReconcile(0);
+  await p;
+  const listsAfterPost = listCalls;
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
+
+  // First bound while the turn is still running: extend without reconciling.
+  await advanceEffortReconcile(15_001);
+  expect(listCalls, "a queued request is not reconciled at the first bound").toBe(listsAfterPost);
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
+
+  // Second bound, still queued: stop the timer but leave the pending to the
+  // long-turn backstop — never an unconfirmed toast.
+  await advanceEffortReconcile(15_001);
+  expect(hubStore.effortPendingOf(ctx.instance.id), "the long-turn pending stays").not.toBeNull();
+  expect(toast).not.toHaveBeenCalled();
+});

@@ -212,6 +212,18 @@ const EFFORT_REQUEST_ID_KEY = "effortRequestId";
 const EFFORT_PENDING_MAX_AGE_MS = 30 * 60_000;
 
 /**
+ * c-effortread r12 item 5: bounded, request-owned reconciliation for an
+ * ID-LESS driver. An older driver that accepts a no-op (the target already
+ * equals the observed state) emits no completion id, and its mapper suppresses
+ * unchanged observations — without this bound the chip sat on 切换中 for the
+ * whole 30-minute max age. The bound mirrors the driver's own read-back window
+ * (10s) plus a delivery margin: at the bound we request one fresh read-back
+ * (the strict fallback settles a real switch) or surface an explicit
+ * "unconfirmed" outcome — never a silent pending.
+ */
+const EFFORT_UNCONFIRMED_BOUND_MS = 15_000;
+
+/**
  * Bulk screen reads fan out one per listed row; cap the fan-out so even a long
  * list (the 2026-09-19 phone repro) stays far under the Hub's per-Node
  * bulk-read sub-budget and can never press the control reservation.
@@ -1011,6 +1023,16 @@ class HubStore {
   private settlementRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   /** Dev/observability: how many settlement frames THIS store handled. */
   private settlementCount = 0;
+  /**
+   * c-effortread r12 item 5: per-instance bounded reconciliation timers for
+   * client effort requests, keyed by instance and owned by their nonce. A
+   * newer request replaces the slot (the old timer is cancelled); a settled
+   * request's timer fires into a no-op.
+   */
+  private effortReconcileTimers = new Map<
+    Id,
+    { nonce: number; timer: ReturnType<typeof setTimeout>; extended: boolean }
+  >();
 
   subscribe = (listener: Listener) => {
     this.listeners.add(listener);
@@ -2864,6 +2886,8 @@ class HubStore {
     for (const [, t] of this.heldRetryTimer) clearTimeout(t);
     this.heldRetryTimer.clear();
     this.heldRetryAttempt.clear();
+    for (const [, slot] of this.effortReconcileTimers) clearTimeout(slot.timer);
+    this.effortReconcileTimers.clear();
     if (this.unloadClearTimer) {
       clearTimeout(this.unloadClearTimer);
       this.unloadClearTimer = null;
@@ -4362,6 +4386,72 @@ class HubStore {
     return requested;
   }
 
+  /**
+   * c-effortread r12 item 5: arm the bounded, request-owned reconciliation for
+   * one client configure. New drivers settle the request from its echoed id
+   * well before the bound, at which point the timer fires into a no-op. An
+   * ID-LESS older driver needs this path: its accepted no-op emits no
+   * completion id and its mapper suppresses unchanged observations.
+   */
+  private armEffortReconciliation(instanceId: Id, nonce: number) {
+    const existing = this.effortReconcileTimers.get(instanceId);
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(() => {
+      void this.runEffortReconciliation(instanceId, nonce);
+    }, EFFORT_UNCONFIRMED_BOUND_MS);
+    this.effortReconcileTimers.set(instanceId, { nonce, timer, extended: false });
+  }
+
+  /**
+   * Bound expiry for one effort request: request a FRESH post-command
+   * read-back (the durable projection folds through the strict legacy
+   * fallback), then either let the settle stand or surface an explicit
+   * "unconfirmed" outcome. A request still queued behind a running turn gets
+   * one bounded extension; after that the long-turn max-age backstop owns it.
+   */
+  private async runEffortReconciliation(instanceId: Id, nonce: number) {
+    const slot = this.effortReconcileTimers.get(instanceId);
+    const pendingNow = this.state.effortPending[instanceId];
+    // Settled/failed, or replaced by a newer request (which armed its own
+    // slot): never touch another request's pending.
+    if (!pendingNow || pendingNow.nonce !== nonce) {
+      if (slot?.nonce === nonce) this.effortReconcileTimers.delete(instanceId);
+      return;
+    }
+    if (pendingNow.queued && slot && !slot.extended) {
+      const timer = setTimeout(() => {
+        void this.runEffortReconciliation(instanceId, nonce);
+      }, EFFORT_UNCONFIRMED_BOUND_MS);
+      this.effortReconcileTimers.set(instanceId, { nonce, timer, extended: true });
+      return;
+    }
+    // One fresh authoritative read-back: an id-less success settles here via
+    // the strict read-back fallback in hydrateEffortEffective.
+    await this.refresh().catch(() => undefined);
+    const after = this.state.effortPending[instanceId];
+    if (!after || after.nonce !== nonce) {
+      this.effortReconcileTimers.delete(instanceId);
+      return;
+    }
+    if (after.queued) {
+      // Still queued after the extension (a genuinely long turn): leave the
+      // chip to the 30-minute backstop rather than calling it unconfirmed.
+      this.effortReconcileTimers.delete(instanceId);
+      return;
+    }
+    // No fresh evidence within the bound: stop the silent 切换中 explicitly.
+    // Keep the optimistic selection — there is no refusal evidence, and an
+    // accepted no-op targeted the observed state — and say so in a toast.
+    const pendingNext = { ...this.state.effortPending };
+    delete pendingNext[instanceId];
+    this.settledEffortPushdown.delete(instanceId);
+    this.emit({ effortPending: pendingNext });
+    this.effortReconcileTimers.delete(instanceId);
+    this.toast(
+      `effort 切换结果未确认：驱动未在时限内回读 ${after.name}${after.ultracode ? " · ultracode" : ""}，已保留所选档位，请核对实际状态`,
+    );
+  }
+
   async setEffort(instanceId: Id, effortIn: EffortSelection, axis: EffortAxis = "tier") {
     const effort = this.gateLiveEffort(instanceId, effortIn);
     const instance = this.state.instances.find((row) => row.id === instanceId);
@@ -4434,6 +4524,12 @@ class HubStore {
       // follow frame was gapped/coalesced; the 2s poll keeps settling it if
       // this read races. Bounded by one network round trip — no timer.
       await this.refresh().catch(() => undefined);
+      // c-effortread r12 item 5: arm the bounded reconciliation. A new
+      // driver's id-bearing completion settles the request long before the
+      // bound; an id-less driver's silent accepted no-op gets one more fresh
+      // read-back and then an explicit unconfirmed outcome instead of sitting
+      // on 切换中 for the 30-minute max age.
+      this.armEffortReconciliation(instanceId, nonce);
     } catch (error) {
       // A failed configure (offline node, network, 4xx) must not leave an
       // optimistic tier/flag, an unhandled rejection, or a stuck indicator.

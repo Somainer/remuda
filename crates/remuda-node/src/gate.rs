@@ -778,18 +778,19 @@ impl GateRegistry {
         let dir = self.land_fence_dir.clone();
         let job_id = job_id.to_owned();
         let _ = tokio::task::spawn_blocking(move || {
-            if land_group_exists(pgid) {
+            // The graceful TERM pass (if one was owed) already ran; any member
+            // still here after the leader was reaped gets KILL, then verify
+            // ESRCH/only-zombies before releasing the fence record.
+            if !land_group_cleared(pgid) {
                 use nix::sys::signal::{Signal, killpg};
                 use nix::unistd::Pid;
-                // The graceful TERM pass (if one was owed) already ran; any
-                // member still here after the leader was reaped gets KILL.
                 let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGKILL));
                 let deadline = Instant::now() + Duration::from_millis(500);
-                while Instant::now() < deadline && land_group_exists(pgid) {
+                while Instant::now() < deadline && !land_group_cleared(pgid) {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
-            if !land_group_exists(pgid) {
+            if land_group_cleared(pgid) {
                 remove_land_fence(&dir, &job_id);
             }
             // If ESRCH still cannot be proven (an unreaped zombie under a
@@ -1166,10 +1167,11 @@ impl DevNode {
             })?;
         let registry = self.gate_registry();
         let mut table = registry.runs.lock().await;
+        let mut group_to_kill: Option<i32> = None;
         if let Some(run) = table.runs.get(&request.job_id) {
             run.cancel.send(true).ok();
             if let Some(pgid) = *run.pgid.lock().unwrap_or_else(|poison| poison.into_inner()) {
-                kill_group(pgid);
+                group_to_kill = Some(pgid);
             }
         }
         // Record the canceled generation whether or not the run is registered
@@ -1180,6 +1182,11 @@ impl DevNode {
         // evicting an older job's authority.
         let recorded = table.record_cancel(&request.job_id, request.generation);
         drop(table);
+        // r14 item 4: force-kill a cancel that ignored TERM. Detached so the
+        // bounded kill never holds the registry lock or the RPC pump.
+        if let Some(pgid) = group_to_kill {
+            tokio::task::spawn_blocking(move || terminate_group(pgid));
+        }
         if !recorded {
             return Err(NodeError::InvalidRequest(format!(
                 "gate.cancel: too many canceled gate jobs ({MAX_CANCELED_RECORDS}); \
@@ -1595,8 +1602,12 @@ impl DevNode {
             pair = wait => pair,
             _ = cancel_rx.changed() => {
                 canceled = true;
-                if let Some(pgid) = *live.pgid.lock().unwrap_or_else(|poison| poison.into_inner()) {
-                    kill_group(pgid);
+                let pgid = *live.pgid.lock().unwrap_or_else(|poison| poison.into_inner());
+                if let Some(pgid) = pgid {
+                    // r14 item 4: a cancel gets the SAME guaranteed sequence as a
+                    // land timeout — TERM → bounded wait → KILL the whole
+                    // group → ESRCH. child.kill() then only reaps the leader.
+                    let _ = tokio::task::spawn_blocking(move || terminate_group(pgid)).await;
                 }
                 // Reap; stdout is dropped.
                 let _ = child.kill().await;
@@ -1605,8 +1616,11 @@ impl DevNode {
             }
             _ = tokio::time::sleep(Duration::from_secs(deadline)) => {
                 timed_out = true;
-                if let Some(pgid) = *live.pgid.lock().unwrap_or_else(|poison| poison.into_inner()) {
-                    kill_group(pgid);
+                let pgid = *live.pgid.lock().unwrap_or_else(|poison| poison.into_inner());
+                if let Some(pgid) = pgid {
+                    // A timeout must kill stubborn descendants, not just the
+                    // leader (r14 item 4): the bounded whole-group kill.
+                    let _ = tokio::task::spawn_blocking(move || terminate_group(pgid)).await;
                 }
                 let _ = child.kill().await;
                 let _ = child.wait().await;
@@ -2594,15 +2608,6 @@ fn git_output(repo: &Path, args: &[&str]) -> Result<String, String> {
     block_git(repo, args)
 }
 
-#[cfg(unix)]
-fn kill_group(pgid: i32) {
-    // Cancel path: best-effort TERM; completion is awaited by the caller's
-    // child.wait(). The synchronous bounded version is terminate_group().
-    use nix::sys::signal::{Signal, killpg};
-    use nix::unistd::Pid;
-    let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
-}
-
 // ── granted-land process-group fence (r14 R1) ──────────────────────────────
 //
 // A granted land child runs in its own process group with kill_on_drop(false):
@@ -2679,11 +2684,24 @@ fn remove_land_fence(dir: &std::path::Path, job_id: &str) {
     let _ = std::fs::remove_file(land_fence_path(dir, job_id));
 }
 
+/// True when no LIVE member of `pgid` remains. The kernel's killpg probe
+/// returning ESRCH proves it outright; if the group still exists (killpg
+/// succeeds) but every member the /proc scan can see is a ZOMBIE, the group is
+/// effectively dead too — the zombies are on their way to being reaped and can
+/// never run another instruction or push.
+#[cfg(unix)]
+fn land_group_cleared(pgid: i32) -> bool {
+    if !land_group_exists(pgid) {
+        return true;
+    }
+    alive_pids_in_group(pgid).is_empty()
+}
+
 /// SIGTERM a whole land group, boundedly wait for it to empty, then SIGKILL the
 /// WHOLE group with killpg (never an enumeration that could miss a member) and
-/// verify `killpg(pgid, 0) == ESRCH`. Returns false only when the group could
-/// not be proven gone within the kill grace (the record is then kept for the
-/// next boot's fence).
+/// verify the group is cleared (ESRCH or only unreaped zombies left). Returns
+/// false only when a LIVE member survives the kill grace (the fence record is
+/// then kept for the next boot's fence).
 #[cfg(unix)]
 fn terminate_and_verify_group(pgid: i32, term_grace: Duration) -> bool {
     use nix::sys::signal::{Signal, killpg};
@@ -2691,7 +2709,7 @@ fn terminate_and_verify_group(pgid: i32, term_grace: Duration) -> bool {
     let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGTERM));
     let term_deadline = Instant::now() + term_grace;
     while Instant::now() < term_deadline {
-        if !land_group_exists(pgid) {
+        if land_group_cleared(pgid) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -2700,12 +2718,12 @@ fn terminate_and_verify_group(pgid: i32, term_grace: Duration) -> bool {
     let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGKILL));
     let kill_deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < kill_deadline {
-        if !land_group_exists(pgid) {
+        if land_group_cleared(pgid) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    !land_group_exists(pgid)
+    land_group_cleared(pgid)
 }
 
 /// r14 R1 startup fence: every leftover record names a granted land group the
@@ -2806,29 +2824,18 @@ pub(crate) fn alive_pids_in_group(pgid: i32) -> Vec<i32> {
 /// this returns (a killed leader is a zombie until that wait). r13 item 5 — a
 /// detached 500 ms KILL used to leave a SIGTERM-ignoring descendant free to
 /// keep pushing while the Node reported a verdict.
+/// Terminate a whole process group SYNCHRONOUSLY with the guaranteed sequence
+/// (r14 item 4): SIGTERM the whole group (killpg, never a per-pid /proc list),
+/// wait boundedly for the group itself to disappear (`killpg(pgid, 0)` ==
+/// ESRCH — the kernel's own, authoritative answer, so a missing /proc or a
+/// transient empty enumeration can never skip the kill), then SIGKILL the WHOLE
+/// group unconditionally and wait again until ESRCH is proven. Returning early
+/// on the first empty scan used to let a SIGTERM-ignoring descendant (one
+/// /proc read away from the signal, or hidden by a /proc hiccup) survive and
+/// keep pushing. The caller reaps the group leader after this returns.
 #[cfg(unix)]
 fn terminate_group(pgid: i32) {
-    use nix::sys::signal::{Signal, kill, killpg};
-    use nix::unistd::Pid;
-    let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
-    let deadline = Instant::now() + LAND_GROUP_TERM_GRACE;
-    let mut survivors = Vec::new();
-    while Instant::now() < deadline {
-        survivors = alive_pids_in_group(pgid);
-        if survivors.is_empty() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    for pid in survivors {
-        let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-    }
-    // Give the kernel a beat to bury the SIGKILL'd (non-zombie) members; the
-    // land leader itself is reaped by the caller's child.wait().
-    let deadline = Instant::now() + Duration::from_millis(200);
-    while Instant::now() < deadline && !alive_pids_in_group(pgid).is_empty() {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let _ = terminate_and_verify_group(pgid, LAND_GROUP_TERM_GRACE);
 }
 
 /// Test-only accessor for the process-group liveness scan (r13 item 5).

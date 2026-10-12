@@ -2802,9 +2802,7 @@ impl TranscriptMapper {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return Ok(Vec::new());
         };
-        let position = self.auto_position;
-        self.auto_position += 1;
-        self.map_record_at(value, position)
+        self.map_record(value)
     }
 
     /// Map one transcript line at its file-relative RECORD position. The
@@ -3013,8 +3011,26 @@ impl TranscriptMapper {
     /// mapper's running [`Self::map_line`] ordinal). Direct callers modeling a
     /// transcript replay should prefer [`Self::map_record_at`] with the real
     /// file-relative position so turn authority survives a mapper reset.
-    pub fn map_record(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
+    /// Allocate this mapper's running automatic record position and advance
+    /// it exactly once. [`Self::map_line`] and [`Self::map_record`] share
+    /// this — a caller feeding decoded records directly gets the same
+    /// strictly increasing positions as the line parser, so successive
+    /// records can never reuse a position (c-ctxusage r15 item 8).
+    fn take_auto_position(&mut self) -> records::SourcePosition {
         let position = self.auto_position;
+        self.auto_position += 1;
+        position
+    }
+
+    /// Map one already-decoded transcript record at this mapper's running
+    /// automatic position. The automatic ordinal is allocated once here and
+    /// shared with [`Self::map_line`], so a record always advances the
+    /// ordinal exactly once regardless of which entry mapped it. Callers
+    /// that need the REPLAY-STABLE file-relative position (every transcript
+    /// pump, which a fresh mapper can replace) must use
+    /// [`Self::map_record_at`] instead.
+    pub fn map_record(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
+        let position = self.take_auto_position();
         self.map_record_at(value, position)
     }
 
@@ -4419,6 +4435,113 @@ mod process_end_startup_tests {
         assert_eq!(
             process_end_event(&shell_failed).map(|end| end.kind),
             Some(ProcessEndKind::Failed)
+        );
+    }
+}
+
+#[cfg(test)]
+mod auto_position_tests {
+    use super::*;
+    use remuda_protocol::{HostId, Id, RunId};
+    use serde_json::json;
+
+    fn mapper() -> TranscriptMapper {
+        TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "sess-auto-position".into(),
+            "2.1.289".into(),
+        )
+    }
+
+    fn assistant_at(position: u64) -> Value {
+        json!({
+            "type": "assistant",
+            "uuid": format!("rec-{position}"),
+            "timestamp": format!("2026-10-13T00:00:{:02}.000Z", position * 5),
+            "isSidechain": false,
+            "requestId": "req-auto-position",
+            "message": {
+                "id": "msg_auto_position",
+                "role": "assistant",
+                "type": "message",
+                "model": "claude-opus-5-5",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "x"}],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": position + 1,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0
+                }
+            }
+        })
+    }
+
+    fn usage_revision(mapper: &mut TranscriptMapper, record: Value) -> Option<u64> {
+        let mut revision = None;
+        for obs in mapper.map_record(record).expect("maps") {
+            if let ObservationPayload::Usage(payload) = obs.body {
+                revision = Some(payload.metric_revision.0);
+            }
+        }
+        // The snapshot publishes when the finalised group is flushed at the
+        // poll boundary (the record carries end_turn).
+        for obs in mapper.flush().expect("flush") {
+            if let ObservationPayload::Usage(payload) = obs.body {
+                revision = Some(payload.metric_revision.0);
+            }
+        }
+        revision
+    }
+
+    fn usage_revision_from_line(mapper: &mut TranscriptMapper, line: &str) -> Option<u64> {
+        let mut revision = None;
+        for obs in mapper.map_line(line).expect("maps line") {
+            if let ObservationPayload::Usage(payload) = obs.body {
+                revision = Some(payload.metric_revision.0);
+            }
+        }
+        for obs in mapper.flush().expect("flush line") {
+            if let ObservationPayload::Usage(payload) = obs.body {
+                revision = Some(payload.metric_revision.0);
+            }
+        }
+        revision
+    }
+
+    /// c-ctxusage r15 item 8: feeding decoded records directly advances the
+    /// automatic position once per record — shared with map_line — so
+    /// successive records never reuse a revision (which the Hub would then
+    /// reject as equal-position and freeze, losing the later snapshot).
+    #[test]
+    fn successive_map_record_calls_advance_the_position_once_each() {
+        let mut mapper = mapper();
+        assert_eq!(usage_revision(&mut mapper, assistant_at(0)), Some(1));
+        assert_eq!(usage_revision(&mut mapper, assistant_at(1)), Some(2));
+        assert_eq!(usage_revision(&mut mapper, assistant_at(2)), Some(3));
+    }
+
+    #[test]
+    fn map_line_and_map_record_share_the_same_ordinal() {
+        let mut direct = mapper();
+        let mut via_line = mapper();
+        let record = assistant_at(0);
+        let line = serde_json::to_string(&record).unwrap();
+        assert_eq!(
+            usage_revision(&mut direct, record.clone()),
+            usage_revision_from_line(&mut via_line, &line),
+            "both entry points allocate the same first position"
+        );
+        // And both keep advancing in lockstep afterwards.
+        let next = assistant_at(1);
+        let next_line = serde_json::to_string(&next).unwrap();
+        assert_eq!(
+            usage_revision(&mut direct, next),
+            usage_revision_from_line(&mut via_line, &next_line)
         );
     }
 }

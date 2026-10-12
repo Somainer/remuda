@@ -605,10 +605,23 @@ pub(crate) struct EffortBridge {
     notify: Notify,
 }
 
+/// An armed switch awaiting its transcript verdict.
+#[derive(Clone)]
+pub(crate) struct PendingSwitch {
+    pub(crate) generation: u64,
+    pub(crate) request: EffortRequest,
+    /// c-effortread r15 item 4: verified transcript byte position captured
+    /// immediately BEFORE the command was submitted (the bound file's EOF at
+    /// that instant). The mapper attributes only slash records starting
+    /// strictly after this position to the switch; `None` when the carrier
+    /// cannot supply a transcript position (direct unit tests).
+    pub(crate) submit_floor: Option<u64>,
+}
+
 #[derive(Default)]
 struct BridgeState {
     /// A switch waiting for its command verdict.
-    pending: Option<(u64, EffortRequest)>,
+    pending: Option<PendingSwitch>,
     /// Generation whose verdict has arrived.
     verdict_gen: u64,
     verdict: Option<Readback>,
@@ -650,15 +663,27 @@ impl EffortBridge {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// Arm a new Remuda switch; returns its generation token.
+    /// Arm a new Remuda switch with no transcript submission floor; returns
+    /// its generation token. Production switch typing goes through
+    /// [`Self::arm_with_floor`] with the pre-submit EOF position.
     ///
     /// Records the attempt as the latest `requested` for the payload echo but
     /// never overwrites the valid LAUNCH provenance (c-effortread r15 item 5).
     pub(crate) fn arm(&self, request: EffortRequest) -> u64 {
+        self.arm_with_floor(request, None)
+    }
+
+    /// Arm a switch with the verified transcript EOF captured immediately
+    /// before its command was submitted (c-effortread r15 item 4).
+    pub(crate) fn arm_with_floor(&self, request: EffortRequest, submit_floor: Option<u64>) -> u64 {
         let mut state = self.lock();
         state.generation += 1;
         let generation = state.generation;
-        state.pending = Some((generation, request.clone()));
+        state.pending = Some(PendingSwitch {
+            generation,
+            request: request.clone(),
+            submit_floor,
+        });
         state.requested = Some(request);
         generation
     }
@@ -689,11 +714,11 @@ impl EffortBridge {
         self.lock()
             .pending
             .as_ref()
-            .map(|(_, request)| request.clone())
+            .map(|pending| pending.request.clone())
     }
 
     /// Pending switch together with its generation, for the mapper to arm once.
-    pub(crate) fn pending_with_gen(&self) -> Option<(u64, EffortRequest)> {
+    pub(crate) fn pending_with_gen(&self) -> Option<PendingSwitch> {
         self.lock().pending.clone()
     }
 
@@ -740,8 +765,8 @@ impl EffortBridge {
     pub(crate) fn resolve(&self, generation: u64, observed: remuda_protocol::ObservedEffort) {
         {
             let mut state = self.lock();
-            if let Some((pending_gen, _)) = state.pending
-                && pending_gen == generation
+            if let Some(pending) = &state.pending
+                && pending.generation == generation
             {
                 state.pending = None;
             }
@@ -760,8 +785,8 @@ impl EffortBridge {
     pub(crate) fn reject(&self, generation: u64, reason: impl Into<String>) {
         {
             let mut state = self.lock();
-            if let Some((pending_gen, _)) = state.pending
-                && pending_gen == generation
+            if let Some(pending) = &state.pending
+                && pending.generation == generation
             {
                 state.pending = None;
             }
@@ -777,8 +802,8 @@ impl EffortBridge {
     pub(crate) fn fail(&self, generation: u64) {
         {
             let mut state = self.lock();
-            if let Some((pending_gen, _)) = state.pending
-                && pending_gen == generation
+            if let Some(pending) = &state.pending
+                && pending.generation == generation
             {
                 state.pending = None;
             }
@@ -831,6 +856,16 @@ pub(crate) trait EffortSwitchIo: Send + Sync {
     /// Current visible screen text, ANSI stripped.
     async fn screen_text(&self) -> crate::DriverResult<String>;
 
+    /// c-effortread r15 item 4: verified transcript byte position captured
+    /// immediately BEFORE the command is submitted — the bound transcript
+    /// file's EOF at that instant. The mapper attributes only slash records
+    /// starting strictly AFTER this position to this switch, so an older
+    /// same-word slash the pump had not read yet can never claim it. `None`
+    /// when no transcript position is available.
+    async fn submission_floor(&self) -> Option<u64> {
+        None
+    }
+
     /// Journal an `instance.configure` effort lifecycle from the worker.
     ///
     /// Distinctly named (not `journal`) because the same IO adapters also
@@ -878,9 +913,13 @@ pub(crate) async fn perform_switch(
     let word = request.command_word();
     let target = request.dialog_target_word();
     let request_id = request.request_id.clone();
-    // Arm before typing so the mapper correlates the slash record the command
-    // produces with this generation.
-    let generation = bridge.arm(request.clone());
+    // Capture the transcript EOF and arm BEFORE typing, so the mapper
+    // correlates only a slash record produced AFTER this instant with this
+    // generation (c-effortread r15 item 4): an older same-word slash still
+    // unread by the pump when this request was armed starts at or before
+    // this position and can never claim it.
+    let submit_floor = io.submission_floor().await;
+    let generation = bridge.arm_with_floor(request.clone(), submit_floor);
 
     // Snapshot before typing: a dialog the previous switch left rendered is
     // stale and must not receive this switch's Enter.
@@ -2192,7 +2231,11 @@ mod switch_tests {
             if self.resolve_after != 0
                 && n >= self.resolve_after
                 && let Some(bridge) = self.bridge.lock().unwrap().clone()
-                && let Some((generation, request)) = bridge.pending_with_gen()
+                && let Some(PendingSwitch {
+                    generation,
+                    request,
+                    submit_floor: _,
+                }) = bridge.pending_with_gen()
             {
                 bridge.resolve(
                     generation,
@@ -2212,7 +2255,7 @@ mod switch_tests {
                 && screen.contains(INVALID_MARKER)
                 && !self.invalid_rejected.swap(true, Ordering::SeqCst)
                 && let Some(bridge) = self.bridge.lock().unwrap().clone()
-                && let Some((generation, _)) = bridge.pending_with_gen()
+                && let Some(PendingSwitch { generation, .. }) = bridge.pending_with_gen()
             {
                 bridge.reject(generation, "invalid-argument");
             }

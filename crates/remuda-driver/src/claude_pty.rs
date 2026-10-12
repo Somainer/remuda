@@ -621,6 +621,7 @@ impl ClaudePtyDriver {
             events: tx.clone(),
             seq: Arc::clone(&self.seq),
             ctx: ctx.clone(),
+            transcript_path: Arc::clone(&transcript_path),
         });
         let effort_worker = crate::effort::spawn_worker(
             Arc::clone(&effort_bridge),
@@ -636,6 +637,7 @@ impl ClaudePtyDriver {
             events: tx.clone(),
             seq: Arc::clone(&self.seq),
             ctx: ctx.clone(),
+            transcript_path: Arc::clone(&transcript_path),
         });
         let model_worker = crate::model::spawn_model_worker(
             Arc::clone(&model_bridge),
@@ -809,6 +811,7 @@ impl ClaudePtyDriver {
                 events: live.events.clone(),
                 seq: Arc::clone(&self.seq),
                 ctx: live.ctx.clone(),
+                transcript_path: Arc::clone(&live.transcript_path),
             };
             (
                 live.pane_id.clone(),
@@ -874,6 +877,7 @@ impl ClaudePtyDriver {
                 events: live.events.clone(),
                 seq: Arc::clone(&self.seq),
                 ctx: live.ctx.clone(),
+                transcript_path: Arc::clone(&live.transcript_path),
             };
             (
                 live.pane_id.clone(),
@@ -1539,8 +1543,8 @@ fn spawn_transcript_pump(
                         // conversation only, and a verified→unverified
                         // transition emits an explicit read-back-unavailable
                         // edge that clears the projected effective state.
-                        let (provenance, poll_failed) = match tail.poll() {
-                            Ok(read) => (read.provenance, read.lines),
+                        let (provenance, poll_failed, poll_positions) = match tail.poll() {
+                            Ok(read) => (read.provenance, read.lines, read.positions),
                             Err(error) => {
                                 tracing::debug!(%error, "transcript tail unreadable this poll");
                                 let p = if tail.verified() {
@@ -1548,7 +1552,7 @@ fn spawn_transcript_pump(
                                 } else {
                                     TailProvenance::Unverified
                                 };
-                                (p, Vec::new())
+                                (p, Vec::new(), Vec::new())
                             }
                         };
                         let gate_edges = mapper
@@ -1563,7 +1567,15 @@ fn spawn_transcript_pump(
                         if !gate_edges.is_empty() {
                             batches.push(Ok(gate_edges));
                         }
-                        batches.extend(poll_failed.iter().map(|line| mapper.map_line(line)));
+                        // c-effortread r15 item 4: each record rides with its
+                        // verified transcript position so an armed slash
+                        // attribution can exclude pre-submission records.
+                        batches.extend(
+                            poll_failed
+                                .iter()
+                                .zip(poll_positions.iter().copied())
+                                .map(|(line, position)| mapper.map_line_at(line, Some(position))),
+                        );
                         batches.push(mapper.flush());
                         (tail, mapper, batches)
                     })
@@ -1838,6 +1850,9 @@ struct HerdrEffortIo {
     events: mpsc::Sender<Observation>,
     seq: Arc<AtomicU64>,
     ctx: ObsCtx,
+    /// Bound transcript path, for the c-effortread r15 item 4 submission
+    /// floor (EOF captured immediately before typing a switch command).
+    transcript_path: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[async_trait]
@@ -1882,6 +1897,14 @@ impl crate::effort::EffortSwitchIo for HerdrEffortIo {
             .await
             .map_err(map_herdr)?;
         Ok(read.text().to_owned())
+    }
+
+    async fn submission_floor(&self) -> Option<u64> {
+        // The bound transcript's EOF immediately before submission: only a
+        // slash appended AFTER this position can be this switch's command
+        // (c-effortread r15 item 4).
+        let path = self.transcript_path.lock().ok()?.clone()?;
+        std::fs::metadata(path).ok().map(|metadata| metadata.len())
     }
 
     async fn journal_effort(&self, status: String, severity: Severity, request_id: Option<String>) {
@@ -2983,6 +3006,99 @@ mod tests {
         assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
         assert_eq!(edge_b.effective.ultracode, Some(true));
         assert!(!bridge.has_pending(), "B's verdict settles B");
+    }
+
+    /// c-effortread r15 item 4: an older native `/effort max` slash still
+    /// UNREAD by the transcript pump when web request B (also max) is armed
+    /// gets attributed to B by command word alone — its old refusal rejects B
+    /// (or an old accepted verdict resolves B). The mapper binds the armed
+    /// switch only to a slash whose verified transcript position is strictly
+    /// AFTER the switch's pre-submit EOF. This drives the case where the older
+    /// SLASH itself (not just its verdict) is unread until after B arms.
+    #[tokio::test]
+    async fn r15_item4_a_pre_submission_slash_never_claims_the_new_same_word_request() {
+        use crate::effort::{EffortBridge, EffortRequest};
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // B is armed at the bound transcript's EOF (1000), which perform_switch
+        // stats immediately before typing. B's own command has not landed.
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(1000));
+
+        // The pump now catches up: an OLDER native /effort max (a human or a
+        // replaced command) whose SLASH record sat unread at byte 500, with
+        // its Kept refusal at byte 600. The positions prove both predate B's
+        // submission.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        let old_verdict = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Kept effort level as high"),
+                Some(600),
+            )
+            .expect("map old refusal");
+        assert!(
+            old_verdict
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the pre-submission refusal emits no request edge"
+        );
+        assert!(
+            bridge.has_pending(),
+            "B is not rejected by the older command's refusal"
+        );
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "no verdict of the older command resolves B"
+        );
+
+        // A slash AT the floor is still pre-submission: not attributed either.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-edge", "max"), Some(1000))
+            .expect("map boundary slash");
+        assert!(bridge.has_pending(), "a record at the floor is pre-submit");
+
+        // B's own slash lands strictly after the floor and arms; its accepted
+        // max verdict resolves B and carries B's id.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+        let out_b = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Set effort level to max"),
+                Some(1600),
+            )
+            .expect("map B verdict");
+        let edge_b = out_b
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("B's verdict emits an effort edge");
+        assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
+        assert_eq!(
+            edge_b.effective.name,
+            Some(remuda_protocol::EffortName::Max)
+        );
+        assert!(!bridge.has_pending(), "B's own verdict settles B");
     }
 
     /// c-r3 item 4: the claude-pty transcript pump driven through its REAL

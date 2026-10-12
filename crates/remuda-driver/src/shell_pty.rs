@@ -900,6 +900,7 @@ impl ShellPtyDriver {
             events,
             seq: Arc::clone(&self.seq),
             ctx,
+            bindings: self.bindings.clone(),
         });
         let ready = io.is_idle().await;
         if ready {
@@ -957,6 +958,7 @@ impl ShellPtyDriver {
             events,
             seq: Arc::clone(&self.seq),
             ctx,
+            bindings: self.bindings.clone(),
         });
         if io.is_idle().await {
             let (done, rx_outcome) = tokio::sync::oneshot::channel();
@@ -1202,6 +1204,7 @@ impl ShellPtyDriver {
             events: tx.clone(),
             seq: Arc::clone(&self.seq),
             ctx: hook_ctx.clone(),
+            bindings: self.bindings.clone(),
         });
         // A fresh run needs a fresh queue: stop the previous worker and close
         // its queue before swapping.
@@ -1298,6 +1301,7 @@ impl ShellPtyDriver {
             events: tx.clone(),
             seq: Arc::clone(&self.seq),
             ctx: hook_ctx.clone(),
+            bindings: self.bindings.clone(),
         });
         if let Some(worker) = self.model_worker.lock().await.take() {
             worker.abort();
@@ -3468,6 +3472,9 @@ struct ShellEffortIo {
     events: mpsc::Sender<remuda_protocol::Observation>,
     seq: Arc<AtomicU64>,
     ctx: promotion::PromoteCtx,
+    /// Current deterministic transcript binding, for the c-effortread r15
+    /// item 4 submission floor (EOF captured immediately before typing).
+    bindings: promotion::BindingHandle,
 }
 
 #[async_trait]
@@ -3497,6 +3504,16 @@ impl crate::effort::EffortSwitchIo for ShellEffortIo {
 
     async fn screen_text(&self) -> crate::DriverResult<String> {
         Ok(self.state.screen_grid().text())
+    }
+
+    async fn submission_floor(&self) -> Option<u64> {
+        // The hydrator follows the same binding; stat the bound transcript's
+        // current EOF so only a slash appended after submission can be
+        // attributed to this switch (c-effortread r15 item 4).
+        let binding = self.bindings.binding()?;
+        std::fs::metadata(binding.path)
+            .ok()
+            .map(|metadata| metadata.len())
     }
 
     async fn journal_effort(

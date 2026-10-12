@@ -2890,6 +2890,20 @@ impl TranscriptMapper {
     /// Map one transcript line. Blank lines and undecodable JSON yield nothing:
     /// a partially written tail is normal while the file is being appended to.
     pub fn map_line(&mut self, line: &str) -> DriverResult<Vec<Observation>> {
+        self.map_line_at(line, None)
+    }
+
+    /// Map one transcript line with its VERIFIED byte position in the
+    /// transcript file (c-effortread r15 item 4). The production tail passes
+    /// the position [`crate::claude_transcript::TailRead`] reports; an armed
+    /// effort switch is attributed only to a slash record starting strictly
+    /// after the switch's pre-submit EOF, so a backlogged older slash (still
+    /// unread when the switch was armed) can never claim the newer request.
+    pub fn map_line_at(
+        &mut self,
+        line: &str,
+        position: Option<u64>,
+    ) -> DriverResult<Vec<Observation>> {
         let line = line.trim();
         if line.is_empty() {
             return Ok(Vec::new());
@@ -2897,7 +2911,7 @@ impl TranscriptMapper {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return Ok(Vec::new());
         };
-        self.map_record(value)
+        self.map_record_at(value, position)
     }
 
     /// Flush whatever assistant run is still buffered.
@@ -2980,6 +2994,16 @@ impl TranscriptMapper {
 
     /// Map one decoded transcript record.
     pub fn map_record(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
+        self.map_record_at(value, None)
+    }
+
+    /// Map one decoded transcript record with its verified transcript byte
+    /// position (see [`Self::map_line_at`]).
+    fn map_record_at(
+        &mut self,
+        value: Value,
+        position: Option<u64>,
+    ) -> DriverResult<Vec<Observation>> {
         // A sidechain record belongs to a sub-agent's own transcript view; the
         // main conversation is what the 结构 tab renders.
         if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
@@ -3008,7 +3032,7 @@ impl TranscriptMapper {
             extra = self.map_effort_assistant(&value)?;
             extra.extend(self.map_model_assistant(&value)?);
         } else if kind == "user" {
-            extra = self.note_effort_user(&value)?;
+            extra = self.note_effort_user(&value, position)?;
             extra.extend(self.note_model_user(&value)?);
             extra.extend(self.note_permission_user(&value)?);
         } else if kind == "system" {
@@ -3043,7 +3067,11 @@ impl TranscriptMapper {
     /// verdict settles the level/toggle and resolves or rejects the switch
     /// bridge. Returns effort edge observations when the verdict changes the
     /// effective level or flag.
-    fn note_effort_user(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
+    fn note_effort_user(
+        &mut self,
+        value: &Value,
+        position: Option<u64>,
+    ) -> DriverResult<Vec<Observation>> {
         // D-056 (4): a resumed session replaying pre-launch records must not
         // arm or settle a current switch from a same-words slash/verdict pair.
         if !self.effort.is_current_process() {
@@ -3078,24 +3106,44 @@ impl TranscriptMapper {
             if let Some(hook) = self.effort_slash_snapshot_hook.take() {
                 hook();
             }
-            let from_remuda = pending_snapshot
-                .as_ref()
-                .is_some_and(|(_, request)| request.command_word() == args);
+            let from_remuda = pending_snapshot.as_ref().is_some_and(|pending| {
+                if pending.request.command_word() != args {
+                    return false;
+                }
+                // c-effortread r15 item 4: matching command content is not
+                // enough — the slash must also have SUBMISSION PROVENANCE: a
+                // verified transcript position strictly AFTER this switch's
+                // pre-submit EOF. An older same-word slash that was still
+                // unread by the pump when this request armed starts at or
+                // before that floor and is treated as a human/replaced
+                // command, so its old refusal/acceptance can never settle
+                // this request. When either side lacks a position (direct
+                // unit tests) the word match alone governs.
+                pending
+                    .submit_floor
+                    .is_none_or(|floor| position.is_some_and(|record_pos| record_pos > floor))
+            });
             // A slash read off an unverified/displaced batch cannot belong to
             // this process: arm neither the generation nor the level await, so
             // a verdict that follows provenance loss cannot settle the switch.
             if from_remuda
-                && let Some((generation, request)) = pending_snapshot
+                && let Some(pending) = pending_snapshot
                 && self
                     .effort_armed
                     .iter()
-                    .all(|(armed_gen, _)| *armed_gen != generation)
+                    .all(|(armed_gen, _)| *armed_gen != pending.generation)
             {
+                let crate::effort::PendingSwitch {
+                    generation,
+                    request,
+                    submit_floor: _,
+                } = pending;
                 // c-effortread r11 item 1: bind the slash generation to ITS OWN
-                // immutable request (id, requested value). Two commands can be
-                // outstanding (A timed out, B armed) before either verdict is
-                // read; the FIFO pairs each verdict with the slash that asked
-                // for it, so A's delayed verdict can never carry B's id.
+                // immutable request (id, requested value, submission floor).
+                // Two commands can be outstanding (A timed out, B armed)
+                // before either verdict is read; the FIFO pairs each verdict
+                // with the slash that asked for it, so A's delayed verdict
+                // can never carry B's id.
                 if let Some(name) = request.awaits_level(self.effort.semantics()) {
                     self.effort.arm_awaiting(name);
                 }

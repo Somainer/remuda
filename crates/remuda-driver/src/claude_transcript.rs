@@ -736,6 +736,9 @@ pub struct TranscriptTail {
     path: PathBuf,
     offset: u64,
     partial: String,
+    /// File offset of the first byte of `partial` (meaningless while the
+    /// held partial is empty; `read_lines` stamps it when a buffer arrives).
+    partial_pos: u64,
     resume: Option<ResumeState>,
 }
 
@@ -946,6 +949,13 @@ impl ResumeMode {
 pub struct TailRead {
     /// Whole newline-terminated records appended since the last poll.
     pub lines: Vec<String>,
+    /// Byte offset of the START of each corresponding record in the transcript
+    /// file (c-effortread r15 item 4). `positions[i]` is the verified
+    /// transcript position of `lines[i]`; the mapper attributes an armed
+    /// switch only to a record starting strictly after the switch's
+    /// pre-submit EOF position, so a backlogged older slash can never claim
+    /// a newer same-word request.
+    pub positions: Vec<u64>,
     /// Whether those lines are provenanced to the current process.
     pub provenance: TailProvenance,
 }
@@ -958,6 +968,7 @@ impl TranscriptTail {
             path,
             offset: 0,
             partial: String::new(),
+            partial_pos: 0,
             resume: None,
         }
     }
@@ -970,6 +981,7 @@ impl TranscriptTail {
             path,
             offset: boundary.start,
             partial: String::new(),
+            partial_pos: 0,
             resume: Some(ResumeState {
                 identity: boundary.identity,
                 head: boundary.head,
@@ -1056,6 +1068,9 @@ impl TranscriptTail {
         if anchor.origin == TailOrigin::Live {
             return Some(Self {
                 path,
+                // The held partial occupies the last partial-len bytes before
+                // the first unread offset.
+                partial_pos: anchor.start.saturating_sub(anchor.partial.len() as u64),
                 offset: anchor.start,
                 partial: anchor.partial,
                 resume: None,
@@ -1071,6 +1086,7 @@ impl TranscriptTail {
             // Restore the held partial line instead of dropping it
             // (c-effortread r8 item 4b): the tail reads new bytes after it and
             // completes the line without re-reading the buffered prefix.
+            partial_pos: anchor.start.saturating_sub(anchor.partial.len() as u64),
             partial: anchor.partial,
             resume: Some(ResumeState {
                 identity: anchor.identity,
@@ -1124,6 +1140,7 @@ impl TranscriptTail {
                     state.absent = true;
                     return Ok(TailRead {
                         lines: Vec::new(),
+                        positions: Vec::new(),
                         provenance: TailProvenance::Unverified,
                     });
                 }
@@ -1169,6 +1186,7 @@ impl TranscriptTail {
                 self.partial.clear();
                 return Ok(TailRead {
                     lines: Vec::new(),
+                    positions: Vec::new(),
                     provenance: TailProvenance::Unverified,
                 });
             }
@@ -1221,17 +1239,31 @@ impl TranscriptTail {
                     }
                 }
                 state.absent = false;
-                let lines = Self::read_lines(&mut file, len, &mut self.offset, &mut self.partial)?;
+                let records = Self::read_lines(
+                    &mut file,
+                    len,
+                    &mut self.offset,
+                    &mut self.partial,
+                    &mut self.partial_pos,
+                )?;
                 return Ok(TailRead {
-                    lines,
+                    lines: records.iter().map(|(_, line)| line.clone()).collect(),
+                    positions: records.iter().map(|(position, _)| *position).collect(),
                     provenance: TailProvenance::Unverified,
                 });
             }
             // Verified resume on the same identity/head: bytes past the anchor
             // are current-process records.
-            let lines = Self::read_lines(&mut file, len, &mut self.offset, &mut self.partial)?;
+            let records = Self::read_lines(
+                &mut file,
+                len,
+                &mut self.offset,
+                &mut self.partial,
+                &mut self.partial_pos,
+            )?;
             return Ok(TailRead {
-                lines,
+                lines: records.iter().map(|(_, line)| line.clone()).collect(),
+                positions: records.iter().map(|(position, _)| *position).collect(),
                 provenance: TailProvenance::Current,
             });
         }
@@ -1241,39 +1273,63 @@ impl TranscriptTail {
             self.offset = 0;
             self.partial.clear();
         }
-        let lines = Self::read_lines(&mut file, len, &mut self.offset, &mut self.partial)?;
+        let records = Self::read_lines(
+            &mut file,
+            len,
+            &mut self.offset,
+            &mut self.partial,
+            &mut self.partial_pos,
+        )?;
         Ok(TailRead {
-            lines,
+            lines: records.iter().map(|(_, line)| line.clone()).collect(),
+            positions: records.iter().map(|(position, _)| *position).collect(),
             provenance: TailProvenance::Current,
         })
     }
 
     /// Seek to `offset`, read through `len`, advance the cursor and split off
     /// the complete newline-terminated lines, holding any partial tail.
+    ///
+    /// Each returned record carries the byte offset at which it STARTS in the
+    /// transcript file (c-effortread r15 item 4): the caller can then exclude
+    /// records preceding a verified position (an armed switch's pre-submit
+    /// EOF). A held partial is carried into the next call together with its
+    /// own start offset.
     fn read_lines(
         file: &mut std::fs::File,
         len: u64,
         offset: &mut u64,
         partial: &mut String,
-    ) -> std::io::Result<Vec<String>> {
+        partial_pos: &mut u64,
+    ) -> std::io::Result<Vec<(u64, String)>> {
         use std::io::{Read, Seek, SeekFrom};
         if len == *offset {
             return Ok(Vec::new());
         }
+        let read_start = *offset;
         file.seek(SeekFrom::Start(*offset))?;
         let mut buf = Vec::with_capacity((len - *offset) as usize);
         let read = file.read_to_end(&mut buf)? as u64;
         *offset += read;
+        if partial.is_empty() {
+            // The held partial (if any) already owns its position; a fresh
+            // buffer starts where this read began.
+            *partial_pos = read_start;
+        }
         partial.push_str(&String::from_utf8_lossy(&buf));
-        let mut lines = Vec::new();
+        let mut records = Vec::new();
         while let Some(index) = partial.find('\n') {
+            // File offset of this record's first byte (UTF-8 byte lengths
+            // match file bytes for the valid-UTF-8 JSONL Claude appends).
+            let record_pos = *partial_pos;
             let line: String = partial.drain(..=index).collect();
+            *partial_pos += line.len() as u64;
             let line = line.trim_end_matches(['\n', '\r']).to_owned();
             if !line.is_empty() {
-                lines.push(line);
+                records.push((record_pos, line));
             }
         }
-        Ok(lines)
+        Ok(records)
     }
 }
 
@@ -1638,6 +1694,35 @@ mod tests {
             .expect("append");
         file.write_all(b"al\":3}\n").expect("write");
         assert_eq!(tail.poll().expect("poll").lines, vec!["{\"partial\":3}"]);
+    }
+
+    /// c-effortread r15 item 4: every returned record carries its verified
+    /// start byte offset, across poll boundaries and a held partial.
+    #[test]
+    fn each_record_carries_its_file_start_position() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("t.jsonl");
+        write(&path, "{\"a\":1}\n{\"b\":2}\n{\"parti");
+        let mut tail = TranscriptTail::new(path.clone());
+        let first = tail.poll().expect("poll");
+        assert_eq!(first.positions, vec![0, b"{\"a\":1}\n".len() as u64]);
+        assert_eq!(first.positions.len(), first.lines.len());
+        // The completing bytes of the held partial continue at the partial's
+        // own start offset, not zero.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("append");
+        file.write_all(b"al\":3}\n{\"d\":4}\n").expect("write");
+        let next = tail.poll().expect("poll");
+        assert_eq!(next.lines, vec!["{\"partial\":3}", "{\"d\":4}"]);
+        assert_eq!(
+            next.positions,
+            vec![
+                (b"{\"a\":1}\n{\"b\":2}\n".len()) as u64,
+                (b"{\"a\":1}\n{\"b\":2}\n{\"partial\":3}\n".len()) as u64,
+            ]
+        );
     }
 
     #[test]

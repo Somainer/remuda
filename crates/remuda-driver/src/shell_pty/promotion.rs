@@ -311,7 +311,11 @@ impl BindingHandle {
     }
 
     /// Current locked binding, if any.
-    fn binding(&self) -> Option<TranscriptBinding> {
+    ///
+    /// c-effortread r15 item 4: visible to the parent `shell_pty` module so
+    /// the effort I/O can stat the bound transcript's EOF for a switch's
+    /// submission floor.
+    pub(super) fn binding(&self) -> Option<TranscriptBinding> {
         self.inner.lock().ok().and_then(|slot| slot.binding.clone())
     }
 
@@ -2631,10 +2635,17 @@ async fn pump(
     // the last message of a batch would otherwise sit unseen until the next
     // record arrives — which, at the end of a turn, may be minutes away.
     // Flushing at the end of each poll is what makes a finished turn appear.
+    // c-effortread r15 item 4: each record rides with its verified transcript
+    // position so an armed slash attribution excludes pre-submission records.
     let mut batches: Vec<_> = gate_edges
         .into_iter()
         .map(|obs| Ok(vec![obs]))
-        .chain(read.lines.iter().map(|line| hydrator.mapper.map_line(line)))
+        .chain(
+            read.lines
+                .iter()
+                .zip(read.positions.iter().copied())
+                .map(|(line, position)| hydrator.mapper.map_line_at(line, Some(position))),
+        )
         .collect();
     batches.push(hydrator.mapper.flush());
     for batch in batches {

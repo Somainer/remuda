@@ -561,16 +561,14 @@ struct StoredSnapshot {
 ///   cost keeps it; the turn clock moves with the newer snapshot (an ingest
 ///   fallback still never overwrites a native time). The watermark is
 ///   persisted EVEN when every value is unchanged;
-/// * an EQUAL-position snapshot may only FILL an unreported bucket or advance
-///   a reported one upward (the replay-safe monotone merge for repeated
-///   print/result deliveries); a reported decrease, an attached cost and the
-///   clock are all frozen;
-/// * an OLDER-position snapshot changes nothing.
+/// * an EQUAL- or OLDER-position snapshot changes NOTHING — no counters, no
+///   equal-position growth or bucket fill, no cost, no clock
+///   (c-ctxusage r15 item 2).
 ///
 /// A COST-ONLY frame (no token baskets reported) is a billing correction on a
 /// separate channel: it updates the bill alone, never counters it did not come
-/// with and never the turn clock, regardless of position. Cumulative SESSION
-/// snapshots have their own monotone acceptance path and are not governed here.
+/// with and never the turn clock. Cumulative SESSION snapshots have their own
+/// monotone acceptance path and are not governed here.
 fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
     let stored: Option<StoredSnapshot> = conn
         .query_row(
@@ -623,43 +621,14 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
         return Ok(false);
     }
 
-    if row.metric_revision < stored.revision {
-        // A stale source position never overrides a newer one: no counters, no
-        // cost, no clock.
+    if row.metric_revision <= stored.revision {
+        // An EQUAL or older source position changes NOTHING: no counters, no
+        // equal-position growth or bucket fill, no cost, no clock
+        // (c-ctxusage r15 item 2). Two frames at one position are one source
+        // record, however often re-delivered or whichever buckets each
+        // delivery happened to carry; fills arrive only with a strictly newer
+        // position.
         return Ok(false);
-    }
-
-    if row.metric_revision == stored.revision {
-        // Repeated delivery of the SAME source position (two print/result
-        // frames for one result): only a fill of an unreported bucket or an
-        // advance of a reported one is accepted. A decrease, the attached cost
-        // and the clock stay frozen.
-        let (grew, decreased) = incoming.growth_against(&stored.counters);
-        if !grew || decreased {
-            return Ok(false);
-        }
-        let merged = incoming.merged_over(&stored.counters);
-        conn.execute(
-            "UPDATE usage_events SET
-                seq = ?1,
-                total_tokens = ?2,
-                input_tokens = ?3,
-                output_tokens = ?4,
-                cache_read_tokens = ?5,
-                cache_write_tokens = ?6
-             WHERE instance_id = ?7 AND scope = 'turn' AND scope_id = ?8",
-            params![
-                row.seq,
-                merged.total,
-                merged.input,
-                merged.output,
-                merged.cache_read,
-                merged.cache_write,
-                row.instance_id,
-                row.scope_id,
-            ],
-        )?;
-        return Ok(true);
     }
 
     // STRICTLY NEWER source position: authoritative. Merge unreported incoming
@@ -3118,6 +3087,104 @@ mod tests {
             .unwrap();
         assert_eq!(revision, 3, "the watermark persisted at 3");
         assert_eq!(output, Some(20), "output stays 20 after the stale frame");
+    }
+
+    /// c-ctxusage r15 item 2: an EQUAL source position changes NOTHING — not a
+    /// counter growth, not a bucket fill, not the seq. The watermark is a
+    /// strict > authority: two frames at the same position are the same source
+    /// record however often it is re-delivered, even when a later delivery
+    /// carries a bigger bucket or a previously omitted one.
+    #[test]
+    fn an_equal_position_snapshot_never_grows_or_fills_a_bucket() {
+        // A turn frame that reports only input/output (cache buckets omitted =
+        // Unknown, never zero).
+        let partial_record = |seq: i64, revision: i64, input: i64, output: i64| {
+            let mut payload = serde_json::Map::new();
+            payload.insert("scope".into(), json!("turn"));
+            payload.insert("mode".into(), json!("snapshot"));
+            payload.insert("scopeId".into(), json!("msg-eq2"));
+            payload.insert("metricRevision".into(), json!(revision.to_string()));
+            payload.insert("inputTokens".into(), known_u(input));
+            payload.insert("outputTokens".into(), known_u(output));
+            payload.insert(
+                "cost".into(),
+                json!({ "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] }),
+            );
+            payload.insert("accounting".into(), json!("estimated"));
+            JournalRecord {
+                instance_id: "ins_r15i2".into(),
+                seq,
+                event_id: format!("evt_{seq}"),
+                event: json!({ "kind": "usage", "payload": Value::Object(payload) }),
+                observed_at: "2026-09-15T00:00:00.000Z".into(),
+            }
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // rev 3: input 100 / output 20, cache buckets omitted (Unknown).
+        assert!(insert(&conn, &partial_record(1, 3, 100, 20)));
+        // The SAME rev 3 with output 25 (a growth): must change nothing.
+        assert!(
+            !insert(&conn, &partial_record(2, 3, 100, 25)),
+            "an equal-position growth must be rejected outright"
+        );
+
+        // An equal-position FILL: still rev 3, now reporting a cache_read
+        // bucket. Retained buckets are filled only by a STRICTLY newer
+        // position; an equal one must leave them Unknown.
+        let mut fill_payload = serde_json::Map::new();
+        fill_payload.insert("scope".into(), json!("turn"));
+        fill_payload.insert("mode".into(), json!("snapshot"));
+        fill_payload.insert("scopeId".into(), json!("msg-eq2"));
+        fill_payload.insert("metricRevision".into(), json!("3"));
+        fill_payload.insert("inputTokens".into(), known_u(100));
+        fill_payload.insert("outputTokens".into(), known_u(20));
+        fill_payload.insert(
+            "cacheReadTokens".into(),
+            json!({ "state": "known", "value": "7" }),
+        );
+        fill_payload.insert(
+            "cost".into(),
+            json!({ "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] }),
+        );
+        fill_payload.insert("accounting".into(), json!("estimated"));
+        let equal_fill = JournalRecord {
+            instance_id: "ins_r15i2".into(),
+            seq: 3,
+            event_id: "evt_3".into(),
+            event: json!({ "kind": "usage", "payload": Value::Object(fill_payload) }),
+            observed_at: "2026-09-15T00:00:00.000Z".into(),
+        };
+        assert!(
+            !insert(&conn, &equal_fill),
+            "an equal-position bucket fill must be rejected outright"
+        );
+
+        let (revision, input, output, cache_read, seq): (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT metric_revision, input_tokens, output_tokens,
+                        cache_read_tokens, seq
+                 FROM usage_events
+                 WHERE instance_id='ins_r15i2' AND scope_id='msg-eq2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(revision, 3);
+        assert_eq!(input, Some(100));
+        assert_eq!(
+            output,
+            Some(20),
+            "the equal-position 20→25 growth is frozen"
+        );
+        assert_eq!(cache_read, None, "the equal-position bucket fill is frozen");
+        assert_eq!(seq, 1, "neither equal-position frame adopts its seq");
     }
 
     /// r4 item 7b: the REAL 2.1.289 fixture replayed by a fresh mapper into a

@@ -457,3 +457,121 @@ fi
         "SIGTERM-ignoring descendant wrote its late marker after the verdict"
     );
 }
+
+/// r13 item 6: a land child that prints a LARGE remote rejection to stderr
+/// (far more than one pipe buffer) then exits nonzero must not block on the
+/// pipe: stderr is drained concurrently, so the gate.run returns promptly with
+/// the structured base-moved verdict instead of hanging until the land budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_land_child_printing_a_large_rejection_to_stderr_does_not_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin.git");
+    Command::new("git")
+        .args(["init", "--bare", "-b", "main"])
+        .arg(&origin)
+        .status()
+        .unwrap();
+    let seed = dir.path().join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    git(&seed, &["init", "-b", "main"]);
+    git(&seed, &["config", "user.email", "t@example.com"]);
+    git(&seed, &["config", "user.name", "T"]);
+    std::fs::write(seed.join("f.txt"), "base\n").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-q", "-m", "init"]);
+    git(&seed, &["checkout", "-q", "-b", "wt/land/bigerr"]);
+    std::fs::write(seed.join("f.txt"), "task\n").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-q", "-m", "task"]);
+    git(
+        &seed,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&seed, &["push", "-q", "origin", "main", "wt/land/bigerr"]);
+    let lane = dir.path().join("lane");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            lane.to_str().unwrap(),
+        ],
+    );
+    git(&lane, &["config", "user.email", "t@example.com"]);
+    git(&lane, &["config", "user.name", "T"]);
+    git(&lane, &["fetch", "-q", "origin"]);
+    std::fs::create_dir_all(dir.path().join("target")).unwrap();
+
+    // Land phase: flood stderr with ~300 KiB (>> 64 KiB pipe buffer), then emit
+    // the structured base_moved verdict on stdout and exit nonzero.
+    let bin = dir.path().join("big-err-land.sh");
+    let script = r#"#!/bin/bash
+set -eu
+branch=""; onto="main"; mode=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --onto) onto="$2"; shift 2;;
+    --land) mode=land; shift;;
+    --gate) mode=gate; shift;;
+    --no-push) shift;;
+    --repo|--target-dir) shift 2;;
+    --*) shift;;
+    merge) shift;;
+    *) if [ -z "$branch" ]; then branch="$1"; fi; shift;;
+  esac
+done
+if [ "$mode" = "gate" ]; then
+  git fetch -q origin
+  git checkout -qB "$onto" "origin/$onto"
+  git merge -q --no-ff "origin/$branch" -m "merge $branch"
+  printf '{"exitCode":0,"status":"verified","base":"%s","head":"%s","merged":"%s"}\n' \
+    "$(git rev-parse "$onto")" "$(git rev-parse "origin/$branch")" "$(git rev-parse HEAD)"
+else
+  # 300 KiB of rejection diagnostics to stderr.
+  head -c 300000 /dev/zero | tr '\0' 'x' 1>&2
+  printf '{"exitCode":3,"status":"base_moved","currentMain":"cccccccccccccccccccccccccccccccccccccccc","error":"remote main moved"}\n'
+  exit 3
+fi
+"#;
+    std::fs::write(&bin, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let node = DevNode::new(&DevServerConfig::loopback(0)).unwrap();
+    node.gate_test_set_authorizer(std::sync::Arc::new(GrantAll))
+        .await;
+    // If stderr were not drained the child would block and run into this 4 s
+    // budget (verdict "uncertain"); with the drain it finishes immediately.
+    node.gate_test_set_land_timeout(Duration::from_secs(4))
+        .await;
+
+    let params = json!({
+        "jobId": "gjb_big_stderr", "laneId": "lane1",
+        "repoPath": lane.to_string_lossy(),
+        "targetDir": dir.path().join("target").to_string_lossy(),
+        "branch": "wt/land/bigerr", "baseBranch": "main",
+        "mode": "land", "web": "never", "push": true, "generation": 1,
+        "binary": bin.to_string_lossy(),
+    });
+
+    let start = Instant::now();
+    let reply = tokio::time::timeout(
+        Duration::from_secs(15),
+        node.dispatch_gate_rpc("gate.run", &params),
+    )
+    .await
+    .expect("gate.run hung on the full stderr pipe")
+    .expect("gate.run errored");
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "took {:?}",
+        start.elapsed()
+    );
+    assert_eq!(reply["status"], json!("base-moved"), "{reply}");
+    assert_eq!(
+        reply["currentMainSha"],
+        json!("cccccccccccccccccccccccccccccccccccccccc"),
+        "{reply}"
+    );
+}

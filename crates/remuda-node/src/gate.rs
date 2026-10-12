@@ -1658,6 +1658,27 @@ impl DevNode {
             #[cfg(unix)]
             let land_pgid = land_child.id().and_then(|pid| i32::try_from(pid).ok());
             let land_stdout = land_child.stdout.take();
+            // r13 item 6: drain stderr CONCURRENTLY for the life of the child
+            // (and keep the handle for timeout/kill). A remote rejection can
+            // print far more than one pipe buffer; never reading it blocked the
+            // land child forever (deadlock) — the exact failure the verify child
+            // already guarded against with its own stderr pump.
+            let land_stderr_task = land_child.stderr.take().map(|stderr| {
+                let node = self.clone();
+                let job_id = request.job_id.clone();
+                let generation = request.generation;
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, BufReader};
+                    let mut lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let _ = node.gate_registry().events.send(GateEventParams {
+                            job_id: job_id.clone(),
+                            generation,
+                            kind: GateEventKind::Log { message: line },
+                        });
+                    }
+                })
+            });
             // Land runs to completion even if cancel fires (grant already
             // held); await it bounded by the (test-overridable) land budget.
             // wait_with_output_piped BORROWS the child (unlike the consuming
@@ -1748,6 +1769,12 @@ impl DevNode {
                     result.status = "failed".into();
                     result.error = Some("land child produced no result".into());
                 }
+            }
+            // The child has exited (or been killed on timeout); let the stderr
+            // pump drain to EOF (bounded) so a large final rejection/error burst
+            // is fully read and the pipe can never have wedged the child.
+            if let Some(task) = land_stderr_task {
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             }
         }
         attach_failure_evidence(&mut result, &trace, request.keep_logs);

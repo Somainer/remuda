@@ -390,15 +390,17 @@ enum InterruptibleEventWait<T> {
 }
 
 /// Test-only probe for the REAL interruptible event wait (ma-sdk-state r17
-/// item 2): the instant at which the waiter computes its ONE deadline (so a
-/// regression clocks the bound from the waiter itself, not from the thread
-/// spawn) and the number of EINTR restarts the wait ACTUALLY performed (a
+/// item 2; r18 item 3): the ONE instant from which the waiter derives its
+/// deadline (sampled where the deadline is computed and stamped into the
+/// probe unchanged — the test clocks `completion - started` against the
+/// bound) and the number of EINTR restarts the wait ACTUALLY performed (a
 /// signal that was merely caught without interrupting the parked syscall
 /// must not count).
 #[cfg(all(any(test, feature = "test-stub"), unix))]
 #[derive(Default)]
 struct EintrWaitProbe {
-    /// Set exactly where [`wait_with_eintr_retry`] computes its deadline.
+    /// The single `started` instant the deadline is `started + timeout`
+    /// from; stamped with exactly that instant (never a second sample).
     deadline_anchor: std::sync::Mutex<Option<std::time::Instant>>,
     /// Incremented on every EINTR restart against that same deadline.
     eintr_retries: std::sync::atomic::AtomicUsize,
@@ -406,8 +408,8 @@ struct EintrWaitProbe {
 
 #[cfg(all(any(test, feature = "test-stub"), unix))]
 impl EintrWaitProbe {
-    fn note_wait_started(&self) {
-        *self.deadline_anchor.lock().expect("eintr probe anchor") = Some(std::time::Instant::now());
+    fn note_wait_started(&self, started: std::time::Instant) {
+        *self.deadline_anchor.lock().expect("eintr probe anchor") = Some(started);
     }
 
     fn note_eintr_retry(&self) {
@@ -446,11 +448,15 @@ fn wait_with_eintr_retry<T>(
     probe: Option<&EintrWaitProbe>,
     mut wait_once: impl FnMut(Duration) -> std::io::Result<InterruptibleEventWait<T>>,
 ) -> std::io::Result<InterruptibleEventWait<T>> {
-    let deadline = std::time::Instant::now() + timeout;
-    // r17 item 2: the probe clock starts HERE, at the waiter's own deadline
-    // computation — not at the spawning thread's start.
+    // ma-sdk-state r18 item 3: sample ONE started instant; the deadline is
+    // derived from it and the probe stamps EXACTLY that instant, so the
+    // test's `completion - started` is measured against the same clock the
+    // retry loop uses (previously the deadline used one Instant::now() sample
+    // and the probe stamped a later one).
+    let started = std::time::Instant::now();
+    let deadline = started + timeout;
     if let Some(probe) = probe {
-        probe.note_wait_started();
+        probe.note_wait_started(started);
     }
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -1746,12 +1752,14 @@ mod tests {
 
         /// The named bound for the waiter join: poll `is_finished` until the
         /// deadline (yield, never sleep) and only then join, which is
-        /// immediate for a finished thread.
+        /// immediate for a finished thread. Returns the waiter's answer and
+        /// the instant it captured INSIDE the waiter thread as its blocking
+        /// wait returned (ma-sdk-state r18 item 3).
         fn join_waiter_bounded(
-            handle: std::thread::JoinHandle<bool>,
+            handle: std::thread::JoinHandle<(bool, std::time::Instant)>,
             deadline: std::time::Instant,
             what: &str,
-        ) -> bool {
+        ) -> (bool, std::time::Instant) {
             while !handle.is_finished() {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -1804,7 +1812,11 @@ mod tests {
                 waiter_pthread_for_signal.store(pthread_self() as usize, Ordering::Release);
                 waiter_tid_for_ack.store(nix::unistd::gettid().as_raw(), Ordering::Release);
 
-                wait_child_exit_blocking(live_pid, WAIT, Some(&probe))
+                let satisfied = wait_child_exit_blocking(live_pid, WAIT, Some(&probe));
+                // ma-sdk-state r18 item 3: stamp the completion instant HERE,
+                // on the waiter thread, the moment the blocking wait returns
+                // — before the bounded join hands it back to the test thread.
+                (satisfied, std::time::Instant::now())
             }
         });
 
@@ -1822,7 +1834,7 @@ mod tests {
         pthread_kill(pthread as Pthread, Some(Signal::SIGUSR1))
             .expect("interrupt the waiting thread");
 
-        let answered = join_waiter_bounded(
+        let (answered, completed) = join_waiter_bounded(
             waiter,
             std::time::Instant::now() + Duration::from_secs(5),
             "the EINTR-interrupted exit waiter",
@@ -1839,17 +1851,24 @@ mod tests {
             !answered,
             "a live child still does not satisfy the exit wait"
         );
-        // Clocked from where the WAITER computed its deadline (not the thread
-        // spawn): a live-child wait must reach the FULL bound. The old
-        // assertion accepted a return 150 ms before the deadline, which let an
-        // early return survive a signal delivered late.
-        let anchor = probe
+        // ma-sdk-state r18 item 3: ONE started instant — sampled by the
+        // waiter, stamped unchanged into the probe, and used to derive the
+        // deadline — paired with the completion instant captured INSIDE the
+        // waiter thread at the blocking return and returned through the
+        // bounded join. A live-child wait must satisfy
+        // `completion - started >= WAIT`: the old assertion read
+        // `started.elapsed()` from the test thread AFTER the join (a second
+        // clock sample that tolerated a return before the deadline) and even
+        // accepted a return 150 ms early.
+        let started = probe
             .deadline_anchor()
-            .expect("the real waiter recorded its deadline anchor");
-        let elapsed = anchor.elapsed();
+            .expect("the real waiter recorded its single started instant");
+        let waited = completed
+            .checked_duration_since(started)
+            .expect("the captured completion instant follows the started instant");
         assert!(
-            elapsed >= WAIT,
-            "EINTR must not fail the exit wait early: it continues until the same deadline ({elapsed:?})"
+            waited >= WAIT,
+            "EINTR must not fail the exit wait early: it continues until the same deadline ({waited:?})"
         );
         let _ = live.kill();
         let _ = live.wait();

@@ -94,6 +94,18 @@ struct InstanceLifetime {
 static INSTANCE_LIFETIMES: LazyLock<Mutex<HashMap<PathBuf, HashMap<String, InstanceLifetime>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// (owner, canonical rollout path) -> the OTHER instance whose overlapping
+/// lifetime made prompt-only attribution impossible the first time this
+/// candidate was judged. A candidate once REJECTED for an owner stays rejected
+/// for that owner for as long as the blocker remains in the cwd census: the
+/// blocker merely CLOSING (liveness ending) must never turn a correct "not
+/// yours" into a match. When the blocker's retained interval genuinely EXPIRES
+/// past [`LIFETIME_RETENTION`] and is pruned (a later same-cwd registration
+/// triggers it), the rejection is cleared on the next judgment and the
+/// candidate may bind (c-usagefu r10 item 2, Ruling A).
+static REJECTED_CANDIDATES: LazyLock<Mutex<HashMap<(String, PathBuf), String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// RAII owner of one registered instance lifetime. The interval opens in
 /// [`begin_lifetime`] (production: before the agent process is launched) and
 /// is marked closed when the LAST clone drops — the live driver slot and the
@@ -162,15 +174,22 @@ pub(crate) fn begin_lifetime(
     owner: &str,
     launched_at: Option<OffsetDateTime>,
 ) -> LifetimeGuard {
+    begin_lifetime_at(cwd, owner, launched_at, OffsetDateTime::now_utc())
+}
+
+/// Clock-injected core of [`begin_lifetime`] (production passes wall-clock
+/// now; regressions advance the retention horizon deterministically).
+pub(crate) fn begin_lifetime_at(
+    cwd: &Path,
+    owner: &str,
+    launched_at: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> LifetimeGuard {
     let key = canonical(cwd);
     let epoch = {
-        let cutoff = OffsetDateTime::now_utc() - LIFETIME_RETENTION;
         let mut map = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
         let by_instance = map.entry(key.clone()).or_default();
-        // Bound retained history: drop closed intervals that can no longer
-        // overlap a current decision. A live interval (closed_at None) is
-        // never pruned.
-        by_instance.retain(|_, lifetime| lifetime.closed_at.is_none_or(|closed| closed >= cutoff));
+        prune_closed_intervals(by_instance, now);
         let lifetime = by_instance
             .entry(owner.to_owned())
             .or_insert_with(|| InstanceLifetime {
@@ -198,6 +217,31 @@ pub(crate) fn begin_lifetime(
             #[cfg(test)]
             closed_at: std::sync::Mutex::new(None),
         }),
+    }
+}
+
+/// Drop CLOSED intervals whose close predates `now - LIFETIME_RETENTION`: they
+/// can no longer overlap any current discovery decision. A live interval
+/// (closed_at None) is never pruned. Retained closed intervals are exactly
+/// what keep a later launch from becoming "sole" over a window a since-closed
+/// instance shared (r9 item 1); the hard horizon bounds that memory (r10
+/// item 2: after it, a rejection keyed to that blocker may flip).
+fn prune_closed_intervals(
+    by_instance: &mut HashMap<String, InstanceLifetime>,
+    now: OffsetDateTime,
+) {
+    let cutoff = now - LIFETIME_RETENTION;
+    by_instance.retain(|_, lifetime| lifetime.closed_at.is_none_or(|closed| closed >= cutoff));
+}
+
+/// Test seam: expire closed intervals in `cwd` as if retention were judged at
+/// `now` (a same-cwd registration triggers the same prune in production).
+#[cfg(test)]
+pub(crate) fn prune_closed_intervals_at(cwd: &Path, now: OffsetDateTime) {
+    let key = canonical(cwd);
+    let mut map = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
+    if let Some(by_instance) = map.get_mut(&key) {
+        prune_closed_intervals(by_instance, now);
     }
 }
 
@@ -525,78 +569,159 @@ pub(crate) fn record_input_at(cwd: &Path, owner: &str, text: &str, at: OffsetDat
     put_input(cwd, owner, text, at);
 }
 
-/// r9 item 1 TIER C: prompt text authorizes a rollout ONLY when ALL hold:
+/// Outcome of judging one candidate for prompt-only attribution (Ruling A).
+enum PromptVerdict {
+    /// Not attributable to this owner on the facts (no lifetime, unknown
+    /// floor, pre-launch creation, or no matching sent prompt).
+    Ineligible,
+    /// Every prompt/launch fact fits but another instance's lifetime overlaps
+    /// the census window, so attribution is refused. The string is the
+    /// overlapping instance the rejection is keyed to.
+    Blocker(String),
+    /// Complete census, sole live instance, prompt window fits: may bind.
+    Match,
+}
+
+/// Pure census judgment shared by the boolean and sticky-rejection paths.
+fn evaluate_prompt(
+    cwd: &Path,
+    owner: &str,
+    rollout_text: &str,
+    session_started: OffsetDateTime,
+) -> PromptVerdict {
+    let cwd_key = canonical(cwd);
+    let wanted = normalize_input(rollout_text);
+    if wanted.is_empty() {
+        return PromptVerdict::Ineligible;
+    }
+    let blocker = {
+        let lifetimes = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
+        let Some(by_instance) = lifetimes.get(&cwd_key) else {
+            return PromptVerdict::Ineligible;
+        };
+        let Some(own) = by_instance.get(owner) else {
+            return PromptVerdict::Ineligible;
+        };
+        // The owner itself needs a KNOWN launch boundary: a promoted (unknown
+        // floor) adapter never uses prompt-only attribution at all.
+        let Some(own_launch) = own.launched_at else {
+            return PromptVerdict::Ineligible;
+        };
+        // Strict launch floor: no pre-launch slack for prompt attribution.
+        if session_started < own_launch {
+            return PromptVerdict::Ineligible;
+        }
+        // Complete-census sole-live proof over [launch, creation]. Another
+        // instance overlaps when it was live at any instant across that
+        // interval. A KNOWN-boundary instance overlaps iff it launched at or
+        // before creation and was still live at the owner's launch. An
+        // UNKNOWN-boundary (promoted) instance cannot be proven to have
+        // launched after creation, so it overlaps whenever it was still live at
+        // the owner's launch — the cwd census is incomplete and prompt-only
+        // attribution is refused (Ruling A; closed exactly at the boundary is
+        // not an overlap).
+        by_instance
+            .iter()
+            .find(|(other, lifetime)| {
+                *other != owner
+                    && lifetime
+                        .launched_at
+                        .is_none_or(|launched| launched <= session_started)
+                    && lifetime.closed_at.is_none_or(|closed| closed > own_launch)
+            })
+            .map(|(other, _)| other.clone())
+    };
+    let prompt_fits = {
+        let inputs = SENT_INPUTS.lock().expect("codex sent inputs");
+        inputs
+            .get(&cwd_key)
+            .and_then(|by_owner| by_owner.get(owner))
+            .is_some_and(|list| {
+                list.iter().any(|input| {
+                    input.text == wanted
+                        && session_started >= input.at - INPUT_MATCH_SLACK
+                        && session_started <= input.at + INPUT_MATCH_WINDOW
+                })
+            })
+    };
+    if !prompt_fits {
+        return PromptVerdict::Ineligible;
+    }
+    match blocker {
+        Some(other) => PromptVerdict::Blocker(other),
+        None => PromptVerdict::Match,
+    }
+}
+
+/// r9 item 1 TIER C boolean: prompt text authorizes a rollout ONLY when the
+/// census is complete and the owner was the sole live instance over
+/// [launch, creation], with the first prompt in its send-time window.
 ///
-/// 1. `owner` registered an instance lifetime in `cwd`;
-/// 2. the rollout was created AT OR AFTER the owner's ACTUAL launch floor —
-///    the locator's 5 s pre-launch slack is NOT available to prompt-only
-///    attribution (only the hook and process-ownership tiers may take an
-///    in-slack candidate);
-/// 3. no OTHER instance was live in that cwd at any instant over the whole
-///    interval [owner launch, rollout creation]. A closed instance's
-///    retained interval counts, so an owner closing before the candidate is
-///    judged never makes the survivor "sole";
-/// 4. the rollout's first prompt is an input THIS owner dispatched, in its
-///    send-time window.
+/// Test-only direct read; production discovery goes through
+/// [`prompt_candidate_matches`] so the r10 item 2 sticky-rejection memory is
+/// always applied.
+#[cfg(test)]
 pub(crate) fn sole_instance_matches(
     cwd: &Path,
     owner: &str,
     rollout_text: &str,
     session_started: OffsetDateTime,
 ) -> bool {
-    let cwd_key = canonical(cwd);
-    let wanted = normalize_input(rollout_text);
-    if wanted.is_empty() {
-        return false;
-    }
-    let lifetimes = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
-    let Some(by_instance) = lifetimes.get(&cwd_key) else {
-        return false;
-    };
-    let Some(own) = by_instance.get(owner) else {
-        return false;
-    };
-    // The owner itself needs a KNOWN launch boundary: a promoted (unknown
-    // floor) adapter never uses prompt-only attribution at all.
-    let Some(own_launch) = own.launched_at else {
-        return false;
-    };
-    // Strict launch floor: no pre-launch slack for prompt attribution.
-    if session_started < own_launch {
-        return false;
-    }
-    // Complete-census sole-live proof over [launch, creation]. Another
-    // instance overlaps when it was live at any instant across that interval.
-    // A KNOWN-boundary instance overlaps iff it launched at or before creation
-    // and was still live at the owner's launch. An UNKNOWN-boundary (promoted)
-    // instance cannot be proven to have launched after creation, so it overlaps
-    // whenever it was still live at the owner's launch — the cwd census is
-    // incomplete and prompt-only attribution is refused (Ruling A; closed
-    // exactly at the boundary is not an overlap).
-    let shared_window = by_instance.iter().any(|(other, lifetime)| {
-        if other == owner {
-            return false;
+    matches!(
+        evaluate_prompt(cwd, owner, rollout_text, session_started),
+        PromptVerdict::Match
+    )
+}
+
+/// Production TIER C entry point with sticky-rejection memory (r10 item 2).
+///
+/// A candidate judged [`PromptVerdict::Blocker`] is REMEMBERED against that
+/// blocker: while the blocker stays in the cwd census, repeated scans (after
+/// the blocker merely CLOSED) keep returning false even if a transient scan
+/// would otherwise look sole. The rejection clears only once the blocker's
+/// retained interval expires past [`LIFETIME_RETENTION`] and is pruned — then a
+/// later judgment returns true and the candidate binds.
+pub(crate) fn prompt_candidate_matches(
+    cwd: &Path,
+    owner: &str,
+    rollout: &Path,
+    rollout_text: &str,
+    session_started: OffsetDateTime,
+) -> bool {
+    match evaluate_prompt(cwd, owner, rollout_text, session_started) {
+        PromptVerdict::Ineligible => false,
+        PromptVerdict::Blocker(blocker) => {
+            REJECTED_CANDIDATES
+                .lock()
+                .expect("rejected codex candidates")
+                .insert((owner.to_owned(), canonical(rollout)), blocker);
+            false
         }
-        let started_before_creation = lifetime
-            .launched_at
-            .is_none_or(|launched| launched <= session_started);
-        started_before_creation && lifetime.closed_at.is_none_or(|closed| closed > own_launch)
-    });
-    if shared_window {
-        return false;
+        PromptVerdict::Match => {
+            let mut rejected = REJECTED_CANDIDATES
+                .lock()
+                .expect("rejected codex candidates");
+            let Some(blocker) = rejected.get(&(owner.to_owned(), canonical(rollout))) else {
+                return true;
+            };
+            let blocker = blocker.clone();
+            // Still on the census (retained after close): the earlier rejection
+            // stands. Once pruned past the retention horizon it is gone: drop
+            // the rejection and let the candidate bind.
+            let still_blocking = {
+                let lifetimes = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
+                lifetimes
+                    .get(&canonical(cwd))
+                    .is_some_and(|by_instance| by_instance.contains_key(&blocker))
+            };
+            if still_blocking {
+                false
+            } else {
+                rejected.remove(&(owner.to_owned(), canonical(rollout)));
+                true
+            }
+        }
     }
-    drop(lifetimes);
-    let inputs = SENT_INPUTS.lock().expect("codex sent inputs");
-    inputs
-        .get(&cwd_key)
-        .and_then(|by_owner| by_owner.get(owner))
-        .is_some_and(|list| {
-            list.iter().any(|input| {
-                input.text == wanted
-                    && session_started >= input.at - INPUT_MATCH_SLACK
-                    && session_started <= input.at + INPUT_MATCH_WINDOW
-            })
-        })
 }
 
 // Test-only visibility so unit tests in other modules of this crate can

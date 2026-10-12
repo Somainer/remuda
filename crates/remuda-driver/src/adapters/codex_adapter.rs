@@ -410,9 +410,10 @@ impl CodexAdapter {
                 // the cwd over the whole [launch, creation] interval —
                 // including since-closed instances whose lifetime the
                 // registry retained. Anything else waits.
-                crate::adapters::codex_discovery::sole_instance_matches(
+                crate::adapters::codex_discovery::prompt_candidate_matches(
                     &cwd,
                     &owner,
+                    path,
                     first_prompt,
                     started,
                 )

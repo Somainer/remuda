@@ -1433,6 +1433,103 @@ fn a_known_boundary_native_codex_overlapping_blocks_generic_prompt_attribution()
 }
 
 #[test]
+fn a_rejected_candidate_stays_rejected_until_the_blocker_interval_expires() {
+    // r10 item 2 (Ruling A retained intervals + sticky rejection):
+    //   A and B overlap in one cwd; B sends P first;
+    //   A creates F carrying P AFTER B's launch, then closes;
+    //   B scans while A's closed interval is retained -> B rejects F.
+    // A merely CLOSING must never turn that into a match: repeated B scans
+    // while A is retained keep F unbound. Only once A's retained interval
+    // EXPIRES past the retention horizon (a new instance C registers 90 min
+    // later and prunes it) does the rejection clear — C launched long after F
+    // so C cannot own it — and F binds B.
+    use crate::adapters::codex_discovery::LifetimeGuardClock as _;
+
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r10-item2-retained";
+    let base = OffsetDateTime::now_utc() - time::Duration::seconds(40);
+    let a_launch = base;
+    let b_floor = base + time::Duration::seconds(10);
+    let f_at = b_floor + time::Duration::seconds(5);
+    let a_close = f_at + time::Duration::seconds(1);
+    let prompt = "shared rollout prompt P";
+
+    // A registers before B, sends the same prompt, then creates F after B's
+    // launch and closes (retained, close after B's floor -> overlap).
+    let a =
+        crate::adapters::codex_discovery::begin_lifetime(Path::new(cwd), INST_A, Some(a_launch));
+    send_fixture_prompt(Path::new(cwd), INST_A, prompt, b_floor);
+
+    let mut b = launch_adapter_keyed(home.path(), cwd, b_floor, INST_B);
+    send_fixture_prompt(Path::new(cwd), INST_B, prompt, b_floor);
+    write_rollout_prompt_at(
+        home.path(),
+        "F-r10-retained",
+        cwd,
+        &f_at.format(&Rfc3339).unwrap(),
+        prompt,
+    );
+    let f_path = home
+        .path()
+        .join("sessions/2026/09/14")
+        .join("rollout-F-r10-retained.jsonl");
+
+    a.close_lifetime_at(a_close);
+    drop(a);
+
+    // B scans repeatedly AFTER A closed: the retained interval plus the sticky
+    // rejection keep F refused — a close never flips the verdict.
+    for _ in 0..3 {
+        assert!(!b.discover().unwrap(), "B rejects F while A overlaps");
+        assert!(b.binding().is_none(), "F stays unbound for B");
+    }
+    assert_eq!(
+        crate::adapters::codex_discovery::claimed_owner_of(&f_path),
+        None,
+        "F is unclaimed after the rejected scans"
+    );
+
+    // 90 minutes after A closed, a NEW instance C registers in the cwd,
+    // pruning A's long-closed interval past the retention horizon.
+    let c_launch = a_close + time::Duration::minutes(90);
+    crate::adapters::codex_discovery::prune_closed_intervals_at(Path::new(cwd), c_launch);
+    let c = crate::adapters::codex_discovery::begin_lifetime_at(
+        Path::new(cwd),
+        INST_C,
+        Some(c_launch),
+        c_launch,
+    );
+
+    // C launched long after F existed, so a strict floor means C can never own
+    // F (it stays unclaimed by C).
+    assert!(
+        !crate::adapters::codex_discovery::sole_instance_matches(
+            Path::new(cwd),
+            INST_C,
+            prompt,
+            f_at
+        ),
+        "C cannot attribute a rollout created before its launch"
+    );
+
+    // With A expired the earlier blocker rejection clears: F now binds B.
+    assert!(
+        b.discover().unwrap(),
+        "F becomes B's once A's retained interval has expired"
+    );
+    assert_eq!(
+        b.binding().map(|binding| binding.session_id.as_str()),
+        Some("F-r10-retained")
+    );
+    assert_eq!(
+        crate::adapters::codex_discovery::claimed_owner_of(&f_path).as_deref(),
+        Some(INST_B),
+        "F is claimed by B"
+    );
+    drop(c);
+}
+
+#[test]
 fn a_unique_process_held_candidate_wins_over_a_weaker_prompt_candidate() {
     // r9 item 2: process-owned and prompt-only candidates must not be pooled
     // into one ambiguous set. B is the sole live instance and sent

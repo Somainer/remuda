@@ -166,6 +166,15 @@ export type EffortPending = {
    */
   source: "client" | "lifecycle";
   /**
+   * c-effortread r13 item 1: this client request replaced an earlier
+   * in-flight request (A→B→C). An ID-LESS queued edge that matches only the
+   * command WORD is then ambiguous — it can be the replaced request A's
+   * delayed edge with C's same word — and is never allowed to bind this
+   * pending's legacy lower bound. The request fails closed to its own send
+   * time until its bounded reconciliation ends it.
+   */
+  afterReplacement: boolean;
+  /**
    * The exact command word the DRIVER types for this configure
    * (c-effortui r4 item 3). On decoupled builds a TIER move with the flag on
    * is a plain level word (`/effort max` leaves the ortho flag as-is), so its
@@ -1128,13 +1137,22 @@ class HubStore {
     // request's outcome before the POST left). A wire pending whose queued
     // stamp is unparseable has NEITHER: fail closed and stay pending for the
     // bounded reconciliation (r12 item 5).
-    const queuedBoundMs =
+    //
+    // c-effortread r13 item 1: the bound is REQUEST-OWNED and an unidentified
+    // event may never LOWER it. A delayed word-only queued edge (the replaced
+    // request A's stale edge after an A→B→C sequence) carries a host stamp
+    // older than this client's send time; taking the queued stamp alone let it
+    // lower C's bound and let A's read-back settle C. For a client request the
+    // bound is therefore the MAX of the queued stamp and the send time.
+    const queuedStampMs =
       pending.queuedObservedAt != null &&
       Number.isFinite(Date.parse(pending.queuedObservedAt))
         ? Date.parse(pending.queuedObservedAt)
-        : pending.source === "client"
-          ? pending.at
-          : null;
+        : null;
+    const queuedBoundMs =
+      pending.source === "client"
+        ? Math.max(pending.at, queuedStampMs ?? Number.NEGATIVE_INFINITY)
+        : queuedStampMs;
     const strictlyAfterQueued =
       queuedBoundMs != null && Date.parse(view.observedAt) > queuedBoundMs;
     const inWindow = postBaseline && strictlyAfterQueued;
@@ -1689,16 +1707,20 @@ class HubStore {
         // `effort-queued` for request A after the user replaced it with B
         // carries a different id/axes and is dropped — it must never overwrite
         // B's pending indicator nor stamp B's queued time (A→B race).
-        // c-effortread r12 item 3: an ID-LESS queued edge never claims
-        // ownership, but with exactly one outstanding request (this
+        // c-effortread r13 item 1: an ID-LESS queued edge never claims
+        // ownership, and with exactly one outstanding request (this
         // per-instance pending) whose exact command word the edge repeats,
         // its observedAt IS a trustworthy request-specific LOWER BOUND for
         // that request — stamp it so a read-back at or before it cannot
         // settle. A different word is a replaced request's stale edge and is
-        // dropped without stamping.
+        // dropped without stamping. After an AMBIGUOUS REPLACEMENT (this
+        // request itself replaced an earlier one, A→B→C) the word is no
+        // longer unique — the same-word edge can be A's delayed edge — so it
+        // is never bound and the request fails closed on its own send time.
         const stampsLegacyQueuedBound =
           edgeId === null &&
           current.source === "client" &&
+          !current.afterReplacement &&
           effortLifecycleMatches(current, parsed.word, "queued");
         if (!edgeBelongsTo(current, "queued") && !stampsLegacyQueuedBound) return;
       } else {
@@ -1745,6 +1767,7 @@ class HubStore {
           // command-word identity, so leave the client prediction null and
           // match via the two-axis fallback.
           commandWord: null,
+          afterReplacement: false,
         };
         this.emit({ effortNonces: { ...this.state.effortNonces, [instanceId]: nonce } });
       }
@@ -4464,6 +4487,9 @@ class HubStore {
     // nonce and its OWN threshold stamped from the current projection. A
     // replaced request's late events cannot settle this indicator.
     const nonce = (this.state.effortNonces[instanceId] ?? 0) + 1;
+    // c-effortread r13 item 1: a request that replaces another in flight makes
+    // every later id-less word-only queued edge ambiguous.
+    const afterReplacement = Boolean(this.state.effortPending[instanceId]);
     // c-effortread r10 items 1–4: the per-request id that rides the configure
     // to the driver and returns on lifecycle edges and the requested echo.
     const requestId = id("effreq_") as unknown as string;
@@ -4503,6 +4529,7 @@ class HubStore {
       flagSettled: !movesFlag,
       source: "client",
       commandWord,
+      afterReplacement,
     };
     this.settledEffortPushdown.delete(instanceId);
     // Optimistically adopt the requested axes SYNCHRONOUSLY, before the

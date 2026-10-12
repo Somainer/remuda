@@ -2563,12 +2563,16 @@ it("r12 item 3: an id-less queued edge is C's lower bound — A's stale max read
   const idC = posts[2]?.requestId!;
   expect(hubStore.effortPendingOf(ctx.instance.id)?.requestId).toBe(idC);
 
-  // B's id-less queued edge stamps B, then C replaces it; C's own id-less
-  // queued edge at T2 stamps C (exact-word match binds the single outstanding
-  // request). A stale word would have been dropped.
+  // B's id-less queued edge is word-mismatched and dropped; C itself
+  // replaced B, so r13 item 1 makes C's own same-word id-less queued edge
+  // ambiguous (A was also max): it must NOT bind — C falls back to its own
+  // client send time as the legacy lower bound.
   ctx.receive(configureLifecycle(3, "effort-queued:low", ctx.instance.id, "2026-09-16T00:00:10.000Z"));
   ctx.receive(configureLifecycle(4, "effort-queued:max", ctx.instance.id, "2026-09-16T00:00:30.000Z"));
-  expect(hubStore.effortPendingOf(ctx.instance.id)?.queuedObservedAt).toBe("2026-09-16T00:00:30.000Z");
+  expect(
+    hubStore.effortPendingOf(ctx.instance.id)?.queuedObservedAt,
+    "an ambiguous same-word edge after A→B→C never binds",
+  ).toBeNull();
 
   // A's DELAYED max read-back (T0): post-baseline, value matches C, but older
   // than C's queued bound. It must stay a veto, not settle C.
@@ -2643,6 +2647,62 @@ it("r12 item 3: a wire pending with no parseable queued bound fails closed", asy
     hubStore.effortPendingOf(ctx.instance.id),
     "no trustworthy lower bound: fail closed, stay pending",
   ).not.toBeNull();
+});
+
+it("r13 item 1: a delayed same-word A edge after A→B→C never lowers C's send-time bound", async () => {
+  const ctx = await startFollowing("r13-item1-backlog", { state: "known", value: "working" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+
+  // Baseline low at T0, before A.
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:50.000Z"));
+
+  // A=max executes at T1 (23:59:55 client time); its id-less queued edge and
+  // its max read-back are delayed in the delivery backlog.
+  vi.setSystemTime(new Date("2026-09-15T23:59:55.000Z"));
+  const aPost = hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+  // The user changes their mind twice at T3: B=low then C=max (same word as A).
+  vi.setSystemTime(new Date("2026-09-16T00:00:10.000Z"));
+  await hubStore.setEffort(ctx.instance.id, { index: 2, name: "low", kind: "claude", ultracode: false });
+  await hubStore.setEffort(ctx.instance.id, { index: 4, name: "max", kind: "claude", ultracode: false });
+  await aPost;
+  const c = hubStore.effortPendingOf(ctx.instance.id);
+  expect(c?.afterReplacement, "C replaced B").toBe(true);
+
+  // The backlog flushes A's QUEUED edge first: same word ("max"), but its
+  // stamp T1 (23:59:56) is older than C's send and C is a replacement — the
+  // edge is ambiguous and must neither claim C nor stamp its bound.
+  ctx.receive(configureLifecycle(3, "effort-queued:max", ctx.instance.id, "2026-09-15T23:59:56.000Z"));
+  expect(
+    hubStore.effortPendingOf(ctx.instance.id)?.nonce,
+    "A's stale queued edge never replaces C",
+  ).toBe(c?.nonce);
+
+  // Then A's delayed max read-back at T2 (23:59:59): post-baseline and value
+  // matches C, but older than C's own send time (T3 = 00:00:10). It must stay
+  // a veto — before the fix the stamped T1 bound let this settle C.
+  ctx.receive(
+    effortEvent(4, "max", false, "remuda", "2026-09-15T23:59:59.000Z", {
+      requested: { name: "max", ultracode: false },
+    }),
+  );
+  const pending = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pending, "A's stale read-back never settles C").not.toBeNull();
+  expect(pending?.nonce).toBe(c?.nonce);
+  expect(pending?.levelSettled).toBe(false);
+  expect(
+    pending?.queuedObservedAt,
+    "an ambiguous word-only edge after A→B→C never lowers the send-time bound",
+  ).toBeNull();
+
+  // A genuinely fresh read-back produced AFTER C left the client settles it
+  // through the strict fallback.
+  ctx.receive(
+    effortEvent(5, "max", false, "remuda", "2026-09-16T00:00:30.000Z", {
+      requested: { name: "max", ultracode: false },
+    }),
+  );
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
 });
 
 async function advanceEffortReconcile(ms: number) {

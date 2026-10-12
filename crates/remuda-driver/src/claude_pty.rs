@@ -1820,15 +1820,17 @@ fn run_terminal_finish(
     gate: &TranscriptGate,
     pending: &TranscriptPending,
     faults: Option<&Arc<crate::test_faults::FaultState>>,
+    cooperative: bool,
 ) {
     let Some(ticket) = gate.register_terminal() else {
         // The epoch retired racing this registration; nothing left to do.
         return;
     };
-    // Test-only seam: park a registered terminal finaliser BEFORE its claim,
-    // modelling the closure merely queued on the blocking pool (r10 item 1).
+    // Test-only seam (r9 item 2): park a QUEUED closure before it claims the
+    // hydrator; inert in prod. Restricted to the cooperative close terminal
+    // (r12 item 3).
     if let Some(faults) = &faults {
-        faults.terminal_finalise_queued();
+        faults.terminal_finalise_queued(ticket, cooperative);
     }
     // claim blocks off-runtime while a registered collector (even one merely
     // queued) or the earlier ticket owner holds the hydrator — a condvar
@@ -1867,7 +1869,7 @@ async fn final_finish_blocking(
     let pending = Arc::clone(pending);
     let finish_faults = faults.cloned();
     let join = tokio::task::spawn_blocking(move || {
-        run_terminal_finish(&gate, &pending, finish_faults.as_ref());
+        run_terminal_finish(&gate, &pending, finish_faults.as_ref(), true);
     });
     let _ = join.await;
 }
@@ -1930,7 +1932,7 @@ impl Drop for AbortTranscriptGuard {
             if let Some(faults) = &faults {
                 faults.note_abort_residual();
             }
-            run_terminal_finish(&gate, &pending, faults.as_ref());
+            run_terminal_finish(&gate, &pending, faults.as_ref(), false);
             // The flusher terminates only after ACTUAL retirement: wait for
             // every registered producer (e.g. a closure still queued on the
             // blocking pool) instead of treating an elapsed budget as done.

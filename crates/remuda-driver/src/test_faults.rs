@@ -42,9 +42,6 @@ pub(crate) struct FaultState {
     /// Arms the ONE-SHOT gate that parks the first registered terminal
     /// finaliser before its claim (c-ctxusage r10 item 1).
     terminal_armed: AtomicBool,
-    /// One-shot: only the FIRST terminal finaliser parks, so the abort
-    /// residual reaches the claim (and blocks there) instead of parking too.
-    terminal_taken: AtomicBool,
     pump_entered: Mutex<bool>,
     pump_entered_cv: Condvar,
     finish_entered: Mutex<bool>,
@@ -100,7 +97,6 @@ impl FaultState {
             finish_armed: AtomicBool::new(false),
             queued_armed: AtomicBool::new(false),
             terminal_armed: AtomicBool::new(false),
-            terminal_taken: AtomicBool::new(false),
             pump_entered: Mutex::new(false),
             pump_entered_cv: Condvar::new(),
             finish_entered: Mutex::new(false),
@@ -186,16 +182,23 @@ impl FaultState {
         self.enter(Phase::Queued);
     }
 
-    /// Park a registered TERMINAL finaliser BEFORE it claims the hydrator
-    /// (c-ctxusage r10 item 1). ONE-SHOT: the first terminal parks (the
-    /// cooperative finalise, merely queued); a later terminal (the abort
-    /// residual) passes through and blocks inside the gate's claim, which is
-    /// the exact production deadlock shape.
-    pub(crate) fn terminal_finalise_queued(&self) {
-        if !self.terminal_armed.load(Ordering::SeqCst) {
-            return;
-        }
-        if self.terminal_taken.swap(true, Ordering::SeqCst) {
+    /// Park the cooperative terminal finaliser (the close-time owner) BEFORE
+    /// it claims the hydrator (c-ctxusage r10 item 1).
+    ///
+    /// The gate admits EXACTLY the cooperative terminal: `cooperative` marks
+    /// the cooperative close finalise (never the abort residual and never an
+    /// in-life boundary finish), and ticket 0 is the first terminal
+    /// registered — the cooperative finalise always registers before close's
+    /// timeout can abort and register the residual. Selecting on BOTH (instead
+    /// of a first-executor swap, c-ctxusage r12 item 3) means the abort thread
+    /// can never steal the cooperative pre-claim barrier when it executes
+    /// first; it reaches the gate claim and parks there instead.
+    pub(crate) fn terminal_finalise_queued(
+        &self,
+        ticket: crate::producer_gate::TerminalTicket,
+        cooperative: bool,
+    ) {
+        if !self.terminal_armed.load(Ordering::SeqCst) || !cooperative || ticket != 0 {
             return;
         }
         *self
@@ -498,5 +501,84 @@ impl TranscriptFaults {
 impl Default for TranscriptFaults {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, feature = "test-faults"))]
+mod terminal_gate_tests {
+    use super::*;
+    use std::sync::PoisonError;
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    fn join_bounded(handle: std::thread::JoinHandle<()>, what: &str) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let _watcher = std::thread::spawn(move || {
+            let _ = tx.send(handle.join());
+        });
+        match rx.recv_timeout(WAIT) {
+            Ok(Ok(())) => {}
+            Ok(Err(payload)) => std::panic::resume_unwind(payload),
+            Err(err) => panic!("{what} within {WAIT:?}: {err:?}"),
+        }
+    }
+
+    /// c-ctxusage r12 item 3: the abort residual's terminal can execute BEFORE
+    /// the merely-queued cooperative closure reaches the seam. The old
+    /// first-executor swap made whichever terminal ran first consume the
+    /// cooperative pre-claim gate, so the test could release without the
+    /// cooperative terminal ever registering. Only the cooperative terminal
+    /// (close owner, registration ticket 0) may park.
+    #[test]
+    fn the_abort_terminal_executing_first_never_consumes_the_cooperative_gate() {
+        let faults = FaultState::new();
+        faults.terminal_armed.store(true, Ordering::SeqCst);
+
+        // Abort residual: registered second (ticket 1), executes first.
+        let abort_faults = Arc::clone(&faults);
+        let abort = std::thread::spawn(move || abort_faults.terminal_finalise_queued(1, false));
+        join_bounded(abort, "the abort terminal parked in the cooperative gate");
+        assert!(
+            !*faults
+                .terminal_entered
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            "the abort residual acknowledged the cooperative gate"
+        );
+
+        // Cooperative close terminal (ticket 0) parks and acknowledges.
+        let coop_faults = Arc::clone(&faults);
+        let coop = std::thread::spawn(move || coop_faults.terminal_finalise_queued(0, true));
+        {
+            let guard = faults
+                .terminal_entered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (guard, wait) = faults
+                .terminal_entered_cv
+                .wait_timeout_while(guard, WAIT, |entered| !*entered)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                !wait.timed_out(),
+                "the cooperative terminal never acknowledged its pre-claim park"
+            );
+            assert!(
+                *guard,
+                "the cooperative terminal never acknowledged its pre-claim park"
+            );
+        }
+
+        // A boundary terminal (non-cooperative) never parks either.
+        let boundary_faults = Arc::clone(&faults);
+        let boundary =
+            std::thread::spawn(move || boundary_faults.terminal_finalise_queued(2, false));
+        join_bounded(boundary, "a boundary terminal parked in the close gate");
+
+        *faults
+            .gate_open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = true;
+        faults.gate_cv.notify_all();
+        join_bounded(coop, "the cooperative terminal never left its park");
     }
 }

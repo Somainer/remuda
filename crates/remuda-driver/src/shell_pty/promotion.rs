@@ -2279,7 +2279,9 @@ fn run_terminal_finalise(
         return;
     };
     if let Some(faults) = faults {
-        faults.terminal_finalise_queued();
+        // The FinaliseGuard is the abort residual, never the cooperative
+        // terminal (c-ctxusage r12 item 3).
+        faults.terminal_finalise_queued(ticket, false);
     }
     let Some(mut hydrator) = gate.claim_terminal(ticket) else {
         if gate.is_retired() {
@@ -2351,7 +2353,10 @@ async fn finalize_hydrator(
     let finish_faults = faults.cloned();
     let join = tokio::task::spawn_blocking(move || {
         if let Some(faults) = &finish_faults {
-            faults.terminal_finalise_queued();
+            // Only the terminal CLOSE finalise is the cooperative owner; an
+            // in-life epoch boundary finish must not take the close gate
+            // (c-ctxusage r12 item 3).
+            faults.terminal_finalise_queued(ticket, final_close);
         }
         let Some(mut hydrator) = gate.claim_terminal(ticket) else {
             if gate.is_retired() {

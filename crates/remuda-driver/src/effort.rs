@@ -610,10 +610,11 @@ pub(crate) struct EffortBridge {
 pub(crate) struct PendingSwitch {
     pub(crate) generation: u64,
     pub(crate) request: EffortRequest,
-    /// c-effortread r15 item 4: verified transcript byte position captured
-    /// immediately BEFORE the command was submitted (the bound file's EOF at
-    /// that instant). The mapper attributes only slash records starting
-    /// strictly after this position to the switch; `None` when the carrier
+    /// c-effortread r15 item 4, r16 item 1: verified transcript byte position
+    /// captured immediately BEFORE the command was submitted (the bound file's
+    /// EOF at that instant). The mapper attributes a slash record to the
+    /// switch only when it starts AT OR AFTER this position — the switch's own
+    /// record starts exactly at this file length; `None` when the carrier
     /// cannot supply a transcript position (direct unit tests).
     pub(crate) submit_floor: Option<u64>,
 }
@@ -676,7 +677,8 @@ impl EffortBridge {
     }
 
     /// Arm a switch with the verified transcript EOF captured immediately
-    /// before its command was submitted (c-effortread r15 item 4).
+    /// before its command was submitted (c-effortread r15 item 4, r16 item 1:
+    /// the switch's own slash starts AT this offset, not strictly past it).
     pub(crate) fn arm_with_floor(&self, request: EffortRequest, submit_floor: Option<u64>) -> u64 {
         let mut state = self.lock();
         state.generation += 1;
@@ -858,12 +860,14 @@ pub(crate) trait EffortSwitchIo: Send + Sync {
     /// Current visible screen text, ANSI stripped.
     async fn screen_text(&self) -> crate::DriverResult<String>;
 
-    /// c-effortread r15 item 4: verified transcript byte position captured
-    /// immediately BEFORE the command is submitted — the bound transcript
-    /// file's EOF at that instant. The mapper attributes only slash records
-    /// starting strictly AFTER this position to this switch, so an older
-    /// same-word slash the pump had not read yet can never claim it. `None`
-    /// when no transcript position is available.
+    /// c-effortread r15 item 4, r16 item 1: verified transcript byte position
+    /// captured immediately BEFORE the command is submitted — the bound
+    /// transcript file's EOF at that instant. The mapper attributes a slash
+    /// record to this switch only when it starts AT OR AFTER this position:
+    /// the switch's own record is appended starting exactly at this offset,
+    /// while an older same-word slash the pump had not read yet starts below
+    /// it and can never claim the switch. `None` when no transcript position
+    /// is available.
     async fn submission_floor(&self) -> Option<u64> {
         None
     }
@@ -916,10 +920,11 @@ pub(crate) async fn perform_switch(
     let target = request.dialog_target_word();
     let request_id = request.request_id.clone();
     // Capture the transcript EOF and arm BEFORE typing, so the mapper
-    // correlates only a slash record produced AFTER this instant with this
-    // generation (c-effortread r15 item 4): an older same-word slash still
-    // unread by the pump when this request was armed starts at or before
-    // this position and can never claim it.
+    // correlates only a slash record produced AT OR AFTER this instant with
+    // this generation (c-effortread r15 item 4, r16 item 1): the command's own
+    // record is appended starting exactly at this offset; an older same-word
+    // slash still unread by the pump when this request was armed starts below
+    // it and can never claim it.
     let submit_floor = io.submission_floor().await;
     let generation = bridge.arm_with_floor(request.clone(), submit_floor);
 

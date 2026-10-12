@@ -3508,8 +3508,9 @@ impl crate::effort::EffortSwitchIo for ShellEffortIo {
 
     async fn submission_floor(&self) -> Option<u64> {
         // The hydrator follows the same binding; stat the bound transcript's
-        // current EOF so only a slash appended after submission can be
-        // attributed to this switch (c-effortread r15 item 4).
+        // current EOF so the switch's own slash (appended starting AT this
+        // offset) attributes to the switch while an older unread slash cannot
+        // (c-effortread r15 item 4, r16 item 1).
         let binding = self.bindings.binding()?;
         std::fs::metadata(binding.path)
             .ok()

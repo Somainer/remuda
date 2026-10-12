@@ -1900,9 +1900,10 @@ impl crate::effort::EffortSwitchIo for HerdrEffortIo {
     }
 
     async fn submission_floor(&self) -> Option<u64> {
-        // The bound transcript's EOF immediately before submission: only a
-        // slash appended AFTER this position can be this switch's command
-        // (c-effortread r15 item 4).
+        // The bound transcript's EOF immediately before submission: the
+        // switch's own slash is appended starting AT this position, so only a
+        // record that starts at or after it can be this switch's command
+        // (c-effortread r15 item 4, r16 item 1).
         let path = self.transcript_path.lock().ok()?.clone()?;
         std::fs::metadata(path).ok().map(|metadata| metadata.len())
     }
@@ -3008,16 +3009,31 @@ mod tests {
         assert!(!bridge.has_pending(), "B's verdict settles B");
     }
 
-    /// c-effortread r15 item 4: an older native `/effort max` slash still
-    /// UNREAD by the transcript pump when web request B (also max) is armed
-    /// gets attributed to B by command word alone — its old refusal rejects B
-    /// (or an old accepted verdict resolves B). The mapper binds the armed
-    /// switch only to a slash whose verified transcript position is strictly
-    /// AFTER the switch's pre-submit EOF. This drives the case where the older
-    /// SLASH itself (not just its verdict) is unread until after B arms.
+    /// c-effortread r15 item 4 / r16 item 1: an older native `/effort max`
+    /// slash already on disk but still UNREAD when web request B (also max)
+    /// is armed must not be attributed to B — its old refusal must never
+    /// reject B. The floor is the bound transcript's EOF captured immediately
+    /// before B submits, and B's OWN slash record is appended to the file
+    /// exactly AT that byte offset: the first byte after the pre-submit EOF
+    /// starts at position L, so a record starting at L is B's command, not a
+    /// pre-submission one. Only records starting BELOW L are excluded.
     #[tokio::test]
-    async fn r15_item4_a_pre_submission_slash_never_claims_the_new_same_word_request() {
+    async fn r16_item1_a_slash_appended_exactly_at_the_pre_submit_eof_claims_its_switch() {
         use crate::effort::{EffortBridge, EffortRequest};
+
+        // A REAL transcript file: the offsets below are its measured byte
+        // lengths, not magic constants.
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("effort-session.jsonl");
+        let prefix = json!({
+            "type": "assistant",
+            "uuid": "msg-prefix",
+            "sessionId": "effort-session",
+            "version": "2.1.289",
+            "message": {"role": "assistant", "content": "warming the transcript"},
+        })
+        .to_string();
+        std::fs::write(&path, format!("{prefix}\n")).expect("seed prefix");
 
         let bridge = Arc::new(EffortBridge::new());
         let mut mapper = TranscriptMapper::new(
@@ -3031,24 +3047,58 @@ mod tests {
         )
         .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
 
-        // B is armed at the bound transcript's EOF (1000), which perform_switch
-        // stats immediately before typing. B's own command has not landed.
+        // The OLDER native /effort max (a human or a replaced command) is
+        // already appended — slash plus its Kept refusal — but the pump has
+        // not read either yet. Record both records' REAL start offsets.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open append");
+        let pos_old_slash = std::fs::metadata(&path).expect("stat").len();
+        use std::io::Write;
+        writeln!(file, "{}", effort_slash_line("cmd-old", "max")).expect("append old slash");
+        let pos_old_refusal = std::fs::metadata(&path).expect("stat").len();
+        writeln!(
+            file,
+            "{}",
+            effort_stdout_line("out-old", "Kept effort level as high")
+        )
+        .expect("append old refusal");
+        assert!(pos_old_slash < pos_old_refusal);
+
+        // B is armed at the bound transcript's EOF L, the exact byte offset
+        // perform_switch stats immediately before typing (carrier seam).
+        let floor = std::fs::metadata(&path).expect("stat").len();
         let request_b = EffortRequest::from_level("max")
             .expect("max")
             .with_request_id(Some("req-b"));
-        let gen_b = bridge.arm_with_floor(request_b, Some(1000));
+        let gen_b = bridge.arm_with_floor(request_b, Some(floor));
 
-        // The pump now catches up: an OLDER native /effort max (a human or a
-        // replaced command) whose SLASH record sat unread at byte 500, with
-        // its Kept refusal at byte 600. The positions prove both predate B's
-        // submission.
+        // B's own command is appended to the file IMMEDIATELY AT L: the next
+        // record after a length-L file starts at byte L, so its verified
+        // position equals the floor.
+        let pos_b_slash = std::fs::metadata(&path).expect("stat").len();
+        assert_eq!(pos_b_slash, floor, "the next append starts exactly at EOF");
+        writeln!(file, "{}", effort_slash_line("cmd-b", "max")).expect("append B slash");
+        let pos_b_verdict = std::fs::metadata(&path).expect("stat").len();
+        writeln!(
+            file,
+            "{}",
+            effort_stdout_line("out-b", "Set effort level to max")
+        )
+        .expect("append B verdict");
+        drop(file);
+
+        // The pump catches up: the OLDER slash starts strictly BELOW the floor
+        // and is not attributed to B, so its refusal neither emits a request
+        // edge nor rejects B.
         mapper
-            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(pos_old_slash))
             .expect("map old slash");
         let old_verdict = mapper
             .map_line_at(
                 &effort_stdout_line("out-old", "Kept effort level as high"),
-                Some(600),
+                Some(pos_old_refusal),
             )
             .expect("map old refusal");
         assert!(
@@ -3069,21 +3119,15 @@ mod tests {
             "no verdict of the older command resolves B"
         );
 
-        // A slash AT the floor is still pre-submission: not attributed either.
+        // B's own slash starts AT the floor and arms; its accepted max verdict
+        // resolves B and carries B's id.
         mapper
-            .map_line_at(&effort_slash_line("cmd-edge", "max"), Some(1000))
-            .expect("map boundary slash");
-        assert!(bridge.has_pending(), "a record at the floor is pre-submit");
-
-        // B's own slash lands strictly after the floor and arms; its accepted
-        // max verdict resolves B and carries B's id.
-        mapper
-            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
-            .expect("map B slash");
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(pos_b_slash))
+            .expect("map B slash at the floor");
         let out_b = mapper
             .map_line_at(
                 &effort_stdout_line("out-b", "Set effort level to max"),
-                Some(1600),
+                Some(pos_b_verdict),
             )
             .expect("map B verdict");
         let edge_b = out_b

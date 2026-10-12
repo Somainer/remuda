@@ -950,11 +950,12 @@ pub struct TailRead {
     /// Whole newline-terminated records appended since the last poll.
     pub lines: Vec<String>,
     /// Byte offset of the START of each corresponding record in the transcript
-    /// file (c-effortread r15 item 4). `positions[i]` is the verified
-    /// transcript position of `lines[i]`; the mapper attributes an armed
-    /// switch only to a record starting strictly after the switch's
-    /// pre-submit EOF position, so a backlogged older slash can never claim
-    /// a newer same-word request.
+    /// file (c-effortread r15 item 4, r16 item 1). `positions[i]` is the
+    /// verified transcript position of `lines[i]`; the mapper attributes an
+    /// armed switch to a record only when it starts at or after the switch's
+    /// pre-submit EOF position (the switch's own record starts exactly at that
+    /// file length), so a backlogged older slash can never claim a newer
+    /// same-word request.
     pub positions: Vec<u64>,
     /// Whether those lines are provenanced to the current process.
     pub provenance: TailProvenance,

@@ -2894,10 +2894,11 @@ impl TranscriptMapper {
     }
 
     /// Map one transcript line with its VERIFIED byte position in the
-    /// transcript file (c-effortread r15 item 4). The production tail passes
-    /// the position [`crate::claude_transcript::TailRead`] reports; an armed
-    /// effort switch is attributed only to a slash record starting strictly
-    /// after the switch's pre-submit EOF, so a backlogged older slash (still
+    /// transcript file (c-effortread r15 item 4, r16 item 1). The production
+    /// tail passes the position [`crate::claude_transcript::TailRead`] reports;
+    /// an armed effort switch is attributed only to a slash record starting at
+    /// or after the switch's pre-submit EOF (the switch's own record starts
+    /// exactly AT that file length), so a backlogged older slash (still
     /// unread when the switch was armed) can never claim the newer request.
     pub fn map_line_at(
         &mut self,
@@ -3110,18 +3111,22 @@ impl TranscriptMapper {
                 if pending.request.command_word() != args {
                     return false;
                 }
-                // c-effortread r15 item 4: matching command content is not
-                // enough — the slash must also have SUBMISSION PROVENANCE: a
-                // verified transcript position strictly AFTER this switch's
-                // pre-submit EOF. An older same-word slash that was still
-                // unread by the pump when this request armed starts at or
-                // before that floor and is treated as a human/replaced
-                // command, so its old refusal/acceptance can never settle
-                // this request. When either side lacks a position (direct
-                // unit tests) the word match alone governs.
+                // c-effortread r15 item 4 / r16 item 1: matching command
+                // content is not enough — the slash must also have SUBMISSION
+                // PROVENANCE: a verified transcript position at or after this
+                // switch's pre-submit EOF. The floor is the file length L
+                // captured immediately before submission, and the command's
+                // OWN record is appended starting exactly at byte L, so the
+                // boundary belongs to the switch (strict `>` rejected B's own
+                // legitimate slash — r16 item 1). Only an older same-word slash
+                // the pump had not read yet, starting BELOW that floor, is
+                // treated as a human/replaced command, so its old refusal/
+                // acceptance can never settle this request. When either side
+                // lacks a position (direct unit tests) the word match alone
+                // governs.
                 pending
                     .submit_floor
-                    .is_none_or(|floor| position.is_some_and(|record_pos| record_pos > floor))
+                    .is_none_or(|floor| position.is_some_and(|record_pos| record_pos >= floor))
             });
             // A slash read off an unverified/displaced batch cannot belong to
             // this process: arm neither the generation nor the level await, so

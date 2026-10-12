@@ -1788,3 +1788,102 @@ fn a_truncation_above_the_torn_start_invalidates_its_coverage() {
         "the shrink removed captured partial bytes above W: the retry is genuine"
     );
 }
+
+/// c-cardsettle-fu2 r8 item 3: another member's failure peek can be the
+/// ONLY open that observes the truncation. After a1's pending boundary is
+/// armed at W, the file is truncated to W and (with no poll in between) a
+/// DIFFERENT member's StopFailure opens the shared journal; the genuine a1
+/// retry is appended only afterwards and shares the captured torn prefix
+/// byte-for-byte, differing just past the observed extent. The peek must
+/// retire the boundary immediately, so the retry resurrects.
+#[test]
+fn another_members_failure_peek_observes_the_truncation() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_r8_other_peek";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    std::fs::write(run_dir.join("agent-a2.jsonl"), "{}\n").unwrap();
+    // a1 started+failed; a2 started and still running. All consumed, cursor W.
+    let prefix = "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n                  {\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n                  {\"type\":\"started\",\"key\":\"v2:k2\",\"agentId\":\"a2\"}\n";
+    std::fs::write(run_dir.join("journal.jsonl"), prefix).unwrap();
+    let w = prefix.len() as u64;
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Failed),
+        "a1 attempt 1 ends Failed"
+    );
+
+    // a1's torn attempt-2 start at W, torn INSIDE the identity value (no
+    // closing quote yet), so the genuine retry below can share every byte
+    // observed at failure time.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        write!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1"
+        )
+        .unwrap();
+    }
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+
+    // Truncate the unread torn tail back to W — with NO poll observing it.
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        file.set_len(w).unwrap();
+    }
+    // ANOTHER member's StopFailure is the first open after the truncation.
+    tailer
+        .agent_event("a2", true, Some(&run_dir.join("agent-a2.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a2", Some(&run_dir.join("agent-a2.jsonl")))
+        .unwrap();
+
+    // Only now is the genuine retry appended: it shares the torn prefix and
+    // differs just past the failure-time extent.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\
+             \"label\":\"genuine-retry-after-observed-truncation\"}}"
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Running),
+        "the other member's peek retired the boundary when it saw the shrink"
+    );
+}

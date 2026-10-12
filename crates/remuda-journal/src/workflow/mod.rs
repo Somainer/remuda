@@ -400,11 +400,44 @@ impl WorkflowJournalTailer {
             .tails
             .get_mut(&journal_path)
             .and_then(|tail| tail.unread_start(agent_id).transpose());
+        // r8 item 3: this peek OPENED the journal and is itself a newly
+        // observed file state. Another member's StopFailure can be the first
+        // open after a truncate/rewrite, so retire every existing cover the
+        // opened file contradicts before this peek's (fresh) watermark is
+        // armed — a peek must not overwrite evidence an earlier poll saw.
+        self.invalidate_covers(index, &journal_path);
         if let Some(Ok(watermark)) = unread {
             self.failure_watermarks
                 .insert(agent_id.to_owned(), watermark);
         }
         self.emit_snapshots()
+    }
+
+    /// Retire, on both sides, every watermark of a member of `index` whose
+    /// cover is contradicted by the journal tail's most recent open (poll or
+    /// failure peek): a rotation, a shrink through the captured bytes, or a
+    /// rewritten pending prefix.
+    fn invalidate_covers(&mut self, index: usize, journal_path: &Path) {
+        let invalid: Vec<String> = {
+            let Some(tail) = self.tails.get(journal_path) else {
+                return;
+            };
+            self.failure_watermarks
+                .iter()
+                .filter(|(agent_id, mark)| {
+                    self.runs[index]
+                        .members
+                        .iter()
+                        .any(|member| member.agent_id == **agent_id)
+                        && !tail.cover_is_valid(mark)
+                })
+                .map(|(agent_id, _)| agent_id.clone())
+                .collect()
+        };
+        for agent_id in invalid {
+            self.failure_watermarks.remove(&agent_id);
+            self.runs[index].clear_failure_watermark(&agent_id);
+        }
     }
 
     /// Tail the main session transcript for this run's terminal markers

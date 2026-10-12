@@ -838,3 +838,101 @@ async fn a_long_method_does_not_blind_the_daemon_controller() {
     let _ = task.await;
     node.shutdown().await.unwrap();
 }
+
+/// r12 item 10b: through the REAL durable daemon/bridge (no StubAuthorizer,
+/// no in-process cancel-map clear), a delayed `gate.run` that rides a bridge
+/// taken over by a restart/second controller is refused by the controller
+/// generation fence — the stale bridge is closed and its dispatch never
+/// executes — while the current controller's bridge still services dispatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delayed_gate_run_on_a_taken_over_bridge_is_refused_not_dispatched() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("never-on-stale-controller");
+    let node = compose(&ServeConfig::fake(
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
+        dir.path().to_path_buf(),
+    ))
+    .unwrap();
+    let control = test_control(dir.path());
+    let task = start(node.clone(), dir.path(), control).await;
+
+    // Bridge A is the first (gen N) controller.
+    let mut a = Peer::connect(dir.path(), false, json!([])).await;
+
+    // A restart/takeover: bridge B becomes the current (gen N+1) controller.
+    let mut b = Peer::connect(dir.path(), true, json!([])).await;
+
+    // The stale bridge A is closed by the daemon as its controller is revoked.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), a.next_opt())
+            .await
+            .expect("wait for stale bridge close")
+            .is_none(),
+        "the taken-over bridge A must be closed"
+    );
+
+    // The delayed dispatch arrives on the stale controller AFTER the takeover.
+    // The write may succeed into the dead pipe buffer; it must never be
+    // executed (no JSON-RPC reply), only closed.
+    let stale_run = json!({
+        "jsonrpc":"2.0","id":"stale-run","method":"gate.run",
+        "params":{
+            "jobId":"gjb_stale_bridge","laneId":"lane1",
+            "repoPath":repo.to_string_lossy(),"targetDir":repo.join("target").to_string_lossy(),
+            "branch":"wt/stale","baseBranch":"main","mode":"verify","web":"never",
+            "env":{},"timeouts":{},"gateTimeoutSecs":0,"push":false,"keepLogs":false,
+            "generation":1,
+        }
+    });
+    let _ = a.write.write_all(format!("{stale_run}\n").as_bytes()).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), a.next_opt())
+            .await
+            .expect("timeout")
+            .is_none(),
+        "the stale gate.run must not produce a reply or execute"
+    );
+
+    // The CURRENT controller B still services a gate.run: authorize then a
+    // real JSON-RPC gate.run response comes back.
+    b.send(json!({
+        "jsonrpc":"2.0","id":"live-run","method":"gate.run",
+        "params":{
+            "jobId":"gjb_live_bridge","laneId":"lane1",
+            "repoPath":repo.to_string_lossy(),"targetDir":repo.join("target").to_string_lossy(),
+            "branch":"wt/live","baseBranch":"main","mode":"verify","web":"never",
+            "env":{},"timeouts":{},"gateTimeoutSecs":0,"push":false,"keepLogs":false,
+            "generation":1,
+        },
+    }))
+    .await;
+
+    // B may first be asked gate.authorize by the real run; answer it, then
+    // collect frames until the gate.run reply for "live-run" arrives.
+    let mut got_live_reply = false;
+    for _ in 0..8 {
+        let frame = b.next().await;
+        if frame["method"] == json!("gate.authorize") {
+            b.send(json!({
+                "jsonrpc":"2.0","id":frame["id"].clone(),
+                "result":{"authorized":true,"generation":frame["params"]["generation"].clone()},
+            }))
+            .await;
+        }
+        if frame["id"] == json!("live-run") {
+            got_live_reply = true;
+            // A reply (failed on the missing checkout, or canceled) proves the
+            // current controller dispatched the run.
+            assert!(frame.get("result").is_some() || frame.get("error").is_some());
+            break;
+        }
+    }
+    assert!(
+        got_live_reply,
+        "the current controller B must service gate.run"
+    );
+
+    task.abort();
+    let _ = task.await;
+    node.shutdown().await.unwrap();
+}

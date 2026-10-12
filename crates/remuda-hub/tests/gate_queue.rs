@@ -486,10 +486,20 @@ async fn run_one_inline(script: &Arc<ScriptState>, params: &Value, node: &mut La
         }
     }
 
-    // Production lane-land path: take the Running → Landing grant before the
-    // push, exactly as the real Node does at the verify→land boundary.
+    // The real Node checks its generation-scoped cancel tombstone immediately
+    // before the grant; model that: if this job's cancel arrived while the
+    // run executed, never take the grant and return canceled (nothing pushed).
+    let canceled = script
+        .gate_cancels
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| frame["jobId"] == json!(job_id));
     let mut status = spec.status;
-    if spec.land_grant {
+    if canceled {
+        status = "canceled";
+    }
+    if spec.land_grant && !canceled {
         let grant_id = {
             let mut seq = script.seq.lock().unwrap();
             *seq += 1;
@@ -2128,5 +2138,108 @@ async fn land_grant_riding_a_replacement_session_after_reconnect_is_refused() ->
 
     // Release the park so teardown is clean (the parked run resumes).
     hold.notify_waiters();
+    Ok(())
+}
+
+/// r12 item 10a (cancel during verification): a cancel that lands while a lane
+/// LAND run is still verifying must make the Node skip the verify→land grant
+/// entirely — no gate.landGrant, no push; the job settles canceled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_during_verification_never_takes_the_land_grant_or_pushes() -> Result<()> {
+    let ctx = Ctx::spawn(1).await?;
+    // wait_cancel parks the run mid-verify until its gate.cancel arrives.
+    ctx.scripts[0].script(
+        "wt/land/cancel-mid-verify",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("4444444444444444444444444444444444444444"),
+            merge_ref: Some("refs/remuda/gate/mid-verify"),
+            land_grant: true,
+            wait_cancel: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/cancel-mid-verify","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap();
+    ctx.wait_state(id, &["running"]).await;
+
+    let (status, _) = ctx
+        .request(
+            "POST",
+            &format!("/v1/projects/{}/gate/jobs/{id}/cancel", ctx.project),
+            Some(json!({})),
+        )
+        .await;
+    assert!(status.is_success(), "cancel of a running verify is 2xx");
+
+    let done = ctx.wait_state(id, &["canceled", "failed"]).await;
+    assert_eq!(done["state"], "canceled", "{done}");
+    assert!(
+        ctx.scripts[0].grant_answers.lock().unwrap().is_empty(),
+        "a canceled verify must never ask for the land grant"
+    );
+    assert!(
+        ctx.scripts[0].land_calls.lock().unwrap().is_empty(),
+        "nothing can be pushed without a grant"
+    );
+    Ok(())
+}
+
+/// r12 item 10a (grant then cancel): once the land grant committed (row
+/// Landing), cancel returns 409 and the granted push runs to completion once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_after_the_grant_is_409_and_the_land_completes_once() -> Result<()> {
+    let ctx = Ctx::spawn(1).await?;
+    let parked = ctx.scripts[0].landing_started.notified();
+    let hold = Arc::new(Notify::new());
+    *ctx.scripts[0].landing_hold.lock().unwrap() = Some(hold.clone());
+    ctx.scripts[0].script(
+        "wt/land/grant-then-cancel",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("5555555555555555555555555555555555555555"),
+            merge_ref: Some("refs/remuda/gate/grant-then-cancel"),
+            land_grant: true,
+            hold_while_landing: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/grant-then-cancel","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(8), parked)
+        .await
+        .expect("run never parked after the grant");
+    let landing = ctx.wait_state(id, &["landing"]).await;
+    assert_eq!(landing["state"], "landing", "{landing}");
+
+    // Cancel after the grant: 409 landing-in-progress, row stays Landing.
+    let (status, body) = ctx
+        .request(
+            "POST",
+            &format!("/v1/projects/{}/gate/jobs/{id}/cancel", ctx.project),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, 409, "cancel after grant must be 409: {body}");
+    assert_eq!(ctx.job(id).await["state"], json!("landing"));
+
+    // Release the granted land; it completes and settles landed exactly once.
+    hold.notify_waiters();
+    let done = ctx.wait_state(id, &["landed", "failed"]).await;
+    assert_eq!(done["state"], "landed", "{done}");
+    assert_eq!(
+        ctx.scripts[0].arrivals.lock().unwrap().len(),
+        1,
+        "the job was dispatched once"
+    );
+    assert_eq!(
+        ctx.scripts[0].grant_answers.lock().unwrap().len(),
+        1,
+        "exactly one grant answer (the granted push runs once)"
+    );
     Ok(())
 }

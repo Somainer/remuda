@@ -435,8 +435,9 @@ async fn at_capacity_a_refused_cancel_does_not_block_a_later_dispatch() {
         .is_err()
     );
 
-    // (1) a tracked at-capacity job's dispatch is refused by the floor and
-    // never reaches git.
+    // (1) a tracked at-capacity job's dispatch is refused by the AUTHORITY
+    // floor (the recorded cancel tombstone), before execute_gate ever runs a
+    // git command — not a git failure against a nonexistent checkout.
     let tracked_repo = dir.path().join("tracked-no-push");
     let tracked = gate_rpc(
         &node,
@@ -449,14 +450,21 @@ async fn at_capacity_a_refused_cancel_does_not_block_a_later_dispatch() {
         json!("canceled"),
         "the tracked job's dispatch must be refused before git: {tracked}"
     );
+    assert_eq!(
+        tracked["reason"],
+        json!("canceled before the run registered"),
+        "the refusal must be the pre-execute authority/tombstone refusal, \
+         not a git error: {tracked}"
+    );
     assert!(
         !tracked_repo.exists(),
-        "refused dispatch must not create the checkout"
+        "refused dispatch must not create the checkout (no git ran)"
     );
 
-    // (2) the overflow job (no record) is NOT blocked by the local floor:
-    // with no carrier attached it executes (and fails on the missing repo —
-    // not canceled), proving the refused cancel recorded nothing.
+    // (2) the overflow job (no cancel record) is NOT blocked by the
+    // tombstone: with the live authorizer it executes (and fails on the
+    // missing repo — not canceled), proving the at-capacity cancel recorded
+    // nothing for it.
     let overflow_repo = dir.path().join("overflow-runs");
     let overflow = gate_rpc(
         &node,

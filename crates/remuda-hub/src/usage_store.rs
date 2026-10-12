@@ -563,12 +563,17 @@ struct StoredSnapshot {
 ///   persisted EVEN when every value is unchanged;
 /// * an EQUAL- or OLDER-position snapshot changes NOTHING — no counters, no
 ///   equal-position growth or bucket fill, no cost, no clock
-///   (c-ctxusage r15 item 2).
+///   (c-ctxusage r15 item 2). The gate runs BEFORE the cost-only branch, so a
+///   billing correction at a stale position is rejected too;
+/// * a STRICTLY NEWER COST-ONLY frame (no token baskets reported) is a
+///   billing correction on a separate channel: the bill alone is corrected
+///   (an unreported bill keeps the stored one) and the watermark advances, so
+///   a later counter snapshot at an older position is then rejected;
+///   counters it did not come with and the turn clock are kept
+///   (c-ctxusage r15 item 3).
 ///
-/// A COST-ONLY frame (no token baskets reported) is a billing correction on a
-/// separate channel: it updates the bill alone, never counters it did not come
-/// with and never the turn clock. Cumulative SESSION snapshots have their own
-/// monotone acceptance path and are not governed here.
+/// Cumulative SESSION snapshots have their own monotone acceptance path and
+/// are not governed here.
 fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
     let stored: Option<StoredSnapshot> = conn
         .query_row(
@@ -600,35 +605,41 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
         return insert_row(conn, row);
     };
 
-    let incoming = SnapshotCounters::of(row);
-    let reports_counters = incoming.token_baskets().iter().any(Option::is_some);
-
-    // COST-ONLY correction: no snapshot counters at all. It is on a separate
-    // channel from turn authority — it never authorizes counters it did not
-    // come with and never rewrites the turn clock (c-ctxusage r14 item 4).
-    if !reports_counters {
-        if row.cost_usd.is_some() && row.cost_usd != stored.cost_usd {
-            // The bill alone is corrected; the ingestion seq advances to the
-            // billing event, but counters, the revision watermark and the turn
-            // clock are all untouched.
-            conn.execute(
-                "UPDATE usage_events SET seq = ?1, cost_usd = ?2
-                 WHERE instance_id = ?3 AND scope = 'turn' AND scope_id = ?4",
-                params![row.seq, row.cost_usd, row.instance_id, row.scope_id],
-            )?;
-            return Ok(true);
-        }
+    // The authority gate runs BEFORE any field branch — including the
+    // cost-only billing channel (c-ctxusage r15 item 3). An equal or older
+    // position touches nothing: no counters, no equal-position growth or
+    // bucket fill, no bill correction, no clock. Two frames at one position
+    // are one source record however often re-delivered and whichever
+    // channels each delivery used; fills and corrections arrive only with a
+    // strictly newer position.
+    if row.metric_revision <= stored.revision {
         return Ok(false);
     }
 
-    if row.metric_revision <= stored.revision {
-        // An EQUAL or older source position changes NOTHING: no counters, no
-        // equal-position growth or bucket fill, no cost, no clock
-        // (c-ctxusage r15 item 2). Two frames at one position are one source
-        // record, however often re-delivered or whichever buckets each
-        // delivery happened to carry; fills arrive only with a strictly newer
-        // position.
-        return Ok(false);
+    let incoming = SnapshotCounters::of(row);
+    let reports_counters = incoming.token_baskets().iter().any(Option::is_some);
+
+    // STRICTLY NEWER COST-ONLY frame: a billing correction on its own
+    // channel. The bill alone is corrected (an unreported bill keeps the
+    // stored one); the watermark and ingestion seq advance so a later
+    // counter snapshot at an older position is rejected; counters it did not
+    // come with and the turn clock are kept exactly as stored.
+    if !reports_counters {
+        conn.execute(
+            "UPDATE usage_events
+             SET seq = ?1,
+                 metric_revision = ?2,
+                 cost_usd = COALESCE(?3, cost_usd)
+             WHERE instance_id = ?4 AND scope = 'turn' AND scope_id = ?5",
+            params![
+                row.seq,
+                row.metric_revision,
+                row.cost_usd,
+                row.instance_id,
+                row.scope_id,
+            ],
+        )?;
+        return Ok(true);
     }
 
     // STRICTLY NEWER source position: authoritative. Merge unreported incoming
@@ -3185,6 +3196,153 @@ mod tests {
         );
         assert_eq!(cache_read, None, "the equal-position bucket fill is frozen");
         assert_eq!(seq, 1, "neither equal-position frame adopts its seq");
+    }
+
+    /// c-ctxusage r15 item 3: a COST-ONLY frame is a billing correction on a
+    /// separate channel but it still rides the strict source-position gate.
+    /// A stale cost-only position changes nothing; a strictly newer cost-only
+    /// position corrects the bill AND advances the authority watermark (so a
+    /// later counter snapshot at an older position is rejected), while
+    /// counters and the turn clock are kept exactly as stored.
+    #[test]
+    fn a_cost_only_frame_is_position_gated_advances_the_watermark_and_keeps_counters_and_clock() {
+        // A cost-only turn frame: scope/scopeId/revision + bill, NO token
+        // baskets at all.
+        let cost_only = |seq: i64, revision: i64, amount: &str| {
+            let mut payload = serde_json::Map::new();
+            payload.insert("scope".into(), json!("turn"));
+            payload.insert("mode".into(), json!("snapshot"));
+            payload.insert("scopeId".into(), json!("msg-co"));
+            payload.insert("metricRevision".into(), json!(revision.to_string()));
+            payload.insert(
+                "cost".into(),
+                json!({
+                    "state": "known",
+                    "value": { "amount": amount, "currency": "USD" }
+                }),
+            );
+            payload.insert("accounting".into(), json!("estimated"));
+            JournalRecord {
+                instance_id: "ins_r15i3".into(),
+                seq,
+                event_id: format!("evt_{seq}"),
+                event: json!({ "kind": "usage", "payload": Value::Object(payload) }),
+                observed_at: "2026-09-15T00:00:00.000Z".into(),
+            }
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // rev 3: input 100 / output 20 at a native time, no bill.
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                1,
+                "ins_r15i3",
+                "turn",
+                Some("msg-co"),
+                3,
+                100,
+                20,
+                0,
+                0,
+                Some("2026-10-10T00:00:00.000Z")
+            )
+        ));
+
+        // Stale cost-only correction at rev 1 (older than the watermark):
+        // changes nothing — the bill is not corrected and the watermark
+        // stays at 3.
+        assert!(
+            !insert(&conn, &cost_only(2, 1, "0.400000000")),
+            "a stale cost-only frame must be rejected by the position gate"
+        );
+        let row: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT metric_revision, cost_usd FROM usage_events
+                 WHERE instance_id='ins_r15i3' AND scope_id='msg-co'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (3, None), "the stale cost correction never lands");
+
+        // Strictly newer cost-only at rev 5: corrects the bill and advances
+        // the watermark. Counters and the native turn clock are kept.
+        assert!(
+            insert(&conn, &cost_only(3, 5, "0.500000000")),
+            "a newer cost-only frame corrects the bill"
+        );
+        let row: (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            String,
+            String,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT metric_revision, input_tokens, output_tokens, cost_usd,
+                        observed_at, observed_at_source, seq
+                 FROM usage_events
+                 WHERE instance_id='ins_r15i3' AND scope_id='msg-co'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, 5, "the cost-only frame advances the watermark to 5");
+        assert_eq!((row.1, row.2), (Some(100), Some(20)), "counters kept");
+        assert_eq!(row.3.as_deref(), Some("0.500000000"), "bill corrected");
+        assert_eq!(
+            (row.4.as_str(), row.5.as_str()),
+            ("2026-10-10T00:00:00.000Z", "native"),
+            "a cost-only frame never rewrites the turn clock"
+        );
+        assert_eq!(row.6, 3, "the billing event advances the ingestion seq");
+
+        // A counter snapshot at rev 4 is now STALE against the cost-only
+        // watermark 5: rejected, output stays 20 even though 25 is a growth.
+        assert!(
+            !insert(
+                &conn,
+                &scoped_record(
+                    4,
+                    "ins_r15i3",
+                    "turn",
+                    Some("msg-co"),
+                    4,
+                    100,
+                    25,
+                    0,
+                    0,
+                    Some("2026-10-10T00:00:04.000Z")
+                )
+            ),
+            "the cost-only watermark rejects a later older-position snapshot"
+        );
+        let output: Option<i64> = conn
+            .query_row(
+                "SELECT output_tokens FROM usage_events
+                 WHERE instance_id='ins_r15i3' AND scope_id='msg-co'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            output,
+            Some(20),
+            "the stale counter snapshot changes nothing"
+        );
     }
 
     /// r4 item 7b: the REAL 2.1.289 fixture replayed by a fresh mapper into a

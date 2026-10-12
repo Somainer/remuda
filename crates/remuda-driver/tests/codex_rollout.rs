@@ -392,7 +392,11 @@ fn tail_appends_complete_records_and_preserves_utf8_across_polls() {
     std::fs::write(&path, b"{\"type\":\"compacted\"}\r\n\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"\xe4").unwrap();
     let mut tail = RolloutTail::new(path.clone());
     let records = tail.poll().unwrap();
-    assert_eq!(records, [r#"{"type":"compacted"}"#]);
+    assert_eq!(
+        records,
+        [(0u64, r#"{"type":"compacted"}"#.to_owned())],
+        "each record carries its first-byte offset in the file"
+    );
     assert!(tail.poll().unwrap().is_empty());
     let mut file = std::fs::OpenOptions::new()
         .append(true)
@@ -401,18 +405,26 @@ fn tail_appends_complete_records_and_preserves_utf8_across_polls() {
     file.write_all(b"\xb8\xad\"}}\n").unwrap();
     let records = tail.poll().unwrap();
     assert_eq!(records.len(), 1);
+    let (offset, line) = &records[0];
     assert_eq!(
-        parse_rollout_line(&records[0]).unwrap().event,
+        parse_rollout_line(line).unwrap().event,
         Event::Message {
             role: "user".into(),
             text: "中".into()
         }
     );
+    // The second record follows the 22-byte CRLF line plus the skipped blank
+    // line (1 byte): offset 23, replay-stable.
+    assert_eq!(*offset, 23);
     assert_eq!(tail.path(), path);
     assert_eq!(tail.offset(), std::fs::metadata(&path).unwrap().len());
     assert!(tail.poll().unwrap().is_empty());
     std::fs::write(&path, b"{\"type\":\"compacted\"}\n").unwrap();
-    assert_eq!(tail.poll().unwrap(), [r#"{"type":"compacted"}"#]);
+    assert_eq!(
+        tail.poll().unwrap(),
+        [(0u64, r#"{"type":"compacted"}"#.to_owned())],
+        "a shrunken file restarts the tail at byte zero"
+    );
 }
 
 fn write_meta(path: &Path, id: &str, root: &str) {

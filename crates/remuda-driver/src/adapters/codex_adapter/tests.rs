@@ -1771,6 +1771,91 @@ fn a_later_resend_keeps_the_initial_prompts_original_window() {
 }
 
 #[test]
+fn a_non_initial_prompt_also_survives_the_cap_for_a_live_discoverer() {
+    // c-usagefu r11 item 10 trigger 1: the r10 anchor protected ONLY the first
+    // prompt. B dispatches an ordinary prompt P as its SECOND send, then 33
+    // more distinct prompts. P fell out of the 32-entry recent list, so a
+    // rollout created inside P's window and discovered at the end could not
+    // bind. Ruling: a live discovery keeps EVERY window until bind/close.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r11-item10-cap";
+    let base = OffsetDateTime::now_utc() - time::Duration::seconds(60);
+
+    let mut b = launch_adapter_keyed(home.path(), cwd, base, INST_B);
+    send_fixture_prompt(Path::new(cwd), INST_B, "warm-up prompt zero", base);
+    // P is an ordinary (non-initial) dispatch.
+    let p_at = base + time::Duration::seconds(2);
+    send_fixture_prompt(Path::new(cwd), INST_B, "the middle prompt P", p_at);
+    for i in 0..33u32 {
+        send_fixture_prompt(
+            Path::new(cwd),
+            INST_B,
+            &format!("later distinct prompt {i}"),
+            base + time::Duration::seconds(10 + i64::from(i)),
+        );
+    }
+    let f_at = p_at + time::Duration::seconds(2);
+    write_rollout_prompt_at(
+        home.path(),
+        "F-middle-cap",
+        cwd,
+        &f_at.format(&Rfc3339).unwrap(),
+        "the middle prompt P",
+    );
+    assert!(
+        b.discover().unwrap(),
+        "P's window is retained past 33 later dispatches, not drained by a cap"
+    );
+    assert_eq!(
+        b.binding().map(|binding| binding.session_id.as_str()),
+        Some("F-middle-cap")
+    );
+}
+
+#[test]
+fn a_resend_of_a_non_initial_prompt_keeps_its_earlier_window() {
+    // c-usagefu r11 item 10 trigger 2: the r10 anchor trick protected only the
+    // FIRST prompt from a resend merge. B sends one warm-up prompt, then Q; F
+    // is created inside Q's ORIGINAL window; B RESENDS Q ten seconds later.
+    // Under the old merge the single recent entry for Q moved to the resend,
+    // sliding its window's back edge past F. Every dispatch is now its own
+    // window, so Q's original evidence still binds F.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r11-item10-resend";
+    let base = OffsetDateTime::now_utc() - time::Duration::seconds(60);
+
+    let mut b = launch_adapter_keyed(home.path(), cwd, base, INST_B);
+    send_fixture_prompt(Path::new(cwd), INST_B, "warm-up prompt zero", base);
+    let q_at = base + time::Duration::seconds(2);
+    send_fixture_prompt(Path::new(cwd), INST_B, "query Q", q_at);
+    // F is created inside Q's original window.
+    let f_at = q_at + time::Duration::seconds(2);
+    write_rollout_prompt_at(
+        home.path(),
+        "F-q-resend",
+        cwd,
+        &f_at.format(&Rfc3339).unwrap(),
+        "query Q",
+    );
+    // Resend 10 s on: under the old merge the only Q evidence moved to q_at+10
+    // and its window's back edge (q_at+5) passed F (q_at+2).
+    send_fixture_prompt(
+        Path::new(cwd),
+        INST_B,
+        "query Q",
+        q_at + time::Duration::seconds(10),
+    );
+    assert!(
+        b.discover().unwrap(),
+        "F matches Q's ORIGINAL window even for a non-initial resent prompt"
+    );
+    assert_eq!(
+        b.binding().map(|binding| binding.session_id.as_str()),
+        Some("F-q-resend")
+    );
+}
+
+#[test]
 fn a_unique_process_held_candidate_wins_over_a_weaker_prompt_candidate() {
     // r9 item 2: process-owned and prompt-only candidates must not be pooled
     // into one ambiguous set. B is the sole live instance and sent

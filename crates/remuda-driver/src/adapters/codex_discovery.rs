@@ -574,15 +574,13 @@ pub(crate) fn evict_expired_inputs(now: OffsetDateTime) {
     map.retain(|cwd, by_instance| {
         by_instance.retain(|owner, log| {
             if live.get(cwd).is_some_and(|set| set.contains(owner)) {
-                // Live unbound discoverer: keep the anchor and every recent
-                // prompt until bind/close (recent is capped at 32).
-                return !log.is_empty();
+                // Live unbound discoverer: keep EVERY dispatch window until
+                // bind/close (c-usagefu r11 item 10) — no age eviction, no cap,
+                // no merging of resends.
+                return !log.windows.is_empty();
             }
-            log.recent.retain(|input| input.at >= cutoff);
-            if log.anchor.as_ref().is_some_and(|input| input.at < cutoff) {
-                log.anchor = None;
-            }
-            !log.is_empty()
+            log.windows.retain(|input| input.at >= cutoff);
+            !log.windows.is_empty()
         });
         !by_instance.is_empty()
     });
@@ -592,32 +590,27 @@ pub(crate) fn evict_expired_inputs(now: OffsetDateTime) {
 struct SentInput {
     /// Whitespace-trimmed prompt text as the driver sent it.
     text: String,
-    /// Time this evidence window starts: the ORIGINAL send for the anchor, the
-    /// latest dispatch for a recent entry.
+    /// Time this dispatch's evidence window starts: every send gets its own
+    /// window, including a resend of an earlier prompt.
     at: OffsetDateTime,
 }
 
-/// Per-instance prompt evidence (c-usagefu r10 item 7). The FIRST prompt is
-/// held separately as an immutable ANCHOR carrying its ORIGINAL send-time
-/// window: a cap over later prompts must never drain it, and a later RESEND of
-/// the same text must not refresh its window (doing so moved the back edge of
-/// the window past a rollout that was created inside the ORIGINAL window).
-/// Later dispatches live in a bounded recent list; a resend of the anchor text
-/// is recorded there too, so the later dispatch still opens its own later
-/// window without disturbing the anchor.
+/// Per-instance prompt evidence (c-usagefu r11 item 10, Ruling): while a
+/// discovery is OPEN every dispatched prompt is retained as its OWN window —
+/// there is no length cap and a later RESEND never overwrites an earlier
+/// window (the old anchor+recent shape drained an unbound discoverer's 33rd
+/// distinct prompt and moved a resent prompt's window forward, losing evidence
+/// a lazily-scanned rollout still needed). Reclamation is by lifecycle: a bind
+/// releases the window and window close clears the cwd's prompts in
+/// [`DiscoveryWindow::release`].
 #[derive(Default)]
 struct PromptLog {
-    anchor: Option<SentInput>,
-    recent: Vec<SentInput>,
+    windows: Vec<SentInput>,
 }
 
 impl PromptLog {
-    fn is_empty(&self) -> bool {
-        self.anchor.is_none() && self.recent.is_empty()
-    }
-
     fn windows(&self) -> impl Iterator<Item = &SentInput> {
-        self.anchor.iter().chain(self.recent.iter())
+        self.windows.iter()
     }
 }
 
@@ -644,27 +637,9 @@ fn put_input(cwd: &Path, owner: &str, text: &str, at: OffsetDateTime) {
         .or_default()
         .entry(owner.to_owned())
         .or_default();
-    match &log.anchor {
-        // First prompt this instance ever sent: keep it as the immutable
-        // anchor with its original window.
-        None => log.anchor = Some(SentInput { text, at }),
-        Some(_) => {
-            // Later dispatch (a fresh prompt OR a resend of the anchor). It
-            // gets/updates its OWN recent entry and never touches the anchor.
-            match log.recent.iter_mut().find(|existing| existing.text == text) {
-                Some(existing) => existing.at = at,
-                None => {
-                    log.recent.push(SentInput { text, at });
-                    // Bound retained LATER history only; the anchor is outside
-                    // this list and can never be drained by it.
-                    if log.recent.len() > 32 {
-                        let excess = log.recent.len() - 32;
-                        log.recent.drain(0..excess);
-                    }
-                }
-            }
-        }
-    }
+    // Every dispatch is a distinct window: even an identical resend is pushed,
+    // so the earlier window keeps its own send-time back edge.
+    log.windows.push(SentInput { text, at });
 }
 
 /// Record that instance `owner` dispatched `text` in `cwd` at `now`.

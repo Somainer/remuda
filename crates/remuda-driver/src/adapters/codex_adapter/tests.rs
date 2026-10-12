@@ -1318,6 +1318,120 @@ fn a_rollout_created_by_an_instance_closed_before_b_launches_stays_unbound() {
     );
 }
 
+// c-usagefu r10 item 1 (Ruling A): a promoted (unknown launch boundary) codex
+// in the cwd makes the census incomplete, so prompt-only attribution is
+// refused even for a generic launch that otherwise looks like the sole match.
+
+#[test]
+fn a_promoted_unknown_boundary_codex_blocks_generic_prompt_attribution() {
+    // The exact r10 review sequence:
+    //   a promoted Codex A (operator-started, launch boundary unknown) and a
+    //   generic driver B share one cwd;
+    //   both dispatch "continue";
+    //   A's process creates rollout F AFTER B launched, but B scans BEFORE A
+    //   ever claims it.
+    // Without the promoted lifetime the r9 census saw only B and let it steal
+    // A's rollout. r10 item 1 registers A with an UNKNOWN boundary: the census
+    // is incomplete -> prompt-only is refused in the cwd, F stays unclaimed.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r10-item1-census";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+    let rfc = now.format(&Rfc3339).unwrap();
+
+    // The promoted watch registers A's unknown-boundary lifetime at detection.
+    let promoted_a = crate::adapters::codex_discovery::begin_lifetime(
+        Path::new(cwd),
+        "promoted-codex-4242",
+        None,
+    );
+
+    // A and B both send the identical prompt; F is created after B's launch.
+    send_fixture_prompt(Path::new(cwd), "promoted-codex-4242", "continue", now);
+    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+    send_fixture_prompt(Path::new(cwd), INST_B, "continue", now);
+    write_rollout_prompt_at(home.path(), "F-promoted", cwd, &rfc, "continue");
+    let f_path = home
+        .path()
+        .join("sessions/2026/09/14")
+        .join("rollout-F-promoted.jsonl");
+
+    assert!(
+        !crate::adapters::codex_discovery::sole_instance_matches(
+            Path::new(cwd),
+            INST_B,
+            "continue",
+            now
+        ),
+        "the unknown-boundary A makes B's sole-instance proof unprovable"
+    );
+    for _ in 0..3 {
+        assert!(
+            !b.discover().unwrap(),
+            "B must not prompt-bind the promoted instance's rollout"
+        );
+        assert!(b.binding().is_none(), "F stays unbound for B");
+    }
+    assert_eq!(
+        crate::adapters::codex_discovery::claimed_owner_of(&f_path),
+        None,
+        "the refused scans leave F unclaimed"
+    );
+
+    // A promoted instance itself never uses prompt-only attribution (its floor
+    // is unknown), regardless of how clean the rest of the census looks.
+    assert!(
+        !crate::adapters::codex_discovery::sole_instance_matches(
+            Path::new(cwd),
+            "promoted-codex-4242",
+            "continue",
+            now
+        ),
+        "an unknown-boundary owner is never a prompt-only attributor"
+    );
+    drop(promoted_a);
+}
+
+#[test]
+fn a_known_boundary_native_codex_overlapping_blocks_generic_prompt_attribution() {
+    // r10 item 1 companion: when the OTHER same-cwd codex is a native launch
+    // with a KNOWN boundary that overlaps [B launch, F creation], B is refused
+    // just the same — the fix is not specific to the unknown case.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r10-item1-known-overlap";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+    let rfc = now.format(&Rfc3339).unwrap();
+
+    // Native codex A launched before B, still live when F is created.
+    let native_a = crate::adapters::codex_discovery::begin_lifetime(
+        Path::new(cwd),
+        "native-A",
+        Some(now - time::Duration::seconds(20)),
+    );
+    send_fixture_prompt(Path::new(cwd), "native-A", "continue", now);
+    let mut b = launch_adapter_keyed(home.path(), cwd, floor, INST_B);
+    send_fixture_prompt(Path::new(cwd), INST_B, "continue", now);
+    write_rollout_prompt_at(home.path(), "F-native", cwd, &rfc, "continue");
+    let f_path = home
+        .path()
+        .join("sessions/2026/09/14")
+        .join("rollout-F-native.jsonl");
+
+    for _ in 0..3 {
+        assert!(
+            !b.discover().unwrap(),
+            "B must not prompt-bind while native A overlaps"
+        );
+        assert!(b.binding().is_none());
+    }
+    assert_eq!(
+        crate::adapters::codex_discovery::claimed_owner_of(&f_path),
+        None
+    );
+    drop(native_a);
+}
+
 #[test]
 fn a_unique_process_held_candidate_wins_over_a_weaker_prompt_candidate() {
     // r9 item 2: process-owned and prompt-only candidates must not be pooled
@@ -1534,7 +1648,7 @@ fn two_real_scans_race_one_claim_and_the_loser_binds_its_own_file() {
     .with_lifetime(crate::adapters::codex_discovery::begin_lifetime(
         Path::new(cwd),
         INST_A,
-        floor,
+        Some(floor),
     ))
     .with_instance_key(Some(INST_A.into()))
     .with_ownership(
@@ -1550,7 +1664,7 @@ fn two_real_scans_race_one_claim_and_the_loser_binds_its_own_file() {
     .with_lifetime(crate::adapters::codex_discovery::begin_lifetime(
         Path::new(cwd),
         INST_B,
-        floor,
+        Some(floor),
     ))
     .with_instance_key(Some(INST_B.into()))
     .with_ownership(

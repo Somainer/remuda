@@ -475,6 +475,14 @@ pub struct ShellPtyDriver {
     /// File-tail signal adapters (codex rollout, grok ACP files). Dropped on
     /// close, which stops their poll tasks (D-028 P6).
     adapters: Mutex<Option<crate::adapters::supervisor::AdapterHandle>>,
+    /// c-usagefu r10 item 1: codex instance-lifetime cohort for a
+    /// driver-launched (native/resumed) codex agent, held for the whole run
+    /// independent of whether/when its file adapter binds. The last clone
+    /// drops on close (or on resume adoption) to close the interval. Kept here
+    /// separately from the adapter handle so an aborted/re-spawned tail never
+    /// ends the census interval early. None for shells, grok and promoted
+    /// attaches (the promoted watch owns its own unknown-boundary guard).
+    codex_lifetime: Mutex<Option<crate::adapters::codex_discovery::LifetimeGuard>>,
     /// Recipe from the last start, reused by [`Driver::close`] to journal what
     /// it stopped and by the Node to audit what was launched.
     recipe: std::sync::Mutex<Option<LaunchRecipe>>,
@@ -535,6 +543,7 @@ impl ShellPtyDriver {
             fallbacks: crate::hook_answer::FallbackLedger::new(),
             hooks: Mutex::new(None),
             adapters: Mutex::new(None),
+            codex_lifetime: Mutex::new(None),
             recipe: std::sync::Mutex::new(None),
             exited: Arc::new(std::sync::Mutex::new(None)),
             effort_bridge: Mutex::new(Arc::new(crate::effort::EffortBridge::new())),
@@ -1059,6 +1068,22 @@ impl ShellPtyDriver {
             })??
         };
         let cmd = build_command(&self.options, cwd, &recipe, hooks.as_ref())?;
+        // c-usagefu r10 item 1 (Ruling A): register the codex agent's live
+        // interval in its cwd at the agent.start boundary, BEFORE the child
+        // is spawned and independent of the file adapter/hook binding. A
+        // same-cwd generic launch doing prompt-only discovery needs a complete
+        // census that includes THIS native instance; the driver holds one
+        // cohort clone for the whole run and hands another to the adapter.
+        let launch_floor = time::OffsetDateTime::now_utc();
+        let native_lifetime = if self.options.target.agent_kind() == Some(AgentKind::Codex) {
+            Some(crate::adapters::codex_discovery::begin_lifetime(
+                std::path::Path::new(cwd),
+                hook_ctx.instance_id.as_id().as_str(),
+                Some(launch_floor),
+            ))
+        } else {
+            None
+        };
         let child = pair.slave.spawn_command(cmd).map_err(pty_err)?;
         drop(pair.slave);
         // `portable-pty` calls `setsid()` before `exec`, so the child leads its
@@ -1277,7 +1302,12 @@ impl ShellPtyDriver {
         // GROK_HOME), follow the child pid, and emit on the instance's one
         // ordered observation channel. Hook-confirmed session identity wins
         // over file discovery (Hook > File) via the adapter confirm path.
-        if let Some(handle) = self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd)? {
+        if let Some(guard) = &native_lifetime {
+            *self.codex_lifetime.lock().await = Some(guard.clone());
+        }
+        if let Some(handle) =
+            self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd, native_lifetime)?
+        {
             *self.adapters.lock().await = Some(handle);
         }
         if self.options.promote {
@@ -1386,6 +1416,7 @@ impl ShellPtyDriver {
     /// wrote, so it only exists when the hook path is live — without hooks
     /// there is no per-session shadow home, and reading the user's real
     /// `~/.codex` from a launched session would cross the §4.2 boundary.
+    #[allow(clippy::too_many_arguments)] // launch wiring passes hooks/recipe/ctx/events/pid/cwd/lifetime.
     fn spawn_adapters(
         &self,
         hooks: &Option<Arc<crate::launch::HookSession>>,
@@ -1394,6 +1425,7 @@ impl ShellPtyDriver {
         events: &mpsc::Sender<remuda_protocol::Observation>,
         pid: Option<i32>,
         cwd: &str,
+        lifetime: Option<crate::adapters::codex_discovery::LifetimeGuard>,
     ) -> DriverResult<Option<crate::adapters::supervisor::AdapterHandle>> {
         let Some(hooks) = hooks else {
             return Ok(None);
@@ -1440,8 +1472,10 @@ impl ShellPtyDriver {
             // carrier here (the shell_pty native path is hook-confirmed).
             ownership: None,
             agent_pid_roots: None,
-            // Hook-confirmed launch: no launch-floor lifetime interval.
-            lifetime: None,
+            // r10 item 1: native/resumed launch joins the cwd census with its
+            // known agent.start floor; the driver's cohort clone keeps the
+            // interval open independent of this adapter's binding.
+            lifetime,
         };
         crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx)
     }
@@ -1471,6 +1505,14 @@ impl ShellPtyDriver {
         let task = tokio::spawn(async move {
             let mut current: Option<remuda_protocol::AgentKind> = None;
             let mut handle: Option<crate::adapters::supervisor::AdapterHandle> = None;
+            // r10 item 1 (Ruling A): a promoted codex is an operator-started
+            // process whose launch boundary is UNKNOWN. Registering it with no
+            // floor puts the cwd census in the "incomplete" state, so a same-cwd
+            // generic launch refuses prompt-only attribution while this codex
+            // could overlap. The guard is held here (not by the file adapter)
+            // and closed when the agent leaves the foreground or this watch
+            // stops, independent of any binding.
+            let mut census_guard: Option<crate::adapters::codex_discovery::LifetimeGuard> = None;
             let mut tick = tokio::time::interval(PROMOTE_POLL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -1490,6 +1532,9 @@ impl ShellPtyDriver {
                 if let Some(old) = handle.take() {
                     old.abort();
                 }
+                // The previous foreground agent is gone: close its census
+                // interval; a codex detection re-registers below.
+                drop(census_guard.take());
                 current = kind;
                 if let Some(kind @ (AgentKind::Codex | AgentKind::Grok)) = kind
                     && let Some(found) = promoted.lock().ok().and_then(|slot| slot.clone())
@@ -1499,6 +1544,14 @@ impl ShellPtyDriver {
                         u32::try_from(found.pid).ok(),
                     )
                 {
+                    if kind == AgentKind::Codex {
+                        let owner = format!("promoted-codex-{}", found.pid);
+                        census_guard = Some(crate::adapters::codex_discovery::begin_lifetime(
+                            &options_cwd,
+                            &owner,
+                            None,
+                        ));
+                    }
                     let adapter_ctx = crate::adapters::supervisor::AdapterCtx {
                         stamp: stamp_ctx.clone(),
                         seq: Arc::clone(&seq),
@@ -1514,6 +1567,8 @@ impl ShellPtyDriver {
                         instance_key: None,
                         ownership: None,
                         agent_pid_roots: None,
+                        // Census presence is owned by the watch guard above;
+                        // the promoted adapter binds by hook/name index only.
                         lifetime: None,
                     };
                     match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {
@@ -1696,6 +1751,10 @@ impl ShellPtyDriver {
         // followed a dead pid). Production single-point of the move:
         // supervisor::adopt_resumed_handle.
         crate::adapters::supervisor::adopt_resumed_handle(&self.adapters, &resumed.adapters).await;
+        // c-usagefu r10 item 1: adopt the resumed run's live codex census
+        // cohort. The previous run's guard is superseded by a newer epoch, so
+        // dropping it here does not record a close for the continued session.
+        *self.codex_lifetime.lock().await = resumed.codex_lifetime.lock().await.take();
         // §9.1: adopt the resumed run's switch coordination. Its worker and
         // mapper share a bridge, and its event sender is the live one. When a
         // switch was mid-flight at resume, adopt the resumed bridge so the

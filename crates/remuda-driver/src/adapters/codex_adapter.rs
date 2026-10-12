@@ -169,7 +169,7 @@ impl CodexAdapter {
                 self.lifetime = Some(crate::adapters::codex_discovery::begin_lifetime(
                     &self.home.cwd,
                     key,
-                    launched_at,
+                    Some(launched_at),
                 ));
             }
         }

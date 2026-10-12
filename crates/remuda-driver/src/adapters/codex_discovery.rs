@@ -70,13 +70,24 @@ const LIFETIME_RETENTION: time::Duration = time::Duration::hours(1);
 
 /// One driver launch's live interval in a cwd.
 struct InstanceLifetime {
-    /// Sampled at the agent.start boundary, BEFORE the child is spawned.
-    launched_at: OffsetDateTime,
+    /// The agent.start boundary, sampled BEFORE the child was spawned. `None`
+    /// means the launch boundary is UNKNOWN: a promoted (hand-typed) instance
+    /// the operator started before this Node detected it. Such an interval
+    /// makes the cwd's census incomplete, so prompt-only attribution is
+    /// refused in the cwd while it could overlap (c-usagefu r10 item 1,
+    /// Ruling A).
+    launched_at: Option<OffsetDateTime>,
     /// None while the instance is live; Some(close) after it closed. The
     /// record is RETAINED past close (independent of binding) so a later
     /// launch cannot become the "sole live instance" over a window a
     /// since-closed instance actually shared.
     closed_at: Option<OffsetDateTime>,
+    /// Bumped on every (re-)registration of this `(cwd, owner)`. A guard from
+    /// an older cohort (a close→resume scratch driver whose handle is adopted
+    /// away) records a close ONLY while it is still the current cohort, so a
+    /// resumed session is never marked closed by its previous spawn
+    /// (c-usagefu r10 item 1).
+    epoch: u64,
 }
 
 /// cwd -> (instance key -> lifetime).
@@ -95,6 +106,9 @@ pub(crate) struct LifetimeGuard {
 struct LifetimeGuardInner {
     key: PathBuf,
     owner: String,
+    /// Registration cohort this guard belongs to. Drop closes the interval
+    /// only if it is still the current cohort (resume bumps the epoch).
+    epoch: u64,
     /// Test clock: when set, Drop records this as the close time instead of
     /// wall-clock now, so regressions can place launches/closes on a
     /// deterministic timeline.
@@ -123,27 +137,33 @@ impl Drop for LifetimeGuardInner {
         let mut map = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
         if let Some(by_instance) = map.get_mut(&self.key)
             && let Some(lifetime) = by_instance.get_mut(&self.owner)
+            && lifetime.epoch == self.epoch
         {
             lifetime.closed_at = Some(at);
         }
     }
 }
 
-/// Register instance `owner` as launching in `cwd` at `launched_at` and
-/// return the lifetime guard. MUST be called before the agent process is
-/// spawned (the agent.start boundary), so an instance that launches/closes in
-/// the gap before the file adapter is constructed is still recorded.
+/// Register instance `owner` as launching in `cwd` at the agent.start boundary
+/// `launched_at` and return the lifetime guard. Generic/native/resumed launches
+/// pass `Some(boundary)` sampled BEFORE the child was spawned; a promoted
+/// (operator-started) instance passes `None` because its real launch boundary
+/// is unknown.
 ///
-/// Re-registering the same `(cwd, owner)` (a close→resume re-spawn with the
-/// stable instance key) reopens the interval while keeping the EARLIEST
-/// launch floor; it never erases an earlier segment.
+/// An unknown-boundary interval still appears in every same-cwd census and
+/// makes prompt-only attribution unprovable while it could overlap the
+/// decision window (c-usagefu r10 item 1, Ruling A).
+///
+/// Re-registering the same `(cwd, owner)` (a close then resume re-spawn with
+/// the stable instance key) reopens the interval, bumps its cohort epoch and
+/// keeps the best-known earliest floor; it never erases an earlier segment.
 pub(crate) fn begin_lifetime(
     cwd: &Path,
     owner: &str,
-    launched_at: OffsetDateTime,
+    launched_at: Option<OffsetDateTime>,
 ) -> LifetimeGuard {
     let key = canonical(cwd);
-    {
+    let epoch = {
         let cutoff = OffsetDateTime::now_utc() - LIFETIME_RETENTION;
         let mut map = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
         let by_instance = map.entry(key.clone()).or_default();
@@ -151,21 +171,30 @@ pub(crate) fn begin_lifetime(
         // overlap a current decision. A live interval (closed_at None) is
         // never pruned.
         by_instance.retain(|_, lifetime| lifetime.closed_at.is_none_or(|closed| closed >= cutoff));
-        by_instance
+        let lifetime = by_instance
             .entry(owner.to_owned())
-            .and_modify(|lifetime| {
-                lifetime.launched_at = lifetime.launched_at.min(launched_at);
-                lifetime.closed_at = None;
-            })
-            .or_insert(InstanceLifetime {
+            .or_insert_with(|| InstanceLifetime {
                 launched_at,
                 closed_at: None,
+                epoch: 0,
             });
-    }
+        // (Re-)open and claim a fresh cohort so a resume scratch driver's
+        // stale guard cannot close the resumed interval on drop.
+        lifetime.epoch = lifetime.epoch.wrapping_add(1);
+        lifetime.closed_at = None;
+        // Best-known earliest floor. An unknown-boundary segment can never be
+        // bounded by a later known one, so None stays sticky across cohorts.
+        lifetime.launched_at = match (lifetime.launched_at, launched_at) {
+            (Some(existing), Some(incoming)) => Some(existing.min(incoming)),
+            _ => None,
+        };
+        lifetime.epoch
+    };
     LifetimeGuard {
         inner: Arc::new(LifetimeGuardInner {
             key,
             owner: owner.to_owned(),
+            epoch,
             #[cfg(test)]
             closed_at: std::sync::Mutex::new(None),
         }),
@@ -527,19 +556,31 @@ pub(crate) fn sole_instance_matches(
     let Some(own) = by_instance.get(owner) else {
         return false;
     };
+    // The owner itself needs a KNOWN launch boundary: a promoted (unknown
+    // floor) adapter never uses prompt-only attribution at all.
+    let Some(own_launch) = own.launched_at else {
+        return false;
+    };
     // Strict launch floor: no pre-launch slack for prompt attribution.
-    if session_started < own.launched_at {
+    if session_started < own_launch {
         return false;
     }
-    // Sole-live proof over [launch, creation]. Another instance overlaps when
-    // it launched at or before creation and was still live at the owner's
-    // launch (closed exactly at the boundary is not an overlap).
+    // Complete-census sole-live proof over [launch, creation]. Another
+    // instance overlaps when it was live at any instant across that interval.
+    // A KNOWN-boundary instance overlaps iff it launched at or before creation
+    // and was still live at the owner's launch. An UNKNOWN-boundary (promoted)
+    // instance cannot be proven to have launched after creation, so it overlaps
+    // whenever it was still live at the owner's launch — the cwd census is
+    // incomplete and prompt-only attribution is refused (Ruling A; closed
+    // exactly at the boundary is not an overlap).
     let shared_window = by_instance.iter().any(|(other, lifetime)| {
-        other != owner
-            && lifetime.launched_at <= session_started
-            && lifetime
-                .closed_at
-                .is_none_or(|closed| closed > own.launched_at)
+        if other == owner {
+            return false;
+        }
+        let started_before_creation = lifetime
+            .launched_at
+            .is_none_or(|launched| launched <= session_started);
+        started_before_creation && lifetime.closed_at.is_none_or(|closed| closed > own_launch)
     });
     if shared_window {
         return false;

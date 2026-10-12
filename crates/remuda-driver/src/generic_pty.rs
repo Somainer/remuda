@@ -400,7 +400,7 @@ impl GenericPtyDriver {
             Some(crate::adapters::codex_discovery::begin_lifetime(
                 std::path::Path::new(&recipe.cwd),
                 &instance_key,
-                launched_at,
+                Some(launched_at),
             ))
         } else {
             None

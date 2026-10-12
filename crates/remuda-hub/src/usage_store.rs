@@ -214,7 +214,6 @@ fn consolidate_message_duplicates(conn: &Connection) -> rusqlite::Result<()> {
                    AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
                    AND m2.metric_revision = {top_revision}
                    AND m2.{column} IS NOT NULL
-                   AND m2.metric_revision = {top_revision}
                  ORDER BY m2.rowid DESC LIMIT 1)"
         ));
     }
@@ -225,6 +224,7 @@ fn consolidate_message_duplicates(conn: &Connection) -> rusqlite::Result<()> {
                  SELECT m2.accounting FROM usage_events m2
                  WHERE m2.instance_id = usage_events.instance_id
                    AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                   AND m2.metric_revision = {top_revision}
                  ORDER BY m2.rowid DESC LIMIT 1)"
     ));
     let batch = format!(
@@ -2503,13 +2503,18 @@ mod tests {
                 ('ins_c1p', 3, 'message', 'c1p', 't', 'snapshot', 2,
                  NULL, 9, 111, NULL, 'reported',
                  '2026-09-15T00:00:06.000Z', 'native'),
-                -- key 'c1n': rev 2 NULL cost with NO same-revision repair.
-                ('ins_c1n', 4, 'message', 'c1n', 't', 'snapshot', 1,
-                 50, 5, 45, '0.05', 'estimated',
-                 '2026-09-15T00:00:00.000Z', 'native'),
-                ('ins_c1n', 5, 'message', 'c1n', 't', 'snapshot', 2,
-                 60, 6, 54, NULL, 'reported',
-                 '2026-09-15T00:00:05.000Z', 'native');",
+                -- key 'c1n': rev 2 NULL cost with NO same-revision repair,
+                -- and an OLDER revision carrying a STRONGER accounting
+                -- authority ('reported') which must not win at rev 2. The
+                -- rev-1 row arrives OUT OF ORDER (highest rowid) so a
+                -- newest-rowid tiebreak without the revision filter would
+                -- wrongly take 'reported'.
+                ('ins_c1n', 4, 'message', 'c1n', 't', 'snapshot', 2,
+                 60, 6, 54, NULL, 'estimated',
+                 '2026-09-15T00:00:05.000Z', 'native'),
+                ('ins_c1n', 5, 'message', 'c1n', 't', 'snapshot', 1,
+                 50, 5, 45, '0.05', 'reported',
+                 '2026-09-15T00:00:00.000Z', 'native');",
         )
         .unwrap();
         migrate(&conn).unwrap();
@@ -2563,6 +2568,19 @@ mod tests {
         assert_eq!(
             cost_n, None,
             "a NULL cost with no same-revision repair stays NULL"
+        );
+        // Accounting follows the SAME at-top-revision rule: the top revision
+        // is 2 ('estimated'); the older rev-1 'reported' never overrides it.
+        let accounting_n: String = conn
+            .query_row(
+                "SELECT accounting FROM usage_events WHERE instance_id='ins_c1n'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            accounting_n, "estimated",
+            "accounting comes from the top revision only, not a stronger rev 1"
         );
 
         // Idempotent: a second migration does not discover rev 1.

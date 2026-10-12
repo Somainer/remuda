@@ -1651,37 +1651,49 @@ impl ShellPtyDriver {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let close_barrier = drain.arm_close().await;
-        // P1 (c-ctxusage r16 item 6): wait for the poller's handoff ack BEFORE
-        // signalling the writer. An in-flight normal tick may already have
-        // passed its closing check and be about to demote/finalise the
-        // hydrator; the ack fires only after that tick completed and the next
-        // iteration entered the non-terminal tail branch. Without the barrier
-        // that demote/finalise could retire the hydrator under the ladder and
-        // eat the writer's termination append. A poller that cannot reach the
-        // branch in time makes the close retryable rather than racing.
-        if let Some(faults) = self
-            .test_faults
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_deref()
-        {
-            faults.note_close_barrier_waiting();
-        }
-        let barrier_bound = self
-            .test_faults
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_deref()
-            .and_then(crate::test_faults::FaultState::close_barrier_timeout)
-            .unwrap_or(PROMOTER_CLOSE_BARRIER);
-        if tokio::time::timeout(barrier_bound, close_barrier)
-            .await
-            .is_err()
-        {
-            tracing::warn!("promoted close barrier was not acknowledged; close stays retryable");
-            return Err(DriverError::WriterStillLive(
-                "the poller never acknowledged the close handoff barrier".into(),
-            ));
+        // The handoff barrier exists to serialize with an IN-FLIGHT poll. In
+        // production a promoted agent exists only because the poller promoted
+        // it, so the poller handle is always live here. The only case with a
+        // promoted slot but no poller is the unit-test setup that injects the
+        // promotion state directly (login options): nothing can be mid-flight,
+        // so the barrier is trivially satisfied.
+        let poller_live = self.poller.lock().await.is_some();
+        if poller_live {
+            // P1 (c-ctxusage r16 item 6): wait for the poller's handoff ack
+            // BEFORE signalling the writer. An in-flight normal tick may
+            // already have passed its closing check and be about to
+            // demote/finalise the hydrator; the ack fires only after that tick
+            // completed and the next iteration entered the non-terminal tail
+            // branch. Without the barrier that demote/finalise could retire
+            // the hydrator under the ladder and eat the writer's termination
+            // append. A poller that cannot reach the branch in time makes the
+            // close retryable rather than racing.
+            if let Some(faults) = self
+                .test_faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_deref()
+            {
+                faults.note_close_barrier_waiting();
+            }
+            let barrier_bound = self
+                .test_faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_deref()
+                .and_then(crate::test_faults::FaultState::close_barrier_timeout)
+                .unwrap_or(PROMOTER_CLOSE_BARRIER);
+            if tokio::time::timeout(barrier_bound, close_barrier)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "promoted close barrier was not acknowledged; close stays retryable"
+                );
+                return Err(DriverError::WriterStillLive(
+                    "the poller never acknowledged the close handoff barrier".into(),
+                ));
+            }
         }
         let outcome = self.stop_tree(&state, true).await;
 

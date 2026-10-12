@@ -1844,8 +1844,18 @@ class HubStore {
    * re-forwards it. Without this set the drain loop would tight-loop a held
    * row up to MAX_FLUSH_PASSES in one flush. A genuinely new row (or a steer
    * landing mid-flush) is not in the set and still drains.
+   *
+   * `skipCurrentlyHeld` (gate 19 item 2) is the timer-fire policy: the held
+   * suppression is enforced against the FRESH selection made INSIDE the
+   * instance lock, not against the snapshot read before the flush waited on
+   * that lock. Another tab can finish a row as "held" while this flush waits;
+   * a snapshot id-set computed earlier misses it and used to re-POST the row
+   * ahead of its held-retry deadline. The policy is checked again at the claim
+   * boundary so the row under the lock is the row that is judged. Normal
+   * flushes deliberately re-POST held rows (a host online→online resume
+   * re-forwards them), so this is opt-in for the timer path only.
    */
-  private async flushAllOutbox(attempted: Set<Id> = new Set()) {
+  private async flushAllOutbox(attempted: Set<Id> = new Set(), skipCurrentlyHeld = false) {
     const box = this.outbox;
     if (!box) return;
     if (this.pageIsUnloading) return;
@@ -1881,7 +1891,19 @@ class HubStore {
         if (this.pageIsUnloading) return;
         try {
           const id = await box.withInstanceLock(instanceId, (iid, deliverable) =>
-            this.deliverOneRow(iid, deliverable.filter((r) => !attempted.has(r.commandId))),
+            this.deliverOneRow(
+              iid,
+              deliverable.filter(
+                (r) =>
+                  !attempted.has(r.commandId) &&
+                  // Gate 19 item 2: the policy rides into the FRESH selection
+                  // built inside this lock turn — a row another tab finished
+                  // as held while we waited is excluded here even though the
+                  // pre-lock snapshot knew it as inflight.
+                  !(skipCurrentlyHeld && r.state === "held"),
+              ),
+              { skipCurrentlyHeld },
+            ),
           );
           if (id) {
             attempted.add(id);
@@ -1916,12 +1938,22 @@ class HubStore {
    * Returns the POSTed row's commandId (added to the flush's attempted set)
    * or null when no candidate POSTed.
    */
-  private async deliverOneRow(instanceId: Id, deliverable: OutboxRecord[]): Promise<Id | null> {
+  private async deliverOneRow(
+    instanceId: Id,
+    deliverable: OutboxRecord[],
+    opts: { skipCurrentlyHeld?: boolean } = {},
+  ): Promise<Id | null> {
     const box = this.outbox;
     if (!box) return null;
     for (const rec of deliverable) {
       const fresh = box.get(rec.commandId) ?? rec;
       if (!isDeliverableOutbox(fresh, Date.now())) continue;
+      // Gate 19 item 2: enforce the held policy a second time at the CLAIM
+      // boundary. The candidate set was filtered from the fresh in-lock
+      // selection, and the per-instance lock prevents another deliverer from
+      // changing the row concurrently; this keeps the policy attached to the
+      // exact row whose claim is about to be written.
+      if (opts.skipCurrentlyHeld && fresh.state === "held") continue;
       const outcome = await this.deliverOutboxRecord(fresh);
       if (outcome === "claim-aborted") {
         // FIFO: the first deliverable row could not claim; never POST a later
@@ -4070,22 +4102,21 @@ class HubStore {
     // instance's lease can already be stealable while its own callback is
     // still queued. HELD rows keep the no-immediate-POST rule everywhere
     // (their own bounded held-retry clock owns the next POST — re-POSTing here
-    // revived the gate-17 item-3 early POST): they are pre-seeded into the
-    // flush's attempted set so delivering another row can never ride a held
-    // row along. A command this document is actively POSTing is excluded;
-    // terminal rows are never deliverable.
-    const suppressedHeld = new Set<Id>();
+    // revived the gate-17 item-3 early POST). Gate 19 item 2: that suppression
+    // is now a POLICY the flush enforces against the FRESH rows it selects
+    // INSIDE the instance lock (and at the claim boundary), not a snapshot id
+    // set taken here: a sibling can finish a row as held WHILE this flush is
+    // waiting on the lock, and the stale snapshot used to let the flush
+    // re-POST it ahead of its held deadline. A command this document is
+    // actively POSTing is excluded; terminal rows are never deliverable.
     let hasStealable = false;
     for (const r of durable) {
-      if (r.state === "held") {
-        suppressedHeld.add(r.commandId);
-        continue;
-      }
+      if (r.state === "held") continue;
       if (!box.isDeliveryActive(r.commandId) && isDeliverableOutbox(r, now)) {
         hasStealable = true;
       }
     }
-    if (hasStealable) void this.flushAllOutbox(suppressedHeld);
+    if (hasStealable) void this.flushAllOutbox(new Set(), true);
   }
 
   private chainReconcile(instanceId: Id, job: () => Promise<unknown>): Promise<unknown> {

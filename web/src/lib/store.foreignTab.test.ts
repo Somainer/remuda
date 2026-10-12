@@ -334,6 +334,150 @@ it("GATE19 item 1: a cloned sibling's sole claim timer reads the lease-less PEND
   }
 });
 
+it("GATE19 item 2: a row another tab finishes as held DURING the timer-triggered flush's lock wait is skipped from the fresh in-lock selection — only pending P POSTs, held H waits for its held-retry trigger", async () => {
+  // The held suppression on the foreign-lease timer path used to be a SNAPSHOT
+  // set of held ids taken from the read BEFORE the flush queued on the
+  // instance lock. Sibling B is finishing H with a "held" answer while A's
+  // flush waits: the snapshot knew H as inflight, the FRESH selection made
+  // under the lock then read H as held and — absent from the stale set —
+  // re-POSTed it ahead of its held-retry deadline. The "skip currently held"
+  // policy must ride into that fresh selection (and be re-checked at the
+  // claim boundary). A later NORMAL flush (the held-retry trigger) still
+  // re-forwards H, so it is waiting, not stranded.
+  vi.useFakeTimers();
+  const owner = "owner_g19_i2";
+  const foreign = "owner_g19_i2_sibling_b";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks: { query: async () => ({ held: [] }) } }, // query, no request
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  sessionStorage.setItem("remuda-outbox-owner", owner);
+  try {
+    const T = Date.now() + 10_000;
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    const send = vi
+      .spyOn(api, "instanceSend")
+      .mockImplementation((async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) => ({
+        relatedCommandIds: [],
+        command: {
+          commandId,
+          id: commandId,
+          state: "accepted",
+          revision: "1",
+          dispatch: "native-acknowledged",
+          resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"]);
+    await bootLive(api, hubStore);
+    const internal = hubStore as unknown as {
+      flushAllOutbox: () => Promise<void>;
+      leaseWakeupFired: (instanceId: string, expectedUntil: number) => Promise<void>;
+      leaseWakeupTimer: Map<string, unknown>;
+      leaseWakeupUntil: Map<string, number>;
+      outbox: { storage: { all: () => Promise<OutboxRecord[]> } };
+    };
+    await internal.flushAllOutbox(); // settle empty boot flush
+
+    const cmdP = "cmd_g19_i2_pending";
+    const cmdH = "cmd_g19_i2_becomes_held";
+    const hRow = (): OutboxRecord => ({
+      commandId: cmdH,
+      clientRequestId: "local_g19_i2_h",
+      instanceId: INSTANCE,
+      journalId: JOURNAL,
+      prompt: "older, becomes held",
+      createdAt: Date.now() - 5_000,
+      attempts: 1,
+      state: "inflight",
+      lease: { owner: foreign, until: T },
+    });
+    const pRow = (): OutboxRecord => ({
+      commandId: cmdP,
+      clientRequestId: "local_g19_i2_p",
+      instanceId: INSTANCE,
+      journalId: JOURNAL,
+      prompt: "pending, must post",
+      createdAt: Date.now() - 2_000,
+      attempts: 1,
+      state: "pending",
+    });
+    // Arm the foreign-lease timer while only the inflight (non-deliverable)
+    // row exists.
+    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([hRow()]));
+    await internal.flushAllOutbox();
+    expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+    // P lands pending before the deadline with no flush of its own.
+    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([hRow(), pRow()]));
+
+    // Deadline. B finishes H as "held" exactly when the flush makes its FRESH
+    // selection UNDER the instance lock: storage read #1 is the timer
+    // snapshot, #2 the flush's pre-lock read, #3 the in-lock deliverer read.
+    vi.setSystemTime(T);
+    const storage = internal.outbox.storage;
+    const realAll = storage.all.bind(storage);
+    let reads = 0;
+    vi.spyOn(storage, "all").mockImplementation(async () => {
+      reads += 1;
+      if (reads === 3) {
+        const cur = JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+        localStorage.setItem(
+          OUTBOX_LS_KEY,
+          JSON.stringify(
+            cur.map((r) =>
+              r.commandId === cmdH
+                ? { ...r, state: "held" as const, gotResponse: true, lease: undefined }
+                : r,
+            ),
+          ),
+        );
+      }
+      return await realAll();
+    });
+    internal.leaseWakeupTimer.delete(INSTANCE);
+    internal.leaseWakeupUntil.delete(INSTANCE);
+    await internal.leaseWakeupFired(INSTANCE, T);
+    for (let i = 0; i < 40; i += 1) await Promise.resolve();
+
+    // Only P was POSTed by the timer-triggered flush; H was skipped held.
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBe(cmdP);
+    const storedAfter = () =>
+      JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(storedAfter().find((r) => r.commandId === cmdP)?.state).toBe("sent");
+    expect(storedAfter().find((r) => r.commandId === cmdH)?.state).toBe("held");
+
+    // Well past the held-retry base interval nothing else POSTs H (no
+    // timer-triggered re-POST ahead of its deadline).
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(send).toHaveBeenCalledTimes(1);
+
+    // A NORMAL flush — the held-retry trigger — re-forwards H exactly once:
+    // held waited for its deadline path rather than being stranded or
+    // POSTed early by the timer.
+    await internal.flushAllOutbox();
+    for (let i = 0; i < 20 && send.mock.calls.length < 2; i += 1) await Promise.resolve();
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1]?.[4]).toBe(cmdH);
+    expect(storedAfter().find((r) => r.commandId === cmdH)?.state).toBe("sent");
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
 it("GATE10 item 7: a lease-less done row committed by another tab skips without aborting the flush; B still sends", async () => {
   const { api, hubStore } = await fresh();
   await bootLive(api, hubStore);

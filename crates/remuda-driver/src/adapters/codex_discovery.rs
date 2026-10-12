@@ -761,6 +761,31 @@ pub(crate) fn forget_lifetime(cwd: &Path, owner: &str) {
     }
 }
 
+/// Test seam: whether `owner` currently has a registered lifetime in `cwd`
+/// (live or retained). Ruling A2 regressions assert the census the moment a
+/// promotion/demotion is published (r11 items 2/3).
+#[cfg(test)]
+pub(crate) fn census_contains(cwd: &Path, owner: &str) -> bool {
+    INSTANCE_LIFETIMES
+        .lock()
+        .expect("codex instance lifetimes")
+        .get(&canonical(cwd))
+        .is_some_and(|by_instance| by_instance.contains_key(owner))
+}
+
+/// Test seam: whether `owner`'s lifetime in `cwd` is still LIVE (its interval
+/// has not been closed). A retained closed interval returns false (r11 item 3:
+/// the close must follow the process stop, never precede close beginning).
+#[cfg(test)]
+pub(crate) fn census_lifetime_is_live(cwd: &Path, owner: &str) -> bool {
+    INSTANCE_LIFETIMES
+        .lock()
+        .expect("codex instance lifetimes")
+        .get(&canonical(cwd))
+        .and_then(|by_instance| by_instance.get(owner))
+        .is_some_and(|lifetime| lifetime.closed_at.is_none())
+}
+
 // Test-only visibility so unit tests in other modules of this crate can
 // build deterministic identities without touching process globals elsewhere.
 #[cfg(test)]

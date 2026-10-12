@@ -1505,14 +1505,10 @@ impl ShellPtyDriver {
         let task = tokio::spawn(async move {
             let mut current: Option<remuda_protocol::AgentKind> = None;
             let mut handle: Option<crate::adapters::supervisor::AdapterHandle> = None;
-            // r10 item 1 (Ruling A): a promoted codex is an operator-started
-            // process whose launch boundary is UNKNOWN. Registering it with no
-            // floor puts the cwd census in the "incomplete" state, so a same-cwd
-            // generic launch refuses prompt-only attribution while this codex
-            // could overlap. The guard is held here (not by the file adapter)
-            // and closed when the agent leaves the foreground or this watch
-            // stops, independent of any binding.
-            let mut census_guard: Option<crate::adapters::codex_discovery::LifetimeGuard> = None;
+            // The promoted-codex cwd census is owned by the promotion POLLER,
+            // which registers the unknown-boundary interval BEFORE it publishes
+            // the detection this watch reads (c-usagefu r11 item 2, Ruling A2).
+            // The watch only spawns/ab-spawns the file adapter.
             let mut tick = tokio::time::interval(PROMOTE_POLL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -1532,9 +1528,6 @@ impl ShellPtyDriver {
                 if let Some(old) = handle.take() {
                     old.abort();
                 }
-                // The previous foreground agent is gone: close its census
-                // interval; a codex detection re-registers below.
-                drop(census_guard.take());
                 current = kind;
                 if let Some(kind @ (AgentKind::Codex | AgentKind::Grok)) = kind
                     && let Some(found) = promoted.lock().ok().and_then(|slot| slot.clone())
@@ -1544,14 +1537,6 @@ impl ShellPtyDriver {
                         u32::try_from(found.pid).ok(),
                     )
                 {
-                    if kind == AgentKind::Codex {
-                        let owner = format!("promoted-codex-{}", found.pid);
-                        census_guard = Some(crate::adapters::codex_discovery::begin_lifetime(
-                            &options_cwd,
-                            &owner,
-                            None,
-                        ));
-                    }
                     let adapter_ctx = crate::adapters::supervisor::AdapterCtx {
                         stamp: stamp_ctx.clone(),
                         seq: Arc::clone(&seq),
@@ -1567,7 +1552,8 @@ impl ShellPtyDriver {
                         instance_key: None,
                         ownership: None,
                         agent_pid_roots: None,
-                        // Census presence is owned by the watch guard above;
+                        // Census presence is owned by the promotion poller,
+                        // which registers before it publishes the detection;
                         // the promoted adapter binds by hook/name index only.
                         lifetime: None,
                     };
@@ -4394,6 +4380,168 @@ mod tests {
             state.pgid.load(Ordering::SeqCst),
             "native evidence follows the direct child before promotion"
         );
+        Driver::close(&driver).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_promoted_codex_registers_its_census_interval_before_publishing_detection() {
+        // c-usagefu r11 item 2 (Ruling A2): the promotion poller registers the
+        // promoted codex's unknown-boundary lifetime BEFORE it publishes the
+        // detection into the `promoted` slot. The r10 shape registered it one
+        // file-adapter-watch tick (~800 ms) later, leaving a window in which a
+        // same-cwd generic launch saw a promoted codex invisible to the census.
+        //
+        // Deterministic phase control on a two-worker runtime: the fake table
+        // blocks EVERY poller sample on a per-call ticket the test releases on
+        // a wall-clock schedule, while the watch keeps its own 800 ms grid. The
+        // poller's promote sample is released at 1100 ms (the watch's 800 ms
+        // tick has already read None; its next tick is at 1600 ms), so a
+        // registration performed by the watch cannot exist at the publish
+        // instant. The demote sample is released at 1900 ms (watch next runs
+        // at 2400 ms), proving the interval closes only once demotion is
+        // published.
+        struct GatedTable {
+            ticket: std::sync::Mutex<u64>,
+            released_until: Arc<AtomicU64>,
+            cv: Arc<std::sync::Condvar>,
+            lock: Arc<std::sync::Mutex<()>>,
+            codex: Arc<AtomicBool>,
+        }
+        impl crate::promote::ProcessTable for GatedTable {
+            fn process_group(&self, pgid: i32) -> Vec<crate::promote::ProcessRow> {
+                if pgid > 0 {
+                    let mine = {
+                        let mut ticket = self
+                            .ticket
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *ticket += 1;
+                        *ticket
+                    };
+                    let mut guard = self
+                        .lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    while self.released_until.load(Ordering::SeqCst) < mine {
+                        guard = self
+                            .cv
+                            .wait(guard)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    if self.codex.load(Ordering::SeqCst) {
+                        return vec![crate::promote::ProcessRow {
+                            pid: pgid,
+                            args: "codex".into(),
+                        }];
+                    }
+                }
+                Vec::new()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let released_until = Arc::new(AtomicU64::new(0));
+        let codex = Arc::new(AtomicBool::new(false));
+        let table = Arc::new(GatedTable {
+            ticket: std::sync::Mutex::new(0),
+            released_until: Arc::clone(&released_until),
+            cv: Arc::new(std::sync::Condvar::new()),
+            lock: Arc::new(std::sync::Mutex::new(())),
+            codex: Arc::clone(&codex),
+        });
+        // Ticket releases after spawn: t=0 sample immediately; the promote
+        // sample at ~1100 ms (between watch ticks 800/1600); the demote sample
+        // at ~1900 ms (between 1600/2400); everything thereafter is open so
+        // driver shutdown never blocks in a sample.
+        let cv = Arc::clone(&table.cv);
+        let lock = Arc::clone(&table.lock);
+        let releaser = {
+            let released_until = Arc::clone(&released_until);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                released_until.store(1, Ordering::SeqCst);
+                cv.notify_all();
+                std::thread::sleep(std::time::Duration::from_millis(1080));
+                released_until.store(2, Ordering::SeqCst);
+                cv.notify_all();
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                released_until.store(3, Ordering::SeqCst);
+                cv.notify_all();
+                std::thread::sleep(std::time::Duration::from_millis(700));
+                released_until.store(u64::MAX, Ordering::SeqCst);
+                let _guard = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cv.notify_all();
+            })
+        };
+
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 60".into()];
+        options.promote = true;
+        let driver = ShellPtyDriver::with_process_table(
+            options,
+            table as Arc<dyn crate::promote::ProcessTable>,
+        );
+        let _events = driver.spawn().await.unwrap().into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0, "the test shell owns a foreground process group");
+        let owner = format!("promoted-codex-{pgid}");
+        let census_present = || crate::adapters::codex_discovery::census_contains(&cwd, &owner);
+        assert!(!census_present(), "nothing registered before a detection");
+
+        // Arm codex before the poller's 800 ms sample (released at 1100).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        codex.store(true, Ordering::SeqCst);
+        for _ in 0..3000 {
+            if driver
+                .promoted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|found| found.kind == AgentKind::Codex)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            driver
+                .promoted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|found| found.kind == AgentKind::Codex),
+            "the codex detection was published"
+        );
+        assert!(
+            census_present(),
+            "registered at the publish instant, not at the watch's next 800 ms tick"
+        );
+
+        // Demote before the poller's 1600 ms sample (released at 1900).
+        codex.store(false, Ordering::SeqCst);
+        for _ in 0..3000 {
+            if driver.promoted.lock().unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            driver.promoted.lock().unwrap().is_none(),
+            "demotion published"
+        );
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "the interval closes once demotion is published, before the watch's next tick"
+        );
+        assert!(
+            census_present(),
+            "but it is RETAINED: a later launch must not become sole over it"
+        );
+
+        releaser.join().unwrap();
         Driver::close(&driver).await.unwrap();
     }
 

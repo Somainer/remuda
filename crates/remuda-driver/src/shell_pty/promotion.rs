@@ -830,6 +830,16 @@ pub(super) fn spawn(
         // SessionStart/turn binding, once observed for this foreground pid,
         // stays live until that pid demotes or a hook confirms the turn end.
         let mut hook_ever_live = false;
+        // c-usagefu r11 item 2 (Ruling A2): the promoted-codex census
+        // interval is maintained HERE, in the poller, and registered BEFORE
+        // the detection is published to the `current` slot the file-adapter
+        // watch reads. The r10 shape registered it one watch tick later,
+        // leaving a window in which the promoted instance was visible to
+        // discovery but absent from the cwd census. The pid tracks the exact
+        // owner: a codex -> codex foreground change closes the old interval
+        // and registers the new one. None = no promoted codex this epoch.
+        let mut census_pid: Option<i32> = None;
+        let mut census_guard: Option<crate::adapters::codex_discovery::LifetimeGuard> = None;
         let mut last_status: Option<ScreenStatus> = None;
         // Once the hook tier is merely *stale*, the screen decides the idle
         // edge — but one sample is not proof: the emulator can miss the TUI's
@@ -885,11 +895,38 @@ pub(super) fn spawn(
                     alias.as_ref().map_or(AgentKind::Claude, |alias| alias.kind),
                 );
             }
+            // Census transition judged from the SAME sample that is about to
+            // be published. A codex entering the foreground registers BEFORE
+            // the slot write, so a same-cwd generic launch discovering during
+            // the promotion window already sees this unknown-boundary
+            // instance and refuses prompt-only attribution. A codex leaving
+            // (demotion or a different foreground process) closes its interval
+            // only AFTER the new sample is published below: the close follows
+            // the observed stop, it never precedes it (Ruling A2).
+            let next_codex_pid = found
+                .as_ref()
+                .and_then(|f| (f.kind == AgentKind::Codex).then_some(f.pid));
+            let mut closed_census = None;
+            if next_codex_pid != census_pid {
+                if let Some(pid) = next_codex_pid {
+                    census_guard = Some(crate::adapters::codex_discovery::begin_lifetime(
+                        &ctx.cwd,
+                        &format!("promoted-codex-{pid}"),
+                        None,
+                    ));
+                } else {
+                    closed_census = census_guard.take();
+                }
+                census_pid = next_codex_pid;
+            }
             // `send` reads this to decide bracketed-paste delivery, so it must
             // track the live foreground even between journaled transitions.
             if let Ok(mut slot) = current.lock() {
                 slot.clone_from(&found);
             }
+            // The foreground change is now published; a demoted codex's
+            // interval may close.
+            drop(closed_census);
             let Ok(now) = now_ts() else { continue };
             let mut saw_demote = false;
             let mut saw_promote = false;

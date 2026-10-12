@@ -163,7 +163,12 @@ impl Cover {
         if self.kind == CoverKind::PendingTail && obs.len > self.extent {
             // The tail grew. Extend over the continuation of the same record:
             // through the first newly observed newline (exclusive), or to the
-            // new end of file while the record is still being written.
+            // new end of file while the record is still being written. The
+            // EXACT raw bytes are kept, including a trailing CR: a CR seen
+            // before any newline is still an unread byte the cover binds, and
+            // overwriting it later must invalidate the cover. CRLF is
+            // normalised only when the completed record is matched in
+            // [`CoverSet::settles`].
             let tail = match obs.rest.get(relative + self.bytes.len()..) {
                 Some(tail) => tail,
                 None => return CoverVerdict::Invalidate,
@@ -174,9 +179,6 @@ impl Cover {
                 .unwrap_or(tail.len());
             let mut bytes = self.bytes.clone();
             bytes.extend_from_slice(&tail[..grow]);
-            if let Some(stripped) = bytes.strip_suffix(b"\r") {
-                bytes = stripped.to_vec();
-            }
             CoverVerdict::Grow(bytes)
         } else {
             CoverVerdict::Keep
@@ -263,7 +265,9 @@ impl CoverSet {
     /// a complete record only with the same generation/offset/digest; a
     /// pending-tail record at its exact offset whose observed bytes are a
     /// byte-for-byte prefix of the completed record. The started fold already
-    /// guarantees record type and agent identity.
+    /// guarantees record type and agent identity. CRLF is normalised here: the
+    /// folded line has its terminating CR stripped, while a pending cover
+    /// grown to the newline keeps the raw CR immediately before it.
     pub(crate) fn settles(
         &self,
         agent: &str,
@@ -278,7 +282,13 @@ impl CoverSet {
                 && cover.offset == offset
                 && match cover.kind {
                     CoverKind::CompleteRecord => cover.digest == *digest,
-                    CoverKind::PendingTail => line.starts_with(&cover.bytes),
+                    CoverKind::PendingTail => {
+                        let prefix = cover
+                            .bytes
+                            .strip_suffix(b"\r")
+                            .unwrap_or(cover.bytes.as_slice());
+                        line.starts_with(prefix)
+                    }
                 }
         })
     }
@@ -593,5 +603,34 @@ mod cover_table_tests {
         assert!(set.settles("a1", 1, W, &digest_of(completed), completed));
         let different = br#"{"type":"result","agentId":"a9"}"#;
         assert!(!set.settles("a1", 1, W, &digest_of(different), different));
+    }
+
+    #[test]
+    fn pending_growth_keeps_a_cr_but_settles_the_crlf_completed_record() {
+        // Growth observed the CR immediately before the not-yet-read newline,
+        // so the stored raw bytes end in CR and the extent covers it. The fold
+        // strips the terminating CR from the line; CRLF is normalised only at
+        // this match, so the completed CRLF record still settles.
+        let record = br#"{"type":"started","agentId":"a1"}"#;
+        let mut grown = record.to_vec();
+        grown.push(b'\r');
+        let mut set = CoverSet::new();
+        set.arm(
+            "a1",
+            vec![Cover::pending(
+                "a1",
+                FILE,
+                1,
+                W,
+                W + grown.len() as u64,
+                grown,
+            )],
+        );
+        assert!(set.settles("a1", 1, W, &digest_of(record), record));
+
+        // A completion that diverges from the captured raw prefix never
+        // matches, CR or no CR.
+        let divergent = br#"{"type":"failed","agentId":"a1"}"#;
+        assert!(!set.settles("a1", 1, W, &digest_of(divergent), divergent));
     }
 }

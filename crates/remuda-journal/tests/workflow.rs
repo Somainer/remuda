@@ -2863,3 +2863,133 @@ fn rewriting_a_captured_trailing_cr_into_a_quote_revives_the_completion() {
         "the CR->quote rewrite changed a covered byte; the completion is genuine"
     );
 }
+
+/// c-cardsettle-fu2 r11 item 1: a raw CR appended to the torn tail on a
+/// LATER incomplete poll (the pending-cover GROWTH path, not the arming peek)
+/// must be kept in the cover's exact bytes and extent. The failure peek arms
+/// over "{"; a subsequent poll sees `{\r` with still no newline; the writer
+/// overwrites the CR with a quote and completes a genuine start in place. With
+/// growth dropping the CR the cover stayed over "{" at W+1, so the rewrite
+/// passed byte validation and the genuine start was held Failed.
+#[test]
+fn a_cr_seen_on_a_later_incomplete_poll_is_kept_then_its_rewrite_revives() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_r11_cr_growth";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    let prefix = "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n\
+{\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n";
+    std::fs::write(run_dir.join("journal.jsonl"), prefix).unwrap();
+    let w = prefix.len() as u64;
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Failed),
+        "attempt 1 ends Failed and is consumed through W"
+    );
+
+    // The failure peek arms over the lone brace only.
+    {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap()
+            .write_all(b"{")
+            .unwrap();
+    }
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+
+    // A LATER incomplete poll observes growth: the raw CR arrives with still
+    // no newline, so the record cannot fold yet.
+    {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap()
+            .write_all(b"\r")
+            .unwrap();
+    }
+    let grown: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        grown.iter().all(|state| *state == WorkflowState::Failed),
+        "the CR growth folds no record; a1 stays Failed: {grown:?}"
+    );
+
+    // Overwrite ONLY the CR with a quote (same length/extent): tail is now
+    // `{"` at W. The next poll observes the contradiction and retires the
+    // cover.
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        file.seek(SeekFrom::Start(w + 1)).unwrap();
+        file.write_all(b"\"").unwrap();
+    }
+    let rewritten: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        rewritten
+            .iter()
+            .all(|state| *state == WorkflowState::Failed),
+        "still no complete record folds; a1 stays Failed: {rewritten:?}"
+    );
+
+    // Complete the record the rewritten bytes actually begin.
+    {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap()
+            .write_all(
+                b"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"cr-growth-genuine\"}\n",
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Running),
+        "the CR->quote rewrite changed a byte the growth covered; the completion is genuine"
+    );
+}

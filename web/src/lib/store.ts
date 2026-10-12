@@ -4007,7 +4007,27 @@ class HubStore {
     // reconciling/flushing against leases that are still fresh by wall time
     // (same discipline as the Outbox wake, gate 13 item 2).
     if (now < expectedUntil) {
-      this.armLeaseWakeup(instanceId, expectedUntil, now, false);
+      // Gate 18 item 4: the closed-over deadline U fired EARLY by wall time,
+      // so U itself is stale — re-arm from the FRESH snapshot just read, not
+      // from the closure. The stored lease may have been replaced with U2
+      // where now < U2 < U; arming the soonest still-future foreign lease for
+      // this instance serves that replacement at U2 instead of leaving it
+      // unserved until U. When the snapshot has NO live foreign lease (the row
+      // was delivered, re-owned by this tab, or went terminal) arm nothing:
+      // resurrecting U would flush against a lease that no longer exists. The
+      // firing wrapper already removed this instance's timer entry.
+      let soonestForeign: number | undefined;
+      for (const r of durable) {
+        if (r.instanceId !== instanceId) continue;
+        if (r.state !== "inflight" || !r.lease) continue;
+        if (r.lease.owner === box.ownerId || r.lease.until <= now) continue;
+        if (soonestForeign === undefined || r.lease.until < soonestForeign) {
+          soonestForeign = r.lease.until;
+        }
+      }
+      if (soonestForeign !== undefined) {
+        this.armLeaseWakeup(instanceId, soonestForeign, now, false);
+      }
       return;
     }
     // Reconcile from the fresh snapshot. Overdue leases are excluded from

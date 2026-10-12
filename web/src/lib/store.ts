@@ -195,19 +195,23 @@ export type EffortPending = {
    */
   commandWord: string | null;
   /**
-   * c-effortread r17 item 1: proof that the driver handling THIS request is
-   * ID-CAPABLE — it flipped true once an edge carrying the request's OWN id was
-   * seen (its id-bearing `effort-queued` lifecycle, which the driver journals
-   * before typing, or an id-bearing verdict echo). While false the request is
-   * treated as explicitly legacy (an older driver / the e2e fake node): the
-   * id-less legacy echo matcher and the strict read-back VALUE FALLBACK stay in
-   * force. Once true the request settles ONLY on matching request-id
-   * evidence: an id-less observation — even a projection the mapper could not
-   * attribute (an older pre-floor command, or this request under provenance
-   * loss) — still updates the effective view but leaves the pending for its
-   * own id verdict or its bounded unconfirmed outcome.
+   * c-effortread r18 item 2: the per-SESSION driver id-capability captured for
+   * THIS request — "unknown" / "id-capable" / "explicitly legacy". It is a
+   * persisted fact about the session's driver, carried across requests, NOT
+   * inferred from this request's own first queued frame:
+   *  - unknown: no capability evidence yet (a fresh session, or a poll that
+   *    arrives before the first lifecycle frame). The request settles ONLY on
+   *    its own id-bearing evidence, or via its bounded unconfirmed outcome —
+   *    never from an id-less matching projection or an instance-list poll.
+   *  - id-capable: an edge carrying a real effort request id was seen in this
+   *    session. Monotonic: later id-less evidence (an unowned verdict the
+   *    mapper could not pair, provenance loss) never downgrades it.
+   *  - legacy: the driver explicitly produced an id-less lifecycle (an older
+   *    driver / the e2e fake node). Only legacy requests may settle through
+   *    the id-less legacy echo matcher and the strict read-back VALUE
+   *    FALLBACK.
    */
-  driverEchoesId: boolean;
+  idCapability: EffortDriverIdCapability;
   /**
    * c-effortread r13 item 2 / r14 item 2: wall-clock ms at which CURRENT
    * ACTIVITY EVIDENCE showed this request leaving the driver queue (the turn
@@ -233,6 +237,18 @@ export type UltraRefusal = {
   modelId: string | null;
   at: string;
 };
+
+/**
+ * c-effortread r18 item 2: per-SESSION knowledge of whether the driver
+ * handling the session echoes the configure's per-request effort id on its
+ * lifecycle/verdict frames.
+ *  - unknown: no evidence yet. Fail closed: only own-id evidence settles.
+ *  - id-capable: an id-bearing edge was seen; monotonic, never downgraded by
+ *    later id-less evidence.
+ *  - legacy: an explicitly ID-LESS driver lifecycle was seen (older driver /
+ *    e2e fake node); the id-less echo matcher and value fallback apply.
+ */
+export type EffortDriverIdCapability = "unknown" | "id-capable" | "legacy";
 
 /** Parse of an effort lifecycle status word into its two axes. */
 type EffortLifecycleRequest = {
@@ -1038,6 +1054,42 @@ class HubStore {
    */
   private settledEffortPushdown = new Map<Id, string>();
   /**
+   * c-effortread r18 item 2: instanceId → this session driver's known
+   * id-capability, persisted ACROSS requests. Absent is "unknown". An
+   * id-bearing edge upgrades to "id-capable" monotonically (never downgraded
+   * by a later id-less projection); an explicitly id-less driver LIFECYCLE
+   * marks "legacy" and may itself be upgraded by later id evidence. Only this
+   * per-session fact decides whether the id-less legacy echo matcher / value
+   * fallback may settle a request — never a per-request flag that resets to
+   * permissive on every send.
+   */
+  private effortDriverId = new Map<Id, EffortDriverIdCapability>();
+
+  /** The session driver's known id-capability ("unknown" until evidence). */
+  effortIdCapability(instanceId: Id): EffortDriverIdCapability {
+    return this.effortDriverId.get(instanceId) ?? "unknown";
+  }
+
+  /**
+   * Record one piece of per-session driver id evidence. `true` is an edge
+   * carrying a real effort request id (id-capable, monotonic); `false` is an
+   * explicitly id-less driver lifecycle frame (legacy). Returns the resulting
+   * capability.
+   */
+  private noteEffortDriverId(
+    instanceId: Id,
+    echoesId: boolean,
+  ): EffortDriverIdCapability {
+    const next: EffortDriverIdCapability = echoesId ? "id-capable" : "legacy";
+    const prev = this.effortDriverId.get(instanceId) ?? "unknown";
+    if (next === "id-capable" || prev === "unknown") {
+      this.effortDriverId.set(instanceId, next);
+      return next;
+    }
+    // An established id-capable session never downgrades on id-less evidence.
+    return prev;
+  }
+  /**
    * The effortEffective each instance carried on the LAST Hub poll (null =
    * polled but absent, absent from the map = never polled). r6 item 6: a poll
    * withdraws the live projection only when a previously seen HUB record
@@ -1366,21 +1418,28 @@ class HubStore {
     // bounds hold; any other id-less echo stays a veto (the no-echo fallback
     // requires NO echo at all, so a stale/non-matching echo cannot ride it).
     const ownEcho = echoNamesThisRequest;
-    // c-effortread r17 item 1: once the driver has proven itself id-capable
-    // FOR THIS REQUEST, only an echo naming THIS request id can settle it. An
-    // id-less echo with matching requested values (an unowned verdict the
-    // mapper could not pair, or this request's own verdict under provenance
-    // loss) still projects the effective view above, but never clears the
-    // pending. The legacy echo matcher and the no-echo value fallback apply
-    // ONLY while the request is still explicitly legacy (no own id seen).
+    // An echo naming THIS request is itself id-capability proof for the whole
+    // session (e.g. the verdict echo arrives before the queued edge was
+    // folded). Record it before any settlement return so even a request fully
+    // settled by this echo upgrades the session and every later request fails
+    // closed on id-less projections.
+    if (ownEcho) this.noteEffortDriverId(instanceId, true);
+    // c-effortread r17 item 1 / r18 item 2: id-less settlement exists ONLY
+    // for a session whose driver is EXPLICITLY LEGACY. An unknown session
+    // (nothing proves the driver echoes ids yet — e.g. an instance-list poll
+    // arriving before the request's id-bearing queued frame) and an
+    // id-capable session both fail closed and wait for the request's own id
+    // evidence or its bounded unconfirmed path. Previously every new client
+    // request reset this to "legacy-ish", so a matching poll before the queued
+    // frame settled B by value.
+    const legacySession = pending.idCapability === "legacy";
     const legacyEchoSettles =
-      !pending.driverEchoesId &&
+      legacySession &&
       legacyEchoNamesRequest &&
       inWindow &&
       viewLevelMatches &&
       viewFlagMatches;
-    const valueFallback =
-      !pending.driverEchoesId && requestedEcho === undefined && inWindow;
+    const valueFallback = legacySession && requestedEcho === undefined && inWindow;
     const ours = ownEcho || legacyEchoSettles || valueFallback;
 
     let { levelSettled, flagSettled } = pending;
@@ -1403,14 +1462,11 @@ class HubStore {
       this.settledEffortPushdown.set(instanceId, view.observedAt);
     }
     if (levelSettled && flagSettled) return null;
-    // An echo naming THIS request is itself the id-capability proof (e.g. the
-    // verdict echo arrives before the queued edge was folded); persist it so
-    // later id-less projections cannot settle a still-open axis.
-    const driverEchoesId = pending.driverEchoesId || echoNamesThisRequest;
-    if (driverEchoesId === pending.driverEchoesId) {
+    const idCapability = ownEcho ? "id-capable" : pending.idCapability;
+    if (idCapability === pending.idCapability) {
       return { ...pending, levelSettled, flagSettled };
     }
-    return { ...pending, levelSettled, flagSettled, driverEchoesId };
+    return { ...pending, levelSettled, flagSettled, idCapability };
   }
 
   /**
@@ -1897,6 +1953,24 @@ class HubStore {
     const edgeId =
       typeof edgeRequestId === "string" && edgeRequestId.trim() ? edgeRequestId : null;
     const current = this.state.effortPending[instanceId];
+    // c-effortread r18 item 2: EVERY driver lifecycle frame is per-SESSION
+    // capability evidence — an id-bearing frame proves the driver echoes
+    // per-request ids (id-capable, monotonic); an id-less one marks the
+    // session driver explicitly legacy. The fact persists across requests, so
+    // a later request starts from the known capability instead of every new
+    // client request resetting to the permissive value fallback.
+    const frameCapability = this.noteEffortDriverId(instanceId, edgeId !== null);
+    if (current && current.idCapability !== frameCapability) {
+      // The pending snapshots the capability at arm time; keep the in-flight
+      // entry consistent with what this frame proved (an unknown pending
+      // downgrades to legacy on an id-less driver frame).
+      this.emit({
+        effortPending: {
+          ...this.state.effortPending,
+          [instanceId]: { ...current, idCapability: frameCapability },
+        },
+      });
+    }
     // Whether a QUEUED edge belongs to the current pending: an id is
     // authoritative; an id-less edge matches only a pending SYNTHESIZED FROM
     // THE WIRE (a configure posted outside this UI) via the strict word/value
@@ -1995,6 +2069,12 @@ class HubStore {
         // authoritative idle.
         const busyNow = effortAwaitsQueueExit(instance?.activity);
         const atCreate = Date.now();
+        // The wire lifecycle is explicit per-session capability evidence
+        // (r18 item 2): an id-bearing queued edge proves id-capable; an
+        // id-less one is an explicitly legacy driver. This persists across
+        // requests, so a later client request in the same session starts from
+        // the proven capability instead of resetting to permissive.
+        const lifecycleCapability = this.noteEffortDriverId(instanceId, edgeId !== null);
         current = {
           nonce,
           requestId: edgeId ?? `lifecycle:${nonce}`,
@@ -2027,9 +2107,9 @@ class HubStore {
           // settlement knows the level and the flag are both in play.
           commandWord: wireMovesBoth ? lowerWord : null,
           afterReplacement: false,
-          // An id on the queued edge proves the driver echoes per-request ids;
-          // an id-less synthesis is an explicitly legacy request (r17 item 1).
-          driverEchoesId: edgeId !== null,
+          // Capability proven by THIS queued edge: id-bearing → id-capable;
+          // an id-less wire lifecycle is an explicitly legacy driver.
+          idCapability: lifecycleCapability,
           // Idle-at-receipt arms the bound immediately; a working session arms
           // it from the working→idle evidence.
           leftQueueAt: busyNow ? null : atCreate,
@@ -2087,6 +2167,10 @@ class HubStore {
         !createdFromWire &&
         effortAwaitsQueueExit(nextActivity) &&
         current.leftQueueAt != null;
+      // The session map and an existing pending were updated with the frame's
+      // capability at lifecycle entry; a freshly synthesized pending adopted
+      // it directly. An id-less queued frame never downgrades an id-capable
+      // session (noteEffortDriverId is monotonic).
       this.emit({
         effortPending: {
           ...this.state.effortPending,
@@ -2097,12 +2181,6 @@ class HubStore {
                 queued: true,
                 queuedObservedAt: stamped,
                 queuedSeq: stampedSeq,
-                // r17 item 1: THIS request's id echoed on its queued edge
-                // proves the driver is id-capable for it; later id-less
-                // projections (an unowned verdict) can no longer settle it.
-                ...(edgeId !== null && edgeId === current.requestId
-                  ? { driverEchoesId: true as const }
-                  : {}),
                 ...(requeuedBehindTurn ? { leftQueueAt: null } : {}),
               },
         },
@@ -2503,6 +2581,15 @@ class HubStore {
    * (e.g. the question-alert watcher) can be driven without a live Hub. */
   setSlicesForTest(slices: Partial<HubState>): void {
     this.emit(slices);
+  }
+
+  /**
+   * Test-only: seed the per-session driver id-capability that a real
+   * id-bearing/id-less lifecycle frame would have established (c-effortread
+   * r18 item 2).
+   */
+  setEffortIdCapabilityForTest(instanceId: Id, capability: EffortDriverIdCapability): void {
+    this.effortDriverId.set(instanceId, capability);
   }
 
   /** Test-only: drive the pagehide/pageshow lifecycle (BFCache, iOS). */
@@ -4929,9 +5016,10 @@ class HubStore {
       source: "client",
       commandWord,
       afterReplacement,
-      // No own-id evidence yet; flips on the request's id-bearing queued edge
-      // or verdict echo (r17 item 1).
-      driverEchoesId: false,
+      // Per-session capability, carried across requests (r18 item 2): an
+      // unknown session fails closed on id-less evidence; only an explicitly
+      // legacy session keeps the value fallback.
+      idCapability: this.effortIdCapability(instanceId),
     };
     this.settledEffortPushdown.delete(instanceId);
     // Optimistically adopt the requested axes SYNCHRONOUSLY, before the

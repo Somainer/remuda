@@ -2755,3 +2755,49 @@ it("r12 item 5: a still-queued request gets one bounded extension and is never c
   expect(hubStore.effortPendingOf(ctx.instance.id), "the long-turn pending stays").not.toBeNull();
   expect(toast).not.toHaveBeenCalled();
 });
+
+it("r12 item 5: a replaced request A resolving late never re-arms over B's reconciliation", async () => {
+  const ctx = await startFollowing("r12-item5-late-arm", { state: "known", value: "idle" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const baseline: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "low", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [baseline] } as never);
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+
+  // A's POST hangs; B (requested next) accepts immediately and arms its
+  // reconciliation. Then A's POST resolves late and tries to arm too.
+  let resolveA: (v: unknown) => void = () => {};
+  let configureCalls = 0;
+  vi.spyOn(api, "instanceConfigure").mockImplementation(async () => {
+    const n = configureCalls++;
+    if (n === 0) return await new Promise((resolve) => { resolveA = resolve; });
+    return {} as never;
+  });
+
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
+  const selection = { index: 1, name: "low", kind: "claude", ultracode: false } as const;
+  const a = hubStore.setEffort(ctx.instance.id, selection);
+  await Promise.resolve();
+  await Promise.resolve();
+  const b = hubStore.setEffort(ctx.instance.id, { ...selection, ultracode: false });
+  await b;
+  const bNonce = hubStore.effortPendingOf(ctx.instance.id)?.nonce;
+
+  // A resolves after B has armed: A's arm must NOT replace B's slot/timer.
+  await advanceEffortReconcile(14_000);
+  resolveA({});
+  await a;
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.nonce).toBe(bNonce);
+
+  // B's own bound fires at B's deadline despite A's late configure: the
+  // pending ends unconfirmed rather than being reset for another 15 s.
+  await advanceEffortReconcile(1_100);
+  expect(hubStore.effortPendingOf(ctx.instance.id), "B's reconciliation, not A's late arm").toBeNull();
+  expect(toast).toHaveBeenCalledTimes(1);
+});

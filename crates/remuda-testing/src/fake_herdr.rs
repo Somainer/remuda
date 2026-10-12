@@ -141,7 +141,18 @@ pub struct FakeHerdrOptions {
     /// File whose contents are appended to `force_close_transcript` when a
     /// still-live agent pane is force-closed.
     pub force_close_record_file: Option<PathBuf>,
+    /// Server-restart / ID-reuse model (c-ctxusage r14 item 1): the FIRST
+    /// live-agent ctrl+c makes the fake act like Herdr restarted — the boot
+    /// generation bumps and the deterministic ids (`w1`, `w1:t1`, `w1:p1`)
+    /// are handed to an UNRELATED workspace with a different creation label
+    /// and its own live agent. A closer that does not re-validate ownership
+    /// kills the foreign pane.
+    pub restart_reuses_ids_on_ctrlc: bool,
 }
+
+/// Creation label the simulated restart hands the reused `w1` workspace to.
+/// Deliberately does not match the driver's `remuda-<uuid>` label.
+pub(crate) const RESTART_FOREIGN_LABEL: &str = "unrelated-workspace-after-restart";
 
 impl FakeHerdrOptions {
     /// Default script and bundled frames, caller supplies the socket.
@@ -157,6 +168,7 @@ impl FakeHerdrOptions {
             interrupt_record_file: None,
             force_close_transcript: None,
             force_close_record_file: None,
+            restart_reuses_ids_on_ctrlc: false,
         }
     }
 
@@ -208,6 +220,18 @@ impl FakeHerdrOptions {
     ) -> Self {
         self.force_close_transcript = Some(transcript.into());
         self.force_close_record_file = Some(record_file.into());
+        self
+    }
+
+    /// Model Herdr restarting DURING a close (c-ctxusage r14 item 1): the
+    /// first ctrl+c against a live agent bumps the server generation and
+    /// re-creates a FOREIGN workspace (different creation label) under the
+    /// reused deterministic ids, with its own live agent on the reused pane
+    /// id. A closer that closes the pane without re-validating ownership
+    /// kills the foreign pane.
+    #[must_use]
+    pub fn restart_reuses_ids_on_ctrlc(mut self) -> Self {
+        self.restart_reuses_ids_on_ctrlc = true;
         self
     }
 }
@@ -291,6 +315,9 @@ impl FakeHerdrServer {
         }
         if let Some(record_file) = &options.force_close_record_file {
             command.env("FAKE_HERDR_FORCE_CLOSE_RECORD", record_file);
+        }
+        if options.restart_reuses_ids_on_ctrlc {
+            command.env("FAKE_HERDR_RESTART_REUSES_IDS", "1");
         }
 
         let mut child = command
@@ -467,6 +494,8 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         .ok()
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
+    let mut restart_reuses_ids_on_ctrlc = std::env::var("FAKE_HERDR_RESTART_REUSES_IDS")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -519,6 +548,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
                     .map_err(|_| FakeHerdrError::Args("bad --unavailable-calls".into()))?;
             }
             "--exit-after-unavailable" => exit_after_unavailable = true,
+            "--restart-reuses-ids-on-ctrlc" => restart_reuses_ids_on_ctrlc = true,
             "--session" | "--takeover" => {
                 if args[i] == "--session" {
                     i += 1;
@@ -559,6 +589,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             interrupt_record_file,
             force_close_transcript,
             force_close_record_file,
+            restart_reuses_ids_on_ctrlc,
         }));
     }
     Err(FakeHerdrError::Args(format!(
@@ -669,6 +700,7 @@ async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
         options.interrupt_record_file,
         options.force_close_transcript,
         options.force_close_record_file,
+        options.restart_reuses_ids_on_ctrlc,
     )));
     // Only the scripted shutdown window (`exit_after_unavailable`) stops the
     // accept loop. Parent death is handled by the outer `parent_watch`
@@ -727,6 +759,12 @@ struct State {
     /// is appended (and the agent removed) only on the pane's force close.
     force_close_transcript: Option<PathBuf>,
     force_close_record_file: Option<PathBuf>,
+    /// Restart/ID-reuse model (c-ctxusage r14 item 1).
+    restart_on_ctrlc: bool,
+    /// The simulated restart fires once.
+    restart_done: bool,
+    /// Bumped by the simulated restart; surfaced in `ping` capabilities.
+    server_generation: u32,
 }
 
 impl State {
@@ -740,6 +778,7 @@ impl State {
         interrupt_record_file: Option<PathBuf>,
         force_close_transcript: Option<PathBuf>,
         force_close_record_file: Option<PathBuf>,
+        restart_on_ctrlc: bool,
     ) -> Self {
         Self {
             script,
@@ -763,6 +802,9 @@ impl State {
             interrupt_record_file,
             force_close_transcript,
             force_close_record_file,
+            restart_on_ctrlc,
+            restart_done: false,
+            server_generation: 1,
         }
     }
 
@@ -908,7 +950,7 @@ fn handle_rpc(
         .lock()
         .map_err(|_| ("internal_error", "state poisoned".into()))?;
     match req.method.as_str() {
-        "ping" => serde_json::to_value(pong()).map_err(json_err),
+        "ping" => serde_json::to_value(pong(&st)).map_err(json_err),
         "session.snapshot" => snapshot(&st),
         "workspace.create" => workspace_create(&mut st, &req.params),
         "workspace.list" => serde_json::to_value(WorkspaceList {
@@ -949,7 +991,7 @@ fn json_err(err: serde_json::Error) -> (&'static str, String) {
     ("internal_error", err.to_string())
 }
 
-fn pong() -> Pong {
+fn pong(st: &State) -> Pong {
     Pong {
         kind: "pong".into(),
         version: "0.9.0-fake".into(),
@@ -957,7 +999,7 @@ fn pong() -> Pong {
         capabilities: Some(ServerCapabilities {
             live_handoff: true,
             detached_server_daemon: false,
-            endpoint_protocol_generation: Some(1),
+            endpoint_protocol_generation: Some(st.server_generation),
             surface_interest: true,
             health_check: true,
         }),
@@ -1253,6 +1295,15 @@ fn pane_send_keys(st: &mut State, params: &Value) -> Result<Value, (&'static str
         })
         .unwrap_or_default();
     if keys.iter().any(|key| key == "ctrl+c") {
+        // c-ctxusage r14 item 1: model Herdr restarting mid-close — the first
+        // ctrl+c lands as the server goes down and the reboot hands the
+        // deterministic ids to an unrelated workspace. The keystroke never
+        // reaches either agent.
+        if st.restart_on_ctrlc && !st.restart_done {
+            st.restart_done = true;
+            simulate_restart_with_id_reuse(st, pane_id);
+            return ok();
+        }
         interrupt_live_agent(st, pane_id);
     }
     if let Some(name) = st
@@ -1302,6 +1353,103 @@ fn interrupt_live_agent(st: &mut State, pane_id: &str) {
         pane.agent = None;
         pane.agent_status = AgentStatus::Unknown;
     }
+}
+
+/// Model a Herdr RESTART (c-ctxusage r14 item 1): bump the boot generation,
+/// wipe every state the predecessor owned, reset the deterministic id
+/// counters, and hand the fresh ids `w1` / `w1:t1` / `w1:p1` to an
+/// UNRELATED workspace with a different creation label and its own live
+/// agent. The predecessor's agent was launched on a split pane (the driver
+/// keeps its root shell on p1 and starts the agent on p2), so the foreign
+/// workspace reproduces the same layout — root shell on p1, its own live
+/// agent on the SAME pane id the closer is about to force-close. A closer
+/// that proves ownership against the predecessor must now refuse the
+/// destructive call: that pane belongs to a stranger.
+fn simulate_restart_with_id_reuse(st: &mut State, wanted_pane_id: &str) {
+    st.server_generation += 1;
+    st.workspaces.clear();
+    st.tabs.clear();
+    st.panes.clear();
+    st.agents.clear();
+    st.screens.clear();
+    st.dead_agents.clear();
+    st.shell_panes.clear();
+    st.slow_until.clear();
+    st.onboarding_step.clear();
+    st.next_ws = 1;
+    st.next_tab = 1;
+    st.next_pane = 1;
+
+    let ws_id = st.alloc_workspace();
+    let tab_id = st.alloc_tab(&ws_id);
+    let root_id = st.alloc_pane(&ws_id);
+    let root = blank_pane(&ws_id, &tab_id, &root_id, "/tmp/foreign-work", true);
+    st.screens.insert(root_id.clone(), "$ \n".to_string());
+    st.panes.insert(root_id, root);
+    // Deterministic ids restart at w1:p1: allocate until the fresh boot has
+    // handed out the SAME pane id the predecessor's agent lived on (it was a
+    // split pane — root shell p1, agent p2). Bounded, so an unexpected id
+    // shape still leaves the foreign agent live on a real pane.
+    let mut agent_pane_id = st.alloc_pane(&ws_id);
+    for _ in 0..16 {
+        if agent_pane_id == wanted_pane_id {
+            break;
+        }
+        let extra = blank_pane(&ws_id, &tab_id, &agent_pane_id, "/tmp/foreign-work", false);
+        st.screens.insert(agent_pane_id.clone(), "$ \n".to_string());
+        st.panes.insert(agent_pane_id.clone(), extra);
+        agent_pane_id = st.alloc_pane(&ws_id);
+    }
+    let agent_pane = blank_pane(&ws_id, &tab_id, &agent_pane_id, "/tmp/foreign-work", false);
+    st.screens
+        .insert(agent_pane.pane_id.clone(), "$ \n".to_string());
+    let pane_count = st.panes.len() + 1;
+    st.panes
+        .insert(agent_pane.pane_id.clone(), agent_pane.clone());
+    let tab = TabInfo {
+        tab_id: tab_id.clone(),
+        workspace_id: ws_id.clone(),
+        number: 1,
+        label: "1".into(),
+        focused: true,
+        pane_count,
+        agent_status: AgentStatus::Working,
+    };
+    let workspace = WorkspaceInfo {
+        pane_count,
+        tab_count: 1,
+        workspace_id: ws_id.clone(),
+        number: 1,
+        label: RESTART_FOREIGN_LABEL.into(),
+        focused: true,
+        active_tab_id: tab_id.clone(),
+        agent_status: AgentStatus::Working,
+    };
+    if let Some(pane) = st.panes.get_mut(&agent_pane.pane_id) {
+        pane.agent = Some("claude".into());
+        pane.agent_status = AgentStatus::Working;
+    }
+    let agent = AgentInfo {
+        terminal_id: "term_foreign".into(),
+        name: Some("foreign-agent".into()),
+        agent: Some("claude".into()),
+        agent_status: AgentStatus::Working,
+        workspace_id: ws_id,
+        tab_id: tab_id.clone(),
+        pane_id: agent_pane.pane_id.clone(),
+        focused: false,
+        agent_session: None,
+        interactive_ready: true,
+        launch_pending: false,
+        cwd: Some("/tmp/foreign-work".into()),
+        terminal_title: Some("Claude Code".into()),
+        terminal_title_stripped: Some("Claude Code".into()),
+        state_change_seq: 1,
+        revision: 1,
+    };
+    st.tabs.insert(tab_id, tab);
+    st.workspaces.insert("w1".into(), workspace);
+    st.agents.insert("foreign-agent".to_string(), agent);
 }
 
 fn pane_process_info(st: &mut State, params: &Value) -> Result<Value, (&'static str, String)> {

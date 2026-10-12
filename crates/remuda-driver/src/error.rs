@@ -54,6 +54,14 @@ pub enum DriverError {
     /// it names was never dispatched.
     #[error("carrier unavailable: {0}")]
     CarrierUnavailable(String),
+    /// A destructive carrier call was refused because its deterministic
+    /// pane/tab/workspace id is now held by a DIFFERENT Herdr boot: the server
+    /// restarted and handed the reused id to an unrelated workspace whose
+    /// creation label (or server generation) no longer matches the resource.
+    /// Closing would kill a foreign user's pane, so the call never went out
+    /// (c-ctxusage r14 item 1).
+    #[error("foreign Herdr resource: {0}")]
+    ForeignHerdrResource(String),
     /// Isolated settings could not be written.
     #[error("settings isolation unavailable: {0}")]
     SettingsIsolationUnavailable(String),
@@ -88,6 +96,9 @@ impl DriverError {
             Self::NativeSessionNotFound => ErrorCode::NativeSessionNotFound,
             Self::AttachWouldWake => ErrorCode::AttachWouldWake,
             Self::ControlUnavailable | Self::CarrierUnavailable(_) => ErrorCode::ControlUnavailable,
+            // A refused foreign-resource close is an invalid launch/carrier
+            // state, not a protocol failure: nothing was sent to Herdr.
+            Self::ForeignHerdrResource(_) => ErrorCode::InvalidLaunchSpec,
             Self::SettingsIsolationUnavailable(_) => ErrorCode::SettingsIsolationUnavailable,
             Self::BinaryNotFound(_) => ErrorCode::InvalidLaunchSpec,
             Self::Io(_) | Self::Json(_) | Self::Protocol(_) => ErrorCode::NativeProtocolError,

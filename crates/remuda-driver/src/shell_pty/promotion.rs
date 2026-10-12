@@ -1718,11 +1718,7 @@ impl SessionModeTable {
                 || (found.session_id.is_some() && !found.session_id_from_hook);
             let hook_provenance = if !launch_session_established {
                 match start_source {
-                    Some("resume") => Some(
-                        transcript_path
-                            .map(ResumeMode::rebound_mode)
-                            .unwrap_or(ResumeMode::Unverified),
-                    ),
+                    Some("resume") => Some(ResumeMode::for_explicit_resume(transcript_path)),
                     Some("clear" | "startup" | "compact") => Some(ResumeMode::Fresh),
                     _ => None,
                 }
@@ -1740,10 +1736,15 @@ impl SessionModeTable {
             // source captured at delivery decides:
             // - clear/startup/compact → a NEW empty session → Fresh, even if
             //   the transcript already holds the queued/pasted prompt now;
-            // - resume/unknown → the file carries (or may carry) another
-            //   session's history → unverified EOF anchor (or Fresh if empty).
+            // - resume → c-effortread r13 item 5: explicit resume provenance
+            //   stays unverified even while its transcript is absent (an
+            //   unverified EOF boundary when the file is available, else bare
+            //   Unverified) — a rename-and-restore must never reopen as Fresh;
+            // - unknown → the file carries (or may carry) another session's
+            //   history → unverified EOF anchor (or Fresh if empty).
             let mode = match start_source {
                 Some("clear" | "startup" | "compact") => ResumeMode::Fresh,
+                Some("resume") => ResumeMode::for_explicit_resume(transcript_path),
                 _ => transcript_path
                     .map(ResumeMode::rebound_mode)
                     .unwrap_or(ResumeMode::Fresh),
@@ -6161,6 +6162,182 @@ mod tests {
         let pending = bridge
             .pending()
             .expect("the historical slash/verdict cannot settle the armed request");
+        assert_eq!(pending.request_id.as_deref(), Some("req-armed"));
+        assert_eq!(pending.name, remuda_protocol::EffortName::Max);
+    }
+
+    /// c-effortread r13 item 5: a hook-only detected Claude process reports
+    /// historical session X with explicit source "resume" while X's transcript
+    /// is temporarily ABSENT (rename-and-restore). The sticky mode captured at
+    /// that instant must be bare Unverified — never Fresh — and it must STAY
+    /// unverified after X is restored, so X's historical effort cannot publish
+    /// as current or settle the armed request.
+    ///
+    /// Same production orchestration as the r12 item 6 case: native hook bus
+    /// → promote_from_hook_binding → apply_native_session_binding (the seam
+    /// classifies the sticky mode) → file restored → maintain_binding opens
+    /// the hydrator and pumps.
+    #[tokio::test]
+    async fn r13_item5_resume_while_transcript_absent_stays_unverified_after_restore() {
+        use crate::effort::EffortRequest;
+        use remuda_protocol::EffortAxis::Tier;
+        use remuda_protocol::EffortSemantics::Decoupled;
+
+        // X's prior history: a high read-back, then a /effort max slash and
+        // its accepted verdict — the pair that settles an armed max request
+        // once a Fresh tail replays it.
+        let history = format!(
+            "{}{}{}",
+            assistant_line(Some("high"), 1),
+            slash_line("max", 2),
+            stdout_verdict(
+                "Set effort level to max (this session only): Maximum capability",
+                3,
+            ),
+        );
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut fx = pump_fixture(dir.path(), &history);
+        fx.ctx.cwd = dir.path().join("repo");
+
+        // The transcript is renamed AWAY between the last poll and the
+        // SessionStart delivery (the rename-and-restore window).
+        std::fs::remove_file(&fx.binding.path).expect("X is absent at the hook instant");
+
+        // Native hook bus: the real relay payload, source resume, naming X.
+        let (tx, _rx) = mpsc::channel(256);
+        let bus = remuda_signal::SignalBus::new(
+            remuda_signal::BusContext {
+                instance_id: InstanceId::new(),
+                host_id: HostId::new(),
+                journal_id: Id::new("obj").expect("journal id"),
+                run_id: RunId::new(),
+                driver_kind: remuda_protocol::DriverKind::ShellPty,
+                adapter_version: "test".into(),
+            },
+            tx,
+            Arc::new(AtomicU64::new(0)),
+        );
+        bus.handle(remuda_signal::HookEnvelope {
+            credential: "cred".into(),
+            event: "SessionStart".into(),
+            ppid: 7,
+            payload: serde_json::json!({
+                "session_id": PUMP_SESSION,
+                "transcript_path": fx.binding.path.to_string_lossy(),
+                "cwd": fx.binding.cwd.to_string_lossy(),
+                "source": "resume",
+            }),
+        })
+        .await;
+        let binding = bus.binding().expect("the native bus folded a binding");
+        assert_eq!(binding.source.as_deref(), Some("resume"));
+
+        // The node-wrapper foreground row forces the hook fallback (the guard
+        // normal detect cannot claim it), exactly as in production.
+        let rows = vec![ProcessRow {
+            pid: 7,
+            args: "node /opt/claude/cli.js".into(),
+        }];
+        assert!(crate::promote::detect(&rows, None).is_none());
+        let found = promote_from_hook_binding(&rows, &binding, AgentKind::Claude)
+            .expect("the authenticated hook pid promotes");
+        assert_eq!(found.session_id.as_deref(), Some(PUMP_SESSION));
+        assert!(found.session_id_from_hook);
+
+        let bindings = BindingHandle::empty();
+        bindings.begin_epoch(&fx.ctx.cwd, &fx.ctx.claude_home);
+        let mut hydrator: Option<Hydrator> = None;
+        let mut announced: Option<String> = None;
+        let mut session_modes = SessionModeTable::default();
+        let mut launch_mode = LaunchModeBinding::Unbound;
+        let mut read_anchors = std::collections::HashMap::new();
+        let mut effort_seeds = std::collections::HashMap::new();
+        let mut withdrawn_sessions = std::collections::HashSet::new();
+        let mut active_session: Option<(i32, String)> = None;
+
+        // The production seam classifies the mode WHILE X IS ABSENT.
+        let rebound = apply_native_session_binding(
+            &bindings,
+            &found,
+            &binding,
+            None,
+            &mut session_modes,
+            &mut read_anchors,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        );
+        assert!(
+            !rebound,
+            "the first hook-only bind ingests, it does not rebind"
+        );
+        let classified = session_modes
+            .mode_for(7, PUMP_SESSION)
+            .expect("the seam recorded one mode for the hook (pid, session)");
+        assert!(
+            matches!(
+                classified.mode,
+                crate::claude_transcript::ResumeMode::Unverified
+            ),
+            "explicit resume provenance with the transcript absent is bare Unverified, never Fresh: {:?}",
+            classified.mode
+        );
+
+        // X is restored (rename back) WITH its prior history before the next
+        // poll tick opens the hydrator.
+        std::fs::write(&fx.binding.path, history.as_bytes()).expect("X restored");
+
+        // A live configure request is armed before the restored file replays.
+        let bridge = Arc::new(crate::effort::EffortBridge::new());
+        let armed = EffortRequest::for_configure(
+            "max",
+            Some(false),
+            Some(Tier),
+            Decoupled,
+            None,
+            None,
+            Some("req-armed"),
+        )
+        .expect("max tier request");
+        bridge.arm(armed);
+        assert!(bridge.has_pending());
+
+        maintain_binding(
+            &bindings,
+            &fx.ctx,
+            &found,
+            &mut hydrator,
+            &mut announced,
+            &fx.tx,
+            &fx.seq,
+            Some(&bridge),
+            None,
+            None,
+            None,
+            None,
+            &mut session_modes,
+            &mut launch_mode,
+            None,
+            &mut read_anchors,
+            &mut effort_seeds,
+            &mut withdrawn_sessions,
+            &mut active_session,
+        )
+        .await;
+        let hydrator = hydrator.expect("the restored X binds and opens a hydrator");
+        assert!(
+            !hydrator.tail.verified(),
+            "the sticky Unverified mode survives the restore: an unverified EOF anchor, not Fresh"
+        );
+
+        let events = drain(&mut fx);
+        assert!(
+            effort_rows(&events).is_empty(),
+            "X's restored historical high/max records never publish current effort: {:?}",
+            effort_rows(&events)
+        );
+        let pending = bridge
+            .pending()
+            .expect("the restored historical slash/verdict cannot settle the armed request");
         assert_eq!(pending.request_id.as_deref(), Some("req-armed"));
         assert_eq!(pending.name, remuda_protocol::EffortName::Max);
     }

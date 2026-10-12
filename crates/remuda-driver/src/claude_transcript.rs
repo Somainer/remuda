@@ -887,6 +887,32 @@ impl ResumeMode {
         }
     }
 
+    /// Mode for an AUTHENTICATED hook report whose explicit source is
+    /// `"resume"` (c-effortread r13 item 5).
+    ///
+    /// Unlike [`ResumeMode::rebound_mode`] (used for the in-TUI unknown-source
+    /// rebound, where an empty/absent file is a brand-new `/clear` session),
+    /// explicit resume provenance may NEVER decay to [`ResumeMode::Fresh`] on
+    /// a missing transcript. The named session carries another session's
+    /// history; at the report instant its file can be temporarily ABSENT
+    /// (rename-and-restore), unreadable, or fail its boundary capture. In all
+    /// those cases the resume stays unverified for the whole epoch:
+    /// - a boundary is available (file present, even empty) → an unverified
+    ///   EOF [`ResumeMode::Boundary`];
+    /// - otherwise (absent/unreadable) → bare [`ResumeMode::Unverified`],
+    ///   whose tail stays unbound and retries (never a live byte-0 tail).
+    ///
+    /// Recording Fresh here was permanent: the sticky mode survives the file
+    /// being restored, so X's replayed historical effort published as current
+    /// and settled an armed switch.
+    #[must_use]
+    pub fn for_explicit_resume(path: Option<&Path>) -> ResumeMode {
+        match path.and_then(ResumeBoundary::unverified_eof) {
+            Some(boundary) => ResumeMode::Boundary(boundary),
+            None => ResumeMode::Unverified,
+        }
+    }
+
     /// Open the tail for a bound transcript `path`. For an [`ResumeMode::Unverified`]
     /// resume, anchors at the file's CURRENT EOF unverified; if the file does
     /// not exist yet returns `None` so the pump retries next tick (never a live
@@ -1255,6 +1281,56 @@ impl TranscriptTail {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// c-effortread r13 item 5: explicit resume provenance never decays to
+    /// Fresh on a missing/empty/unreadable transcript. A present file yields an
+    /// unverified EOF boundary (verified=false); an absent file or no path
+    /// yields bare Unverified (the tail stays unbound and retries, never
+    /// byte 0).
+    #[test]
+    fn r13_item5_for_explicit_resume_is_never_fresh() {
+        let dir = tempfile::tempdir().expect("tmp");
+
+        // No path at all (the hook report carried none).
+        assert!(matches!(
+            ResumeMode::for_explicit_resume(None),
+            ResumeMode::Unverified
+        ));
+
+        // The named transcript is absent (rename-and-restore window).
+        let absent = dir.path().join("absent.jsonl");
+        assert!(matches!(
+            ResumeMode::for_explicit_resume(Some(&absent)),
+            ResumeMode::Unverified
+        ));
+
+        // An empty file is "available": an unverified boundary at offset 0,
+        // still never Fresh (the gate stays closed for the epoch).
+        let empty = dir.path().join("empty.jsonl");
+        write(&empty, "");
+        match ResumeMode::for_explicit_resume(Some(&empty)) {
+            ResumeMode::Boundary(boundary) => {
+                assert!(
+                    !boundary.verified,
+                    "an explicit-resume boundary is unverified"
+                );
+                assert_eq!(boundary.start, 0);
+            }
+            other => panic!("expected an unverified Boundary, got {other:?}"),
+        }
+
+        // A present, non-empty restored transcript anchors unverified at its
+        // current EOF so the historical records never replay as current.
+        let restored = dir.path().join("x.jsonl");
+        write(&restored, "{\"type\":\"assistant\"}\n");
+        match ResumeMode::for_explicit_resume(Some(&restored)) {
+            ResumeMode::Boundary(boundary) => {
+                assert!(!boundary.verified);
+                assert_eq!(boundary.start, b"{\"type\":\"assistant\"}\n".len() as u64);
+            }
+            other => panic!("expected an unverified EOF Boundary, got {other:?}"),
+        }
+    }
 
     /// c-effortread r8 item 4(b): the held partial line rides across a
     /// demote/re-promotion. A tail that has buffered a half-written JSONL

@@ -4553,8 +4553,13 @@ class HubStore {
       // Still behind the running turn: no read-back is even possible yet.
       // Wait; the working→idle activity evidence stamps leftQueueAt and
       // re-arms a fresh full bound. Never refresh and never declare
-      // unconfirmed while queued — the long-turn max-age backstop bounds the
-      // total wait.
+      // unconfirmed while queued. The 30-minute max-age is the total-wait
+      // backstop: past it (a genuinely lost activity edge) stop rescheduling —
+      // `effortPendingOf` already prunes the chip at the same age.
+      if (Date.now() - pendingNow.at > EFFORT_PENDING_MAX_AGE_MS) {
+        this.effortReconcileTimers.delete(instanceId);
+        return;
+      }
       const timer = setTimeout(() => {
         void this.runEffortReconciliation(instanceId, nonce);
       }, EFFORT_UNCONFIRMED_BOUND_MS);

@@ -2141,6 +2141,13 @@ async fn shutdown_for_backlog_overflow(
     // still lands.
     #[cfg(feature = "test-stub")]
     test_barrier::note_overflow_kill_waiting(&inner.barrier);
+    // ma-sdk-state r14 item 2 (test-stub): a deterministic gate BETWEEN the
+    // admission seal and the live-handle kill. A regression parks the detached
+    // shutdown here, takes the live lock itself, and ABORTS the triggering send
+    // task; the kill must still land after the gate opens because the shutdown
+    // owns its own task and lifetime. Open by default.
+    #[cfg(feature = "test-stub")]
+    test_barrier::hold_before_overflow_kill(&inner.barrier).await;
     {
         let mut live = inner.live.lock().await;
         if let Some(live) = live.as_mut() {
@@ -2923,6 +2930,13 @@ pub mod test_barrier {
         /// slot — the acknowledged saturation point (replaces sleep-polling the
         /// channel capacity).
         emit_waiting_count: AtomicUsize,
+        /// ma-sdk-state r14 item 2: gate between the overflow admission seal
+        /// and the live-handle kill. OPEN by default (the shutdown proceeds); a
+        /// regression shuts it to park the detached shutdown, abort the
+        /// triggering send, and prove the kill still happens.
+        overflow_kill_parked: AtomicBool,
+        overflow_kill_gate_open: AtomicBool,
+        overflow_kill_gate: tokio::sync::Notify,
         /// ma-sdk-state r14 item 1: the worker has fully handled a charged job
         /// but its owned permits are still held (the pre-release gate is
         /// shut). A regression parks the publisher here across close and
@@ -2979,6 +2993,9 @@ pub mod test_barrier {
             rollback_gate_open: AtomicBool::new(true),
             rollback_gate: tokio::sync::Notify::new(),
             emit_waiting_count: AtomicUsize::new(0),
+            overflow_kill_parked: AtomicBool::new(false),
+            overflow_kill_gate_open: AtomicBool::new(true),
+            overflow_kill_gate: tokio::sync::Notify::new(),
             charge_release_parked: AtomicBool::new(false),
             charge_release_open: AtomicBool::new(true),
             charge_release_gate: tokio::sync::Notify::new(),
@@ -3173,6 +3190,24 @@ pub mod test_barrier {
             state.emit_waiting_count.fetch_add(1, Ordering::AcqRel);
             state.state_changed.notify_waiters();
         }
+    }
+
+    /// ma-sdk-state r14 item 2 gate: park the detached overflow shutdown
+    /// BETWEEN its admission seal and its live-handle kill. Open by default.
+    pub(super) async fn hold_before_overflow_kill(slot: &Slot) {
+        let Some(state) = current(slot) else {
+            return;
+        };
+        state.overflow_kill_parked.store(true, Ordering::Release);
+        state.state_changed.notify_waiters();
+        if state.overflow_kill_gate_open.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = state.overflow_kill_gate.notified();
+        if state.overflow_kill_gate_open.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
     }
 
     /// ma-sdk-state r14 item 1 worker gate: the job is fully handled but its
@@ -3477,6 +3512,49 @@ pub mod test_barrier {
             .await;
         }
 
+        /// ma-sdk-state r14 item 2: SHUT the gate between the overflow
+        /// admission seal and the live-handle kill, so the detached shutdown
+        /// parks there while a test aborts the triggering send.
+        pub fn hold_overflow_kill(&self) {
+            self.state
+                .overflow_kill_parked
+                .store(false, Ordering::Release);
+            self.state
+                .overflow_kill_gate_open
+                .store(false, Ordering::Release);
+        }
+
+        /// Release the detached overflow shutdown into its kill step.
+        pub fn release_overflow_kill(&self) {
+            if !self
+                .state
+                .overflow_kill_gate_open
+                .swap(true, Ordering::AcqRel)
+            {
+                self.state.overflow_kill_gate.notify_waiters();
+            }
+        }
+
+        /// Wait until the detached overflow shutdown reached the shut
+        /// pre-kill gate (seal done, kill not yet attempted).
+        pub async fn wait_until_overflow_kill_gate_parked(&self, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| {
+                    state.overflow_kill_parked.load(Ordering::Acquire)
+                        && !state.overflow_kill_gate_open.load(Ordering::Acquire)
+                },
+                || {
+                    "write_commit barrier: timed out waiting for the overflow shutdown to park \
+                     before its kill"
+                        .to_owned()
+                },
+            )
+            .await;
+        }
+
         /// ma-sdk-state r14 item 1: wait until `n` ordinary emissions found the
         /// observation channel saturated and parked for consumer capacity.
         pub async fn wait_until_emit_waiting(&self, n: usize, timeout: Duration) {
@@ -3773,6 +3851,7 @@ pub mod test_barrier {
             self.release_cancelled_ticket();
             self.release_rollback_without_ticket();
             self.release_charge_release();
+            self.release_overflow_kill();
         }
     }
 

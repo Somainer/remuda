@@ -131,6 +131,23 @@ fn child_gone_or_zombie(pid: &str) -> bool {
         .is_some_and(|state| matches!(state, "Z" | "X" | "x"))
 }
 
+/// ma-sdk-state r14 item 2: the ONE named bounded wait every pre-close
+/// SIGKILL-death assertion goes through (ma-sdk-state r14's no-inline-sleep
+/// rule replaces the r13 inline poll loop). The transition to gone/zombie is
+/// external kernel state with no driver acknowledgement, so a short poll
+/// interval is unavoidable — it lives inside this named helper, never at a
+/// call site — and the overall deadline is the named bound.
+async fn wait_child_gone_or_zombie(pid: &str, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !child_gone_or_zombie(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the overflow SIGKILL delivered to the flooding child ({pid})"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 fn prompt(text: &str) -> DriverInput {
     prompt_id(text, "msg-1")
 }
@@ -1347,16 +1364,9 @@ async fn an_overflow_kill_contending_on_live_still_reaps_the_child() {
     // child is therefore GONE or a zombie (/proc state Z), which
     // group_alive (signal 0) cannot distinguish from a live process. This is
     // the pre-close evidence — close's own ladder would otherwise mask a
-    // skipped overflow kill. Polled under a bound like the close tests' reap
-    // waits (external kernel state, not a driver acknowledgement).
-    let reap_deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while !child_gone_or_zombie(&pid) {
-        assert!(
-            std::time::Instant::now() < reap_deadline,
-            "the contended overflow kill delivered SIGKILL to the flooding child"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    // skipped overflow kill. It goes through the named bounded death waiter
+    // (ma-sdk-state r14: no inline poll/sleep at the call site).
+    wait_child_gone_or_zombie(&pid, Duration::from_secs(15)).await;
 
     // The terminal diagnostic rides the reserved permit.
     let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
@@ -1386,6 +1396,119 @@ async fn an_overflow_kill_contending_on_live_still_reaps_the_child() {
         !process_alive(&pid),
         "close reaps the SIGKILLed group the contended overflow already killed"
     );
+    let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+}
+
+/// ma-sdk-state r14 item 2: when a RESERVATION admission trips the overflow,
+/// the shutdown runs in its OWN detached task. Aborting the triggering send
+/// while the shutdown is parked (seal done, kill held off by a contended live
+/// handle) must not cancel it: once the contention clears the flooding child
+/// is still killed and the terminal diagnostic is still published.
+#[tokio::test]
+async fn aborting_the_triggering_send_mid_overflow_shutdown_still_kills_and_publishes() {
+    const ITEM_CAP: usize = 256;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_SILENT_PROMPTS".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+    let pid = handle
+        .ack()
+        .native_ids
+        .get("pid")
+        .expect("pid on the launch ack")
+        .clone();
+
+    // Open every write/commit gate so tickets accumulate, then SHUT the
+    // detached shutdown's pre-kill gate (after release(), which opens it).
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.release();
+    barrier.hold_overflow_kill();
+
+    // Flood reservation tickets on a spawned task: the cap-breach send is the
+    // triggering future this test aborts mid-shutdown.
+    let d = driver.clone();
+    let mut flooder = tokio::spawn(async move {
+        for n in 0..4_000usize {
+            let id = format!("msg-r14-2-{n}");
+            if d.send(prompt_id("silent turn", &id)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // The detached shutdown sealed admission and parked at the pre-kill gate.
+    barrier
+        .wait_until_overflow_kill_gate_parked(Duration::from_secs(20))
+        .await;
+
+    // Contend the kill exactly like the r13 item-3 fixture: take the live
+    // handle BEFORE releasing the shutdown into its kill step.
+    let live_hold = driver
+        .bounded_hold_live_for_test(Duration::from_secs(5))
+        .await;
+
+    // ABORT THE TRIGGERING SEND (and the whole flood) while the shutdown is
+    // sealed-but-before-kill. With the r13 inline-await shape this cancelled
+    // the kill and the terminal publication with it.
+    flooder.abort();
+    let _ = wait_bounded(&mut flooder, Duration::from_secs(5), "the aborted flooder").await;
+    assert!(
+        process_alive(&pid),
+        "the child is still alive while the kill contends for the held handle"
+    );
+
+    // Release the shutdown into its kill; the held live handle blocks it, and
+    // the child still cannot have been killed meanwhile.
+    barrier.release_overflow_kill();
+    assert!(
+        process_alive(&pid),
+        "the kill lands only once the live handle is released"
+    );
+    drop(live_hold);
+
+    // The detached shutdown survived the abort: the kill lands and the
+    // terminal diagnostic is published.
+    barrier
+        .wait_until_backlog_overflow(Duration::from_secs(20))
+        .await;
+    wait_child_gone_or_zombie(&pid, Duration::from_secs(15)).await;
+
+    let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+        seen.iter().any(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+    })
+    .await;
+    let terminal = all
+        .iter()
+        .find(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+        .expect("the aborted triggering send still publishes the overflow terminal");
+    assert_eq!(lifecycle_status(terminal), Some("failed"));
+
+    drop(barrier);
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close after the mid-shutdown abort",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close after the mid-shutdown abort")
+    .expect("close ack");
     let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
         .await
         .expect("the RunHandle reaches recv=None after close");

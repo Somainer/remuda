@@ -529,6 +529,22 @@ pub enum CwdRollout {
     Ambiguous,
 }
 
+/// Ownership evidence a candidate rollout carries, strongest first
+/// (c-usagefu r9 item 2). The locator resolves candidates GLOBALLY by tier
+/// instead of pooling them: a unique hook/process candidate binds even while
+/// a weaker prompt-only candidate also happens to match, so the two never
+/// make each other ambiguous.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateTier {
+    /// Hook-confirmed native session, or re-recognition by id of a session
+    /// this instance already claimed.
+    Hook,
+    /// The rollout file is held open by the candidate's own process tree.
+    Process,
+    /// Only prompt-text + sole-live-window evidence (weakest).
+    Prompt,
+}
+
 /// Clock slack between "we dispatched the launch" and codex writing the
 /// session's first `session_meta` line. The two clocks are the same host, but
 /// the dispatch RPC can return a hair after the pane's process started.
@@ -546,16 +562,16 @@ pub fn locate_rollout_by_cwd(
     cwd: &Path,
     launched_at: time::OffsetDateTime,
     exclude: &dyn Fn(&Path) -> bool,
-    // Ownership gate beyond cwd + timestamp: a candidate is accepted only
-    // when this returns true for (file, session start, first user message).
-    // The driver passes the sent-input match (r5 item 5); tests pass accept-all.
-    input_gate: &dyn Fn(&Path, time::OffsetDateTime, &str, &Value) -> bool,
+    // Ownership gate beyond cwd + timestamp: returns the evidence tier the
+    // candidate carries for THIS instance, or None to reject it. The driver
+    // answers hook/process/prompt (r9 items 1-2); tests pass accept-all.
+    input_gate: &dyn Fn(&Path, time::OffsetDateTime, &str, &Value) -> Option<CandidateTier>,
 ) -> CwdRollout {
     let floor = launched_at - LAUNCH_TIME_SLACK;
     // Wall-clock form of the floor for mtime comparisons.
     let floor_system = std::time::SystemTime::UNIX_EPOCH
         + std::time::Duration::from_secs(floor.unix_timestamp().max(0) as u64);
-    let mut matches: Vec<(String, PathBuf, bool)> = Vec::new();
+    let mut matches: Vec<(String, PathBuf, bool, CandidateTier)> = Vec::new();
     let mut pending = vec![codex_home.join("sessions")];
     while let Some(dir) = pending.pop() {
         let Ok(dir_meta) = std::fs::symlink_metadata(&dir) else {
@@ -657,25 +673,46 @@ pub fn locate_rollout_by_cwd(
                     // Header-only lazy file — wait for its real prompt.
                     continue;
                 };
-                if !input_gate(entry.path().as_path(), started, &first_prompt, &metadata) {
+                let Some(tier) =
+                    input_gate(entry.path().as_path(), started, &first_prompt, &metadata)
+                else {
                     continue;
-                }
+                };
                 // Distinguish a strictly post-launch session (safe to
                 // hydrate from byte zero) from an in-slack candidate (a
                 // possible relaunch — tail from EOF).
                 let strict = started >= launched_at;
-                matches.push((id.to_owned(), entry.path(), strict));
+                matches.push((id.to_owned(), entry.path(), strict, tier));
             }
         }
     }
-    match matches.len() {
-        0 => CwdRollout::NotYet,
-        1 => {
-            let (id, path, strict) = matches.remove(0);
-            CwdRollout::Found { id, path, strict }
+    // r9 item 2: resolve GLOBALLY by tier rather than pooling. A unique
+    // hook candidate wins over everything; else a unique process-held
+    // candidate; prompt-only candidates are considered only when no
+    // stronger evidence exists. Two at the winning tier stay Ambiguous; a
+    // weak prompt candidate can never make a uniquely process-owned
+    // rollout ambiguous.
+    for tier in [
+        CandidateTier::Hook,
+        CandidateTier::Process,
+        CandidateTier::Prompt,
+    ] {
+        let mut at_tier = matches.iter().filter(|candidate| candidate.3 == tier);
+        let first = at_tier.next();
+        let second = at_tier.next();
+        match (first, second) {
+            (Some(candidate), None) => {
+                return CwdRollout::Found {
+                    id: candidate.0.clone(),
+                    path: candidate.1.clone(),
+                    strict: candidate.2,
+                };
+            }
+            (Some(_), Some(_)) => return CwdRollout::Ambiguous,
+            (None, _) => continue,
         }
-        _ => CwdRollout::Ambiguous,
     }
+    CwdRollout::NotYet
 }
 
 /// Compare a rollout's `session_meta.cwd` with the launch cwd. A literal match

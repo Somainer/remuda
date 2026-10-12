@@ -1318,6 +1318,44 @@ fn a_rollout_created_by_an_instance_closed_before_b_launches_stays_unbound() {
     );
 }
 
+#[test]
+fn a_unique_process_held_candidate_wins_over_a_weaker_prompt_candidate() {
+    // r9 item 2: process-owned and prompt-only candidates must not be pooled
+    // into one ambiguous set. B is the sole live instance and sent
+    // "continue"; two same-cwd post-launch rollouts carry it:
+    //   G — held open by B's own agent process (tier b);
+    //   F — prompt-compatible only (a weaker foreign candidate).
+    // Pooled, the two read as Ambiguous and B binds nothing; resolved by
+    // tier, the unique process candidate G binds and F is ignored.
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r9-item2-tiers";
+    let now = OffsetDateTime::now_utc();
+    let floor = now - time::Duration::seconds(5);
+    let rfc = now.format(&Rfc3339).unwrap();
+
+    write_rollout_prompt_at(home.path(), "F-weak", cwd, &rfc, "continue");
+    write_rollout_prompt_at(home.path(), "G-held", cwd, &rfc, "continue");
+    let dir = home.path().join("sessions/2026/09/14");
+    let (probe, roots) = fake_ownership(9101);
+    probe.hold(&dir.join("rollout-G-held.jsonl"), 9101);
+
+    send_fixture_prompt(Path::new(cwd), INST_B, "continue", now);
+    let mut b = launch_with_fake_ownership(home.path(), cwd, floor, INST_B, 9101, &probe, &roots);
+    assert!(
+        b.discover().unwrap(),
+        "the unique process-held candidate G binds despite the weaker F"
+    );
+    assert_eq!(
+        b.binding().map(|binding| binding.session_id.as_str()),
+        Some("G-held")
+    );
+    assert_eq!(
+        crate::adapters::codex_discovery::claimed_owner_of(&dir.join("rollout-F-weak.jsonl")),
+        None,
+        "F is never claimed"
+    );
+}
+
 /// A prompt sent to a GROK pane must not authorize a codex bind with the
 /// same first user message.
 #[test]

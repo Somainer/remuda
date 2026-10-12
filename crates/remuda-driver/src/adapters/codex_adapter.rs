@@ -388,23 +388,26 @@ impl CodexAdapter {
             launched_at,
             &|path: &Path| crate::adapters::codex_discovery::is_claimed_by_other(path, &owner),
             &|path, started, first_prompt, metadata| {
-                // TIER B (r8 item 1): the rollout file is open in THIS
-                // instance's agent process tree — attribution independent of
-                // prompt text and immune to identical prompts / closed owners.
-                if process_owns(path) {
-                    return true;
-                }
-                // Already-claimed by THIS owner (re-recognition by id).
+                use crate::codex_rollout::CandidateTier;
+                // TIER A (r9 item 2 ordering): re-recognition by id of a
+                // session THIS owner already claimed (the hook-confirmed id
+                // itself is handled before the cwd scan).
                 if metadata["id"]
                     .as_str()
                     .is_some_and(|id| crate::adapters::codex_discovery::owned_by(&cwd, &owner, id))
                 {
-                    return true;
+                    return Some(CandidateTier::Hook);
+                }
+                // TIER B: the rollout file is open in THIS instance's agent
+                // process tree — attribution independent of prompt text and
+                // immune to identical prompts / closed owners.
+                if process_owns(path) {
+                    return Some(CandidateTier::Process);
                 }
                 // TIER C (r9 item 1): prompt text ONLY when the rollout was
                 // created at/after this instance's ACTUAL launch (no
-                // pre-launch slack) and this has been the sole live instance
-                // in the cwd over the whole [launch, creation] interval —
+                // pre-launch slack) and this was the sole live instance in
+                // the cwd over the whole [launch, creation] interval —
                 // including since-closed instances whose lifetime the
                 // registry retained. Anything else waits.
                 crate::adapters::codex_discovery::sole_instance_matches(
@@ -413,6 +416,7 @@ impl CodexAdapter {
                     first_prompt,
                     started,
                 )
+                .then_some(CandidateTier::Prompt)
             },
         ) {
             CwdRollout::Found { id, path, strict } => {

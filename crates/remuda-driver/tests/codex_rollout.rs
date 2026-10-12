@@ -507,7 +507,7 @@ fn locate_by_cwd_skips_a_fresh_file_when_its_date_directory_predates_the_floor()
     // after the floor (so parsing WOULD return Found), but the YYYY/MM/DD date
     // directory's own mtime predates the floor -> the whole subtree is
     // skipped without opening the file.
-    use remuda_driver::codex_rollout::{CwdRollout, locate_rollout_by_cwd};
+    use remuda_driver::codex_rollout::{CandidateTier, CwdRollout, locate_rollout_by_cwd};
     use std::fs::File;
     use std::time::SystemTime;
 
@@ -544,7 +544,9 @@ fn locate_by_cwd_skips_a_fresh_file_when_its_date_directory_predates_the_floor()
         .unwrap();
 
     let floor = time::OffsetDateTime::now_utc() + time::Duration::seconds(60);
-    let found = locate_rollout_by_cwd(home.path(), cwd, floor, &|_| false, &|_, _, _, _| true);
+    let found = locate_rollout_by_cwd(home.path(), cwd, floor, &|_| false, &|_, _, _, _| {
+        Some(CandidateTier::Prompt)
+    });
     assert!(
         matches!(found, CwdRollout::NotYet),
         "the stale date directory prunes a fresh, content-matching file: {found:?}"
@@ -553,7 +555,9 @@ fn locate_by_cwd_skips_a_fresh_file_when_its_date_directory_predates_the_floor()
     // A floor older than the forced directory mtime finds the same file
     // normally (its mtime is stale by construction for this test).
     let past = time::OffsetDateTime::now_utc() - time::Duration::seconds(4000);
-    let found = locate_rollout_by_cwd(home.path(), cwd, past, &|_| false, &|_, _, _, _| true);
+    let found = locate_rollout_by_cwd(home.path(), cwd, past, &|_| false, &|_, _, _, _| {
+        Some(CandidateTier::Prompt)
+    });
     assert!(
         matches!(found, CwdRollout::Found { .. }),
         "past floor binds"
@@ -566,7 +570,7 @@ fn locate_by_cwd_skips_an_old_file_even_under_a_fresh_non_date_directory() {
     // the directory prune never touches), a content-matching file whose mtime
     // predates the floor is skipped without parsing. Content timestamp is set
     // after the floor, so removing the file filter would return Found.
-    use remuda_driver::codex_rollout::{CwdRollout, locate_rollout_by_cwd};
+    use remuda_driver::codex_rollout::{CandidateTier, CwdRollout, locate_rollout_by_cwd};
     use std::fs::File;
     use std::time::SystemTime;
 
@@ -602,14 +606,18 @@ fn locate_by_cwd_skips_an_old_file_even_under_a_fresh_non_date_directory() {
         .unwrap();
 
     let floor = time::OffsetDateTime::now_utc() + time::Duration::seconds(60);
-    let found = locate_rollout_by_cwd(home.path(), cwd, floor, &|_| false, &|_, _, _, _| true);
+    let found = locate_rollout_by_cwd(home.path(), cwd, floor, &|_| false, &|_, _, _, _| {
+        Some(CandidateTier::Prompt)
+    });
     assert!(
         matches!(found, CwdRollout::NotYet),
         "the per-file mtime filter skips a content-matching file: {found:?}"
     );
 
     let past = time::OffsetDateTime::now_utc() - time::Duration::seconds(4000);
-    let found = locate_rollout_by_cwd(home.path(), cwd, past, &|_| false, &|_, _, _, _| true);
+    let found = locate_rollout_by_cwd(home.path(), cwd, past, &|_| false, &|_, _, _, _| {
+        Some(CandidateTier::Prompt)
+    });
     assert!(
         matches!(found, CwdRollout::Found { .. }),
         "past floor binds"

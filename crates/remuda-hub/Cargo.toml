@@ -73,6 +73,9 @@ openssl = "0.10"
 # is pulled.
 nix = { version = "0.28", default-features = false, features = ["fs", "time", "net", "socket"] }
 remuda-journal.workspace = true
+# tests/support/mod.rs (shared with the hub_e2e example) serializes a real
+# typed CommandResult for the accept_reply acceptance-envelope regression.
+remuda-protocol.workspace = true
 remuda-testing.workspace = true
 serde_cbor_2 = "0.13"
 sha2.workspace = true

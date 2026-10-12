@@ -162,20 +162,23 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 /// in ONE transaction (c-usagefu r9 item 3).
 ///
 /// The survivor is the FIRST write (lowest rowid, preserving ingest
-/// ordering). Ruling C1 (c-usagefu r10 item 3; r11 item 8 makes it exact):
-/// - counters/cost (total/input/output/cache buckets, cost_usd) AND the
-///   `accounting` authority are ACCOUNTING and come from the AUTHORITATIVE
-///   sibling — the highest metric_revision row that reports each value,
-///   newest rowid breaking a revision tie. A rev-1 row reporting output
-///   10/cost 0.01/accounting estimated and a rev-2 row reporting output
-///   20/cost 0.02/accounting reported leave the survivor at 20/0.02/reported,
-///   never the first-write 10/0.01/estimated. A bucket no sibling reports
-///   stays NULL (a NULL-to-known repair still arrives from whichever revision
-///   carries it);
+/// ordering). Ruling C1 (c-usagefu r10 item 3; r11 item 8), made EXACT by
+/// c-usagefu r12 item 5 (Ruling C1'):
+/// - the highest metric_revision is determined FIRST. Counters/cost
+///   (total/input/output/cache buckets, cost_usd) AND the `accounting`
+///   authority come ONLY from rows AT that revision; among same-revision
+///   rows, the newest rowid reporting the bucket wins. A rev-1 row reporting
+///   input 7 / cost 0.10 / estimated and a rev-2 row reporting NULL input /
+///   NULL cost / reported leave the survivor at rev 2 with input and cost
+///   STILL NULL — the older revision's known values never fill the newer
+///   revision's gaps (the first-write 10/0.01/estimated never returns). A
+///   NULL bucket is repaired ONLY from another non-NULL row at the SAME
+///   highest revision;
 /// - revision: the maximum;
 /// - profile/model/turn id/native context window/observed time are
-///   ATTRIBUTION and merge best-known (any non-NULL sibling; native time over
-///   ingest time), independent of which revision owned the accounting.
+///   ATTRIBUTION and merge best-known (any non-NULL sibling, at ANY
+///   revision; native time over ingest time), independent of which revision
+///   owned the accounting.
 ///
 /// A second run changes nothing: one row per key makes the UPDATE/DELETE
 /// no-ops and the index creates are `IF NOT EXISTS`.
@@ -183,8 +186,48 @@ fn consolidate_message_duplicates(conn: &Connection) -> rusqlite::Result<()> {
     // migrate() holds only `&Connection`; the migration runs once at DB open
     // on a single connection (no concurrent writers), so an unchecked
     // transaction is sound and still gives atomic commit/rollback.
+    //
+    // C1' (r12 item 5): the accounting assignments are generated from one
+    // shared "highest revision first" fragment. The top revision is resolved
+    // FIRST; every counter/cost column and the accounting authority come only
+    // from rows AT that revision (newest rowid among them), and a NULL is
+    // repaired only by a non-NULL sibling at the SAME revision — an older
+    // revision's known value never fills it.
     let tx = conn.unchecked_transaction()?;
-    tx.execute_batch(
+    let top_revision = "(
+                 SELECT MAX(m3.metric_revision) FROM usage_events m3
+                 WHERE m3.instance_id = usage_events.instance_id
+                   AND m3.scope = 'message' AND m3.scope_id = usage_events.scope_id)";
+    let mut accounting_sets = String::new();
+    for column in [
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "cost_usd",
+    ] {
+        accounting_sets.push_str(&format!(
+            ",{column} = (
+                 SELECT m2.{column} FROM usage_events m2
+                 WHERE m2.instance_id = usage_events.instance_id
+                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                   AND m2.metric_revision = {top_revision}
+                   AND m2.{column} IS NOT NULL
+                   AND m2.metric_revision = {top_revision}
+                 ORDER BY m2.rowid DESC LIMIT 1)"
+        ));
+    }
+    // accounting is NOT NULL on every row, so no IS NOT NULL filter: the
+    // newest row at the top revision is the authority.
+    accounting_sets.push_str(&format!(
+        ",accounting = (
+                 SELECT m2.accounting FROM usage_events m2
+                 WHERE m2.instance_id = usage_events.instance_id
+                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                 ORDER BY m2.rowid DESC LIMIT 1)"
+    ));
+    let batch = format!(
         "UPDATE usage_events
          SET profile_id = COALESCE(profile_id,
              (SELECT m2.profile_id FROM usage_events m2
@@ -201,51 +244,8 @@ fn consolidate_message_duplicates(conn: &Connection) -> rusqlite::Result<()> {
               WHERE m2.instance_id = usage_events.instance_id
                 AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
                 AND m2.turn_id IS NOT NULL LIMIT 1)),
-             metric_revision = (
-                 SELECT MAX(m2.metric_revision) FROM usage_events m2
-                 WHERE m2.instance_id = usage_events.instance_id
-                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id),
-             total_tokens = (
-                 SELECT m2.total_tokens FROM usage_events m2
-                 WHERE m2.instance_id = usage_events.instance_id
-                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
-                   AND m2.total_tokens IS NOT NULL
-                 ORDER BY m2.metric_revision DESC, m2.rowid DESC LIMIT 1),
-             input_tokens = (
-                 SELECT m2.input_tokens FROM usage_events m2
-                 WHERE m2.instance_id = usage_events.instance_id
-                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
-                   AND m2.input_tokens IS NOT NULL
-                 ORDER BY m2.metric_revision DESC, m2.rowid DESC LIMIT 1),
-             output_tokens = (
-                 SELECT m2.output_tokens FROM usage_events m2
-                 WHERE m2.instance_id = usage_events.instance_id
-                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
-                   AND m2.output_tokens IS NOT NULL
-                 ORDER BY m2.metric_revision DESC, m2.rowid DESC LIMIT 1),
-             cache_read_tokens = (
-                 SELECT m2.cache_read_tokens FROM usage_events m2
-                 WHERE m2.instance_id = usage_events.instance_id
-                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
-                   AND m2.cache_read_tokens IS NOT NULL
-                 ORDER BY m2.metric_revision DESC, m2.rowid DESC LIMIT 1),
-             cache_write_tokens = (
-                 SELECT m2.cache_write_tokens FROM usage_events m2
-                 WHERE m2.instance_id = usage_events.instance_id
-                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
-                   AND m2.cache_write_tokens IS NOT NULL
-                 ORDER BY m2.metric_revision DESC, m2.rowid DESC LIMIT 1),
-             cost_usd = (
-                 SELECT m2.cost_usd FROM usage_events m2
-                 WHERE m2.instance_id = usage_events.instance_id
-                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
-                   AND m2.cost_usd IS NOT NULL
-                 ORDER BY m2.metric_revision DESC, m2.rowid DESC LIMIT 1),
-             accounting = (
-                 SELECT m2.accounting FROM usage_events m2
-                 WHERE m2.instance_id = usage_events.instance_id
-                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
-                 ORDER BY m2.metric_revision DESC, m2.rowid DESC LIMIT 1),
+             metric_revision = {top_revision}
+             {accounting_sets},
              native_context_window = COALESCE(native_context_window,
              (SELECT m2.native_context_window FROM usage_events m2
               WHERE m2.instance_id = usage_events.instance_id
@@ -301,8 +301,9 @@ fn consolidate_message_duplicates(conn: &Connection) -> rusqlite::Result<()> {
          -- the same response and must not double the Message totals.
          CREATE UNIQUE INDEX IF NOT EXISTS usage_events_message_dedupe
              ON usage_events(instance_id, scope, scope_id)
-             WHERE scope = 'message' AND scope_id IS NOT NULL;",
-    )?;
+             WHERE scope = 'message' AND scope_id IS NOT NULL;"
+    );
+    tx.execute_batch(&batch)?;
     tx.commit()
 }
 
@@ -2324,14 +2325,15 @@ mod tests {
 
     #[test]
     fn migration_accounting_comes_from_the_highest_revision_survivor() {
-        // c-usagefu r10 item 3 (Ruling C): BOTH duplicates already carry known
-        // accounting at DIFFERENT revisions — rev 1 reports output 10 / cost
-        // 0.01, a rev-2 replay reports output 20 / cost 0.02. Keeping the
-        // first non-NULL froze the survivor at 10 / 0.01 even though revision
-        // 2 is authoritative. Counters/cost must follow the HIGHEST revision
-        // (with a NULL bucket repaired from a known lower revision), while
-        // attribution (turn id, native time, profile, model, mode, context
-        // window) merges best-known. A second migration must be a no-op.
+        // c-usagefu r10 item 3 (Ruling C), made exact by r12 item 5 (C1'):
+        // BOTH duplicates carry known accounting at DIFFERENT revisions —
+        // rev 1 reports total 10 / input 7 / output 10 / cost 0.01 /
+        // estimated, a rev-2 replay reports total 20 / input NULL / output
+        // 20 / cost 0.02 / reported. Counters/cost/accounting come ONLY from
+        // the highest revision, so the survivor takes rev-2 values and its
+        // input stays NULL — rev-1's 7 never fills a rev-2 gap. Attribution
+        // (turn id, native time, profile, model, mode, context window) merges
+        // best-known from either revision. A second migration is a no-op.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE usage_events (
@@ -2440,9 +2442,8 @@ mod tests {
         assert_eq!(first.revision, 2, "revision is the authoritative max");
         assert_eq!(first.total, Some(20), "rev-2 total wins over rev-1 10");
         assert_eq!(
-            first.input,
-            Some(7),
-            "rev-2 leaves input NULL: the NULL is repaired from known rev-1 7"
+            first.input, None,
+            "C1': rev-2 leaves input NULL and rev-1's known 7 never fills it"
         );
         assert_eq!(first.output, Some(20), "rev-2 output 20 wins over rev-1 10");
         assert_eq!(first.cache_read, Some(50));
@@ -2472,6 +2473,108 @@ mod tests {
             .unwrap();
         assert_eq!(count2, 1);
         assert_eq!(read_survivor(&conn), first, "re-migrating changes nothing");
+    }
+
+    #[test]
+    fn migration_keeps_a_top_revision_null_even_when_an_older_revision_was_known() {
+        // c-usagefu r12 item 5 (Ruling C1' exact): determine the highest
+        // revision FIRST; counters, cost and accounting come ONLY from that
+        // revision. A rev-1 input 7 / cost 0.10 / estimated and a rev-2
+        // NULL input / NULL cost / reported leave the survivor at rev 2 with
+        // input and cost STILL NULL — the older revision's values never fill
+        // them. NULL repair happens only among rows AT the top revision:
+        // a second rev-2 row carrying input 9 repairs the input to 9, while
+        // the rev-1 7 is ignored. Actual old-schema database, migrated.
+        let conn = open_old_dual_schema();
+        conn.execute_batch(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode,
+                 metric_revision, total_tokens, input_tokens, output_tokens,
+                 cost_usd, accounting, observed_at, observed_at_source)
+             VALUES
+                -- key 'c1p': rev 1 fully known; rev 2 NULL input/cost,
+                -- with a same-revision sibling repairing input but not cost.
+                ('ins_c1p', 1, 'message', 'c1p', 't', 'snapshot', 1,
+                 100, 7, 93, '0.10', 'estimated',
+                 '2026-09-15T00:00:00.000Z', 'native'),
+                ('ins_c1p', 2, 'message', 'c1p', 't', 'snapshot', 2,
+                 120, NULL, NULL, NULL, 'reported',
+                 '2026-09-15T00:00:05.000Z', 'native'),
+                ('ins_c1p', 3, 'message', 'c1p', 't', 'snapshot', 2,
+                 NULL, 9, 111, NULL, 'reported',
+                 '2026-09-15T00:00:06.000Z', 'native'),
+                -- key 'c1n': rev 2 NULL cost with NO same-revision repair.
+                ('ins_c1n', 4, 'message', 'c1n', 't', 'snapshot', 1,
+                 50, 5, 45, '0.05', 'estimated',
+                 '2026-09-15T00:00:00.000Z', 'native'),
+                ('ins_c1n', 5, 'message', 'c1n', 't', 'snapshot', 2,
+                 60, 6, 54, NULL, 'reported',
+                 '2026-09-15T00:00:05.000Z', 'native');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        let (revision, total, input, output, cost, accounting): (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT metric_revision, total_tokens, input_tokens,
+                        output_tokens, cost_usd, accounting
+                 FROM usage_events WHERE instance_id='ins_c1p'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(revision, 2, "the highest revision is taken first");
+        assert_eq!(total, Some(120), "total comes from rev 2 only");
+        assert_eq!(
+            input,
+            Some(9),
+            "NULL input is repaired ONLY from another rev-2 row, never rev-1 7"
+        );
+        assert_eq!(output, Some(111), "output comes from the rev-2 sibling");
+        assert_eq!(
+            cost, None,
+            "rev-2 NULL cost stays NULL; rev-1 0.10 never fills it"
+        );
+        assert_eq!(accounting, "reported", "accounting is the rev-2 authority");
+
+        let cost_n: Option<String> = conn
+            .query_row(
+                "SELECT cost_usd FROM usage_events WHERE instance_id='ins_c1n'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cost_n, None,
+            "a NULL cost with no same-revision repair stays NULL"
+        );
+
+        // Idempotent: a second migration does not discover rev 1.
+        migrate(&conn).unwrap();
+        let cost_still_null: Option<String> = conn
+            .query_row(
+                "SELECT cost_usd FROM usage_events WHERE instance_id='ins_c1p'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cost_still_null, None);
     }
 
     /// Create a real pre-r6-schema usage_events table (all modern columns, no

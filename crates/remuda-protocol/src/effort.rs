@@ -523,6 +523,26 @@ pub fn classify_effort_slash(args: &str, semantics: EffortSemantics) -> EffortSl
     }
 }
 
+/// Which evidence established the level in [`EffortTracker::last`]
+/// (c-effortread r21 ruling B″(2)). A `/effort status|current` read-back is
+/// authoritative for the FLAG but only REPORTS the level: when the level is
+/// known from status alone a later status's resolved level (e.g.
+/// `Effort level: auto (currently …)`) replaces it, whereas a level a
+/// verdict/assistant/model channel established wins (the launch-case status
+/// vs assistant-record disagreement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LevelSource {
+    /// No level established yet.
+    #[default]
+    None,
+    /// The level is known only from `/effort status|current` output.
+    Status,
+    /// The level was established by change evidence: an accepted verdict
+    /// (including a suppressed one later published), an assistant/model
+    /// read-back, or the `/model` verdict's effort clause.
+    Evidence,
+}
+
 /// Transcript-side effective-effort state: dedup and source attribution.
 ///
 /// Edges only: [`EffortTracker::observe`] returns `None` for an unchanged
@@ -534,6 +554,9 @@ pub struct EffortTracker {
     /// Coupled/decoupled, learned from transcript `version` fields.
     semantics: EffortSemantics,
     last: Option<ObservedEffort>,
+    /// c-effortread r21 ruling B″(2): which channel established the level in
+    /// `last`; decides whether a status read-back may replace that level.
+    level_source: LevelSource,
     pending_source: EffortSource,
     /// Coupled builds only: a `/effort ultracode` slash record armed xhigh +
     /// flag ahead of its verdict/assistant record.
@@ -572,6 +595,7 @@ impl Default for EffortTracker {
         Self {
             semantics: EffortSemantics::Unknown,
             last: None,
+            level_source: LevelSource::None,
             pending_source: EffortSource::Unknown,
             ultracode_pending: false,
             flag: None,
@@ -650,6 +674,7 @@ impl EffortTracker {
         let cleared = self.last.take();
         // Drop any process-specific flag/awaiting latch: no later record is
         // trusted to re-set them, and no pending switch resolves Applied.
+        self.level_source = LevelSource::None;
         self.flag = None;
         self.awaiting = None;
         self.ultracode_pending = false;
@@ -716,6 +741,10 @@ impl EffortTracker {
     ) {
         self.semantics = semantics;
         self.last = Some(ObservedEffort { name, ultracode });
+        // The seeded tuple was an established effective state; treat its level
+        // as evidence-backed so a later status read-back yields to it (the
+        // fresh tracker cannot know status alone established it).
+        self.level_source = LevelSource::Evidence;
         // `source` is mapper-owned bookkeeping; preserve the seeded source so
         // the next observation is attributed consistently.
         self.pending_source = source;
@@ -923,6 +952,7 @@ impl EffortTracker {
         // c-effortread r20 ruling B′: the owned accept flows through the one
         // shared authoritative reconcile (latch + clear deferred + dedupe
         // against the last PUBLISHED tuple).
+        self.level_source = LevelSource::Evidence;
         let edge = self.reconcile_authoritative(observed, source);
         if edge.is_some() {
             self.pending_source = EffortSource::Unknown;
@@ -963,6 +993,10 @@ impl EffortTracker {
             ultracode: flag,
         };
         let changes_published = self.last != Some(observed);
+        // The accepted verdict is level evidence even while its edge is held:
+        // a status read-back that follows must yield to the transcript level
+        // the verdict established, not to a level an earlier status reported.
+        self.level_source = LevelSource::Evidence;
         self.deferred = Some(observed);
         UnownedAccept {
             observed,
@@ -985,6 +1019,9 @@ impl EffortTracker {
     ) -> Option<(ObservedEffort, EffortSource)> {
         let edge = self.last != Some(observed);
         self.last = Some(observed);
+        // The stashed acceptance was a real verdict: its published level is
+        // evidence-backed (c-effortread r21 ruling B″(2)).
+        self.level_source = LevelSource::Evidence;
         // Keep the latched flag consistent with the published value even when
         // the slot was overwritten after the flag was last latched.
         if let Some(flag) = observed.ultracode {
@@ -1017,9 +1054,15 @@ impl EffortTracker {
 
     /// Feed a `/effort status|current` observation. Status never settles an
     /// awaiting switch and is never attributed to one ([`EffortSource::Unknown`]
-    /// ): it reports the current state rather than changing it. The reported
-    /// level is ignored while an assistant record has established the
-    /// effective level (the two can disagree — launch case g).
+    /// ): it reports the current state rather than changing it.
+    ///
+    /// c-effortread r21 ruling B″(2): status is authoritative for the FLAG
+    /// but only REPORTS the level. The reported level replaces a level that
+    /// was established ONLY by earlier status output (`Current effort
+    /// level: high` followed by `Effort level: auto (currently medium)` after
+    /// `/effort auto`); it yields to a level a verdict/assistant/model channel
+    /// established for the current process (the two can disagree — launch
+    /// case g — and the assistant level wins).
     ///
     /// c-effortread r20 ruling B′: status is an AUTHORITATIVE read-back like
     /// the other channels and goes through the one shared reconcile, whether
@@ -1038,12 +1081,20 @@ impl EffortTracker {
         if let Some(flag) = parsed.ultracode {
             self.flag = Some(flag);
         }
-        let name = self.last.map(|last| last.name).unwrap_or(parsed.name);
+        let established_by_evidence = self.level_source == LevelSource::Evidence;
+        let name = match self.last {
+            Some(last) if established_by_evidence => last.name,
+            _ => parsed.name,
+        };
         let observed = ObservedEffort {
             name,
             ultracode: self.flag,
         };
-        self.reconcile_authoritative(observed, EffortSource::Unknown)
+        let edge = self.reconcile_authoritative(observed, EffortSource::Unknown);
+        if !established_by_evidence {
+            self.level_source = LevelSource::Status;
+        }
+        edge
     }
 
     /// Feed the `ultra_effort_enter|exit` attachment riding the next prompt.
@@ -1142,6 +1193,9 @@ impl EffortTracker {
         }
         let ultracode = self.assistant_flag(name);
         let observed = ObservedEffort { name, ultracode };
+        // An assistant/model read-back establishes the level; a later status
+        // yields to it (c-effortread r21 ruling B″(2)).
+        self.level_source = LevelSource::Evidence;
         // c-effortread r20 ruling B′: one shared authoritative reconcile. The
         // suppressed slot is superseded even when this emits nothing (the
         // read-back equals the last published state).
@@ -2530,6 +2584,80 @@ mod tests {
         );
         // A following xhigh assistant record agrees with the published tuple.
         assert!(tracker.observe(Some("xhigh"), None).is_none());
+    }
+
+    #[test]
+    fn r21_item2_a_status_resolved_level_replaces_a_status_only_level_but_yields_to_evidence() {
+        // c-effortread r21 ruling B″(2), fresh current-process tracker with no
+        // assistant record: a status can be the only level evidence, and the
+        // level it resolves to moves (e.g. after `/effort auto`). Once a
+        // verdict/assistant channel establishes the level, a status yields.
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.289");
+        let status_high = match parse_effort_stdout(
+            "Current effort level: high (Comprehensive implementation with extensive testing and \
+             documentation)",
+            EffortSemantics::Decoupled,
+        ) {
+            EffortStdout::Status(parsed) => parsed,
+            other => panic!("{other:?}"),
+        };
+        let status_auto_medium = match parse_effort_stdout(
+            "Effort level: auto (currently medium)",
+            EffortSemantics::Decoupled,
+        ) {
+            EffortStdout::Status(parsed) => parsed,
+            other => panic!("{other:?}"),
+        };
+        // 1) The first status publishes its resolved level {high, off}.
+        let first = tracker
+            .note_status(status_high)
+            .expect("the first status establishes the level");
+        assert_eq!(
+            first.0,
+            ObservedEffort {
+                name: EffortName::High,
+                ultracode: Some(false),
+            }
+        );
+        // 2) /effort auto acknowledges without changing the projected state.
+        assert!(
+            tracker
+                .note_stdout("Effort level set to auto", false)
+                .is_none()
+        );
+        // 3) The auto status's resolved level replaces the status-only level.
+        let resolved = tracker
+            .note_status(status_auto_medium)
+            .expect("auto now resolves to medium; the status-only level moves");
+        assert_eq!(
+            resolved.0,
+            ObservedEffort {
+                name: EffortName::Medium,
+                ultracode: Some(false),
+            }
+        );
+        assert_eq!(tracker.last_observed(), Some(resolved.0));
+        // A repeat is a dedup.
+        assert!(tracker.note_status(status_auto_medium).is_none());
+
+        // Model-clamping precedence: an assistant record then ESTABLISHES
+        // high; a status claiming auto-resolved medium must not move it.
+        let established = tracker
+            .observe(Some("high"), None)
+            .expect("the assistant high read-back is an edge");
+        assert_eq!(established.0.name, EffortName::High);
+        assert!(
+            tracker.note_status(status_auto_medium).is_none(),
+            "the status yields to the assistant-established level"
+        );
+        assert_eq!(
+            tracker.last_observed().map(|observed| observed.name),
+            Some(EffortName::High),
+            "the status's medium never replaces an evidence level"
+        );
+        // A repeated status keeps yielding: no level edge, no settlement.
+        assert!(tracker.note_status(status_auto_medium).is_none());
     }
 
     #[test]

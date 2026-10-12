@@ -4916,6 +4916,118 @@ mod tests {
         );
     }
 
+    /// c-effortread r21 item 2 ruling B″(2): with NO switch and no assistant
+    /// record, a fresh mapper reads `Current effort level: high`, then
+    /// `/effort auto` and `Effort level: auto (currently medium)`. Status is
+    /// the only level evidence, so the resolved medium REPLACES the earlier
+    /// status-only high and publishes `{medium, off}` exactly once (previously
+    /// every status reused the last published level and high stuck). After an
+    /// assistant record establishes high, a later auto-resolved-medium status
+    /// YIELDS (the model-clamping precedence) and publishes nothing.
+    #[tokio::test]
+    async fn r21_item2_a_status_resolved_level_updates_a_status_only_level_then_yields_to_assistant()
+     {
+        // No effort bridge: every edge must be settlement-free (no request id).
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        );
+
+        // 1) /effort status reports high.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-status-high", "status"), Some(400))
+            .expect("map the first status slash");
+        let high = mapper
+            .map_line_at(
+                &effort_stdout_line(
+                    "out-status-high",
+                    "Current effort level: high (Comprehensive implementation with extensive \
+                     testing and documentation)",
+                ),
+                Some(420),
+            )
+            .expect("map the high status");
+        assert_eq!(
+            r19_effort_edges(&high),
+            vec![(Some(remuda_protocol::EffortName::High), Some(false), None)],
+            "the first status publishes the status-only level {{high, off}}"
+        );
+
+        // 2) /effort auto: the acknowledgement changes nothing.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-auto", "auto"), Some(500))
+            .expect("map the auto slash");
+        let ack = mapper
+            .map_line_at(
+                &effort_stdout_line("out-auto", "Effort level set to auto"),
+                Some(520),
+            )
+            .expect("map the auto acknowledgement");
+        assert!(
+            r19_effort_edges(&ack).is_empty(),
+            "the auto acknowledgement is not a level edge"
+        );
+
+        // 3) The auto status resolves to medium: the status-only level moves,
+        //    with no switch settlement.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-status-medium", "status"), Some(600))
+            .expect("map the second status slash");
+        let medium = mapper
+            .map_line_at(
+                &effort_stdout_line("out-status-medium", "Effort level: auto (currently medium)"),
+                Some(620),
+            )
+            .expect("map the auto-resolved status");
+        assert_eq!(
+            r19_effort_edges(&medium),
+            vec![(Some(remuda_protocol::EffortName::Medium), Some(false), None)],
+            "the third record publishes {{medium, off}}; no request settles"
+        );
+
+        // Model-clamping precedence: an assistant record now ESTABLISHES
+        // high; a following auto-resolved-medium status must yield.
+        let established = mapper
+            .map_line_at(
+                &json!({
+                    "type": "assistant",
+                    "uuid": "msg-high",
+                    "sessionId": "effort-session",
+                    "version": "2.1.289",
+                    "message": {"id": "msg-high", "role": "assistant", "type": "message",
+                                "content": [{"type": "text", "text": "on it"}]},
+                    "effort": "high",
+                    "perTurnEffort": null,
+                })
+                .to_string(),
+                Some(700),
+            )
+            .expect("map the assistant high record");
+        assert_eq!(
+            r19_effort_edges(&established),
+            vec![(Some(remuda_protocol::EffortName::High), Some(false), None)],
+            "the assistant record establishes {{high, off}}"
+        );
+        mapper
+            .map_line_at(&effort_slash_line("cmd-status-yield", "status"), Some(800))
+            .expect("map the yielding status slash");
+        let yields = mapper
+            .map_line_at(
+                &effort_stdout_line("out-status-yield", "Effort level: auto (currently medium)"),
+                Some(820),
+            )
+            .expect("map the yielding status");
+        assert!(
+            r19_effort_edges(&yields).is_empty(),
+            "the status yields to the assistant-established high; medium never publishes"
+        );
+    }
+
     /// c-effortread r16 item 3: when the carrier's floor lookup FAILS (the
     /// bound transcript was rotated/removed or the stat errors), production no
     /// longer falls back to word-only attribution. The switch is armed with

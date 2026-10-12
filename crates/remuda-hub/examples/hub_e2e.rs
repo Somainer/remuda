@@ -2256,6 +2256,7 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("model-queued:{mid}"),
+                                None,
                             )
                             .await?;
                         } else if let Some(mid) = requested.strip_prefix("__notfound__:") {
@@ -2265,6 +2266,7 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("model-degraded:{mid}:not-found"),
+                                None,
                             )
                             .await?;
                         } else {
@@ -2335,6 +2337,10 @@ async fn fake_node(
                     if let Some(effort) = params.get("effort")
                         && let Some(requested) = effort.get("name").and_then(Value::as_str)
                     {
+                        let effort_request_id = effort
+                            .get("requestId")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty());
                         // D-056: the wire is a native level word plus an
                         // orthogonal ultracode boolean. Test-only sentinels
                         // (the UI sends real words, never these):
@@ -2349,6 +2355,7 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("effort-queued:{word}"),
+                                effort_request_id,
                             )
                             .await?;
                         } else if let Some(rest) = requested.strip_prefix("__degrade__:") {
@@ -2358,6 +2365,7 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("effort-degraded:{rest}"),
+                                effort_request_id,
                             )
                             .await?;
                         } else if requested == "__ultra_refuse_model__"
@@ -2374,6 +2382,7 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("effort-degraded:{reason}"),
+                                effort_request_id,
                             )
                             .await?;
                         } else {
@@ -2405,20 +2414,35 @@ async fn fake_node(
                             } else {
                                 serde_json::Value::Bool(false)
                             };
-                            let event = json!({
-                                "kind": "effort",
-                                "completeness": "structured",
-                                "payload": {
-                                    "requested": {"name": requested, "ultracode": want_ultra},
-                                    "effective": {
-                                        "name": tier,
-                                        "ultracode": flag,
-                                        "source": "remuda",
-                                        "observedAt": observed_at
-                                    },
-                                    "raw": tier
+                            let event = {
+                                // c-effortread r11: a real driver stamps the
+                                // verdict observation with the configure's own
+                                // request id, so the web settles (and accepts a
+                                // clamped/opposite outcome) on that echo instead
+                                // of the stricter id-less legacy fallback.
+                                let request_id = effort
+                                    .get("requestId")
+                                    .and_then(Value::as_str)
+                                    .filter(|id| !id.is_empty());
+                                let mut event = json!({
+                                    "kind": "effort",
+                                    "completeness": "structured",
+                                    "payload": {
+                                        "requested": {"name": requested, "ultracode": want_ultra},
+                                        "effective": {
+                                            "name": tier,
+                                            "ultracode": flag,
+                                            "source": "remuda",
+                                            "observedAt": observed_at
+                                        },
+                                        "raw": tier
+                                    }
+                                });
+                                if let Some(id) = request_id {
+                                    event["payload"]["requestId"] = json!(id);
                                 }
-                            });
+                                event
+                            };
                             append_n = append_event(
                                 &mut ws,
                                 &mut frame_queue,
@@ -2444,6 +2468,7 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("permission-queued:{word}"),
+                                None,
                             )
                             .await?;
                         } else if let Some(word) = requested.strip_prefix("__degrade__:") {
@@ -2453,6 +2478,7 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("permission-degraded:{word}:no-status-line"),
+                                None,
                             )
                             .await?;
                         } else {
@@ -5219,8 +5245,23 @@ async fn append_configure_status(
     instance_id: &str,
     n: u64,
     status: &str,
+    effort_request_id: Option<&str>,
 ) -> Result<u64> {
     let seq = n + 1;
+    let mut event = json!({
+        "kind": "lifecycle",
+        "payload": {
+            "type": "native",
+            "nativeName": "instance.configure",
+            "status": status
+        }
+    });
+    // c-effortread r11: the fake driver echoes the configure's request id on
+    // lifecycle edges, exactly like the real driver; the web binds queued/
+    // degraded edges to that request rather than the id-less legacy matcher.
+    if let Some(id) = effort_request_id.filter(|id| !id.is_empty()) {
+        event["payload"]["relatedIds"] = json!({ "effortRequestId": id });
+    }
     ws.send(Message::Text(
         json!({
             "jsonrpc": "2.0",
@@ -5228,14 +5269,7 @@ async fn append_configure_status(
             "method": "journal.append",
             "params": {
                 "instanceId": instance_id,
-                "event": {
-                    "kind": "lifecycle",
-                    "payload": {
-                        "type": "native",
-                        "nativeName": "instance.configure",
-                        "status": status
-                    }
-                }
+                "event": event
             }
         })
         .to_string()

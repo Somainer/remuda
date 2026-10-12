@@ -1123,17 +1123,19 @@ fn flow_case_arm(column: &str) -> String {
 /// - per-call (`turn`/`message`) rows therefore count for exactly the
 ///   instances not fully covered by priced stock.
 ///
-/// r9 items 4/5: eligible FLOW is the shared call-identity relation
-/// ([`eligible_flow_predicate`]) — every Message plus unmatched Turns.
-/// Session STOCK is used, per instance/session, ONLY when no eligible flow
-/// exists at all (legacy NULL-scope Turns included in that decision);
-/// cumulative stock is never added to, or used as a smaller-flow fallback
-/// against, the per-call sums.
+/// r9 items 4/5 and r10 Ruling B (item 6): eligible FLOW is the shared
+/// call-identity relation ([`eligible_flow_predicate`]). Session STOCK is used,
+/// per instance/session, ONLY when no eligible flow exists at all (legacy
+/// NULL-scope Turns included in that decision); cumulative stock is never added
+/// to, or used as a smaller-flow fallback against, the per-call sums. COST
+/// follows the SAME decision as tokens (item 6): a priced Session snapshot on
+/// an instance that also has eligible flow is ignored and the flow cost is
+/// billed.
 ///
 /// `r5_` CTEs: `r5_scoped_instances` (instances with any scoped session
 /// row), `r5_eligible_stock` (newest point per scoped partition, plus the
-/// legacy NULL chain where no scoped row exists), `r5_stock_instances`
-/// (instances whose every newest point is priced), `r9_stock_only_instances`
+/// legacy NULL chain where no scoped row exists), `r5_flow_instances`
+/// (instances with at least one eligible flow row), `r9_stock_only_instances`
 /// (instances with session rows and NO eligible flow). Pricing decisions are
 /// precomputed once per statement; the flow subquery joins the CTEs rather
 /// than running a correlated NOT EXISTS per row.
@@ -1177,20 +1179,15 @@ fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate:
             )
             WHERE rn = 1
          ),
-         r5_stock_instances AS (
-            SELECT instance_id FROM r5_eligible_stock
-            GROUP BY instance_id
-            HAVING COUNT(cost) = COUNT(*)
-         ),
          r5_flow_instances AS (
-            -- Every instance in the aggregate except those fully covered by
-            -- priced stock: includes instances that have session rows at all
-            -- (eligible-stock set, NULL-newest excluded above) AND instances
-            -- with only per-call rows (no session rows).
-            SELECT DISTINCT instance_id FROM usage_events
-            WHERE ({stock_predicate} OR scope != 'session')
-            EXCEPT
-            SELECT instance_id FROM r5_stock_instances
+            -- r10 item 6 (Ruling B): COST follows the exact eligible-flow
+            -- decision as tokens. An instance bills per-call FLOW cost whenever
+            -- it has any eligible flow row — even if it ALSO carries a priced
+            -- Session snapshot. Only a genuinely stock-only instance (no
+            -- eligible flow at all, see r9_stock_only_instances) is excluded
+            -- here and billed from its latest stock instead.
+            SELECT DISTINCT f.instance_id FROM usage_events f
+            WHERE {flow_exists_f}
          )
          SELECT COUNT(*),
                 -- r9 items 4/5: ONE token representation per call — the
@@ -1226,7 +1223,7 @@ fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate:
                     {flow_output}
                 END), 0),
                 (SELECT COALESCE(SUM(cost), 0.0) FROM r5_eligible_stock
-                 WHERE instance_id IN (SELECT instance_id FROM r5_stock_instances))
+                 WHERE instance_id IN (SELECT instance_id FROM r9_stock_only_instances))
                 +
                 (SELECT COALESCE(SUM(CAST(flow.cost_usd AS REAL)), 0.0)
                  FROM usage_events flow
@@ -3532,8 +3529,8 @@ mod tests {
             .unwrap()
         );
         assert!(
-            (aggregate_instance(&conn, "ins_sticky").unwrap().cost_usd - 0.50).abs() < 1e-9,
-            "before the reset the priced stock is the bill"
+            (aggregate_instance(&conn, "ins_sticky").unwrap().cost_usd - 0.10).abs() < 1e-9,
+            "eligible flow exists: the priced Turn 0.10 is the bill, stock ignored (r10 item 6)"
         );
         // Turn 2: unpriced session point becomes the newest point.
         assert!(
@@ -3663,11 +3660,12 @@ mod tests {
         // for the instance. Two native sessions (codex rebind) each carry a
         // cumulative reported cost; the bill is the newest accepted point per
         // (instance, scope_id), summed — 0.50 + 0.05, never the interleave of
-        // whichever row landed last.
+        // whichever row landed last. r10 item 6 keeps this ONLY for a
+        // stock-ONLY instance: no per-call eligible flow is present here, so
+        // the cumulative stock is the bill (Ruling B).
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        // Session s1 reports 0.40 then 0.50 (only the newest counts); a
-        // per-call estimate exists too but is ignored while a stock exists.
+        // Session s1 reports 0.40 then 0.50 (only the newest counts).
         assert!(insert(
             &conn,
             &tokenless_session_record_for("ins_two", 1, "s1", 1, Some("0.40"))
@@ -3680,8 +3678,6 @@ mod tests {
             &conn,
             &tokenless_session_record_for("ins_two", 3, "s1", 2, Some("0.50"))
         ));
-        let turn = priced_turn_record("ins_two", 4, "msg_1", "0.03");
-        assert!(insert(&conn, &turn));
 
         let agg = aggregate_instance(&conn, "ins_two").unwrap();
         assert!(
@@ -3728,8 +3724,11 @@ mod tests {
     #[test]
     fn a_per_call_only_instance_keeps_its_flow_sum_beside_a_priced_instance() {
         // The flow fallback is keyed per INSTANCE (turn rows carry no session
-        // key): instance A reports a priced stock, instance B only per-call
-        // estimates. B's 0.03 must not be wiped just because A has a stock.
+        // key): instance B reports only per-call estimates and must not be
+        // wiped because A carries stock. r10 item 6 (Ruling B): COST follows
+        // the eligible-flow decision — A has a priced stock AND its own
+        // eligible per-call Turn, so A bills that FLOW (0.10) and its stock is
+        // ignored; stock-less B contributes its flow 0.02 + 0.01. Total 0.13.
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         let project = |rec: &JournalRecord| {
@@ -3748,7 +3747,8 @@ mod tests {
             )
             .unwrap()
         );
-        // ins_a's own turn estimate is ignored (it has a stock) ...
+        // ins_a has eligible flow: its own turn estimate is the bill, not the
+        // 0.50 stock (Ruling B item 6).
         assert!(
             insert_usage_event(
                 &conn,
@@ -3756,7 +3756,7 @@ mod tests {
             )
             .unwrap()
         );
-        // ... while ins_b, stock-less, contributes its per-call flow.
+        // ins_b, stock-less, contributes its per-call flow.
         assert!(
             insert_usage_event(
                 &conn,
@@ -3774,10 +3774,99 @@ mod tests {
 
         let supply = aggregate_supply(&conn, "pvp_mix", "gw/model-mix").unwrap();
         assert!(
-            (supply.cost_usd - 0.53).abs() < 1e-9,
-            "A's stock 0.50 + B's flow 0.03, ins_a's own flow ignored: got {}",
+            (supply.cost_usd - 0.13).abs() < 1e-9,
+            "A's flow 0.10 + B's flow 0.03 (A stock ignored), got {}",
             supply.cost_usd
         );
+    }
+
+    #[test]
+    fn priced_flow_cost_is_billed_alongside_an_unmatched_historical_turn_ignoring_stock() {
+        // c-usagefu r10 item 6 (Ruling B): COST follows the exact eligible-flow
+        // decision as tokens. An unmatched historical Turn t1 ($0.10) and a NEW
+        // Message r2 ($0.05, no matching Turn) are both eligible flow; r2
+        // carries a priced cumulative Session snapshot ($0.99). Because an
+        // eligible flow EXISTS, the priced stock must NOT be selected: the bill
+        // is the unmatched Turn 0.10 + the Message 0.05 = 0.15 (and tokens are
+        // the same flow 100 + 50 = 150), never the 0.99 stock.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let project = |seq: i64,
+                       scope: &str,
+                       scope_id: &str,
+                       turn: Option<&str>,
+                       out: i64,
+                       cost: Option<&str>| {
+            let mut event = json!({
+                "kind": "usage",
+                "nativeAt": {"state": "known", "value": "2030-01-01T00:00:00.000Z"},
+                "payload": {
+                    "scope": scope,
+                    "scopeId": scope_id,
+                    "mode": "snapshot",
+                    "metricRevision": "1",
+                    "inputTokens": {"state": "known", "value": "0"},
+                    "outputTokens": {"state": "known", "value": out.to_string()},
+                    "cost": if let Some(amount) = cost {
+                        json!({"state": "known",
+                               "value": {"amount": amount, "currency": "USD"}})
+                    } else {
+                        json!({"state": "unknown", "reason": "unpriced",
+                               "evidenceEventIds": []})
+                    },
+                    "accounting": "estimated"
+                }
+            });
+            if let Some(t) = turn {
+                event["source"] = json!({"nativeTurnId": {"state": "known", "value": t}});
+            }
+            let rec = JournalRecord {
+                instance_id: "ins_cost6".into(),
+                seq,
+                event_id: format!("e{seq}"),
+                event,
+                observed_at: "2030-01-01T00:00:00.000Z".into(),
+            };
+            project_usage_event(&rec, Some("pvp_cost6"), Some("gpt-5.4")).unwrap()
+        };
+        // Historical unmatched Turn t1.
+        insert_row(
+            &conn,
+            &project(1, "turn", "t1", Some("t1"), 100, Some("0.10")),
+        )
+        .unwrap();
+        // New Message r2 for a turn with NO Turn row (eligible flow).
+        insert_row(
+            &conn,
+            &project(2, "message", "resp2", Some("t2"), 50, Some("0.05")),
+        )
+        .unwrap();
+        // A priced cumulative Session snapshot that accompanies r2.
+        let stock = project_usage_event(
+            &tokenless_session_record_for("ins_cost6", 3, "s1", 1, Some("0.99")),
+            Some("pvp_cost6"),
+            Some("gpt-5.4"),
+        )
+        .unwrap();
+        insert_usage_event(&conn, &stock).unwrap();
+
+        let agg = aggregate_instance(&conn, "ins_cost6").unwrap();
+        assert_eq!(
+            agg.output_tokens, 150,
+            "flow tokens 100 + 50, stock ignored"
+        );
+        assert!(
+            (agg.cost_usd - 0.15).abs() < 1e-9,
+            "flow cost 0.10 + 0.05, never the 0.99 priced stock, got {}",
+            agg.cost_usd
+        );
+        let supply = aggregate_supply(&conn, "pvp_cost6", "gpt-5.4").unwrap();
+        assert_eq!(supply.output_tokens, 150);
+        assert!((supply.cost_usd - 0.15).abs() < 1e-9);
+        let rollup = rollup_fold(&conn, "ins_cost6", "codex", Some("gpt-5.4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_output_tokens, Some(150));
     }
 
     /// Token-less session growth point with an explicit instance id.

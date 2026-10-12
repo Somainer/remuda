@@ -162,14 +162,16 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 /// in ONE transaction (c-usagefu r9 item 3).
 ///
 /// The survivor is the FIRST write (lowest rowid, preserving ingest
-/// ordering). Ruling C (c-usagefu r10 item 3):
-/// - counters/cost (total/input/output/cache buckets, cost_usd) are
-///   ACCOUNTING and come from the AUTHORITATIVE sibling — the highest
-///   metric_revision row that reports each value, newest rowid breaking a
-///   revision tie. A rev-1 row reporting output 10/cost 0.01 and a rev-2 row
-///   reporting output 20/cost 0.02 leave the survivor at 20/0.02, never the
-///   first non-NULL 10/0.01. A bucket no sibling reports stays NULL (a
-///   NULL-to-known repair still arrives from whichever revision carries it);
+/// ordering). Ruling C1 (c-usagefu r10 item 3; r11 item 8 makes it exact):
+/// - counters/cost (total/input/output/cache buckets, cost_usd) AND the
+///   `accounting` authority are ACCOUNTING and come from the AUTHORITATIVE
+///   sibling — the highest metric_revision row that reports each value,
+///   newest rowid breaking a revision tie. A rev-1 row reporting output
+///   10/cost 0.01/accounting estimated and a rev-2 row reporting output
+///   20/cost 0.02/accounting reported leave the survivor at 20/0.02/reported,
+///   never the first-write 10/0.01/estimated. A bucket no sibling reports
+///   stays NULL (a NULL-to-known repair still arrives from whichever revision
+///   carries it);
 /// - revision: the maximum;
 /// - profile/model/turn id/native context window/observed time are
 ///   ATTRIBUTION and merge best-known (any non-NULL sibling; native time over
@@ -238,6 +240,11 @@ fn consolidate_message_duplicates(conn: &Connection) -> rusqlite::Result<()> {
                  WHERE m2.instance_id = usage_events.instance_id
                    AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
                    AND m2.cost_usd IS NOT NULL
+                 ORDER BY m2.metric_revision DESC, m2.rowid DESC LIMIT 1),
+             accounting = (
+                 SELECT m2.accounting FROM usage_events m2
+                 WHERE m2.instance_id = usage_events.instance_id
+                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
                  ORDER BY m2.metric_revision DESC, m2.rowid DESC LIMIT 1),
              native_context_window = COALESCE(native_context_window,
              (SELECT m2.native_context_window FROM usage_events m2
@@ -2264,15 +2271,16 @@ mod tests {
                  total_tokens, input_tokens, output_tokens,
                  cache_read_tokens, cache_write_tokens, cost_usd,
                  observed_at, observed_at_source, profile_id, model,
-                 native_context_window)
+                 native_context_window, accounting)
              VALUES
                 ('ins_rev', 1, 'message', 'r1', NULL, 'snapshot', 1,
                  10, 7, 10, NULL, NULL, '0.01',
-                 '2026-09-15T00:00:00.000Z', 'ingest', NULL, NULL, NULL),
+                 '2026-09-15T00:00:00.000Z', 'ingest', NULL, NULL, NULL,
+                 'estimated'),
                 ('ins_rev', 2, 'message', 'r1', 't1', 'snapshot', 2,
                  20, NULL, 20, 50, 3, '0.02',
                  '2026-09-15T00:00:05.000Z', 'native', 'pvp_rev', 'gpt-5.4',
-                 200000);",
+                 200000, 'reported');",
         )
         .unwrap();
 
@@ -2287,6 +2295,7 @@ mod tests {
             cache_read: Option<i64>,
             cache_write: Option<i64>,
             cost: Option<String>,
+            accounting: String,
             turn_id: Option<String>,
             profile: Option<String>,
             model: Option<String>,
@@ -2299,6 +2308,7 @@ mod tests {
                 "SELECT seq, metric_revision, mode,
                         total_tokens, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, cost_usd,
+                        accounting,
                         turn_id, profile_id, model, native_context_window,
                         observed_at, observed_at_source
                  FROM usage_events WHERE scope_id='r1'",
@@ -2314,12 +2324,13 @@ mod tests {
                         cache_read: r.get(6)?,
                         cache_write: r.get(7)?,
                         cost: r.get(8)?,
-                        turn_id: r.get(9)?,
-                        profile: r.get(10)?,
-                        model: r.get(11)?,
-                        context_window: r.get(12)?,
-                        observed_at: r.get(13)?,
-                        source: r.get(14)?,
+                        accounting: r.get(9)?,
+                        turn_id: r.get(10)?,
+                        profile: r.get(11)?,
+                        model: r.get(12)?,
+                        context_window: r.get(13)?,
+                        observed_at: r.get(14)?,
+                        source: r.get(15)?,
                     })
                 },
             )
@@ -2347,6 +2358,10 @@ mod tests {
             first.cost.as_deref(),
             Some("0.02"),
             "cost is accounting: rev-2 0.02 wins, never the first non-NULL 0.01"
+        );
+        assert_eq!(
+            first.accounting, "reported",
+            "accounting is accounting: rev-2 'reported' wins over rev-1 'estimated'"
         );
         // Attribution merges best-known from either revision.
         assert_eq!(first.turn_id.as_deref(), Some("t1"));

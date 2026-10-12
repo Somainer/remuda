@@ -1956,3 +1956,212 @@ fn a_replacement_after_the_failure_peek_cannot_reuse_the_pending_generation() {
         "the second replacement starts its own generation; the retry is genuine"
     );
 }
+
+/// c-cardsettle-fu2 r9 item 2 (poll path): a complete attempt-2 start at W
+/// is followed by a lone "{" at Z when the live StopFailure peeks. The peek
+/// arms TWO independent covers: a complete record at W and a pending tail at
+/// Z. Truncating only the trailing "{" (back to Z) must invalidate the
+/// pending cover alone; the intact complete cover keeps the settled attempt
+/// Failed when the poll folds it. (r8 coupled the complete record into the
+/// pending boundary as a fallback and discarded both together.)
+#[test]
+fn truncating_the_lone_brace_keeps_the_intact_complete_cover_poll() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_r9_lone_brace_poll";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    let prefix = "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n\
+{\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n";
+    std::fs::write(run_dir.join("journal.jsonl"), prefix).unwrap();
+    let w = prefix.len() as u64;
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Failed),
+        "attempt 1 ends Failed"
+    );
+
+    // A COMPLETE attempt-2 start (terminated) at W, then a lone "{" at Z.
+    let attempt2 = "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n";
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        write!(journal, "{attempt2}").unwrap();
+        write!(journal, "{{").unwrap();
+    }
+    let z = w + attempt2.len() as u64;
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+
+    // Drop ONLY the trailing "{" (set_len back to Z); the complete record at
+    // W is intact. The next poll is the first open after the shrink.
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        file.set_len(z).unwrap();
+    }
+    let folded: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        folded.iter().all(|state| *state == WorkflowState::Failed),
+        "the intact complete cover survives the pending tail's truncation; the settled \
+         attempt stays Failed: {folded:?}"
+    );
+
+    // A genuinely different retry appended at Z resurrects.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"genuine\"}}"
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Running),
+        "the retry after the covered record is genuine"
+    );
+}
+
+/// c-cardsettle-fu2 r9 item 2 (peek path): as above, but ANOTHER member's
+/// StopFailure is the first open after the "{" truncation. Its peek must
+/// invalidate only the pending cover and leave a1's complete cover armed, so
+/// the settled attempt-2 start folds Failed before the genuine retry runs.
+#[test]
+fn truncating_the_lone_brace_keeps_the_intact_complete_cover_peek() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_r9_lone_brace_peek";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    std::fs::write(run_dir.join("agent-a2.jsonl"), "{}\n").unwrap();
+    let prefix = "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n\
+{\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n\
+{\"type\":\"started\",\"key\":\"v2:k2\",\"agentId\":\"a2\"}\n";
+    std::fs::write(run_dir.join("journal.jsonl"), prefix).unwrap();
+    let w = prefix.len() as u64;
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Failed),
+        "a1 attempt 1 ends Failed and the prefix is consumed"
+    );
+
+    let attempt2 = "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n";
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        write!(journal, "{attempt2}").unwrap();
+        write!(journal, "{{").unwrap();
+    }
+    let z = w + attempt2.len() as u64;
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+
+    // Truncate the lone "{" with NO poll observing it.
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        file.set_len(z).unwrap();
+    }
+    // Another member's failure peek is the first open after the shrink.
+    tailer
+        .agent_event("a2", true, Some(&run_dir.join("agent-a2.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a2", Some(&run_dir.join("agent-a2.jsonl")))
+        .unwrap();
+
+    // A genuinely different retry lands at Z; the poll folds BOTH the intact
+    // attempt-2 start (Failed) and the retry (Running) in order.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"genuine\"}}"
+        )
+        .unwrap();
+    }
+    let folded: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        *folded.first().expect("an a1 observation while folding"),
+        WorkflowState::Failed,
+        "the settled attempt-2 start stays covered after the other member's peek: {folded:?}"
+    );
+    assert_eq!(
+        *folded.last().expect("an a1 observation while folding"),
+        WorkflowState::Running,
+        "the different retry at Z is genuine: {folded:?}"
+    );
+}

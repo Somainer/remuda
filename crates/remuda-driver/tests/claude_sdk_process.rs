@@ -1780,6 +1780,144 @@ async fn a_frame_after_a_paused_reservation_overflow_publishes_the_overflow_term
         .expect("the RunHandle reaches recv=None after close");
 }
 
+/// ma-sdk-state r16 item 1: a GENUINE receiver EOF — `driver.kill()` closing
+/// the child's stdout while a RESERVATION-triggered overflow shutdown is PAUSED
+/// at its pre-kill gate — must not publish an ordinary StdoutEof terminal. The
+/// overflow has already won terminal ownership under the admission
+/// synchronization, so ordinary EOF publication is suppressed and the resumed
+/// overflow task delivers the single terminal.
+#[tokio::test]
+async fn a_genuine_eof_while_the_overflow_shutdown_is_paused_leaves_it_the_one_terminal() {
+    const ITEM_CAP: usize = 256;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    // Silent prompts trip the RESERVATION backlog without producing a single
+    // stdout frame, so after the flood joins the reader's next observation is
+    // the genuine EOF itself — no Closed-refused frame in between.
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_SILENT_PROMPTS".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.release();
+    barrier.hold_overflow_kill();
+
+    let d = driver.clone();
+    let flooder = tokio::spawn(async move {
+        for n in 0..4_000usize {
+            let id = format!("msg-r16-1-{n}");
+            if d.send(prompt_id("silent turn", &id)).await.is_err() {
+                break;
+            }
+        }
+    });
+    barrier
+        .wait_until_overflow_kill_gate_parked(Duration::from_secs(20))
+        .await;
+    join_bounded(
+        flooder,
+        Duration::from_secs(10),
+        "the flood after the refusal",
+    )
+    .await;
+
+    // Kill the child genuinely WHILE the overflow gate is held: the reader sees
+    // a real recv()=None (not an admission refusal). ACKNOWLEDGE the EOF was
+    // suppressed under the admission critical section — the old reader
+    // enqueued the ordinary StdoutEof here.
+    wait_bounded(
+        driver.kill(),
+        Duration::from_secs(10),
+        "kill the fake child",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for kill")
+    .expect("kill acks");
+    // ACKNOWLEDGE which terminal owner the genuine EOF resolved to under the
+    // admission critical section. The fixed reader suppresses the ordinary
+    // StdoutEof (first arm); the pre-fix reader enqueued it (second arm) —
+    // racing the two NAMED bounded acknowledgements gives the RED its defect
+    // name at once instead of timing out on the missing suppression.
+    tokio::select! {
+        () = barrier.wait_until_eof_suppressed_after_overflow(Duration::from_secs(10)) => {}
+        () = barrier.wait_until_stdout_eof_queued(Duration::from_secs(10)) => {
+            panic!("the genuine EOF queued an ordinary StdoutEof while the paused overflow shutdown owns the terminal");
+        }
+    }
+
+    // Drain a fence with the shutdown still paused: no terminal session
+    // lifecycle may appear — the suppressed EOF enqueued nothing, and the
+    // overflow terminal is still parked behind its gate (the init-time
+    // session "started" is not terminal).
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
+    let drained = drain_fence(&mut handle, fence, Duration::from_secs(20)).await;
+    let early_terminals = drained
+        .iter()
+        .filter(|o| {
+            lifecycle_named(o) == Some("session")
+                && matches!(lifecycle_status(o), Some("exited") | Some("failed"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        early_terminals.is_empty(),
+        "the genuine EOF published no terminal before the overflow shutdown ran: {early_terminals:?}"
+    );
+
+    // Resume the paused shutdown: exactly one terminal — the overflow one.
+    barrier.release_overflow_kill();
+    barrier
+        .wait_until_backlog_overflow(Duration::from_secs(10))
+        .await;
+    let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+        seen.iter().any(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+    })
+    .await;
+    let terminals = all
+        .iter()
+        .filter(|o| {
+            lifecycle_named(o) == Some("session")
+                && matches!(lifecycle_status(o), Some("exited") | Some("failed"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "exactly one session terminal, the overflow one: {all:?}"
+    );
+    let terminal = terminals[0];
+    assert_eq!(lifecycle_status(terminal), Some("failed"));
+    assert!(
+        session_terminal_related(terminal)
+            .and_then(|r| r.get("reason"))
+            .is_some_and(|reason| reason == "publication_backlog_overflow")
+    );
+
+    drop(barrier);
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close after the paused-overflow genuine-EOF proof",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close")
+    .expect("close ack");
+    let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+}
+
 /// ma-sdk-state r13 item 4: when the overflow terminal is published with the
 /// worker blocked in emit against the FULL events channel, the terminal rides
 /// the reserved permit behind every queued observation and NOTHING follows it;

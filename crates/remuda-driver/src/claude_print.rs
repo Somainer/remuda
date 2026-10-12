@@ -2153,7 +2153,11 @@ async fn map_loop(
 ) {
     // The loop exits three ways:
     // * `recv()` returns None — the CHILD's stdout reached EOF. That is the
-    //   ONLY case that seals reservation admission and enqueues StdoutEof.
+    //   case that seals reservation admission and enqueues StdoutEof, UNLESS
+    //   an overflow has already won terminal ownership (r16 item 1): checked
+    //   under the admission mutex below, a genuine EOF arriving while the
+    //   overflow shutdown is paused before its kill is suppressed so it cannot
+    //   publish an ordinary `exited` and steal the overflow task's terminal.
     // * frame admission refuses with Overflow — spawn the overflow shutdown
     //   and stop: its task owns the terminal.
     // * frame admission refuses with Closed — the overflow latch already
@@ -2253,9 +2257,17 @@ async fn map_loop(
         }
     }
     if !refused {
-        // recv() returned None: the CHILD's stdout reached EOF. Seal
-        // reservation admission and enqueue the exit as ONE critical section
-        // under the publication mutex (ma-sdk-state r11 item 2):
+        // recv() returned None: the CHILD's stdout reached EOF. Coordinate EOF
+        // and overflow-terminal ownership as ONE admission critical section
+        // (ma-sdk-state r16 item 1): under the publish mutex the overflow
+        // shutdown uses for its own seal, check the overflow latch. Once an
+        // overflow has won, suppress the ordinary StdoutEof publication and
+        // leave the single terminal to the spawned overflow task — a GENUINE
+        // EOF (a driver.kill() landing while the paused shutdown still holds
+        // the kill) used to enqueue StdoutEof unconditionally, so the worker
+        // emitted an ordinary `exited` that took the terminal from the paused
+        // overflow task. With no overflow fired this remains the only path
+        // that seals admission and queues StdoutEof (ma-sdk-state r11 item 2):
         // prepare_prompt_write holds that same mutex from its seal check
         // through book creation and ticket insertion, so a reservation can
         // never queue a Reserve ticket BEHIND this StdoutEof. Either the
@@ -2265,14 +2277,33 @@ async fn map_loop(
         // bypasses the frame caps so a full backlog cannot delay the terminal
         // seal. `closed` is set here, not only by explicit close: a prompt
         // sent after the child's natural exit can never start a turn.
-        let gate = launch.publish.lock().await;
-        launch.closed.store(true, Ordering::SeqCst);
-        if let Some(publisher) = gate.as_ref() {
-            let _ = publisher.admit_control(PublishJob::StdoutEof);
+        let overflow_owns_terminal;
+        {
+            let gate = launch.publish.lock().await;
+            // The latch is set synchronously by the spawner BEFORE the
+            // shutdown task seals under this same mutex, so observing it here
+            // means the overflow terminal is already owned (its seal either
+            // happened first and `closed` is set, or it happens next once this
+            // critical section releases).
+            overflow_owns_terminal = gate
+                .as_ref()
+                .is_some_and(|publisher| publisher.budget().overflowed.load(Ordering::Acquire));
+            if !overflow_owns_terminal {
+                launch.closed.store(true, Ordering::SeqCst);
+                if let Some(publisher) = gate.as_ref() {
+                    let _ = publisher.admit_control(PublishJob::StdoutEof);
+                }
+            }
         }
-        drop(gate);
         #[cfg(feature = "test-stub")]
-        test_barrier::note_stdout_eof_queued(&inner.barrier);
+        if overflow_owns_terminal {
+            // Fired from inside the admission critical section's wake: by this
+            // point the suppressed EOF did NOT queue a terminal, so a fence
+            // enqueued after the acknowledgement cannot be jumped by one.
+            test_barrier::note_eof_suppressed_after_overflow(&inner.barrier);
+        } else {
+            test_barrier::note_stdout_eof_queued(&inner.barrier);
+        }
     } else {
         // r15 item 4: the reader is stopping AFTER an admission refusal, with
         // no StdoutEof queued. Fired here, after the seal section, so a test
@@ -3193,6 +3224,11 @@ pub mod test_barrier {
         /// acknowledgement fence knowing the reader will no longer insert a
         /// terminal job ahead of it.
         reader_finished_after_refusal: AtomicBool,
+        /// ma-sdk-state r16 item 1: a GENUINE stdout EOF (recv() returned None)
+        /// reached the admission critical section AFTER an overflow had won
+        /// terminal ownership, so ordinary StdoutEof publication was
+        /// suppressed — the spawned overflow task delivers the one terminal.
+        eof_suppressed_after_overflow: AtomicBool,
         /// ma-sdk-state r15 item 6: number of triggering sends parked on the
         /// post-spawn overflow-refusal gate (the shutdown is in progress
         /// while the send waits here — the exact point an abort must land).
@@ -3256,6 +3292,7 @@ pub mod test_barrier {
             closed_frame_refusals: AtomicUsize::new(0),
             overflow_frame_refusals: AtomicUsize::new(0),
             reader_finished_after_refusal: AtomicBool::new(false),
+            eof_suppressed_after_overflow: AtomicBool::new(false),
             // r15 item 6: post-spawn overflow-refusal gate.
             overflow_refusal_parked_count: AtomicUsize::new(0),
             overflow_refusal_gate_open: AtomicBool::new(true),
@@ -3458,6 +3495,19 @@ pub mod test_barrier {
         if let Some(state) = current(slot) {
             state
                 .reader_finished_after_refusal
+                .store(true, Ordering::Release);
+            state.state_changed.notify_waiters();
+        }
+    }
+
+    /// r16 item 1 hook: a GENUINE reader EOF (recv() returned None) reached the
+    /// admission critical section after an overflow had won terminal
+    /// ownership, so the ordinary StdoutEof was suppressed and the overflow
+    /// task owns the single terminal.
+    pub(super) fn note_eof_suppressed_after_overflow(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state
+                .eof_suppressed_after_overflow
                 .store(true, Ordering::Release);
             state.state_changed.notify_waiters();
         }
@@ -3839,6 +3889,25 @@ pub mod test_barrier {
                 || {
                     "write_commit barrier: timed out waiting for the reader to finish after the \
                      frame admission refusal"
+                        .to_owned()
+                },
+            )
+            .await;
+        }
+
+        /// r16 item 1: wait until a GENUINE stdout EOF (recv() returned None)
+        /// was suppressed under the admission critical section because an
+        /// overflow had already won terminal ownership. No ordinary StdoutEof
+        /// is queued at this point.
+        pub async fn wait_until_eof_suppressed_after_overflow(&self, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            wait_until_with(
+                &self.state,
+                deadline,
+                |state| state.eof_suppressed_after_overflow.load(Ordering::Acquire),
+                || {
+                    "write_commit barrier: timed out waiting for the genuine EOF to be \
+                     suppressed in favour of the overflow terminal"
                         .to_owned()
                 },
             )

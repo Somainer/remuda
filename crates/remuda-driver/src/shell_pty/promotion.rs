@@ -3943,24 +3943,41 @@ mod tests {
         let gate: PromoteGate = Arc::new(crate::producer_gate::ProducerGate::new());
         gate.retire_idle();
         let seq = Arc::new(AtomicU64::new(0));
+        // Production (collect_pump) has finished above; signal that BEFORE the
+        // flusher starts so its first predicate sees a real completion state
+        // rather than a parked producer. The gate is retired and the queue is
+        // non-empty, so the flusher drains and then exits — it cannot return
+        // while frames remain (c-ctxusage r13 item 6).
+        done.store(true, Ordering::SeqCst);
+        let flusher_done = Arc::clone(&done);
         let handle = tokio::spawn(emission_flusher(
             Arc::clone(&pending),
             Arc::clone(&notify),
-            done,
+            flusher_done,
             gate,
             tx,
             seq,
             ctx.clone(),
             None,
         ));
-        // Drain through the flusher, capturing the delivered order.
+        notify.notify_one();
+        // Await FLUSHER TERMINATION under a timeout: the completion signal is
+        // the task returning after the retired gate and an empty queue, never
+        // a 500 ms receive gap (which could pass before a queued frame or a
+        // re-popped duplicate was delivered).
+        tokio::time::timeout(Duration::from_secs(30), handle)
+            .await
+            .expect("flusher did not terminate after production finished")
+            .expect("flusher panicked");
+        // The terminated flusher dropped its sender; after its buffered frames
+        // the receiver closes - inspect the COMPLETED stream.
         let mut delivered: Vec<String> = Vec::new();
-        while let Ok(obs) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
-            && let Some(obs) = obs
+        while let Some(obs) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("receiver did not close after flusher termination")
         {
             delivered.push(serde_json::to_string(&obs).unwrap_or_default());
         }
-        handle.abort();
         let rendered = delivered.join("|");
         let pos = |needle: &str| rendered.find(needle);
         assert!(pos("BACKLOG_B").is_some(), "backlog delivered: {rendered}");

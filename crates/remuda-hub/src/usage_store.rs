@@ -555,11 +555,20 @@ fn insert_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> 
 }
 
 /// Insert or improve a durable Message row keyed on
-/// (instance_id, scope='message', scope_id). c-usagefu r8 item 5: a byte-0
-/// replay re-emits the same response; if the existing row lacks turn_id or a
-/// native timestamp and the incoming row carries one, update those fields
-/// (and counters/cost when the existing row had them NULL). Returns true when
-/// a row was inserted OR updated.
+/// (instance_id, scope='message', scope_id).
+///
+/// c-usagefu r11 item 9 (Ruling C1, EXACT) — live duplicate updates are
+/// REVISION-AUTHORITATIVE for accounting:
+/// - a newer revision (`metric_revision`) replaces present counters/cost and
+///   the `accounting` authority outright, and raises the stored revision; its
+///   NULL buckets impose nothing;
+/// - an OLDER revision never replaces anything; its known buckets do not even
+///   fill NULLs — a NULL->known repair is allowed only at the SAME or a NEWER
+///   revision;
+/// - attribution (turn_id, native timestamp/source) still repairs best-known
+///   independent of revision.
+///
+/// Returns true when a row was inserted OR at least one value changed.
 fn upsert_message_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO usage_events
@@ -567,7 +576,8 @@ fn upsert_message_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Resul
              metric_revision, total_tokens, input_tokens, output_tokens,
              cache_read_tokens, cache_write_tokens, cost_usd, accounting,
              observed_at, observed_at_source, native_context_window)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 ?15, ?16, ?17, ?18, ?19)",
         params![
             row.instance_id,
             row.seq,
@@ -593,24 +603,36 @@ fn upsert_message_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Resul
     if inserted > 0 {
         return Ok(true);
     }
-    // Duplicate durable key: improve the stored row where the incoming row has
-    // a value the stored one lacks (turn_id, native timestamp/source, NULL
-    // counters/cost). Never overwrite a present value with NULL.
-    //
-    // c-usagefu r10 item 8 (Ruling C): a NULL-to-known ACCOUNTING repair is
-    // allowed independent of attribution. A row ingested with COMPLETE
-    // attribution (turn id + native time already present) but an UNKNOWN cost
-    // must still receive the known cost on replay; the old guard ran the UPDATE
-    // only while attribution was incomplete, so the cost stayed NULL forever.
+    // Duplicate durable key. Every accounting RHS compares the incoming
+    // revision against the stored one (the RHS sees the pre-update row), so an
+    // older revision is inert even while the revision column advances.
     let updated = conn.execute(
         "UPDATE usage_events SET
+             metric_revision = CASE
+                 WHEN ?12 > metric_revision THEN ?12
+                 ELSE metric_revision END,
              turn_id = COALESCE(turn_id, ?3),
-             total_tokens = COALESCE(total_tokens, ?4),
-             input_tokens = COALESCE(input_tokens, ?5),
-             output_tokens = COALESCE(output_tokens, ?6),
-             cache_read_tokens = COALESCE(cache_read_tokens, ?7),
-             cache_write_tokens = COALESCE(cache_write_tokens, ?8),
-             cost_usd = COALESCE(cost_usd, ?9),
+             total_tokens = CASE
+                 WHEN ?4 IS NOT NULL AND ?12 >= metric_revision THEN ?4
+                 ELSE total_tokens END,
+             input_tokens = CASE
+                 WHEN ?5 IS NOT NULL AND ?12 >= metric_revision THEN ?5
+                 ELSE input_tokens END,
+             output_tokens = CASE
+                 WHEN ?6 IS NOT NULL AND ?12 >= metric_revision THEN ?6
+                 ELSE output_tokens END,
+             cache_read_tokens = CASE
+                 WHEN ?7 IS NOT NULL AND ?12 >= metric_revision THEN ?7
+                 ELSE cache_read_tokens END,
+             cache_write_tokens = CASE
+                 WHEN ?8 IS NOT NULL AND ?12 >= metric_revision THEN ?8
+                 ELSE cache_write_tokens END,
+             cost_usd = CASE
+                 WHEN ?9 IS NOT NULL AND ?12 >= metric_revision THEN ?9
+                 ELSE cost_usd END,
+             accounting = CASE
+                 WHEN ?12 >= metric_revision THEN ?13
+                 ELSE accounting END,
              observed_at = CASE
                  WHEN observed_at_source = 'native' THEN observed_at
                  WHEN ?11 = 'native' THEN ?10
@@ -619,14 +641,19 @@ fn upsert_message_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Resul
                  WHEN observed_at_source = 'native' THEN 'native'
                  ELSE ?11 END
          WHERE instance_id = ?1 AND scope = 'message' AND scope_id = ?2
-           AND (turn_id IS NULL
+           AND (
+                metric_revision < ?12
+                OR (turn_id IS NULL AND ?3 IS NOT NULL)
                 OR (observed_at_source != 'native' AND ?11 = 'native')
-                OR (total_tokens IS NULL AND ?4 IS NOT NULL)
-                OR (input_tokens IS NULL AND ?5 IS NOT NULL)
-                OR (output_tokens IS NULL AND ?6 IS NOT NULL)
-                OR (cache_read_tokens IS NULL AND ?7 IS NOT NULL)
-                OR (cache_write_tokens IS NULL AND ?8 IS NOT NULL)
-                OR (cost_usd IS NULL AND ?9 IS NOT NULL))",
+                OR (?12 >= metric_revision AND (
+                        (?4 IS NOT NULL AND total_tokens IS NOT ?4)
+                     OR (?5 IS NOT NULL AND input_tokens IS NOT ?5)
+                     OR (?6 IS NOT NULL AND output_tokens IS NOT ?6)
+                     OR (?7 IS NOT NULL AND cache_read_tokens IS NOT ?7)
+                     OR (?8 IS NOT NULL AND cache_write_tokens IS NOT ?8)
+                     OR (?9 IS NOT NULL AND cost_usd IS NOT ?9)
+                     OR (accounting IS NOT ?13)))
+           )",
         params![
             row.instance_id,        // ?1
             row.scope_id,           // ?2
@@ -639,6 +666,8 @@ fn upsert_message_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Resul
             row.cost_usd,           // ?9
             row.observed_at,        // ?10
             row.observed_at_source, // ?11
+            row.metric_revision,    // ?12
+            row.accounting,         // ?13
         ],
     )?;
     Ok(updated > 0)
@@ -3353,6 +3382,172 @@ mod tests {
             (agg.cost_usd - 0.10).abs() < 1e-9,
             "repaired cost is billable"
         );
+    }
+
+    #[test]
+    fn duplicate_message_updates_are_revision_authoritative_for_accounting() {
+        // c-usagefu r11 item 9 (Ruling C1, EXACT) through the public ingest
+        // path: every record is projected from a real usage observation into
+        // the durable Message row r9.
+        //   seq 1, rev 1: output 10 / cost 0.01 / estimated
+        //   seq 2, rev 2: output 20 / cost 0.02 / reported   -> REPLACES, rev 2
+        //   seq 3, rev 1: output 99 / cost 0.99 / estimated  -> OLDER, inert
+        //   seq 4, rev 2: output unknown, cache_read 50, cost unknown
+        //                 -> same-revision NULL->known repair of cache only
+        //   seq 5, rev 3: output 25 / cost 0.03 / reported  -> REPLACES, rev 3
+        // An older revision never downgrades counters, cost or accounting; a
+        // same/newer revision fills a NULL bucket and replaces present
+        // accounting outright.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let native = "2026-09-15T00:00:00.000Z";
+        let known = |v: &str| json!({"state": "known", "value": v});
+        let unknown =
+            json!({"state": "unknown", "reason": "unpriced-model", "evidenceEventIds": []});
+        let record = |seq: i64,
+                      rev: u32,
+                      output: serde_json::Value,
+                      cache_read: Option<u64>,
+                      cost: serde_json::Value,
+                      accounting: &str| JournalRecord {
+            instance_id: "ins_c1live".into(),
+            seq,
+            event_id: format!("e{seq}"),
+            event: json!({
+                "kind": "usage",
+                "nativeAt": {"state": "known", "value": native},
+                "source": {"nativeTurnId": {"state": "known", "value": "t9"}},
+                "payload": {
+                    "scope": "message", "scopeId": "r9", "mode": "snapshot",
+                    "metricRevision": rev.to_string(),
+                    "inputTokens": known("0"),
+                    "outputTokens": output,
+                    "cacheReadTokens": cache_read
+                        .map_or(json!({"state":"unknown"}), |c| known(&c.to_string())),
+                    "cost": cost,
+                    "accounting": accounting
+                }
+            }),
+            observed_at: native.into(),
+        };
+        let ingest = |rec: &JournalRecord| {
+            let row = project_usage_event(rec, Some("pvp_c1"), Some("gpt-5.4")).unwrap();
+            insert_usage_event(&conn, &row).unwrap()
+        };
+        let state = |conn: &Connection| -> (i64, Option<i64>, Option<i64>, Option<String>, String) {
+            conn.query_row(
+                "SELECT metric_revision, output_tokens, cache_read_tokens, cost_usd,
+                            accounting
+                     FROM usage_events WHERE scope_id='r9'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0).unwrap(),
+                        r.get(1).unwrap(),
+                        r.get(2).unwrap(),
+                        r.get(3).unwrap(),
+                        r.get(4).unwrap(),
+                    ))
+                },
+            )
+            .unwrap()
+        };
+
+        assert!(ingest(&record(
+            1,
+            1,
+            known("10"),
+            None,
+            json!({"state":"known","value":{"amount":"0.01","currency":"USD"}}),
+            "estimated"
+        )));
+        assert_eq!(
+            state(&conn),
+            (1, Some(10), None, Some("0.01".into()), "estimated".into())
+        );
+
+        // Newer revision replaces the authoritative accounting.
+        assert!(ingest(&record(
+            2,
+            2,
+            known("20"),
+            None,
+            json!({"state":"known","value":{"amount":"0.02","currency":"USD"}}),
+            "reported"
+        )));
+        assert_eq!(
+            state(&conn),
+            (2, Some(20), None, Some("0.02".into()), "reported".into())
+        );
+
+        // Older revision is entirely inert — no downgrade, no changed row.
+        assert!(
+            !ingest(&record(
+                3,
+                1,
+                known("99"),
+                Some(7),
+                json!({"state":"known","value":{"amount":"0.99","currency":"USD"}}),
+                "estimated"
+            )),
+            "the older duplicate changes nothing"
+        );
+        assert_eq!(
+            state(&conn),
+            (2, Some(20), None, Some("0.02".into()), "reported".into()),
+            "an older revision never replaces even a NULL bucket"
+        );
+
+        // Same revision fills a NULL bucket, imposes nothing via its unknowns.
+        assert!(ingest(&record(
+            4,
+            2,
+            json!({"state":"unknown"}),
+            Some(50),
+            unknown.clone(),
+            "reported"
+        )));
+        assert_eq!(
+            state(&conn),
+            (
+                2,
+                Some(20),
+                Some(50),
+                Some("0.02".into()),
+                "reported".into()
+            ),
+            "same-revision NULL->known repair fills cache_read only"
+        );
+
+        // Newer revision replaces present values again.
+        assert!(ingest(&record(
+            5,
+            3,
+            known("25"),
+            Some(60),
+            json!({"state":"known","value":{"amount":"0.03","currency":"USD"}}),
+            "reported"
+        )));
+        assert_eq!(
+            state(&conn),
+            (
+                3,
+                Some(25),
+                Some(60),
+                Some("0.03".into()),
+                "reported".into()
+            )
+        );
+
+        // One durable row all along.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE scope_id='r9'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

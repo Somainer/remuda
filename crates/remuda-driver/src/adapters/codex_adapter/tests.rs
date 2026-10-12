@@ -1729,6 +1729,131 @@ fn a_pending_launch_window_survives_another_window_releasing_before_adapter_buil
 }
 
 #[test]
+fn a_window_releasing_inside_a_pending_launch_registration_cannot_prune_its_interval() {
+    // c-usagefu r13 item 1: register_pending_launch must register the launch
+    // boundary, the lifetime AND the window retention as ONE critical section
+    // with respect to last-window pruning. r12 did the lifetime insert and the
+    // window open under two separate mutexes, so another window's release
+    // landing in that gap was still seen as the cwd's LAST window: it pruned
+    // C's just-closed interval, and B's later real discover() bound C's
+    // rollout although C overlapped B's whole [launch, creation] window.
+    //
+    // Barrier-controlled timeline:
+    //   t0      A launches (its window is the cwd's only one)
+    //   t0+1    C launches with a known boundary
+    //   t0+2    B registers: lifetime inserted, thread parks BEFORE its
+    //           window opens, still holding the registration critical section
+    //   t0+2.5  C's rollout FC is created (this stamp is written later)
+    //   t0+3    C closes — AFTER B's boundary and AFTER FC's creation
+    //   in-gap  A's window releases (A's own interval closed at t0-1, so it is
+    //           deliberately not a blocker) while B is parked
+    //   then    B's window opens; B runs the REAL discover() path.
+    use crate::adapters::codex_discovery::{LifetimeGuardClock as _, PendingLaunchBarrier};
+
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r13-item1-atomic";
+    let t0 = OffsetDateTime::now_utc() - time::Duration::seconds(10);
+    let t_c = t0 + time::Duration::seconds(1);
+    let t_b = t0 + time::Duration::seconds(2);
+    let t_f = t0 + time::Duration::milliseconds(2500);
+    let t_c_close = t0 + time::Duration::seconds(3);
+
+    // A: the window that will release inside B's registration. Its OWN
+    // interval is closed before B's boundary so it can never be the blocker;
+    // only the retention prune is on trial here.
+    let a = launch_adapter_keyed(home.path(), cwd, t0, INST_A);
+    a.close_lifetime_at(t0 - time::Duration::seconds(1));
+
+    // C launches with a known boundary; it closes after B's boundary.
+    let c_guard =
+        crate::adapters::codex_discovery::begin_lifetime(Path::new(cwd), INST_C, Some(t_c));
+    c_guard.close_lifetime_at(t_c_close);
+    drop(c_guard);
+    assert!(
+        crate::adapters::codex_discovery::census_contains(Path::new(cwd), INST_C),
+        "C's closed interval is retained while A's window is open"
+    );
+
+    // Arm the barrier, then run B's registration on another thread.
+    let barrier = PendingLaunchBarrier::arm(Path::new(cwd));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let builder = std::thread::Builder::new()
+        .name("r13-item1-pending-launch".into())
+        .spawn(move || {
+            let pending = crate::adapters::codex_discovery::register_pending_launch(
+                Path::new(cwd),
+                INST_B,
+                Some(t_b),
+            );
+            tx.send(pending).unwrap();
+        })
+        .unwrap();
+
+    // B has inserted its lifetime but has not opened its window yet.
+    barrier.wait_to_enter();
+    assert!(
+        crate::adapters::codex_discovery::census_contains(Path::new(cwd), INST_B),
+        "B's lifetime is registered before the window opens"
+    );
+
+    // A releases its window INSIDE B's registration. With the r12 code this
+    // prunes C (B has no window yet, so A looks like the last window); with
+    // the atomic registration the release blocks until B's window is open and
+    // then only decrements the count 2 -> 1.
+    let releaser = std::thread::Builder::new()
+        .name("r13-item1-release".into())
+        .spawn(move || drop(a))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    barrier.release();
+    let b_pending = rx.recv().unwrap();
+    builder.join().unwrap();
+    releaser.join().unwrap();
+
+    assert!(
+        crate::adapters::codex_discovery::census_contains(Path::new(cwd), INST_C),
+        "C's closed interval survives a release that raced B's registration"
+    );
+
+    // FC appears after B's boundary but while C was still live; B dispatched
+    // the matching prompt.
+    let prompt = "B item1 prompt";
+    send_fixture_prompt(
+        Path::new(cwd),
+        INST_B,
+        prompt,
+        t0 + time::Duration::seconds(3),
+    );
+    write_rollout_prompt_at(
+        home.path(),
+        "FC-r13-item1",
+        cwd,
+        &t_f.format(&Rfc3339).unwrap(),
+        prompt,
+    );
+
+    // The real production discovery path — no test-only census predicate:
+    // C's retained interval overlaps [B launch, FC creation], so B refuses.
+    let b_lifetime = b_pending.lifetime;
+    let b_window = b_pending.window;
+    let mut b = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: PathBuf::from(cwd),
+        pid: None,
+        launched_at: Some(t_b),
+    })
+    .with_lifetime(b_lifetime.witness())
+    .with_window(b_window)
+    .with_instance_key(Some(INST_B.to_owned()));
+    assert!(
+        !b.discover().unwrap(),
+        "B must not bind FC: the interval pruned inside its registration still overlaps"
+    );
+    assert!(b.binding().is_none());
+}
+
+#[test]
 fn a_resumed_instance_discovers_through_real_adapters_without_bridging_the_gap() {
     // c-usagefu r12 item 6 (Ruling A2): the r11 version of this regression
     // hand-built lifetime segments and judged through the test-only

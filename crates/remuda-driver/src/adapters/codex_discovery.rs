@@ -41,6 +41,19 @@ static OPEN_WINDOWS: LazyLock<Mutex<HashMap<PathBuf, WindowEntry>>> =
 static OPEN_DISCOVERERS: LazyLock<Mutex<HashMap<PathBuf, HashSet<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Coordination lock between a pending LAUNCH registration and a LAST-WINDOW
+/// release (c-usagefu r13 item 1). Registration inserts the lifetime segment
+/// and opens the discovery window as ONE critical section; a last-window
+/// release (its refcount drop, the prompt-evidence clear and the closed-
+/// segment prune) is the opposite critical section. Without it another
+/// window's release could land in the gap between the two separate mutex
+/// operations, observe itself as the cwd's LAST window while the launching
+/// instance had a lifetime but no window yet, and prune a closed interval the
+/// launch's later discovery decision still needed. Always the OUTERMOST lock:
+/// it is acquired alone, never while one of the fine-grained mutexes below is
+/// held.
+static LAUNCH_REGISTRATION: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 /// rollout path -> owning instance key.
 static CLAIMED_ROLLOUTS: LazyLock<Mutex<HashMap<PathBuf, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -300,14 +313,144 @@ pub(crate) struct PendingCodexLaunch {
 /// Register a codex launch's lifetime AND its pending-discovery window as one
 /// bundle, at the agent.start boundary BEFORE the child is spawned
 /// (Ruling A2', r12 item 2).
+///
+/// c-usagefu r13 item 1: the bundle is ONE critical section with respect to
+/// the last-window prune. r12 performed the lifetime insert and the window
+/// open as two separate mutex operations, so another same-cwd window releasing
+/// in the gap still saw itself as the cwd's LAST window and pruned closed
+/// intervals (and cleared prompt evidence) the not-yet-windowed launch's later
+/// discovery decision needed. The coordination lock in [`LAUNCH_REGISTRATION`]
+/// is held across both halves and across the test barrier between them.
 pub(crate) fn register_pending_launch(
     cwd: &Path,
     owner: &str,
     launched_at: Option<OffsetDateTime>,
 ) -> PendingCodexLaunch {
-    PendingCodexLaunch {
-        lifetime: begin_lifetime(cwd, owner, launched_at),
-        window: DiscoveryWindow::open(cwd, owner),
+    let _registration = LAUNCH_REGISTRATION
+        .lock()
+        .expect("codex launch registration");
+    let lifetime = begin_lifetime(cwd, owner, launched_at);
+    // Test barrier (cfg(test)): parks BETWEEN the lifetime insert and the
+    // window open WHILE HOLDING the coordination lock, so a barrier-controlled
+    // regression can drive another window's release into exactly this gap. In
+    // production builds this is a no-op.
+    #[cfg(test)]
+    pending_launch_test_barrier(cwd);
+    let window = DiscoveryWindow::open(cwd, owner);
+    PendingCodexLaunch { lifetime, window }
+}
+
+#[cfg(test)]
+static PENDING_LAUNCH_BARRIER: std::sync::LazyLock<
+    std::sync::Mutex<Option<std::sync::Arc<PendingLaunchBarrier>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Barrier parking [`register_pending_launch`] between the lifetime insert and
+/// the window open, while it still holds [`LAUNCH_REGISTRATION`]. Arm with
+/// [`PendingLaunchBarrier::arm`]; the parking thread blocks in
+/// [`Self::wait_to_enter`] until registration reached the barrier, and
+/// [`Self::release`] lets the registration finish. On drop the barrier
+/// disarms itself so a later test never parks unexpectedly.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) struct PendingLaunchBarrier {
+    /// Only registrations for THIS canonical cwd park (parallel tests share
+    /// the process and the static slot).
+    cwd: PathBuf,
+    entered: std::sync::Mutex<bool>,
+    entered_cv: std::sync::Condvar,
+    proceed: std::sync::Mutex<bool>,
+    proceed_cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl PendingLaunchBarrier {
+    /// Arm the global park for registrations in `cwd` only (parallel tests
+    /// sharing the process never park on another test's barrier); the returned
+    /// guard disarms on drop.
+    pub(crate) fn arm(cwd: &Path) -> std::sync::Arc<Self> {
+        let barrier = std::sync::Arc::new(Self {
+            cwd: canonical(cwd),
+            entered: std::sync::Mutex::new(false),
+            entered_cv: std::sync::Condvar::new(),
+            proceed: std::sync::Mutex::new(false),
+            proceed_cv: std::sync::Condvar::new(),
+        });
+        *PENDING_LAUNCH_BARRIER
+            .lock()
+            .expect("pending launch barrier") = Some(std::sync::Arc::clone(&barrier));
+        barrier
+    }
+
+    /// Registration thread: mark itself INSIDE the critical section (lifetime
+    /// inserted, window not yet open), then block until [`Self::release`].
+    fn park(&self) {
+        {
+            let mut entered = self
+                .entered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *entered = true;
+            self.entered_cv.notify_all();
+        }
+        let mut proceed = self
+            .proceed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*proceed {
+            proceed = self
+                .proceed_cv
+                .wait(proceed)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Block until a registration thread has entered the barrier.
+    pub(crate) fn wait_to_enter(&self) {
+        let mut entered = self
+            .entered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*entered {
+            entered = self
+                .entered_cv
+                .wait(entered)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Let the parked registration finish (its window opens immediately after).
+    pub(crate) fn release(&self) {
+        let mut proceed = self
+            .proceed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *proceed = true;
+        self.proceed_cv.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for PendingLaunchBarrier {
+    fn drop(&mut self) {
+        // Release any parked registration and disarm the global slot.
+        self.release();
+        *PENDING_LAUNCH_BARRIER
+            .lock()
+            .expect("pending launch barrier") = None;
+    }
+}
+
+#[cfg(test)]
+fn pending_launch_test_barrier(cwd: &Path) {
+    let armed = PENDING_LAUNCH_BARRIER
+        .lock()
+        .expect("pending launch barrier")
+        .as_ref()
+        .filter(|barrier| barrier.cwd == canonical(cwd))
+        .map(std::sync::Arc::clone);
+    if let Some(barrier) = armed {
+        barrier.park();
     }
 }
 /// Called when the cwd's LAST discovery window closes: no attribution decision
@@ -513,6 +656,16 @@ impl DiscoveryWindow {
             return;
         }
         self.released = true;
+        // c-usagefu r13 item 1: the refcount drop and the last-window effects
+        // (discoverer removal, prompt clear, closed-segment prune) are ONE
+        // critical section against a pending launch's registration. While this
+        // lock is held, register_pending_launch cannot sit between its
+        // lifetime insert and its window open, so this release is either
+        // genuinely the cwd's last window (the launching instance does not
+        // exist yet either) or it sees the launch's window and does not prune.
+        let _registration = LAUNCH_REGISTRATION
+            .lock()
+            .expect("codex launch registration");
         let mut map = OPEN_WINDOWS.lock().expect("codex discovery windows");
         let mut last_window = false;
         if let Some(entry) = map.get_mut(&self.key) {

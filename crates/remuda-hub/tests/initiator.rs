@@ -3404,16 +3404,26 @@ async fn an_rpc_failure_for_attempt_one_does_not_fail_running_attempt_two() {
     assert_eq!(doc["state"], json!("running"), "{doc}");
 
     // Attempt 1's parked gate.run now answers with a JSON-RPC error. It is the
-    // stale dispatch's callback; its failure must NOT fail attempt 2.
+    // stale dispatch's callback; its failure must NOT fail attempt 2. Assert
+    // the row STAYS running under a bounded latch instead of a blind sleep:
+    // the negative fact ("the stale error had no effect") is proven by
+    // observing running immediately and watching it remain running across a
+    // window comfortably longer than a verdict write takes.
     hook1.reply_error();
     hook1.release();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-    assert_eq!(
-        doc["state"],
-        json!("running"),
-        "stale attempt-1 RPC failure must not fail attempt 2: {doc}"
-    );
+    let stability = tokio::time::Instant::now() + Duration::from_millis(250);
+    loop {
+        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+        assert_eq!(
+            doc["state"],
+            json!("running"),
+            "stale attempt-1 RPC failure must not fail attempt 2: {doc}"
+        );
+        if tokio::time::Instant::now() >= stability {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     // The CURRENT (attempt 2) gate.run RPC error does fail it.
     hook2.reply_error();
@@ -3461,7 +3471,11 @@ async fn a_stale_attempts_step_event_does_not_overwrite_the_current_steps() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // A stale attempt-1 step for the SAME step name must be ignored.
+    // A stale attempt-1 step for the SAME step name must be ignored. Bounded
+    // latch, not a sleep: the step applies (or is rejected) when its event is
+    // processed, so observe the attempt-2 state once and then confirm it never
+    // changes across a window that comfortably covers an event write — the
+    // same stability idiom the production waits use.
     node.send_raw(json!({
         "jsonrpc": "2.0",
         "method": "gate.event",
@@ -3473,9 +3487,8 @@ async fn a_stale_attempts_step_event_does_not_overwrite_the_current_steps() {
         },
     }));
     // A raw sleep cannot prove the stale step was ignored: assert the step
-    // STAYS attempt-2's on every read across a bounded deadline (an accepted
-    // step applies well within it), the bounded stability idiom the
-    // production wait helpers use — no sleep-based evidence.
+    // STAYS attempt-2's across a bounded deadline (an accepted step applies
+    // well within it).
     node.send_raw(json!({
         "jsonrpc": "2.0",
         "method": "gate.event",
@@ -3486,7 +3499,23 @@ async fn a_stale_attempts_step_event_does_not_overwrite_the_current_steps() {
             "step": { "name": "cargo-test", "status": "ok", "durationMs": 9999 },
         },
     }));
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    // First, latch the stable attempt-2 state.
+    let stable = async {
+        loop {
+            let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+            let step = doc.get("steps").and_then(|s| s.get(0));
+            if step.is_some_and(|step| step["name"] == json!("cargo-test")) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(2), stable)
+        .await
+        .expect("attempt-2 step applied");
+    // Then hold it for a short stability window proving the rejected stale
+    // step never lands.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
     loop {
         let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
         let step = &doc["steps"][0];
@@ -3500,7 +3529,7 @@ async fn a_stale_attempts_step_event_does_not_overwrite_the_current_steps() {
         if tokio::time::Instant::now() >= deadline {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 

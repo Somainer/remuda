@@ -698,9 +698,13 @@ export class Outbox {
    * expiry recovery and must arm T2 itself — this wake is being cancelled and
    * the store schedules foreign leases only from flush/unload rearm, so
    * without the handoff the (possibly crashed) foreign claim stays inflight
-   * with no recovery clock. Fired only on the timer-discovery path: a refresh
-   * inside a flush reaches the store's own scheduleLeaseExpiryWakeup with the
-   * same durable snapshot.
+   * with no recovery clock. Fired on the timer-discovery path AND on snapshot
+   * reconciliation (gate 18 item 3: another tracked command's foreign
+   * replacement can be first seen while a different command's timer refreshes
+   * the durable set); on a store flush both this hook and the store's own
+   * scheduleLeaseExpiryWakeup see the same snapshot and arm the same deadline
+   * (armLeaseWakeup move-earlier-only dedups). The firing command itself is
+   * excluded on the timer path — its critical section owns that outcome.
    */
   onForeignLeaseHandoff: ((rec: OutboxRecord) => void) | null = null;
 

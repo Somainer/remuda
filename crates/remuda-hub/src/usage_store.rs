@@ -966,25 +966,81 @@ pub enum BudgetStatus {
     Stop,
 }
 
-/// c-usagefu r9 items 4/5: ONE shared eligible-FLOW relation by CALL
-/// identity, used by the rollup, both aggregates and the TPM windows.
+/// c-usagefu r10 Ruling B: ONE shared eligible-FLOW relation by CALL identity,
+/// used by the rollup, both aggregates and the TPM windows.
 ///
-/// Keep every Message row; keep a Turn row only when NO Message represents
-/// the same call (`message.turn_id = turn.scope_id`, same instance).
-/// Pre-r6 databases wrote both rows per codex call; per-instance gating hid
-/// an unrelated Turn-only call whenever the instance had ANY Message. A
-/// legacy NULL-scope_id Turn can never match a Message and is always kept.
-fn eligible_flow_predicate(outer: &str, matched: &str) -> String {
+/// Each native turn is counted EITHER from its Turn row OR from its Message
+/// rows, never both.
+///
+/// * A MODERN Message (`turn_id` present) represents the call once a Turn row
+///   for that turn exists; the Turn is then suppressed ([`turn_fully_covered_sql`]
+///   is tightened to a provably-COMPLETE equality check in item 5).
+/// * A LEGACY Message has no `turn_id` (pre-r6 wrote one Message + one Turn per
+///   call). It is counted only when NO Turn row covers its time window; where
+///   a covering Turn exists the Turn is counted and the legacy Message dropped
+///   (item 4).
+/// * A Turn row is counted only when its modern Messages do NOT represent the
+///   call. A legacy-covered turn therefore always counts (its Messages are the
+///   link-less legacy kind).
+fn eligible_flow_predicate(outer: &str) -> String {
+    let cover_linked =
+        turn_fully_covered_sql(&format!("{outer}.instance_id"), &format!("{outer}.turn_id"));
+    let cover_linked_turn = turn_fully_covered_sql(
+        &format!("{outer}.instance_id"),
+        &format!("{outer}.scope_id"),
+    );
     format!(
-        "({outer}.scope = 'message'
-            OR ({outer}.scope = 'turn' AND NOT EXISTS (
-                SELECT 1 FROM usage_events {matched}
-                WHERE {matched}.instance_id = {outer}.instance_id
-                  AND {matched}.scope = 'message'
-                  AND {matched}.turn_id = {outer}.scope_id
-            )))"
+        "(({outer}.scope = 'message' AND {outer}.turn_id IS NOT NULL
+            AND (
+                NOT EXISTS (
+                    SELECT 1 FROM usage_events _ef_t
+                    WHERE _ef_t.instance_id = {outer}.instance_id
+                      AND _ef_t.scope = 'turn'
+                      AND _ef_t.scope_id = {outer}.turn_id
+                )
+                OR ({cover_linked})
+            )
+         )
+         OR ({outer}.scope = 'message' AND {outer}.turn_id IS NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM usage_events _ef_lt
+                 WHERE _ef_lt.instance_id = {outer}.instance_id
+                   AND _ef_lt.scope = 'turn'
+                   AND datetime({outer}.observed_at)
+                       BETWEEN datetime(_ef_lt.observed_at,
+                                       '-{LEGACY_TURN_LOOKBACK_SECS} seconds')
+                           AND datetime(_ef_lt.observed_at,
+                                       '+{LEGACY_TURN_SLACK_SECS} seconds')
+             )
+         )
+         OR ({outer}.scope = 'turn' AND NOT ({cover_linked_turn})))"
     )
 }
+
+/// True when the turn `(inst, tid)` already has a modern linked Message
+/// representing it (a `message` row stamped with the turn id that carries a
+/// durable response-level `scope_id`). c-usagefu r10 item 5 tightens this to a
+/// PROVABLY COMPLETE equality check; item 4 only needs the linked existence
+/// rule so a modern Message/Turn pair still bills once while the legacy
+/// no-turn_id pairing is handled by the time-window branch above.
+fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
+    format!(
+        "EXISTS (
+            SELECT 1 FROM usage_events _fc_e
+            WHERE _fc_e.instance_id = {inst}
+              AND _fc_e.scope = 'message'
+              AND _fc_e.turn_id = {tid}
+              AND _fc_e.scope_id IS NOT NULL
+        )"
+    )
+}
+
+/// A response usage record is written DURING the turn, up to the whole turn
+/// duration before the end-of-turn Turn snapshot. Bound how far before a Turn
+/// row a link-less legacy Message may sit and still describe that same call.
+const LEGACY_TURN_LOOKBACK_SECS: i64 = 600;
+/// Small clock-skew slack after the Turn snapshot.
+const LEGACY_TURN_SLACK_SECS: i64 = 5;
 
 /// True when instance `instance_expr` has at least one eligible flow row
 /// (see [`eligible_flow_predicate`]). Legacy NULL-scope Turn rows count.
@@ -995,7 +1051,7 @@ fn has_eligible_flow_sql(instance_expr: &str) -> String {
             WHERE _ef_e.instance_id = {instance_expr}
               AND {}
         )",
-        eligible_flow_predicate("_ef_e", "_ef_m")
+        eligible_flow_predicate("_ef_e")
     )
 }
 
@@ -1005,7 +1061,7 @@ fn has_eligible_flow_sql(instance_expr: &str) -> String {
 fn flow_case_arm(column: &str) -> String {
     format!(
         "WHEN {} THEN {column}",
-        eligible_flow_predicate("usage_events", "_ef_c")
+        eligible_flow_predicate("usage_events")
     )
 }
 
@@ -1143,11 +1199,11 @@ fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate:
                    AND flow.scope != 'session'
                    AND {flow_cost})
          FROM usage_events WHERE {outer_predicate}",
-        flow_exists_f = eligible_flow_predicate("f", "fm"),
+        flow_exists_f = eligible_flow_predicate("f"),
         flow_total = flow_case_arm("total_tokens"),
         flow_input = flow_case_arm("input_tokens"),
         flow_output = flow_case_arm("output_tokens"),
-        flow_cost = eligible_flow_predicate("flow", "flowm"),
+        flow_cost = eligible_flow_predicate("flow"),
     )
 }
 
@@ -1283,7 +1339,7 @@ fn sum_turn_tokens_since(
              WHERE instance_id = ?1 AND observed_at >= ?2
                AND observed_at_source = 'native'
                AND {eligible}",
-            eligible = eligible_flow_predicate("usage_events", "_ef_w")
+            eligible = eligible_flow_predicate("usage_events")
         ),
         params![instance_id, since],
         |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2270,6 +2326,83 @@ mod tests {
             .unwrap();
         assert_eq!(count2, 1);
         assert_eq!(read_survivor(&conn), first, "re-migrating changes nothing");
+    }
+
+    /// Create a real pre-r6-schema usage_events table (all modern columns, no
+    /// dedupe indexes) so Ruling B regressions migrate an ACTUAL historical
+    /// database rather than inserting into an already-migrated one.
+    fn open_old_dual_schema() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                scope_id TEXT,
+                turn_id TEXT,
+                mode TEXT NOT NULL,
+                metric_revision INTEGER NOT NULL DEFAULT 1,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                observed_at_source TEXT NOT NULL DEFAULT 'ingest',
+                native_context_window INTEGER,
+                PRIMARY KEY (instance_id, seq)
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn legacy_message_without_turn_id_bills_the_covering_turn_once() {
+        // c-usagefu r10 item 4 (Ruling B): a pre-r6 codex call wrote a Message
+        // r1 = 100 with NO turn_id AND a Turn t1 = 100 covering its time
+        // window (the message is recorded 3 s before the end-of-turn snapshot).
+        // The call must count 100, not 200: the link-less legacy Message is
+        // dropped in favour of the covering Turn. A separate Turn-only call t2
+        // = 50 with no Message still counts, proving turn rows are not broadly
+        // suppressed.
+        let conn = open_old_dual_schema();
+        conn.execute_batch(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode,
+                 output_tokens, cost_usd, observed_at, observed_at_source,
+                 profile_id, model)
+             VALUES
+                ('ins_legacy', 1, 'message', 'r1', NULL, 'snapshot',
+                 100, '0.10', '2030-01-01T00:00:00.000Z', 'native',
+                 'pvp_legacy', 'gpt-5.4'),
+                ('ins_legacy', 2, 'turn', 't1', 't1', 'snapshot',
+                 100, '0.10', '2030-01-01T00:00:03.000Z', 'native',
+                 'pvp_legacy', 'gpt-5.4'),
+                ('ins_legacy', 3, 'turn', 't2', 't2', 'snapshot',
+                 50, '0.05', '2030-01-01T00:00:07.000Z', 'native',
+                 'pvp_legacy', 'gpt-5.4');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        let agg = aggregate_instance(&conn, "ins_legacy").unwrap();
+        assert_eq!(
+            agg.output_tokens, 150,
+            "covering Turn 100 (legacy Message dropped) + Turn-only 50"
+        );
+        assert!((agg.cost_usd - 0.15).abs() < 1e-9, "0.10 + 0.05, not 0.25");
+        let supply = aggregate_supply(&conn, "pvp_legacy", "gpt-5.4").unwrap();
+        assert_eq!(supply.output_tokens, 150);
+        assert!((supply.cost_usd - 0.15).abs() < 1e-9);
+        let rollup = rollup_fold(&conn, "ins_legacy", "codex", Some("gpt-5.4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_output_tokens, Some(150));
     }
 
     #[test]

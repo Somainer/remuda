@@ -1381,12 +1381,19 @@ async fn an_overflow_kill_reaches_the_child_through_a_held_live_handle() {
         .expect("the RunHandle reaches recv=None after close");
 }
 
-/// ma-sdk-state r14 item 2: when a RESERVATION admission trips the overflow,
-/// the shutdown runs in its OWN detached task. Aborting the triggering send
-/// while the shutdown is parked (seal done, kill held off by a contended live
-/// handle) must not cancel it: once the contention clears the flooding child
-/// is still killed and the terminal diagnostic is still published.
-#[tokio::test]
+/// ma-sdk-state r14 item 2, accepted schedule (ma-sdk-state r15 item 6): on a
+/// MULTI-THREAD runtime the abort must genuinely land on the triggering send
+/// WHILE the overflow shutdown is in progress.
+///
+/// The current-thread version only ever aborted an already-finished flooder:
+/// the breaching send spawns the shutdown synchronously and immediately
+/// returns the refusal error, so the shutdown task ran only after the send
+/// ended. Here the trigger send PARKS at a post-spawn barrier gate while the
+/// shutdown parks (sealed) at its pre-kill gate; the test acknowledges both
+/// parked points, aborts the send, and asserts the join reports a
+/// cancellation. The detached, launch-scoped shutdown then still kills the
+/// captured child and publishes the terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aborting_the_triggering_send_mid_overflow_shutdown_still_kills_and_publishes() {
     const ITEM_CAP: usize = 256;
     const BYTE_CAP: usize = 256 * 1024;
@@ -1407,58 +1414,70 @@ async fn aborting_the_triggering_send_mid_overflow_shutdown_still_kills_and_publ
         .expect("pid on the launch ack")
         .clone();
 
-    // Open every write/commit gate so tickets accumulate, then SHUT the
-    // detached shutdown's pre-kill gate (after release(), which opens it).
+    // Open write/commit gates; SHUT both the shutdown's pre-kill gate AND the
+    // triggering send's post-spawn refusal gate.
     let barrier = driver.arm_write_commit_barrier();
     barrier.release();
     barrier.hold_overflow_kill();
+    barrier.hold_overflow_refusal();
 
-    // Flood reservation tickets on a spawned task: the cap-breach send is the
-    // triggering future this test aborts mid-shutdown.
+    // Flood reservation tickets on a task on the OTHER worker.
     let d = driver.clone();
     let mut flooder = tokio::spawn(async move {
         for n in 0..4_000usize {
-            let id = format!("msg-r14-2-{n}");
+            let id = format!("msg-r15-6-{n}");
             if d.send(prompt_id("silent turn", &id)).await.is_err() {
                 break;
             }
         }
     });
 
-    // The detached shutdown sealed admission and parked at the pre-kill gate.
+    // The shutdown sealed admission and parked at its pre-kill gate — it is
+    // genuinely in progress.
     barrier
         .wait_until_overflow_kill_gate_parked(Duration::from_secs(20))
         .await;
+    // The TRIGGER SEND spawned it and is now parked BEFORE returning its
+    // error — so aborting the flooder lands on a live, in-flight send rather
+    // than on a finished one.
+    barrier
+        .wait_until_overflow_refusal_parked(1, Duration::from_secs(20))
+        .await;
 
-    // Contend the kill with a held live handle, exactly like the old r13
-    // item-3 fixture: with the launch-scoped captured-pid kill the handle is
-    // now irrelevant, but keeping it held proves the kill does not read it.
+    // Keep the kill target's live handle held through the abort, too: the
+    // launch-scoped kill must reach the captured pid without it (r15 item 1).
     let live_hold = driver
         .bounded_hold_live_for_test(Duration::from_secs(5))
         .await;
 
-    // ABORT THE TRIGGERING SEND (and the whole flood) while the shutdown is
-    // sealed-but-before-kill. With the r13 inline-await shape this cancelled
-    // the kill and the terminal publication with it.
+    // ABORT while both tasks are parked mid-shutdown. The join must report a
+    // real cancellation landing at the send's post-spawn await.
     flooder.abort();
-    let _ = wait_bounded(&mut flooder, Duration::from_secs(5), "the aborted flooder").await;
+    let join = wait_bounded(&mut flooder, Duration::from_secs(5), "the aborted flooder")
+        .await
+        .expect("the bounded join itself completed")
+        .expect_err("the flooder task was aborted, so its inner result is a JoinError");
+    assert!(
+        join.is_cancelled(),
+        "the abort landed on the in-flight triggering send: {join:?}"
+    );
     assert!(
         process_alive(&pid),
-        "the child is still alive while the shutdown parks at the pre-kill gate"
+        "the child stays alive while the shutdown parks at the pre-kill gate"
     );
 
-    // Release the shutdown into its kill: it reaches the captured pid THROUGH
-    // the still-held live handle, rather than waiting for it.
+    // Release the parked send (no task waits anymore) and then the shutdown:
+    // it reaches the captured pid THROUGH the still-held live handle.
+    barrier.release_overflow_refusal();
     barrier.release_overflow_kill();
     wait_child_gone_or_zombie(&pid, Duration::from_secs(15)).await;
     drop(live_hold);
 
-    // The detached shutdown survived the abort: the terminal diagnostic is
-    // published after the kill.
+    // The detached shutdown survived the genuine mid-flight abort: the
+    // terminal diagnostic is published after the kill.
     barrier
         .wait_until_backlog_overflow(Duration::from_secs(20))
         .await;
-    wait_child_gone_or_zombie(&pid, Duration::from_secs(15)).await;
 
     let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
         seen.iter().any(|o| {
@@ -1475,7 +1494,7 @@ async fn aborting_the_triggering_send_mid_overflow_shutdown_still_kills_and_publ
                 .and_then(|r| r.get("reason"))
                 .is_some_and(|reason| reason == "publication_backlog_overflow")
         })
-        .expect("the aborted triggering send still publishes the overflow terminal");
+        .expect("the genuinely-aborted triggering send still publishes the overflow terminal");
     assert_eq!(lifecycle_status(terminal), Some("failed"));
 
     drop(barrier);

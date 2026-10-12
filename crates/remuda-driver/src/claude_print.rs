@@ -1987,6 +1987,12 @@ async fn prepare_prompt_write(
                 frame_bytes,
                 carrier,
             );
+            // ma-sdk-state r15 item 6 (test-stub): park the triggering send
+            // HERE, with the spawned shutdown known to be in progress, so a
+            // test can abort THIS future mid-shutdown (on a multi-thread
+            // runtime the abort lands at this await). Open by default.
+            #[cfg(feature = "test-stub")]
+            test_barrier::hold_after_overflow_spawn(&inner.barrier).await;
             return Err(DriverError::ControlUnavailable);
         }
     });
@@ -3187,6 +3193,12 @@ pub mod test_barrier {
         /// acknowledgement fence knowing the reader will no longer insert a
         /// terminal job ahead of it.
         reader_finished_after_refusal: AtomicBool,
+        /// ma-sdk-state r15 item 6: number of triggering sends parked on the
+        /// post-spawn overflow-refusal gate (the shutdown is in progress
+        /// while the send waits here — the exact point an abort must land).
+        overflow_refusal_parked_count: AtomicUsize,
+        overflow_refusal_gate_open: AtomicBool,
+        overflow_refusal_gate: tokio::sync::Notify,
     }
 
     /// An armed write-commit barrier. Releases on drop.
@@ -3244,6 +3256,10 @@ pub mod test_barrier {
             closed_frame_refusals: AtomicUsize::new(0),
             overflow_frame_refusals: AtomicUsize::new(0),
             reader_finished_after_refusal: AtomicBool::new(false),
+            // r15 item 6: post-spawn overflow-refusal gate.
+            overflow_refusal_parked_count: AtomicUsize::new(0),
+            overflow_refusal_gate_open: AtomicBool::new(true),
+            overflow_refusal_gate: tokio::sync::Notify::new(),
         });
         *slot.lock().expect("barrier lock") = Some(state.clone());
         WriteCommitBarrier { state }
@@ -3464,6 +3480,28 @@ pub mod test_barrier {
             state.emit_waiting_count.fetch_add(1, Ordering::AcqRel);
             state.state_changed.notify_waiters();
         }
+    }
+
+    /// ma-sdk-state r15 item 6 gate: park the TRIGGER SEND right after it
+    /// spawned the overflow shutdown and before the refusal error returns, so
+    /// the send task is provably alive while the shutdown is in progress and
+    /// aborting it genuinely lands mid-shutdown. Open by default.
+    pub(super) async fn hold_after_overflow_spawn(slot: &Slot) {
+        let Some(state) = current(slot) else {
+            return;
+        };
+        state
+            .overflow_refusal_parked_count
+            .fetch_add(1, Ordering::AcqRel);
+        state.state_changed.notify_waiters();
+        if state.overflow_refusal_gate_open.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = state.overflow_refusal_gate.notified();
+        if state.overflow_refusal_gate_open.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
     }
 
     /// ma-sdk-state r14 item 2 gate: park the detached overflow shutdown
@@ -3817,6 +3855,50 @@ pub mod test_barrier {
                 deadline,
                 |state| state.overflow_kill_waiting.load(Ordering::Acquire),
                 || "write_commit barrier: timed out waiting for the overflow kill to                     contend on the live handle".to_owned(),
+            )
+            .await;
+        }
+
+        /// ma-sdk-state r15 item 6: SHUT the gate at which the triggering send
+        /// parks after spawning the overflow shutdown, so the abort lands on a
+        /// genuinely in-flight send while the shutdown is running.
+        pub fn hold_overflow_refusal(&self) {
+            self.state
+                .overflow_refusal_parked_count
+                .store(0, Ordering::Release);
+            self.state
+                .overflow_refusal_gate_open
+                .store(false, Ordering::Release);
+        }
+
+        /// Release a send parked on the post-spawn refusal gate.
+        pub fn release_overflow_refusal(&self) {
+            if !self
+                .state
+                .overflow_refusal_gate_open
+                .swap(true, Ordering::AcqRel)
+            {
+                self.state.overflow_refusal_gate.notify_waiters();
+            }
+        }
+
+        /// Wait until `n` triggering sends are parked after spawning the
+        /// overflow shutdown (the shutdown itself is acknowledged in progress
+        /// separately via the pre-kill gate).
+        pub async fn wait_until_overflow_refusal_parked(&self, n: usize, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            wait_until_with(
+                &self.state,
+                deadline,
+                move |state| {
+                    state.overflow_refusal_parked_count.load(Ordering::Acquire) >= n
+                        && !state.overflow_refusal_gate_open.load(Ordering::Acquire)
+                },
+                || {
+                    "write_commit barrier: timed out waiting for the triggering send to park \
+                     after spawning the overflow shutdown"
+                        .to_owned()
+                },
             )
             .await;
         }

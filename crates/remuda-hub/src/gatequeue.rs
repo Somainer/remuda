@@ -1223,6 +1223,23 @@ pub(crate) async fn apply_result(
         barrier.note_completed();
         return;
     }
+    // r13 item 5: a granted land child that hit its budget reports UNCERTAIN —
+    // its group is terminated on the Node, but the remote may already have taken
+    // the ref. Never turn that into Failed/landed from the verdict: keep the
+    // Landing occupancy and let the bounded remote probe establish the truth
+    // (immediate forced pass if the lane is connected, else on reconnect).
+    if existing.state == GateJobState::Landing && result.status == "uncertain" {
+        tracing::info!(
+            job_id,
+            "land reported uncertain after its timeout; leaving Landing for remote reconciliation"
+        );
+        if let Some(host) = landing_lane_host(state, &existing).await {
+            schedule_landing_reconcile(state, Some(host.as_id().to_string()));
+        }
+        #[cfg(any(test, feature = "test-faults"))]
+        barrier.note_completed();
+        return;
+    }
     // Test-only pre-read barrier: park here (row confirmed live + generation
     // matched) so two real arrivals can be held simultaneously.
     #[cfg(any(test, feature = "test-faults"))]
@@ -1337,6 +1354,11 @@ pub(crate) async fn apply_result(
                         ?grant_session_u64,
                         "dropping Landing verdict in writer from a non-granted session"
                     );
+                    return None;
+                }
+                // r13 item 5: uncertain never moves the Landing; the remote
+                // reconciler settles it.
+                if result.status == "uncertain" {
                     return None;
                 }
                 for step in &result.steps {

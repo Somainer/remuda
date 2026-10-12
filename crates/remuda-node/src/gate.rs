@@ -1676,24 +1676,37 @@ impl DevNode {
             };
             match land_outcome {
                 Err(()) => {
-                    // The budget expired: kill the whole land process group so
-                    // the CAS push cannot complete after this verdict, then
-                    // reap the child. Reporting failed is now honest — the
-                    // force-with-lease push is a single atomic ref update that
-                    // cannot have landed from a killed group.
+                    // The budget expired. Terminate the WHOLE land group
+                    // synchronously (TERM, bounded wait, KILL, reap) before
+                    // reporting, so a SIGTERM-ignoring git/ssh descendant cannot
+                    // keep pushing after this verdict. Even then, the remote may
+                    // already have accepted the ref before the client hung, so
+                    // the outcome is reported UNCERTAIN — never "failed": the
+                    // Hub keeps the Landing row and reconciles against the exact
+                    // granted merge on the remote (r13 item 5).
                     #[cfg(unix)]
-                    if let Some(pgid) = land_pgid {
-                        kill_group(pgid);
+                    {
+                        if let Some(pgid) = land_pgid {
+                            tokio::task::spawn_blocking(move || terminate_group(pgid))
+                                .await
+                                .ok();
+                        }
+                        // Reap the land leader (a SIGKILL'd zombie otherwise).
+                        let _ = land_child.wait().await;
                     }
-                    let _ = land_child.kill().await;
-                    let _ = land_child.wait().await;
-                    result.status = "failed".into();
+                    #[cfg(not(unix))]
+                    {
+                        let _ = land_child.kill().await;
+                        let _ = land_child.wait().await;
+                    }
+                    result.status = "uncertain".into();
                     result.error = Some(format!(
-                        "land exceeded {}s; killed land process group",
+                        "land exceeded {}s; terminated the land process group; push outcome \
+                         unknown (the Hub reconciles against the remote)",
                         land_budget.as_secs()
                     ));
                     result.reason = Some(format!(
-                        "land timed out after {}s and was killed",
+                        "land timed out after {}s; push outcome uncertain",
                         land_budget.as_secs()
                     ));
                 }
@@ -2357,13 +2370,91 @@ fn git_output(repo: &Path, args: &[&str]) -> Result<String, String> {
 
 #[cfg(unix)]
 fn kill_group(pgid: i32) {
+    // Cancel path: best-effort TERM; completion is awaited by the caller's
+    // child.wait(). The synchronous bounded version is terminate_group().
     use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
     let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(500));
-        let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
-    });
+}
+
+/// Bounded grace a land child's process group gets to exit after SIGTERM
+/// before SIGKILL. Short enough that a timed-out land returns promptly, long
+/// enough for a well-behaved git/ssh to finish a clean shutdown.
+#[cfg(unix)]
+const LAND_GROUP_TERM_GRACE: Duration = Duration::from_millis(750);
+
+/// Pids currently alive (non-zombie) whose process group is `pgid` (Linux
+/// /proc enumeration). An empty Vec means none running; on a platform without
+/// /proc it returns empty ("cannot tell").
+#[cfg(unix)]
+pub(crate) fn alive_pids_in_group(pgid: i32) -> Vec<i32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+        // /proc/<pid>/stat: after the comm field '(…)', field 1 is state and
+        // field 3 is the process group. comm may contain spaces/parens, so
+        // split from the last ')'.
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+            continue;
+        };
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        let state = fields.first().copied().unwrap_or("");
+        let pgrp = fields.get(2).and_then(|v| v.parse::<i32>().ok());
+        if pgrp == Some(pgid) && state != "Z" {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// Terminate a whole land process group SYNCHRONOUSLY: SIGTERM the group,
+/// boundedly wait for every non-zombie member (including a git/ssh descendant)
+/// to exit, then SIGKILL the survivors. The caller reaps its own leader after
+/// this returns (a killed leader is a zombie until that wait). r13 item 5 — a
+/// detached 500 ms KILL used to leave a SIGTERM-ignoring descendant free to
+/// keep pushing while the Node reported a verdict.
+#[cfg(unix)]
+fn terminate_group(pgid: i32) {
+    use nix::sys::signal::{Signal, kill, killpg};
+    use nix::unistd::Pid;
+    let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
+    let deadline = Instant::now() + LAND_GROUP_TERM_GRACE;
+    let mut survivors = Vec::new();
+    while Instant::now() < deadline {
+        survivors = alive_pids_in_group(pgid);
+        if survivors.is_empty() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for pid in survivors {
+        let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+    // Give the kernel a beat to bury the SIGKILL'd (non-zombie) members; the
+    // land leader itself is reaped by the caller's child.wait().
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < deadline && !alive_pids_in_group(pgid).is_empty() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Test-only accessor for the process-group liveness scan (r13 item 5).
+#[cfg(unix)]
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub fn gate_test_alive_pids_in_group(pgid: i32) -> Vec<i32> {
+    alive_pids_in_group(pgid)
 }
 
 #[cfg(test)]

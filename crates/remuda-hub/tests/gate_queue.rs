@@ -39,6 +39,10 @@ struct RunSpec {
     /// When set with `land_grant`, the run parks AFTER verify and BEFORE it
     /// asks for the grant, while the test reconnects the carrier session.
     hold_before_grant: bool,
+    /// When set with `land_grant`, after the grant the run returns an
+    /// `uncertain` verdict (its land group was killed on timeout; the remote may
+    /// still have the ref). The Hub must keep Landing and reconcile remotely.
+    uncertain_after_grant: bool,
     /// When set with `land_grant`, the run parks AFTER the grant is granted
     /// (the row is Landing) and before it returns the landed verdict, until
     /// `landing_hold` is released — so a test can assert a second job is not
@@ -71,6 +75,7 @@ impl Default for RunSpec {
             hold_before_grant: false,
             hold_while_landing: false,
             rpc_error_after_grant: false,
+            uncertain_after_grant: false,
         }
     }
 }
@@ -553,6 +558,11 @@ async fn run_one_inline(
         if answer.get("granted").and_then(Value::as_bool) != Some(true) {
             // A refused grant means the real Node never pushes.
             status = "canceled";
+        } else if spec.uncertain_after_grant {
+            // The land group was killed on timeout: report uncertain (the
+            // remote may already hold the ref). The socket stays up to answer
+            // the Hub's read-only reconcile probe.
+            status = "uncertain";
         } else if spec.hold_while_landing {
             // The row is now Landing; park before the landed verdict. Keep
             // pumping the carrier while parked: a real Node's land child runs
@@ -2372,5 +2382,66 @@ async fn rpc_loss_after_grant_with_carrier_still_up_schedules_landing_reconcile(
     );
     // The run sent exactly one land grant (nothing was re-run/re-pushed).
     assert_eq!(ctx.scripts[0].grant_answers.lock().unwrap().len(), 1);
+    Ok(())
+}
+
+/// r13 item 5: a granted land child that hit its budget reports `uncertain`
+/// after its process group was fully terminated. The Hub must NOT turn that
+/// into failed (the remote could already hold the ref): it keeps the Landing
+/// occupancy and the forced reconcile probes the live lane for the exact merge
+/// and settles landed. The periodic reconciler is throttled beyond the test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uncertain_land_timeout_keeps_landing_and_reconciles_to_landed() -> Result<()> {
+    let ctx = Ctx::spawn_with_config(
+        1,
+        |_| {},
+        |cfg| {
+            cfg.gate_landing_recovery_ms = 1;
+            cfg.gate_landing_probe_interval_ms = 60_000;
+        },
+    )
+    .await?;
+    *ctx.scripts[0].resolve_landing_reply.lock().unwrap() = Some(json!({
+        "jobId": "ignored",
+        "status": "landed",
+        "baseSha": "5555555555555555555555555555555555555555"
+    }));
+    ctx.scripts[0].script(
+        "wt/land/uncertain-timeout",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("5555555555555555555555555555555555555555"),
+            merge_ref: Some("refs/remuda/gate/uncertain"),
+            land_grant: true,
+            uncertain_after_grant: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/uncertain-timeout","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap().to_owned();
+
+    // The uncertain verdict must not settle failed; the forced probe lands it.
+    let settled = ctx.wait_state(&id, &["landed", "failed"]).await;
+    assert_eq!(
+        settled["state"], "landed",
+        "uncertain must reconcile, not fail: {settled}"
+    );
+    assert!(
+        !ctx.scripts[0].resolve_calls.lock().unwrap().is_empty(),
+        "the uncertain verdict must trigger a remote probe"
+    );
+    let actions = ctx.hub.test_gate_audit_actions(&id).await?;
+    assert_eq!(
+        actions.iter().filter(|a| *a == "gate.landed").count(),
+        1,
+        "{actions:?}"
+    );
+    assert_eq!(
+        actions.iter().filter(|a| *a == "gate.failed").count(),
+        0,
+        "{actions:?}"
+    );
     Ok(())
 }

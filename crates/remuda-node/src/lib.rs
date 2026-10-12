@@ -139,6 +139,11 @@ pub use gate::GateRunHold;
 /// Land-grant answer type used by the durable daemon authorizer and tests.
 #[doc(hidden)]
 pub use gate::LandGrantAnswer as GateLandGrantAnswer;
+/// Test-only: pids still alive in a process group (r13 item 5 kill/reap test).
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+#[cfg(unix)]
+pub use gate::gate_test_alive_pids_in_group;
 pub use remuda_signal::hook_silence::{
     HookSilenceProbes, HookSilenceReason, classify as classify_hook_silence,
     diagnose as diagnose_hook_silence, link_fresh as hook_link_fresh,

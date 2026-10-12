@@ -610,10 +610,13 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
     // come with and never rewrites the turn clock (c-ctxusage r14 item 4).
     if !reports_counters {
         if row.cost_usd.is_some() && row.cost_usd != stored.cost_usd {
+            // The bill alone is corrected; the ingestion seq advances to the
+            // billing event, but counters, the revision watermark and the turn
+            // clock are all untouched.
             conn.execute(
-                "UPDATE usage_events SET cost_usd = ?1
-                 WHERE instance_id = ?2 AND scope = 'turn' AND scope_id = ?3",
-                params![row.cost_usd, row.instance_id, row.scope_id],
+                "UPDATE usage_events SET seq = ?1, cost_usd = ?2
+                 WHERE instance_id = ?3 AND scope = 'turn' AND scope_id = ?4",
+                params![row.seq, row.cost_usd, row.instance_id, row.scope_id],
             )?;
             return Ok(true);
         }

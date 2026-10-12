@@ -948,7 +948,7 @@ export class Outbox {
     const full: OutboxRecord = { attempts: 0, state: "pending", ...rec };
     await this.storage.put(full);
     this.cache.set(full.commandId, full);
-    this.reconcileFromCache();
+    await this.reconcileFromDurable();
     this.emit();
     return full;
   }
@@ -967,10 +967,11 @@ export class Outbox {
     const stored = await this.storage.mergeUnlessDone(commandId, patch);
     if (!stored) return null;
     this.cache.set(commandId, stored);
-    // Re-judge every wake from the just-committed state (terminal cancels the
-    // deadline wake, held hands it to the held-retry clock, a fresh lease
-    // adopts the new deadline) through the ONE central function.
-    this.reconcileFromCache();
+    // Re-judge every wake from an AUTHORITATIVE snapshot after the just-
+    // committed write (terminal cancels the deadline wake, held hands it to
+    // the held-retry clock, a fresh lease adopts the new deadline) through the
+    // ONE central function — never from the local cache merge.
+    await this.reconcileFromDurable();
     this.emit();
     return stored;
   }
@@ -978,7 +979,7 @@ export class Outbox {
   async remove(commandId: Id) {
     await this.storage.delete(commandId);
     this.cache.delete(commandId);
-    this.reconcileFromCache();
+    await this.reconcileFromDurable();
     this.emit();
   }
 
@@ -1166,15 +1167,26 @@ export class Outbox {
    * reconciliation arms nothing for it — even when its lease owner equals
    * this persisted recovery owner (a cloned sibling shares that id).
    */
+  /**
+   * Mark a command as being actively delivered BY THIS document (store calls
+   * this right after winning its claim, for the duration of the POST). The
+   * active POST is that row's in-flight guarded delivery, so the central
+   * reconciliation arms nothing for it — even when its lease owner equals
+   * this persisted recovery owner (a cloned sibling shares that id). No
+   * reconciliation runs from the cache here: the claim patch and the finish
+   * patch each reconcile from an AUTHORITATIVE durable snapshot (gate 21
+   * item 2), which is when the active flag is observed.
+   */
   beginActiveDelivery(commandId: Id) {
     this.activeDeliveries.add(commandId);
-    this.reconcileFromCache();
   }
 
-  /** The live delivery finished (or was skipped after claim) — reconcile anew. */
+  /**
+   * The live delivery finished (or was skipped after claim). The finish patch
+   * already re-judged authoritatively, so this only clears the active marker.
+   */
   endActiveDelivery(commandId: Id) {
     this.activeDeliveries.delete(commandId);
-    this.reconcileFromCache();
   }
 
   isDeliveryActive(commandId: Id): boolean {
@@ -1196,15 +1208,14 @@ export class Outbox {
   }
 
   /**
-   * A lease/delivery wake fired. Read the AUTHORITATIVE durable set UNDER the
-   * instance lock (every reconciliation takes the same critical section so a
-   * live sibling's committed write is visible), re-apply the central policy
-   * for every tracked row, then settle the FIRING command from its FRESH
-   * decision:
-   *  - deliver:  hand the store one guarded delivery trigger;
-   *  - deadline: adopt the renewed/replaced/rolled-back lease deadline;
-   *  - held:     the store's held-retry clock is the only allowed timer;
-   *  - quiet/missing: nothing.
+   * A lease/delivery wake fired. Take the instance lock and read the
+   * AUTHORITATIVE durable snapshot; the CENTRAL reconciliation settles every
+   * row — including the firing row's live-lease deadline (the timer path
+   * never arms a lease directly, c-reconnfu gate 21 item 2). The firing
+   * command's own handoff is decided from the same snapshot:
+   *  - deliver: hand the store one guarded delivery trigger;
+   *  - held:    the store's held-retry clock is the only allowed timer;
+   *  - deadline/quiet/missing: the table already armed/cancelled it.
    * A failed read or lock never ends recovery in silence: the bounded,
    * lifetime-aware read-retry ends in the same central reconciliation.
    */
@@ -1212,14 +1223,12 @@ export class Outbox {
     if (this.disposed || this.unloading) return;
     let durable: OutboxRecord[];
     try {
-      // The fire's critical section is an AUTHORITATIVE read for EVERY row:
-      // the reconciliation below guarantees each other deliverable row a
-      // 0 ms delivery wake, each live lease its deadline wake, each held row
-      // its held-retry clock. The firing command alone is exempt from that
-      // pass — its fresh decision settles it further down.
-      durable = await this.runUnderInstanceLock(instanceId, () =>
-        this.readAndReconcile(commandId),
-      );
+      await this.runUnderInstanceLock(instanceId, async () => {
+        durable = await this.readDurable();
+        if (!this.disposed && !this.unloading) {
+          this.applyLeaseWakeReconcile(durable, { firingCommandId: commandId });
+        }
+      });
     } catch {
       // The lock request itself failed (deadlock/SecurityError) or its read
       // rejected: the bounded read-retry keeps recovery responsibility and
@@ -1228,7 +1237,7 @@ export class Outbox {
       return;
     }
     if (this.disposed || this.unloading) return;
-    const current = durable.find((r) => r.commandId === commandId);
+    const current = durable!.find((r) => r.commandId === commandId);
     if (!current) return; // missing: the reconciliation already dropped it
     const decision = leaseWakeDecision(current, {
       now: Date.now(),
@@ -1241,22 +1250,9 @@ export class Outbox {
       this.onClaimWake?.();
       return;
     }
-    if (decision.kind === "deadline" && decision.lease) {
-      // Renewed by its owner, replaced with another owner's claim, or still
-      // fresh after a clock rollback: adopt the AUTHORITATIVE deadline
-      // (0 ms when already overdue, failures reset) and never steal a fresh
-      // lease — the in-lock read at the next fire re-judges.
-      this.armLeaseWake(commandId, instanceId, {
-        kind: "lease",
-        lease: decision.lease,
-        failures: 0,
-        at: decision.lease.until,
-      });
-      return;
-    }
     if (decision.kind === "held") this.onHeldLease?.(decision.instanceId);
-    // quiet: nothing — the snapshot reconciliation already cancelled or
-    // re-armed every OTHER tracked wake.
+    // deadline: the central read above adopted the authoritative lease wake;
+    // quiet/missing: it cancelled the wake — nothing else to do.
   }
 
   /** Read durable rows into the storage-first cache; no other side effect. */
@@ -1284,9 +1280,19 @@ export class Outbox {
       isActiveDelivery: (id) => this.activeDeliveries.has(id),
     });
     const byId = new Map(decisions.map((d) => [d.commandId, d]));
+    // The FIRING row settles itself when its decision is deliver/held (its
+    // fire hands off to the guarded flush / held-retry clock below), so the
+    // table must not also arm a duplicate wake for it. A firing row with a
+    // live/renewed lease IS armed here: the timer path never arms a lease
+    // directly (c-reconnfu gate 21 item 2).
+    const firingSettlesItself = (id: Id) => {
+      if (id !== opts.firingCommandId) return false;
+      const k = byId.get(id)?.kind;
+      return k === "deliver" || k === "held";
+    };
     // Reconcile EXISTING wakes against the fresh decisions.
     for (const [id, entry] of [...this.leaseWakeups]) {
-      if (id === opts.firingCommandId) continue; // its own fire settles it
+      if (firingSettlesItself(id)) continue;
       const d = byId.get(id);
       if (!d || d.kind === "quiet") {
         this.cancelLeaseWake(id);
@@ -1331,7 +1337,7 @@ export class Outbox {
     }
     // Discover rows with no wake yet.
     for (const d of decisions) {
-      if (d.commandId === opts.firingCommandId) continue;
+      if (firingSettlesItself(d.commandId)) continue;
       if (this.leaseWakeups.has(d.commandId)) continue;
       if (d.kind === "deadline" && d.lease) {
         this.armLeaseWake(d.commandId, d.instanceId, {
@@ -1372,22 +1378,22 @@ export class Outbox {
     });
   }
 
-  /** Re-apply the central policy from the storage-first cache (after a write). */
-  private reconcileFromCache() {
+  /**
+   * Re-apply the CENTRAL policy from an AUTHORITATIVE durable snapshot (gate
+   * 21 item 2): a wake decision must never be based on the local write-through
+   * cache, which can carry rows a sibling deleted/finished or miss a
+   * committed write. Individual writes therefore re-read durable storage and
+   * reconcile from that; the snapshot is not merged with stale cache rows.
+   */
+  private async reconcileFromDurable(): Promise<void> {
     if (this.disposed) return;
-    this.applyLeaseWakeReconcile([...this.cache.values()]);
+    await this.refreshDurable();
   }
 
-  /** Authoritative read + central reconcile (store flush, rearm, tests). */
+  /** Authoritative read + central reconcile (store flush, timer, writes). */
   async refreshDurable(): Promise<OutboxRecord[]> {
-    return await this.readAndReconcile();
-  }
-
-  private async readAndReconcile(firingCommandId?: Id): Promise<OutboxRecord[]> {
     const durable = await this.readDurable();
-    if (!this.disposed && !this.unloading) {
-      this.applyLeaseWakeReconcile(durable, { firingCommandId });
-    }
+    if (!this.disposed && !this.unloading) this.applyLeaseWakeReconcile(durable);
     return durable;
   }
 

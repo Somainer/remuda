@@ -687,6 +687,91 @@ describe("Outbox", () => {
     }
   });
 
+  it("GATE21 item 2: a write-triggered reconciliation uses the AUTHORITATIVE durable snapshot, not the local cache — a sibling-finished row loses its wake", async () => {
+    // Two real Outboxes share one durable backend. X and Y are A's fresh
+    // inflight claims on two instances (deadline wakes at 30 s/60 s, so no
+    // timer fires during the test). B finishes X through its REAL write flow.
+    // A then writes Y: pre-gate-21 the write re-reconciled from A's LOCAL
+    // cache (which never saw B's commit and kept X inflight), so X's deadline
+    // wake survived a row that no longer existed in storage. Writes must
+    // reconcile only from a fresh authoritative snapshot — X's wake is
+    // cancelled while Y keeps exactly one.
+    vi.useFakeTimers();
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: { locks: undefined },
+    });
+    try {
+      const owner = "owner_g21_item2";
+      const store = new MemStorage();
+      const now = Date.now();
+      const px = store.put(
+        rec({
+          commandId: "cmd_g21_item2_x",
+          instanceId: "ins_g21_item2_x",
+          state: "inflight",
+          attempts: 1,
+          createdAt: now - 2_000,
+          lease: { owner, until: now + 30_000 },
+        }),
+      );
+      const py = store.put(
+        rec({
+          commandId: "cmd_g21_item2_y",
+          instanceId: "ins_g21_item2_y",
+          state: "inflight",
+          attempts: 1,
+          createdAt: now - 1_000,
+          lease: { owner, until: now + 60_000 },
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await px;
+      await py;
+
+      const a = await Outbox.load(store, owner);
+      const b = await Outbox.load(store, owner);
+      await a.refreshDurable(); // the store's boot reconciliation
+      expect(a.pendingLeaseWakeups().sort()).toEqual(["cmd_g21_item2_x", "cmd_g21_item2_y"].sort());
+
+      // B's real delivery flow finishes X (sibling commit). A's cache is not
+      // told and no A timer fires inside this window.
+      const bPatch = b.patch("cmd_g21_item2_x", {
+        state: "sent",
+        gotResponse: true,
+        lease: undefined,
+      });
+      await vi.advanceTimersByTimeAsync(5);
+      await bPatch;
+      expect(store.map.get("cmd_g21_item2_x")?.state).toBe("sent");
+      expect(a.pendingLeaseWakeups()).toContain("cmd_g21_item2_x"); // stale until A re-reads
+      expect(a.pendingLeaseWakeups()).toContain("cmd_g21_item2_y");
+
+      // A writes Y through its REAL patch flow (storage-first write +
+      // reconciliation). The post-write reconciliation is authoritative:
+      // X's phantom wake is cancelled; Y keeps its one deadline wake.
+      const aPatch = a.patch("cmd_g21_item2_y", {
+        state: "sent",
+        gotResponse: true,
+        lease: undefined,
+      });
+      await vi.advanceTimersByTimeAsync(5);
+      await aPatch;
+      expect(a.pendingLeaseWakeups().filter((id) => id === "cmd_g21_item2_x")).toEqual([]);
+      expect(a.pendingLeaseWakeups().filter((id) => id === "cmd_g21_item2_y")).toEqual([]);
+
+      // Far past both old deadlines: no phantom wake ever comes back.
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(a.pendingLeaseWakeups()).toEqual([]);
+      a.dispose();
+      b.dispose();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
   it("GATE12 item 2 (gate 20): a one-shot durable-read failure at the deadline retries bounded and still delivers", async () => {
     // A rejected fire read enters the bounded read-retry chain; the 250 ms
     // retry succeeds, the central reconciliation arms the 0 ms delivery wake

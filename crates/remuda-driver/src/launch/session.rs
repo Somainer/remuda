@@ -237,6 +237,16 @@ impl HookSession {
         self.bus.turn_active(pid)
     }
 
+    /// Test-only: the per-instance hook credential carried in the materialized
+    /// child environment. Lets an in-crate test emit a REAL SessionStart on the
+    /// session's hook socket as the resumed codex process would, on hosts where
+    /// reading `/proc/<pid>/environ` is restricted by ptrace policy.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn test_hook_credential(&self) -> Option<String> {
+        self.shims.env.get("REMUDA_HOOK_CREDENTIAL").cloned()
+    }
+
     /// Wall-clock time of the newest hook record from the exact foreground
     /// agent, when one exists. The promotion poller bounds its hook guard by
     /// this so a stalled hook channel cannot pin the screen to `working`.

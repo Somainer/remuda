@@ -53,6 +53,8 @@ pub mod keys;
 pub mod launch;
 pub mod lifecycle;
 mod promotion;
+#[cfg(test)]
+mod resume_gap_test;
 pub mod send;
 
 pub use launch::{AgentLaunch, CARRIER_ENV, Target, native_carrier_enabled};

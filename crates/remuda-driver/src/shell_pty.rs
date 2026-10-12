@@ -484,6 +484,15 @@ pub struct ShellPtyDriver {
     /// ends it early. None for shells, grok and promoted attaches (the
     /// promotion poller owns the promoted unknown-boundary cohort).
     codex_lifetime: Mutex<Option<crate::adapters::codex_discovery::LifetimeGuard>>,
+    /// c-usagefu r12 item 1 (Ruling A2'): OWNER guards of every promoted-codex
+    /// census interval the promotion poller registers, owned by the
+    /// DRIVER/SESSION rather than by the poller or foreground detection. The
+    /// poller only pushes; a demotion never closes. The driver drains the vec
+    /// in close() and closes every interval only after the stop ladder
+    /// confirms the process group terminated (or forgets them on a
+    /// stop-incomplete survivor so the safety-net Drop cannot lie).
+    promoted_codex_lifetimes:
+        Arc<std::sync::Mutex<Vec<crate::adapters::codex_discovery::LifetimeGuard>>>,
     /// Recipe from the last start, reused by [`Driver::close`] to journal what
     /// it stopped and by the Node to audit what was launched.
     recipe: std::sync::Mutex<Option<LaunchRecipe>>,
@@ -545,6 +554,7 @@ impl ShellPtyDriver {
             hooks: Mutex::new(None),
             adapters: Mutex::new(None),
             codex_lifetime: Mutex::new(None),
+            promoted_codex_lifetimes: Arc::new(std::sync::Mutex::new(Vec::new())),
             recipe: std::sync::Mutex::new(None),
             exited: Arc::new(std::sync::Mutex::new(None)),
             effort_bridge: Mutex::new(Arc::new(crate::effort::EffortBridge::new())),
@@ -1347,6 +1357,7 @@ impl ShellPtyDriver {
                 self.options.auto_trust_workspace,
                 Arc::clone(&self.interrupt_pid),
                 Arc::clone(&self.interrupt_screen_markers),
+                Arc::clone(&self.promoted_codex_lifetimes),
                 tx.clone(),
                 Arc::clone(&self.seq),
                 Some(Arc::clone(&effort_bridge)),
@@ -1719,6 +1730,10 @@ impl ShellPtyDriver {
             },
             Arc::clone(&self.table),
         );
+        // c-usagefu r12 item 1: the resumed run's poller registers promoted
+        // codex intervals into the SAME driver-owned slot, so every cohort of
+        // this session closes in one place after the final stop ladder.
+        resumed.promoted_codex_lifetimes = Arc::clone(&self.promoted_codex_lifetimes);
         // The adopted poller/bus must update the same control handles that
         // callers retain on `self`, including native cancel confirmation.
         resumed.promoted = Arc::clone(&self.promoted);
@@ -2866,13 +2881,28 @@ impl Driver for ShellPtyDriver {
             }
             Err(error) => tracing::error!(%error, "pty stop ladder failed"),
         }
-        // Ruling A2: close the census interval only AFTER the process has
+        // Ruling A2/A2': close the census intervals only AFTER the process has
         // actually stopped — a record the agent writes while this teardown was
-        // in flight must find a live census. When the group is NOT gone
-        // (stop-incomplete: a survivor outlived SIGKILL), leave the interval
-        // live rather than record a false close: forget the owner so even its
-        // Drop safety net cannot close it.
+        // in flight must find a live census. This covers BOTH the
+        // driver-launched cohort and every promoted-codex interval the poller
+        // handed the session (r12 item 1: a demotion never closes one). When
+        // the group is NOT gone (stop-incomplete: a survivor outlived SIGKILL),
+        // leave the intervals live rather than record a false close: forget
+        // every owner so even its Drop safety net cannot close it.
         if let Some(lifetime) = self.codex_lifetime.lock().await.take() {
+            if group_gone {
+                lifetime.close_interval();
+            } else {
+                std::mem::forget(lifetime);
+            }
+        }
+        let promoted_guards = self
+            .promoted_codex_lifetimes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect::<Vec<_>>();
+        for lifetime in promoted_guards {
             if group_gone {
                 lifetime.close_interval();
             } else {
@@ -4412,11 +4442,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_promoted_codex_registers_its_census_interval_before_publishing_detection() {
-        // c-usagefu r11 item 2 (Ruling A2): the promotion poller registers the
-        // promoted codex's unknown-boundary lifetime BEFORE it publishes the
-        // detection into the `promoted` slot. The r10 shape registered it one
-        // file-adapter-watch tick (~800 ms) later, leaving a window in which a
-        // same-cwd generic launch saw a promoted codex invisible to the census.
+        // c-usagefu r11 item 2 (Ruling A2), tightened by r12 item 1 (A2'):
+        // the promotion poller registers the promoted codex's unknown-boundary
+        // lifetime BEFORE it publishes the detection into the `promoted` slot,
+        // and the OWNER guard is handed to the driver. The r10 shape
+        // registered it one file-adapter-watch tick (~800 ms) later, leaving a
+        // window in which a same-cwd generic launch saw a promoted codex
+        // invisible to the census.
         //
         // Deterministic phase control on a two-worker runtime: the fake table
         // blocks EVERY poller sample on a per-call ticket the test releases on
@@ -4425,8 +4457,8 @@ mod tests {
         // tick has already read None; its next tick is at 1600 ms), so a
         // registration performed by the watch cannot exist at the publish
         // instant. The demote sample is released at 1900 ms (watch next runs
-        // at 2400 ms), proving the interval closes only once demotion is
-        // published.
+        // at 2400 ms): under A2' demotion must NOT close the interval — it
+        // stays live until the driver's stop ladder runs at test end.
         struct GatedTable {
             ticket: std::sync::Mutex<u64>,
             released_until: Arc<AtomicU64>,
@@ -4559,30 +4591,175 @@ mod tests {
             driver.promoted.lock().unwrap().is_none(),
             "demotion published"
         );
-        // The guard drop runs immediately after the slot write in the same
-        // poller iteration (the close FOLLOWS publication — Ruling A2). Allow
-        // a few ms for the poller task to reach it on a loaded box; the hard
-        // guarantee being tested is that the close is well before the watch's
-        // next 800 ms tick and never before publication.
-        let mut closed_after_publish = false;
-        for _ in 0..200 {
-            if !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner) {
-                closed_after_publish = true;
-                break;
-            }
+        // r12 item 1 (Ruling A2'): demotion only forgets the pid — the poller
+        // no longer closes the interval. Ownership is the driver/session's and
+        // the interval stays LIVE until the stop ladder confirms the process
+        // terminated. Give any (now incorrect) poller-side close a generous
+        // window to show itself: the interval must remain live throughout.
+        for _ in 0..100 {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+                "a demotion must NOT close the promoted interval (r12 A2')"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         assert!(
-            closed_after_publish,
-            "the interval closes right after demotion publishes, before the watch's next tick"
-        );
-        assert!(
             census_present(),
-            "but it is RETAINED: a later launch must not become sole over it"
+            "and it stays registered for a competing same-cwd discovery"
         );
 
         releaser.join().unwrap();
         Driver::close(&driver).await.unwrap();
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "the driver closes the promoted interval only after the stop ladder"
+        );
+        assert!(
+            census_present(),
+            "closed-but-retained for pending discovery decisions"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_promoted_codex_rollout_after_a_demotion_is_never_attributed_to_a_competitor() {
+        // c-usagefu r12 item 1 (Ruling A2'): a promoted codex leaves the
+        // foreground (demotion) while its process is still alive in the PTY.
+        // r11 CLOSED the census interval on demotion, so a competing
+        // driver-launched codex that dispatched the same prompt afterwards
+        // became the sole live instance over [its launch, rollout creation]
+        // and bound a rollout the promoted session actually owned — even one
+        // created while close was stopping the promoted process. The promoted
+        // lifetime is now owned by the DRIVER/SESSION: a demotion leaves it
+        // LIVE and it closes only after the stop ladder confirms termination.
+        //
+        // The competitor runs the REAL production discovery path
+        // (CodexAdapter::discover over an actual rollout fixture), never a
+        // test-only census helper.
+        struct Item1Table {
+            codex: Arc<AtomicBool>,
+        }
+        impl crate::promote::ProcessTable for Item1Table {
+            fn process_group(&self, pgid: i32) -> Vec<crate::promote::ProcessRow> {
+                if pgid > 0 && self.codex.load(Ordering::SeqCst) {
+                    vec![crate::promote::ProcessRow {
+                        pid: pgid,
+                        args: "codex".into(),
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let codex = Arc::new(AtomicBool::new(false));
+        let table = Arc::new(Item1Table {
+            codex: Arc::clone(&codex),
+        });
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 60".into()];
+        options.promote = true;
+        let driver = ShellPtyDriver::with_process_table(
+            options,
+            table as Arc<dyn crate::promote::ProcessTable>,
+        );
+        let _events = driver.spawn().await.unwrap().into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        let owner = format!("promoted-codex-{pgid}");
+
+        codex.store(true, Ordering::SeqCst);
+        for _ in 0..3000 {
+            if driver
+                .promoted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|found| found.kind == AgentKind::Codex)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(crate::adapters::codex_discovery::census_contains(
+            &cwd, &owner
+        ));
+
+        // The codex leaves the foreground — but its sleep-60 process is still
+        // running in the PTY group.
+        codex.store(false, Ordering::SeqCst);
+        for _ in 0..3000 {
+            if driver.promoted.lock().unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(driver.promoted.lock().unwrap().is_none(), "demoted");
+        assert!(
+            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "r12 A2': demotion does NOT close the promoted lifetime"
+        );
+
+        // A competing driver-launched codex starts in the same cwd AFTER the
+        // demotion, dispatches a prompt, and a rollout carrying that prompt is
+        // created in its CODEX_HOME (the lazily-written real fixture layout).
+        let competitor_home = tempfile::tempdir().unwrap();
+        let floor = time::OffsetDateTime::now_utc();
+        let mut competitor = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+            home: competitor_home.path().to_path_buf(),
+            cwd: cwd.clone(),
+            pid: None,
+            launched_at: Some(floor),
+        })
+        .with_instance_key(Some("r12-item1-competitor".to_owned()));
+        let prompt = "competitor prompt that must not win";
+        crate::adapters::codex_discovery::record_input(&cwd, "r12-item1-competitor", prompt);
+        let started = time::OffsetDateTime::now_utc();
+        let date_dir = format!(
+            "{:04}/{:02}/{:02}",
+            started.year(),
+            u8::from(started.month()),
+            started.day()
+        );
+        let month_dir = competitor_home.path().join("sessions").join(date_dir);
+        std::fs::create_dir_all(&month_dir).unwrap();
+        let started_rfc = started
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        std::fs::write(
+            month_dir.join("rollout-r12competitor.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{started_rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"r12competitor\",\"session_id\":\"r12competitor\",\"cwd\":\"{}\",\"timestamp\":\"{started_rfc}\"}}}}\n\
+                 {{\"timestamp\":\"{started_rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+
+        // Production discovery (the public poll entry point runs discover):
+        // the promoted session's LIVE unknown-boundary interval overlaps
+        // [competitor launch, creation], so prompt-only attribution is
+        // refused and the rejection is permanently remembered.
+        use crate::adapters::FileSignalAdapter as _;
+        let observed = competitor.poll().unwrap();
+        assert!(observed.is_empty(), "a refused candidate emits nothing");
+        assert!(competitor.binding().is_none());
+
+        // The driver now closes: the stop ladder kills the still-running
+        // process and only then closes the promoted interval. Close is
+        // deterministic here (plain sleep), so bound it loosely.
+        Driver::close(&driver).await.unwrap();
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "closed after confirmed termination"
+        );
+        assert!(
+            crate::adapters::codex_discovery::census_contains(&cwd, &owner),
+            "the closed interval is retained while the competitor decision is pending"
+        );
+        let observed = competitor.poll().unwrap();
+        assert!(observed.is_empty(), "still refused after close");
+        assert!(competitor.binding().is_none());
     }
 
     #[tokio::test]

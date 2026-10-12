@@ -783,6 +783,13 @@ pub(super) fn spawn(
     auto_trust_workspace: bool,
     interrupt_pid: Arc<AtomicI32>,
     interrupt_screen_markers: Arc<Mutex<InterruptBaseline>>,
+    // c-usagefu r12 item 1 (Ruling A2'): driver-owned slot collecting the
+    // promoted-codex lifetime OWNER guards this poller registers. The poller
+    // only ever pushes a fresh guard when a codex pid is detected; it never
+    // closes one. The driver drains and closes them after the stop ladder
+    // confirms termination, so the lifetime is owned by the session rather
+    // than by the poller or foreground detection.
+    promoted_lifetimes: Arc<std::sync::Mutex<Vec<crate::adapters::codex_discovery::LifetimeGuard>>>,
     events: mpsc::Sender<Observation>,
     seq: Arc<AtomicU64>,
     effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
@@ -830,16 +837,18 @@ pub(super) fn spawn(
         // SessionStart/turn binding, once observed for this foreground pid,
         // stays live until that pid demotes or a hook confirms the turn end.
         let mut hook_ever_live = false;
-        // c-usagefu r11 item 2 (Ruling A2): the promoted-codex census
-        // interval is maintained HERE, in the poller, and registered BEFORE
-        // the detection is published to the `current` slot the file-adapter
-        // watch reads. The r10 shape registered it one watch tick later,
-        // leaving a window in which the promoted instance was visible to
-        // discovery but absent from the cwd census. The pid tracks the exact
-        // owner: a codex -> codex foreground change closes the old interval
-        // and registers the new one. None = no promoted codex this epoch.
+        // c-usagefu r12 item 1 (Ruling A2'): the promoted-codex census
+        // intervals are registered HERE, BEFORE the detection is published to
+        // the `current` slot the file-adapter watch reads, but OWNED by the
+        // driver: every detected codex pid gets a fresh interval whose guard is
+        // handed to the driver in `promoted_lifetimes`. The poller never closes
+        // one — a demotion only forgets the pid so the next codex foreground
+        // registers another interval. r11 owned the guard in a poller local
+        // and closed it on demotion, so a codex that left the foreground (or a
+        // poller that was shut down) lost its census before the session's
+        // process terminated: a rollout created during close could be
+        // attributed to a competing same-cwd discovery.
         let mut census_pid: Option<i32> = None;
-        let mut census_guard: Option<crate::adapters::codex_discovery::LifetimeGuard> = None;
         let mut last_status: Option<ScreenStatus> = None;
         // Once the hook tier is merely *stale*, the screen decides the idle
         // edge — but one sample is not proof: the emulator can miss the TUI's
@@ -900,22 +909,26 @@ pub(super) fn spawn(
             // the slot write, so a same-cwd generic launch discovering during
             // the promotion window already sees this unknown-boundary
             // instance and refuses prompt-only attribution. A codex leaving
-            // (demotion or a different foreground process) closes its interval
-            // only AFTER the new sample is published below: the close follows
-            // the observed stop, it never precedes it (Ruling A2).
+            // (demotion or a different foreground process) does NOT close the
+            // interval here: ownership is the driver's, and the interval
+            // closes only once the stop ladder confirms the process terminated
+            // (Ruling A2', r12 item 1). A codex -> codex foreground change
+            // hands the driver a second live interval — the poller cannot
+            // prove the earlier pid is dead, so both stay in the census.
             let next_codex_pid = found
                 .as_ref()
                 .and_then(|f| (f.kind == AgentKind::Codex).then_some(f.pid));
-            let mut closed_census = None;
             if next_codex_pid != census_pid {
                 if let Some(pid) = next_codex_pid {
-                    census_guard = Some(crate::adapters::codex_discovery::begin_lifetime(
+                    let guard = crate::adapters::codex_discovery::begin_lifetime(
                         &ctx.cwd,
                         &format!("promoted-codex-{pid}"),
                         None,
-                    ));
-                } else {
-                    closed_census = census_guard.take();
+                    );
+                    promoted_lifetimes
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(guard);
                 }
                 census_pid = next_codex_pid;
             }
@@ -924,9 +937,6 @@ pub(super) fn spawn(
             if let Ok(mut slot) = current.lock() {
                 slot.clone_from(&found);
             }
-            // The foreground change is now published; a demoted codex's
-            // interval may close.
-            drop(closed_census);
             let Ok(now) = now_ts() else { continue };
             let mut saw_demote = false;
             let mut saw_promote = false;

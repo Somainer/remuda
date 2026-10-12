@@ -484,6 +484,9 @@ impl FileTail {
         if cover.generation() != self.generation {
             return false;
         }
+        if obs.file_id.is_some_and(|id| id != cover.file_id()) {
+            return false;
+        }
         match cover {
             UnreadCover::Complete(mark) => !(obs.shrunk && obs.len <= mark.offset),
             UnreadCover::Pending(boundary) => {
@@ -596,8 +599,9 @@ impl FileTail {
         // Observe the file BEFORE normalisation: a replacement (different
         // device/inode) or an in-place shrink is recorded against the previous
         // open so armed covers can be retired before any record is folded.
+        let replaced = self.file_id.is_some_and(|id| id != opened_id);
         let shrunk = self.last_len.is_some_and(|prev| len < prev);
-        self.detect_rotation(&mut file, len)?;
+        self.detect_rotation(&mut file, len, replaced)?;
         let rest_base = self.offset;
         file.seek(SeekFrom::Start(rest_base))?;
         let mut rest = Vec::new();
@@ -609,7 +613,7 @@ impl FileTail {
         self.last_len = Some(len);
         self.file_id = Some(opened_id);
         self.last_observation = Some(FileObservation {
-            replaced: false,
+            replaced,
             shrunk,
             len,
             file_id: Some(opened_id),
@@ -624,8 +628,55 @@ impl FileTail {
         }))
     }
 
-    fn detect_rotation(&mut self, file: &mut File, len: u64) -> Result<(), Error> {
+    fn detect_rotation(&mut self, file: &mut File, len: u64, replaced: bool) -> Result<(), Error> {
+        // A different file at the path (rename/replace) starts a fresh
+        // generation even when the cursor sits at offset 0, so a replacement
+        // can never reuse the generation a failure peek armed.
+        if replaced {
+            tracing::warn!(
+                path = %self.path.display(),
+                generation = self.generation,
+                "jsonl replaced at path; starting new file generation"
+            );
+            self.rotate();
+            return Ok(());
+        }
         if self.offset == 0 {
+            // Anchored at offset 0 (typically right after a failure peek
+            // normalised a rotation): an in-place truncate+rewrite of the SAME
+            // inode cannot reuse this generation. The previous open captured
+            // unread bytes (`last_rest` at base 0); a shrink below their
+            // extent, or any byte change in the shared prefix, means the bytes
+            // a cover was armed against no longer exist.
+            if !self.last_rest.is_empty() {
+                let prev_extent = self.last_rest_base + self.last_rest.len() as u64;
+                if len < prev_extent {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        generation = self.generation,
+                        prev_extent,
+                        len,
+                        "jsonl rewritten from offset 0; starting new file generation"
+                    );
+                    self.rotate();
+                    return Ok(());
+                }
+                let check = std::cmp::min(prev_extent, len) as usize;
+                if check > 0 {
+                    let mut buf = vec![0u8; check];
+                    file.seek(SeekFrom::Start(0))?;
+                    file.read_exact(&mut buf)?;
+                    if buf != self.last_rest[..check] {
+                        tracing::warn!(
+                            path = %self.path.display(),
+                            generation = self.generation,
+                            "jsonl unread prefix rewritten at offset 0; starting new file \
+                             generation"
+                        );
+                        self.rotate();
+                    }
+                }
+            }
             return Ok(());
         }
         if len < self.offset {

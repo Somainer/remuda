@@ -1887,3 +1887,72 @@ fn another_members_failure_peek_observes_the_truncation() {
         "the other member's peek retired the boundary when it saw the shrink"
     );
 }
+
+/// c-cardsettle-fu2 r8 item 4: a replacement AFTER the failure peek must
+/// not reuse the pending generation. The peek normalises a shorter torn file
+/// to a fresh generation; before any poll, the file is replaced AGAIN (new
+/// inode via atomic rename) by a different complete LONGER genuine retry.
+#[test]
+fn a_replacement_after_the_failure_peek_cannot_reuse_the_pending_generation() {
+    fn replace_atomic(run_dir: &Path, contents: &str) {
+        let journal = run_dir.join("journal.jsonl");
+        let tmp = run_dir.join("journal.jsonl.tmp");
+        std::fs::write(&tmp, contents).unwrap();
+        std::fs::rename(&tmp, &journal).unwrap();
+    }
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_r8_replace_after";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    // Attempt 1: deliberately long so later replacement files are shorter
+    // than the consumed cursor.
+    replace_atomic(
+        &run_dir,
+        "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"the-first-long-attempt\"}\n\
+         {\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n",
+    );
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Failed),
+        "attempt 1 ends Failed and is consumed"
+    );
+
+    // Replace with a SHORTER torn attempt-2 start at offset 0.
+    replace_atomic(
+        &run_dir,
+        "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"",
+    );
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+
+    // Before any poll, replace the file AGAIN with a different, complete,
+    // LONGER genuine retry (a new inode; length above the torn file's extent).
+    replace_atomic(
+        &run_dir,
+        "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\",\"label\":\"genuine-retry-after-second-replacement\"}\n",
+    );
+
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Running),
+        "the second replacement starts its own generation; the retry is genuine"
+    );
+}

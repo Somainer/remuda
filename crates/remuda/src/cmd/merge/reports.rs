@@ -17,10 +17,37 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
 use super::MergeReport;
+
+/// Process-unique nonce mixed into every staging filename, so two publications
+/// in the same millisecond (and across lanes sharing this process) still get
+/// distinct temp files.
+static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// A UNIQUE staging path for one publication. The old
+/// `<name>.json.tmp` constant was shared by every lane: a concurrent
+/// publication's staging was overwritten mid-write and its own cleanup deleted
+/// the other lane's bytes (r14 item 7). The name carries the pid, a
+/// millisecond timestamp, and a per-process monotonic nonce.
+fn unique_temp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "report".to_owned());
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(".{file_name}.{pid}.{micros}.{nonce}.tmp"))
+}
 
 pub(super) fn common_dir(repo: &Path) -> Result<PathBuf> {
     let raw = super::git(repo, &["rev-parse", "--git-common-dir"])?;
@@ -100,7 +127,7 @@ fn publish_immutable(path: &Path, contents: &str, captured: &MergeReport) -> Res
         // Idempotent re-publish of the identical tuple: leave it untouched.
         return Ok(());
     }
-    let temporary = path.with_extension("json.tmp");
+    let temporary = unique_temp_path(path);
     fs::write(&temporary, contents).context("write report file")?;
     // Atomic create-new: fails if another lane published concurrently.
     match fs::hard_link(&temporary, path) {
@@ -158,9 +185,15 @@ fn write_atomic(path: &Path, contents: &str) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("create report directory {}", parent.display()))?;
     }
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, contents).context("write report file")?;
-    fs::rename(&temporary, path).context("publish report file")
+    let temporary = unique_temp_path(path);
+    let outcome = fs::write(&temporary, contents)
+        .context("write report file")
+        .and_then(|()| fs::rename(&temporary, path).context("publish report file"));
+    if outcome.is_err() {
+        // Remove only OUR staging file; never touch another lane's temp.
+        let _ = fs::remove_file(&temporary);
+    }
+    outcome
 }
 
 /// Record the constructed merge commit before the gate runs, so a queue lane
@@ -524,5 +557,47 @@ mod tests {
             loaded.head.as_deref(),
             Some("aaaa11111111111111111111111111111111111")
         );
+    }
+
+    #[test]
+    fn concurrent_publications_get_distinct_temp_files_even_in_one_burst() {
+        // r14 item 7: every concurrent publication must stage in its OWN temp
+        // file. The old fixed `<name>.json.tmp` gave every lane the same path,
+        // so staging writes/cleanups raced. A tight concurrent burst through
+        // unique_temp_path must yield zero collisions (the nonce guarantees
+        // it within a process; the pid disambiguates across processes).
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("base.json");
+        let threads = 16;
+        let per = 200;
+        let paths: std::collections::HashSet<_> = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..threads {
+                handles.push(scope.spawn(|| {
+                    (0..per)
+                        .map(|_| unique_temp_path(&target))
+                        .collect::<Vec<_>>()
+                }));
+            }
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        assert_eq!(
+            paths.len(),
+            threads * per,
+            "concurrent report publications collide on a shared temp file"
+        );
+        // Every staging file lives next to the report and is a distinct hidden
+        // .tmp name (so no lane ever removes another lane's bytes).
+        for path in &paths {
+            assert!(path.parent() == Some(temporary.path()));
+            let name = path.file_name().unwrap().to_string_lossy();
+            assert!(
+                name.starts_with(".base.json.") && name.ends_with(".tmp"),
+                "{name}"
+            );
+        }
     }
 }

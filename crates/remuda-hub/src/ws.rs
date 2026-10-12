@@ -459,7 +459,21 @@ pub(crate) fn spawn_egress_reinstall(state: &AppState, host_id: String) {
 /// created before it are touched.
 pub(crate) fn spawn_post_hello_tasks(state: &AppState, host_id: String) {
     spawn_egress_reinstall(state, host_id.clone());
-    crate::workspaces::spawn_unregister_abort_sweep(state, host_id, crate::config::now_rfc3339());
+    crate::workspaces::spawn_unregister_abort_sweep(
+        state,
+        host_id.clone(),
+        crate::config::now_rfc3339(),
+    );
+    // r13 item 1: now that this carrier is registered, immediately reconcile
+    // (read-only, forced) any Landing row pinned to this host against the exact
+    // granted merge — covering a Hub restart where the push reached origin
+    // before exit, and a push still in flight (which stays Landing until the
+    // remote confirms). Detached like the sweeps so it never blocks the read
+    // loop; the periodic reconciler retries anything still uncertain.
+    let state = state.clone();
+    tokio::spawn(async move {
+        crate::gatequeue::reconcile_landings(&state, Some(&host_id)).await;
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

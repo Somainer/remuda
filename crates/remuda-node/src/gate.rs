@@ -667,6 +667,12 @@ pub(crate) struct GateRegistry {
     /// the production 10 minutes.
     #[cfg(any(test, feature = "test-faults"))]
     land_timeout: Mutex<Option<Duration>>,
+    /// Test-only override for the consumed merge/land CLI (`request.binary` is
+    /// still preferred). Lets a real-DevNode e2e drive genuine git fetch/merge/
+    /// push against a local bare origin with a tiny stand-in CLI while every
+    /// authority decision still runs through the real Hub.
+    #[cfg(any(test, feature = "test-faults"))]
+    merge_bin: Mutex<Option<std::path::PathBuf>>,
     events: tokio::sync::broadcast::Sender<GateEventParams>,
 }
 
@@ -681,8 +687,34 @@ impl GateRegistry {
             run_holds: Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-faults"))]
             land_timeout: Mutex::new(None),
+            #[cfg(any(test, feature = "test-faults"))]
+            merge_bin: Mutex::new(None),
             events,
         }
+    }
+
+    /// Test-only: override the consumed merge/land CLI.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) async fn set_merge_bin(&self, bin: std::path::PathBuf) {
+        *self.merge_bin.lock().await = Some(bin);
+    }
+
+    /// Resolve the merge/land child binary: the dispatch-provided path, then a
+    /// test-only configured CLI, then this Node's own executable.
+    async fn merge_binary(&self, provided: &Option<String>) -> String {
+        if let Some(binary) = provided {
+            return binary.clone();
+        }
+        #[cfg(any(test, feature = "test-faults"))]
+        {
+            if let Some(bin) = self.merge_bin.lock().await.clone() {
+                return bin.to_string_lossy().into_owned();
+            }
+        }
+        std::env::current_exe()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// Test-only: override the granted land child timeout (r12 item 4).
@@ -925,6 +957,14 @@ impl DevNode {
     #[cfg(any(test, feature = "test-faults"))]
     pub async fn gate_test_set_land_timeout(&self, timeout: std::time::Duration) {
         self.gate_registry().set_land_timeout(timeout).await;
+    }
+
+    /// Test-only: point the consumed verify/land child at a stand-in CLI that
+    /// still performs real git against a local bare origin (r13 item 1 e2e).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_set_merge_bin(&self, bin: std::path::PathBuf) {
+        self.gate_registry().set_merge_bin(bin).await;
     }
 
     /// Dispatch one Hub→Node gate RPC by method name.
@@ -1269,12 +1309,7 @@ impl DevNode {
         emit(GateEventKind::Phase {
             phase: phase.into(),
         });
-        let binary = request.binary.clone().unwrap_or_else(|| {
-            std::env::current_exe()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        });
+        let binary = registry.merge_binary(&request.binary).await;
         let mut args = vec![
             "merge".to_owned(),
             request.branch.clone(),

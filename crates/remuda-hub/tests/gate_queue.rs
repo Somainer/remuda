@@ -1969,13 +1969,16 @@ async fn no_second_dispatch_while_the_first_is_landing() -> Result<()> {
     Ok(())
 }
 
-/// r12 item 1: a Hub restart with a Landing row it CANNOT confirm settles the
-/// job failed with an explicit indeterminate reason (never re-run, never
-/// landing forever); a later `landed` verdict is ignored against the terminal
-/// row.
+/// r13 item 1: with the lane carrier connected but the exact granted merge NOT
+/// on the remote, a Landing row stays Landing while the bounded recovery window
+/// is open (the push may still complete) and settles failed with an explicit
+/// indeterminate reason only once that window elapses — never re-run, never
+/// guessed early. A later `landed` verdict is ignored against the terminal row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_landing_unconfirmed_settles_failed_indeterminate() -> Result<()> {
-    let ctx = Ctx::spawn(1).await?;
+    // Bound the recovery window to ~nothing so the post-restart probe that
+    // cannot confirm the merge immediately classifies the push as over.
+    let ctx = Ctx::spawn_with_config(1, |_| {}, |cfg| cfg.gate_landing_recovery_ms = 1).await?;
     let hold = Arc::new(Notify::new());
     *ctx.scripts[0].landing_hold.lock().unwrap() = Some(hold.clone());
     ctx.scripts[0].script(
@@ -1997,10 +2000,10 @@ async fn restart_landing_unconfirmed_settles_failed_indeterminate() -> Result<()
     ctx.hub.test_reconcile().await;
     let settled = ctx.wait_state(&id, &["failed", "landed"]).await;
     assert_eq!(settled["state"], "failed", "{settled}");
-    let reason = settled["reason"].as_str().unwrap_or("");
+    let error = settled["error"].as_str().unwrap_or("");
     assert!(
-        reason.contains("outcome unknown"),
-        "indeterminate reason: {reason}"
+        error.contains("outcome unknown") && error.contains("recovery window"),
+        "indeterminate bounded-recovery error: {error}"
     );
     assert_eq!(ctx.scripts[0].resolve_calls.lock().unwrap().len(), 1);
 

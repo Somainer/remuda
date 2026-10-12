@@ -47,6 +47,8 @@ pub(crate) const SCHEDULE_TICK_MILLIS: u64 = 1000;
 const GATE_LOG_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 /// Budget for the home host's fetch-and-push land.
 const HOME_LAND_TIMEOUT: Duration = Duration::from_secs(12 * 60);
+/// Minimum spacing between read-only remote probes for one Landing row.
+const LANDING_PROBE_INTERVAL_MS: u64 = 5_000;
 /// Budget for dropping a job's pinned refs on a lane.
 const UNPIN_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often the pinned-ref retention sweep runs.
@@ -96,6 +98,12 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // this, so a paused/old frame riding a replacement session after a
     // reconnect can neither execute nor land. Hub-only: never on the wire.
     crate::store::ensure_column(conn, "gate_jobs", "dispatch_session", "INTEGER")?;
+    // r13 item 1: when the Running → Landing grant committed, so a Hub restart
+    // can bound how long an unconfirmed Landing may wait before the push is
+    // provably over budget. Hub-only: never on the wire.
+    crate::store::ensure_column(conn, "gate_jobs", "landing_at", "TEXT")?;
+    // r13 item 1: last read-only remote probe of a Landing row (throttle).
+    crate::store::ensure_column(conn, "gate_jobs", "landing_probed_at", "TEXT")?;
     Ok(())
 }
 
@@ -1893,6 +1901,18 @@ fn age_ms(now: &str, earlier: &Timestamp) -> Option<u64> {
     u64::try_from((now - earlier).whole_milliseconds()).ok()
 }
 
+/// Milliseconds between `now` and a RFC3339 timestamp string; None if either is
+/// unparseable or the timestamp is in the future.
+fn elapsed_since(now: &str, earlier: Option<&str>) -> Option<u64> {
+    let earlier = earlier?;
+    let parse = |value: &str| {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+    };
+    let now = parse(now)?;
+    let earlier = parse(earlier)?;
+    u64::try_from((now - earlier).whole_milliseconds()).ok()
+}
+
 /// Best-effort `gate.unpin` on the lane host.
 async fn unpin_lane_refs(
     state: &AppState,
@@ -2010,19 +2030,163 @@ pub(crate) async fn reconcile(state: &AppState) {
             })
             .await;
     }
-    // A Landing row's granted push cannot be blindly re-run (a second push is
-    // the hazard the grant exists to prevent). Resolve it deterministically:
-    // confirm via the lane host that the granted merge is already on the remote
-    // base → landed; otherwise (host gone, fetch failed, non-ancestor) settle
-    // failed with an explicit indeterminate reason rather than leave the job
-    // landing forever.
-    let jobs = state.store.list_gate_jobs(None).await;
-    if let Ok(jobs) = jobs {
-        for job in jobs
-            .into_iter()
-            .filter(|job| job.state == GateJobState::Landing)
+    // r13 item 1: Landing rows are NOT settled at startup. The carrier registry
+    // is empty before the listener binds, so the remote cannot be probed yet,
+    // and guessing a verdict here is exactly the bug: a push that reached
+    // origin/main before the Hub exited would be called failed, and a push that
+    // is still running could be re-run (a second push). Every Landing row keeps
+    // its lane/land occupancy and is reconciled only once a carrier can answer
+    // (`reconcile_landings` after hello and on every schedule tick) against the
+    // EXACT granted merge, bounded by the recovery window.
+}
+
+/// A persisted Landing row plus its Hub-only recovery bookkeeping.
+pub(crate) struct LandingRow {
+    job: GateJob,
+    landing_at: Option<String>,
+    probed_at: Option<String>,
+}
+
+/// Spawn the self-serializing Landing reconciler: one pass at a time, every
+/// [`LANDING_PROBE_INTERVAL_MS`], so an outstanding remote probe can never pile
+/// up with another. Started by the Hub after it is serving; Landing rows only
+/// resolve once a carrier is reachable. r13 items 1 & 2.
+pub(crate) fn spawn_landing_reconciler(state: &AppState) -> tokio::task::JoinHandle<()> {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(LANDING_PROBE_INTERVAL_MS));
+        loop {
+            interval.tick().await;
+            reconcile_landings(&state, None).await;
+        }
+    })
+}
+
+/// Reconcile every Landing row against the remote, read-only, WITHOUT ever
+/// re-running a push. Called from the schedule tick (throttled) and forced for
+/// one host immediately after its carrier registers (`force_host`).
+///
+/// Outcome rule for a row whose lane host is currently connected:
+///   * the exact granted merge is already an ancestor of the remote base →
+///     LANDED (exactly once; the row keeps occupying until then);
+///   * not on the remote AND the bounded recovery window since the grant has
+///     elapsed (the Node's land group is then provably terminated by its
+///     budget, so the push cannot still land) → FAILED with an explicit
+///     indeterminate reason;
+///   * otherwise the outcome is still UNCERTAIN (push in flight, host between
+///     reconnects, or a probe error) → the row STAYS Landing and keeps its
+///     occupancy; a later tick/hello retries.
+pub(crate) async fn reconcile_landings(state: &AppState, force_host: Option<&str>) {
+    let Ok(rows) = state.store.list_landing_jobs().await else {
+        return;
+    };
+    let recovery_ms = state.config.gate_landing_recovery_ms;
+    for row in rows {
+        let LandingRow {
+            job,
+            landing_at,
+            probed_at,
+        } = row;
+        let Some(lane_host) = landing_lane_host(state, &job).await else {
+            continue;
+        };
+        // Only reconcile when the lane host has a live carrier; otherwise the
+        // outcome genuinely cannot be established yet — keep occupancy.
+        if state
+            .nodes
+            .generation_of(lane_host.as_id().as_str())
+            .await
+            .is_none()
         {
-            settle_landing_after_restart(state, &job).await;
+            continue;
+        }
+        let forced = force_host.is_some_and(|host| host == lane_host.as_id().as_str());
+        let now = now();
+        if !forced
+            && let Some(age) = elapsed_since(&now, probed_at.as_deref())
+            && age < LANDING_PROBE_INTERVAL_MS
+        {
+            continue;
+        }
+        let confirmed = probe_landing_contained(state, &job).await;
+        let _ = state
+            .store
+            .mark_landing_probed(job.id.as_id().as_str(), &now)
+            .await;
+        if confirmed {
+            settle_landing_row(state, &job, true).await;
+            continue;
+        }
+        // Not confirmed. Settle failed only once the grant has outlived the
+        // whole land budget + grace; before that the push may still complete,
+        // so the honest state is the uncertainty-preserving Landing.
+        let expired =
+            elapsed_since(&now, landing_at.as_deref()).is_some_and(|age| age >= recovery_ms);
+        if expired {
+            settle_landing_row(state, &job, false).await;
+        }
+    }
+}
+
+/// Resolve the lane host a Landing job must be probed on, if its project/lane
+/// still resolve.
+async fn landing_lane_host(state: &AppState, job: &GateJob) -> Option<remuda_protocol::HostId> {
+    let lane_id = job.lane_id.clone()?;
+    let project = state
+        .store
+        .get_project(job.project_id.as_id().to_string())
+        .await
+        .ok()
+        .flatten()?;
+    project
+        .gate
+        .lanes
+        .iter()
+        .find(|lane| lane.id == lane_id)
+        .map(|lane| lane.host_id.clone())
+}
+
+/// Write the one terminal state a Landing probe established. `landed` records
+/// the confirmed remote outcome; `false` records an explicit indeterminate
+/// failure after the bounded window. Never re-queues or re-dispatches.
+async fn settle_landing_row(state: &AppState, job: &GateJob, landed: bool) {
+    let job_id = job.id.as_id().to_string();
+    let outcome = state
+        .store
+        .mutate_gate_job(&job_id, move |row| {
+            if row.state != GateJobState::Landing {
+                return None;
+            }
+            row.home_land_in_flight = false;
+            row.landing_session_epoch = None;
+            row.finished_at = Some(now_ts());
+            if landed {
+                row.state = GateJobState::Landed;
+                row.error = None;
+                if row.reason.is_none() {
+                    row.reason =
+                        Some("landed; confirmed on remote main by reconciliation".into());
+                }
+            } else {
+                row.state = GateJobState::Failed;
+                let error =
+                    "landing outcome unknown after the bounded recovery window; the granted push \
+                     was not confirmed on the remote base and the land budget elapsed (the job is \
+                     not re-run automatically)";
+                row.error = Some(error.into());
+                row.reason = Some("failed; landing unconfirmed after the recovery window".into());
+            }
+            Some(())
+        })
+        .await;
+    if let Ok(Some(settled)) = outcome {
+        if settled.state == GateJobState::Landed {
+            journal(state, &settled.requested_by, "gate.landed", &settled).await;
+            drop_job_refs(state, &settled).await;
+            run_then_hook(state, &settled).await;
+        } else {
+            journal(state, &settled.requested_by, "gate.failed", &settled).await;
+            drop_job_refs(state, &settled).await;
         }
     }
 }
@@ -2056,49 +2220,6 @@ pub(crate) async fn recover_ended_session(state: &AppState, host_id: &str, sessi
     }
     if !jobs.is_empty() {
         schedule_once(state);
-    }
-}
-
-/// Resolve one Landing row left by a restart. Best-effort read-only probe to
-/// the lane host, then a single terminal write.
-async fn settle_landing_after_restart(state: &AppState, job: &GateJob) {
-    let confirmed_landed = probe_landing_contained(state, job).await;
-    let job_id = job.id.as_id().to_string();
-    let outcome = state
-        .store
-        .mutate_gate_job(&job_id, move |row| {
-            if row.state != GateJobState::Landing {
-                return None;
-            }
-            row.home_land_in_flight = false;
-            row.landing_session_epoch = None;
-            row.finished_at = Some(now_ts());
-            if confirmed_landed {
-                row.state = GateJobState::Landed;
-                row.error = None;
-                if row.reason.is_none() {
-                    row.reason = Some("landed; confirmed on remote main after hub restart".into());
-                }
-            } else {
-                row.state = GateJobState::Failed;
-                let error =
-                    "landing outcome unknown after hub restart; the granted push was not confirmed \
-                     on the remote base (the job is not re-run automatically)";
-                row.error = Some(error.into());
-                row.reason = Some("failed; landing outcome unknown after hub restart".into());
-            }
-            Some(())
-        })
-        .await;
-    if let Ok(Some(settled)) = outcome {
-        if settled.state == GateJobState::Landed {
-            journal(state, &settled.requested_by, "gate.landed", &settled).await;
-            drop_job_refs(state, &settled).await;
-            run_then_hook(state, &settled).await;
-        } else {
-            journal(state, &settled.requested_by, "gate.failed", &settled).await;
-            drop_job_refs(state, &settled).await;
-        }
     }
 }
 
@@ -2206,6 +2327,56 @@ impl Store {
                 )
                 .optional()?;
             Ok(raw.and_then(|text| serde_json::from_str(&text).ok()))
+        })
+        .await
+    }
+
+    /// r13 item 1: list every Landing row together with its grant timestamp
+    /// and last remote-probe timestamp (both Hub-only columns).
+    pub(crate) async fn list_landing_jobs(
+        &self,
+    ) -> Result<Vec<LandingRow>, crate::store::StoreError> {
+        self.run_named("list_landing_jobs", |conn| {
+            let mut statement = conn.prepare(
+                "SELECT doc_json, landing_at, landing_probed_at FROM gate_jobs
+                  WHERE state = 'landing' ORDER BY queued_at ASC, rowid ASC",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let doc: String = row.get(0)?;
+                let landing_at: Option<String> = row.get(1)?;
+                let probed_at: Option<String> = row.get(2)?;
+                Ok((doc, landing_at, probed_at))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (doc, landing_at, probed_at) = row?;
+                if let Ok(job) = serde_json::from_str::<GateJob>(&doc) {
+                    out.push(LandingRow {
+                        job,
+                        landing_at,
+                        probed_at,
+                    });
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// r13 item 1: stamp the last remote-probe time for one Landing row.
+    pub(crate) async fn mark_landing_probed(
+        &self,
+        job_id: &str,
+        at: &str,
+    ) -> Result<(), crate::store::StoreError> {
+        let job_id = job_id.to_owned();
+        let at = at.to_owned();
+        self.run_named("mark_landing_probed", move |conn| {
+            conn.execute(
+                "UPDATE gate_jobs SET landing_probed_at = ?2 WHERE id = ?1 AND state = 'landing'",
+                params![job_id, at],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -2991,6 +3162,8 @@ impl Store {
                             '$.landingSessionEpoch', ?2),
                             '$.mergeSha', ?6),
                         state = 'landing',
+                        landing_at = ?8,
+                        landing_probed_at = NULL,
                         revision = revision + 1,
                         updated_at = ?3
                   WHERE id = ?1
@@ -3006,7 +3179,8 @@ impl Store {
                     generation,
                     host_id,
                     merge_sha,
-                    session_i64
+                    session_i64,
+                    now,
                 ],
             )?;
             if updated > 0 {

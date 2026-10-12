@@ -124,6 +124,13 @@ pub struct HubConfig {
     /// ignored rather than applied.
     #[serde(default = "default_gate_cancel_grace_ms")]
     pub gate_cancel_grace_ms: u64,
+    /// r13 item 1: bound on an unconfirmed Landing. After the grant, the Node
+    /// terminates the land process group at its own budget; this adds reconnect
+    /// grace. A granted merge not on the remote once this elapses is a
+    /// provably-finished failed push; before it the row stays Landing. Default
+    /// 12 minutes. Tests set it small.
+    #[serde(default = "default_gate_landing_recovery_ms")]
+    pub gate_landing_recovery_ms: u64,
     /// Per-IP authentication attempt burst budget (login/pair/passkey).
     #[serde(default = "default_auth_ip_burst")]
     pub auth_ip_burst: f64,
@@ -206,6 +213,10 @@ fn default_gate_cancel_grace_ms() -> u64 {
     30 * 1000
 }
 
+fn default_gate_landing_recovery_ms() -> u64 {
+    12 * 60 * 1000
+}
+
 fn default_push_block_ms() -> u64 {
     30_000
 }
@@ -253,6 +264,7 @@ impl Default for HubConfig {
             requested_grace_ms: default_requested_grace_ms(),
             gate_ref_retention_ms: default_gate_ref_retention_ms(),
             gate_cancel_grace_ms: default_gate_cancel_grace_ms(),
+            gate_landing_recovery_ms: default_gate_landing_recovery_ms(),
             auth_ip_burst: default_auth_ip_burst(),
             auth_ip_refill_per_sec: default_auth_ip_refill_per_sec(),
             auth_global_burst: default_auth_global_burst(),
@@ -296,6 +308,7 @@ impl HubConfig {
             requested_grace_ms: default_requested_grace_ms(),
             gate_ref_retention_ms: default_gate_ref_retention_ms(),
             gate_cancel_grace_ms: default_gate_cancel_grace_ms(),
+            gate_landing_recovery_ms: default_gate_landing_recovery_ms(),
             // Keep production rate-limit defaults here so the 429 integration
             // test exercises real budgets; the Playwright harness relaxes them
             // explicitly because it mounts the login page dozens of times from

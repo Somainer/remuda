@@ -611,6 +611,11 @@ impl RunningHub {
     #[doc(hidden)]
     pub async fn test_reconcile(&self) {
         crate::gatequeue::reconcile(&self.state).await;
+        // r13 item 1: Landing rows are no longer settled at startup; they are
+        // probed against the remote once a carrier is reachable. The fake lane
+        // in gate-queue tests stays connected, so run the same bounded pass the
+        // post-hello task runs (a row never probed has a NULL throttle stamp).
+        crate::gatequeue::reconcile_landings(&self.state, None).await;
     }
 
     /// Test-only: claim a queued gate job the way the scheduler tick would,
@@ -1244,6 +1249,10 @@ async fn spawn_inner(
             }
         }
     });
+    // r13 items 1/2: bounded, occupancy-preserving reconciliation of granted
+    // Landing rows against the remote once carriers are reachable (independent
+    // of the 1 s schedule tick so a remote probe never stalls dispatch).
+    crate::gatequeue::spawn_landing_reconciler(&state);
     Ok(RunningHub {
         addr,
         bootstrap_token,

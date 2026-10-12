@@ -539,6 +539,74 @@ describe("Outbox", () => {
     }
   });
 
+  it("GATE21 item 1 follow-up: a flush epilogue must not arm a delivery wake for an instance whose next POST the STORE's outbox-retry timer owns (offline-restore regression)", async () => {
+    // End-to-end SW-restore regression captured at the Outbox boundary: a
+    // guarded flush attempts a POST while offline; the POST fails at the
+    // boundary and the store restores the row to lease-less pending AND arms
+    // its own bounded scheduleOutboxRetry. The flush epilogue's fresh
+    // authoritative reconciliation used to ALSO arm a 0 ms delivery wake; that
+    // duplicate wake flapped wake→flush and (after the real reload) missed the
+    // reconnect-driven delivery. While the store marker is held, the
+    // reconciliation arms nothing; clearing it (the store timer fires) re-arms.
+    vi.useFakeTimers();
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
+    try {
+      const I = "ins_g21_store_retry";
+      const store = new MemStorage();
+      const put = store.put(
+        rec({ commandId: "cmd_g21_store_retry", instanceId: I, state: "pending", createdAt: 1_000 }),
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await put;
+      const box0 = await Outbox.load(store, "owner_g21_store_retry");
+      await box0.refreshDurable();
+      // A pending row with no flush cover gets its one 0 ms delivery wake.
+      expect(box0.pendingLeaseWakeups()).toEqual(["cmd_g21_store_retry"]);
+      const hook = vi.fn();
+      box0.onClaimWake = hook;
+      await vi.advanceTimersByTimeAsync(5);
+      expect(hook).toHaveBeenCalledTimes(1);
+      box0.dispose();
+
+      // New document (the real reload): same durable backend, fresh outbox.
+      const box = (await Outbox.load(store, "owner_g21_store_retry")) as unknown as {
+        beginDeliveryPass: (ids: Iterable<string>) => number;
+        endDeliveryPasses: (t: Iterable<number>) => Promise<void>;
+        refreshDurable: () => Promise<unknown>;
+        pendingLeaseWakeups: () => string[];
+        dispose: () => void;
+        onClaimWake: (() => void) | null;
+        noteStoreRetryScheduled: (i: string) => void;
+        clearStoreRetry: (i: string) => void;
+      };
+      const hook2 = vi.fn();
+      box.onClaimWake = hook2;
+      // The guarded flush: suppress, and the store's boundary-failed POST has
+      // armed scheduleOutboxRetry BEFORE the epilogue runs (exactly what
+      // store.scheduleOutboxRetry does on the offline-restore failure path).
+      const token = box.beginDeliveryPass([I]);
+      box.noteStoreRetryScheduled(I);
+      // Flush epilogue: release this pass and re-judge authoritatively. The
+      // store timer owns I, so NO delivery wake may be armed (the pre-fix
+      // epilogue armed a 0 ms duplicate that broke offline restore).
+      await box.endDeliveryPasses([token]);
+      expect(box.pendingLeaseWakeups()).toEqual([]);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(hook2).not.toHaveBeenCalled();
+
+      // The store's retry timer fires and clears the marker: a later
+      // reconciliation arms the row's one wake again.
+      box.clearStoreRetry(I);
+      await box.refreshDurable();
+      expect(box.pendingLeaseWakeups()).toEqual(["cmd_g21_store_retry"]);
+      box.dispose();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
   it("GATE21 item 1a: a flush whose claim read fails once while queued past the 250 ms recovery behind a sibling-held lock re-arms ONLY from the scoped flush epilogue (R delivers via A's real timer)", async () => {
     // The gate 20 shape let a flush that posted nothing end by CLEARING the
     // suppression set: its bounded recovery read had run while its rows were

@@ -3968,8 +3968,12 @@ class HubStore {
     // Same full-jitter shape as the reconnect backoff, capped at 30 s.
     const delay = Math.floor(Math.random() * Math.min(30_000, 500 * 2 ** n));
     this.outboxRetryAttempt.set(instanceId, n + 1);
+    // The store's jittered retry owns this instance's next delivery; the
+    // outbox must not arm a parallel delivery wake from a flush epilogue.
+    this.outbox?.noteStoreRetryScheduled(instanceId);
     const timer = setTimeout(() => {
       this.outboxRetryTimer.delete(instanceId);
+      this.outbox?.clearStoreRetry(instanceId);
       // The timer is armed only by a real enqueue (authenticated UI); a stale
       // device session answers 401 and the response path handles logout.
       void this.flushAllOutbox();
@@ -3999,6 +4003,7 @@ class HubStore {
     if (t) clearTimeout(t);
     this.outboxRetryTimer.delete(instanceId);
     this.outboxRetryAttempt.delete(instanceId);
+    this.outbox?.clearStoreRetry(instanceId);
   }
 
   /** Serialise reconciliation jobs for one instance (FIFO, error-tolerant). */

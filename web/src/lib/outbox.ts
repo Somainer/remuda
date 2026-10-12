@@ -703,6 +703,17 @@ export class Outbox {
   private deliveryPasses = new Map<number, Set<Id>>();
   private nextDeliveryPassToken = 1;
   /**
+   * Instances whose next delivery is already owned by the STORE's bounded
+   * `scheduleOutboxRetry` timer (an attempted POST failed at the network
+   * boundary and the row was restored to lease-less pending). A flush
+   * epilogue must NOT additionally arm an Outbox delivery wake for such an
+   * instance — the store retry (and an online/resume flush) owns it; arming a
+   * second 0 ms wake made the offline-restore path flap wake→flush and miss
+   * the reconnect-driven delivery. The set is cleared when the store timer
+   * fires or the store tears its retry down.
+   */
+  private storeRetryPending = new Set<Id>();
+  /**
    * Single bounded READ-RETRY chain for a rejected authoritative read (timer
    * fire or store flush). The retry ends in the SAME central reconciliation;
    * teardown/dispose cancels it. `promise` lets concurrent callers coalesce.
@@ -1065,6 +1076,7 @@ export class Outbox {
     this.deliveryFailures.clear();
     this.deliveryPasses.clear();
     this.deliverySuppressed.clear();
+    this.storeRetryPending.clear();
   }
 
   /** The page stayed / was restored (BFCache): allow reconciliation again. */
@@ -1386,8 +1398,19 @@ export class Outbox {
     return (
       this.flushChain.has(instanceId) ||
       this.queuedFlush.has(instanceId) ||
-      this.deliverySuppressed.has(instanceId)
+      this.deliverySuppressed.has(instanceId) ||
+      this.storeRetryPending.has(instanceId)
     );
+  }
+
+  /** Store marks an instance whose next delivery its own retry timer owns. */
+  noteStoreRetryScheduled(instanceId: Id) {
+    this.storeRetryPending.add(instanceId);
+  }
+
+  /** Store clears the marker when its retry fires or it tears the timer down. */
+  clearStoreRetry(instanceId: Id) {
+    this.storeRetryPending.delete(instanceId);
   }
 
   /** Arm a deliver wake at the instance's current bounded backoff instant. */

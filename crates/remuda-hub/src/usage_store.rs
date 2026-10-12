@@ -138,6 +138,18 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     // c-usagefu (c): native per-model context window reported on the payload.
     crate::store::ensure_column(conn, "usage_events", "native_context_window", "INTEGER")?;
+    // c-usagefu r13 item 2 (COORDINATOR RULING U1): origin/main's projection
+    // did not persist the payload's scopeId even though main's adapter sent it
+    // and the durable JOURNAL retains it verbatim. A main-shape codex Turn row
+    // therefore arrived here with scope_id NULL; after the upgrade a byte-zero
+    // replay emits the same calls as durable Messages keyed by their native
+    // turn id, and the coverage proof pairs Message.turn_id with the Turn's
+    // scope_id — a NULL there could never match, so the Turn AND its replayed
+    // Messages would both bill. Recover scope_id from the journal for every
+    // still-unscoped usage row (Turn AND Session: main dropped it on both).
+    // Rows this branch wrote already carry it and are untouched; when no
+    // journal table exists (unit fixtures) the guard makes this a no-op.
+    backfill_scope_ids_from_journal(conn)?;
     // Now the columns exist on both a fresh CREATE and an upgraded DB.
     //
     // Dedupe indexes are scope-specific (c-ctxusage r4 item 3):
@@ -154,6 +166,54 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // crash between delete and index creation can never leave a partially
     // collapsed database. Idempotent.
     consolidate_message_duplicates(conn)?;
+    Ok(())
+}
+
+/// Recover the `scope_id` origin/main's projection dropped, from the durable
+/// journal that retained the whole event (c-usagefu r13 item 2, Ruling U1).
+///
+/// Main's [`project_usage_event`] predated the `scope_id` column: it persisted
+/// codex Turn and Session rows without the `payload.scopeId` its own adapter
+/// sent. The journal row stores the full event JSON, so the upgrade pairs a
+/// NULL-scoped usage row with its journal row `(instance_id, seq)` and reads
+/// `$.payload.scopeId` back. A post-upgrade byte-zero replay's durable Message
+/// rows link on their native turn id; without the recovered Turn scope_id the
+/// coverage proof could not match and the call would bill twice. Idempotent:
+/// only NULL `scope_id` rows are candidates, so a second migration is a no-op.
+fn backfill_scope_ids_from_journal(conn: &Connection) -> rusqlite::Result<()> {
+    // The migration runs on the store connection; unit-test fixtures create the
+    // usage_events table alone, so the update is gated on the journal table
+    // actually existing.
+    let journal_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'journal'",
+        [],
+        |row| row.get(0),
+    )?;
+    if journal_exists == 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE usage_events
+         SET scope_id = (
+             SELECT json_extract(j.payload_json, '$.payload.scopeId')
+             FROM journal j
+             WHERE j.instance_id = usage_events.instance_id
+               AND j.seq = usage_events.seq
+               AND json_valid(j.payload_json)
+               AND json_extract(j.payload_json, '$.kind') = 'usage'
+         )
+         WHERE scope_id IS NULL
+           AND EXISTS (
+               SELECT 1 FROM journal j2
+               WHERE j2.instance_id = usage_events.instance_id
+                 AND j2.seq = usage_events.seq
+                 AND json_valid(j2.payload_json)
+                 AND json_extract(j2.payload_json, '$.kind') = 'usage'
+                 AND json_extract(j2.payload_json, '$.payload.scopeId') IS NOT NULL
+           )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -1015,31 +1075,36 @@ pub enum BudgetStatus {
     Stop,
 }
 
-/// c-usagefu r11 Ruling B1, made EXACT by r12 item 4 (Ruling B2'): ONE shared
-/// eligible-FLOW relation by CALL identity, used by the rollup, both
-/// aggregates and the TPM windows.
+/// c-usagefu r13 COORDINATOR RULING U1: ONE shared eligible-FLOW relation by
+/// CALL identity, used by the rollup, both aggregates and the TPM windows.
+///
+/// U1 bounds the upgrade: usagefu never landed, so the only databases in the
+/// field are (a) those written by origin/main's schema and codex insert path
+/// (turn- and session-scope rows only, NO codex Message rows) and (b) those
+/// written by the final schema (every Message carries the durable
+/// (rollout file, byte offset) identity and its turn id). Shapes produced only
+/// by intermediate unlanded rounds are out of scope and need no reconciliation.
 ///
 /// Each native turn is counted EITHER from its Turn row OR from its Message
-/// rows, never both.
+/// rows, never both:
 ///
-/// * A MODERN Message (`turn_id` present) is counted only when either:
-///   * the turn has a Turn row AND its Messages PROVABLY cover the whole turn
-///     — EVERY counted record of the turn carries a persisted DURABLE identity
-///     (the `v2` (rollout file, byte offset) marker) and the per-bucket sums
-///     equal the Turn ([`turn_fully_covered_sql`]); or
-///   * the turn has NO Turn row and its coverage does NOT MIX legacy
-///     identities (pre-r12 fallback / native response_id) with durable ones.
-///     A turn that mixes after an upgrade byte-0 replay can never be proven
-///     to avoid double counting, so its Messages are dropped (B2'); a purely
-///     legacy turn keeps counting as before, a purely durable one normally.
-/// * A LEGACY Message has no `turn_id` (pre-r6 codex emitted a Turn for EVERY
-///   call alongside the attribution-less Message). B1 needs NO clocks: when
-///   the instance has ANY Turn row at all, every legacy Message is dropped;
-///   when the instance has NO Turn rows whatsoever, its legacy Messages are
-///   all counted. There is no timestamp window and no cross-clock comparison.
-/// * A Turn row is counted only when its Messages do NOT provably cover it
-///   completely with durable identities. A legacy-covered, partially-covered
-///   or identity-mixed turn therefore always counts from its Turn row.
+/// * A linked Message (`turn_id` present) is counted when either:
+///   * its turn has NO Turn row — a final-shape turn without a Turn row counts
+///     its durable linked Messages (a zero-token record contributes nothing);
+///     or
+///   * the Turn row EXISTS and the durable linked Messages match it on every
+///     token bucket it reports ([`turn_fully_covered_sql`]) — bucket-sum
+///     equality IS the completeness proof. A mismatch counts the Turn and drops
+///     the linked Messages.
+/// * A Message WITHOUT `turn_id` is the pre-r6 attribution-less Message: B1
+///   needs no clocks — when the instance has ANY Turn row at all every such
+///   Message is dropped; an instance with no Turn rows whatsoever counts all
+///   of them.
+/// * A Turn row is counted only when its durable linked Messages do NOT match
+///   it bucket-for-bucket. A main-shape Turn row (which main projected without
+///   a scope_id) has its scope_id backfilled from the journal at migration, so
+///   a post-upgrade byte-0 replay's durable Messages pair with it and suppress
+///   it once the sums match.
 fn eligible_flow_predicate(outer: &str) -> String {
     let cover_linked =
         turn_fully_covered_sql(&format!("{outer}.instance_id"), &format!("{outer}.turn_id"));
@@ -1047,18 +1112,15 @@ fn eligible_flow_predicate(outer: &str) -> String {
         &format!("{outer}.instance_id"),
         &format!("{outer}.scope_id"),
     );
-    let mixed_without_turn =
-        turn_identity_mixed_sql(&format!("{outer}.instance_id"), &format!("{outer}.turn_id"));
     format!(
         "(({outer}.scope = 'message' AND {outer}.turn_id IS NOT NULL
             AND (
-                (NOT EXISTS (
+                NOT EXISTS (
                     SELECT 1 FROM usage_events _ef_t
                     WHERE _ef_t.instance_id = {outer}.instance_id
                       AND _ef_t.scope = 'turn'
                       AND _ef_t.scope_id = {outer}.turn_id
                  )
-                 AND NOT ({mixed_without_turn}))
                 OR ({cover_linked})
             )
          )
@@ -1073,23 +1135,10 @@ fn eligible_flow_predicate(outer: &str) -> String {
     )
 }
 
-/// SQL boolean: the linked Message rows of turn `(inst, tid)` include BOTH a
-/// record with the durable (rollout file, byte offset) identity AND one
-/// without it (a pre-r12 fallback/native response_id identity, or a missing
-/// scope id). Ruling B2' (c-usagefu r12 item 4): such a turn mixes eras after
-/// an upgrade byte-0 replay and cannot be counted from Messages without
-/// risking a double count.
-fn turn_identity_mixed_sql(inst: &str, tid: &str) -> String {
-    format!(
-        "({has_durable} AND {has_legacy})",
-        has_durable = turn_has_durable_message_sql(inst, tid, "_mix_d"),
-        has_legacy = turn_has_nondurable_message_sql(inst, tid, "_mix_l"),
-    )
-}
-
 /// SQL boolean: at least one linked Message of `(inst, tid)` carries the
-/// persisted durable identity marker. `alias` must be unique per use inside
-/// one enclosing statement (SQLite forbids duplicate correlation aliases).
+/// persisted durable identity marker the final codex adapter mints for every
+/// counted record. `alias` must be unique per use inside one enclosing
+/// statement (SQLite forbids duplicate correlation aliases).
 fn turn_has_durable_message_sql(inst: &str, tid: &str, alias: &str) -> String {
     let marker = remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX;
     format!(
@@ -1104,48 +1153,31 @@ fn turn_has_durable_message_sql(inst: &str, tid: &str, alias: &str) -> String {
     )
 }
 
-/// SQL boolean: at least one linked Message of `(inst, tid)` LACKS the durable
-/// identity marker — a native response_id scope, a pre-r11 fallback id, or a
-/// missing scope id. Such a record cannot be proven replay-stable against the
-/// r12 adapter's (file, offset) identity.
-fn turn_has_nondurable_message_sql(inst: &str, tid: &str, alias: &str) -> String {
-    let marker = remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX;
-    format!(
-        "EXISTS (
-            SELECT 1 FROM usage_events {alias}
-            WHERE {alias}.instance_id = {inst}
-              AND {alias}.scope = 'message'
-              AND {alias}.turn_id = {tid}
-              AND ({alias}.scope_id IS NULL
-                   OR substr({alias}.scope_id, 1, {len}) != '{marker}')
-        )",
-        len = marker.len(),
-    )
-}
-
-/// True when the Messages linked to turn `(inst, tid)` PROVABLY cover the whole
-/// turn (Ruling B item 5; c-usagefu r12 item 4 makes Ruling B2' exact):
+/// True when the DURABLE linked Messages of turn `(inst, tid)` match its Turn
+/// row on every token bucket the Turn row actually reports
+/// (COORDINATOR RULING U1, c-usagefu r13 item 2).
 ///
-/// - EVERY counted record linked to the turn carries a persisted DURABLE
-///   response-level identity — the r12 `v2` (rollout file identity, byte
-///   offset) marker the adapter now mints for every token_usage_record. A
-///   single linked Message under a legacy identity (a native response_id
-///   scope, a pre-r11 fallback id, or a missing scope id) makes coverage
-///   unprovable: the turn could mix eras after an upgrade replay, so the
-///   Turn is billed and its Messages dropped. "At least one durable Message
-///   plus matching sums" is NOT sufficient (r11's looser rule suppressed
-///   Turns whose identity set could double count on replay) — existence of
-///   any durable linked Message is implied by this test;
-/// - for every TOKEN bucket the Turn row actually reports, the linked
-///   Messages' sum EQUALS it. A bucket the Turn leaves NULL (a sparse
-///   historical Turn never carried total/cache-write) cannot disprove
-///   coverage and is not compared; the Messages may additionally report
-///   buckets the Turn omitted. When a response record was not persisted the
-///   bucket sum falls short of the Turn and the Turn is billed instead.
-///   Cost is deliberately NOT part of the proof: it is a priced projection
-///   that may legitimately differ from a historical Turn, and item 6 makes
-///   cost follow the SAME eligible-flow selection (covered → Message cost;
-///   uncovered → Turn cost).
+/// Bucket-sum equality between a Turn row and its durable linked Messages IS
+/// the completeness proof:
+///
+/// - at least one linked Message carries the persisted durable (rollout file
+///   identity, byte offset) identity the final adapter mints for EVERY
+///   token_usage_record, and every bucket SUM runs over DURABLE linked
+///   Messages only. Main wrote no codex Message rows at all and the final
+///   schema writes none without the durable marker, so no per-record identity
+///   mix can occur in an in-scope database;
+/// - for every TOKEN bucket the Turn row reports, the durable Messages' sum
+///   EQUALS it. A bucket the Turn leaves NULL (a sparse historical Turn never
+///   carried total/cache-write) cannot disprove coverage and is not compared;
+///   the Messages may additionally report buckets the Turn omitted. A
+///   zero-token record contributes nothing (it adds zero to the sums), so it
+///   neither creates nor breaks equality;
+/// - when the durable sums fall short of the Turn on any reported bucket the
+///   turn is NOT covered: the Turn is billed and its linked Messages are
+///   dropped — never both.
+///
+/// Cost is deliberately NOT part of the proof: it is a priced projection that
+/// may legitimately differ from a historical Turn.
 fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
     let buckets = [
         "total_tokens",
@@ -1154,19 +1186,14 @@ fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
         "cache_read_tokens",
         "cache_write_tokens",
     ];
-    // Every linked counted record must be durable: at least one durable
-    // linked Message AND none lacking the durable marker.
-    let mut conds = vec![
-        turn_has_durable_message_sql(inst, tid, "_fc_d"),
-        format!(
-            "NOT {}",
-            turn_has_nondurable_message_sql(inst, tid, "_fc_l")
-        ),
-    ];
+    // At least one durable linked Message.
+    let mut conds = vec![turn_has_durable_message_sql(inst, tid, "_fc_d")];
     for bucket in buckets {
         // Each condition is a full OR and MUST be parenthesized: the list is
         // joined with AND, and a bare `A IS NULL OR B = C` would let AND bind
-        // tighter and silently flatten the coverage proof across buckets.
+        // tighter and silently flatten the coverage proof across buckets. The
+        // sum is scoped to DURABLE linked Messages (the marker prefix).
+        let marker = remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX;
         conds.push(format!(
             "((SELECT _fc_t.{bucket} FROM usage_events _fc_t
               WHERE _fc_t.instance_id = {inst}
@@ -1175,10 +1202,12 @@ fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
                 SELECT SUM(_fc_s.{bucket}) FROM usage_events _fc_s
                 WHERE _fc_s.instance_id = {inst}
                   AND _fc_s.scope = 'message' AND _fc_s.turn_id = {tid}
+                  AND substr(_fc_s.scope_id, 1, {len}) = '{marker}'
              ), 0)
              = (SELECT _fc_t2.{bucket} FROM usage_events _fc_t2
                 WHERE _fc_t2.instance_id = {inst}
-                  AND _fc_t2.scope = 'turn' AND _fc_t2.scope_id = {tid}))"
+                  AND _fc_t2.scope = 'turn' AND _fc_t2.scope_id = {tid}))",
+            len = marker.len(),
         ));
     }
     conds.join(" AND ")
@@ -2757,17 +2786,15 @@ mod tests {
 
     #[test]
     fn partially_covered_turn_bills_the_turn_and_a_fully_covered_one_bills_messages() {
-        // c-usagefu r10 item 5 (Ruling B), exact identity rule from r12 item 4
-        // (Ruling B2'): a Turn is suppressed in favour of its Messages only
-        // when EVERY counted record of the turn carries the persisted durable
-        // (rollout file, byte offset) identity and the sums cover the Turn.
+        // c-usagefu r13 item 2 (Ruling U1): a Turn is suppressed in favour of
+        // its Messages only when its DURABLE linked Messages match it on every
+        // token bucket (bucket-sum equality).
         //   t1: Turn 120 / $0.12 with ONE linked Message r1 = 100 / $0.10
-        //       under a LEGACY response_id identity (the other accepted 20
-        //       record was never emitted as a Message) -> coverage unprovable,
-        //       count the Turn 120 and drop r1 (never 100, never 220).
+        //       under a non-durable identity (the other accepted 20 record was
+        //       never emitted as a Message) -> the durable sum is 0, not 120:
+        //       mismatch, count the Turn 120 and drop r1 (never 100, never 220).
         //   t2: Turn 120 / $0.12 fully covered by r2a = 100 plus r2b = 20,
-        //       BOTH persisted under the r12 durable v2 identity -> bill the
-        //       two Messages, drop the Turn.
+        //       BOTH durable -> bill the two Messages, drop the Turn.
         // Both turns contribute 120 -> 240 output, $0.24.
         use remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX as M;
         let r2a = format!("{M}100:rollout-partial");
@@ -2837,26 +2864,29 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_is_suppressed_only_when_every_counted_record_has_a_durable_identity() {
-        // c-usagefu r12 item 4 (Ruling B2'): "at least one Message plus
-        // matching sums" never suppresses a Turn — EVERY counted record of
-        // the turn must carry the persisted durable (rollout file, byte
-        // offset) identity. Actual old-schema database, migrated, five turns:
+    fn bucket_sum_equality_decides_turn_suppression_and_a_no_turn_turn_counts_its_messages() {
+        // c-usagefu r13 item 2 (COORDINATOR RULING U1): the r12 identity-MIX
+        // predicate reconciled only shapes the intermediate unlanded rounds
+        // could produce, and U1 puts those out of scope. Within in-scope data
+        // bucket-sum equality between a Turn row and its DURABLE linked
+        // Messages IS the completeness proof; a mismatch counts the Turn and
+        // drops the Messages, and a turn with no Turn row counts its linked
+        // Messages. Actual old-schema database, migrated, five turns:
         //
-        //  t1 Turn 120 + linked Messages: a LEGACY response_id record 100
-        //     (stale-priced 0.99) and a DURABLE record 20 (0.02) — sums match
-        //     but identities MIX -> bill the Turn 120 / 0.12, drop both.
-        //  t2 Turn 120 + two DURABLE Messages 100+20 (0.10+0.02) -> fully
-        //     covered, suppress the Turn, bill the Messages.
-        //  t3 NO Turn row: LEGACY 50 + DURABLE 50 (an upgrade byte-0 replay
-        //     duplicated the call under a new identity) -> MIXED: drop the
-        //     Messages, count nothing (never 100).
-        //  t4 NO Turn row, one LEGACY Message 30 -> pure-legacy turn counts.
-        //  t5 NO Turn row, one DURABLE Message 70 -> modern turn counts.
+        //  t1 Turn 120 + linked Messages: a non-durable record 100 (stale-priced
+        //     0.99) and a DURABLE record 20 (0.02) -> the DURABLE sum (20) does
+        //     not match the Turn (120): bill the Turn 120 / 0.12, drop both
+        //     Messages (never the stale 0.99, never 140).
+        //  t2 Turn 120 + two DURABLE Messages 100+20 (0.10+0.02) -> sums match
+        //     bucket-for-bucket: suppress the Turn, bill the Messages.
+        //  t3 NO Turn row: a non-durable 50 and a DURABLE 50 -> U1 deletes the
+        //     mixed-identity drop; a turn without a Turn row counts its linked
+        //     Messages, so both bill (100). (The r12 assertion of a ZERO
+        //     contribution for this mixed no-Turn turn is removed by U1.)
+        //  t4 NO Turn row, one non-durable Message 30 -> counts as before.
+        //  t5 NO Turn row, one DURABLE Message 70 -> final-shape turn counts.
         //
-        // Output: 120 + 120 + 0 + 30 + 70 = 340. The r11 rule suppressed t1
-        // on sums alone (billing the stale 0.99) and counted t3 twice:
-        // 120 (msgs 1.01) + 120 + 100 + 30 + 70 = 440 / $1.15.
+        // Output: 120 + 120 + 100 + 30 + 70 = 440.
         use remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX as M;
         let d = |off: u64| format!("{M}{off}:rollout-r12-item4");
         let conn = open_old_dual_schema();
@@ -2918,32 +2948,37 @@ mod tests {
             .unwrap()
                 == 1
         };
-        // t1: the mixed turn bills its Turn and drops both Messages.
-        assert!(eligible("turn", "t1"), "mixed-identity t1 bills the Turn");
+        // t1: the durable sum mismatches the Turn -> the Turn bills and both
+        // linked Messages drop.
+        assert!(eligible("turn", "t1"), "mismatched t1 bills the Turn");
         assert!(!eligible("message", "legacy-r1"));
         assert!(!eligible("message", &d(300)));
-        // t2: every record durable -> Messages bill, Turn suppresses.
-        assert!(!eligible("turn", "t2"), "fully durable t2 suppresses Turn");
+        // t2: durable sums match -> Messages bill, Turn suppresses.
+        assert!(!eligible("turn", "t2"), "fully covered t2 suppresses Turn");
         assert!(eligible("message", &d(400)));
         assert!(eligible("message", &d(520)));
-        // t3: no Turn, mixed identities -> nothing counts.
+        // t3: no Turn row -> every linked Message counts (U1; the r12 mixed
+        // no-Turn zero contribution is gone).
         assert!(
-            !eligible("message", "legacy-r3"),
-            "mixed no-Turn turn drops"
+            eligible("message", "legacy-r3"),
+            "no-Turn t3 counts its Messages"
         );
-        assert!(!eligible("message", &d(640)));
-        // t4/t5: unmixed no-Turn turns count.
-        assert!(eligible("message", "legacy-r4"), "pure-legacy turn counts");
-        assert!(eligible("message", &d(760)), "pure-durable turn counts");
+        assert!(eligible("message", &d(640)));
+        // t4/t5: no-Turn turns count.
+        assert!(
+            eligible("message", "legacy-r4"),
+            "non-durable no-Turn turn counts"
+        );
+        assert!(eligible("message", &d(760)), "durable no-Turn turn counts");
 
         let agg = aggregate_instance(&conn, "ins_durable").unwrap();
         assert_eq!(
-            agg.output_tokens, 340,
-            "120 t1 Turn + 120 t2 Messages + 0 t3 mixed + 30 + 70"
+            agg.output_tokens, 440,
+            "120 t1 Turn + 120 t2 Messages + 100 t3 Messages + 30 + 70"
         );
         assert!(
-            (agg.cost_usd - 0.34).abs() < 1e-9,
-            "0.12 + 0.12 + 0 + 0.03 + 0.07"
+            (agg.cost_usd - 0.44).abs() < 1e-9,
+            "0.12 + 0.12 + 0.10 + 0.03 + 0.07"
         );
     }
 
@@ -3344,165 +3379,376 @@ mod tests {
     }
 
     #[test]
-    fn an_upgraded_old_database_counts_once_after_a_real_adapter_byte_zero_replay() {
-        // c-usagefu r12 item 3 (Rulings B1/B2'): an ACTUAL old-schema
-        // (pre-r6) codex database holds one Turn row per call alongside a
-        // link-less Message, keyed on the native response_id era. After
-        // migration a REAL CodexAdapter re-tails the same rollout byte zero
-        // (a restart that reclaims the file) and re-emits every record under
-        // the new durable (rollout file identity, byte offset) identities.
-        // The aggregates must count each call EXACTLY ONCE: the per-turn
-        // pairing drops the legacy link-less Messages and the Turn rows, and
-        // the durable unique index makes a second byte-0 replay a no-op.
-        use remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX;
-        use remuda_driver::adapters::{AdapterHome, CodexAdapter, FileSignalAdapter as _};
-        use remuda_protocol::{ObservationPayload, UsageScope};
+    fn a_main_shape_database_migrates_and_counts_once_after_two_real_byte_zero_replays() {
+        // c-usagefu r13 item 2 (COORDINATOR RULING U1), regression (a): the
+        // upgrade case that actually exists in the field. A database written by
+        // origin/main's REAL usage_events schema and codex insert path holds
+        // turn- and session-scope rows ONLY (main's projection persisted no
+        // scope_id, though the durable journal retained payload.scopeId).
+        // Migrate recovers the Turn scope_ids from the journal; then a REAL
+        // CodexAdapter byte-zero replay re-tails the rollout TWICE, re-emitting
+        // each call as a durable Message. Totals, cost and the TPM windows must
+        // count every call EXACTLY ONCE and omit nothing: bucket-sum equality
+        // suppresses the backfilled Turn rows in favour of the durable
+        // Messages, and the durable unique index makes the second replay a
+        // no-op.
+        use remuda_driver::adapters::{
+            AdapterHome, CodexAdapter, FileSignalAdapter, StampCtx, stamp,
+        };
+        use remuda_protocol::{InstanceId, ObservationPayload};
         use std::io::Write;
+
+        let profile = "pvp_r13main";
+        let model = "gpt-5.4";
+        let session_id = "r13main";
+        let instance_id = "ins_r13main";
+
+        // Native model-call timestamps, recent enough for BOTH TPM windows.
+        let rfc = |secs: i64| {
+            let t = time::OffsetDateTime::now_utc() - time::Duration::seconds(secs);
+            t.format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let at1 = rfc(10);
+        let at2 = rfc(20);
 
         let home_dir = tempfile::tempdir().unwrap();
         let codex_home = home_dir.path().join(".codex");
-        let session_dir = codex_home.join("sessions/2026/10/13");
-        std::fs::create_dir_all(&session_dir).unwrap();
-        let rollout = session_dir.join("rollout-r12-upgrade.jsonl");
+        let date_dir = codex_home.join("sessions/2026/10/13");
+        std::fs::create_dir_all(&date_dir).unwrap();
+        let rollout = date_dir.join(format!("rollout-{session_id}.jsonl"));
         std::fs::write(
             &rollout,
-            r#"{"ordinal":0,"type":"session_meta","payload":{"id":"r12-upgrade","session_id":"r12-upgrade","cwd":"/w","timestamp":"2026-10-13T00:00:00.000Z"}}
-"#,
+            format!(
+                "{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"session_id\":\"{session_id}\",\"cwd\":\"/w\",\"timestamp\":\"2026-10-13T00:00:00.000Z\"}}}}\n"
+            ),
         )
         .unwrap();
-        // Two calls: t1's record CARRIES a native response_id, t2's carries
-        // none. Both must get the durable (file, offset) identity.
-        let append_turn = |turn: &str, response: Option<&str>, output: u64| {
+        let append_turn = |turn: &str, input: u64, output: u64, at: &str| {
+            let total = input + output;
             let mut file = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&rollout)
                 .unwrap();
             writeln!(
                 file,
-                "{{\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"{turn}\"}}}}"
-            )
-            .unwrap();
-            let id_field = response
-                .map(|id| format!(r#","response_id":"{id}""#))
-                .unwrap_or_default();
-            writeln!(
-                file,
-                "{{\"ordinal\":2,\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"{turn}\"{id_field},\"usage\":{{\"input_tokens\":0,\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":{output},\"reasoning_output_tokens\":0,\"total_tokens\":{output}}}}}}}"
+                "{{\"ordinal\":1,\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"{turn}\",\"model\":\"{model}\"}}}}"
             )
             .unwrap();
             writeln!(
                 file,
-                "{{\"ordinal\":3,\"timestamp\":\"2026-10-13T00:00:0{}.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"{turn}\"}}}}",
-                output
+                "{{\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"{turn}\"}}}}"
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "{{\"ordinal\":3,\"timestamp\":\"{at}\",\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"{turn}\",\"response_id\":\"{turn}-r\",\"usage\":{{\"input_tokens\":{input},\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":{output},\"reasoning_output_tokens\":0,\"total_tokens\":{total}}}}}}}"
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "{{\"ordinal\":4,\"timestamp\":\"{at}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"{turn}\"}}}}"
             )
             .unwrap();
         };
-        append_turn("t1", Some("legacy-response-r1"), 100);
-        append_turn("t2", None, 20);
+        append_turn("t1", 1000, 100, &at1);
+        append_turn("t2", 500, 20, &at2);
 
-        // The OLD database: actual old-schema table, populated pre-migration
-        // with the pre-r6 shape — a Turn row AND a link-less Message per call.
-        let conn = open_old_dual_schema();
+        // Learn the counters/session stock the SAME rollout yields through the
+        // real adapter — these are exactly the per-turn Turn snapshot and the
+        // cumulative Session snapshots main's codex path wrote.
+        let mut probe = CodexAdapter::new(AdapterHome {
+            home: codex_home.clone(),
+            cwd: "/w".into(),
+            pid: None,
+            launched_at: None,
+        });
+        probe.bind_rollout(session_id, rollout.clone());
+        let observed = probe.poll().unwrap();
+        let stamp_ctx = StampCtx {
+            instance_id: InstanceId::new(),
+            host_id: remuda_protocol::HostId::new(),
+            journal_id: remuda_protocol::Id::new("obj").unwrap(),
+            run_id: remuda_protocol::RunId::new(),
+            session_id: session_id.into(),
+        };
+        let mut projected: Vec<(String, Option<String>, UsageEventRow)> = Vec::new();
+        for (i, obs) in observed.iter().enumerate() {
+            let ObservationPayload::Usage(_) = &obs.payload else {
+                continue;
+            };
+            let stamped = stamp(&stamp_ctx, i as u64 + 1, obs).unwrap();
+            let event = serde_json::to_value(&stamped).unwrap();
+            let rec = JournalRecord {
+                instance_id: instance_id.into(),
+                seq: i as i64 + 1,
+                event_id: stamped.event_id.as_id().as_str().to_owned(),
+                event,
+                observed_at: at1.clone(),
+            };
+            let row = project_usage_event(&rec, Some(profile), Some(model)).unwrap();
+            let scope = row.scope.clone();
+            let turn = row.turn_id.clone();
+            projected.push((scope, turn, row));
+        }
+        let messages: Vec<&UsageEventRow> = projected
+            .iter()
+            .filter(|(scope, _, _)| scope == "message")
+            .map(|(_, _, row)| row)
+            .collect();
+        let sessions: Vec<&UsageEventRow> = projected
+            .iter()
+            .filter(|(scope, _, _)| scope == "session")
+            .map(|(_, _, row)| row)
+            .collect();
+        assert_eq!(messages.len(), 2, "one Message per call");
+        assert_eq!(
+            sessions.len(),
+            2,
+            "one cumulative Session snapshot per call"
+        );
+        let t1_msg = messages[0];
+        let t2_msg = messages[1];
+        let sess1 = sessions[0];
+        let sess2 = sessions[1];
+        let expected_output = t1_msg.output_tokens.unwrap() + t2_msg.output_tokens.unwrap();
+        let expected_input = t1_msg.input_tokens.unwrap() + t2_msg.input_tokens.unwrap();
+        let expected_cost: f64 = messages
+            .iter()
+            .map(|row| {
+                row.cost_usd
+                    .as_deref()
+                    .unwrap_or("0")
+                    .parse::<f64>()
+                    .unwrap()
+            })
+            .sum();
+
+        // --- The FIELD database: origin/main's REAL schema ------------------
+        let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "INSERT INTO usage_events
-                (instance_id, seq, scope, scope_id, turn_id, mode,
-                 total_tokens, output_tokens, cost_usd, observed_at,
-                 observed_at_source, profile_id, model)
-             VALUES
-                ('ins_upgrade', 1, 'turn', 't1', 't1', 'snapshot',
-                 100, 100, '0.10', '2026-10-13T00:00:01.000Z', 'native',
-                 'pvp_upgrade', 'gpt-5.4'),
-                ('ins_upgrade', 2, 'message', 'legacy-response-r1', NULL,
-                 'snapshot', 100, 100, '0.10',
-                 '2026-10-13T00:00:01.100Z', 'native', 'pvp_upgrade',
-                 'gpt-5.4'),
-                ('ins_upgrade', 3, 'turn', 't2', 't2', 'snapshot',
-                 20, 20, '0.02', '2026-10-13T00:00:02.000Z', 'native',
-                 'pvp_upgrade', 'gpt-5.4'),
-                ('ins_upgrade', 4, 'message', 'legacy-response-r2', NULL,
-                 'snapshot', 20, 20, '0.02',
-                 '2026-10-13T00:00:02.100Z', 'native', 'pvp_upgrade',
-                 'gpt-5.4');",
+            "CREATE TABLE journal (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (instance_id, seq)
+             );
+             CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (instance_id, seq)
+             );",
         )
         .unwrap();
-        migrate(&conn).unwrap();
 
-        // Real adapter byte-zero replay (the restart/reclaim path), draining
-        // through the PUBLIC ingest functions so the durable unique index
-        // participates — not a test insert bypass.
+        // Main's journal retained the WHOLE event, including the scopeId main's
+        // projection then dropped. Only payload.scopeId matters to the
+        // migration, so the fixture journal rows carry just that envelope.
+        conn.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, 1, 'je1', ?2, ?3), (?1, 2, 'je2', ?4, ?3),
+                    (?1, 3, 'je3', ?5, ?6), (?1, 4, 'je4', ?7, ?6)",
+            params![
+                instance_id,
+                json!({"kind":"usage","payload":{"scope":"turn","scopeId":"t1"}}).to_string(),
+                at1,
+                json!({"kind":"usage","payload":{"scope":"session","scopeId":session_id}})
+                    .to_string(),
+                json!({"kind":"usage","payload":{"scope":"turn","scopeId":"t2"}}).to_string(),
+                at2,
+                json!({"kind":"usage","payload":{"scope":"session","scopeId":session_id}})
+                    .to_string(),
+            ],
+        )
+        .unwrap();
+
+        // Main's insert path: one Turn row per call (NO scope_id/turn_id
+        // columns persisted) and one cumulative Session snapshot per call,
+        // counters equal to the real per-turn totals / cumulative stock.
+        let insert_main_row = |seq: i64, scope: &str, r: &UsageEventRow| {
+            conn.execute(
+                "INSERT INTO usage_events
+                    (instance_id, seq, profile_id, model, scope, mode,
+                     total_tokens, input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens, cost_usd,
+                     accounting, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'snapshot', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    instance_id,
+                    seq,
+                    profile,
+                    model,
+                    scope,
+                    r.total_tokens,
+                    r.input_tokens,
+                    r.output_tokens,
+                    r.cache_read_tokens,
+                    r.cache_write_tokens,
+                    r.cost_usd,
+                    r.accounting,
+                    r.observed_at,
+                ],
+            )
+            .unwrap();
+        };
+        insert_main_row(1, "turn", t1_msg);
+        insert_main_row(2, "session", sess1);
+        insert_main_row(3, "turn", t2_msg);
+        insert_main_row(4, "session", sess2);
+
+        // --- Upgrade: the migration under test ------------------------------
+        migrate(&conn).unwrap();
+        let backfilled: Vec<(String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare("SELECT scope, scope_id FROM usage_events ORDER BY seq")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            backfilled,
+            vec![
+                ("turn".to_string(), Some("t1".to_string())),
+                ("session".to_string(), Some(session_id.to_string())),
+                ("turn".to_string(), Some("t2".to_string())),
+                ("session".to_string(), Some(session_id.to_string())),
+            ],
+            "main's dropped scopeId is recovered from the journal"
+        );
+
+        // The probe held the process-wide rollout claim; release it before the
+        // byte-zero replay adapters bind (exactly the restart/reclaim handoff).
+        drop(probe);
+        // --- Two real byte-zero replays through the PUBLIC ingest path ------
         let mut seq = 100i64;
-        let drain = |seq: &mut i64| {
+        for replay in 1..=2 {
             let mut adapter = CodexAdapter::new(AdapterHome {
                 home: codex_home.clone(),
                 cwd: "/w".into(),
                 pid: None,
                 launched_at: None,
-            })
-            .with_instance_key(Some("r12-upgrade-instance".to_owned()));
-            adapter.bind_rollout("r12-upgrade", rollout.clone());
-            let mut emitted = Vec::new();
-            for observed in adapter.poll().unwrap() {
-                let turn_id = observed.turn_id.clone();
-                let ObservationPayload::Usage(payload) = observed.payload else {
+            });
+            adapter.bind_rollout(session_id, rollout.clone());
+            let polled = adapter.poll().unwrap();
+            for obs in polled {
+                let ObservationPayload::Usage(_) = &obs.payload else {
                     continue;
                 };
-                if payload.scope != UsageScope::Message {
-                    continue;
-                }
-                emitted.push(payload.scope_id.clone());
+                let stamped = stamp(&stamp_ctx, seq as u64 + 1, &obs).unwrap();
+                let event = serde_json::to_value(&stamped).unwrap();
                 let rec = JournalRecord {
-                    instance_id: "ins_upgrade".into(),
-                    seq: *seq,
-                    event_id: format!("evt_upgrade_{seq}"),
-                    event: json!({
-                        "kind": "usage",
-                        "payload": serde_json::to_value(&payload).unwrap(),
-                        "source": turn_id
-                            .map(|t| json!({"nativeTurnId": {"value": t}}))
-                            .unwrap_or_else(|| json!({})),
-                    }),
-                    observed_at: "2026-10-13T00:00:03.000Z".into(),
+                    instance_id: instance_id.into(),
+                    seq,
+                    event_id: format!("je_replay_{replay}_{seq}"),
+                    event,
+                    observed_at: "2026-10-13T01:00:00.000Z".into(),
                 };
-                let row = project_usage_event(&rec, None, None).unwrap();
+                let row = project_usage_event(&rec, Some(profile), Some(model)).unwrap();
                 insert_usage_event(&conn, &row).unwrap();
-                *seq += 1;
+                seq += 1;
             }
-            emitted
-        };
-
-        let first_ids = drain(&mut seq);
-        assert_eq!(first_ids.len(), 2, "both calls re-emit one Message each");
-        for id in &first_ids {
-            assert!(
-                id.starts_with(CODEX_DURABLE_RESPONSE_SCOPE_PREFIX),
-                "B2': every counted record — response_id or not — uses the \
-                 durable (file, offset) identity, got {id}"
-            );
         }
-        let second_ids = drain(&mut seq);
-        assert!(
-            second_ids.len() == 2,
-            "the adapter emits the records again on a second byte-0 replay"
-        );
-        let rows_after_replay: i64 = conn
+
+        let durable_messages: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM usage_events
-                 WHERE instance_id='ins_upgrade' AND scope='message'
-                   AND scope_id LIKE ?1",
-                [format!("{CODEX_DURABLE_RESPONSE_SCOPE_PREFIX}%")],
-                |r| r.get(0),
+                 WHERE instance_id = ?1 AND scope = 'message'",
+                [instance_id],
+                |row| row.get(0),
             )
             .unwrap();
         assert_eq!(
-            rows_after_replay, 2,
-            "both byte-0 replays persist the SAME two durable rows, not four"
+            durable_messages, 2,
+            "two replays persist the same two Messages"
         );
-
-        let agg = aggregate_instance(&conn, "ins_upgrade").unwrap();
+        let eligible_turns: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM usage_events
+                     WHERE instance_id = ?1 AND scope = 'turn' AND {p}",
+                    p = eligible_flow_predicate("usage_events")
+                ),
+                [instance_id],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(
-            agg.output_tokens, 120,
+            eligible_turns, 0,
+            "bucket-sum equality suppresses both Turns"
+        );
+        let eligible_messages: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM usage_events
+                     WHERE instance_id = ?1 AND scope = 'message' AND {p}",
+                    p = eligible_flow_predicate("usage_events")
+                ),
+                [instance_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(eligible_messages, 2, "each call's durable Message counts");
+
+        let agg = aggregate_instance(&conn, instance_id).unwrap();
+        assert_eq!(agg.input_tokens, expected_input, "both calls' input, once");
+        assert_eq!(
+            agg.output_tokens, expected_output,
             "100 + 20 counted once: no Turn+Message pair, no replay duplicate"
         );
+        assert!(
+            (agg.cost_usd - expected_cost).abs() < 1e-9,
+            "cost is the two Messages' priced sum once, got {} want {expected_cost}",
+            agg.cost_usd
+        );
+        let supply = aggregate_supply(&conn, profile, model).unwrap();
+        assert_eq!(supply.output_tokens, expected_output);
+        assert!((supply.cost_usd - expected_cost).abs() < 1e-9);
+
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id,
+                kind: "codex",
+                spec_model: Some(model),
+                effective_model: None,
+                profile_id: Some(profile),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rollup.turns, 2, "TPM turn count: each call once");
+        assert_eq!(
+            rollup.session_output_tokens,
+            Some(expected_output),
+            "totals are the Message flow, never the Turn rows on top"
+        );
+        assert_eq!(
+            rollup.tpm_out_60s,
+            Some(expected_output),
+            "native Messages inside the 60 s window count each call once"
+        );
+        assert_eq!(
+            rollup.tpm_out_5m,
+            Some((expected_output as f64 / 5.0).round() as i64),
+            "5 m per-minute average likewise counts each call once"
+        );
+        assert_eq!(rollup.tpm_in_60s, Some(expected_input));
     }
 
     #[test]

@@ -3130,22 +3130,28 @@ impl TranscriptMapper {
                 if pending.request.command_word() != args {
                     return false;
                 }
-                // c-effortread r15 item 4 / r16 item 1: matching command
+                // c-effortread r15 item 4 / r16 items 1/3: matching command
                 // content is not enough — the slash must also have SUBMISSION
-                // PROVENANCE: a verified transcript position at or after this
-                // switch's pre-submit EOF. The floor is the file length L
-                // captured immediately before submission, and the command's
-                // OWN record is appended starting exactly at byte L, so the
-                // boundary belongs to the switch (strict `>` rejected B's own
-                // legitimate slash — r16 item 1). Only an older same-word slash
-                // the pump had not read yet, starting BELOW that floor, is
-                // treated as a human/replaced command, so its old refusal/
-                // acceptance can never settle this request. When either side
-                // lacks a position (direct unit tests) the word match alone
-                // governs.
-                pending
-                    .submit_floor
-                    .is_none_or(|floor| position.is_some_and(|record_pos| record_pos >= floor))
+                // PROVENANCE. With a verified floor L (the file length captured
+                // immediately before submission) only a record starting at or
+                // after L can be this switch: the command's OWN record starts
+                // exactly at byte L (r16 item 1), while an older same-word
+                // slash the pump had not read yet starts BELOW L and is treated
+                // as a human/replaced command. When the carrier reports
+                // provenance UNAVAILABLE (stat failed / no bound transcript),
+                // NOTHING is attributed — the request ends through its own
+                // timeout/unconfirmed path rather than by word-only matching
+                // (r16 item 3). When either side lacks provenance (direct unit
+                // tests via the test-only `arm`) the word match alone governs.
+                pending.submit_floor.as_ref().is_none_or(|provenance| {
+                    use crate::effort::SubmissionProvenance;
+                    match provenance {
+                        SubmissionProvenance::Floor(floor) => {
+                            position.is_some_and(|record_pos| record_pos >= *floor)
+                        }
+                        SubmissionProvenance::Unavailable => false,
+                    }
+                })
             });
             // A slash read off an unverified/displaced batch cannot belong to
             // this process: arm neither the generation nor the level await, so

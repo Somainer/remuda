@@ -1843,6 +1843,22 @@ pub(crate) fn dummy_digest() -> DriverResult<Digest> {
     .map_err(DriverError::Protocol)
 }
 
+/// Resolve the Herdr carrier's pre-submission provenance from its bound
+/// transcript path (c-effortread r16 item 3): a successful stat is the
+/// verified pre-submit EOF the switch's own slash is appended AT; no binding
+/// or a failed stat (the file was rotated/removed between bind and submit) is
+/// explicit provenance loss, never a word-only fallback.
+fn herdr_submission_provenance(path: Option<&str>) -> crate::effort::SubmissionProvenance {
+    use crate::effort::SubmissionProvenance;
+    match path {
+        Some(path) => match std::fs::metadata(path) {
+            Ok(metadata) => SubmissionProvenance::Floor(metadata.len()),
+            Err(_) => SubmissionProvenance::Unavailable,
+        },
+        None => SubmissionProvenance::Unavailable,
+    }
+}
+
 /// §9.1 [`crate::effort::EffortSwitchIo`] backed by a Herdr pane.
 struct HerdrEffortIo {
     client: Client,
@@ -1899,13 +1915,18 @@ impl crate::effort::EffortSwitchIo for HerdrEffortIo {
         Ok(read.text().to_owned())
     }
 
-    async fn submission_floor(&self) -> Option<u64> {
+    async fn submission_floor(&self) -> crate::effort::SubmissionProvenance {
         // The bound transcript's EOF immediately before submission: the
         // switch's own slash is appended starting AT this position, so only a
         // record that starts at or after it can be this switch's command
-        // (c-effortread r15 item 4, r16 item 1).
-        let path = self.transcript_path.lock().ok()?.clone()?;
-        std::fs::metadata(path).ok().map(|metadata| metadata.len())
+        // (c-effortread r15 item 4, r16 item 1). A missing binding or a failed
+        // stat is explicit provenance loss (r16 item 3): the mapper attributes
+        // nothing rather than falling back to word-only matching.
+        let path = match self.transcript_path.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        herdr_submission_provenance(path.as_deref())
     }
 
     async fn journal_effort(&self, status: String, severity: Severity, request_id: Option<String>) {
@@ -3019,7 +3040,7 @@ mod tests {
     /// pre-submission one. Only records starting BELOW L are excluded.
     #[tokio::test]
     async fn r16_item1_a_slash_appended_exactly_at_the_pre_submit_eof_claims_its_switch() {
-        use crate::effort::{EffortBridge, EffortRequest};
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
 
         // A REAL transcript file: the offsets below are its measured byte
         // lengths, not magic constants.
@@ -3072,7 +3093,7 @@ mod tests {
         let request_b = EffortRequest::from_level("max")
             .expect("max")
             .with_request_id(Some("req-b"));
-        let gen_b = bridge.arm_with_floor(request_b, Some(floor));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(floor)));
 
         // B's own command is appended to the file IMMEDIATELY AT L: the next
         // record after a length-L file starts at byte L, so its verified
@@ -3153,7 +3174,7 @@ mod tests {
     /// Kept refusal answers the unowned slot, B's own acceptance answers B.
     #[tokio::test]
     async fn r16_item2_a_pre_floor_slash_keeps_a_fifo_slot_so_its_verdict_never_consumes_b() {
-        use crate::effort::{EffortBridge, EffortRequest};
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
 
         let bridge = Arc::new(EffortBridge::new());
         let mut mapper = TranscriptMapper::new(
@@ -3171,7 +3192,7 @@ mod tests {
         let request_b = EffortRequest::from_level("max")
             .expect("max")
             .with_request_id(Some("req-b"));
-        let gen_b = bridge.arm_with_floor(request_b, Some(1000));
+        let gen_b = bridge.arm_with_floor(request_b, Some(SubmissionProvenance::Floor(1000)));
 
         // The pump catches up an OLDER same-word slash sitting below the floor.
         mapper
@@ -3230,6 +3251,115 @@ mod tests {
             .expect("B's verdict emits an effort edge");
         assert_eq!(edge_b.request_id.as_deref(), Some("req-b"));
         assert!(!bridge.has_pending(), "B's own verdict settles B");
+    }
+
+    /// c-effortread r16 item 3: when the carrier's floor lookup FAILS (the
+    /// bound transcript was rotated/removed or the stat errors), production no
+    /// longer falls back to word-only attribution. The switch is armed with
+    /// explicit "provenance unavailable" and the mapper attributes NOTHING to
+    /// it, so an unread older same-word slash with a delayed refusal — and even
+    /// the switch's own read-back restored afterwards — can never settle B; the
+    /// request ends through its own bounded no-readback/unconfirmed path.
+    #[tokio::test]
+    async fn r16_item3_a_failed_floor_lookup_attributes_nothing_to_the_request() {
+        use crate::effort::{EffortBridge, EffortRequest, SubmissionProvenance};
+
+        // Exercise the carrier's REAL lookup seam against a REAL file.
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("effort-session.jsonl");
+        std::fs::write(&path, "a bound transcript the pump is following\n").expect("seed");
+        let present = herdr_submission_provenance(Some(path.to_string_lossy().as_ref()));
+        assert!(
+            matches!(present, SubmissionProvenance::Floor(_)),
+            "a successful stat is a verified floor"
+        );
+        // The bound file disappears (rotation/cleanup) immediately before the
+        // switch would stat it: the lookup fails.
+        std::fs::remove_file(&path).expect("rotate the transcript away");
+        let provenance = herdr_submission_provenance(Some(path.to_string_lossy().as_ref()));
+        assert!(
+            matches!(provenance, SubmissionProvenance::Unavailable),
+            "a failed stat is explicit provenance loss, never word-only"
+        );
+
+        let bridge = Arc::new(EffortBridge::new());
+        let mut mapper = TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "effort-session".into(),
+            "2.1.289".into(),
+        )
+        .with_effort_bridge(Arc::clone(&bridge) as Arc<EffortBridge>, None);
+
+        // B is armed THROUGH the production seam with the failed provenance.
+        let request_b = EffortRequest::from_level("max")
+            .expect("max")
+            .with_request_id(Some("req-b"));
+        let gen_b = bridge.arm_with_floor(request_b, Some(provenance));
+
+        // The pump restores an unread OLD same-word slash plus its refusal.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-old", "max"), Some(500))
+            .expect("map old slash");
+        let old_verdict = mapper
+            .map_line_at(
+                &effort_stdout_line("out-old", "Kept effort level as high"),
+                Some(600),
+            )
+            .expect("map old refusal");
+        assert!(
+            old_verdict
+                .iter()
+                .all(|obs| !matches!(obs.body, ObservationPayload::Effort(_))),
+            "the old refusal emits no request edge"
+        );
+        assert!(
+            bridge.has_pending(),
+            "the restored old refusal never rejects B"
+        );
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "nothing resolves B"
+        );
+
+        // Even B's OWN post-submission slash and accepted verdict attribute
+        // NOTHING while provenance is unavailable: the edge carries no request
+        // id and the bridge stays unresolved for the bounded timeout.
+        mapper
+            .map_line_at(&effort_slash_line("cmd-b", "max"), Some(1500))
+            .expect("map B slash");
+        let out_b = mapper
+            .map_line_at(
+                &effort_stdout_line("out-b", "Set effort level to max"),
+                Some(1600),
+            )
+            .expect("map B verdict");
+        let b_edge = out_b
+            .iter()
+            .find_map(|obs| match &obs.body {
+                ObservationPayload::Effort(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("the human-path edge still reflects the transcript");
+        assert_eq!(
+            b_edge.request_id.as_deref(),
+            None,
+            "no read-back is attributed to B under provenance loss"
+        );
+        assert!(bridge.has_pending(), "B is not settled by any read-back");
+        assert!(
+            bridge
+                .wait(gen_b, std::time::Duration::from_millis(40))
+                .await
+                .is_none(),
+            "B ends through its own timeout/unconfirmed path"
+        );
     }
 
     /// c-r3 item 4: the claude-pty transcript pump driven through its REAL

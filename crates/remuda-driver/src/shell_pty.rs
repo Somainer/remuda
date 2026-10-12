@@ -3506,15 +3506,21 @@ impl crate::effort::EffortSwitchIo for ShellEffortIo {
         Ok(self.state.screen_grid().text())
     }
 
-    async fn submission_floor(&self) -> Option<u64> {
+    async fn submission_floor(&self) -> crate::effort::SubmissionProvenance {
+        use crate::effort::SubmissionProvenance;
         // The hydrator follows the same binding; stat the bound transcript's
         // current EOF so the switch's own slash (appended starting AT this
         // offset) attributes to the switch while an older unread slash cannot
-        // (c-effortread r15 item 4, r16 item 1).
-        let binding = self.bindings.binding()?;
-        std::fs::metadata(binding.path)
-            .ok()
-            .map(|metadata| metadata.len())
+        // (c-effortread r15 item 4, r16 item 1). No binding or a failed stat is
+        // explicit provenance loss (r16 item 3): attribute nothing rather than
+        // falling back to word-only matching.
+        let Some(binding) = self.bindings.binding() else {
+            return SubmissionProvenance::Unavailable;
+        };
+        match std::fs::metadata(binding.path) {
+            Ok(metadata) => SubmissionProvenance::Floor(metadata.len()),
+            Err(_) => SubmissionProvenance::Unavailable,
+        }
     }
 
     async fn journal_effort(

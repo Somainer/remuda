@@ -605,18 +605,34 @@ pub(crate) struct EffortBridge {
     notify: Notify,
 }
 
+/// Verified submission provenance captured immediately BEFORE an effort
+/// command is typed (c-effortread r16 item 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmissionProvenance {
+    /// The bound transcript EOF was verified immediately before submission:
+    /// the mapper attributes only slash records starting at or after this byte
+    /// offset (the command's own record starts exactly at the file length).
+    Floor(u64),
+    /// The carrier could NOT verify a floor (no bound transcript, or the stat
+    /// failed — a rotated/removed file). The mapper attributes NOTHING to the
+    /// switch: neither a restored older same-word command nor the switch's own
+    /// read-back can settle it. The switch still types and the command can
+    /// apply in the TUI, but the request ends through its own bounded
+    /// no-readback/unconfirmed path — never by word-only matching.
+    Unavailable,
+}
+
 /// An armed switch awaiting its transcript verdict.
 #[derive(Clone)]
 pub(crate) struct PendingSwitch {
     pub(crate) generation: u64,
     pub(crate) request: EffortRequest,
-    /// c-effortread r15 item 4, r16 item 1: verified transcript byte position
-    /// captured immediately BEFORE the command was submitted (the bound file's
-    /// EOF at that instant). The mapper attributes a slash record to the
-    /// switch only when it starts AT OR AFTER this position — the switch's own
-    /// record starts exactly at this file length; `None` when the carrier
-    /// cannot supply a transcript position (direct unit tests).
-    pub(crate) submit_floor: Option<u64>,
+    /// c-effortread r15 item 4, r16 items 1/3: submission provenance captured
+    /// immediately BEFORE the command was submitted. `Some(Floor(L))`
+    /// attributes a slash record to the switch only when it starts at or after
+    /// L; `Some(Unavailable)` attributes nothing; `None` is the direct-unit-test
+    /// seam ([`EffortBridge::arm`]) where the word match alone governs.
+    pub(crate) submit_floor: Option<SubmissionProvenance>,
 }
 
 #[derive(Default)]
@@ -676,10 +692,15 @@ impl EffortBridge {
         self.arm_with_floor(request, None)
     }
 
-    /// Arm a switch with the verified transcript EOF captured immediately
-    /// before its command was submitted (c-effortread r15 item 4, r16 item 1:
-    /// the switch's own slash starts AT this offset, not strictly past it).
-    pub(crate) fn arm_with_floor(&self, request: EffortRequest, submit_floor: Option<u64>) -> u64 {
+    /// Arm a switch with the submission provenance captured immediately before
+    /// its command was submitted (c-effortread r15 item 4, r16 items 1/3): a
+    /// verified floor the switch's own slash starts AT, or explicit provenance
+    /// loss under which the mapper attributes nothing.
+    pub(crate) fn arm_with_floor(
+        &self,
+        request: EffortRequest,
+        submit_floor: Option<SubmissionProvenance>,
+    ) -> u64 {
         let mut state = self.lock();
         state.generation += 1;
         let generation = state.generation;
@@ -860,16 +881,19 @@ pub(crate) trait EffortSwitchIo: Send + Sync {
     /// Current visible screen text, ANSI stripped.
     async fn screen_text(&self) -> crate::DriverResult<String>;
 
-    /// c-effortread r15 item 4, r16 item 1: verified transcript byte position
-    /// captured immediately BEFORE the command is submitted — the bound
-    /// transcript file's EOF at that instant. The mapper attributes a slash
-    /// record to this switch only when it starts AT OR AFTER this position:
-    /// the switch's own record is appended starting exactly at this offset,
-    /// while an older same-word slash the pump had not read yet starts below
-    /// it and can never claim the switch. `None` when no transcript position
-    /// is available.
-    async fn submission_floor(&self) -> Option<u64> {
-        None
+    /// c-effortread r15 item 4, r16 items 1/3: submission provenance captured
+    /// immediately BEFORE the command is typed. A verified [`Floor`] is the
+    /// bound transcript's EOF (the command's own slash is appended starting at
+    /// that offset); [`Unavailable`] means the carrier could not verify a
+    /// floor, in which case the mapper attributes no slash record to this
+    /// switch and it ends through its bounded no-readback path. Production
+    /// carriers always implement this; the test mock defaults to
+    /// [`Unavailable`] (it resolves the bridge directly, never via the mapper).
+    ///
+    /// [`Floor`]: SubmissionProvenance::Floor
+    /// [`Unavailable`]: SubmissionProvenance::Unavailable
+    async fn submission_floor(&self) -> SubmissionProvenance {
+        SubmissionProvenance::Unavailable
     }
 
     /// Journal an `instance.configure` effort lifecycle from the worker.
@@ -924,8 +948,10 @@ pub(crate) async fn perform_switch(
     // this generation (c-effortread r15 item 4, r16 item 1): the command's own
     // record is appended starting exactly at this offset; an older same-word
     // slash still unread by the pump when this request was armed starts below
-    // it and can never claim it.
-    let submit_floor = io.submission_floor().await;
+    // it and can never claim it. When the carrier cannot verify a floor the
+    // mapper attributes NOTHING and the switch ends on its bounded read-back
+    // wait (c-effortread r16 item 3).
+    let submit_floor = Some(io.submission_floor().await);
     let generation = bridge.arm_with_floor(request.clone(), submit_floor);
 
     // Snapshot before typing: a dialog the previous switch left rendered is

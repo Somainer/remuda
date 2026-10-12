@@ -5169,6 +5169,21 @@ mod tests {
             &mut withdrawn_sessions,
             &mut active_session,
         ));
+        // c-effortread r12 item 7: assert the classified mode IMMEDIATELY at
+        // the seam. Without this, deleting the record() inside
+        // apply_native_session_binding was masked — maintain_binding
+        // re-classifies before the later hydrator assertion runs. The startup
+        // source is the launch session's own FIRST record → Fresh, not rebound.
+        let launch_mode_at_seam = session_modes
+            .mode_for(7, CORRECT)
+            .expect("the launch seam records a mode before maintain_binding");
+        assert!(
+            matches!(
+                launch_mode_at_seam.mode,
+                crate::claude_transcript::ResumeMode::Fresh
+            ) && !launch_mode_at_seam.rebound,
+            "startup source classifies the launch session Fresh at the seam: {launch_mode_at_seam:?}"
+        );
         maintain_binding(
             &bindings,
             &fx.ctx,
@@ -5213,6 +5228,20 @@ mod tests {
             &mut withdrawn_sessions,
             &mut active_session,
         ));
+        // r12 item 7: the /clear seam records Z as a Fresh REBOUND at the seam
+        // itself — a later record for the same pid — before maintain_binding
+        // opens anything. Deleting the seam record must fail here even though
+        // the final hydration below happens to open Fresh anyway.
+        let clear_mode_at_seam = session_modes
+            .mode_for(7, "clear-z")
+            .expect("the /clear seam records Z's mode before maintain_binding");
+        assert!(
+            matches!(
+                clear_mode_at_seam.mode,
+                crate::claude_transcript::ResumeMode::Fresh
+            ) && clear_mode_at_seam.rebound,
+            "clear source classifies Z as a Fresh rebound at the seam: {clear_mode_at_seam:?}"
+        );
         // The production loop arm on a rebind/first-claim: drop the previous
         // session's hydrator and its one-shot announce.
         hydrator = None;

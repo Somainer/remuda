@@ -251,8 +251,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stalled_consumer_caps_the_queue_and_drain_resumes_collection() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_consumer_caps_the_queue_and_drain_resumes_collection() {
         let notify = Arc::new(Notify::new());
         let queue = Arc::new(BoundedPending::<usize>::new(3, Arc::clone(&notify)));
         // One TYPED acknowledgement channel: Parked when the producer wants
@@ -260,38 +260,61 @@ mod tests {
         // no separate finished flag a caller could store only afterwards.
         let (event_tx, event_rx) = channel();
         queue.set_event_barrier(event_tx);
+
+        // Start ONLY the producer: with no consumer it fills the queue and
+        // parks on the capacity wait, making the first Parked a live snapshot.
         let producer_queue = Arc::clone(&queue);
         let producer = std::thread::spawn(move || {
             producer_queue.push_all_blocking(0..6);
         });
 
-        let mut delivered = Vec::new();
-        let mut saw_capacity_park = false;
-        // recv_event returns Parked or Done (it panics on a timeout or a
-        // closed channel): drain after every Parked and exit exactly on the
-        // producer's Done - the typed event IS the completion proof.
-        while let ProducerEvent::Parked = recv_event(&event_rx, "producer never parked or finished")
-        {
-            assert!(
-                queue.producer_parked(),
-                "a Parked event means the producer holds frames at capacity"
-            );
-            if !saw_capacity_park {
-                assert_eq!(queue.len(), 3, "parked at exactly the capacity");
-                saw_capacity_park = true;
-            }
-            while let Some(frame) = queue.pop_for_send() {
-                delivered.push(frame);
-            }
-        }
-        while let Some(frame) = queue.pop_for_send() {
-            delivered.push(frame);
-        }
-        join_bounded(producer, "producer thread never returned");
-        assert!(
-            saw_capacity_park,
-            "the producer never exercised the capacity park"
+        // The FIRST Parked is the only event asserted against the producer's
+        // CURRENT state: it is sent while the producer holds the queue lock at
+        // capacity, so waiting == 1 and len == capacity when it is received.
+        // No consumer drains before this snapshot.
+        assert_eq!(
+            recv_event(&event_rx, "producer never parked or finished"),
+            ProducerEvent::Parked
         );
+        assert!(
+            queue.producer_parked(),
+            "the first Parked means the producer holds frames at capacity"
+        );
+        assert_eq!(queue.len(), 3, "parked at exactly the capacity");
+
+        // Only now start a real flusher (woken solely by the queue-integrated
+        // Notify); the producer runs to completion. Later Parked events may
+        // already be BUFFERED in the channel by then - they are HISTORY: a
+        // Parked only proves the producer parked at some point in the past,
+        // never that it is parked now. Joining before reading them makes that
+        // buffering deterministic instead of a load-dependent race (the old
+        // test asserted producer_parked()/len() on every buffered Parked and
+        // could fail on correct behaviour, c-ctxusage r12 item 4).
+        let drainer_queue = Arc::clone(&queue);
+        let drainer_notify = Arc::clone(&notify);
+        let drainer = tokio::spawn(async move {
+            let mut delivered = Vec::new();
+            while delivered.len() < 6 {
+                drainer_notify.notified().await;
+                while let Some(frame) = drainer_queue.pop_for_send() {
+                    delivered.push(frame);
+                }
+            }
+            delivered
+        });
+        join_bounded(producer, "producer thread never returned");
+        let mut parks = 1u32;
+        loop {
+            match recv_event(&event_rx, "producer event stream ended without Done") {
+                ProducerEvent::Parked => parks += 1,
+                ProducerEvent::Done => break,
+            }
+        }
+        let delivered = tokio::time::timeout(Duration::from_secs(10), drainer)
+            .await
+            .expect("drainer task never finished")
+            .expect("drainer panicked");
+        assert!(parks >= 1, "the producer never exercised the capacity park");
         assert_eq!(delivered, vec![0, 1, 2, 3, 4, 5]);
     }
 
@@ -356,7 +379,12 @@ mod tests {
             }
             delivered
         });
-        entered.wait().await;
+        // Bounded rendezvous: a consumer that never reaches the
+        // notified().await park must fail here instead of hanging the binary
+        // (c-ctxusage r12 item 4).
+        tokio::time::timeout(Duration::from_secs(10), entered.wait())
+            .await
+            .expect("consumer never reached its notified().await park");
 
         let producer_queue = Arc::clone(&queue);
         let producer = std::thread::spawn(move || {

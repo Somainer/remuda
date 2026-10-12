@@ -368,7 +368,9 @@ impl EffortRequest {
     /// - Coupled (2.1.203–2.1.283): a flag-on request is the single bare
     ///   `/effort ultracode` — on those builds that word IS the xhigh-tier
     ///   command; anything else is a plain level word. The UI guarantees it
-    ///   never asks for `{non-xhigh, true}`.
+    ///   never asks for `{non-xhigh, true}`. An explicit flag axis with no
+    ///   boolean or an explicit flag-off is refused before dispatch
+    ///   (c-effortread r12 item 4).
     /// - Decoupled (≥2.1.284):
     ///   * explicit `axis = Flag` → the orthogonal toggle
     ///     (`/effort ultracode on|off`) at the given tier, executed exactly —
@@ -390,24 +392,20 @@ impl EffortRequest {
         request_id: Option<&str>,
     ) -> Option<Self> {
         let normalized = level.trim().to_ascii_lowercase();
-        if semantics == remuda_protocol::EffortSemantics::Coupled && ultracode == Some(true) {
-            return Self::from_level("ultracode").map(|req| req.with_request_id(request_id));
-        }
-        if semantics == remuda_protocol::EffortSemantics::Decoupled {
-            let target_name = parse_plain_effort_name(&normalized);
-            match axis {
-                // Explicit flag intent: execute exactly the toggle at this
-                // tier, no provenance guess needed (the sender disambiguated).
-                // c-effortread r11 item 5: a flag operation REQUIRES an
-                // explicit boolean. A missing/invalid `ultracode` (None) used
-                // to type `ultracode off` — silently switching a session whose
-                // flag was ON — so refuse at this boundary instead; no command
-                // is typed and the configure returns an honest rejection.
-                Some(remuda_protocol::EffortAxis::Flag) => {
-                    let name = target_name?;
-                    // An explicit boolean is mandatory for a flag operation.
-                    let flag = ultracode?;
-                    return Some(
+        // c-effortread r12 item 4: an explicit FLAG operation is validated
+        // BEFORE the semantics/carrier dispatch. It REQUIRES an explicit
+        // boolean on every build — `ultracode` None means the boolean was
+        // absent or carried a non-boolean JSON value (the node maps both to
+        // None). The r11 gate lived inside the decoupled arm, so on a coupled
+        // CLI (e.g. 2.1.273, flag ON at xhigh) `{"name":"high","axis":"flag"}`
+        // fell through and typed `/effort high`, and an explicit flag-OFF on a
+        // build without the orthogonal toggle silently executed a level move.
+        if axis == Some(remuda_protocol::EffortAxis::Flag) {
+            let flag = ultracode?;
+            return match semantics {
+                remuda_protocol::EffortSemantics::Decoupled => {
+                    let name = parse_plain_effort_name(&normalized)?;
+                    Some(
                         Self {
                             name,
                             ultracode: flag,
@@ -419,52 +417,65 @@ impl EffortRequest {
                             request_id: None,
                         }
                         .with_request_id(request_id),
-                    );
+                    )
                 }
-                // Explicit tier intent: a plain level move; the orthogonal flag
-                // stays where the running session had it.
-                Some(remuda_protocol::EffortAxis::Tier) => {
-                    return Self::from_level(&normalized)
-                        .map(|req| req.with_request_id(request_id));
+                // Coupled builds express flag-ON only, as the one bare
+                // xhigh-level-plus-flag word.
+                remuda_protocol::EffortSemantics::Coupled if flag => {
+                    Self::from_level("ultracode").map(|req| req.with_request_id(request_id))
                 }
-                None => {
-                    // c-effortread r10 item 5: a legacy tier-only request
-                    // carries NO boolean (`ultracode` absent). It is the plain
-                    // level word BEFORE any toggle inference — even when the
-                    // observed session has the flag ON at the same tier. An
-                    // ON/OFF command requires an explicit boolean.
-                    if ultracode.is_none() {
-                        return Self::from_level(&normalized)
-                            .map(|request| request.with_request_id(request_id));
+                // Coupled flag-OFF and every flag operation on legacy/unknown
+                // builds cannot be expressed AS A FLAG OPERATION: refuse
+                // instead of substituting a level command.
+                _ => None,
+            };
+        }
+        if semantics == remuda_protocol::EffortSemantics::Coupled && ultracode == Some(true) {
+            return Self::from_level("ultracode").map(|req| req.with_request_id(request_id));
+        }
+        if semantics == remuda_protocol::EffortSemantics::Decoupled {
+            let target_name = parse_plain_effort_name(&normalized);
+            // Explicit tier intent: a plain level move; the orthogonal flag
+            // stays where the running session had it. (An explicit Flag axis
+            // already returned above.)
+            if let Some(remuda_protocol::EffortAxis::Tier) = axis {
+                return Self::from_level(&normalized).map(|req| req.with_request_id(request_id));
+            }
+            // axis is None here: a legacy client that did not state intent.
+            // c-effortread r10 item 5: a legacy tier-only request carries NO
+            // boolean (`ultracode` absent). It is the plain level word BEFORE
+            // any toggle inference — even when the observed session has the
+            // flag ON at the same tier. An ON/OFF command requires an explicit
+            // boolean.
+            if ultracode.is_none() {
+                return Self::from_level(&normalized)
+                    .map(|request| request.with_request_id(request_id));
+            }
+            // Legacy client with an explicit boolean: a same-tier proven
+            // selection lets either flag direction mean the toggle.
+            let proven = Self::classify_provenance(observed, requested);
+            if let Some(name) =
+                target_name.filter(|name| proven.as_ref().is_some_and(|obs| obs.name == *name))
+            {
+                return Some(
+                    Self {
+                        name,
+                        ultracode: ultracode == Some(true),
+                        word: if ultracode == Some(true) {
+                            "ultracode on"
+                        } else {
+                            "ultracode off"
+                        },
+                        request_id: None,
                     }
-                    // Legacy client with an explicit boolean: a same-tier
-                    // proven selection lets either flag direction mean the
-                    // toggle.
-                    let proven = Self::classify_provenance(observed, requested);
-                    if let Some(name) = target_name
-                        .filter(|name| proven.as_ref().is_some_and(|obs| obs.name == *name))
-                    {
-                        return Some(
-                            Self {
-                                name,
-                                ultracode: ultracode == Some(true),
-                                word: if ultracode == Some(true) {
-                                    "ultracode on"
-                                } else {
-                                    "ultracode off"
-                                },
-                                request_id: None,
-                            }
-                            .with_request_id(request_id),
-                        );
-                    }
-                    // A cold flag-ON with no axis is ambiguous: do not execute
-                    // a different (tier) operation — refuse. A flag-off or a
-                    // plain level is still just the level word.
-                    if ultracode == Some(true) {
-                        return None;
-                    }
-                }
+                    .with_request_id(request_id),
+                );
+            }
+            // A cold flag-ON with no axis is ambiguous: do not execute a
+            // different (tier) operation — refuse. A flag-off or a plain level
+            // is still just the level word.
+            if ultracode == Some(true) {
+                return None;
             }
         } else if ultracode == Some(true) {
             // Legacy/unknown build: the flag cannot be expressed; refuse
@@ -1637,6 +1648,115 @@ mod sync_tests {
         .expect("an explicit true types ultracode on");
         assert_eq!(on.command_word(), "ultracode on");
         assert!(on.ultracode);
+    }
+
+    /// c-effortread r12 item 4: the explicit-boolean gate for a FLAG axis runs
+    /// BEFORE the semantics dispatch. On a coupled CLI (2.1.273, flag ON at
+    /// xhigh) the r11 gate only covered decoupled builds, so a missing
+    /// boolean (`{"name":"high","axis":"flag"}` — the node maps an absent OR
+    /// non-boolean JSON value to None) fell through and typed `/effort high`;
+    /// an explicit flag-OFF was substituted with a level move too. Only flag-ON
+    /// maps to the one coupled bare word; every other flag op is refused.
+    #[test]
+    fn r12_item4_coupled_flag_operations_are_validated_before_semantics() {
+        use remuda_protocol::EffortAxis::{Flag, Tier};
+        use remuda_protocol::EffortSemantics::{Coupled, Decoupled, Unknown};
+
+        // The headline regression: axis=flag with NO boolean on a coupled
+        // build is refused, not executed as `/effort high`.
+        assert!(
+            EffortRequest::for_configure(
+                "high",
+                None,
+                Some(Flag),
+                Coupled,
+                None,
+                None,
+                Some("effreq_missing_coupled"),
+            )
+            .is_none(),
+            "coupled axis=flag with ultracode None must not type a level"
+        );
+        // Explicit flag-ON is the one bare coupled word (xhigh + flag), even
+        // with the explicit axis.
+        let on = EffortRequest::for_configure(
+            "xhigh",
+            Some(true),
+            Some(Flag),
+            Coupled,
+            None,
+            None,
+            Some("effreq_on_coupled"),
+        )
+        .expect("coupled flag-on is the bare ultracode word");
+        assert_eq!(on.command_word(), "ultracode");
+        assert_eq!(on.name, EffortName::Xhigh);
+        assert_eq!(on.request_id.as_deref(), Some("effreq_on_coupled"));
+        // Explicit flag-OFF is NOT expressible as a flag operation on coupled
+        // builds (the web sends that intent as a TIER move): refuse, never a
+        // substituted `/effort high`.
+        assert!(
+            EffortRequest::for_configure(
+                "high",
+                Some(false),
+                Some(Flag),
+                Coupled,
+                None,
+                None,
+                Some("effreq_off_coupled"),
+            )
+            .is_none(),
+            "coupled flag-off is an unsupported flag operation, not a level word"
+        );
+        // The same missing-boolean request on an unknown/legacy build is
+        // refused as well.
+        assert!(
+            EffortRequest::for_configure("high", None, Some(Flag), Unknown, None, None, None)
+                .is_none()
+        );
+        // And explicit flag-OFF on legacy builds no longer falls through to
+        // the plain-level fallback.
+        assert!(
+            EffortRequest::for_configure(
+                "high",
+                Some(false),
+                Some(Flag),
+                Unknown,
+                None,
+                None,
+                None
+            )
+            .is_none(),
+            "an unsupported build refuses flag-off with explicit intent"
+        );
+        // Decoupled behaviour is unchanged by the earlier gate: missing
+        // boolean refused, explicit on/off exact toggles, explicit tier a
+        // plain level.
+        assert!(
+            EffortRequest::for_configure("high", None, Some(Flag), Decoupled, None, None, None)
+                .is_none()
+        );
+        assert_eq!(
+            EffortRequest::for_configure(
+                "high",
+                Some(false),
+                Some(Flag),
+                Decoupled,
+                None,
+                None,
+                None
+            )
+            .unwrap()
+            .command_word(),
+            "ultracode off"
+        );
+        assert_eq!(
+            EffortRequest::for_configure("max", None, Some(Tier), Coupled, None, None, None)
+                .unwrap()
+                .command_word(),
+            "max",
+            "an explicit tier axis still produces the plain level on coupled builds"
+        );
     }
 
     /// c-effortui r4 item 2 trigger A: Remuda drags high→max; the USER then

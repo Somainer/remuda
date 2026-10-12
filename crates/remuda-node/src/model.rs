@@ -563,4 +563,35 @@ mod tests {
         }));
         assert_eq!(request.effort_request_id, None);
     }
+
+    #[test]
+    fn configure_maps_a_missing_or_invalid_ultracode_boolean_to_none_with_the_flag_axis() {
+        // c-effortread r12 item 4: a FLAG-axis configure whose boolean is
+        // absent OR carries a non-boolean JSON value reaches the driver as
+        // `effort_ultracode = None` WITH `effort_axis = Some("flag")`, so the
+        // driver's pre-dispatch gate refuses it on every build instead of
+        // reading None as false and typing `ultracode off` / a plain level.
+        for value in [
+            json!({ "name": "high", "axis": "flag" }),
+            json!({ "name": "high", "axis": "flag", "ultracode": "on" }),
+            json!({ "name": "high", "axis": "flag", "ultracode": 1 }),
+            json!({ "name": "high", "axis": "flag", "ultracode": null }),
+        ] {
+            let request: InstanceCommandRequest =
+                serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+            let request = request.with_configure(&json!({ "effort": value }));
+            assert_eq!(request.effort_axis.as_deref(), Some("flag"), "{value}");
+            assert_eq!(request.effort_ultracode, None, "{value}");
+            assert_eq!(request.effort_name.as_deref(), Some("high"), "{value}");
+        }
+        // A genuine boolean is preserved alongside the axis (sanity: the gate
+        // must not refuse well-formed toggles before the build dispatch).
+        let request: InstanceCommandRequest =
+            serde_json::from_value(json!({ "operation": "instance.configure" })).unwrap();
+        let request = request.with_configure(&json!({
+            "effort": { "name": "high", "axis": "flag", "ultracode": false }
+        }));
+        assert_eq!(request.effort_axis.as_deref(), Some("flag"));
+        assert_eq!(request.effort_ultracode, Some(false));
+    }
 }

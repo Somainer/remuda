@@ -851,13 +851,18 @@ impl ShellPtyDriver {
         &self,
         level: &str,
         ultracode: Option<bool>,
+        axis: Option<remuda_protocol::EffortAxis>,
         request_id: Option<String>,
     ) -> DriverResult<DriverAck> {
         // The promoted-shell carrier does not hold the agent's reported binary
         // version, so the version-gated ultracode axis fails closed here (the
         // Herdr `claude_pty` carrier is the version-aware one and types
         // `ultracode` / `ultracode on|off` itself). Plain level switches work.
-        if ultracode == Some(true) {
+        // c-effortread r12 item 4: the explicit axis is threaded all the way
+        // here (send() used to drop it). ANY explicit flag operation — on,
+        // off, or one whose boolean is missing/non-boolean (None) — is refused
+        // rather than silently typing a plain `/effort <level>` for it.
+        if axis == Some(remuda_protocol::EffortAxis::Flag) || ultracode == Some(true) {
             return Err(DriverError::CapabilityUnsupported(
                 "ultracode cannot be switched from a promoted-shell carrier; \
                  use the managed Claude session"
@@ -2605,6 +2610,7 @@ impl Driver for ShellPtyDriver {
                 .switch_effort(
                     level,
                     switch.effort_ultracode,
+                    switch.effort_axis,
                     switch.effort_request_id.clone(),
                 )
                 .await;

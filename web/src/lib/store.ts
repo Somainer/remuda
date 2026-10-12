@@ -4079,6 +4079,25 @@ class HubStore {
       if (soonestForeign !== undefined) {
         this.armLeaseWakeup(instanceId, soonestForeign, now, false);
       }
+      // Gate 19 item 3: arming only FUTURE leases used to let an ALREADY
+      // deliverable row lose its only wakeup on this early path. The fresh
+      // snapshot can contain (a) a lease-less PENDING row a dead owner's
+      // failed POST restored and closed over (its in-memory retry died with
+      // the page), or (b) a replacement foreign lease that is ALREADY expired
+      // by the rolled-back wall clock. Both are stealable now; route them
+      // through the same GUARDED delivery path the normal fire path uses
+      // (held rows excluded — their held-retry clock owns that POST; a row
+      // this document is actively POSTing and terminal rows excluded). The
+      // flush re-reads authoritatively and reconciles all timers, so the
+      // future lease armed above is the only clock that remains afterwards.
+      let hasStealableOnRollback = false;
+      for (const r of durable) {
+        if (r.state === "held") continue;
+        if (!box.isDeliveryActive(r.commandId) && isDeliverableOutbox(r, now)) {
+          hasStealableOnRollback = true;
+        }
+      }
+      if (hasStealableOnRollback) void this.flushAllOutbox(new Set(), true);
       return;
     }
     // Reconcile from the fresh snapshot. Overdue leases are excluded from

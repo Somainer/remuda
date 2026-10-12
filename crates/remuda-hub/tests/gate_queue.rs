@@ -44,6 +44,11 @@ struct RunSpec {
     /// `landing_hold` is released — so a test can assert a second job is not
     /// dispatched while the first still owns the lane/push.
     hold_while_landing: bool,
+    /// When set with `land_grant`, after the grant is granted the Node sends a
+    /// JSON-RPC ERROR for the gate.run (the Node crashed after the grant before
+    /// its Finished/reply) but the SOCKET STAYS OPEN and keeps answering
+    /// read-only probes. Models an RPC loss with a still-connected carrier.
+    rpc_error_after_grant: bool,
 }
 
 impl Default for RunSpec {
@@ -65,6 +70,7 @@ impl Default for RunSpec {
             land_grant: false,
             hold_before_grant: false,
             hold_while_landing: false,
+            rpc_error_after_grant: false,
         }
     }
 }
@@ -211,8 +217,9 @@ async fn enroll(
                     "generation": params["generation"].clone(),
                 }),
                 "gate.run" => {
+                    let rpc_id = id.clone();
                     script.arrivals.lock().unwrap().push(params.clone());
-                    run_one_inline(&script, &params, &mut node).await
+                    run_one_inline(&script, &params, &rpc_id, &mut node).await
                 }
                 "gate.cancel" => {
                     let job = params["jobId"].as_str().unwrap_or("").to_string();
@@ -375,7 +382,12 @@ type LaneSocket =
 /// Run a scripted gate job inline. While waiting, keep draining the socket so
 /// a concurrent `gate.cancel` for this job is observed (and any other RPC
 /// still gets its ack). Returns the gate.run result.
-async fn run_one_inline(script: &Arc<ScriptState>, params: &Value, node: &mut LaneSocket) -> Value {
+async fn run_one_inline(
+    script: &Arc<ScriptState>,
+    params: &Value,
+    rpc_id: &Value,
+    node: &mut LaneSocket,
+) -> Value {
     let job_id = params["jobId"].as_str().unwrap_or("").to_string();
     let branch = params["branch"].as_str().unwrap_or("").to_string();
     let spec = script.next_spec(&branch);
@@ -589,6 +601,57 @@ async fn run_one_inline(script: &Arc<ScriptState>, params: &Value, node: &mut La
                     }
                 }
             }
+        } else if spec.rpc_error_after_grant {
+            // The Node received the grant and the row is Landing, but it dies
+            // before Finished: send a JSON-RPC ERROR for THIS gate.run while the
+            // socket stays open, then keep answering read-only probes forever
+            // (the carrier is still connected). Never returns a result.
+            script.landing_started.notify_waiters();
+            node.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0", "id": rpc_id,
+                    "error": {"code": -32001, "message": "node crashed after grant before reply"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            loop {
+                let frame = match node.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        serde_json::from_str::<Value>(&text).unwrap_or(json!({}))
+                    }
+                    _ => break,
+                };
+                let Some(fid) = frame.get("id").cloned() else {
+                    continue;
+                };
+                let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+                let in_params = frame.get("params").cloned().unwrap_or(json!({}));
+                let result = match method {
+                    "gate.resolveLanding" => {
+                        let job = in_params["jobId"].as_str().unwrap_or("").to_string();
+                        script.resolve_calls.lock().unwrap().push(in_params);
+                        script
+                            .resolve_landing_reply
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .unwrap_or_else(|| json!({"jobId": job, "status": "unknown"}))
+                    }
+                    _ => json!({"ok": true}),
+                };
+                let reply = json!({"jsonrpc":"2.0","id":fid,"result":result});
+                if node
+                    .send(Message::Text(reply.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            unreachable!("the post-grant crash arm parks for the life of the socket");
         }
     }
 
@@ -2244,5 +2307,70 @@ async fn cancel_after_the_grant_is_409_and_the_land_completes_once() -> Result<(
         1,
         "exactly one grant answer (the granted push runs once)"
     );
+    Ok(())
+}
+
+/// r13 item 2: the Node crashes AFTER the grant but before its Finished/RPC
+/// reply, while the carrier SOCKET stays open. The gate.run RPC returns an
+/// error, but the Hub must not fail the Landing (the push may be done); it
+/// keeps occupancy and immediately schedules a BOUNDED read-only reconciliation
+/// on the still-connected lane. The periodic reconciler is throttled far beyond
+/// the test, so only the forced RPC-loss pass can settle it: the remote
+/// confirms the exact granted merge → landed once, never re-pushed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpc_loss_after_grant_with_carrier_still_up_schedules_landing_reconcile() -> Result<()> {
+    let ctx = Ctx::spawn_with_config(
+        1,
+        |_| {},
+        |cfg| {
+            // Expiry is irrelevant (the merge IS on the remote), and the
+            // periodic reconciler must not rescue the row within the test.
+            cfg.gate_landing_recovery_ms = 1;
+            cfg.gate_landing_probe_interval_ms = 60_000;
+        },
+    )
+    .await?;
+    *ctx.scripts[0].resolve_landing_reply.lock().unwrap() = Some(json!({
+        "jobId": "ignored",
+        "status": "landed",
+        "baseSha": "6666666666666666666666666666666666666666"
+    }));
+    ctx.scripts[0].script(
+        "wt/land/rpc-lost-after-grant",
+        RunSpec {
+            status: "landed",
+            merge_sha: Some("6666666666666666666666666666666666666666"),
+            merge_ref: Some("refs/remuda/gate/rpc-lost"),
+            land_grant: true,
+            rpc_error_after_grant: true,
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/land/rpc-lost-after-grant","mode":"land"}))
+        .await;
+    let id = job["id"].as_str().unwrap().to_owned();
+
+    // The forced post-RPC-loss reconcile probes the live carrier and settles.
+    let settled = ctx.wait_state(&id, &["landed", "failed"]).await;
+    assert_eq!(
+        settled["state"], "landed",
+        "RPC loss must not fail a Landing: {settled}"
+    );
+
+    // The reconcile was actually driven by the RPC loss (one read-only probe),
+    // and the journal records exactly one landing.
+    assert!(
+        !ctx.scripts[0].resolve_calls.lock().unwrap().is_empty(),
+        "the RPC loss must trigger a remote probe"
+    );
+    let actions = ctx.hub.test_gate_audit_actions(&id).await?;
+    assert_eq!(
+        actions.iter().filter(|a| *a == "gate.landed").count(),
+        1,
+        "{actions:?}"
+    );
+    // The run sent exactly one land grant (nothing was re-run/re-pushed).
+    assert_eq!(ctx.scripts[0].grant_answers.lock().unwrap().len(), 1);
     Ok(())
 }

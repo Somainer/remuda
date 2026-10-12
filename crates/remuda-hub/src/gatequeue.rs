@@ -47,8 +47,10 @@ pub(crate) const SCHEDULE_TICK_MILLIS: u64 = 1000;
 const GATE_LOG_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 /// Budget for the home host's fetch-and-push land.
 const HOME_LAND_TIMEOUT: Duration = Duration::from_secs(12 * 60);
-/// Minimum spacing between read-only remote probes for one Landing row.
-const LANDING_PROBE_INTERVAL_MS: u64 = 5_000;
+/// Minimum spacing between read-only remote probes for one Landing row; the
+/// configured interval is clamped to this floor so a misconfigured tiny value
+/// cannot hammer a remote with fetches.
+const MIN_LANDING_PROBE_INTERVAL_MS: u64 = 250;
 /// Budget for dropping a job's pinned refs on a lane.
 const UNPIN_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often the pinned-ref retention sweep runs.
@@ -1006,6 +1008,25 @@ async fn fail_rpc(state: &AppState, job_id: &str, expected_generation: u32, erro
 }
 
 async fn fail_rpc_inner(state: &AppState, job_id: &str, expected_generation: u32, error: &Value) {
+    // r13 item 2: the grant was taken and the gate.run reply/link was lost. The
+    // row stays Landing and keeps occupancy, but the loss must not strand it:
+    // kick the bounded read-only reconciliation for its lane host now (a
+    // still-connected carrier is probed immediately; a dropped one is handled
+    // when it reconnects), in addition to the periodic reconciler.
+    if let Ok(Some(job)) = state.store.get_gate_job(job_id).await
+        && job.state == GateJobState::Landing
+        && job.attempts == expected_generation
+    {
+        tracing::info!(
+            expected_generation,
+            error = %message_or_default(error),
+            "gate.run RPC lost during Landing; scheduling bounded reconciliation"
+        );
+        if let Some(host) = landing_lane_host(state, &job).await {
+            schedule_landing_reconcile(state, Some(host.as_id().to_string()));
+        }
+        return;
+    }
     let message = error
         .get("message")
         .and_then(Value::as_str)
@@ -2047,14 +2068,38 @@ pub(crate) struct LandingRow {
     probed_at: Option<String>,
 }
 
-/// Spawn the self-serializing Landing reconciler: one pass at a time, every
-/// [`LANDING_PROBE_INTERVAL_MS`], so an outstanding remote probe can never pile
-/// up with another. Started by the Hub after it is serving; Landing rows only
-/// resolve once a carrier is reachable. r13 items 1 & 2.
+/// Force one bounded Landing reconciliation pass for a host (or all hosts) off
+/// whatever task noticed the need (an RPC/carrier loss, a reconnect). Detached
+/// so the caller never blocks on a remote probe; the read-only probe is
+/// self-throttling and never re-runs a push. r13 items 1 & 2.
+pub(crate) fn schedule_landing_reconcile(state: &AppState, host: Option<String>) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        reconcile_landings(&state, host.as_deref()).await;
+    });
+}
+
+fn message_or_default(error: &Value) -> String {
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("gate.run failed")
+        .to_owned()
+}
+
+/// Spawn the self-serializing Landing reconciler: one pass at a time, at the
+/// configured probe interval, so an outstanding remote probe can never pile up
+/// with another. Started by the Hub after it is serving; Landing rows only
+/// resolve once a carrier is reachable. Forced passes (post-hello, post-loss)
+/// run independently and bypass the per-row throttle. r13 items 1 & 2.
 pub(crate) fn spawn_landing_reconciler(state: &AppState) -> tokio::task::JoinHandle<()> {
     let state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(LANDING_PROBE_INTERVAL_MS));
+        let interval_ms = state
+            .config
+            .gate_landing_probe_interval_ms
+            .max(MIN_LANDING_PROBE_INTERVAL_MS);
+        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
         loop {
             interval.tick().await;
             reconcile_landings(&state, None).await;
@@ -2081,6 +2126,10 @@ pub(crate) async fn reconcile_landings(state: &AppState, force_host: Option<&str
         return;
     };
     let recovery_ms = state.config.gate_landing_recovery_ms;
+    let probe_interval_ms = state
+        .config
+        .gate_landing_probe_interval_ms
+        .max(MIN_LANDING_PROBE_INTERVAL_MS);
     for row in rows {
         let LandingRow {
             job,
@@ -2104,7 +2153,7 @@ pub(crate) async fn reconcile_landings(state: &AppState, force_host: Option<&str
         let now = now();
         if !forced
             && let Some(age) = elapsed_since(&now, probed_at.as_deref())
-            && age < LANDING_PROBE_INTERVAL_MS
+            && age < probe_interval_ms
         {
             continue;
         }

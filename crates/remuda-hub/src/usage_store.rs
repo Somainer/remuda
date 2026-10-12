@@ -478,6 +478,11 @@ impl SnapshotCounters {
         ]
     }
 
+    /// The four independent token baskets, excluding the derived total.
+    fn token_baskets(&self) -> [Option<i64>; 4] {
+        [self.input, self.output, self.cache_read, self.cache_write]
+    }
+
     /// Per-bucket comparison of an incoming cumulative snapshot against the
     /// stored one. `None` incoming means "not reported" and imposes no
     /// constraint; `None` stored with a reported incoming is growth.
@@ -534,6 +539,7 @@ impl SnapshotCounters {
 /// The stored state a scoped upsert conflicts with.
 struct StoredSnapshot {
     counters: SnapshotCounters,
+    revision: i64,
     observed_at: String,
     observed_at_source: String,
 }
@@ -541,17 +547,24 @@ struct StoredSnapshot {
 /// Insert or revise a Turn-scoped snapshot (one revision-replaced row per
 /// assistant message id).
 ///
-/// A later record of the same message carries the message's FINAL counters
-/// (c-ctxusage r3 item 1): accept when any reported counter grows without one
-/// decreasing. Independently, a NATIVE observation repairs a stored ingest-
-/// fallback provenance even when counters are identical AND the timestamp
-/// string equals the fallback (r11 item 5); an ingest fallback never
-/// overwrites a native time (c-ctxusage r4 item 5).
+/// Revision authority (c-ctxusage r13 item 3): a NEWER snapshot for the same
+/// `(instance, scope, scope_id)` is the source's correction and replaces every
+/// bucket it explicitly reports even when the value moves DOWN (output 20 →
+/// 15), keeping buckets it does not report; an OLDER snapshot never overrides
+/// anything; an EQUAL-revision snapshot may only fill an unreported bucket or
+/// advance a reported one (the replay-safe monotone rule). Derived totals are
+/// recomputed from the merged basket. Cumulative SESSION snapshots have their
+/// own monotone acceptance path and are intentionally not governed here.
+///
+/// Independently, a NATIVE observation repairs a stored ingest-fallback
+/// provenance even when counters are identical AND the timestamp string
+/// equals the fallback (r11 item 5); an ingest fallback never overwrites a
+/// native time (c-ctxusage r4 item 5).
 fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
     let stored: Option<StoredSnapshot> = conn
         .query_row(
             "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens,
-                    cache_write_tokens, observed_at, observed_at_source
+                    cache_write_tokens, metric_revision, observed_at, observed_at_source
              FROM usage_events
              WHERE instance_id = ?1 AND scope = 'turn' AND scope_id = ?2",
             params![row.instance_id, row.scope_id],
@@ -564,8 +577,9 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
                         cache_read: r.get(3)?,
                         cache_write: r.get(4)?,
                     },
-                    observed_at: r.get(5)?,
-                    observed_at_source: r.get(6)?,
+                    revision: r.get(5)?,
+                    observed_at: r.get(6)?,
+                    observed_at_source: r.get(7)?,
                 })
             },
         )
@@ -576,8 +590,24 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
     };
 
     let incoming = SnapshotCounters::of(row);
-    let (grew, decreased) = incoming.growth_against(&stored.counters);
-    let counters_change = grew && !decreased;
+    let counters_change = if row.metric_revision > stored.revision {
+        // Authoritative correction: any REPORTED basket that differs wins,
+        // downwards included; unreported baskets are retained below. The
+        // derived total is excluded — it is recomputed after the merge.
+        incoming
+            .token_baskets()
+            .into_iter()
+            .zip(stored.counters.token_baskets())
+            .any(|(incoming, kept)| incoming.is_some_and(|value| Some(value) != kept))
+    } else if row.metric_revision < stored.revision {
+        // A stale revision never overrides a newer correction.
+        false
+    } else {
+        // Equal revision (the common print/result case): accept a fill or an
+        // advance, reject any reported decrease.
+        let (grew, decreased) = incoming.growth_against(&stored.counters);
+        grew && !decreased
+    };
     // Independently, a NATIVE observation repairs a stored ingest-fallback
     // PROVENANCE even when the counters and timestamp string are unchanged:
     // the native source carrying the exact fallback string still proves the

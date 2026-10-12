@@ -334,6 +334,126 @@ it("GATE19 item 1: a cloned sibling's sole claim timer reads the lease-less PEND
   }
 });
 
+it("GATE20 item 2: X's deadline fire must not cancel Y's only wake when a cloned sibling restored Y to lease-less pending — Y delivers", async () => {
+  // A tracks two SAME-owner inflight claims: X until T1, Y until T2 (T2 > T1).
+  // The cloned sibling finishes X (sent) but its POST/status reconciliation
+  // for Y FAILS: Y is restored to lease-less PENDING and the sibling closes
+  // before its in-memory retry. A performs no flush: X's expiry at T1 is the
+  // only external trigger. The old per-snapshot reconciliation CANCELLED Y's
+  // wake there (it was no longer inflight) with no handoff, so Y stranded.
+  // The central reconciliation must instead re-judge Y as deliverable: one
+  // 0 ms delivery wake → guarded flush → exactly one POST, for Y. X is never
+  // POSTed and nothing waits for T2.
+  vi.useFakeTimers();
+  const owner = "owner_g20_i2";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks: { query: async () => ({ held: [] }) } }, // query, no request
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  sessionStorage.setItem("remuda-outbox-owner", owner);
+  try {
+    const { api, hubStore } = await fresh();
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) => ({
+        relatedCommandIds: [],
+        command: {
+          commandId,
+          id: commandId,
+          state: "accepted",
+          revision: "1",
+          dispatch: "native-acknowledged",
+          resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    const internal = hubStore as unknown as {
+      flushAllOutbox: () => Promise<void>;
+      outbox: { refreshDurable: () => Promise<unknown>; pendingLeaseWakeups: () => string[] };
+    };
+    await internal.flushAllOutbox(); // settle the empty boot flush
+    expect(send).not.toHaveBeenCalled();
+
+    const X = "cmd_g20_i2_x";
+    const Y = "cmd_g20_i2_y";
+    const T1_MS = 10_000;
+    const T2_MS = 30_000;
+    const inflightRow = (id: string, untilMs: number, prompt: string): OutboxRecord => ({
+      commandId: id,
+      clientRequestId: `local_${id}`,
+      instanceId: INSTANCE,
+      journalId: JOURNAL,
+      prompt,
+      createdAt: Date.now() - 1_000,
+      attempts: 1,
+      state: "inflight",
+      lease: { owner, until: Date.now() + untilMs },
+    });
+    localStorage.setItem(
+      OUTBOX_LS_KEY,
+      JSON.stringify([
+        inflightRow(X, T1_MS, "sibling finishes this one"),
+        inflightRow(Y, T2_MS, "sibling fails this one"),
+      ]),
+    );
+    await internal.outbox.refreshDurable();
+    expect(internal.outbox.pendingLeaseWakeups().sort()).toEqual([X, Y].sort());
+    expect(send).not.toHaveBeenCalled();
+
+    // Midway to T1: X is durably SENT, Y is lease-less PENDING (the sibling's
+    // failed reconciliation), and the sibling has closed.
+    await vi.advanceTimersByTimeAsync(5_000);
+    localStorage.setItem(
+      OUTBOX_LS_KEY,
+      JSON.stringify([
+        {
+          ...inflightRow(X, T1_MS, "sibling finishes this one"),
+          state: "sent",
+          gotResponse: true,
+          lease: undefined,
+        } satisfies OutboxRecord,
+        {
+          commandId: Y,
+          clientRequestId: `local_${Y}`,
+          instanceId: INSTANCE,
+          journalId: JOURNAL,
+          prompt: "sibling fails this one",
+          createdAt: Date.now() - 2_000,
+          attempts: 1,
+          state: "pending",
+          lastError: "sibling POST reconciliation failed",
+        } satisfies OutboxRecord,
+      ]),
+    );
+
+    // X's deadline at T1 is the ONLY trigger. Y's 0 ms delivery wake is armed
+    // from inside X's awaited read chain: pump with positive fake-time steps
+    // (a 0 ms advance does not dispatch a timer a fire's microtask scheduled).
+    await vi.advanceTimersByTimeAsync(T1_MS - 5_000);
+    for (let i = 0; i < 60 && send.mock.calls.length === 0; i += 1) {
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+    }
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBe(Y);
+    const stored = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(stored().find((r) => r.commandId === X)?.state).toBe("sent");
+    expect(stored().find((r) => r.commandId === Y)?.state).toBe("sent");
+
+    // Well past T2: no second POST, X never POSTed.
+    await vi.advanceTimersByTimeAsync(T2_MS * 2);
+    expect(send).toHaveBeenCalledTimes(1);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
 it("GATE10 item 7: a lease-less done row committed by another tab skips without aborting the flush; B still sends", async () => {
   const { api, hubStore } = await fresh();
   await bootLive(api, hubStore);

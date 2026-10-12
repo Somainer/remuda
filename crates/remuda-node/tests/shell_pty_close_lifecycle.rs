@@ -563,7 +563,14 @@ async fn promoted_close_drains_the_writers_termination_append_before_hydrator_re
     );
 
     let started = Instant::now();
-    driver.close().await.expect("promoted close");
+    // Bounded wait (c-ctxusage r16 item 2): a wedged carrier must hang the
+    // TEST as a failure, not forever. The close itself already bounds every
+    // carrier dial/handshake; this outer bound guards the whole promoted
+    // close path.
+    tokio::time::timeout(Duration::from_secs(15), driver.close())
+        .await
+        .expect("promoted close hung past the bounded wait")
+        .expect("promoted close");
     // The ladder's polite rung alone has a 2 s settle bound plus the bounded
     // live drain; a prompt writer exits within it, so the whole close stays
     // well under the escalated-rung and promoter timeouts.

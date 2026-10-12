@@ -158,7 +158,12 @@ fn map_connect(socket: &Path, err: std::io::Error) -> Error {
     match err.kind() {
         std::io::ErrorKind::NotFound
         | std::io::ErrorKind::ConnectionRefused
-        | std::io::ErrorKind::BrokenPipe => Error::Unreachable {
+        | std::io::ErrorKind::BrokenPipe
+        // A nonblocking connect against a saturated accept queue comes back
+        // immediately as WouldBlock: the carrier is alive but not accepting.
+        // Nothing was written, so it is a transient, safely-retryable dial
+        // failure rather than an uncertain dispatch (c-ctxusage r16 item 2).
+        | std::io::ErrorKind::WouldBlock => Error::Unreachable {
             socket: socket.to_path_buf(),
         },
         _ => Error::Io(err),
@@ -197,10 +202,23 @@ pub(crate) struct PersistentConn {
 
 impl PersistentConn {
     /// Dial one connection and hold it open. Nothing is written.
-    pub(crate) async fn connect(socket: &Path) -> Result<Self, Error> {
-        let stream = UnixStream::connect(socket)
-            .await
-            .map_err(|err| map_connect(socket, err))?;
+    ///
+    /// Establishment is BOUNDED by `max_wait`: a carrier that accepts new
+    /// connections arbitrarily slowly (a wedged or saturated Herdr) must not
+    /// pin a close phase forever (c-ctxusage r16 item 2). No request byte has
+    /// been sent when this fails, so an establishment timeout is reported as
+    /// [`Error::Unreachable`] — a transient, safely-retryable dial failure,
+    /// never an uncertain post-dispatch outcome.
+    pub(crate) async fn connect(socket: &Path, max_wait: Duration) -> Result<Self, Error> {
+        let stream = match timeout(max_wait, UnixStream::connect(socket)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(err)) => return Err(map_connect(socket, err)),
+            Err(_) => {
+                return Err(Error::Unreachable {
+                    socket: socket.to_path_buf(),
+                });
+            }
+        };
         let (reader, writer) = stream.into_split();
         Ok(Self {
             socket: socket.to_path_buf(),

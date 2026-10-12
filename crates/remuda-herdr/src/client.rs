@@ -441,7 +441,10 @@ pub struct PersistentClient {
 
 impl PersistentClient {
     async fn open(socket_path: &Path, timeout: Duration) -> Result<Self, Error> {
-        let conn = PersistentConn::connect(socket_path).await?;
+        // Connection establishment is bounded by the same RPC timeout: a
+        // carrier that never finishes accepting must not wedge the caller
+        // (c-ctxusage r16 item 2).
+        let conn = PersistentConn::connect(socket_path, timeout).await?;
         Ok(Self { conn, timeout })
     }
 

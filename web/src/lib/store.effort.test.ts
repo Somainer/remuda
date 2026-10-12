@@ -2795,6 +2795,73 @@ it("r13 item 2: the bound starts on working → idle evidence, so a no-op after 
   expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");
 });
 
+it("r13 item 3: an observer-tab legacy pending with a silent no-op completes unconfirmed at its bound", async () => {
+  const ctx = await startFollowing("r13-item3-observer-noop");
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const baseline: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "low", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [baseline] } as never);
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  // An id-less queued edge for a no-op (target already equals the observed
+  // low) posted by ANOTHER client; this tab only observes the lifecycle.
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
+  ctx.receive(configureLifecycle(3, "effort-queued:low", ctx.instance.id, "2026-09-16T00:00:05.000Z"));
+  const pending = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pending?.source, "the observer owns no client send").toBe("lifecycle");
+  expect(pending?.queued, "the driver edge proves the queue; the chip keeps 排队中").toBe(true);
+  expect(typeof pending?.leftQueueAt, "idle-at-receipt anchors the bound now").toBe("number");
+
+  // No applied id, no newer projection ever arrives: before the bound the
+  // chip stays, after it the explicit unconfirmed outcome ends the pending.
+  await advanceEffortReconcile(14_999);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
+  expect(toast).not.toHaveBeenCalled();
+  await advanceEffortReconcile(2);
+  expect(hubStore.effortPendingOf(ctx.instance.id), "unconfirmed ends the observer pending").toBeNull();
+  expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");
+});
+
+it("r13 item 3: an observer pending with an unusable queued timestamp fails closed, then unconfirmed", async () => {
+  const ctx = await startFollowing("r13-item3-observer-badstamp");
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const baseline: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "low", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [baseline] } as never);
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
+  // The id-less queued edge carries NO parseable observedAt.
+  ctx.receive(configureLifecycle(3, "effort-queued:low", ctx.instance.id, "not-a-timestamp"));
+  const pending = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pending?.queuedObservedAt, "the unusable stamp is discarded").toBeNull();
+  expect(typeof pending?.leftQueueAt, "the bound still arms").toBe("number");
+
+  // Even a fresh value-matching id-less read-back cannot settle it: with no
+  // trustworthy lower bound the strict fallback fails closed.
+  ctx.receive(
+    effortEvent(4, "low", false, "remuda", "2026-09-16T00:00:20.000Z", {
+      requested: { name: "low", ultracode: false },
+    }),
+  );
+  expect(
+    hubStore.effortPendingOf(ctx.instance.id),
+    "no lower bound: stay pending through the read-back",
+  ).not.toBeNull();
+  expect(toast).not.toHaveBeenCalled();
+
+  // The armed bound ends the request explicitly instead of waiting 30 min.
+  await advanceEffortReconcile(15_001);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");
+});
+
 it("r12 item 5: an id-less accepted no-op surfaces an explicit unconfirmed outcome at the bound", async () => {
   const ctx = await startFollowing("r12-item5-unconfirmed", { state: "known", value: "idle" });
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);

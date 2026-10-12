@@ -1062,13 +1062,15 @@ class HubStore {
   getSnapshot = () => this.state;
 
   private emit(patch: Partial<HubState>) {
-    // c-effortread r13 item 2: current activity evidence (live follow native
+    // c-effortread r13 item 2/3: current activity evidence (live follow native
     // turn events or full-instance entity snapshots) is the ONLY authority on
-    // a queued request leaving the driver queue. A pending stamped `queued` at
-    // send time while a turn was running keeps that stale flag forever; when
-    // the evidence moves working → idle, flip that exact pending (nonce
-    // guarded) and anchor its reconciliation bound to NOW. Doing this inside
-    // the same emission keeps listeners from ever seeing the split state.
+    // when a queued effort request can actually run. A pending stamped while a
+    // turn was running waits for working → idle; at that transition the exact
+    // nonce-guarded pending gets its reconciliation bound anchored (a client
+    // pending also drops the chip's 排队中 flag — its immutable send-time
+    // snapshot could not track this; a wire pending keeps the driver-provided
+    // queue word). Everything happens inside the same emission so listeners
+    // never see split state.
     let queueExits: Map<Id, number> | null = null;
     if (patch.instances) {
       for (const next of patch.instances) {
@@ -1076,7 +1078,9 @@ class HubStore {
         const prev = this.state.instances.find((row) => row.id === next.id);
         if (prev?.activity?.state !== "known" || prev.activity.value !== "working") continue;
         const pending = this.state.effortPending[next.id];
-        if (pending?.queued) (queueExits ??= new Map()).set(next.id, pending.nonce);
+        if (pending && pending.leftQueueAt == null) {
+          (queueExits ??= new Map()).set(next.id, pending.nonce);
+        }
       }
     }
     let merged = patch;
@@ -1085,11 +1089,17 @@ class HubStore {
       const pendingNext = { ...(patch.effortPending ?? this.state.effortPending) };
       for (const [id, nonce] of queueExits) {
         const pending = pendingNext[id];
-        if (!pending || pending.nonce !== nonce || !pending.queued) {
+        if (!pending || pending.nonce !== nonce || pending.leftQueueAt != null) {
           queueExits.delete(id);
           continue;
         }
-        pendingNext[id] = { ...pending, queued: false, leftQueueAt: atExit };
+        pendingNext[id] = {
+          ...pending,
+          leftQueueAt: atExit,
+          // Only the client's optimistic snapshot tracks the chip word from
+          // local activity; a wire pending's queued state is driver-provided.
+          ...(pending.source === "client" ? { queued: false } : {}),
+        };
       }
       if (queueExits.size) merged = { ...patch, effortPending: pendingNext };
     }
@@ -1785,6 +1795,15 @@ class HubStore {
         const wireMovesLevel = wireMovesBoth || wireAxis !== "flag";
         const wireMovesFlag = wireMovesBoth || wireAxis === "flag";
         const existingView = this.state.effortEffective[instanceId];
+        // c-effortread r13 item 3: the observer tab owns no client send. The
+        // driver's `effort-queued` edge proves the request is queued (the chip
+        // keeps 排队中), but the bounded reconciliation is anchored on CURRENT
+        // activity evidence exactly like a client request: when the session is
+        // already idle at receipt the bound starts now (a backlogged edge / an
+        // accepted no-op); when a turn is running it starts at working→idle.
+        const busyNow =
+          instance?.activity?.state === "known" && instance.activity.value === "working";
+        const atCreate = Date.now();
         current = {
           nonce,
           requestId: edgeId ?? `lifecycle:${nonce}`,
@@ -1795,7 +1814,7 @@ class HubStore {
           name: fallbackSelection.name,
           ultracode: fallbackSelection.ultracode === true,
           queued: true,
-          at: Date.now(),
+          at: atCreate,
           baselineObservedAt: existingView?.observedAt ?? null,
           queuedObservedAt: queuedThreshold,
       // Axes this request does not move need no proof; every axis the
@@ -1813,9 +1832,9 @@ class HubStore {
           // match via the two-axis fallback.
           commandWord: null,
           afterReplacement: false,
-          // The wire edge proves the request is queued RIGHT NOW; r13 item 3
-          // arms its reconciliation, which the working→idle evidence anchors.
-          leftQueueAt: null,
+          // Idle-at-receipt arms the bound immediately; a working session arms
+          // it from the working→idle evidence.
+          leftQueueAt: busyNow ? null : atCreate,
         };
         this.emit({ effortNonces: { ...this.state.effortNonces, [instanceId]: nonce } });
       }
@@ -1824,12 +1843,39 @@ class HubStore {
       // pre-request baseline. A duplicate queued edge keeps the same time; an
       // unparseable timestamp leaves a previous stamp untouched.
       const stamped = queuedThreshold ?? current.queuedObservedAt;
+      // A lifecycle-created entry carries the queue state derived from current
+      // activity; a queued edge for an EXISTING request really did re-queue it:
+      // if a turn is now running again, the bound waits for the next
+      // working→idle evidence (r13 item 2/3).
+      const createdFromWire = this.state.effortPending[instanceId]?.nonce !== current.nonce;
+      const nextActivity = this.state.instances.find((row) => row.id === instanceId)?.activity;
+      const requeuedBehindTurn =
+        !createdFromWire &&
+        nextActivity?.state === "known" &&
+        nextActivity.value === "working" &&
+        current.leftQueueAt != null;
       this.emit({
         effortPending: {
           ...this.state.effortPending,
-          [instanceId]: { ...current, queued: true, queuedObservedAt: stamped },
+          [instanceId]: createdFromWire
+            ? current
+            : {
+                ...current,
+                queued: true,
+                queuedObservedAt: stamped,
+                ...(requeuedBehindTurn ? { leftQueueAt: null } : {}),
+              },
         },
       });
+      if (createdFromWire) {
+        // c-effortread r13 item 3: the observer tab's legacy pending gets the
+        // same bounded, request-owned reconciliation as a client request,
+        // owned by ITS nonce (a newer edge replaces; settlement/cleanup of a
+        // stale nonce is a no-op). A silent id-less no-op or an unusable
+        // queued timestamp ends in the explicit unconfirmed outcome instead of
+        // sitting on 切换中 for the 30-minute max age.
+        this.armEffortReconciliation(instanceId, current.nonce);
+      }
       return;
     }
     if (parsed.kind === "applied") {
@@ -4481,10 +4527,10 @@ class HubStore {
    * read-back (the durable projection folds through the strict legacy
    * fallback), then either let the settle stand or surface an explicit
    * "unconfirmed" outcome. The bound is request-owned FROM THE MOMENT THE
-   * REQUEST LEFT THE DRIVER QUEUE (r13 item 2): a request still behind a
-   * running turn waits for the working→idle activity evidence (which re-arms
-   * the slot) instead of burning its bound in the queue; a genuinely long
-   * turn is owned by the 30-minute max-age backstop.
+   * REQUEST COULD RUN (r13 item 2/3 — a client request at the working→idle
+   * evidence, a wire pending at receipt when idle): a request still behind a
+   * running turn (`leftQueueAt == null`) waits instead of burning its bound
+   * in the queue; the 30-minute max-age backstop bounds the total wait.
    */
   private async runEffortReconciliation(instanceId: Id, nonce: number) {
     const slot = this.effortReconcileTimers.get(instanceId);
@@ -4495,22 +4541,23 @@ class HubStore {
       if (slot?.nonce === nonce) this.effortReconcileTimers.delete(instanceId);
       return;
     }
-    if (pendingNow.queued) {
+    if (pendingNow.leftQueueAt == null) {
       // Still behind the running turn: no read-back is even possible yet.
-      // Wait; the working→idle activity evidence flips `queued` and re-arms a
-      // fresh full bound. Never refresh and never declare unconfirmed while
-      // queued — the long-turn max-age backstop bounds the total wait.
+      // Wait; the working→idle activity evidence stamps leftQueueAt and
+      // re-arms a fresh full bound. Never refresh and never declare
+      // unconfirmed while queued — the long-turn max-age backstop bounds the
+      // total wait.
       const timer = setTimeout(() => {
         void this.runEffortReconciliation(instanceId, nonce);
       }, EFFORT_UNCONFIRMED_BOUND_MS);
       this.effortReconcileTimers.set(instanceId, { nonce, timer });
       return;
     }
-    // The request owns its bound from when it left the queue (an idle-send
-    // request initializes that to the send time). A timer that was armed
-    // BEFORE a late activity exit must not fire early: reschedule the
-    // remainder instead of reconciling on a partial window.
-    const boundStart = pendingNow.leftQueueAt ?? pendingNow.at;
+    // The request owns its bound from when it could run (an idle-send request
+    // initializes that to the send time). A timer that was armed BEFORE a late
+    // activity exit must not fire early: reschedule the remainder instead of
+    // reconciling on a partial window.
+    const boundStart = pendingNow.leftQueueAt;
     const elapsed = Date.now() - boundStart;
     if (elapsed < EFFORT_UNCONFIRMED_BOUND_MS) {
       const timer = setTimeout(() => {
@@ -4527,10 +4574,10 @@ class HubStore {
       this.effortReconcileTimers.delete(instanceId);
       return;
     }
-    if (after.queued) {
-      // A queued edge re-queued the request during the read-back: the
-      // activity-exit evidence will re-arm the bound; wait rather than ending
-      // it unconfirmed against a request the driver has not run yet.
+    if (after.leftQueueAt == null) {
+      // A new turn re-queued the request during the read-back: the next
+      // working→idle evidence re-arms the bound; wait rather than ending it
+      // unconfirmed against a request the driver has not run yet.
       const timer = setTimeout(() => {
         void this.runEffortReconciliation(instanceId, nonce);
       }, EFFORT_UNCONFIRMED_BOUND_MS);

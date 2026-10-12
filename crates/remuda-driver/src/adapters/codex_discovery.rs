@@ -58,15 +58,8 @@ fn canonical(path: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Instance LIFETIMES (c-usagefu r9 item 1)
+// Instance LIFETIMES (c-usagefu r9 item 1; r11 Ruling A2)
 // ---------------------------------------------------------------------------
-
-/// How long a CLOSED instance's lifetime is retained after close. Prompt-only
-/// attribution windows span minutes ([`INPUT_MATCH_WINDOW`]); a record older
-/// than this can no longer overlap any plausible discovery decision, so it is
-/// pruned on the next registration in that cwd. The bound exists because the
-/// registry lives for the whole Node process.
-const LIFETIME_RETENTION: time::Duration = time::Duration::hours(1);
 
 /// One interval an instance was live in a cwd.
 struct InstanceLifetime {
@@ -251,17 +244,6 @@ pub(crate) fn begin_lifetime(
     owner: &str,
     launched_at: Option<OffsetDateTime>,
 ) -> LifetimeGuard {
-    begin_lifetime_at(cwd, owner, launched_at, OffsetDateTime::now_utc())
-}
-
-/// Clock-injected core of [`begin_lifetime`] (production passes wall-clock
-/// now; regressions advance the retention horizon deterministically).
-pub(crate) fn begin_lifetime_at(
-    cwd: &Path,
-    owner: &str,
-    launched_at: Option<OffsetDateTime>,
-    now: OffsetDateTime,
-) -> LifetimeGuard {
     let key = canonical(cwd);
     let epoch = {
         let mut map = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
@@ -269,11 +251,12 @@ pub(crate) fn begin_lifetime_at(
         let segments = by_instance
             .entry(owner.to_owned())
             .or_insert_with(InstanceSegments::empty);
-        prune_closed_intervals(segments, now);
         // A resume starts a NEW interval: never mutate an existing segment
         // (no floor min, no reopening, no bridging). The cohort epoch is one
         // past the newest segment so a stale guard's close lands on its own
-        // segment alone.
+        // segment alone. Registration does NOT prune by time: closed segments
+        // are retained while a discovery decision is pending and dropped only
+        // when the cwd's last discovery window closes (r11 item 5, Ruling A2).
         let epoch = segments
             .segments
             .last()
@@ -298,29 +281,24 @@ pub(crate) fn begin_lifetime_at(
     }
 }
 
-/// Drop CLOSED intervals whose close predates `now - LIFETIME_RETENTION`: they
-/// can no longer overlap any current discovery decision. A live interval
-/// (closed_at None) is never pruned. Retained closed intervals are exactly
-/// what keep a later launch from becoming "sole" over a window a since-closed
-/// instance shared (r9 item 1); the hard horizon bounds that memory (r10
-/// item 2: after it, a rejection keyed to that blocker may flip).
-fn prune_closed_intervals(segments: &mut InstanceSegments, now: OffsetDateTime) {
-    let cutoff = now - LIFETIME_RETENTION;
-    segments
-        .segments
-        .retain(|segment| segment.closed_at.is_none_or(|closed| closed >= cutoff));
-}
-
-/// Test seam: expire closed intervals in `cwd` as if retention were judged at
-/// `now` (a same-cwd registration triggers the same prune in production).
-#[cfg(test)]
-pub(crate) fn prune_closed_intervals_at(cwd: &Path, now: OffsetDateTime) {
-    let key = canonical(cwd);
+/// Drop every CLOSED segment of every owner in `cwd`, keeping LIVE intervals.
+/// Called when the cwd's LAST discovery window closes: no attribution decision
+/// is then pending, and Ruling A2 (c-usagefu r11 item 5) bounds the registry
+/// by PENDING DECISIONS rather than by a fixed time horizon. A segment that
+/// closed cannot overlap a decision made by a window that opened only after
+/// every earlier window was gone, so the discard is sound. A live segment
+/// (closed_at None) is always retained.
+fn prune_closed_for_cwd(key: &Path) {
     let mut map = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
-    if let Some(by_instance) = map.get_mut(&key) {
+    if let Some(by_instance) = map.get_mut(key) {
         for segments in by_instance.values_mut() {
-            prune_closed_intervals(segments, now);
+            segments
+                .segments
+                .retain(|segment| segment.closed_at.is_none());
         }
+        // Drop owners with no interval left (every segment closed), so the
+        // census genuinely forgets them rather than keeping an empty shell.
+        by_instance.retain(|_, segments| !segments.segments.is_empty());
     }
 }
 
@@ -329,6 +307,23 @@ pub(crate) fn prune_closed_intervals_at(cwd: &Path, now: OffsetDateTime) {
 #[cfg(test)]
 pub(crate) trait LifetimeGuardClock {
     fn close_lifetime_at(&self, at: OffsetDateTime);
+}
+
+/// Test seam: move `owner`'s newest segment's recorded close to `at`, as if
+/// wall-clock time had advanced to `at` after the interval closed. Lets
+/// retention regressions place a closed segment arbitrarily far in the past
+/// without sleeping (r11 item 5).
+#[cfg(test)]
+pub(crate) fn retroactively_close_at(cwd: &Path, owner: &str, at: OffsetDateTime) {
+    let key = canonical(cwd);
+    let mut map = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
+    if let Some(segments) = map
+        .get_mut(&key)
+        .and_then(|by_instance| by_instance.get_mut(owner))
+        && let Some(last) = segments.segments.last_mut()
+    {
+        last.closed_at = Some(at);
+    }
 }
 
 #[cfg(test)]
@@ -513,18 +508,22 @@ impl DiscoveryWindow {
         {
             set.remove(&self.owner);
         }
-        // r7 item 10: when this is the LAST open window for the cwd, no
-        // discovery lifecycle remains — discard all recorded prompts so they
-        // cannot authorize a future unrelated rollout and do not accumulate.
-        // (A specific owner's prompts are also harmless once no window is
-        // open; the next launch records fresh inputs.)
-        if last_window
-            && let Some(by_instance) = SENT_INPUTS
+        // r7 item 10 + r11 item 5 (Ruling A2): when this is the LAST open
+        // window for the cwd, no discovery lifecycle remains and no
+        // attribution decision is pending. Discard all recorded prompts so
+        // they cannot authorize a future unrelated rollout, and drop every
+        // CLOSED lifetime segment — retained only while a pending decision
+        // could overlap them, never on a fixed time horizon. LIVE segments are
+        // kept (a bound instance stays live after its window released).
+        if last_window {
+            if let Some(by_instance) = SENT_INPUTS
                 .lock()
                 .expect("codex sent inputs")
                 .get_mut(&self.key)
-        {
-            by_instance.clear();
+            {
+                by_instance.clear();
+            }
+            prune_closed_for_cwd(&self.key);
         }
     }
 }

@@ -1481,10 +1481,8 @@ fn a_rejected_candidate_is_never_rematched_even_after_the_blocker_leaves_the_cen
     assert!(!b.discover().unwrap(), "B rejects F while A overlaps");
     assert!(b.binding().is_none(), "F stays unbound for B");
 
-    // The blocker leaves the census in EVERY way the r10 code could wait for:
-    // pruned past the old retention horizon, then forgotten entirely.
-    let later = a_close + time::Duration::hours(2);
-    crate::adapters::codex_discovery::prune_closed_intervals_at(Path::new(cwd), later);
+    // The blocker leaves the census ENTIRELY — Ruling A1 has no expiry: not on
+    // blocker close, not on interval pruning, not on any census change.
     crate::adapters::codex_discovery::forget_lifetime(Path::new(cwd), INST_A);
 
     // A clean re-judgment with NO blocker on the census would match — the
@@ -1509,6 +1507,93 @@ fn a_rejected_candidate_is_never_rematched_even_after_the_blocker_leaves_the_cen
         crate::adapters::codex_discovery::claimed_owner_of(&f_path),
         None,
         "F is still unclaimed"
+    );
+}
+
+#[test]
+fn a_closed_interval_is_retained_for_a_pending_decision_past_any_hour_boundary() {
+    // c-usagefu r11 item 5 (Ruling A2 exact): closed intervals are retained
+    // while ANY pending discovery decision could overlap them — there is no
+    // fixed one-hour prune. r10 pruned every closed segment older than an
+    // hour on the next same-cwd registration, so a live unbound discoverer
+    // scanning lazily more than an hour later saw an incomplete census and
+    // could bind a rollout the closed instance actually owned. Once the
+    // cwd's LAST discovery window closes (no decision remains pending), the
+    // closed segments are dropped and live intervals kept.
+    use crate::adapters::codex_discovery::LifetimeGuardClock as _;
+
+    let home = tempfile::tempdir().unwrap();
+    let cwd = "/projects/r11-item5-retention";
+    // Anchor near wall-clock now (concurrent real-time tests share the prompt
+    // registry's age sweep), then walk TWO HOURS forward.
+    let base = OffsetDateTime::now_utc() - time::Duration::seconds(20);
+    let b_floor = base + time::Duration::seconds(5);
+    let f_at = base + time::Duration::seconds(7);
+    let a_close = base + time::Duration::seconds(10);
+    let prompt = "late lazy rollout prompt";
+
+    // A registers, shares the window with B over F's creation, then closes —
+    // while B is still a live unbound discoverer.
+    let a = crate::adapters::codex_discovery::begin_lifetime(Path::new(cwd), INST_A, Some(base));
+    let mut b = launch_adapter_keyed(home.path(), cwd, b_floor, INST_B);
+    send_fixture_prompt(Path::new(cwd), INST_B, prompt, b_floor);
+    write_rollout_prompt_at(
+        home.path(),
+        "F-retained",
+        cwd,
+        &f_at.format(&Rfc3339).unwrap(),
+        prompt,
+    );
+    a.close_lifetime_at(a_close);
+    drop(a);
+
+    // While A's close is recent the census proof is unprovable: B refuses F.
+    assert!(
+        !crate::adapters::codex_discovery::sole_instance_matches(
+            Path::new(cwd),
+            INST_B,
+            prompt,
+            f_at
+        ),
+        "the retained closed segment keeps the census sole-live proof unprovable"
+    );
+    assert!(
+        !b.discover().unwrap(),
+        "the production discovery path refuses F"
+    );
+    assert!(b.binding().is_none());
+
+    // Wall-clock advances past the old one-hour horizon WHILE B is still a
+    // live unbound discoverer: move A's recorded close two hours into the
+    // past, then another same-cwd instance registers (r10 pruned on exactly
+    // this). The pending-decision rule retains A regardless of age; r10's
+    // fixed-hour prune discarded it here.
+    crate::adapters::codex_discovery::retroactively_close_at(
+        Path::new(cwd),
+        INST_A,
+        OffsetDateTime::now_utc() - time::Duration::hours(2) - time::Duration::minutes(10),
+    );
+    let _c = crate::adapters::codex_discovery::begin_lifetime(Path::new(cwd), INST_C, None);
+    assert!(
+        crate::adapters::codex_discovery::census_contains(Path::new(cwd), INST_A),
+        "A's closed segment is retained two hours past close while B's decision is pending"
+    );
+    // The production path keeps refusing F for B too (the Ruling A1 permanent
+    // rejection from the first judgment).
+    assert!(!b.discover().unwrap(), "B still refuses F two hours on");
+    assert!(b.binding().is_none());
+
+    // B gives up: its discovery window is the cwd's last one, so on close the
+    // pending-decision retention ends — A's CLOSED segment is dropped while
+    // C's LIVE interval stays.
+    drop(b);
+    assert!(
+        !crate::adapters::codex_discovery::census_contains(Path::new(cwd), INST_A),
+        "closed segments are pruned when the last window closes, not by the clock"
+    );
+    assert!(
+        crate::adapters::codex_discovery::census_lifetime_is_live(Path::new(cwd), INST_C),
+        "a live interval survives the closed-segment prune"
     );
 }
 
@@ -1541,13 +1626,12 @@ fn a_resume_starts_a_new_interval_and_never_bridges_the_gap() {
     let t107 = t0 + time::Duration::seconds(107);
 
     // First interval: registered at t0, closed at t20.
-    let first = crate::adapters::codex_discovery::begin_lifetime_at(cwd, INST_A, Some(t0), t0);
+    let first = crate::adapters::codex_discovery::begin_lifetime(cwd, INST_A, Some(t0));
     first.close_lifetime_at(t20);
     drop(first);
 
     // Resume at t100: a brand-new segment whose floor is the resume time.
-    let resumed =
-        crate::adapters::codex_discovery::begin_lifetime_at(cwd, INST_A, Some(t100), t100);
+    let resumed = crate::adapters::codex_discovery::begin_lifetime(cwd, INST_A, Some(t100));
 
     let segments = crate::adapters::codex_discovery::census_segments(cwd, INST_A);
     assert_eq!(
@@ -1577,7 +1661,7 @@ fn a_resume_starts_a_new_interval_and_never_bridges_the_gap() {
     // launched and the resumed segment does not exist yet, so C is sole. Under
     // the old bridged record (launch min = t0, closed cleared), A invented an
     // overlap spanning the gap and C was refused.
-    let _c = crate::adapters::codex_discovery::begin_lifetime_at(cwd, INST_C, Some(t30), t30);
+    let _c = crate::adapters::codex_discovery::begin_lifetime(cwd, INST_C, Some(t30));
     send_fixture_prompt(cwd, INST_C, "gap prompt", t45);
     assert!(
         crate::adapters::codex_discovery::sole_instance_matches(cwd, INST_C, "gap prompt", t50),

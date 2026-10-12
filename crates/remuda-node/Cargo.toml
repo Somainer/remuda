@@ -49,7 +49,7 @@ tokio-tungstenite.workspace = true
 url = "2"
 tracing.workspace = true
 uuid.workspace = true
-nix = { version = "0.28", features = ["process", "fs", "signal"] }
+nix = { version = "0.28", features = ["process", "fs", "signal", "inotify"] }
 plist = { version = "1.10.1", default-features = false }
 
 [dev-dependencies]

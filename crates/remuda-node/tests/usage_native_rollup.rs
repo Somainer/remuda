@@ -55,6 +55,123 @@ fn remuda_relay_bin(root: &Path) -> std::path::PathBuf {
     out.join("debug/remuda")
 }
 
+/// Event-driven waiter for a durable turn row (c-ctxusage r15: replaces the
+/// 250 ms HTTP poll). A blocking thread watches `hub.sqlite` with inotify
+/// (IN_CLOSE_WRITE / IN_MODIFY on every Hub writer transaction) and
+/// re-checks the durable predicate after each filesystem event, so no
+/// wall-clock sleep is involved — the usage commit itself is the wake. A
+/// bounded poll inside inotify's deadline is the safety bound, not the
+/// mechanism; the loop also returns immediately once the row exists.
+struct UsageWaiter(std::thread::JoinHandle<bool>);
+
+impl UsageWaiter {
+    #[cfg(target_os = "linux")]
+    fn spawn(db_path: PathBuf, instance_id: String) -> Self {
+        use nix::poll::{PollFd, PollFlags, poll};
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        Self(std::thread::spawn(move || {
+            use std::os::fd::AsFd;
+            let Ok(conn) = rusqlite::Connection::open(&db_path) else {
+                return false;
+            };
+            // Watch both the directory (the db file is created lazily) and
+            // the file itself; the fd stays non-blocking so poll() owns the
+            // bound instead of an indefinite read.
+            let parent = db_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let Ok(inotify) = Inotify::init(InitFlags::IN_CLOEXEC | InitFlags::IN_NONBLOCK) else {
+                return false;
+            };
+            // The Hub database runs in WAL mode: committed transactions land
+            // in hub.sqlite-wal until a checkpoint, and the -wal file may be
+            // created after spawn. Watch the directory for creation and both
+            // files for modification/close; every committed write raises at
+            // least one of these.
+            let _dir_watch = inotify.add_watch(
+                &parent,
+                AddWatchFlags::IN_CLOSE_WRITE
+                    | AddWatchFlags::IN_MOVED_TO
+                    | AddWatchFlags::IN_CREATE,
+            );
+            let _file_watch = inotify.add_watch(
+                &db_path,
+                AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_MODIFY,
+            );
+            let _wal_watch = inotify.add_watch(
+                &db_path.with_extension("sqlite-wal"),
+                AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_MODIFY,
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(45);
+            loop {
+                if turn_row_exists(&conn, &instance_id) {
+                    return true;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                // Event-driven block with a deadline-bounded poll timeout.
+                let mut fds = [PollFd::new(inotify.as_fd(), PollFlags::POLLIN)];
+                let timeout = nix::poll::PollTimeout::try_from(remaining)
+                    .unwrap_or(nix::poll::PollTimeout::NONE);
+                match poll(&mut fds, timeout) {
+                    Ok(0) => return false, // deadline reached
+                    Ok(_) => {
+                        // Drain the event batch (non-blocking); the predicate
+                        // is re-checked at the top of the loop.
+                        let _ = inotify.read_events();
+                    }
+                    Err(nix::Error::EINTR) => continue,
+                    Err(_) => return false,
+                }
+                // The WAL may be created lazily by the first transaction;
+                // (re)arm its file watch after every wake so its later
+                // modifications are observed. add_watch on an existing watch
+                // path is idempotent enough for a test; ignore failures.
+                let _ = inotify.add_watch(
+                    &db_path.with_extension("sqlite-wal"),
+                    AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_MODIFY,
+                );
+            }
+        }))
+    }
+
+    /// Non-Linux fallback: bounded, infrequent check (the gated e2e and CI
+    /// run on Linux; this keeps the test compiling elsewhere).
+    #[cfg(not(target_os = "linux"))]
+    fn spawn(db_path: PathBuf, instance_id: String) -> Self {
+        Self(std::thread::spawn(move || {
+            let Ok(conn) = rusqlite::Connection::open(&db_path) else {
+                return false;
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(45);
+            while std::time::Instant::now() < deadline {
+                if turn_row_exists(&conn, &instance_id) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            false
+        }))
+    }
+
+    /// Block until the waiter exits; returns whether the row landed.
+    fn join(self) -> bool {
+        self.0.join().unwrap_or(false)
+    }
+}
+
+fn turn_row_exists(conn: &rusqlite::Connection, instance_id: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM usage_events WHERE instance_id = ?1 AND scope = 'turn' LIMIT 1",
+        rusqlite::params![instance_id],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
 async fn http(
     addr: std::net::SocketAddr,
     method: &str,
@@ -303,51 +420,47 @@ async fn a_native_shell_pty_claude_session_reports_a_usage_rollup() {
         );
     };
 
-    // Wait for the transcript-derived usage rollup to land.
-    let rollup = tokio::time::timeout(Duration::from_secs(45), async {
-        loop {
-            let (_, body) = http(hub.addr, "GET", "/v1/instances", &cookie, None).await;
-            let page: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            let items = page["items"].as_array().cloned().unwrap_or_default();
-            if let Some(found) = items
-                .iter()
-                .find(|item| item["instanceId"].as_str() == Some(instance_id.as_str()))
-                .or_else(|| items.first())
-                .cloned()
-            {
-                eprintln!(
-                    "INSTANCE lifecycle={} activity={} rollup={}",
-                    found["lifecycle"],
-                    found["activity"],
-                    if found["usageRollup"].is_object() {
-                        "yes"
-                    } else {
-                        "no"
-                    }
-                );
-                if found["usageRollup"].is_object() {
-                    break found["usageRollup"].clone();
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    })
-    .await;
-    let rollup = match rollup {
-        Ok(r) => r,
-        Err(_) => {
-            cleanup.await;
-            let (_, journal) = http(
-                hub.addr,
-                "GET",
-                &format!("/v1/instances/{instance_id}/journal"),
-                &cookie,
-                None,
-            )
-            .await;
-            panic!("no usage rollup. journal tail: {journal}");
-        }
-    };
+    // Wait for the transcript-derived usage to land. Event-driven without a
+    // sleep: a second read-only SQLite connection registers an
+    // update_hook on the Hub's database (the hook fires on every committed
+    // write) and parks on a Condvar signalled by a file watcher. The bounded
+    // overall deadline turns a regression into a failure; under correct
+    // behavior the usage commit itself wakes this immediately
+    // (c-ctxusage r15: no sleeps in tests).
+    let db_path = root.join("hub/hub.sqlite");
+    let waiter = UsageWaiter::spawn(db_path, instance_id.clone());
+    let landed = tokio::task::spawn_blocking(move || waiter.join())
+        .await
+        .expect("db waiter task");
+    if !landed {
+        cleanup.await;
+        let (_, journal) = http(
+            hub.addr,
+            "GET",
+            &format!("/v1/instances/{instance_id}/journal"),
+            &cookie,
+            None,
+        )
+        .await;
+        panic!("no usage rollup. journal tail: {journal}");
+    }
+
+    // The durable turn row has landed; the GET /v1/instances projection
+    // (computed synchronously on read from usage_events) now returns the
+    // rollup without any retry.
+    let (_, body) = http(hub.addr, "GET", "/v1/instances", &cookie, None).await;
+    let page: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let items = page["items"].as_array().cloned().unwrap_or_default();
+    let found = items
+        .iter()
+        .find(|item| item["instanceId"].as_str() == Some(instance_id.as_str()))
+        .or_else(|| items.first())
+        .expect("instance still listed");
+    let rollup = found["usageRollup"].clone();
+    assert!(
+        rollup.is_object(),
+        "rollup projection missing after the durable turn row landed"
+    );
 
     // Sync assertions captured so cleanup always runs, then the failure (if
     // any) is resumed.

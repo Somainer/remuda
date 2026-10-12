@@ -215,16 +215,26 @@ async fn launch_harness() -> (Harness, tokio::sync::mpsc::Receiver<Observation>)
     });
     let driver = ShellPtyDriver::new(options);
     let handle = driver.start(spec_for(&workspace)).await.expect("start");
-    let rx = handle.into_events();
+    let mut rx = handle.into_events();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(25);
-    while std::time::Instant::now() < deadline {
-        if Driver::wait_control(&driver).await.is_ok() {
+    // Event-driven readiness (c-ctxusage r15: no wall-clock poll): the
+    // promoter's `agent_promoted` lifecycle is emitted once the fake harness
+    // is detected in the foreground and its epoch is bound — exactly the
+    // state wait_control's poll loop was approximating. The tests then wait
+    // on a specific usage scope, a strictly stronger pump barrier.
+    let promoted_deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    let mut promoted = false;
+    while let Ok(remaining) = tokio::time::timeout_at(promoted_deadline, rx.recv()).await {
+        let Some(observation) = remaining else { break };
+        if let ObservationPayload::Lifecycle(lifecycle) = &observation.body
+            && let remuda_protocol::LifecyclePayload::Native(native) = lifecycle.as_ref()
+            && native.native_name == "agent_promoted"
+        {
+            promoted = true;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(Driver::wait_control(&driver).await.is_ok(), "never ready");
+    assert!(promoted, "the foreground harness was never promoted");
     (Harness { driver, dir }, rx)
 }
 

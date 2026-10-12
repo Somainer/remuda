@@ -1199,6 +1199,50 @@ class HubStore {
       }
       if (queueExits.size) merged = { ...patch, effortPending: pendingNext };
     }
+    // c-effortread r17 item 2: later busy evidence (working or
+    // waiting-interaction) — in the SAME follow batch as an earlier idle
+    // snapshot, or in any later emission — re-queues the request behind a turn
+    // or a parked interaction. The per-event fold stamps leftQueueAt and arms
+    // the 15 s timer on EACH idle snapshot; without this symmetric fold a batch
+    // shaped [idle snapshot, busy snapshot] left the timer armed, and it fired
+    // an unconfirmed toast while the driver was still blocked. Withdraw the
+    // stamp and cancel THAT nonce's timer; the next authoritative idle
+    // re-stamps leftQueueAt (above) and re-arms the full window.
+    let queueReentries: Map<Id, number> | null = null;
+    if (merged.instances) {
+      const pendingBase = merged.effortPending ?? this.state.effortPending;
+      for (const next of merged.instances) {
+        if (!effortAwaitsQueueExit(next.activity)) continue;
+        const pending = pendingBase[next.id];
+        if (pending && pending.leftQueueAt != null) {
+          (queueReentries ??= new Map()).set(next.id, pending.nonce);
+        }
+      }
+    }
+    if (queueReentries?.size) {
+      const base = merged.effortPending ?? this.state.effortPending;
+      const pendingNext = { ...base };
+      for (const [id, nonce] of queueReentries) {
+        const pending = pendingNext[id];
+        if (!pending || pending.nonce !== nonce || pending.leftQueueAt == null) {
+          queueReentries.delete(id);
+          continue;
+        }
+        pendingNext[id] = {
+          ...pending,
+          leftQueueAt: null,
+          // The optimistic chip re-enters 排队中 for a client request; a wire
+          // pending already carries the driver-provided queue word.
+          ...(pending.source === "client" ? { queued: true } : {}),
+        };
+        const slot = this.effortReconcileTimers.get(id);
+        if (slot?.nonce === nonce) {
+          clearTimeout(slot.timer);
+          this.effortReconcileTimers.delete(id);
+        }
+      }
+      if (queueReentries.size) merged = { ...merged, effortPending: pendingNext };
+    }
     this.state = { ...this.state, ...merged };
     for (const listener of this.listeners) listener();
     // Re-arm the request-owned bound for every request that just left its

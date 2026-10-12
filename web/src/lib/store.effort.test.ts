@@ -3604,3 +3604,79 @@ it("r17 item 1 (failed floor): B's own verdict arriving id-less under provenance
   expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");
 });
 
+it("r17 item 2: an idle snapshot followed by a busy snapshot in ONE batch cancels the idle-armed 15 s timer", async () => {
+  // One follow/catch-up batch carries, in journal order, an idle snapshot and
+  // THEN a working snapshot. The per-event fold used to stamp leftQueueAt and
+  // arm the 15 s bound on the intermediate idle; the later busy evidence never
+  // cancelled it, so the bound toasted "unconfirmed" while the driver was
+  // blocked on the new turn. The busy snapshot must withdraw the stamp and
+  // cancel the timer; the full window re-anchors only at the next idle.
+  const ctx = await startFollowing("r17-item2-batch-idle-busy", { state: "known", value: "waiting-interaction" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const baseline: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "low", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [baseline] } as never);
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  const entityActivity = (value: "working" | "waiting-interaction" | "idle", observedAt: string): Observation =>
+    ({
+      eventId: `evt_act_entity_r17_${value}_${observedAt}`,
+      instanceId: ctx.instance.id,
+      journalId: "x",
+      seq: "0",
+      kind: "lifecycle",
+      source: { channel: "runtime" },
+      observedAt,
+      payload: {
+        type: "entity",
+        entityType: "instance",
+        entityId: ctx.instance.id,
+        entity: {
+          id: ctx.instance.id,
+          activity: { state: "known", value },
+          activityEvidenceEventIds: [],
+          nativeRef: ctx.instance.nativeRef,
+          updatedAt: observedAt,
+        },
+      },
+    }) as unknown as Observation;
+
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
+  // The configure posts while an interaction is on screen: queued, no anchor.
+  const p = hubStore.setEffort(ctx.instance.id, { index: 1, name: "low", kind: "claude", ultracode: false });
+  await advanceEffortReconcile(0);
+  await p;
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.leftQueueAt).toBeNull();
+
+  // ONE batch: an idle snapshot stamps the exit and arms the 15 s bound, then
+  // a working snapshot in the SAME batch puts the request back in the queue.
+  ctx.receiveBatch([
+    entityActivity("idle", "2026-09-16T00:00:05.000Z"),
+    entityActivity("working", "2026-09-16T00:00:06.000Z"),
+  ]);
+  const requeued = hubStore.effortPendingOf(ctx.instance.id);
+  expect(requeued?.queued, "the later busy evidence re-queues the request").toBe(true);
+  expect(requeued?.leftQueueAt, "the idle stamp is withdrawn").toBeNull();
+
+  // The idle-armed timer must be gone: well past 15 s while still blocked, no
+  // unconfirmed toast and the pending survives.
+  await advanceEffortReconcile(15_001);
+  expect(hubStore.effortPendingOf(ctx.instance.id), "never unconfirmed while blocked").not.toBeNull();
+  expect(toast).not.toHaveBeenCalled();
+
+  // Authoritative idle in a LATER batch re-anchors a fresh full window.
+  ctx.receiveBatch([entityActivity("idle", "2026-09-16T00:00:40.000Z")]);
+  const exited = hubStore.effortPendingOf(ctx.instance.id);
+  expect(exited?.queued).toBe(false);
+  expect(typeof exited?.leftQueueAt).toBe("number");
+  await advanceEffortReconcile(14_999);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
+  expect(toast).not.toHaveBeenCalled();
+  await advanceEffortReconcile(2);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");
+});

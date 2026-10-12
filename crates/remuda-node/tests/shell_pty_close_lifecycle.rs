@@ -742,3 +742,215 @@ async fn an_incomplete_promoted_close_stays_live_and_a_retry_completes() {
         "the termination usage is delivered exactly once across both attempts"
     );
 }
+
+/// Build the promoted-claude fake-harness layout shared by the P1 race tests
+/// (c-ctxusage r16 item 6).
+fn p1_promoted_layout() -> (tempfile::TempDir, PathBuf, PathBuf, ShellPtyDriver) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let workspace = root.join("workspace");
+    let native_home = root.join("home");
+    let instance_dir = root.join("instance");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&native_home).unwrap();
+    let install = root.join("opt/bin");
+    std::fs::create_dir_all(&install).unwrap();
+    let binary = install.join("claude");
+    std::fs::copy(ensure_workspace_bin("fake-harness"), &binary).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let events_path = root.join("harness-events.jsonl");
+
+    let transcript = remuda_driver::claude_transcript::project_dir(&native_home, &workspace)
+        .join(format!("{SESSION_ID}.jsonl"));
+    seed_transcript(&transcript, 20);
+
+    let mut options = ShellPtyOptions::agent(
+        workspace.clone(),
+        AgentKind::Claude,
+        AgentLaunch {
+            profile: Box::new(profile()),
+            launch_dir: instance_dir.join("launch"),
+            native_home: native_home.clone(),
+            binary: Some(binary),
+            origin: LaunchOrigin::Human,
+            native_home_managed: true,
+            settings_overlay: None,
+        },
+    );
+    options.emulator = true;
+    options.pin_native_home = true;
+    options.claude_home = Some(native_home);
+    options
+        .extra_env
+        .insert("FAKE_HARNESS_DIALECT_VERSION".into(), "modern".into());
+    options.extra_env.insert(
+        "FAKE_HARNESS_EVENTS_OUT".into(),
+        events_path.to_string_lossy().into_owned(),
+    );
+    options
+        .extra_env
+        .insert("FAKE_HARNESS_APPEND_ON_SIGNAL".into(), "1".into());
+    options.hooks = Some(HookConfig {
+        instance_dir,
+        relay_binary: relay_bin(),
+        tui: remuda_driver::TuiMode::Default,
+    });
+    let driver = ShellPtyDriver::new(options);
+    (dir, workspace, transcript, driver)
+}
+
+/// P1 (c-ctxusage r16 item 6), barrier-after-closing-check: a promoted close
+/// armed while a blocking transcript collect is still in flight must WAIT for
+/// that poll to finish and for the poller to enter the non-terminal closing
+/// branch before signalling the writer. Without the handoff barrier close ran
+/// the stop ladder concurrently with the in-flight normal pump, which could
+/// demote/finalise the hydrator under the writer shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promoted_close_waits_for_an_in_flight_poll_to_reach_the_closing_branch() {
+    use remuda_driver::test_faults::TranscriptFaults;
+    use std::io::Write;
+
+    let (_dir, workspace, transcript, driver) = p1_promoted_layout();
+    let driver = std::sync::Arc::new(driver);
+    let faults = TranscriptFaults::new();
+    driver.set_test_faults(faults.clone());
+
+    // Bind first, without any gate.
+    let handle = driver
+        .start(spec_for(&workspace, DriverKind::ShellPty))
+        .await
+        .expect("start");
+    let mut events_rx = handle.into_events();
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
+    let drainer = tokio::spawn(async move {
+        while let Some(observation) = events_rx.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+                && native.native_name == "transcript_bound"
+                && let Some(tx) = bound_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(20), bound_rx)
+        .await
+        .expect("the seeded replay never bound")
+        .expect("bound oneshot closed without firing");
+
+    // Now arm the pump gate and append fresh tail bytes: the NEXT normal tick
+    // enters its blocking collect and parks there, mid-flight in the NORMAL
+    // (sample/demote/finalise) branch.
+    faults.arm_pump_gate();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .expect("open transcript for append");
+    file.write_all(filler("race", 9001).as_bytes())
+        .expect("append fresh record");
+    file.sync_all().expect("sync append");
+    drop(file);
+    assert!(
+        faults.wait_pump_entered(),
+        "the post-bind normal-tick collect never parked"
+    );
+
+    // Close while that collect is parked. It must reach the barrier wait and
+    // stay there — the stop ladder cannot run until the poll finishes and the
+    // loop reaches the non-terminal closing branch.
+    let mut close: tokio::task::JoinHandle<_> = tokio::spawn({
+        let driver = driver.clone();
+        async move { driver.close().await }
+    });
+    assert!(
+        faults.wait_close_barrier_waiting_for(Duration::from_secs(15)),
+        "close never parked at the poller handoff barrier"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut close)
+            .await
+            .is_err(),
+        "close ran the stop ladder while the in-flight pump was still parked"
+    );
+
+    faults.release();
+    let result = tokio::time::timeout(Duration::from_secs(30), close)
+        .await
+        .expect("close task panicked")
+        .expect("close timed out after the pump released");
+    result.expect("close completes once the poller reaches the closing branch");
+
+    driver.abort_event_workers_for_test().await;
+    tokio::time::timeout(Duration::from_secs(30), drainer)
+        .await
+        .expect("event channel never closed")
+        .expect("event drainer panicked");
+}
+
+/// P1 (c-ctxusage r16 item 6), foreign drain: when the channel close arms is
+/// not the one the running poller observes (the resumed-promotion defect —
+/// start_resumed spawned a poller on a fresh LiveDrain instead of the
+/// driver's adopted one), the handoff barrier can never be acknowledged. The
+/// close must return the RETRYABLE WriterStillLive error WITHOUT signalling
+/// the writer or retiring anything; restoring the drain the poller actually
+/// holds lets a retried close complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_barrier_on_a_foreign_drain_is_retryable_and_a_retry_completes() {
+    use remuda_driver::test_faults::TranscriptFaults;
+
+    let (_dir, workspace, _transcript, driver) = p1_promoted_layout();
+    let faults = TranscriptFaults::new();
+    // Bound the wait so the missed-barrier case fails fast instead of 15 s.
+    faults.arm_close_barrier_timeout(Duration::from_millis(1200));
+    driver.set_test_faults(faults.clone());
+
+    let handle = driver
+        .start(spec_for(&workspace, DriverKind::ShellPty))
+        .await
+        .expect("start");
+    let mut events_rx = handle.into_events();
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
+    let drainer = tokio::spawn(async move {
+        while let Some(observation) = events_rx.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+                && native.native_name == "transcript_bound"
+                && let Some(tx) = bound_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(20), bound_rx)
+        .await
+        .expect("the seeded replay never bound")
+        .expect("bound oneshot closed without firing");
+
+    // Simulate the foreign-drain invariant violation: the poller keeps the
+    // original drain while close arms a fresh one.
+    let original = driver.test_swap_live_drain();
+    let first = tokio::time::timeout(Duration::from_secs(15), driver.close())
+        .await
+        .expect("the first close hung past its bound");
+    assert!(
+        matches!(first, Err(remuda_driver::DriverError::WriterStillLive(_))),
+        "a close whose barrier the poller never sees is retryable, got {first:?}"
+    );
+
+    // Restore the drain the live poller actually holds; the retry now reaches
+    // the closing branch, acknowledges, and finishes the teardown.
+    driver.test_restore_live_drain(original);
+    tokio::time::timeout(Duration::from_secs(15), driver.close())
+        .await
+        .expect("the retried close hung past its bound")
+        .expect("the retried close completes once the drain is the poller's");
+
+    driver.abort_event_workers_for_test().await;
+    tokio::time::timeout(Duration::from_secs(30), drainer)
+        .await
+        .expect("event channel never closed")
+        .expect("event drainer panicked");
+}

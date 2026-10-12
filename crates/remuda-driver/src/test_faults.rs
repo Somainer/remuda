@@ -96,6 +96,11 @@ pub(crate) struct FaultState {
     /// deterministically without the production 2 s wait (c-ctxusage r13
     /// item 1). Milliseconds; 0 means the production grace.
     agent_exit_grace_ms: AtomicU64,
+    /// Overrides the promoted-close poller handoff barrier bound
+    /// (PROMOTER_CLOSE_BARRIER) so a test that exercises a missed/foreign
+    /// drain gets the retryable error fast (P1, c-ctxusage r16 item 6).
+    /// Milliseconds; 0 means the production bound.
+    close_barrier_timeout_ms: AtomicU64,
     /// Remaining close calls whose native stop-phase ownership probe must
     /// fail, modelling Herdr refusing `session.snapshot` during its shutdown
     /// window (c-ctxusage r13 item 2): one decremented failure per close
@@ -124,6 +129,11 @@ pub(crate) struct FaultState {
     /// retryable `WriterStillLive` error without retiring the hydrator, and a
     /// retried close runs the real verification and completes.
     promoted_stop_incomplete_attempts: AtomicU64,
+    /// Acknowledged when a promoted close is parked at the poller handoff
+    /// barrier, waiting for an in-flight normal poll to finish (P1,
+    /// c-ctxusage r16 item 6).
+    close_barrier_waiting: Mutex<bool>,
+    close_barrier_waiting_cv: Condvar,
 }
 
 /// A parked phase must never wait forever on a test that forgot to release:
@@ -164,6 +174,7 @@ impl FaultState {
             close_timeout_ms: AtomicU64::new(0),
             pending_capacity: AtomicU64::new(0),
             agent_exit_grace_ms: AtomicU64::new(0),
+            close_barrier_timeout_ms: AtomicU64::new(0),
             close_probe_failures: AtomicU64::new(0),
             close_tail_armed: AtomicBool::new(false),
             close_tail_entered: Mutex::new(false),
@@ -172,6 +183,8 @@ impl FaultState {
             close_phase_calls: Mutex::new(0),
             close_phase_calls_cv: Condvar::new(),
             promoted_stop_incomplete_attempts: AtomicU64::new(0),
+            close_barrier_waiting: Mutex::new(false),
+            close_barrier_waiting_cv: Condvar::new(),
         })
     }
 
@@ -373,6 +386,14 @@ impl FaultState {
         }
     }
 
+    /// The injected promoted-close barrier timeout override, if armed.
+    pub(crate) fn close_barrier_timeout(&self) -> Option<Duration> {
+        match self.close_barrier_timeout_ms.load(Ordering::SeqCst) {
+            0 => None,
+            millis => Some(Duration::from_millis(millis)),
+        }
+    }
+
     /// Consume one armed promoted stop-incomplete attempt (P1,
     /// c-ctxusage r16 item 5). Returns true while the current promoted close
     /// must synthesize a writer-that-survived-the-ladder outcome.
@@ -384,6 +405,17 @@ impl FaultState {
                 if n > 0 { Some(n - 1) } else { None }
             })
             .is_ok_and(|previous| previous > 0)
+    }
+
+    /// Note that a promoted close is parked at the poller handoff barrier
+    /// (P1, c-ctxusage r16 item 6).
+    pub(crate) fn note_close_barrier_waiting(&self) {
+        let mut waiting = self
+            .close_barrier_waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *waiting = true;
+        self.close_barrier_waiting_cv.notify_all();
     }
 
     /// Acknowledge that the streaming flusher exited. A test holding a
@@ -543,6 +575,16 @@ impl TranscriptFaults {
             .store(u64::from(attempts), Ordering::SeqCst);
     }
 
+    /// Shorten the promoted-close poller handoff barrier so a test of a
+    /// missed/foreign drain crosses the retryable bound quickly (P1,
+    /// c-ctxusage r16 item 6). Production bound is used otherwise.
+    pub fn arm_close_barrier_timeout(&self, timeout: Duration) {
+        self.inner.close_barrier_timeout_ms.store(
+            timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            Ordering::SeqCst,
+        );
+    }
+
     /// Make the next `attempts` promoted closes report the native writer as
     /// STILL LIVE after the stop ladder (P1, c-ctxusage r16 item 5): each such
     /// close returns the retryable `WriterStillLive` error without retiring
@@ -680,6 +722,16 @@ impl TranscriptFaults {
         Self::wait_true(
             &self.inner.flusher_exited,
             &self.inner.flusher_exited_cv,
+            timeout,
+        )
+    }
+
+    /// Block until a promoted close parks at the poller handoff barrier
+    /// (P1, c-ctxusage r16 item 6), bounded.
+    pub fn wait_close_barrier_waiting_for(&self, timeout: Duration) -> bool {
+        Self::wait_true(
+            &self.inner.close_barrier_waiting,
+            &self.inner.close_barrier_waiting_cv,
             timeout,
         )
     }

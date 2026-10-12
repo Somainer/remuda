@@ -111,6 +111,10 @@ const REAP_EXITING_GRACE: std::time::Duration = std::time::Duration::from_secs(3
 /// read and queue flush, so it stays tight while still bounded on a loaded
 /// host.
 const PROMOTER_LIVE_DRAIN: std::time::Duration = std::time::Duration::from_secs(3);
+/// Bound on the poller handoff barrier at the start of a promoted close
+/// (P1, c-ctxusage r16 item 6). Generous against one in-flight blocking
+/// collect over a large transcript; a miss makes the close retryable.
+const PROMOTER_CLOSE_BARRIER: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Native lifecycle name for a PTY process that ended (§5.5).
 pub const NATIVE_EXIT: &str = "native_exit";
@@ -476,7 +480,7 @@ pub struct ShellPtyDriver {
     /// item 7): the promoted close stops the native writer first and flushes
     /// its termination append between the stop-ladder rungs while the
     /// hydrator and sender are still live.
-    live_drain: promotion::LiveDrain,
+    live_drain: std::sync::Mutex<promotion::LiveDrain>,
     /// Exit waiter (§5.5), stopped on close.
     waiter: Mutex<Option<JoinHandle<()>>>,
     /// Process table behind detection; a fixture in tests.
@@ -548,6 +552,39 @@ impl ShellPtyDriver {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(faults.inner);
     }
 
+    /// Test-only: replace the drain close arms on with a DIFFERENT
+    /// [`LiveDrain`] while the running poller keeps the original — exactly the
+    /// invariant violation a resumed/start_resumed promoted close had before
+    /// the poller adopted the parent driver's drain (P1, c-ctxusage r16
+    /// item 6). The opaque handle returned restores the original drain for a
+    /// retried close via [`Self::test_restore_live_drain`]. Call BEFORE close,
+    /// never while one is in flight.
+    #[cfg(feature = "test-faults")]
+    pub fn test_swap_live_drain(&self) -> Box<dyn std::any::Any + Send> {
+        let original = self
+            .live_drain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        *self
+            .live_drain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = promotion::LiveDrain::new();
+        Box::new(original)
+    }
+
+    /// Test-only: restore the drain returned by [`Self::test_swap_live_drain`].
+    #[cfg(feature = "test-faults")]
+    pub fn test_restore_live_drain(&self, drain: Box<dyn std::any::Any + Send>) {
+        let drain = *drain
+            .downcast::<promotion::LiveDrain>()
+            .expect("the restore handle came from test_swap_live_drain");
+        *self
+            .live_drain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = drain;
+    }
+
     /// Test-only: stop the long-lived effort/model/permission worker tasks
     /// and wait for their event-sender clones to drop, so the last senders of
     /// the event channel are gone and a receiver observes closure. These
@@ -583,7 +620,7 @@ impl ShellPtyDriver {
             poller: Mutex::new(None),
             poller_shutdown: Mutex::new(None),
             poller_finalised: Mutex::new(None),
-            live_drain: promotion::LiveDrain::new(),
+            live_drain: std::sync::Mutex::new(promotion::LiveDrain::new()),
             waiter: Mutex::new(None),
             table,
             fallbacks: crate::hook_answer::FallbackLedger::new(),
@@ -1365,6 +1402,13 @@ impl ShellPtyDriver {
                 .clone();
             *self.poller_shutdown.lock().await = Some(poller_tx);
             *self.poller_finalised.lock().await = Some(finalised_rx);
+            // Clone under the std mutex and DROP the guard before the await
+            // below: a non-Send guard must not cross the poller lock.
+            let live_drain = self
+                .live_drain
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             *self.poller.lock().await = Some(promotion::spawn(
                 Arc::clone(&state),
                 hook_ctx.clone(),
@@ -1403,7 +1447,7 @@ impl ShellPtyDriver {
                 poller_rx,
                 finalised_tx,
                 test_faults,
-                self.live_drain.clone(),
+                live_drain,
             ));
             // A login shell has no agent at spawn; once promotion identifies a
             // hand-typed codex/grok, start its file adapter against the native
@@ -1601,7 +1645,44 @@ impl ShellPtyDriver {
         let state = self.state().await?;
         // From here the poller only tail-reads the bound transcript; it does
         // not demote or finish the hydrator on an epoch boundary.
-        self.live_drain.arm_close();
+        let drain = self
+            .live_drain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let close_barrier = drain.arm_close().await;
+        // P1 (c-ctxusage r16 item 6): wait for the poller's handoff ack BEFORE
+        // signalling the writer. An in-flight normal tick may already have
+        // passed its closing check and be about to demote/finalise the
+        // hydrator; the ack fires only after that tick completed and the next
+        // iteration entered the non-terminal tail branch. Without the barrier
+        // that demote/finalise could retire the hydrator under the ladder and
+        // eat the writer's termination append. A poller that cannot reach the
+        // branch in time makes the close retryable rather than racing.
+        if let Some(faults) = self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+        {
+            faults.note_close_barrier_waiting();
+        }
+        let barrier_bound = self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            .and_then(crate::test_faults::FaultState::close_barrier_timeout)
+            .unwrap_or(PROMOTER_CLOSE_BARRIER);
+        if tokio::time::timeout(barrier_bound, close_barrier)
+            .await
+            .is_err()
+        {
+            tracing::warn!("promoted close barrier was not acknowledged; close stays retryable");
+            return Err(DriverError::WriterStillLive(
+                "the poller never acknowledged the close handoff barrier".into(),
+            ));
+        }
         let outcome = self.stop_tree(&state, true).await;
 
         // Test-only fault (P1, c-ctxusage r16 item 5): synthesize a writer
@@ -1732,7 +1813,12 @@ impl ShellPtyDriver {
             lifecycle::stop_group_draining(pgid, close_master, reaper, |_rung| async move {
                 // Bounded live flush of the writer's termination append
                 // while the poller, hydrator and event sender are still up.
-                let ack = self.live_drain.request().await;
+                let drain = self
+                    .live_drain
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let ack = drain.request().await;
                 let _ = tokio::time::timeout(PROMOTER_LIVE_DRAIN, ack).await;
             })
             .await
@@ -1823,6 +1909,30 @@ impl ShellPtyDriver {
         resumed.interrupt_screen_markers = Arc::clone(&self.interrupt_screen_markers);
         resumed.exited = Arc::clone(&self.exited);
         resumed.seq = Arc::clone(&self.seq);
+        // The resumed run's poller is adopted back onto THIS driver below, so
+        // it must coordinate close through THIS driver's LiveDrain and see
+        // the same test fault handle: a freshly constructed resumed driver has
+        // its own drain, and close() on the adopted driver would otherwise arm
+        // a channel its poller never observes — the handoff barrier and live
+        // drains would be lost on a resumed promoted close (P1,
+        // c-ctxusage r16 item 6).
+        resumed.live_drain = std::sync::Mutex::new(
+            self.live_drain
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        );
+        if let Some(faults) = self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            *resumed
+                .test_faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(faults);
+        }
         let handle = match spec {
             Some(spec) => resumed.spawn_at(&spec.cwd.clone(), Some(&spec)).await?,
             None => resumed.spawn().await?,

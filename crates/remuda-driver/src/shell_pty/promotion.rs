@@ -780,6 +780,11 @@ pub(super) struct LiveDrain {
     /// lifecycle, no epoch boundary finalise, so the close-time terminal
     /// finalise keeps owning the hydrator.
     closing: Arc<AtomicBool>,
+    /// One-shot fired by the poller once it has OBSERVED an armed close and is
+    /// inside the tail-only branch — the handoff barrier close waits on before
+    /// signalling the writer, so an in-flight normal poll's demote/finalise can
+    /// not interleave with writer shutdown (P1, c-ctxusage r16 item 6).
+    close_barrier: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 impl LiveDrain {
@@ -788,16 +793,35 @@ impl LiveDrain {
             notify: Arc::new(Notify::new()),
             waiters: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             closing: Arc::new(AtomicBool::new(false)),
+            close_barrier: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
-    /// Mark the close ladder as in progress.
-    pub(super) fn arm_close(&self) {
+    /// Mark the close ladder as in progress and install the poller handoff
+    /// barrier. Wakes the poller immediately so it leaves any select park.
+    pub(super) async fn arm_close(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.close_barrier.lock().await = Some(tx);
+        // Store the flag only after the barrier is installed, then wake the
+        // poller: whichever select arm fires, the next is_closing() decision
+        // sees both.
         self.closing.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+        rx
     }
 
     pub(super) fn is_closing(&self) -> bool {
         self.closing.load(Ordering::SeqCst)
+    }
+
+    /// Poller side of the handoff barrier: fire once per arm when it enters
+    /// the non-terminal closing branch, BEFORE the tail collect, so close only
+    /// runs the stop ladder once no normal poll (sample/demote/finalise) is in
+    /// flight (P1, c-ctxusage r16 item 6).
+    pub(super) async fn note_closing_observed(&self) {
+        if let Some(tx) = self.close_barrier.lock().await.take() {
+            let _ = tx.send(());
+        }
     }
 
     /// Ask the poller for one live drain. The receiver fires after the next
@@ -982,6 +1006,12 @@ pub(super) fn spawn(
             // must keep owning the hydrator so the writer's termination append
             // is drained while the sender is live.
             if live_drain.is_closing() {
+                // Handoff barrier (P1, c-ctxusage r16 item 6): reaching here
+                // means any earlier in-flight normal poll already finished and
+                // THIS iteration will not sample, demote or finalise. Acknowledge
+                // before the tail collect so close, waiting on this ack, only
+                // signals the writer once interleaving is impossible.
+                live_drain.note_closing_observed().await;
                 let _ = pump(
                     &hydrator,
                     &pending,

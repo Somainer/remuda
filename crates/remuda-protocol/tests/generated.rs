@@ -133,6 +133,10 @@ fn public_wire_types_are_registered_for_generation() {
         // §9.1: parsed verdict of an /effort stdout line — mapper output, not
         // a wire type.
         "EffortStdout",
+        // c-effortread r19 item 2: internal outcome of folding a suppressed
+        // unowned effort verdict into the tracker's deferred slot — mapper
+        // state, never serialized on the wire.
+        "UnownedAccept",
         // D-056: version-gated effort semantics and the slash-argument
         // classifier — pure transcript-mapper state/inputs, never on the wire.
         "EffortSemantics",

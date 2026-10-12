@@ -2586,13 +2586,15 @@ enum VerdictFront {
     Empty,
 }
 
-/// c-effortread r18 item 3: one edge an unowned accepted verdict WOULD have
-/// published, stashed while an armed switch is still outstanding. The edge is
-/// held with ITS OWN verdict record's deterministic event id and raw stdout,
-/// so when the armed switch ends (refusal/timeout) the deferred publish
-/// derives the SAME id the journal tailer derives for that record — the live
-/// mapper and durable replay converge on one event instead of the value being
-/// swallowed by edge dedup.
+/// c-effortread r18 item 3 / r19 item 2 ruling B: the ONE edge the latest
+/// unowned accepted verdict WOULD have published, stashed while an armed
+/// switch is still outstanding. The edge is held with ITS OWN verdict
+/// record's deterministic event id and raw stdout, so when the armed switch
+/// ends (refusal/timeout) the deferred publish derives the SAME id the
+/// journal tailer derives for that record — the live mapper and durable
+/// replay converge on one event instead of the value being swallowed by edge
+/// dedup. Every suppressed acceptance OVERWRITES this slot, including one
+/// equal to the published baseline (a return to baseline).
 struct DeferredEffortEdge {
     observed: remuda_protocol::ObservedEffort,
     event_id: EventId,
@@ -2619,9 +2621,12 @@ pub struct TranscriptMapper {
     /// pairs with ITS OWN slash — never with a newer owned request B typed
     /// while A's verdict was outstanding.
     effort_armed: std::collections::VecDeque<EffortSlashSlot>,
-    /// c-effortread r18 item 3: edges of suppressed unowned acceptances, in
-    /// verdict order, awaiting the armed switch's end to be published.
-    deferred_effort_edges: std::collections::VecDeque<DeferredEffortEdge>,
+    /// c-effortread r18 item 3 / r19 item 2 ruling B: the ONE latest
+    /// suppressed unowned acceptance edge awaiting the armed switch's end.
+    /// Every suppressed acceptance overwrites it; any authoritative
+    /// effective-state publication or the end-of-switch publish clears it via
+    /// [`Self::invalidate_deferred_effort`].
+    deferred_effort_edge: Option<DeferredEffortEdge>,
     /// c-effortread r12 item 1: test-only one-shot seam fired immediately
     /// after a `/effort` slash takes its single pending snapshot. It lets a
     /// unit test deterministically time the request out and arm a newer one
@@ -2685,7 +2690,7 @@ impl TranscriptMapper {
             effort,
             effort_bridge: None,
             effort_armed: std::collections::VecDeque::new(),
-            deferred_effort_edges: std::collections::VecDeque::new(),
+            deferred_effort_edge: None,
             #[cfg(test)]
             effort_slash_snapshot_hook: None,
             model: remuda_protocol::ModelTracker::new(),
@@ -3283,20 +3288,24 @@ impl TranscriptMapper {
                     .as_ref()
                     .is_some_and(|bridge| bridge.has_pending());
                 if matches!(front, VerdictFront::Unowned) && armed_switch_pending {
-                    // r18 item 3: the folded state is NOT published now, but
-                    // the verdict's own edge is stashed with its record event
-                    // id and published once the armed switch ends (or emitted
-                    // by the next authoritative same-value read-back), so a
-                    // suppressed pre-floor acceptance can no longer consume the
-                    // effective update permanently.
-                    if let Some((observed, _)) = self.effort.note_unowned_stdout(&stdout) {
+                    // r18 item 3 / r19 item 2 ruling B: the folded state is
+                    // NOT published now, but the verdict's own edge is
+                    // stashed with its record event id. The stash is ONE
+                    // latest slot: EVERY suppressed accepted verdict
+                    // overwrites it — including one equal to the published
+                    // baseline (a return to baseline) — so it is handed back
+                    // even when it changes no published state. It is
+                    // published once the armed switch ends (if still current
+                    // and different), or dropped by the next authoritative
+                    // publication via invalidate_deferred_effort.
+                    if let Some(accept) = self.effort.note_unowned_stdout(&stdout) {
                         let event_id = self.effort_event_id(
                             value,
-                            observed.name,
+                            accept.observed.name,
                             remuda_protocol::EFFORT_STDOUT_NATIVE,
                         );
-                        self.deferred_effort_edges.push_back(DeferredEffortEdge {
-                            observed,
+                        self.deferred_effort_edge = Some(DeferredEffortEdge {
+                            observed: accept.observed,
                             event_id,
                             raw: Some(stdout.clone()),
                         });
@@ -3307,8 +3316,9 @@ impl TranscriptMapper {
                 let edge = self.effort.note_stdout(&stdout, from_remuda);
                 // B's OWN verdict (or an idle-bridge human verdict) is the
                 // authority and publishes/supersedes anything a suppressed
-                // unowned acceptance had latched (r18 item 3).
-                self.deferred_effort_edges.clear();
+                // unowned acceptance had latched (r18 item 3 / r19 item 2
+                // ruling B): one shared invalidation of both slots.
+                self.invalidate_deferred_effort();
                 if let Some((generation, _)) = &paired
                     && let Some(bridge) = &self.effort_bridge
                 {
@@ -3359,10 +3369,12 @@ impl TranscriptMapper {
                     .and_then(|bridge| bridge.pending())
                     .is_some();
                 if let Some((observed, source)) = self.effort.note_stdout(&stdout, from_remuda) {
-                    // The authoritative status edge supersedes any stashed
-                    // suppressed acceptance (r18 item 3).
+                    // The authoritative status edge supersedes a stashed
+                    // suppressed acceptance (r18 item 3). A same-value status
+                    // settles nothing and deliberately does NOT clear the
+                    // stash (status is not an effort-level publication).
                     if self.effort.deferred_observation().is_none() {
-                        self.deferred_effort_edges.clear();
+                        self.deferred_effort_edge = None;
                     }
                     observations = self.effort_observation(
                         value,
@@ -3419,42 +3431,54 @@ impl TranscriptMapper {
                 self.prune_front_non_switch_slot();
             }
         }
-        // c-effortread r18 item 3: once NO switch is armed on the bridge (an
-        // owned verdict resolved/rejected it above, B ended through its
-        // bounded path and this is a later verdict, or no bridge exists),
-        // publish the edges of suppressed unowned acceptances in verdict
-        // order, each under ITS OWN verdict record's event id (live-vs-journal
-        // parity). While a switch remains armed the stash stays held and the
-        // next authoritative read-back emits instead.
+        // c-effortread r18 item 3 / r19 item 2 ruling B: once NO switch is
+        // armed on the bridge (an owned verdict resolved/rejected it above, B
+        // ended through its bounded path and this is a later verdict, or no
+        // bridge exists), publish the ONE stashed suppressed acceptance under
+        // ITS OWN verdict record's event id (live-vs-journal parity). It is
+        // published at most once and only when it still differs from the last
+        // published state; a return-to-baseline slot emits nothing. While a
+        // switch remains armed the stash stays held and the next authoritative
+        // read-back invalidates it.
         let bridge_idle = self
             .effort_bridge
             .as_ref()
             .is_none_or(|bridge| !bridge.has_pending());
-        if bridge_idle && !self.deferred_effort_edges.is_empty() {
-            let stashed = std::mem::take(&mut self.deferred_effort_edges);
-            for stashed_edge in stashed {
-                let DeferredEffortEdge {
-                    observed: stashed_observed,
-                    event_id,
-                    raw,
-                } = stashed_edge;
-                if let Some((observed, source)) = self.effort.publish_deferred(stashed_observed) {
-                    let mut emitted = self.effort_observation(
-                        value,
-                        observed,
-                        source,
-                        raw,
-                        remuda_protocol::EFFORT_STDOUT_NATIVE,
-                        None,
-                    )?;
-                    if let Some(first) = emitted.first_mut() {
-                        first.event_id = event_id;
-                    }
-                    observations.append(&mut emitted);
-                }
+        if bridge_idle
+            && let Some(DeferredEffortEdge {
+                observed: stashed_observed,
+                event_id,
+                raw,
+            }) = self.deferred_effort_edge.take()
+            && let Some((observed, source)) = self.effort.publish_deferred(stashed_observed)
+        {
+            let mut emitted = self.effort_observation(
+                value,
+                observed,
+                source,
+                raw,
+                remuda_protocol::EFFORT_STDOUT_NATIVE,
+                None,
+            )?;
+            if let Some(first) = emitted.first_mut() {
+                first.event_id = event_id;
             }
+            observations.append(&mut emitted);
         }
         Ok(observations)
+    }
+
+    /// c-effortread r19 item 2 ruling B: the ONE shared invalidation of the
+    /// suppressed-acceptance slot. An AUTHORITATIVE effective-state
+    /// publication — an owned accept, an assistant read-back, the effort
+    /// clause of a `/model` verdict, an `ultra_effort_enter|exit` attachment
+    /// — clears BOTH the tracker's deferred state and this mapper's stashed
+    /// edge, so a suppressed acceptance can never be published after it was
+    /// superseded. The end-of-switch deferred publish also drains through the
+    /// tracker side here (after taking the slot for emission).
+    fn invalidate_deferred_effort(&mut self) {
+        self.effort.clear_deferred();
+        self.deferred_effort_edge = None;
     }
 
     /// c-effortread r16 item 2 / r17 item 1: pop the front verdict-order slot.
@@ -3509,7 +3533,16 @@ impl TranscriptMapper {
             value.pointer("/attachment/type").and_then(Value::as_str)
         {
             let enters = label == "ultra_effort_enter";
-            if let Some((observed, source)) = self.effort.note_ultra_attachment(enters) {
+            let edge = self.effort.note_ultra_attachment(enters);
+            // r19 item 2 ruling B: the attachment is an authoritative flag
+            // publication and clears the suppressed slot (the tracker cleared
+            // its own deferred for the current process — including a sparse
+            // repeat that emits no edge). Replayed pre-launch attachments are
+            // ignored by both sides.
+            if self.effort.is_current_process() {
+                self.invalidate_deferred_effort();
+            }
+            if let Some((observed, source)) = edge {
                 // The attachment type is the native-key label, exactly like
                 // the journal tailer, so both channels derive one event id.
                 return self.effort_observation(value, observed, source, None, label, None);
@@ -3605,14 +3638,26 @@ impl TranscriptMapper {
     fn map_effort_assistant(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
         let effort = value.get("effort").and_then(Value::as_str);
         let per_turn = value.get("perTurnEffort").and_then(Value::as_str);
+        // r19 item 2 ruling B: an assistant record carrying a parseable level
+        // is an authoritative effective-state read-back and clears the
+        // suppressed-acceptance slot unconditionally — even a same-value
+        // record that produces no edge. A record with no level (the common
+        // case) reaches neither observe_level nor this invalidation.
+        let raw_level = [effort, per_turn]
+            .into_iter()
+            .flatten()
+            .find(|raw| !raw.trim().is_empty());
+        let level_read = raw_level.is_some_and(|raw| {
+            remuda_protocol::EffortTracker::parse_level(raw, self.effort.semantics()).is_some()
+        });
         let Some((observed, source)) = self.effort.observe(effort, per_turn) else {
+            if level_read {
+                self.invalidate_deferred_effort();
+            }
             return Ok(Vec::new());
         };
-        // r18 item 3: an authoritative assistant read-back that emitted just
-        // published (or superseded) the state a suppressed unowned acceptance
-        // had latched; its stashed edges are consumed and dropped.
-        if self.effort.deferred_observation().is_none() {
-            self.deferred_effort_edges.clear();
+        if level_read {
+            self.invalidate_deferred_effort();
         }
         let raw = effort
             .filter(|value| !value.is_empty())
@@ -3776,7 +3821,13 @@ impl TranscriptMapper {
                     } else {
                         EffortSource::Slash
                     };
-                    if let Some((observed, source)) = self.effort.observe_level(name, source) {
+                    // r19 item 2 ruling B: the /model verdict's effort clause
+                    // is an authoritative effective-state publication and
+                    // clears the suppressed slot — even a same-value read-back
+                    // that emits no edge.
+                    let edge = self.effort.observe_level(name, source);
+                    self.invalidate_deferred_effort();
+                    if let Some((observed, source)) = edge {
                         out.extend(self.effort_observation(
                             value,
                             observed,

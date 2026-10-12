@@ -1194,17 +1194,16 @@ fn interrupt_live_agent(st: &mut State, pane_id: &str) {
     }
     if let (Some(transcript), Some(record_file)) =
         (&st.interrupt_transcript, &st.interrupt_record_file)
+        && let Ok(record) = std::fs::read_to_string(record_file)
     {
-        if let Ok(record) = std::fs::read_to_string(record_file) {
-            use std::io::Write;
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(transcript)
-                && file.write_all(record.as_bytes()).is_ok()
-            {
-                let _ = file.sync_all();
-            }
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(transcript)
+            && file.write_all(record.as_bytes()).is_ok()
+        {
+            let _ = file.sync_all();
         }
     }
     st.agents.retain(|_, agent| agent.pane_id != pane_id);

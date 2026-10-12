@@ -304,11 +304,10 @@ mod tests {
         });
         join_bounded(producer, "producer thread never returned");
         let mut parks = 1u32;
-        loop {
-            match recv_event(&event_rx, "producer event stream ended without Done") {
-                ProducerEvent::Parked => parks += 1,
-                ProducerEvent::Done => break,
-            }
+        while let ProducerEvent::Parked =
+            recv_event(&event_rx, "producer event stream ended without Done")
+        {
+            parks += 1;
         }
         let delivered = tokio::time::timeout(Duration::from_secs(10), drainer)
             .await

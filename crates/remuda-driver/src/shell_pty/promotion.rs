@@ -3033,22 +3033,24 @@ mod tests {
         // Phase 1 drains only content (no stop_reason -> no usage). The
         // flusher delivers the OWN content through rx: prove the pump + queue
         // actually work, so the later absence of EVIL frames is meaningful.
+        // Bounded RECEIVE acknowledgement: the OWN message arriving, not an
+        // idle gap polled every 10 ms (c-ctxusage r12 item 5).
         let mut saw_own = false;
-        for _ in 0..100 {
-            while let Ok(obs) = rx.try_recv() {
-                if let ObservationPayload::Message(message) = &obs.body {
-                    let rendered = serde_json::to_string(message).unwrap_or_default();
-                    if rendered.contains("OWN") {
+        while !saw_own {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+                Ok(Some(obs)) => {
+                    if let ObservationPayload::Message(message) = &obs.body
+                        && serde_json::to_string(message)
+                            .unwrap_or_default()
+                            .contains("OWN")
+                    {
                         saw_own = true;
                     }
                 }
+                Ok(None) => panic!("the event stream closed before the OWN content arrived"),
+                Err(_) => panic!("the flusher never delivered the legitimate OWN content"),
             }
-            if saw_own {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(saw_own, "the flusher delivers the legitimate OWN content");
 
         // Phase 2: a foreign-cwd user record, then a finalised assistant turn.
         // Under r4 the reading finalise polled these exact records and
@@ -3119,9 +3121,19 @@ mod tests {
         assert!(bindings.degraded(), "the foreign cwd degrades the claim");
         assert!(!hydrator.has_hydrator(), "the hydrator is discarded");
 
-        // Give the flusher a bounded window to deliver any phase-2 frames a
-        // buggy degrade might have parked, then drain.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Retire the gate and stop the flusher, then AWAIT its completion
+        // under a bound: once the flusher has exited everything it could ever
+        // deliver is already in the receiver stream, so draining it inspects
+        // the COMPLETED stream instead of guessing a 100 ms settle window
+        // (c-ctxusage r12 item 5). A buggy degrade that parked the phase-2
+        // EVIL frames would have had the flusher deliver them before exit.
+        hydrator.retire_idle();
+        flush_done.store(true, Ordering::SeqCst);
+        notify.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), flusher)
+            .await
+            .expect("flusher never retired after the degrade")
+            .expect("flusher task panicked");
         let mut saw_usage = false;
         let mut saw_foreign_message = false;
         while let Ok(obs) = rx.try_recv() {
@@ -3141,18 +3153,26 @@ mod tests {
             "foreign content must never be journaled"
         );
         assert!(!saw_usage, "foreign usage must never reach usage_events");
-
-        // Release and join the flusher so no task outlives the test.
-        hydrator.retire_idle();
-        flush_done.store(true, Ordering::SeqCst);
-        notify.notify_one();
-        flusher.await.expect("flusher exits");
     }
 
     // ----- deterministic binding, per epoch --------------------------------
 
     #[test]
     fn the_pid_file_binds_the_foreground_session_and_a_second_poll_does_not_switch() {
+        // Explicit, strictly ordered mtimes replace the old 20 ms sleeps: file
+        // timestamps on a coarse filesystem can tie inside a millisecond, but
+        // a one-second spacing is deterministic (c-ctxusage r12 item 5).
+        fn set_mtime(path: &Path, age: Duration) {
+            std::fs::File::open(path)
+                .expect("open for mtime")
+                .set_modified(
+                    std::time::SystemTime::now()
+                        .checked_sub(age)
+                        .expect("mtime base"),
+                )
+                .expect("set mtime");
+        }
+
         let tmp = tempfile::tempdir().expect("tmp");
         let cwd = tmp.path().join("repo");
         std::fs::create_dir_all(&cwd).expect("mkdir");
@@ -3161,8 +3181,8 @@ mod tests {
 
         // The correct, older session belongs to the foreground pid; a busier
         // session from another pid keeps getting written and is newest-mtime.
-        slug_session(tmp.path(), &cwd, CORRECT, "{}\n");
-        slug_session(tmp.path(), &cwd, BUSY_OTHER, "{}\n");
+        let correct_path = slug_session(tmp.path(), &cwd, CORRECT, "{}\n");
+        let busy_path = slug_session(tmp.path(), &cwd, BUSY_OTHER, "{}\n");
         write(
             &tmp.path().join("sessions").join("4242.json"),
             &format!(
@@ -3170,15 +3190,15 @@ mod tests {
                 serde_json::json!(cwd.to_string_lossy())
             ),
         );
-        std::thread::sleep(Duration::from_millis(20));
-        let mut busy = std::fs::OpenOptions::new()
-            .append(true)
-            .open(
-                crate::claude_transcript::project_dir(tmp.path(), &cwd)
-                    .join(format!("{BUSY_OTHER}.jsonl")),
-            )
-            .expect("open");
-        writeln!(busy, "{{}}").expect("write");
+        {
+            let mut busy = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&busy_path)
+                .expect("open");
+            writeln!(busy, "{{}}").expect("write");
+        }
+        set_mtime(&correct_path, Duration::from_secs(30));
+        set_mtime(&busy_path, Duration::from_secs(29));
 
         let found = detected_claude(4242, None);
         let first = bindings.resolve(&found).expect("first poll binds");
@@ -3190,8 +3210,8 @@ mod tests {
 
         // Another session is created and becomes the newest file afterwards;
         // the epoch must stay on its locked claim.
-        std::thread::sleep(Duration::from_millis(20));
-        slug_session(tmp.path(), &cwd, LATE_STARTER, "{}\n");
+        let late_path = slug_session(tmp.path(), &cwd, LATE_STARTER, "{}\n");
+        set_mtime(&late_path, Duration::from_secs(28));
         let second = bindings.resolve(&found).expect("second poll still bound");
         assert_eq!(second.session_id, CORRECT, "must never switch files");
     }
@@ -3743,12 +3763,17 @@ mod tests {
     }
 
     /// c-ctxusage r8 item 4: the flusher pops the OWNED frame under the queue
-    /// lock BEFORE it awaits send. With a zero-capacity channel the send parks
-    /// until the receiver reads, and while parked the frame must already be out
-    /// of the queue — the old clone-front/send/pop sequence left it in place,
-    /// so a concurrent rebind prepending the snapshot lost the snapshot to the
+    /// lock BEFORE it awaits send. The one-slot channel holds FIRST while the
+    /// send of SECOND parks, and while parked the frame must already be out of
+    /// the queue — the old clone-front/send/pop sequence left it in place, so a
+    /// concurrent rebind prepending the snapshot lost the snapshot to the
     /// later pop and duplicated the in-flight frame.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    ///
+    /// Current-thread runtime: after the test reads FIRST, the woken flusher
+    /// is only SCHEDULED, so the synchronous requeue lands before it polls
+    /// again — the rebind race is deterministic without an elapsed window
+    /// (c-ctxusage r12 item 5).
+    #[tokio::test]
     async fn flusher_pops_the_owned_frame_before_the_send_awaits() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = ctx_in(dir.path());
@@ -3779,38 +3804,43 @@ mod tests {
         let handle = tokio::spawn(async move {
             flush_pending(&flusher_pending, &tx, &AtomicU64::new(0), &flusher_ctx).await
         });
-        // Wait for the flusher to park sending SECOND into the full buffer.
-        // With pop-before-send the queue is empty at that point (the frame is
-        // owned by the in-flight send); the old clone-front/send/pop sequence
-        // parked with SECOND still queued. Best-effort barrier: the ordering
-        // assertions below discriminate the two implementations regardless of
-        // whether this state was observed.
-        let park_deadline = std::time::Instant::now() + Duration::from_millis(500);
-        while std::time::Instant::now() < park_deadline && !pending.is_empty() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        // A concurrent REBIND prepends the new epoch's snapshot while the
-        // SECOND send is in flight — the exact r8 item 4 race.
-        pending.push_front_requeue(marker_obs("SNAPSHOT_R"));
-
-        // New code: buffer drains FIRST, the parked send then resolves with
-        // SECOND, and the rebind snapshot is last — none lost or duplicated.
-        // Old code: the post-send pop_front discarded the prepended snapshot.
-        let first = rx.recv().await.expect("first frame");
+        // Bounded RECEIVE acknowledgement: once FIRST is delivered the
+        // one-slot buffer is occupied, so the flusher must be parked sending
+        // SECOND. With pop-before-send the queue is empty at that point (the
+        // frame is owned by the in-flight send); the old
+        // clone-front/send/pop sequence parked with SECOND still queued. No
+        // elapsed-window polling (c-ctxusage r12 item 5).
+        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("first frame timed out")
+            .expect("first frame");
         assert!(
             serde_json::to_string(&first)
                 .unwrap_or_default()
                 .contains("FIRST"),
             "FIFO order broken on the first frame"
         );
-        let second = rx.recv().await.expect("second frame");
+        // A concurrent REBIND prepends the new epoch's snapshot while the
+        // SECOND send is in flight — the exact r8 item 4 race.
+        pending.push_front_requeue(marker_obs("SNAPSHOT_R"));
+
+        // New code: the parked send resolves with SECOND, and the rebind
+        // snapshot is last — none lost or duplicated.
+        // Old code: the post-send pop_front discarded the prepended snapshot.
+        let second = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("second frame timed out")
+            .expect("second frame");
         assert!(
             serde_json::to_string(&second)
                 .unwrap_or_default()
                 .contains("SECOND"),
             "in-flight frame must be the one delivered"
         );
-        let snapshot = rx.recv().await.expect("rebind snapshot not lost");
+        let snapshot = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("rebind snapshot timed out")
+            .expect("rebind snapshot not lost");
         assert!(
             serde_json::to_string(&snapshot)
                 .unwrap_or_default()
@@ -3818,7 +3848,10 @@ mod tests {
             "rebind snapshot delivered after the in-flight frame"
         );
         assert!(
-            rx.recv().await.is_none(),
+            tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("close wait timed out")
+                .is_none(),
             "no frame duplicated by the rebind race"
         );
         let _ = handle.await;

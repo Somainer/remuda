@@ -29,7 +29,6 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
 
 const FINAL_MSG_ID: &str = "msg_abort_final_usage";
 /// The fake harness's fixed session id (`remuda_testing::paths::FIXTURE`).
@@ -254,17 +253,11 @@ async fn abort_past_the_finalise_bound_still_rescues_the_last_usage_run() {
         }
     });
 
-    // The promoter is running (SessionStart binds the seeded transcript).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
-    let mut ready = false;
-    while std::time::Instant::now() < deadline {
-        if Driver::wait_control(&driver).await.is_ok() {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    assert!(ready, "composer never became ready");
+    // The promoter is running (SessionStart binds the seeded transcript). The
+    // injected pump gate's entered acknowledgement below is the readiness
+    // proof: the first collect can only park after the promoter bound and
+    // entered its blocking map, so no wait_control poll/sleep loop is needed
+    // (c-ctxusage r12 item 5).
 
     // Barrier: the first blocking collect has entered and is parked BEFORE
     // tail.poll with the hydrator out of the slot and collect_in_flight set —
@@ -409,43 +402,63 @@ async fn abort_during_cooperative_finalise_parks_frames_before_retiring() {
     let handle = driver.start(spec_for(&workspace)).await.expect("start");
     let mut events_rx = handle.into_events();
     let final_count = Arc::new(AtomicU32::new(0));
-    let bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
     let (final_tx, final_rx) = tokio::sync::oneshot::channel();
     let final_tx = std::sync::Mutex::new(Some(final_tx));
+    // Positive ack that the whole first-bind replay drained: the 20 seeded
+    // filler records' turn usage scopes (the final no-stop record is not among
+    // them - a poll can never publish it).
+    let (replayed_tx, replayed_rx) = tokio::sync::oneshot::channel();
+    let replayed_tx = std::sync::Mutex::new(Some(replayed_tx));
     let drainer_count = Arc::clone(&final_count);
-    let drainer_bound = Arc::clone(&bound);
     let drainer = tokio::spawn(async move {
+        let mut replay_scopes = std::collections::HashSet::new();
         while let Some(observation) = events_rx.recv().await {
             if let remuda_protocol::ObservationPayload::Lifecycle(lc) = &observation.body
                 && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
                 && native.native_name == "transcript_bound"
+                && let Some(tx) = bound_tx.lock().unwrap().take()
             {
-                drainer_bound.store(true, Ordering::SeqCst);
+                let _ = tx.send(());
             }
-            if let remuda_protocol::ObservationPayload::Usage(payload) = &observation.body
-                && payload.scope_id == FINAL_MSG_ID
-            {
-                drainer_count.fetch_add(1, Ordering::SeqCst);
-                if let Some(tx) = final_tx.lock().unwrap().take() {
-                    let _ = tx.send(observation);
+            if let remuda_protocol::ObservationPayload::Usage(payload) = &observation.body {
+                if payload.scope_id == FINAL_MSG_ID {
+                    drainer_count.fetch_add(1, Ordering::SeqCst);
+                    if let Some(tx) = final_tx.lock().unwrap().take() {
+                        let _ = tx.send(observation);
+                    }
+                } else if payload.scope_id.starts_with("fill-msg-")
+                    && replay_scopes.insert(payload.scope_id.clone())
+                    && replay_scopes.len() == 20
+                    && let Some(tx) = replayed_tx.lock().unwrap().take()
+                {
+                    let _ = tx.send(());
                 }
             }
         }
     });
 
-    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
-    while Instant::now() < ready_deadline && Driver::wait_control(&driver).await.is_err() {}
-    let bind_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !bound.load(Ordering::SeqCst) && std::time::Instant::now() < bind_deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert!(
-        bound.load(Ordering::SeqCst),
-        "the seeded replay never bound"
+    // Event acknowledgement: the seeded replay bound, not a wait_control poll
+    // loop or a 20 ms flag poll (c-ctxusage r12 item 5).
+    tokio::time::timeout(std::time::Duration::from_secs(20), bound_rx)
+        .await
+        .expect("the seeded replay never bound")
+        .expect("bound oneshot closed without firing");
+    // Acknowledgement that the ungated first pump drained ALL its replay:
+    // every filler usage scope arrived. The FINAL no-stop usage can only be
+    // produced by finish(), which close has not run, so the count is
+    // asserted immediately as an established state, not after a 200 ms
+    // settling window (c-ctxusage r12 item 5).
+    tokio::time::timeout(std::time::Duration::from_secs(30), replayed_rx)
+        .await
+        .expect("the first-bind replay never fully drained")
+        .expect("replay oneshot closed without firing");
+    assert_eq!(
+        final_count.load(Ordering::SeqCst),
+        0,
+        "the no-stop FINAL usage must not publish before the close finalise"
     );
-    // Settle the first (ungated) pump; it must not publish the no-stop FINAL.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(final_count.load(Ordering::SeqCst), 0);
 
     driver.close().await.expect("close");
     assert!(

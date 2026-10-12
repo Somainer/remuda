@@ -1056,10 +1056,30 @@ export class Outbox {
       // Gate 12 item 3: dispose while the read was suspended — never reclaim.
       if (this.disposed) return { kind: "stop", rec: null };
       const current = durable.find((r) => r.commandId === commandId);
-      // A successful read found the row missing or terminal (NOT inflight):
-      // stop for real.
-      if (!current || current.state !== "inflight" || !current.lease) {
-        return { kind: "stop", rec: current ?? null };
+      // A successful read found the row missing: stop for real.
+      if (!current) {
+        return { kind: "stop", rec: null };
+      }
+      // Gate 19 item 1: a firing lease timer that successfully reads a
+      // DELIVERABLE row must end in a GUARDED delivery (or a recovery timer),
+      // never silence. The case here is a CLONED sibling (same persisted owner)
+      // whose POST/status reconciliation failed: it restored the row to a
+      // lease-less PENDING state and closed before its in-memory retry ran, so
+      // this document's tracked expiry timer is the row's ONLY trigger. The
+      // store's flush re-reads authoritative rows inside the instance lock and
+      // claims durably, so this can never double-POST a row a live sibling is
+      // POSTing (that sibling holds the lock; the fresh read then finds it
+      // inflight/sent). A lease-less inflight row is deliverable under the same
+      // rule. HELD rows are deliberately excluded: their own bounded
+      // held-retry clock owns the next POST (no immediate POST from a lease
+      // timer, gate 18 item 1), as are every terminal state
+      // (sent/done/rejected/unknown/reconciling).
+      if (current.state === "pending" || (current.state === "inflight" && !current.lease)) {
+        return { kind: "deliver", rec: current };
+      }
+      // Present but non-deliverable (held/terminal): stop for real.
+      if (current.state !== "inflight" || !current.lease) {
+        return { kind: "stop", rec: current };
       }
       const lease = current.lease;
       if (lease.owner !== snapshot.owner || lease.until !== snapshot.until) {
@@ -1320,6 +1340,16 @@ export class Outbox {
       if (this.activeDeliveries.has(rec.commandId)) continue;
       if (this.claimWakeups.has(rec.commandId)) continue;
       if (!commandIdFromKey(rec.commandId)) continue;
+      // Gate 19 item 1: the firing command's map entry was deleted by its
+      // timer wrapper BEFORE this refresh ran, so the membership check above
+      // cannot see it. Its own critical section further down this call stack
+      // owns the authoritative outcome for it (reclaim → deliver, adopt,
+      // handoff or stop); arming a fresh 0 ms wake here produced a SECOND
+      // fire for the same command — harmless under the single-deliverer lock
+      // but a duplicate delivery trigger that fired after the first one
+      // ended, and two fires raced each other's reclaim. The foreign-handoff
+      // branch above dedups the firing command for the same reason.
+      if (rec.commandId === firingCommandId) continue;
       this.scheduleClaimWakeup(rec.commandId, rec.instanceId, rec.lease, 0);
     }
   }

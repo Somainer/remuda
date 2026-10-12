@@ -224,6 +224,116 @@ it("GATE16 item 4b: a same-owner inflight claim first seen AFTER load is deliver
   }
 });
 
+it("GATE19 item 1: a cloned sibling's sole claim timer reads the lease-less PENDING row its dead POST left and delivers (never abandons it)", async () => {
+  // A loaded while a CLONED document B (same persisted owner) holds an
+  // inflight claim, so A's Outbox tracks the claim's expiry. B's
+  // POST/status reconciliation then fails: B restores the row to a
+  // lease-less PENDING state and closes BEFORE its in-memory retry runs (a
+  // real pagehide clears it). A performs no flush — at T its claim timer is
+  // the row's ONLY trigger. The timer's critical section used to classify
+  // the non-inflight row as "stop" and returned in silence, so the command
+  // was never POSTed on the idle focused tab. It must end in the guarded
+  // delivery path: one real POST, exactly once.
+  vi.useFakeTimers();
+  const owner = "owner_g19_i1";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks: { query: async () => ({ held: [] }) } }, // query, no request
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  sessionStorage.setItem("remuda-outbox-owner", owner);
+  try {
+    const { api, hubStore } = await fresh();
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _a: unknown, _m: unknown, commandId: string) => ({
+        relatedCommandIds: [],
+        command: {
+          commandId,
+          id: commandId,
+          state: "accepted",
+          revision: "1",
+          dispatch: "native-acknowledged",
+          resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    const internal = hubStore as unknown as {
+      flushAllOutbox: () => Promise<void>;
+      outbox: { refreshDurable: () => Promise<unknown>; pendingClaimWakeups: () => string[] };
+    };
+    // Settle the empty boot flush (no row yet, no POST).
+    await internal.flushAllOutbox();
+    expect(send).not.toHaveBeenCalled();
+
+    const cmd = "cmd_g19_i1_pending_after_failed_post";
+    const LEASE_MS = 30_000;
+    // B (cloned same owner) holds the live inflight claim; A discovers it via
+    // a durable refresh and tracks its expiry.
+    localStorage.setItem(
+      OUTBOX_LS_KEY,
+      JSON.stringify([
+        {
+          commandId: cmd,
+          clientRequestId: "local_g19_i1",
+          instanceId: INSTANCE,
+          journalId: JOURNAL,
+          prompt: "B failed and closed",
+          createdAt: Date.now() - 1_000,
+          attempts: 1,
+          state: "inflight",
+          lease: { owner, until: Date.now() + LEASE_MS },
+        } satisfies OutboxRecord,
+      ]),
+    );
+    await internal.outbox.refreshDurable();
+    expect(internal.outbox.pendingClaimWakeups()).toEqual([cmd]);
+    expect(send).not.toHaveBeenCalled();
+
+    // B's POST/status reconciliation fails: lease-less pending, then B closes
+    // before its in-memory retry (which pagehide would clear anyway).
+    await vi.advanceTimersByTimeAsync(2_000);
+    localStorage.setItem(
+      OUTBOX_LS_KEY,
+      JSON.stringify([
+        {
+          commandId: cmd,
+          clientRequestId: "local_g19_i1",
+          instanceId: INSTANCE,
+          journalId: JOURNAL,
+          prompt: "B failed and closed",
+          createdAt: Date.now() - 3_000,
+          attempts: 1,
+          state: "pending",
+          lastError: "network down",
+        } satisfies OutboxRecord,
+      ]),
+    );
+
+    // The tracked expiry timer is the only trigger on an idle tab: it must
+    // deliver the pending row exactly once at the deadline.
+    await vi.advanceTimersByTimeAsync(LEASE_MS - 2_000);
+    for (let i = 0; i < 30 && send.mock.calls.length === 0; i += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBe(cmd);
+    const stored = JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(stored.find((r) => r.commandId === cmd)?.state).toBe("sent");
+
+    // No duplicate long afterwards.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
 it("GATE10 item 7: a lease-less done row committed by another tab skips without aborting the flush; B still sends", async () => {
   const { api, hubStore } = await fresh();
   await bootLive(api, hubStore);

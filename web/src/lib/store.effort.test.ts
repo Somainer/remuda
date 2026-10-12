@@ -2923,6 +2923,135 @@ it("r14 item 2: the bound starts on working → waiting-interaction → idle, so
   expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");
 });
 
+it("r15 item 1: a client request created while waiting-interaction stays queued past 15 s and anchors only on idle", async () => {
+  const ctx = await startFollowing("r15-item1-client-waiting", { state: "known", value: "waiting-interaction" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // The id-less driver keeps projecting the unchanged baseline.
+  const baseline: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "low", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
+  };
+  let listCalls = 0;
+  vi.spyOn(api, "instanceList").mockImplementation(async () => {
+    listCalls += 1;
+    return { items: [baseline] } as never;
+  });
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  const entityActivity = (value: "idle"): Observation =>
+    ({
+      eventId: `evt_act_entity_${value}`,
+      instanceId: ctx.instance.id,
+      journalId: "x",
+      seq: "0",
+      kind: "lifecycle",
+      source: { channel: "runtime" },
+      observedAt: "2026-09-16T00:00:30.000Z",
+      payload: {
+        type: "entity",
+        entityType: "instance",
+        entityId: ctx.instance.id,
+        entity: {
+          id: ctx.instance.id,
+          activity: { state: "known", value },
+          activityEvidenceEventIds: [],
+          nativeRef: ctx.instance.nativeRef,
+          updatedAt: "2026-09-16T00:00:30.000Z",
+        },
+      },
+    }) as unknown as Observation;
+
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
+  // A configure posted while a PermissionRequest/Elicitation is on screen.
+  const p = hubStore.setEffort(ctx.instance.id, { index: 1, name: "low", kind: "claude", ultracode: false });
+  await advanceEffortReconcile(0);
+  await p;
+  const sent = hubStore.effortPendingOf(ctx.instance.id);
+  expect(sent?.queued, "waiting-interaction keeps the request queued").toBe(true);
+  expect(sent?.leftQueueAt, "the execution deadline is not started yet").toBeNull();
+
+  // The human takes longer than the 15 s bound to answer. The driver still
+  // cannot execute (it needs Idle/Done + interactive_ready), so no deadline
+  // may fire and end the request unconfirmed.
+  const listsAtWaiting = listCalls;
+  await advanceEffortReconcile(15_001);
+  expect(listCalls, "never reconcile a request still awaiting queue exit").toBe(listsAtWaiting);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
+  expect(toast).not.toHaveBeenCalled();
+
+  // Only authoritative idle eligibility starts the execution deadline.
+  ctx.receive(entityActivity("idle"));
+  const exited = hubStore.effortPendingOf(ctx.instance.id);
+  expect(exited?.queued, "idle evidence tracks the queue exit").toBe(false);
+  expect(typeof exited?.leftQueueAt).toBe("number");
+
+  // With no fresh evidence in the post-idle window: explicit unconfirmed.
+  await advanceEffortReconcile(14_999);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
+  await advanceEffortReconcile(2);
+  expect(listCalls).toBe(listsAtWaiting);
+  expect(hubStore.effortPendingOf(ctx.instance.id), "unconfirmed ends the pending").toBeNull();
+  expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");
+});
+
+it("r15 item 1: an observer pending created from a queued edge while waiting-interaction anchors only on idle", async () => {
+  const ctx = await startFollowing("r15-item1-observer-waiting", { state: "known", value: "waiting-interaction" });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+  const baseline: Instance = {
+    ...ctx.instance,
+    effortEffective: { name: "low", ultracode: false, source: "slash", observedAt: "2026-09-15T23:59:57.000Z" },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [baseline] } as never);
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => {});
+
+  const entityActivity = (value: "idle"): Observation =>
+    ({
+      eventId: `evt_act_entity_${value}`,
+      instanceId: ctx.instance.id,
+      journalId: "x",
+      seq: "0",
+      kind: "lifecycle",
+      source: { channel: "runtime" },
+      observedAt: "2026-09-16T00:00:30.000Z",
+      payload: {
+        type: "entity",
+        entityType: "instance",
+        entityId: ctx.instance.id,
+        entity: {
+          id: ctx.instance.id,
+          activity: { state: "known", value },
+          activityEvidenceEventIds: [],
+          nativeRef: ctx.instance.nativeRef,
+          updatedAt: "2026-09-16T00:00:30.000Z",
+        },
+      },
+    }) as unknown as Observation;
+
+  ctx.receive(effortEvent(2, "low", false, "slash", "2026-09-15T23:59:57.000Z"));
+  vi.useFakeTimers({ now: new Date("2026-09-16T00:00:00.000Z") });
+  // Another client's configure reaches this tab only through the queued edge.
+  ctx.receive(configureLifecycle(3, "effort-queued:low", ctx.instance.id, "2026-09-16T00:00:05.000Z"));
+  const pending = hubStore.effortPendingOf(ctx.instance.id);
+  expect(pending?.source).toBe("lifecycle");
+  expect(pending?.queued, "the chip keeps 排队中 behind the interaction").toBe(true);
+  expect(pending?.leftQueueAt, "the observer bound does not start while waiting").toBeNull();
+
+  await advanceEffortReconcile(15_001);
+  expect(hubStore.effortPendingOf(ctx.instance.id), "past 15 s it is still queued, not unconfirmed").not.toBeNull();
+  expect(toast).not.toHaveBeenCalled();
+
+  ctx.receive(entityActivity("idle"));
+  const exited = hubStore.effortPendingOf(ctx.instance.id);
+  expect(typeof exited?.leftQueueAt, "the deadline starts at authoritative idle").toBe("number");
+  await advanceEffortReconcile(14_999);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).not.toBeNull();
+  await advanceEffortReconcile(2);
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(toast.mock.calls[0]?.[0] ?? "").toContain("未确认");
+});
+
 it("r13 item 3: an observer-tab legacy pending with a silent no-op completes unconfirmed at its bound", async () => {
   const ctx = await startFollowing("r13-item3-observer-noop");
   vi.spyOn(api, "interactionList").mockResolvedValue([] as never);

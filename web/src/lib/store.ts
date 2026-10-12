@@ -250,6 +250,25 @@ const EFFORT_PENDING_MAX_AGE_MS = 30 * 60_000;
 const EFFORT_UNCONFIRMED_BOUND_MS = 15_000;
 
 /**
+ * c-effortread r15 item 1: whether current activity evidence says a queued
+ * effort request is STILL waiting to leave the driver queue. The driver
+ * executes a queued switch only once the agent is Idle/Done AND
+ * interactive_ready — a session parked on a PermissionRequest/Elicitation
+ * reports `waiting-interaction` and is just as unrunnable as a `working`
+ * one (crates/remuda-driver/src/pty_interaction.rs, effort.rs queue worker).
+ * Treating waiting-interaction as idle initialised the execution deadline
+ * immediately, so a request could end "unconfirmed" while the driver was
+ * still waiting to type it. Only authoritative idle evidence anchors the
+ * deadline (see {@link HubStore.emit}'s queue-exit fold).
+ */
+function effortAwaitsQueueExit(activity: Instance["activity"] | undefined): boolean {
+  return (
+    activity?.state === "known" &&
+    (activity.value === "working" || activity.value === "waiting-interaction")
+  );
+}
+
+/**
  * Bulk screen reads fan out one per listed row; cap the fan-out so even a long
  * list (the 2026-09-19 phone repro) stays far under the Hub's per-Node
  * bulk-read sub-budget and can never press the control reservation.
@@ -1817,9 +1836,10 @@ class HubStore {
         // keeps 排队中), but the bounded reconciliation is anchored on CURRENT
         // activity evidence exactly like a client request: when the session is
         // already idle at receipt the bound starts now (a backlogged edge / an
-        // accepted no-op); when a turn is running it starts at working→idle.
-        const busyNow =
-          instance?.activity?.state === "known" && instance.activity.value === "working";
+        // accepted no-op); when a turn is running — or the session is parked
+        // on waiting-interaction (r15 item 1) — it starts at the next
+        // authoritative idle.
+        const busyNow = effortAwaitsQueueExit(instance?.activity);
         const atCreate = Date.now();
         current = {
           nonce,
@@ -1882,14 +1902,14 @@ class HubStore {
           : current.queuedObservedAt;
       // A lifecycle-created entry carries the queue state derived from current
       // activity; a queued edge for an EXISTING request really did re-queue it:
-      // if a turn is now running again, the bound waits for the next
-      // working→idle evidence (r13 item 2/3).
+      // if a turn is now running again — or the session parked on a
+      // PermissionRequest/Elicitation (r15 item 1) — the bound waits for the
+      // next authoritative idle evidence (r13 item 2/3).
       const createdFromWire = this.state.effortPending[instanceId]?.nonce !== current.nonce;
       const nextActivity = this.state.instances.find((row) => row.id === instanceId)?.activity;
       const requeuedBehindTurn =
         !createdFromWire &&
-        nextActivity?.state === "known" &&
-        nextActivity.value === "working" &&
+        effortAwaitsQueueExit(nextActivity) &&
         current.leftQueueAt != null;
       this.emit({
         effortPending: {
@@ -4650,8 +4670,11 @@ class HubStore {
   async setEffort(instanceId: Id, effortIn: EffortSelection, axis: EffortAxis = "tier") {
     const effort = this.gateLiveEffort(instanceId, effortIn);
     const instance = this.state.instances.find((row) => row.id === instanceId);
-    const busy =
-      instance?.activity?.state === "known" ? instance.activity.value === "working" : false;
+    // r15 item 1: waiting-interaction (PermissionRequest/Elicitation) is just
+    // as unrunnable as working — the driver needs Idle/Done +
+    // interactive_ready — so the request is queued and its deadline starts
+    // only from authoritative idle evidence.
+    const busy = effortAwaitsQueueExit(instance?.activity);
     // New per-request provenance (c-effortui): every switch gets a fresh
     // nonce and its OWN threshold stamped from the current projection. A
     // replaced request's late events cannot settle this indicator.

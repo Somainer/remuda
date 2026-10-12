@@ -3448,14 +3448,20 @@ JSON
         let node = fixture.node.clone();
         let p = params(&fixture, "verify");
         let job_id = p.job_id.clone();
+        // Latched, bounded hold instead of a fixed sleep: park the run at the
+        // handler entry (before run registration / lane / git), so the cancel is
+        // guaranteed to arrive before the run reads its canceled tombstone.
+        let hold = GateRunHold::new();
+        node.gate_registry().arm_run_hold(hold.clone()).await;
         let running = tokio::spawn(async move { node.run_gate_typed(p).await });
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        hold.wait_arrived().await;
         let canceled = fixture
             .node
             .cancel_gate(&serde_json::json!({ "jobId": job_id }))
             .await
             .unwrap();
         assert_eq!(canceled["ok"], true);
+        hold.release();
         let result = tokio::time::timeout(Duration::from_secs(10), running)
             .await
             .expect("cancel reaped the run")

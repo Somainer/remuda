@@ -3,6 +3,7 @@ import { OUTBOX_LS_KEY, type OutboxRecord } from "./outbox";
 
 const INSTANCE = "ins_lease_wakeup";
 const JOURNAL = "obj_lease_wakeup_journal";
+const COMMAND = "cmd_foreign_inflight";
 
 type Api = typeof import("./api").api;
 type Store = typeof import("./store").hubStore;
@@ -13,15 +14,20 @@ async function fresh(): Promise<{ api: Api; hubStore: Store }> {
   return { api: apiModule.api, hubStore: storeModule.hubStore };
 }
 
+type OutboxInternal = {
+  ownerId: string;
+  pendingLeaseWakeups: () => string[];
+  leaseWakeAt: (id: string) => number | undefined;
+  clearUnloading: () => void;
+};
+
 type Internal = {
   ensureOutbox: () => Promise<boolean>;
   flushAllOutbox: () => Promise<void>;
   rearmLeaseWakeups: () => Promise<void>;
-  leaseWakeupTimer: Map<string, unknown>;
-  leaseWakeupUntil: Map<string, number>;
   unloadClearTimer: ReturnType<typeof setTimeout> | null;
   pageIsUnloading: boolean;
-  outbox: { ownerId: string };
+  outbox: OutboxInternal;
 };
 
 function internalOf(hubStore: Store): Internal {
@@ -29,10 +35,11 @@ function internalOf(hubStore: Store): Internal {
 }
 
 /**
- * c-reconnfu round 2 item 4: lease-expiry wakeups are armed at another tab's
- * in-flight lease expiry. Two ways they were lost: a cancelled beforeunload
- * cleared them without re-arming, and an armed timer was never moved earlier
- * for a sooner foreign lease.
+ * c-reconnfu gate 20: lease-expiry wakes are the CENTRAL per-command wakes in
+ * the Outbox (the store's per-instance scheduler is gone). A cancelled
+ * beforeunload clears them then re-arms read-only; a sooner lease moves a
+ * wake earlier; a lease expiring while a prompt is open is recovered once
+ * the page stays — all via the one reconciliation.
  */
 afterEach(() => {
   vi.restoreAllMocks();
@@ -69,7 +76,7 @@ async function boot(api: Api, hubStore: Store) {
 
 function foreignInflightRow(until: number): OutboxRecord {
   return {
-    commandId: "cmd_foreign_inflight",
+    commandId: COMMAND,
     clientRequestId: "local_foreign_inflight",
     instanceId: INSTANCE,
     journalId: JOURNAL,
@@ -85,10 +92,10 @@ function writeRows(...rows: OutboxRecord[]) {
   localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify(rows));
 }
 
-it("a cancelled beforeunload re-arms a cleared lease-expiry wakeup without flushing", async () => {
-  // beforeunload disarms the timers; a CANCELLED prompt fires no pagehide,
-  // the page stays, and the self-reset re-latches delivery and re-arms the
-  // lease wakeups READ-ONLY (it never flushes itself: in a real reload the
+it("a cancelled beforeunload re-arms the cleared lease wake without flushing", async () => {
+  // beforeunload disarms the wakes; a CANCELLED prompt fires no pagehide, the
+  // page stays, and the self-reset re-latches delivery and re-arms from
+  // durable rows READ-ONLY (it never flushes itself: in a real reload the
   // task runs before pagehide inside teardown).
   vi.useFakeTimers();
   try {
@@ -100,8 +107,8 @@ it("a cancelled beforeunload re-arms a cleared lease-expiry wakeup without flush
     const send = vi.spyOn(api, "instanceSend").mockResolvedValue({
       relatedCommandIds: [],
       command: {
-        commandId: "cmd_foreign_inflight",
-        id: "cmd_foreign_inflight",
+        commandId: COMMAND,
+        id: COMMAND,
         state: "queued",
         dispatch: "not-dispatched",
         resolution: "clear",
@@ -110,22 +117,23 @@ it("a cancelled beforeunload re-arms a cleared lease-expiry wakeup without flush
 
     writeRows(foreignInflightRow(Date.now() + 10_000));
     await internal.flushAllOutbox();
-    expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(true);
+    expect(internal.outbox.pendingLeaseWakeups()).toEqual([COMMAND]);
 
     // User triggers navigation but CANCELS the prompt: beforeunload disarms;
-    // the reset task then re-arms the wakeup from durable rows.
+    // the reset task re-arms the wake from durable rows.
     window.dispatchEvent(new Event("beforeunload"));
-    expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(false);
+    expect(internal.outbox.pendingLeaseWakeups()).toEqual([]);
     await vi.advanceTimersByTimeAsync(0);
     expect(hubStore.pageIsUnloadingForTest).toBe(false);
-    expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(true);
+    expect(internal.outbox.pendingLeaseWakeups()).toEqual([COMMAND]);
     // The self-reset re-armed only: the foreign lease is live, so no POST.
     expect(send).not.toHaveBeenCalled();
 
-    // The re-armed wakeup still fires at lease expiry and steals the row.
+    // The re-armed wake still fires at lease expiry and steals the row.
     await vi.advanceTimersByTimeAsync(9_999);
     expect(send).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
+    for (let i = 0; i < 20 && send.mock.calls.length === 0; i += 1) await Promise.resolve();
     expect(send).toHaveBeenCalledTimes(1);
 
     hubStore.logout();
@@ -148,14 +156,14 @@ it("a genuine reload: the beforeunload self-reset task never flushes and pagehid
     writeRows(foreignInflightRow(Date.now() + 10_000));
     await internal.flushAllOutbox();
     flushSpy.mockClear();
-    expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(true);
+    expect(internal.outbox.pendingLeaseWakeups()).toEqual([COMMAND]);
 
     // Real navigation ordering: beforeunload's reset task runs first …
     window.dispatchEvent(new Event("beforeunload"));
     await vi.advanceTimersByTimeAsync(0);
-    // … then pagehide disarms every timer; the reset task never flushed.
+    // … then pagehide disarms every wake; the reset task never flushed.
     window.dispatchEvent(new Event("pagehide"));
-    expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(false);
+    expect(internal.outbox.pendingLeaseWakeups()).toEqual([]);
     await vi.advanceTimersByTimeAsync(11_000);
     expect(flushSpy).not.toHaveBeenCalled();
     expect(hubStore.pageIsUnloadingForTest).toBe(true);
@@ -166,7 +174,7 @@ it("a genuine reload: the beforeunload self-reset task never flushes and pagehid
   }
 });
 
-it("an armed lease wakeup is moved earlier when a sooner foreign lease appears", async () => {
+it("an armed lease wake moves earlier when a sooner lease deadline appears", async () => {
   vi.useFakeTimers();
   try {
     const { api, hubStore } = await fresh();
@@ -175,8 +183,8 @@ it("an armed lease wakeup is moved earlier when a sooner foreign lease appears",
     vi.spyOn(api, "instanceSend").mockResolvedValue({
       relatedCommandIds: [],
       command: {
-        commandId: "cmd_foreign_inflight",
-        id: "cmd_foreign_inflight",
+        commandId: COMMAND,
+        id: COMMAND,
         state: "queued",
         dispatch: "not-dispatched",
         resolution: "clear",
@@ -185,20 +193,24 @@ it("an armed lease wakeup is moved earlier when a sooner foreign lease appears",
 
     writeRows(foreignInflightRow(Date.now() + 10_000));
     await internal.flushAllOutbox();
-    const first = internal.leaseWakeupTimer.get(INSTANCE);
-    expect(first).toBeTruthy();
+    const firstDeadline = internal.outbox.leaseWakeAt(COMMAND);
+    expect(firstDeadline).toBeTruthy();
 
-    // 2 s later another tab's NEWER in-flight row for this instance carries a
-    // lease expiring 1 s from now (sooner than the 8 s still on the clock).
+    // 2 s later the same row's lease is renewed (or re-claimed) with a
+    // deadline 1 s from now — sooner than the ~8 s left on the old wake.
     await vi.advanceTimersByTimeAsync(2_000);
     writeRows(foreignInflightRow(Date.now() + 1_000));
     await internal.flushAllOutbox();
-    expect(internal.leaseWakeupTimer.get(INSTANCE)).not.toBe(first);
+    const soonerDeadline = internal.outbox.leaseWakeAt(COMMAND);
+    expect(soonerDeadline).toBeLessThan(firstDeadline!);
 
-    // The wakeup fires at the SOONER expiry (3 s total), never waits for 10 s.
+    // The wake fires at the SOONER expiry (~3 s total), never waits for 10 s.
     await vi.advanceTimersByTimeAsync(999);
     expect(vi.mocked(api.instanceSend)).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
+    for (let i = 0; i < 20 && vi.mocked(api.instanceSend).mock.calls.length === 0; i += 1) {
+      await Promise.resolve();
+    }
     expect(vi.mocked(api.instanceSend)).toHaveBeenCalledTimes(1);
 
     hubStore.logout();
@@ -225,8 +237,8 @@ async function overduePromptBlocked(): Promise<{
   const send = vi.spyOn(api, "instanceSend").mockResolvedValue({
     relatedCommandIds: [],
     command: {
-      commandId: "cmd_foreign_inflight",
-      id: "cmd_foreign_inflight",
+      commandId: COMMAND,
+      id: COMMAND,
       state: "queued",
       dispatch: "not-dispatched",
       resolution: "clear",
@@ -235,43 +247,41 @@ async function overduePromptBlocked(): Promise<{
 
   writeRows(foreignInflightRow(Date.now() + 10_000));
   await internal.flushAllOutbox();
-  expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(true);
+  expect(internal.outbox.pendingLeaseWakeups()).toEqual([COMMAND]);
 
-  // beforeunload disarms the wakeup and queues the self-reset; hold the reset
+  // beforeunload disarms the wakes and queues the self-reset; hold the reset
   // out of the fake queue (the native dialog blocks the event loop).
   window.dispatchEvent(new Event("beforeunload"));
   const blockedReset = internal.unloadClearTimer;
   expect(blockedReset).toBeTruthy();
   clearTimeout(blockedReset!);
   internal.unloadClearTimer = null;
-  expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(false);
+  expect(internal.outbox.pendingLeaseWakeups()).toEqual([]);
 
   // The prompt stays open PAST the lease deadline: nothing armed, no delivery.
   await vi.advanceTimersByTimeAsync(10_001);
   expect(send).not.toHaveBeenCalled();
-  expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(false);
+  expect(internal.outbox.pendingLeaseWakeups()).toEqual([]);
   expect(hubStore.pageIsUnloadingForTest).toBe(true);
   return { api, hubStore, internal, send };
 }
 
-it("a cancelled prompt with an ALREADY-EXPIRED foreign lease schedules an immediate guarded delivery", async () => {
-  // c-reconnfu round 3 item 4: the scheduler filtered expired leases out of
-  // the cancelled-prompt re-arm, so a lease that went overdue while the
-  // beforeunload prompt was open stranded its stealable row forever. The
-  // read-only re-arm now includes overdue leases as immediate wakeups.
+it("a cancelled prompt with an ALREADY-EXPIRED lease schedules an immediate guarded delivery", async () => {
+  // The lease went overdue while the beforeunload prompt was open. The user
+  // CANCELS: the self-reset clears the flag and reconciles read-only; the
+  // overdue claim arms an IMMEDIATE delivery wake.
   vi.useFakeTimers();
   try {
     const { hubStore, internal, send } = await overduePromptBlocked();
 
-    // The user CANCELS: the self-reset body runs (the setTimeout(0) task the
-    // dialog held), clears the flag and re-arms read-only. The overdue lease
-    // arms an IMMEDIATE wakeup — the old filter armed nothing.
     internal.pageIsUnloading = false;
+    internal.outbox.clearUnloading();
     await internal.rearmLeaseWakeups();
-    expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(true);
+    expect(internal.outbox.pendingLeaseWakeups()).toEqual([COMMAND]);
 
-    // The immediate wakeup delivers the stealable row once.
+    // The immediate wake delivers the stealable row once.
     await vi.advanceTimersByTimeAsync(1);
+    for (let i = 0; i < 20 && send.mock.calls.length === 0; i += 1) await Promise.resolve();
     expect(send).toHaveBeenCalledTimes(1);
 
     hubStore.logout();
@@ -281,19 +291,20 @@ it("a cancelled prompt with an ALREADY-EXPIRED foreign lease schedules an immedi
 });
 
 it("a real pagehide after the overdue re-arm cancels the immediate delivery", async () => {
-  // The overdue wakeup must stay guarded: if the navigation actually
-  // proceeds (the prompt allowed it) the immediate timer is disarmed with
-  // every other timer and must never POST into teardown.
+  // The overdue wake must stay guarded: if the navigation actually proceeds
+  // (the prompt allowed it) the immediate timer is disarmed with every other
+  // timer and must never POST into teardown.
   vi.useFakeTimers();
   try {
     const { hubStore, internal, send } = await overduePromptBlocked();
 
     internal.pageIsUnloading = false;
+    internal.outbox.clearUnloading();
     await internal.rearmLeaseWakeups();
-    expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(true);
+    expect(internal.outbox.pendingLeaseWakeups()).toEqual([COMMAND]);
 
     window.dispatchEvent(new Event("pagehide"));
-    expect(internal.leaseWakeupTimer.has(INSTANCE)).toBe(false);
+    expect(internal.outbox.pendingLeaseWakeups()).toEqual([]);
     await vi.advanceTimersByTimeAsync(1);
     expect(send).not.toHaveBeenCalled();
 

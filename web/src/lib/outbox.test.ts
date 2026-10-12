@@ -334,7 +334,7 @@ describe("Outbox", () => {
     }
   });
 
-  it("GATE12 item 4: refreshDurable reconciles claim wakeups — cancel terminal/missing, re-arm a changed lease", async () => {
+  it("GATE12 item 4 (gate 20): refreshDurable runs the CENTRAL reconciliation — terminal/missing wakes cancelled, changed lease adopted", async () => {
     const originalNavigator = globalThis.navigator;
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
     vi.useFakeTimers();
@@ -356,8 +356,12 @@ describe("Outbox", () => {
         await p;
       }
       const box = await Outbox.load(store, owner);
+      // The store's boot flush is the first authoritative reader after load;
+      // it applies the central reconciliation and arms the deadline wakes.
+      await box.refreshDurable();
       await vi.advanceTimersByTimeAsync(0);
-      expect(box.pendingClaimWakeups().sort()).toEqual(["cmd_deleted", "cmd_renewed", "cmd_sent"]);
+      expect(box.pendingLeaseWakeups().sort()).toEqual(["cmd_deleted", "cmd_renewed", "cmd_sent"]);
+      expect(box.leaseWakeKind("cmd_renewed")).toBe("lease");
       const wakes = vi.fn();
       box.onClaimWake = wakes;
 
@@ -388,29 +392,31 @@ describe("Outbox", () => {
 
       await box.refreshDurable();
 
-      // Terminal and missing claims lost their wakeups; the renewed one kept
-      // its wakeup for the LATER deadline.
-      expect(box.pendingClaimWakeups()).toEqual(["cmd_renewed"]);
+      // Terminal and missing claims lost their wakes; the renewed one kept
+      // its wake for the LATER deadline.
+      expect(box.pendingLeaseWakeups()).toEqual(["cmd_renewed"]);
       expect(box.get("cmd_sent")?.state).toBe("sent");
 
       // At the OLD deadline nothing fires (sent would re-trigger wrongly; the
       // renewed claim is still live).
       await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
       expect(wakes).not.toHaveBeenCalled();
-      expect(box.pendingClaimWakeups()).toEqual(["cmd_renewed"]);
+      expect(box.pendingLeaseWakeups()).toEqual(["cmd_renewed"]);
       expect(store.map.get("cmd_renewed")?.state).toBe("inflight");
 
-      // The renewed claim goes inactive and reclaims only at T2.
+      // At T2 the expired claim hands the store one guarded delivery trigger.
       await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
       expect(wakes).toHaveBeenCalledTimes(1);
-      expect(store.map.get("cmd_renewed")?.state).toBe("pending");
+      // No Outbox-side reclaim: the store's in-lock deliverer claims the
+      // expired lease durably itself.
+      expect(store.map.get("cmd_renewed")?.state).toBe("inflight");
     } finally {
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     }
   });
 
-  it("GATE12 item 3: dispose during a deferred deadline READ makes the wakeup return with no reclaim, no flush, zero timers", async () => {
+  it("GATE12 item 3 (gate 20): dispose during a suspended deadline READ imports nothing, delivers nothing, leaves zero timers", async () => {
     const originalNavigator = globalThis.navigator;
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
     vi.useFakeTimers();
@@ -422,15 +428,15 @@ describe("Outbox", () => {
         reads = 0;
         override async all() {
           this.reads += 1;
-          if (this.reads >= 2) {
+          // load (#1), boot refresh (#2), the FIRE read (#3).
+          if (this.reads >= 3) {
             await readGate;
-            // While the wake read was suspended, another tab durably
+            // While the fire read was suspended, another tab durably
             // committed sent; the read now returns the changed durable state.
             const cur = this.map.get("cmd_disp_read");
             if (cur && cur.state === "inflight") {
               this.map.set("cmd_disp_read", { ...cur, state: "sent", gotResponse: true, lease: undefined });
             }
-            return await super.all();
           }
           return await super.all();
         }
@@ -448,57 +454,60 @@ describe("Outbox", () => {
       await vi.advanceTimersByTimeAsync(5);
       await putP;
       const box = await Outbox.load(store, owner);
+      await box.refreshDurable();
       await vi.advanceTimersByTimeAsync(0);
       const wakes = vi.fn();
       box.onClaimWake = wakes;
-      const reclaimSpy = vi.spyOn(store, "reclaimInflight");
 
       // Deadline fires; the durable read is suspended.
       await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
-      expect(box.pendingClaimWakeups()).toEqual([]); // handle deleted when fire started
+      expect(box.pendingLeaseWakeups()).toEqual([]); // handle deleted when fire started
       box.dispose(); // teardown while the read is in flight
       releaseRead!();
       await vi.advanceTimersByTimeAsync(10_000); // far past any retry/backoff
 
-      // Nothing reclaimed, nothing delivered, nothing re-armed; the CHANGED
-      // durable row (sent) must NOT have been imported into the cache after
-      // dispose — this Outbox keeps its pre-teardown inflight view.
-      expect(reclaimSpy).not.toHaveBeenCalled();
+      // The read-retry chain is disposed too: the CHANGED durable row (sent)
+      // is not imported into the cache, nothing is delivered or re-armed.
       expect(store.map.get("cmd_disp_read")?.state).toBe("sent");
       expect(box.get("cmd_disp_read")?.state).toBe("inflight"); // cache untouched
       expect(wakes).not.toHaveBeenCalled();
-      expect(box.pendingClaimWakeups()).toEqual([]);
+      expect(box.pendingLeaseWakeups()).toEqual([]);
     } finally {
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     }
   });
 
-  it("GATE12 item 3: dispose during a deferred deadline RECLAIM makes the wakeup return with no cache mutation, no flush, zero timers", async () => {
+  it("GATE13 item 3 (gate 20): dispose during a suspended fire READ that would find a sibling-restored PENDING row never delivers", async () => {
+    // The fire critical section is read-only now (no reclaim write); still a
+    // read resumed after dispose must neither import the deliverable row nor
+    // fire the delivery hook — a logged-out/tearing-down Outbox owns nothing.
     const originalNavigator = globalThis.navigator;
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
     vi.useFakeTimers();
     try {
-      vi.setSystemTime(400_000);
-      let releaseReclaim: (() => void) | null = null;
-      const reclaimGate = new Promise<void>((r) => void (releaseReclaim = r));
-      class GatedReclaim extends MemStorage {
-        override async reclaimInflight(
-          id: string,
-          expected: { owner: string; until: number },
-          opts?: { requireExpired?: boolean; signal?: AbortSignal },
-        ): Promise<OutboxRecord | null> {
-          await reclaimGate;
-          // Forward the lifetime signal: the base backend refuses the write
-          // when dispose aborted during the suspension.
-          return await super.reclaimInflight(id, expected, opts);
+      vi.setSystemTime(350_000);
+      let releaseRead: (() => void) | null = null;
+      const readGate = new Promise<void>((r) => void (releaseRead = r));
+      class GatedPending extends MemStorage {
+        reads = 0;
+        override async all() {
+          this.reads += 1;
+          if (this.reads >= 3) {
+            await readGate;
+            const cur = this.map.get("cmd_disp_pending");
+            if (cur && cur.state === "inflight") {
+              this.map.set("cmd_disp_pending", { ...cur, state: "pending", lease: undefined });
+            }
+          }
+          return await super.all();
         }
       }
-      const store = new GatedReclaim();
-      const owner = "owner_disp_reclaim";
+      const store = new GatedPending();
+      const owner = "owner_disp_pending";
       const putP = store.put(
         rec({
-          commandId: "cmd_disp_reclaim",
+          commandId: "cmd_disp_pending",
           instanceId: "ins_disp",
           state: "inflight",
           lease: { owner, until: Date.now() + LEASE_TTL_MS },
@@ -507,34 +516,30 @@ describe("Outbox", () => {
       await vi.advanceTimersByTimeAsync(5);
       await putP;
       const box = await Outbox.load(store, owner);
+      await box.refreshDurable();
       await vi.advanceTimersByTimeAsync(0);
       const wakes = vi.fn();
       box.onClaimWake = wakes;
 
-      // Deadline: read succeeds, reclaim transaction is suspended.
       await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
-      box.dispose(); // teardown while the reclaim is in flight: abort signal
-      releaseReclaim!();
+      box.dispose();
+      releaseRead!();
       await vi.advanceTimersByTimeAsync(10_000);
 
-      // Gate 13 item 3: the lifetime signal ABORTED the transaction before
-      // its put committed — the durable row stays inflight. The disposed
-      // Outbox never caches, emits, triggers delivery, or retries.
-      expect(store.map.get("cmd_disp_reclaim")?.state).toBe("inflight");
-      expect(box.get("cmd_disp_reclaim")?.state).toBe("inflight");
+      expect(store.map.get("cmd_disp_pending")?.state).toBe("pending");
+      expect(box.get("cmd_disp_pending")?.state).toBe("inflight");
       expect(wakes).not.toHaveBeenCalled();
-      expect(box.pendingClaimWakeups()).toEqual([]);
+      expect(box.pendingLeaseWakeups()).toEqual([]);
     } finally {
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     }
   });
 
-  it("GATE12 item 2: a one-shot durable-read failure at the deadline retries bounded with the SAME snapshot and still delivers", async () => {
-    // The pre-fix fire treated a rejected storage.all() like "row gone" and
-    // stopped, so the only wakeup was lost (the store's own lease scheduler
-    // skips same-owner rows). A failed READ must retry; only a successful read
-    // that finds the row missing/terminal is allowed to stop.
+  it("GATE12 item 2 (gate 20): a one-shot durable-read failure at the deadline retries bounded and still delivers", async () => {
+    // A rejected fire read enters the bounded read-retry chain; the 250 ms
+    // retry succeeds, the central reconciliation arms the 0 ms delivery wake
+    // and the store hook fires exactly once.
     const originalNavigator = globalThis.navigator;
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
     vi.useFakeTimers();
@@ -545,9 +550,8 @@ describe("Outbox", () => {
         failed = false;
         override async all() {
           this.reads += 1;
-          // Call 1 is Outbox.load's own snapshot read; the deadline's read is
-          // call 2 — fail exactly that one.
-          if (this.reads === 2 && !this.failed) {
+          // load (#1), boot refresh (#2), the FIRE read (#3) fails once.
+          if (this.reads === 3 && !this.failed) {
             this.failed = true;
             throw new Error("IDB read aborted");
           }
@@ -568,27 +572,29 @@ describe("Outbox", () => {
       await vi.advanceTimersByTimeAsync(5);
       await putP;
       const box = await Outbox.load(store, owner);
+      await box.refreshDurable();
       await vi.advanceTimersByTimeAsync(0);
       const wakes = vi.fn();
       box.onClaimWake = wakes;
 
-      // Deadline fires: the first read aborts, the wake is NOT lost.
+      // Deadline fires: the read aborts; the read-RETRY (not a lease wake)
+      // now owns recovery.
       await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
       expect(wakes).not.toHaveBeenCalled();
-      expect(box.pendingClaimWakeups()).toEqual(["cmd_readfail"]);
+      expect(box.pendingLeaseWakeups()).toEqual([]);
 
-      // The bounded retry (250 ms) reads successfully and reclaims.
+      // 250 ms backoff: read succeeds → 0 ms delivery wake → fire → hook.
       await vi.advanceTimersByTimeAsync(250);
+      await vi.advanceTimersByTimeAsync(10);
       expect(wakes).toHaveBeenCalledTimes(1);
-      expect(store.map.get("cmd_readfail")?.state).toBe("pending");
-      expect(box.pendingClaimWakeups()).toEqual([]);
+      expect(box.pendingLeaseWakeups()).toEqual([]);
     } finally {
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     }
   });
 
-  it("GATE13 item 2: a timer firing across a system-clock ROLLBACK does not reclaim the still-fresh lease — it re-arms and reclaims at the new deadline", async () => {
+  it("GATE13 item 2 (gate 20): a timer firing across a system-clock ROLLBACK adopts the fresh-lease deadline and delivers only when wall time catches up", async () => {
     const originalNavigator = globalThis.navigator;
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
     vi.useFakeTimers();
@@ -601,7 +607,7 @@ describe("Outbox", () => {
         reads = 0;
         override async all() {
           this.reads += 1;
-          if (this.reads >= 2) await readGate; // the wake's read is suspended
+          if (this.reads >= 3) await readGate; // the fire's read is suspended
           return await super.all();
         }
       }
@@ -617,37 +623,40 @@ describe("Outbox", () => {
       await vi.advanceTimersByTimeAsync(5);
       await putP;
       const box = await Outbox.load(store, "owner_rb");
+      await box.refreshDurable();
       await vi.advanceTimersByTimeAsync(0);
       const wakes = vi.fn();
       box.onClaimWake = wakes;
 
-      // The deadline timer fires (clock advanced to T), but its durable read
-      // is suspended WHILE the system clock moves 10 s backwards.
+      // The deadline fires (clock at T) but its read is suspended WHILE the
+      // system clock moves 10 s backwards.
       await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
       vi.setSystemTime(T - 10_000);
       releaseRead!();
       await vi.advanceTimersByTimeAsync(10);
-      // Still fresh under the rolled-back wall clock: not reclaimed, re-armed.
+      // Still fresh under the rolled-back wall clock: adopted deadline, no
+      // delivery, one armed wake at T.
       expect(store.map.get("cmd_rollback")?.state).toBe("inflight");
       expect(wakes).not.toHaveBeenCalled();
-      expect(box.pendingClaimWakeups()).toEqual(["cmd_rollback"]);
+      expect(box.pendingLeaseWakeups()).toEqual(["cmd_rollback"]);
+      expect(box.leaseWakeAt("cmd_rollback")).toBe(T);
 
-      // Wall time catches up with the deadline: now the conditional reclaim
-      // (with its in-transaction expiry check) commits.
+      // Wall time catches up: the delivery hook fires; the durable row is an
+      // expired inflight claim the store deliverer now owns.
       await vi.advanceTimersByTimeAsync(10_000);
       await vi.advanceTimersByTimeAsync(10);
-      expect(store.map.get("cmd_rollback")?.state).toBe("pending");
       expect(wakes).toHaveBeenCalledTimes(1);
+      expect(store.map.get("cmd_rollback")?.state).toBe("inflight");
     } finally {
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     }
   });
 
-  it("GATE13 item 1a: a wake that fires after the REPLACEMENT lease also expired adopts it and reclaims immediately (throttled timer)", async () => {
+  it("GATE13 item 1a (gate 20): a fire whose fresh read finds the REPLACEMENT lease already expired delivers immediately", async () => {
     // The background timer fires late (throttled tab): by T the durable row
-    // carries a RENEWED lease T2 that has ITSELF expired. "Still inflight" must
-    // never be treated as terminal — adopt the replacement and reclaim now.
+    // carries a RENEWED lease T2 that has ITSELF expired. The decision is
+    // "deliver" now — "still inflight" is never terminal.
     const originalNavigator = globalThis.navigator;
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
     vi.useFakeTimers();
@@ -658,9 +667,9 @@ describe("Outbox", () => {
         readCount = 0;
         override async all() {
           this.readCount += 1;
-          // On the wake's read (load's own read is #1) the durable row now
-          // carries the renewed-but-expired replacement lease.
-          if (this.readCount >= 2) {
+          // The fire read (#3; load #1, boot refresh #2) sees the
+          // renewed-but-expired replacement lease.
+          if (this.readCount >= 3) {
             const cur = this.map.get("cmd_late");
             if (cur && cur.lease?.until === T) {
               this.map.set("cmd_late", {
@@ -684,26 +693,24 @@ describe("Outbox", () => {
       await vi.advanceTimersByTimeAsync(5);
       await putP;
       const box = await Outbox.load(store, "owner_late");
+      await box.refreshDurable();
       await vi.advanceTimersByTimeAsync(0);
       const wakes = vi.fn();
       box.onClaimWake = wakes;
 
       await vi.advanceTimersByTimeAsync(LEASE_TTL_MS); // T (and T2-1000 both past)
       await vi.advanceTimersByTimeAsync(10);
-      expect(store.map.get("cmd_late")?.state).toBe("pending");
+      expect(store.map.get("cmd_late")?.state).toBe("inflight");
+      expect(store.map.get("cmd_late")?.lease?.until).toBe(T - 1_000);
       expect(wakes).toHaveBeenCalledTimes(1);
-      expect(box.pendingClaimWakeups()).toEqual([]);
+      expect(box.pendingLeaseWakeups()).toEqual([]);
     } finally {
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     }
   });
 
-  it("GATE13 item 1b: a replacement lease written between read and reclaim is ADOPTED — re-arm for future T2, deliver at T2", async () => {
-    // No Web Locks: the other context renews between read and reclaimInflight;
-    // the conditional transaction correctly returns the replacement inflight
-    // row. The wake must adopt it (not stop): no delivery at T, re-armed for
-    // T2, delivered at T2 once the claim is inactive.
+  it("GATE13 item 1b (gate 20): the fire read finds a FUTURE replacement lease — adopt deadline T2, deliver at T2", async () => {
     const originalNavigator = globalThis.navigator;
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
     vi.useFakeTimers();
@@ -715,10 +722,8 @@ describe("Outbox", () => {
         readCount = 0;
         override async all() {
           this.readCount += 1;
-          const rows = await super.all();
-          // On the wake's read (load's own read is #1) the row still shows the
-          // old snapshot; the renewal lands before reclaimInflight runs.
-          if (this.readCount >= 2) {
+          // The fire read (#3) returns the renewed future lease directly.
+          if (this.readCount >= 3) {
             const cur = this.map.get("cmd_renew_between")!;
             if (cur.lease?.until === T) {
               this.map.set("cmd_renew_between", {
@@ -728,7 +733,7 @@ describe("Outbox", () => {
               });
             }
           }
-          return rows;
+          return await super.all();
         }
       }
       const store = new RenewBetweenStorage();
@@ -743,6 +748,7 @@ describe("Outbox", () => {
       await vi.advanceTimersByTimeAsync(5);
       await putP;
       const box = await Outbox.load(store, "owner_between");
+      await box.refreshDurable();
       await vi.advanceTimersByTimeAsync(0);
       const wakes = vi.fn();
       box.onClaimWake = wakes;
@@ -753,23 +759,24 @@ describe("Outbox", () => {
       expect(store.map.get("cmd_renew_between")?.state).toBe("inflight");
       expect(store.map.get("cmd_renew_between")?.lease?.until).toBe(T2);
       expect(wakes).not.toHaveBeenCalled();
-      expect(box.pendingClaimWakeups()).toEqual(["cmd_renew_between"]);
+      expect(box.pendingLeaseWakeups()).toEqual(["cmd_renew_between"]);
+      expect(box.leaseWakeAt("cmd_renew_between")).toBe(T2);
 
       await vi.advanceTimersByTimeAsync(LEASE_TTL_MS); // T2
       await vi.advanceTimersByTimeAsync(10);
-      expect(store.map.get("cmd_renew_between")?.state).toBe("pending");
       expect(wakes).toHaveBeenCalledTimes(1);
+      expect(store.map.get("cmd_renew_between")?.state).toBe("inflight");
     } finally {
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     }
   });
 
-  it("GATE13 item 1c: a load-time reclaim returning a replacement inflight row arms that lease's wake", async () => {
+  it("GATE13 item 1c (gate 20): a load-time reclaim returning a replacement inflight row is cached; the boot reconciliation arms its deadline", async () => {
     // query says holder gone -> load reclaims; the conditional transaction
     // finds the live owner renewed the lease while load was in flight and
-    // returns the replacement inflight row verbatim. The box must cache it AND
-    // adopt its deadline (future -> armed), so a later crash still recovers it.
+    // returns the replacement inflight row verbatim. The box caches it; the
+    // store-equivalent boot refresh arms the deadline (future -> armed).
     const originalNavigator = globalThis.navigator;
     Object.defineProperty(globalThis, "navigator", {
       configurable: true,
@@ -787,8 +794,11 @@ describe("Outbox", () => {
         ): Promise<OutboxRecord | null> {
           const existing = this.map.get(id);
           if (!existing) return null;
-          // Live owner renewed concurrently: conditional returns the row.
-          return { ...existing, attempts: 3, lease: { owner: expected.owner, until: T2 } };
+          // Live owner renewed concurrently: the real backend PERSISTS the
+          // conditional write and returns the replacement row verbatim.
+          const replaced = { ...existing, attempts: 3, lease: { owner: expected.owner, until: T2 } };
+          this.map.set(id, replaced);
+          return replaced;
         }
       }
       const store = new ReplaceOnReclaim();
@@ -803,17 +813,19 @@ describe("Outbox", () => {
       await vi.advanceTimersByTimeAsync(5);
       await putP;
       const box = await Outbox.load(store, "owner_lr");
-      await vi.advanceTimersByTimeAsync(0);
       expect(box.get("cmd_load_replace")?.state).toBe("inflight");
       expect(box.get("cmd_load_replace")?.lease?.until).toBe(T2);
-      expect(box.pendingClaimWakeups()).toEqual(["cmd_load_replace"]);
+      expect(box.pendingLeaseWakeups()).toEqual([]); // load arms nothing itself
+      await box.refreshDurable(); // the boot-flush reader arms
+      expect(box.pendingLeaseWakeups()).toEqual(["cmd_load_replace"]);
+      expect(box.leaseWakeAt("cmd_load_replace")).toBe(T2);
     } finally {
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     }
   });
 
-  it("GATE13 item 1d: refresh seeing an already-expired REPLACEMENT lease adopts and reclaims, not cancels", async () => {
+  it("GATE13 item 1d (gate 20): refresh seeing an already-expired REPLACEMENT lease arms an immediate delivery wake, never cancels", async () => {
     const originalNavigator = globalThis.navigator;
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
     vi.useFakeTimers();
@@ -832,8 +844,9 @@ describe("Outbox", () => {
       await vi.advanceTimersByTimeAsync(5);
       await putP;
       const box = await Outbox.load(store, "owner_rr");
+      await box.refreshDurable();
       await vi.advanceTimersByTimeAsync(0);
-      expect(box.pendingClaimWakeups()).toEqual(["cmd_refresh_replace"]);
+      expect(box.pendingLeaseWakeups()).toEqual(["cmd_refresh_replace"]);
       const wakes = vi.fn();
       box.onClaimWake = wakes;
 
@@ -852,31 +865,25 @@ describe("Outbox", () => {
       await box.refreshDurable();
 
       // Adopted and scheduled immediately (not cancelled).
-      expect(box.pendingClaimWakeups()).toEqual(["cmd_refresh_replace"]);
+      expect(box.pendingLeaseWakeups()).toEqual(["cmd_refresh_replace"]);
+      expect(box.leaseWakeKind("cmd_refresh_replace")).toBe("deliver");
       await vi.advanceTimersByTimeAsync(10);
-      expect(store.map.get("cmd_refresh_replace")?.state).toBe("pending");
       expect(wakes).toHaveBeenCalledTimes(1);
+      expect(store.map.get("cmd_refresh_replace")?.state).toBe("inflight");
     } finally {
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     }
   });
 
-  it("GATE12 item 1: a wakeup reclaims ONLY its lease snapshot after it is due — a renewed later lease re-arms for T2, then reclaims", async () => {
-    // T  = lease deadline observed at load (fresh same-owner claim, Web Locks
-    //      absent -> UNKNOWN ownership -> kept, wakeup armed at T).
-    // T2 = a live delivery RETRY renews the lease to T2 > T.
-    // At T the wakeup must NOT force the live renewed claim to pending (that
-    // let a concurrent POST race in cloned-tab no-locks mode); it re-arms for
-    // T2 and only reclaims there if the claim is still inactive. The read +
-    // conditional reclaim run under the real per-instance lock when present.
+  it("GATE12 item 1 (gate 20): a deadline fire adopts a renewed later lease T2 and delivers only at T2; its read takes the instance lock", async () => {
     const originalNavigator = globalThis.navigator;
     const lockNames: string[] = [];
     Object.defineProperty(globalThis, "navigator", {
       configurable: true,
       value: {
-        // No query (unknown ownership at load) but request EXISTS: the wakeup
-        // still serializes its read+reclaim under the lock.
+        // No query (unknown ownership at load) but request EXISTS: the fire
+        // still runs its authoritative read under the per-instance lock.
         locks: {
           request: (name: string, _opts: unknown, cb: () => Promise<unknown>) => {
             lockNames.push(name);
@@ -903,12 +910,14 @@ describe("Outbox", () => {
       await vi.advanceTimersByTimeAsync(5);
       await putP;
       const box = await Outbox.load(store, owner);
+      await box.refreshDurable();
       await vi.advanceTimersByTimeAsync(0);
-      expect(box.pendingClaimWakeups()).toEqual(["cmd_renew"]);
+      expect(box.pendingLeaseWakeups()).toEqual(["cmd_renew"]);
       const wakes = vi.fn();
       box.onClaimWake = wakes;
 
-      // A live delivery retry RENEWS the lease (new until T2 > T) before T.
+      // A live delivery RETRIES and RENEWS the lease (new until T2 > T)
+      // before T.
       const T2 = T + LEASE_TTL_MS;
       const renewP = store.put(
         rec({
@@ -922,23 +931,20 @@ describe("Outbox", () => {
       await vi.advanceTimersByTimeAsync(5);
       await renewP;
 
-      // At T: still the live renewed claim — no reclaim, no delivery trigger,
-      // wakeup moved to T2.
+      // At T: still the live renewed claim — no delivery, wake moved to T2.
       await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
       expect(store.map.get("cmd_renew")?.state).toBe("inflight");
       expect(store.map.get("cmd_renew")?.lease?.until).toBe(T2);
       expect(wakes).not.toHaveBeenCalled();
-      expect(box.pendingClaimWakeups()).toEqual(["cmd_renew"]);
+      expect(box.pendingLeaseWakeups()).toEqual(["cmd_renew"]);
+      expect(box.leaseWakeAt("cmd_renew")).toBe(T2);
 
-      // The row goes inactive and stays on the renewed lease up to T2: then
-      // the wakeup reclaims its snapshot and triggers exactly one delivery.
+      // T2: one guarded delivery trigger for the expired claim.
       await vi.advanceTimersByTimeAsync(LEASE_TTL_MS);
-      expect(store.map.get("cmd_renew")?.state).toBe("pending");
-      expect(store.map.get("cmd_renew")?.lease).toBeUndefined();
       expect(wakes).toHaveBeenCalledTimes(1);
-      expect(box.pendingClaimWakeups()).toEqual([]);
+      expect(box.pendingLeaseWakeups()).toEqual([]);
 
-      // The deadline read+reclaim took the real per-instance lock.
+      // The deadline read took the real per-instance lock.
       expect(lockNames).toContain(instanceDeliveryLockName(instanceId));
     } finally {
       vi.useRealTimers();
@@ -946,7 +952,7 @@ describe("Outbox", () => {
     }
   });
 
-  it("GATE11 item 5: a failed load-time reclaim arms a TRACKED expiry wakeup that requeues and triggers exactly one delivery", async () => {
+  it("GATE11 item 5 (gate 20): two failed load reclaims leave the inflight row; the deadline wake then triggers exactly one delivery turn", async () => {
     const originalNavigator = globalThis.navigator;
     Object.defineProperty(globalThis, "navigator", {
       configurable: true,
@@ -955,8 +961,9 @@ describe("Outbox", () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(10_000);
-      // reclaimInflight fails BOTH load attempts (one-shot abort + retry),
-      // then works when the tracked wakeup fires at the lease deadline.
+      // reclaimInflight fails BOTH load attempts (one-shot abort + retry);
+      // the wake path no longer reclaims (it reads and hands the store
+      // deliverer the expired claim), so the count stays at two.
       class FlakyStorage extends MemStorage {
         reclaimCalls = 0;
         override async reclaimInflight(
@@ -982,14 +989,17 @@ describe("Outbox", () => {
       await putP;
 
       const box = await Outbox.load(store, "owner_wake");
+      await box.refreshDurable();
       await vi.advanceTimersByTimeAsync(0);
-      // Both reclaim writes aborted: still inflight, and the tracked wakeup is
-      // armed (the old code armed an untracked refresh-only timer).
+      // Both reclaim writes aborted: still inflight with its fresh lease; the
+      // central reconciliation armed its deadline wake.
       expect(store.map.get("cmd_wake")?.state).toBe("inflight");
-      expect(box.pendingClaimWakeups()).toEqual(["cmd_wake"]);
+      expect(box.pendingLeaseWakeups()).toEqual(["cmd_wake"]);
 
       // Delivery stand-in for the store's flushAllOutbox: one lock turn, one
-      // POST per delivered row.
+      // POST per delivered row. The deliverer's in-lock read selects the
+      // expired inflight claim (isDeliverable) even though it was never
+      // reclaimed to pending.
       const wakes = vi.fn();
       const posts: string[][] = [];
       box.onClaimWake = () => {
@@ -1005,12 +1015,13 @@ describe("Outbox", () => {
       expect(wakes).not.toHaveBeenCalled();
       expect(posts).toEqual([]);
 
-      // At the deadline, with NO other trigger: requeue -> exactly one POST.
+      // At the deadline, with NO other trigger: the fire hands the expired
+      // claim to the guarded deliverer: exactly one POST.
       await vi.advanceTimersByTimeAsync(2_000);
-      expect(store.map.get("cmd_wake")?.state).toBe("pending");
       expect(wakes).toHaveBeenCalledTimes(1);
       await vi.advanceTimersByTimeAsync(50);
       expect(posts).toEqual([["cmd_wake"]]);
+      expect(store.reclaimCalls ?? 0).toBe(2);
 
       // Long afterwards: no duplicate wake/delivery.
       await vi.advanceTimersByTimeAsync(LEASE_TTL_MS * 2);
@@ -1022,7 +1033,7 @@ describe("Outbox", () => {
     }
   });
 
-  it("GATE11 item 5: the tracked wakeup is cancelled when the row is delivered before the deadline", async () => {
+  it("GATE11 item 5 (gate 20): the wake is cancelled through the central reconciliation when the row is delivered before the deadline", async () => {
     const originalNavigator = globalThis.navigator;
     Object.defineProperty(globalThis, "navigator", {
       configurable: true,
@@ -1054,14 +1065,16 @@ describe("Outbox", () => {
       await vi.advanceTimersByTimeAsync(5);
       await putP;
       const box = await Outbox.load(store, "owner_wake2");
+      await box.refreshDurable();
       await vi.advanceTimersByTimeAsync(0);
-      expect(box.pendingClaimWakeups()).toEqual(["cmd_wake_delivered"]);
+      expect(box.pendingLeaseWakeups()).toEqual(["cmd_wake_delivered"]);
 
       const wakes = vi.fn();
       box.onClaimWake = wakes;
 
-      // The claim gets a definite answer before the deadline (deliverer's
-      // finish write): the tracked wakeup is cancelled.
+      // The claim gets a definite answer before the deadline (the deliverer's
+      // finish write): patch commits storage-first and the central
+      // reconciliation cancels the wake.
       const patchP = box.patch("cmd_wake_delivered", {
         state: "sent",
         gotResponse: true,
@@ -1070,7 +1083,7 @@ describe("Outbox", () => {
       await vi.advanceTimersByTimeAsync(5);
       await patchP;
       expect(store.map.get("cmd_wake_delivered")?.state).toBe("sent");
-      expect(box.pendingClaimWakeups()).toEqual([]);
+      expect(box.pendingLeaseWakeups()).toEqual([]);
 
       await vi.advanceTimersByTimeAsync(LEASE_TTL_MS * 2);
       expect(wakes).not.toHaveBeenCalled();
@@ -1589,7 +1602,10 @@ describe("Outbox", () => {
     const fn = vi.fn();
     box.subscribe(fn);
     await box.enqueue(rec({ commandId: "cmd_n" }));
-    await box.patch("cmd_n", { state: "inflight" });
+    // A FRESH lease: the central reconciliation arms a far-future deadline
+    // wake (not a 0 ms delivery wake), so this mutation emits just once.
+    await box.patch("cmd_n", { state: "inflight", lease: { owner: "owner_n", until: Date.now() + LEASE_TTL_MS } });
+    box.cancelAllWakesForUnload();
     await box.remove("cmd_n");
     expect(fn).toHaveBeenCalledTimes(3);
   });

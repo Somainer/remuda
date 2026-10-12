@@ -1,5 +1,6 @@
 import type { AttachmentRef } from "./attachments";
 import type { Id } from "../types/wire";
+import { leaseWakeDecision, reconcileLeaseWakes } from "./leaseWakes";
 
 /**
  * D-055 client outbox: every `instance.send` is written here BEFORE its POST,
@@ -649,21 +650,57 @@ export class Outbox {
    */
   private readonly leaseToken: Id = newCommandId();
   /**
-   * Tracked lease-expiry wakeups for INACTIVE persisted claims (rows this
-   * context is not itself POSTing): same-owner claims kept until their
-   * deadline (held/unknown, gate 11 item 3) and claims whose load-time
-   * reclaim failed (gate 10 item 8). One handle per commandId; a row leaving
-   * inflight (or {@link dispose}) cancels it (c-reconnfu gate 11 item 5).
+   * The SINGLE lease-wake bookkeeping (c-reconnfu gate 20): one armed wake per
+   * command this document is not itself POSTing but owes recovery for.
    *
-   * Gate 12 item 1: the entry carries the EXACT lease snapshot observed when
-   * it was armed. The deadline callback may reclaim that snapshot only after
-   * its own deadline; a live retry that renewed the lease to a later until
-   * re-arms instead of forcing the renewed live claim back to pending.
+   *  - kind "lease":   an inactive inflight row with a LIVE lease (a foreign
+   *                    owner, or a cloned same-owner sibling — the policy is
+   *                    owner-agnostic) waited out until `lease.until`;
+   *  - kind "deliver": a deliverable row (pending / lease-less / stealable)
+   *                    whose guarded delivery is not currently running. Fires
+   *                    immediately the first time, then on the bounded backoff
+   *                    the store records after a failed delivery attempt.
+   *
+   * Held rows never appear (the store's held-retry clock owns them) and
+   * neither do rows in {@link activeDeliveries} (the live POST is the
+   * in-flight delivery). Every snapshot reader — timer fire, in-lock
+   * deliverer read, store flush, unload rearm — re-applies the SAME central
+   * reconciliation instead of cancelling/arming wakes itself.
    */
-  private claimWakeups = new Map<
+  private leaseWakeups = new Map<
     Id,
-    { instanceId: Id; snapshot: { owner: Id; until: number }; handle: ReturnType<typeof setTimeout> }
+    {
+      instanceId: Id;
+      kind: "lease" | "deliver";
+      /** Exact live-lease snapshot for kind "lease" (adoption/rollback check). */
+      lease?: { owner: Id; until: number };
+      failures: number;
+      /** Scheduled fire time, epoch ms (lease deadline or backoff instant). */
+      at: number;
+      handle: ReturnType<typeof setTimeout>;
+    }
   >();
+  /**
+   * Bounded per-instance failure count for delivery attempts that could not
+   * make progress (pre-lock/in-lock durable read failed, the claim transaction
+   * aborted, the instance mutex was held): the next "deliver" wake for the
+   * instance backs off 250 ms·2^n instead of firing immediately. Reset the
+   * moment one of the instance's rows is actually POSTed.
+   */
+  private deliveryFailures = new Map<Id, number>();
+  /**
+   * Instances whose guarded delivery the store is about to run IMMEDIATELY
+   * after the current snapshot read (its normal flush loop). Deliverable rows
+   * there need no 0 ms wake — the starting flush IS the in-flight cover; the
+   * store clears this once that loop ends and re-reconciles leftovers.
+   */
+  private deliverySuppressed = new Set<Id>();
+  /**
+   * Single bounded READ-RETRY chain for a rejected authoritative read (timer
+   * fire or store flush). The retry ends in the SAME central reconciliation;
+   * teardown/dispose cancels it. `promise` lets concurrent callers coalesce.
+   */
+  private readRetry: { failures: number; handle: ReturnType<typeof setTimeout>; promise: Promise<OutboxRecord[] | null> } | null = null;
   /**
    * Set by {@link dispose}. A deadline callback already suspended inside
    * storage.all()/reclaimInflight when dispose() ran can resume afterwards;
@@ -672,11 +709,14 @@ export class Outbox {
    */
   private disposed = false;
   /**
-   * Lifetime signal (gate 13 item 3): aborting makes an in-flight wake
-   * reclaim transaction roll back BEFORE its put commits, so a dispose racing
-   * a suspended IndexedDB reclaim cannot leave a durable pending write behind.
+   * Set by the store on pagehide/beforeunload, cleared when the page stays.
+   * While true a reconciliation applies NO bookkeeping and a deadline fire
+   * does no work: a read suspended across a genuine reload teardown must not
+   * arm a timer (or trigger a flush) into the tearing-down page. BFCache
+   * restore / the cancelled-prompt self-reset clears it and re-enters via a
+   * fresh read.
    */
-  private lifetime = new AbortController();
+  private unloading = false;
   /**
    * Commands THIS document is currently POSTing (claimed via
    * {@link beginActiveDelivery}/{@link endActiveDelivery}). While present, a
@@ -686,27 +726,22 @@ export class Outbox {
   private activeDeliveries = new Set<Id>();
 
   /**
-   * Store hook fired exactly once when a tracked wakeup reclaims a row: the
-   * store runs its single-deliverer flush (the Outbox itself never POSTs).
+   * Store hook fired when a "deliver" wake fires and an authoritative read
+   * under the instance lock found the row deliverable: the store runs its
+   * single-deliverer GUARDED flush (the Outbox itself never POSTs). The store
+   * is expected to suppress currently-held rows there — a held row's only
+   * wake is its held-retry timer (gate 20 item 3).
    */
   onClaimWake: (() => void) | null = null;
   /**
-   * Store hook fired when a tracked SAME-OWNER wakeup fires (gate 17 item 2)
-   * and its critical section discovers the row is now an inflight claim of a
-   * FOREIGN owner. The wake stops tracking and hands the store the
-   * AUTHORITATIVE row (with the foreign deadline): the store owns foreign
-   * expiry recovery and must arm T2 itself — this wake is being cancelled and
-   * the store schedules foreign leases only from flush/unload rearm, so
-   * without the handoff the (possibly crashed) foreign claim stays inflight
-   * with no recovery clock. Fired on the timer-discovery path AND on snapshot
-   * reconciliation (gate 18 item 3: another tracked command's foreign
-   * replacement can be first seen while a different command's timer refreshes
-   * the durable set); on a store flush both this hook and the store's own
-   * scheduleLeaseExpiryWakeup see the same snapshot and arm the same deadline
-   * (armLeaseWakeup move-earlier-only dedups). The firing command itself is
-   * excluded on the timer path — its critical section owns that outcome.
+   * Store hook fired when the central reconciliation observes a HELD row that
+   * currently has no other owner in this document: the store's bounded
+   * held-retry timer (same-id re-POST without spending the attempt budget) is
+   * that row's only clock, whether this tab delivered the held answer itself
+   * or first saw the row held by a sibling. Fired from every reconciliation
+   * pass; the store's arm is idempotent.
    */
-  onForeignLeaseHandoff: ((rec: OutboxRecord) => void) | null = null;
+  onHeldLease: ((instanceId: Id) => void) | null = null;
 
   private constructor(storage: OutboxStorage, owner?: Id) {
     this.storage = storage;
@@ -784,10 +819,12 @@ export class Outbox {
             : "free";
         if (ownership !== "free" && rec.lease.until > now) {
           // Held by a live cloned tab, or ownership unknowable: the fresh
-          // same-owner lease stands until its deadline. A TRACKED wakeup
-          // reclaims it at expiry (item 5) — the cloned tab may be gone by
-          // then; until then this context neither requeues nor delivers.
-          box.scheduleClaimWakeup(id, rec.instanceId, rec.lease);
+          // same-owner lease stands until its deadline. This load arms
+          // NOTHING — the store's boot flush reads the authoritative set and
+          // the central reconcileLeaseWakes arms the one deadline wake for it
+          // (a cloned tab may be gone by the deadline; the in-lock read at
+          // fire time re-judges). Until then this context neither requeues
+          // nor delivers.
           continue;
         }
         requeue.push({ id, instanceId: rec.instanceId, expected: rec.lease });
@@ -832,23 +869,14 @@ export class Outbox {
           // Authoritative current row — reclaimed to pending, terminal, or a
           // replacement inflight lease a live owner renewed while this load
           // reclaimed. Gate 13 item 1 (c): an inflight replacement is NEVER
-          // terminal here — adopt its lease (future deadline armed, overdue
-          // reclaimed immediately by the scheduled wake).
+          // terminal here — adopt its lease into the cache; the boot flush's
+          // central reconciliation arms the deadline wake (future armed,
+          // overdue delivered immediately).
           box.cache.set(id, stored);
-          if (stored.state === "inflight" && stored.lease && stored.lease.owner === box.owner) {
-            // Same-owner inflight replacement: adopt its lease (future armed,
-            // overdue reclaimed immediately). A FOREIGN replacement is handed
-            // off to the store's foreign-lease scheduler — do not arm (gate 16
-            // item 2: exactly one scheduler per lease).
-            box.scheduleClaimWakeup(id, instanceId, stored.lease, 0);
-          } else {
-            box.clearClaimWakeup(id);
-          }
         } else {
-          // Persist failed twice: the row is still (durable) inflight with its
-          // lease. The TRACKED expiry wakeup (item 5) reclaims and triggers
-          // delivery at the deadline instead of merely refreshing the cache.
-          box.scheduleClaimWakeup(id, instanceId, expected);
+          // Persist failed twice: the row is still (durable) inflight with
+          // its lease. The boot flush's authoritative read and the central
+          // reconciliation own the deadline wake / delivery.
         }
       }),
     );
@@ -913,6 +941,7 @@ export class Outbox {
     const full: OutboxRecord = { attempts: 0, state: "pending", ...rec };
     await this.storage.put(full);
     this.cache.set(full.commandId, full);
+    this.reconcileFromCache();
     this.emit();
     return full;
   }
@@ -931,8 +960,10 @@ export class Outbox {
     const stored = await this.storage.mergeUnlessDone(commandId, patch);
     if (!stored) return null;
     this.cache.set(commandId, stored);
-    // The claim has a definite answer: its expiry wakeup must never fire.
-    if (stored.state !== "inflight") this.clearClaimWakeup(commandId);
+    // Re-judge every wake from the just-committed state (terminal cancels the
+    // deadline wake, held hands it to the held-retry clock, a fresh lease
+    // adopts the new deadline) through the ONE central function.
+    this.reconcileFromCache();
     this.emit();
     return stored;
   }
@@ -940,67 +971,131 @@ export class Outbox {
   async remove(commandId: Id) {
     await this.storage.delete(commandId);
     this.cache.delete(commandId);
-    this.clearClaimWakeup(commandId);
+    this.reconcileFromCache();
     this.emit();
   }
 
   /**
-   * Arm (or replace) the tracked lease-expiry wakeup for one inactive claim.
-   * The entry remembers the observed lease SNAPSHOT (gate 12 item 1): at the
-   * deadline fireClaimWakeup may reclaim exactly that lease and only after it
-   * is due; a row carrying a later renewed lease re-arms for that deadline.
+   * Delay for a "deliver" wake after `failures` unsuccessful delivery
+   * attempts on its instance: 0 ms the first time, then capped exponential
+   * backoff. The same bounded envelope the old per-claim deadline retry used.
    */
-  private scheduleClaimWakeup(
-    commandId: Id,
-    instanceId: Id,
-    snapshot: { owner: Id; until: number },
-    failures = 0,
-  ) {
-    // Gate 12 item 3: a suspended deadline callback that resumes after
-    // dispose must never re-arm.
-    if (this.disposed) return;
-    const old = this.claimWakeups.get(commandId);
-    if (old) clearTimeout(old.handle);
-    // A follow-up to a failed deadline read/reclaim waits a capped
-    // exponential backoff; the first arm waits for the lease deadline.
-    const delay =
-      failures === 0
-        ? Math.max(0, snapshot.until - Date.now())
-        : Math.min(CLAIM_WAKE_MAX_RETRY_MS, CLAIM_WAKE_BASE_RETRY_MS * 2 ** (failures - 1));
-    const handle = setTimeout(() => {
-      this.claimWakeups.delete(commandId);
-      void this.fireClaimWakeup(commandId, instanceId, snapshot, failures);
-    }, delay);
-    this.claimWakeups.set(commandId, { instanceId, snapshot, handle });
+  private deliverWakeDelay(failures: number): number {
+    return failures === 0
+      ? 0
+      : Math.min(CLAIM_WAKE_MAX_RETRY_MS, CLAIM_WAKE_BASE_RETRY_MS * 2 ** (failures - 1));
   }
 
-  private clearClaimWakeup(commandId: Id) {
-    const entry = this.claimWakeups.get(commandId);
+  /** Arm (or replace) one lease/delivery wake. Fires at spec.at (epoch ms). */
+  private armLeaseWake(
+    commandId: Id,
+    instanceId: Id,
+    spec: { kind: "lease" | "deliver"; lease?: { owner: Id; until: number }; failures: number; at: number },
+  ) {
+    if (this.disposed) return;
+    this.cancelLeaseWake(commandId);
+    const handle = setTimeout(() => {
+      this.leaseWakeups.delete(commandId);
+      void this.fireLeaseWake(commandId, instanceId);
+    }, Math.max(0, spec.at - Date.now()));
+    this.leaseWakeups.set(commandId, {
+      instanceId,
+      kind: spec.kind,
+      lease: spec.lease,
+      failures: spec.failures,
+      at: spec.at,
+      handle,
+    });
+  }
+
+  private cancelLeaseWake(commandId: Id) {
+    const entry = this.leaseWakeups.get(commandId);
     if (entry) {
       clearTimeout(entry.handle);
-      this.claimWakeups.delete(commandId);
+      this.leaseWakeups.delete(commandId);
     }
   }
 
-  /** Test/teardown visibility for the set of pending tracked claim wakeups. */
-  pendingClaimWakeups(): Id[] {
-    return [...this.claimWakeups.keys()];
+  /**
+   * Cancel every armed wake and the bounded read retry WITHOUT disposing: a
+   * genuine pagehide must leave a tearing-down page with zero timers. A
+   * CANCELLED beforeunload re-enters via refreshDurable* (read-only rearm).
+   * Also latches {@link unloading} so a read suspended across the teardown
+   * applies no reconciliation when it resumes.
+   */
+  cancelAllWakesForUnload() {
+    this.unloading = true;
+    for (const entry of this.leaseWakeups.values()) clearTimeout(entry.handle);
+    this.leaseWakeups.clear();
+    if (this.readRetry) {
+      clearTimeout(this.readRetry.handle);
+      this.readRetry = null;
+    }
+    this.deliveryFailures.clear();
+    this.deliverySuppressed.clear();
+  }
+
+  /** The page stayed / was restored (BFCache): allow reconciliation again. */
+  clearUnloading() {
+    this.unloading = false;
+  }
+
+  /** Test/teardown visibility for the set of armed lease/delivery wakes. */
+  pendingLeaseWakeups(): Id[] {
+    return [...this.leaseWakeups.keys()];
+  }
+
+  /** Test visibility: scheduled fire time (epoch ms) of one command's wake. */
+  leaseWakeAt(commandId: Id): number | undefined {
+    return this.leaseWakeups.get(commandId)?.at;
+  }
+
+  /** Test visibility: kind of an armed wake. */
+  leaseWakeKind(commandId: Id): "lease" | "deliver" | undefined {
+    return this.leaseWakeups.get(commandId)?.kind;
+  }
+
+  /**
+   * Record a delivery attempt that could not make progress on the instance
+   * (durable read failure, claim-transaction abort, contended mutex): the
+   * next deliver wake for its rows backs off instead of firing immediately.
+   * Bounded by CLAIM_WAKE_MAX_FAILURES.
+   */
+  noteDeliveryFailure(instanceId: Id) {
+    this.deliveryFailures.set(instanceId, (this.deliveryFailures.get(instanceId) ?? 0) + 1);
+  }
+
+  /** A row of the instance was actually POSTed: clear its failure backoff. */
+  noteDeliveryProgress(instanceId: Id) {
+    this.deliveryFailures.delete(instanceId);
+  }
+
+  /** Mark instances whose guarded delivery the store starts immediately. */
+  suppressDeliveryWakes(ids: Iterable<Id>) {
+    for (const id of ids) this.deliverySuppressed.add(id);
+  }
+
+  /** Flush loop ended: leftovers must be re-judged without suppression. */
+  clearSuppressedDeliveryWakes() {
+    this.deliverySuppressed.clear();
   }
 
   /**
    * Mark a command as being actively delivered BY THIS document (store calls
-   * this right after winning its claim, for the duration of the POST). Suppresses
-   * expiry recovery for our own live claim even when its lease owner equals the
-   * persisted recovery owner (a cloned sibling shares that id).
+   * this right after winning its claim, for the duration of the POST). The
+   * active POST is that row's in-flight guarded delivery, so the central
+   * reconciliation arms nothing for it — even when its lease owner equals
+   * this persisted recovery owner (a cloned sibling shares that id).
    */
   beginActiveDelivery(commandId: Id) {
     this.activeDeliveries.add(commandId);
-    this.clearClaimWakeup(commandId);
+    this.reconcileFromCache();
   }
 
   /** The live delivery finished (or was skipped after claim) — reconcile anew. */
   endActiveDelivery(commandId: Id) {
     this.activeDeliveries.delete(commandId);
+    this.reconcileFromCache();
   }
 
   isDeliveryActive(commandId: Id): boolean {
@@ -1021,160 +1116,239 @@ export class Outbox {
     return await fn();
   }
 
-  private async fireClaimWakeup(
-    commandId: Id,
-    instanceId: Id,
-    snapshot: { owner: Id; until: number },
-    failures = 0,
-  ) {
-    // Gate 12 item 3: a handle can fire around the same microtask dispose
-    // clears the map; a disposed Outbox runs no deadline work at all.
-    if (this.disposed) return;
-    // Read + conditional reclaim as ONE critical section under the instance
-    // lock (gate 12 item 1). Gate 12 item 2: a FAILED read/reclaim is
-    // distinguished from a successful read that finds the row missing or
-    // terminal — the former retries bounded with the SAME snapshot (the only
-    // wake must not die on a one-shot IDB error), the latter stops for real.
-    type Outcome =
-      | { kind: "failure" }
-      | { kind: "stop"; rec: OutboxRecord | null }
-      | { kind: "adopt"; lease: { owner: Id; until: number } }
-      | { kind: "handoff"; rec: OutboxRecord }
-      | { kind: "deliver"; rec: OutboxRecord };
-    let outcome: Outcome;
+  /**
+   * A lease/delivery wake fired. Read the AUTHORITATIVE durable set UNDER the
+   * instance lock (every reconciliation takes the same critical section so a
+   * live sibling's committed write is visible), re-apply the central policy
+   * for every tracked row, then settle the FIRING command from its FRESH
+   * decision:
+   *  - deliver:  hand the store one guarded delivery trigger;
+   *  - deadline: adopt the renewed/replaced/rolled-back lease deadline;
+   *  - held:     the store's held-retry clock is the only allowed timer;
+   *  - quiet/missing: nothing.
+   * A failed read or lock never ends recovery in silence: the bounded,
+   * lifetime-aware read-retry ends in the same central reconciliation.
+   */
+  private async fireLeaseWake(commandId: Id, instanceId: Id) {
+    if (this.disposed || this.unloading) return;
+    let durable: OutboxRecord[];
     try {
-      outcome = await this.runUnderInstanceLock(instanceId, async () => {
-      let durable: OutboxRecord[];
-      try {
-        // Gate 18 item 3: this read reconciles OTHER tracked wakes too; pass
-        // the firing id so its own command is never handed off twice (the
-        // critical section below returns X's authoritative outcome).
-        durable = await this.refreshFromStorage(commandId);
-      } catch {
-        return { kind: "failure" } satisfies Outcome;
-      }
-      // Gate 12 item 3: dispose while the read was suspended — never reclaim.
-      if (this.disposed) return { kind: "stop", rec: null };
-      const current = durable.find((r) => r.commandId === commandId);
-      // A successful read found the row missing: stop for real.
-      if (!current) {
-        return { kind: "stop", rec: null };
-      }
-      // Gate 19 item 1: a firing lease timer that successfully reads a
-      // DELIVERABLE row must end in a GUARDED delivery (or a recovery timer),
-      // never silence. The case here is a CLONED sibling (same persisted owner)
-      // whose POST/status reconciliation failed: it restored the row to a
-      // lease-less PENDING state and closed before its in-memory retry ran, so
-      // this document's tracked expiry timer is the row's ONLY trigger. The
-      // store's flush re-reads authoritative rows inside the instance lock and
-      // claims durably, so this can never double-POST a row a live sibling is
-      // POSTing (that sibling holds the lock; the fresh read then finds it
-      // inflight/sent). A lease-less inflight row is deliverable under the same
-      // rule. HELD rows are deliberately excluded: their own bounded
-      // held-retry clock owns the next POST (no immediate POST from a lease
-      // timer, gate 18 item 1), as are every terminal state
-      // (sent/done/rejected/unknown/reconciling).
-      if (current.state === "pending" || (current.state === "inflight" && !current.lease)) {
-        return { kind: "deliver", rec: current };
-      }
-      // Present but non-deliverable (held/terminal): stop for real.
-      if (current.state !== "inflight" || !current.lease) {
-        return { kind: "stop", rec: current };
-      }
-      const lease = current.lease;
-      if (lease.owner !== snapshot.owner || lease.until !== snapshot.until) {
-        if (lease.owner !== this.owner) {
-          // Gate 16 item 2: ownership changed to a FOREIGN owner. The store's
-          // lease-expiry scheduler (scheduleLeaseExpiryWakeup) is the single
-          // owner of foreign-lease recovery; this Outbox wake must HAND OFF
-          // — cancel itself instead of adopting — so two schedulers never
-          // fire for one lease. Gate 17 item 2: carry the AUTHORITATIVE row
-          // (not just the lease) so the outcome handler caches it and hands
-          // the foreign deadline to the store hook — this wake is the only
-          // recovery clock that knew about the row (B may already be dead).
-          return { kind: "handoff", rec: current };
-        }
-        // Same owner, different deadline: a renewal by this recovery identity.
-        // Gate 13 item 1 (a/b): "still inflight" is never terminal — ADOPT
-        // {owner, until}; delay max(0, until-now), failure count reset, so an
-        // overdue same-owner replacement reclaims immediately.
-        return { kind: "adopt", lease };
-      }
-      // Same exact snapshot. Gate 13 item 2: a timer firing is NOT proof of
-      // absolute expiry — the system clock can roll back after arming, so
-      // Date.now() may be < until even though the delay elapsed. Re-arm the
-      // UNCHANGED snapshot and wait out the remaining wall time instead of
-      // stealing a still-fresh lease.
-      if (Date.now() < snapshot.until) {
-        return { kind: "adopt", lease: snapshot } satisfies Outcome;
-      }
-      // Same exact snapshot and its deadline has passed: conditional reclaim.
-      // The transaction re-checks expiry against its own Date.now() inside and
-      // rolls back on dispose (gate 13 item 3 lifetime signal).
-      try {
-        const reclaimed = await this.storage.reclaimInflight(commandId, snapshot, {
-          requireExpired: true,
-          signal: this.lifetime.signal,
-        });
-        // Gate 12 item 3: dispose while the reclaim was suspended.
-        if (this.disposed) return { kind: "stop", rec: null };
-        if (!reclaimed) return { kind: "stop", rec: null };
-        if (reclaimed.state === "pending") return { kind: "deliver", rec: reclaimed };
-        // Gate 13 item 1 (b): a concurrent renewal between read and claim
-        // makes the conditional return the replacement inflight row. Same
-        // owner -> adopt; foreign owner -> hand off the AUTHORITATIVE row to
-        // the store scheduler (gate 17 item 2: cache the returned row here,
-        // not just the lease).
-        if (reclaimed.state === "inflight" && reclaimed.lease) {
-          return reclaimed.lease.owner === this.owner
-            ? { kind: "adopt", lease: reclaimed.lease }
-            : { kind: "handoff", rec: reclaimed };
-        }
-        return { kind: "stop", rec: reclaimed };
-      } catch {
-        return { kind: "failure" };
-      }
-    });
+      // The fire's critical section is an AUTHORITATIVE read for EVERY row:
+      // the reconciliation below guarantees each other deliverable row a
+      // 0 ms delivery wake, each live lease its deadline wake, each held row
+      // its held-retry clock. The firing command alone is exempt from that
+      // pass — its fresh decision settles it further down.
+      durable = await this.runUnderInstanceLock(instanceId, () =>
+        this.readAndReconcile(commandId),
+      );
     } catch {
-      // The lock request itself failed (deadlock/SecurityError): same bounded
-      // retry as a storage failure.
-      outcome = { kind: "failure" };
-    }
-
-    // Gate 12 item 3: teardown while the read/reclaim was suspended — drop
-    // whatever the storage layer returned: no cache write, no re-arm, no
-    // delivery trigger.
-    if (this.disposed) return;
-
-    if (outcome.kind === "failure") {
-      if (failures + 1 < CLAIM_WAKE_MAX_FAILURES) {
-        this.scheduleClaimWakeup(commandId, instanceId, snapshot, failures + 1);
-      }
+      // The lock request itself failed (deadlock/SecurityError) or its read
+      // rejected: the bounded read-retry keeps recovery responsibility and
+      // ends in the same central reconciliation.
+      await this.refreshDurableRecovering(1);
       return;
     }
-    if (outcome.kind === "adopt") {
-      // Fresh failure counter for the new lease; scheduleClaimWakeup turns an
-      // overdue deadline into an immediate wake.
-      this.scheduleClaimWakeup(commandId, instanceId, outcome.lease, 0);
-      return;
-    }
-    if (outcome.kind === "handoff") {
-      // Foreign owner now. Gate 17 item 2: CACHE the authoritative replacement
-      // row (the conditional reclaim returned it verbatim; keeping the stale
-      // same-owner lease would mislead the pending count), stop tracking it in
-      // the Outbox, and hand the foreign row+deadline to the store's
-      // foreign-lease scheduler — the only thing that schedules T2 from here.
-      this.cache.set(commandId, outcome.rec);
-      this.clearClaimWakeup(commandId);
-      this.onForeignLeaseHandoff?.(outcome.rec);
-      return;
-    }
-    if (outcome.rec) this.cache.set(commandId, outcome.rec);
-    if (outcome.kind === "deliver") {
+    if (this.disposed || this.unloading) return;
+    const current = durable.find((r) => r.commandId === commandId);
+    if (!current) return; // missing: the reconciliation already dropped it
+    const decision = leaseWakeDecision(current, {
+      now: Date.now(),
+      isActiveDelivery: (id) => this.activeDeliveries.has(id),
+    });
+    if (decision.kind === "deliver") {
+      // Exactly one guarded delivery trigger for this wake; the store flush
+      // re-reads authoritatively under the lock and makes the durable claim.
       this.emit();
-      // Exactly one delivery trigger for this wakeup.
       this.onClaimWake?.();
+      return;
     }
+    if (decision.kind === "deadline" && decision.lease) {
+      // Renewed by its owner, replaced with another owner's claim, or still
+      // fresh after a clock rollback: adopt the AUTHORITATIVE deadline
+      // (0 ms when already overdue, failures reset) and never steal a fresh
+      // lease — the in-lock read at the next fire re-judges.
+      this.armLeaseWake(commandId, instanceId, {
+        kind: "lease",
+        lease: decision.lease,
+        failures: 0,
+        at: decision.lease.until,
+      });
+      return;
+    }
+    if (decision.kind === "held") this.onHeldLease?.(decision.instanceId);
+    // quiet: nothing — the snapshot reconciliation already cancelled or
+    // re-armed every OTHER tracked wake.
+  }
+
+  /** Read durable rows into the storage-first cache; no other side effect. */
+  async readDurable(): Promise<OutboxRecord[]> {
+    const durable = (await this.storage.all()).filter((r) => commandIdFromKey(r.commandId));
+    if (this.disposed) return [];
+    // Gate 13 item 3: check lifetime RIGHT after the read and BEFORE touching
+    // the cache — a dispose while all() was suspended imports no rows.
+    for (const rec of durable) this.cache.set(rec.commandId, rec);
+    return durable;
+  }
+
+  /**
+   * Apply the CENTRAL wake reconciliation (c-reconnfu gate 20) to an
+   * authoritative durable snapshot — the ONLY place lease/delivery wakes are
+   * armed or cancelled. For every row the policy table decides deliver /
+   * deadline / held / quiet, and the bookkeeping enforces exactly one cover:
+   * an armed wake, or the in-flight/imminent guarded delivery.
+   */
+  applyLeaseWakeReconcile(durable: OutboxRecord[], opts: { firingCommandId?: Id } = {}) {
+    if (this.disposed || this.unloading) return;
+    const now = Date.now();
+    const decisions = reconcileLeaseWakes(durable, {
+      now,
+      isActiveDelivery: (id) => this.activeDeliveries.has(id),
+    });
+    const byId = new Map(decisions.map((d) => [d.commandId, d]));
+    // Reconcile EXISTING wakes against the fresh decisions.
+    for (const [id, entry] of [...this.leaseWakeups]) {
+      if (id === opts.firingCommandId) continue; // its own fire settles it
+      const d = byId.get(id);
+      if (!d || d.kind === "quiet") {
+        this.cancelLeaseWake(id);
+        continue;
+      }
+      if (d.kind === "held") {
+        this.cancelLeaseWake(id);
+        this.onHeldLease?.(d.instanceId);
+        continue;
+      }
+      if (d.kind === "deadline" && d.lease) {
+        if (
+          entry.kind === "lease" &&
+          entry.lease &&
+          entry.lease.owner === d.lease.owner &&
+          entry.lease.until === d.lease.until
+        ) {
+          continue; // identical live lease: keep the one armed wake
+        }
+        this.armLeaseWake(id, d.instanceId, {
+          kind: "lease",
+          lease: d.lease,
+          failures: 0,
+          at: d.lease.until,
+        });
+        continue;
+      }
+      // Deliverable NOW: arm the bounded 0 ms/backoff delivery wake unless the
+      // guarded delivery for this instance is already running/imminent.
+      if (entry.kind === "deliver") continue; // bounded retry already pending
+      if (this.deliveryCovered(d.instanceId)) {
+        this.cancelLeaseWake(id);
+        continue;
+      }
+      this.armDeliverWake(id, d.instanceId, now);
+    }
+    // Discover rows with no wake yet.
+    for (const d of decisions) {
+      if (d.commandId === opts.firingCommandId) continue;
+      if (this.leaseWakeups.has(d.commandId)) continue;
+      if (d.kind === "deadline" && d.lease) {
+        this.armLeaseWake(d.commandId, d.instanceId, {
+          kind: "lease",
+          lease: d.lease,
+          failures: 0,
+          at: d.lease.until,
+        });
+      } else if (d.kind === "held") {
+        this.onHeldLease?.(d.instanceId);
+      } else if (d.kind === "deliver") {
+        if (this.deliveryCovered(d.instanceId)) continue;
+        this.armDeliverWake(d.commandId, d.instanceId, now);
+      }
+    }
+  }
+
+  /**
+   * True when a guarded delivery for the instance is already running or
+   * promised by the store's flush loop: its deliverable rows need no wake.
+   */
+  private deliveryCovered(instanceId: Id): boolean {
+    return (
+      this.flushChain.has(instanceId) ||
+      this.queuedFlush.has(instanceId) ||
+      this.deliverySuppressed.has(instanceId)
+    );
+  }
+
+  /** Arm a deliver wake at the instance's current bounded backoff instant. */
+  private armDeliverWake(commandId: Id, instanceId: Id, now: number) {
+    const failures = this.deliveryFailures.get(instanceId) ?? 0;
+    if (failures >= CLAIM_WAKE_MAX_FAILURES) return; // bounded; a later trigger re-enters
+    this.armLeaseWake(commandId, instanceId, {
+      kind: "deliver",
+      failures,
+      at: now + this.deliverWakeDelay(failures),
+    });
+  }
+
+  /** Re-apply the central policy from the storage-first cache (after a write). */
+  private reconcileFromCache() {
+    if (this.disposed) return;
+    this.applyLeaseWakeReconcile([...this.cache.values()]);
+  }
+
+  /** Authoritative read + central reconcile (store flush, rearm, tests). */
+  async refreshDurable(): Promise<OutboxRecord[]> {
+    return await this.readAndReconcile();
+  }
+
+  private async readAndReconcile(firingCommandId?: Id): Promise<OutboxRecord[]> {
+    const durable = await this.readDurable();
+    if (!this.disposed && !this.unloading) {
+      this.applyLeaseWakeReconcile(durable, { firingCommandId });
+    }
+    return durable;
+  }
+
+  /**
+   * Authoritative read + central reconcile with a BOUNDED, lifetime-aware
+   * retry when storage rejects: the failed read keeps recovery responsibility
+   * (250 ms·2^(n-1) capped at 5 s, CLAIM_WAKE_MAX_FAILURES attempts) and the
+   * retry ENDS IN THE SAME central reconciliation — a deliverable row never
+   * loses its only wake to a one-shot IndexedDB error. Concurrent callers
+   * coalesce onto the one retry chain.
+   *
+   * `failures` is the count of consecutive failures the CALLER already
+   * observed (a timer fire or the flush passes 1); 0 attempts a fresh read
+   * immediately. Resolves null when disposed or the budget is exhausted (a
+   * later user/online flush, unload-cancel rearm or reload re-enters fresh).
+   */
+  async refreshDurableRecovering(failures = 0): Promise<OutboxRecord[] | null> {
+    if (this.disposed || this.unloading) return null;
+    if (this.readRetry) return await this.readRetry.promise;
+    if (failures === 0) {
+      try {
+        const rows = await this.readDurable();
+        if (this.disposed) return null;
+        this.applyLeaseWakeReconcile(rows);
+        return rows;
+      } catch {
+        return await this.refreshDurableRecovering(1);
+      }
+    }
+    if (failures >= CLAIM_WAKE_MAX_FAILURES) return null;
+    const delay = Math.min(CLAIM_WAKE_MAX_RETRY_MS, CLAIM_WAKE_BASE_RETRY_MS * 2 ** (failures - 1));
+    const entry: {
+      failures: number;
+      handle: ReturnType<typeof setTimeout>;
+      promise: Promise<OutboxRecord[] | null>;
+    } = { failures, handle: undefined as never, promise: undefined as never };
+    entry.promise = new Promise<OutboxRecord[] | null>((resolve) => {
+      entry.handle = setTimeout(() => {
+        this.readRetry = null;
+        void this.refreshDurableRecovering(0).then(resolve, () => resolve(null));
+      }, delay);
+      // Published inside the executor so concurrent callers coalesce onto
+      // this chain before the scheduled read.
+      this.readRetry = entry;
+    });
+    return await entry.promise;
   }
 
   /**
@@ -1187,14 +1361,10 @@ export class Outbox {
    */
   dispose() {
     this.disposed = true;
-    // Abort any reclaim transaction suspended inside storage: its put must not
-    // commit after teardown (gate 13 item 3).
-    this.lifetime.abort();
-    for (const entry of this.claimWakeups.values()) clearTimeout(entry.handle);
-    this.claimWakeups.clear();
+    this.cancelAllWakesForUnload();
     this.activeDeliveries.clear();
     this.onClaimWake = null;
-    this.onForeignLeaseHandoff = null;
+    this.onHeldLease = null;
   }
 
   isFlushing(instanceId: Id): boolean {
@@ -1254,13 +1424,23 @@ export class Outbox {
     return await this.runWithLease(instanceId, fn);
   }
 
-  /** Build the deliverable set from FRESH durable command rows inside the lock. */
+  /**
+   * Build the deliverable set from FRESH durable command rows inside the lock.
+   * The in-lock read is itself an authoritative snapshot: run the CENTRAL
+   * reconciliation from it (deadline/held wakes for rows this turn does not
+   * touch), then hand the deliverable selection to the deliverer. Its own
+   * deliverable rows need no delivery wakes — flushChain marks the guarded
+   * delivery in flight; a read failure here rejects the lock turn and the
+   * store's bounded failure path re-enters the reconciliation (gate 20
+   * item 4).
+   */
   private async runDeliverer<T>(
     instanceId: Id,
     fn: (instanceId: Id, deliverable: OutboxRecord[]) => Promise<T>,
   ): Promise<T> {
     const now = Date.now();
-    const durable = (await this.refreshFromStorage()).filter((r) => commandIdFromKey(r.commandId));
+    const durable = await this.readDurable();
+    if (!this.disposed) this.applyLeaseWakeReconcile(durable);
     const deliverable = durable
       .filter((r) => r.instanceId === instanceId && isDeliverable(r, now))
       .sort(
@@ -1268,100 +1448,6 @@ export class Outbox {
           this.rank(a) - this.rank(b) || a.createdAt - b.createdAt || a.commandId.localeCompare(b.commandId),
       );
     return await fn(instanceId, deliverable);
-  }
-
-  private async refreshFromStorage(firingCommandId?: Id): Promise<OutboxRecord[]> {
-    const durable = (await this.storage.all()).filter((r) => commandIdFromKey(r.commandId));
-    // Gate 13 item 3: check lifetime RIGHT after the storage read and BEFORE
-    // touching the cache — a dispose while all() was suspended must not import
-    // changed rows (and must not re-arm a wake) into a tearing-down Outbox.
-    if (this.disposed) return [];
-    for (const rec of durable) this.cache.set(rec.commandId, rec);
-    this.reconcileClaimWakeups(durable, firingCommandId);
-    return durable;
-  }
-
-  /**
-   * Reconcile tracked claim wakeups against a FRESH durable set (gate 12
-   * item 4): another tab may have delivered/deleted the row a wakeup is
-   * waiting on, or renewed its lease. Cancel when the row is missing or no
-   * longer inflight; re-arm for the new FUTURE lease when the observed lease
-   * changed. Gate 13 item 1 (d): a changed lease that is ALREADY expired is
-   * adopted and scheduled immediately (conditional reclaim under the lock),
-   * never cancelled — "still inflight" is not terminal.
-   *
-   * Gate 15 item 2: ALSO discover NEWLY APPEARED inactive claims — inflight
-   * rows (including SAME-owner ones, e.g. a cloned sibling document that
-   * claimed the row after this Outbox loaded and then crashed) that this
-   * document is not actively delivering get an expiry wake. Rows this
-   * document is POSTing are skipped (activeDeliveries).
-   */
-  private reconcileClaimWakeups(durable: OutboxRecord[], firingCommandId?: Id) {
-    if (this.disposed) return;
-    const byId = new Map(durable.map((r) => [r.commandId, r]));
-    for (const [id, entry] of [...this.claimWakeups]) {
-      const fresh = byId.get(id);
-      if (!fresh || fresh.state !== "inflight" || !fresh.lease) {
-        this.clearClaimWakeup(id);
-        continue;
-      }
-      const lease = fresh.lease;
-      if (lease.owner === entry.snapshot.owner && lease.until === entry.snapshot.until) continue;
-      if (lease.owner !== this.owner) {
-        // Ownership changed to a foreign owner: HAND OFF to the store's
-        // foreign-lease scheduler (gate 16 item 2). Adopting here too would
-        // run two schedulers for one lease. Gate 18 item 3: this handoff must
-        // ALSO run on the RECONCILIATION path — a snapshot read on one
-        // command's timer (X terminal) is the only thing that observes
-        // ANOTHER tracked command Y being re-claimed by a crashed foreign
-        // owner at deadline T2; cancelling Y's wake here without the handoff
-        // left Y inflight with no recovery clock. The firing command itself is
-        // deduplicated: its own critical section owns the authoritative
-        // outcome for it (and may hand it off there).
-        this.clearClaimWakeup(id);
-        if (id !== firingCommandId) this.onForeignLeaseHandoff?.(fresh);
-        continue;
-      }
-      // Same-owner replacement lease — adopt (future deadline armed, overdue
-      // armed immediately, failure count reset).
-      this.scheduleClaimWakeup(id, entry.instanceId, lease, 0);
-    }
-    // Discover NEWLY APPEARED inactive SAME-OWNER claims with no wake yet —
-    // inflight rows another document with the persisted recovery owner
-    // created AFTER our load and then crashed (gate 15 item 2). FOREIGN
-    // owners are intentionally excluded: the store's own lease-expiry
-    // scheduler owns their recovery, and arming both double-delivered. Our
-    // own live POST (a cloned-document sibling shares the persisted owner)
-    // is suppressed via activeDeliveries; the per-document instance mutex
-    // (leaseToken) serializes any actual reclaim attempt.
-    for (const rec of durable) {
-      if (rec.state !== "inflight" || !rec.lease) continue;
-      if (rec.lease.owner !== this.owner) continue;
-      if (this.activeDeliveries.has(rec.commandId)) continue;
-      if (this.claimWakeups.has(rec.commandId)) continue;
-      if (!commandIdFromKey(rec.commandId)) continue;
-      // Gate 19 item 1: the firing command's map entry was deleted by its
-      // timer wrapper BEFORE this refresh ran, so the membership check above
-      // cannot see it. Its own critical section further down this call stack
-      // owns the authoritative outcome for it (reclaim → deliver, adopt,
-      // handoff or stop); arming a fresh 0 ms wake here produced a SECOND
-      // fire for the same command — harmless under the single-deliverer lock
-      // but a duplicate delivery trigger that fired after the first one
-      // ended, and two fires raced each other's reclaim. The foreign-handoff
-      // branch above dedups the firing command for the same reason.
-      if (rec.commandId === firingCommandId) continue;
-      this.scheduleClaimWakeup(rec.commandId, rec.instanceId, rec.lease, 0);
-    }
-  }
-
-  /**
-   * Re-read the durable store and merge into the cache. A surviving tab's
-   * cache only knows rows it loaded/enqueued itself; another tab can persist
-   * rows after this tab loaded, and delivery picks its instance locks from the
-   * result, so the foreign rows (and their instances) are discovered.
-   */
-  async refreshDurable(): Promise<OutboxRecord[]> {
-    return await this.refreshFromStorage();
   }
 
   private leaseKey(instanceId: Id): Id {

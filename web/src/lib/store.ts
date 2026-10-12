@@ -86,17 +86,6 @@ const RECONCILE_GET_INTERVAL_MS = 1_000;
 /** Bounded backoff for Hub-held (Node offline) same-id re-POSTs. */
 const HELD_RETRY_BASE_MS = 2_000;
 const HELD_RETRY_MAX_MS = 30_000;
-/**
- * Bounded backoff for the foreign-lease timer's authoritative durable READ
- * when IndexedDB transiently rejects (c-reconnfu gate 19 item 4): the timer
- * wrapper has already removed the firing entry, so giving up on a one-shot
- * read failure lost the row's only recovery clock. Retries cap at the same
- * shape as the Outbox's own claim-wake read retries (~under a minute); a
- * later flush/unload rearm/reload picks the row up if they are exhausted.
- */
-const LEASE_WAKE_READ_BASE_MS = 250;
-const LEASE_WAKE_READ_MAX_RETRY_MS = 5_000;
-const LEASE_WAKE_READ_MAX_FAILURES = 7;
 import { liveSummary } from "../features/session/liveSummary";
 import { HubHttpError, isUnauthorized } from "./httpError";
 import { e2eSeamsEnabled } from "./e2eSeams";
@@ -768,14 +757,18 @@ class HubStore {
         // a failed load-time reclaim) and then triggers the normal
         // single-deliverer flush here — no unrelated UI event required.
         box.onClaimWake = () => {
-          void this.flushAllOutbox();
+          // A central lease/delivery wake is the trigger: run the GUARDED
+          // flush, which skips rows currently HELD — their bounded
+          // held-retry timer (armed by the same reconciliation via
+          // onHeldLease) is the only thing allowed to re-POST them. A normal
+          // user/online/held-retry flush still re-forwards held rows.
+          void this.flushAllOutbox(new Set(), true);
         };
-        // Gate 17 item 2: the Outbox's same-owner claim wake can fire and
-        // discover a FOREIGN replacement lease (the other document already
-        // crashed). Its wake is cancelled at that moment; only this hook puts
-        // T2 on the store's foreign-lease scheduler.
-        box.onForeignLeaseHandoff = (rec) => {
-          this.scheduleForeignLeaseHandoff(rec, Date.now());
+        // The central reconciliation hands HELD rows to their one allowed
+        // clock: the bounded same-id held-retry timer, whether this tab
+        // delivered the held answer or observed a sibling's held write.
+        box.onHeldLease = (instanceId) => {
+          if (!this.pageIsUnloading) this.scheduleHeldRetry(instanceId);
         };
         this.emit({ outboxPending: box.pendingCount() });
         if (opened.degraded) this.toast("本机无法可靠保存待发消息（存储不可用）");
@@ -1415,6 +1408,7 @@ class HubStore {
     // The flag must never outlive the unload that set it.
     this.pageIsUnloading = false;
     this.unloadProceeded = false;
+    this.outbox?.clearUnloading();
     if (event.persisted) {
       this.connection?.dispatch({ type: "resume" });
       // Resume any rows queued while the page was suspended.
@@ -1426,6 +1420,7 @@ class HubStore {
       // Returning from an iOS backgrounding fires visibilitychange without a
       // persisted pageshow; treat it as the same unload-flag reset.
       this.pageIsUnloading = false;
+      this.outbox?.clearUnloading();
     }
     this.connection?.setVisibility(document.visibilityState === "visible");
   };
@@ -1573,11 +1568,9 @@ class HubStore {
       this.unloadProceeded = true;
       for (const [, t] of this.outboxRetryTimer) clearTimeout(t);
       this.outboxRetryTimer.clear();
-      for (const [, t] of this.leaseWakeupTimer) clearTimeout(t);
-      this.leaseWakeupTimer.clear();
-      this.leaseWakeupUntil.clear();
-      for (const [, t] of this.leaseWakeupReadRetry) clearTimeout(t);
-      this.leaseWakeupReadRetry.clear();
+      // Cancel EVERY central lease/delivery wake + bounded read retry (the
+      // Outbox owns them post gate 20) so a tearing-down page keeps zero timers.
+      this.outbox?.cancelAllWakesForUnload();
       if (this.unloadClearTimer) {
         clearTimeout(this.unloadClearTimer);
         this.unloadClearTimer = null;
@@ -1591,11 +1584,7 @@ class HubStore {
     // delivery and re-arms the lease wakeups.
     for (const [, t] of this.outboxRetryTimer) clearTimeout(t);
     this.outboxRetryTimer.clear();
-    for (const [, t] of this.leaseWakeupTimer) clearTimeout(t);
-    this.leaseWakeupTimer.clear();
-    this.leaseWakeupUntil.clear();
-    for (const [, t] of this.leaseWakeupReadRetry) clearTimeout(t);
-    this.leaseWakeupReadRetry.clear();
+    this.outbox?.cancelAllWakesForUnload();
     // The reset runs at setTimeout(0): in Chromium it measurably fires ~0.1
     // ms BEFORE pagehide during a real reload, so pagehide marks
     // unloadProceeded but cannot cancel this task in time. The task
@@ -1610,25 +1599,31 @@ class HubStore {
       this.unloadClearTimer = null;
       if (this.unloadProceeded) return;
       this.pageIsUnloading = false;
+      this.outbox?.clearUnloading();
       void this.rearmLeaseWakeups();
     }, 0);
   };
 
   /**
-   * Re-arm lease-expiry wakeups from durable rows WITHOUT flushing: read-only
-   * refresh + schedule. Used by the cancelled-beforeunload self-reset, which
-   * must not itself POST (the task can run inside a real reload teardown).
+   * Re-arm the central lease wakes from durable rows WITHOUT flushing: a
+   * read-only authoritative refresh + reconciliation. Used by the
+   * cancelled-beforeunload self-reset, which must not itself POST (the task
+   * can run inside a real reload teardown). The reconciliation arms deadline
+   * wakes for live leases and a 0 ms delivery wake for an overdue/stealable
+   * row the prompt sat open past; that wake's fire → guarded flush is itself
+   * blocked while pageIsUnloading stays set (a real pagehide cancels all
+   * wakes via cancelAllWakesForUnload).
    */
   private async rearmLeaseWakeups() {
     const box = this.outbox;
     if (!box || this.pageIsUnloading) return;
-    const now = Date.now();
-    const durable = await box.refreshDurable().catch(() => null);
+    const durable = await box.readDurable().catch(() => null);
+    // A real pagehide can land while the read was suspended (the reset task
+    // runs ~immediately before pagehide during a genuine reload): a torn-down
+    // page imports the rows but applies NO reconciliation, so it arms no
+    // timer.
     if (!durable || this.pageIsUnloading) return;
-    // The prompt may have sat open PAST the foreign lease deadline: include
-    // overdue leases so an immediate guarded wakeup delivers the stealable
-    // row (the normal flush path skips them — it delivers them itself).
-    this.scheduleLeaseExpiryWakeup(durable, now, box.ownerId, true);
+    box.applyLeaseWakeReconcile(durable);
   }
 
   get outboxUnavailable(): boolean {
@@ -1874,63 +1869,74 @@ class HubStore {
     const box = this.outbox;
     if (!box) return;
     if (this.pageIsUnloading) return;
-    // Drain passes; each pass acquires the lock, posts at most the FIRST
-    // deliverable unattempted row, and releases — letting queued conversions
-    // interleave.
-    for (let pass = 0; pass < MAX_FLUSH_PASSES; pass += 1) {
-      if (this.pageIsUnloading) return;
-      // Pick the instance locks from FRESH durable rows, not the load-time
-      // cache: another tab can persist a row after this tab loaded, and a
-      // cache-only enumeration would never even attempt its instance lock.
-      const now = Date.now();
-      let durable;
-      try {
-        durable = await box.refreshDurable();
-      } catch (err) {
-        // flushAllOutbox is fire-and-forget from many call sites; a rejected
-        // durable refresh must not become an unhandled rejection (gate 6 item
-        // 4c). Surface it and stop this pass — the retry timer / reconnect /
-        // next trigger re-runs the flush under the same command ids.
-        this.reconcileToast(err, "刷新待发队列");
-        return;
-      }
-      const instances = [
-        ...new Set(durable.filter((r) => isDeliverableOutbox(r, now)).map((r) => r.instanceId)),
-      ];
-      // Rows owned in flight by another (possibly crashed) tab are not
-      // deliverable until their lease expires; arm a wakeup at the earliest
-      // expiry so this tab delivers them without an unrelated UI event.
-      this.scheduleLeaseExpiryWakeup(durable, now, box.ownerId);
-      let deliveredNew = false;
-      for (const instanceId of instances) {
+    try {
+      // Drain passes; each pass acquires the lock, posts at most the FIRST
+      // deliverable unattempted row, and releases — letting queued conversions
+      // interleave.
+      for (let pass = 0; pass < MAX_FLUSH_PASSES; pass += 1) {
         if (this.pageIsUnloading) return;
+        // Pick the instance locks from FRESH durable rows, not the load-time
+        // cache: another tab can persist a row after this tab loaded, and a
+        // cache-only enumeration would never even attempt its instance lock.
+        const now = Date.now();
+        let durable;
         try {
-          const id = await box.withInstanceLock(instanceId, (iid, deliverable) =>
-            this.deliverOneRow(
-              iid,
-              deliverable.filter(
-                (r) =>
-                  !attempted.has(r.commandId) &&
-                  // Gate 19 item 2: the policy rides into the FRESH selection
-                  // built inside this lock turn — a row another tab finished
-                  // as held while we waited is excluded here even though the
-                  // pre-lock snapshot knew it as inflight.
-                  !(skipCurrentlyHeld && r.state === "held"),
-              ),
-              { skipCurrentlyHeld },
-            ),
-          );
-          if (id) {
-            attempted.add(id);
-            deliveredNew = true;
-          }
-        } catch {
-          // The lease/lock acquisition failed (never a double POST: the row is
-          // inflight with a fresh durable lease). A retry timer / reconnect
-          // re-triggers under the same id; keep draining other instances.
+          durable = await box.readDurable();
+        } catch (err) {
+          // flushAllOutbox is fire-and-forget from many call sites; a rejected
+          // durable refresh must not become an unhandled rejection (gate 6 item
+          // 4c). Surface it and stop this pass — gate 20 item 4 adds the
+          // bounded recovery retry that ends back in the central
+          // reconciliation; until then other triggers re-run the flush.
+          this.reconcileToast(err, "刷新待发队列");
+          return;
         }
+        const instances = [
+          ...new Set(durable.filter((r) => isDeliverableOutbox(r, now)).map((r) => r.instanceId)),
+        ];
+        // This flush loop is the imminent guarded delivery for every instance
+        // with a deliverable row: mark it before applying the CENTRAL
+        // reconciliation (c-reconnfu gate 20) so no parallel 0 ms delivery
+        // wake is armed for rows THIS loop is about to claim. Live leases get
+        // their one deadline wake; held rows their held-retry clock.
+        box.suppressDeliveryWakes(instances);
+        box.applyLeaseWakeReconcile(durable);
+        let deliveredNew = false;
+        for (const instanceId of instances) {
+          if (this.pageIsUnloading) return;
+          try {
+            const id = await box.withInstanceLock(instanceId, (iid, deliverable) =>
+              this.deliverOneRow(
+                iid,
+                deliverable.filter(
+                  (r) =>
+                    !attempted.has(r.commandId) &&
+                    // Gate 19 item 2: the policy rides into the FRESH selection
+                    // built inside this lock turn — a row another tab finished
+                    // as held while we waited is excluded here even though the
+                    // pre-lock snapshot knew it as inflight.
+                    !(skipCurrentlyHeld && r.state === "held"),
+                ),
+                { skipCurrentlyHeld },
+              ),
+            );
+            if (id) {
+              attempted.add(id);
+              deliveredNew = true;
+            }
+          } catch {
+            // The lease/lock acquisition failed (never a double POST: the row is
+            // inflight with a fresh durable lease). A retry timer / reconnect
+            // re-triggers under the same id; keep draining other instances.
+          }
+        }
+        if (!deliveredNew) break;
       }
-      if (!deliveredNew) break;
+    } finally {
+      // Clear imminent-delivery suppression even on early return: any leftover
+      // row must be re-judged freely by the next central reconciliation (gate
+      // 20 item 4 makes the flush end in one authoritatively).
+      this.outbox?.clearSuppressedDeliveryWakes();
     }
   }
 
@@ -2637,15 +2643,10 @@ class HubStore {
     for (const [, t] of this.heldRetryTimer) clearTimeout(t);
     this.heldRetryTimer.clear();
     this.heldRetryAttempt.clear();
-    for (const [, t] of this.leaseWakeupTimer) clearTimeout(t);
-    this.leaseWakeupTimer.clear();
-    this.leaseWakeupUntil.clear();
-    for (const [, t] of this.leaseWakeupReadRetry) clearTimeout(t);
-    this.leaseWakeupReadRetry.clear();
-    // Drop the outbox INSTANCE (durable rows stay in storage): cancel its
-    // tracked lease-expiry claim wakeups so none fires a flush into the
-    // logged-out auth epoch; the next bootstrap re-runs Outbox.load and
-    // re-evaluates ownership/leases (gate 11 item 5).
+    // Drop the outbox INSTANCE (durable rows stay in storage): dispose()
+    // cancels every central lease/delivery wake and drops the delivery
+    // callbacks so no wake can flush a logged-out auth epoch; the next
+    // bootstrap re-runs Outbox.load and reconciles from durable rows.
     this.outbox?.dispose();
     this.outbox = null;
     this.outboxUnsubscribe?.();
@@ -3909,24 +3910,6 @@ class HubStore {
   private heldRetryTimer = new Map<Id, ReturnType<typeof setTimeout>>();
   private heldRetryAttempt = new Map<Id, number>();
   /**
-   * Wakeup armed at another tab's in-flight lease expiry. A row another tab
-   * owns in flight is non-deliverable until the lease passes; if that tab
-   * crashed, nothing else re-triggers a flush here, so the wakeup fires
-   * exactly when the row becomes stealable.
-   */
-  private leaseWakeupTimer = new Map<Id, ReturnType<typeof setTimeout>>();
-  /** Expiry the per-instance wakeup is currently armed for (move-earlier). */
-  private leaseWakeupUntil = new Map<Id, number>();
-  /**
-   * Bounded READ-RETRY armed when a fired lease wakeup's authoritative
-   * refreshDurable() rejected (transient IndexedDB failure). The timer
-   * wrapper already deleted the wake entry by then, so this retry IS the
-   * row's recovery responsibility until a read succeeds. Tracked separately
-   * from {@link leaseWakeupTimer} so logout/pagehide/beforeunload cancel it
-   * with the other timers (c-reconnfu gate 19 item 4).
-   */
-  private leaseWakeupReadRetry = new Map<Id, ReturnType<typeof setTimeout>>();
-  /**
    * In-flight/outbox-keyed conversion of a held bubble, keyed by
    * clientRequestId. A held prompt gets exactly ONE commandId for its
    * lifetime: a turn-end `flushHeld` racing a `steerHeld` of the same row
@@ -3974,221 +3957,7 @@ class HubStore {
     this.outboxRetryAttempt.delete(instanceId);
   }
 
-  /**
-   * Arm one wakeup per instance at the earliest FOREIGN in-flight lease
-   * expiry. Rows with no live foreign lease need nothing (they are
-   * deliverable now or owned by this tab). An already-OVERDUE foreign lease
-   * is skipped on the normal flush path (that same flush pass is about to
-   * deliver the stealable row; arming an immediate timer would race the
-   * delivery and chain further immediate flushes on a "held" answer). The
-   * read-only cancelled-beforeunload re-arm passes includeOverdue: the
-   * prompt can sit open past the deadline, and without an immediate arm the
-   * stealable row would stay stranded. The immediate delivery is guarded
-   * (a real pagehide clears the timer; flush checks the unload flag).
-   * An already-armed wakeup is moved EARLIER when a freshly seen foreign
-   * lease expires sooner (a second tab's newer in-flight row can carry a
-   * shorter lease); it is never pushed out.
-   */
-  private scheduleLeaseExpiryWakeup(
-    durable: OutboxRecord[],
-    now: number,
-    owner: Id,
-    includeOverdue = false,
-  ) {
-    const earliest = new Map<Id, number>();
-    for (const r of durable) {
-      if (r.state !== "inflight" || !r.lease) continue;
-      if (r.lease.owner === owner) continue;
-      if (!includeOverdue && r.lease.until <= now) continue;
-      const prev = earliest.get(r.instanceId);
-      if (prev === undefined || r.lease.until < prev) earliest.set(r.instanceId, r.lease.until);
-    }
-    // Gate 17 item 3: reconcile EXISTING timers against this authoritative
-    // snapshot, not only newly computed ones. A timer armed for B's foreign
-    // lease must be cancelled when the row left that state: B's failed
-    // delivery restored it to pending (a flush at T-500 then claims it and
-    // holds the POST), the lease moved to this owner, or the row became
-    // terminal. Leaving the old T timer live let it fire into a row awaiting
-    // its own held-retry deadline and re-POST it early. An instance still
-    // present in `earliest` keeps its (move-earlier-only) timer.
-    for (const instanceId of [...this.leaseWakeupTimer.keys()]) {
-      if (earliest.has(instanceId)) continue;
-      const old = this.leaseWakeupTimer.get(instanceId);
-      if (old) clearTimeout(old);
-      this.leaseWakeupTimer.delete(instanceId);
-      this.leaseWakeupUntil.delete(instanceId);
-    }
-    for (const [instanceId, until] of earliest) {
-      this.armLeaseWakeup(instanceId, until, now, includeOverdue);
-    }
-  }
-
-  /**
-   * Gate 17 item 2: arm the per-instance foreign-lease wakeup from ONE
-   * authoritative row the Outbox's own claim wake just discovered. That wake
-   * is being cancelled on handoff, and the store otherwise schedules foreign
-   * leases only from a flush/unload rearm — with neither in flight the
-   * replacement lease (the other document may already have crashed) would
-   * stay inflight forever. An already-overdue deadline arms an immediate
-   * guarded wake (pagehide and the flush unload flag guard it).
-   */
-  private scheduleForeignLeaseHandoff(rec: OutboxRecord, now: number = Date.now()) {
-    if (this.pageIsUnloading) return;
-    if (rec.state !== "inflight" || !rec.lease) return;
-    if (rec.lease.owner === this.outbox?.ownerId) return;
-    this.armLeaseWakeup(rec.instanceId, rec.lease.until, now, true);
-  }
-
-  /**
-   * Arm (or move EARLIER) the single foreign-lease wakeup for an instance.
-   * A fresh snapshot with a later deadline never pushes an armed wake out.
-   * `allowOverdue` arms a 0 ms guarded wake (used by the read-only unload
-   * re-arm and the gate-17 handoff); the normal flush path skips overdue
-   * leases because that same pass delivers the stealable row itself.
-   */
-  private armLeaseWakeup(instanceId: Id, until: number, now: number, allowOverdue: boolean) {
-    if (!allowOverdue && until <= now) return;
-    const armed = this.leaseWakeupUntil.get(instanceId);
-    if (armed !== undefined && armed <= until) return;
-    const old = this.leaseWakeupTimer.get(instanceId);
-    if (old) clearTimeout(old);
-    this.leaseWakeupUntil.set(instanceId, until);
-    const timer = setTimeout(() => {
-      this.leaseWakeupTimer.delete(instanceId);
-      this.leaseWakeupUntil.delete(instanceId);
-      void this.leaseWakeupFired(instanceId, until);
-    }, Math.max(0, until - Date.now()));
-    this.leaseWakeupTimer.set(instanceId, timer);
-  }
-
-  /**
-   * A foreign-lease timer fired. Gate 17 item 3: revalidate the tracked lease
-   * against an AUTHORITATIVE durable snapshot BEFORE flushing — the timer was
-   * armed from an older snapshot and the row may since have been claimed by
-   * this document (its POST is `held` with its own retry clock), restored to
-   * pending and re-claimed, or moved to a terminal/renewed lease. Flushing
-   * unconditionally re-POSTed a held command before its held-retry deadline.
-   * The snapshot also reconciles (cancels obsolete, re-arms renewed) every
-   * other armed timer; a flush runs only when a foreign lease for THIS
-   * instance is genuinely stealable now.
-   */
-  private async leaseWakeupFired(instanceId: Id, expectedUntil: number, readFailures = 0) {
-    if (this.pageIsUnloading) return;
-    const box = this.outbox;
-    if (!box) return;
-    const durable = await box.refreshDurable().catch(() => null);
-    if (!durable) {
-      // Gate 19 item 4: the firing wrapper has ALREADY removed this
-      // instance's wake entry, so a one-shot rejected read used to leave the
-      // (possibly crashed-owner) row with no recovery clock at all. Retain
-      // recovery responsibility with a bounded read retry: exponential
-      // backoff capped at 5 s, a handful of attempts; the handle lives in
-      // leaseWakeupReadRetry so logout/pagehide/beforeunload cancel it, and
-      // a teardown/unload that lands while the failed read was suspended is
-      // re-checked before arming. Exhausted retries stop here — a later
-      // flush, unload-cancelled rearm or reload reads the row again.
-      if (this.pageIsUnloading || !this.outbox) return;
-      if (readFailures + 1 >= LEASE_WAKE_READ_MAX_FAILURES) return;
-      const delay = Math.min(
-        LEASE_WAKE_READ_MAX_RETRY_MS,
-        LEASE_WAKE_READ_BASE_MS * 2 ** readFailures,
-      );
-      const old = this.leaseWakeupReadRetry.get(instanceId);
-      if (old) clearTimeout(old);
-      const handle = setTimeout(() => {
-        this.leaseWakeupReadRetry.delete(instanceId);
-        void this.leaseWakeupFired(instanceId, expectedUntil, readFailures + 1);
-      }, delay);
-      this.leaseWakeupReadRetry.set(instanceId, handle);
-      return;
-    }
-    if (this.pageIsUnloading) return;
-    const now = Date.now();
-    // A timer firing is not proof the wall deadline passed: the system clock
-    // can roll back after arming. Wait out the remaining time instead of
-    // reconciling/flushing against leases that are still fresh by wall time
-    // (same discipline as the Outbox wake, gate 13 item 2).
-    if (now < expectedUntil) {
-      // Gate 18 item 4: the closed-over deadline U fired EARLY by wall time,
-      // so U itself is stale — re-arm from the FRESH snapshot just read, not
-      // from the closure. The stored lease may have been replaced with U2
-      // where now < U2 < U; arming the soonest still-future foreign lease for
-      // this instance serves that replacement at U2 instead of leaving it
-      // unserved until U. When the snapshot has NO live foreign lease (the row
-      // was delivered, re-owned by this tab, or went terminal) arm nothing:
-      // resurrecting U would flush against a lease that no longer exists. The
-      // firing wrapper already removed this instance's timer entry.
-      let soonestForeign: number | undefined;
-      for (const r of durable) {
-        if (r.instanceId !== instanceId) continue;
-        if (r.state !== "inflight" || !r.lease) continue;
-        if (r.lease.owner === box.ownerId || r.lease.until <= now) continue;
-        if (soonestForeign === undefined || r.lease.until < soonestForeign) {
-          soonestForeign = r.lease.until;
-        }
-      }
-      if (soonestForeign !== undefined) {
-        this.armLeaseWakeup(instanceId, soonestForeign, now, false);
-      }
-      // Gate 19 item 3: arming only FUTURE leases used to let an ALREADY
-      // deliverable row lose its only wakeup on this early path. The fresh
-      // snapshot can contain (a) a lease-less PENDING row a dead owner's
-      // failed POST restored and closed over (its in-memory retry died with
-      // the page), or (b) a replacement foreign lease that is ALREADY expired
-      // by the rolled-back wall clock. Both are stealable now; route them
-      // through the same GUARDED delivery path the normal fire path uses
-      // (held rows excluded — their held-retry clock owns that POST; a row
-      // this document is actively POSTing and terminal rows excluded). The
-      // flush re-reads authoritatively and reconciles all timers, so the
-      // future lease armed above is the only clock that remains afterwards.
-      let hasStealableOnRollback = false;
-      for (const r of durable) {
-        if (r.state === "held") continue;
-        if (!box.isDeliveryActive(r.commandId) && isDeliverableOutbox(r, now)) {
-          hasStealableOnRollback = true;
-        }
-      }
-      if (hasStealableOnRollback) void this.flushAllOutbox(new Set(), true);
-      return;
-    }
-    // Reconcile from the fresh snapshot. Overdue leases are excluded from
-    // re-arming here: the due check below owns the immediate delivery, so no
-    // competing 0 ms timer can start a second flush for the same rows.
-    // Gate 18 item 2 invariant for that reconciliation: a timer for an
-    // ALREADY-OVERDUE foreign lease is cancelled here only when THIS call goes
-    // on to flush — and it does exactly that whenever any overdue foreign
-    // lease (or other deliverable row) exists (hasStealable below). If nothing
-    // is stealable, the durable set contains no overdue foreign lease to
-    // cancel, so dropping obsolete timers is safe. Background tabs align timer
-    // wakeups: this instance's callback can run while another instance I2 is
-    // overdue but I2's own callback has not run yet; scoping the decision to
-    // the firing instance used to cancel I2's only recovery timer.
-    this.scheduleLeaseExpiryWakeup(durable, now, box.ownerId, false);
-    // Gate 18 item 1: the fired timer's revalidation must also deliver a
-    // PENDING row the dead owner left behind (B's failed POST restored it
-    // lease-less; its only retry was B's in-memory one, cleared by B's
-    // pagehide) — this idle tab's timer is the row's only trigger. Gate 18
-    // item 2: check EVERY instance, not only the firing one — another armed
-    // instance's lease can already be stealable while its own callback is
-    // still queued. HELD rows keep the no-immediate-POST rule everywhere
-    // (their own bounded held-retry clock owns the next POST — re-POSTing here
-    // revived the gate-17 item-3 early POST). Gate 19 item 2: that suppression
-    // is now a POLICY the flush enforces against the FRESH rows it selects
-    // INSIDE the instance lock (and at the claim boundary), not a snapshot id
-    // set taken here: a sibling can finish a row as held WHILE this flush is
-    // waiting on the lock, and the stale snapshot used to let the flush
-    // re-POST it ahead of its held deadline. A command this document is
-    // actively POSTing is excluded; terminal rows are never deliverable.
-    let hasStealable = false;
-    for (const r of durable) {
-      if (r.state === "held") continue;
-      if (!box.isDeliveryActive(r.commandId) && isDeliverableOutbox(r, now)) {
-        hasStealable = true;
-      }
-    }
-    if (hasStealable) void this.flushAllOutbox(new Set(), true);
-  }
-
+  /** Serialise reconciliation jobs for one instance (FIFO, error-tolerant). */
   private chainReconcile(instanceId: Id, job: () => Promise<unknown>): Promise<unknown> {
     const prev = this.reconcileChain.get(instanceId) ?? Promise.resolve();
     const next = prev.then(job, job);

@@ -138,6 +138,12 @@ class FakeObjectStore {
               await this.db.commitGate;
               if (this.tx.aborted) return;
             }
+            // READ requests can be suspended post-onsuccess too (a fire-time
+            // authoritative read resumed after dispose).
+            if (!opts?.gateCommit && this.db.readGate) {
+              await this.db.readGate;
+              if (this.tx.aborted) return;
+            }
             commit();
           } finally {
             this.tx.requestSettled();
@@ -213,6 +219,8 @@ class FakeDb {
   abortCount = 0;
   /** When truthy (a promise), post-request WRITE commits wait for it (disposal window tests). */
   commitGate: Promise<void> | null = null;
+  /** When truthy, read REQUESTS (get/getAll) suspend here after onsuccess, pre-complete. */
+  readGate: Promise<void> | null = null;
   /** Resolves (with the command id) when a gated write reaches its suspended commit. */
   gatedCommitEntered: ((commandId: string) => void) | null = null;
   /** Every object-store request issued (get/put/getAll/delete), in order. */
@@ -347,12 +355,12 @@ it("a write whose request succeeds but whose transaction aborts afterwards is no
   expect((await storage.all()).map((r) => r.commandId)).toContain("cmd_retry_ok");
 });
 
-it("GATE16 item 2: a tracked same-owner claim that becomes FOREIGN hands off — the Outbox wake cancels and never triggers a flush", async () => {
-  // One expiry scheduler per lease: Outbox owns same-owner inactive claims,
-  // the store scheduler owns foreign ones. If the Outbox wake adopted the
-  // foreign lease it would fire onClaimWake (a second, independent
-  // flushAllOutbox with its own attempted set) at the deadline — the exact
-  // path that re-POSTed a 'held' command before its retry delay.
+it("GATE16 item 2 (gate 20): a tracked claim that becomes FOREIGN keeps ONE scheduler — the central reconciliation adopts the foreign deadline itself and delivers once at T", async () => {
+  // Gate 20 removed the two-scheduler handoff: the ONE central wake owner
+  // tracks the lease regardless of owner. A replacement by a FOREIGN document
+  // is adopted (a single wake moved to its deadline) — there is no separate
+  // store scheduler any more, and exactly one delivery trigger fires once the
+  // foreign lease expires.
   const install = installFakeIndexedDB();
   void install;
   const opened = await openOutboxStorage();
@@ -365,6 +373,7 @@ it("GATE16 item 2: a tracked same-owner claim that becomes FOREIGN hands off —
     const owner = "owner_same_then_foreign";
     const foreign = "owner_other_document";
     const T = Date.now() + 30_000;
+    const T2 = T + 30_000;
     await storage.put({
       ...probeRecord("cmd_handoff"),
       instanceId: "ins_hf",
@@ -372,32 +381,38 @@ it("GATE16 item 2: a tracked same-owner claim that becomes FOREIGN hands off —
       lease: { owner, until: T },
     });
     const box = await Outbox.load(storage, owner);
-    expect(box.pendingClaimWakeups()).toEqual(["cmd_handoff"]);
+    await box.refreshDurable();
+    expect(box.pendingLeaseWakeups()).toEqual(["cmd_handoff"]);
     const wakes = vi.fn();
     box.onClaimWake = wakes;
 
-    // Before the deadline another document claims the same row with its OWN
-    // lease at the same deadline (a renewal by a different recovery owner).
+    // Before the deadline another document claims the row with its OWN
+    // (foreign) lease renewed to T2.
     const replaceP = storage.put({
       ...probeRecord("cmd_handoff"),
       instanceId: "ins_hf",
       state: "inflight",
-      lease: { owner: foreign, until: T },
+      lease: { owner: foreign, until: T2 },
     });
     await vi.advanceTimersByTimeAsync(5);
     await replaceP;
-    // Any refresh (the store refreshes inside every flush) must hand the wake
-    // off rather than adopt the foreign lease.
+    // The central reconciliation adopts the foreign lease (one wake at T2).
     await box.refreshDurable();
-    expect(box.pendingClaimWakeups()).toEqual([]);
+    expect(box.pendingLeaseWakeups()).toEqual(["cmd_handoff"]);
+    expect(box.leaseWakeAt("cmd_handoff")).toBe(T2);
     expect(box.get("cmd_handoff")?.lease?.owner).toBe(foreign);
 
-    // Well past the deadline: no Outbox-driven delivery trigger — the store's
-    // foreign-lease scheduler is the only one allowed to recover this row.
-    await vi.advanceTimersByTimeAsync(60_000);
-    await vi.advanceTimersByTimeAsync(100);
+    // At the OLD deadline T nothing fires — the foreign claim is still live.
+    await vi.advanceTimersByTimeAsync(30_000);
     expect(wakes).not.toHaveBeenCalled();
-    expect(box.pendingClaimWakeups()).toEqual([]);
+    expect(box.pendingLeaseWakeups()).toEqual(["cmd_handoff"]);
+
+    // At T2 the (possibly crashed) foreign lease expires: the one wake hands
+    // the store a single guarded delivery trigger, never twice.
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(wakes).toHaveBeenCalledTimes(1);
+    expect(box.pendingLeaseWakeups()).toEqual([]);
     box.dispose();
   } finally {
     vi.useRealTimers();
@@ -405,7 +420,7 @@ it("GATE16 item 2: a tracked same-owner claim that becomes FOREIGN hands off —
   }
 });
 
-it("GATE15 item 2: a same-owner inflight claim appearing AFTER load gets an expiry wake and delivers at the deadline; an active delivery is not woken", async () => {
+it("GATE15 item 2 (gate 20): an inflight claim appearing AFTER load gets the one deadline wake and fires delivery at deadline; an active delivery is not woken", async () => {
   const db = installFakeIndexedDB();
   const opened = await openOutboxStorage();
   const storage = opened.storage;
@@ -416,6 +431,7 @@ it("GATE15 item 2: a same-owner inflight claim appearing AFTER load gets an expi
     vi.setSystemTime(1_200_000);
     const owner = "owner_late_claim";
     const box = await Outbox.load(storage, owner);
+    await box.refreshDurable();
     const wakes = vi.fn();
     box.onClaimWake = wakes;
 
@@ -430,27 +446,29 @@ it("GATE15 item 2: a same-owner inflight claim appearing AFTER load gets an expi
     });
     await vi.advanceTimersByTimeAsync(5);
     await putP;
-    expect(box.pendingClaimWakeups()).toEqual([]); // not at load time
+    expect(box.pendingLeaseWakeups()).toEqual([]); // not at load time
 
     await box.refreshDurable(); // appears now
-    expect(box.pendingClaimWakeups()).toEqual(["cmd_late_claim"]);
+    expect(box.pendingLeaseWakeups()).toEqual(["cmd_late_claim"]);
 
     // An active delivery of the same row suppresses its wake (this document
     // is POSTing it — it must not steal its own claim).
     box.beginActiveDelivery("cmd_late_claim");
     await box.refreshDurable();
-    expect(box.pendingClaimWakeups()).toEqual([]);
+    expect(box.pendingLeaseWakeups()).toEqual([]);
     box.endActiveDelivery("cmd_late_claim");
 
     // Inactive again: the next refresh re-adopts the expiry recovery.
     await box.refreshDurable();
-    expect(box.pendingClaimWakeups()).toEqual(["cmd_late_claim"]);
+    expect(box.pendingLeaseWakeups()).toEqual(["cmd_late_claim"]);
 
     // The sibling never finishes; at the deadline, with no other trigger, the
-    // wake reclaims pending and fires delivery exactly once.
+    // fire hands the expired inflight claim to the store deliverer exactly
+    // once (the Outbox itself writes no reclaim anymore).
     await vi.advanceTimersByTimeAsync(30_000);
     await vi.advanceTimersByTimeAsync(10);
-    expect(db.rows.get("cmd_late_claim")?.state).toBe("pending");
+    expect(db.rows.get("cmd_late_claim")?.state).toBe("inflight");
+    expect(db.rows.get("cmd_late_claim")?.lease?.until).toBe(T);
     expect(wakes).toHaveBeenCalledTimes(1);
     box.dispose();
   } finally {
@@ -526,11 +544,12 @@ it("GATE15 item 1: releaseLease deletes only the matching owner's mutex row", as
   expect(await storage.releaseLease(key, "tok_A")).toBe(false);
 });
 
-it("GATE14 item 1: Outbox.dispose during a production IDB reclaim (requests issued, commit pending) aborts the tx — durable row stays inflight", async () => {
-  // Exercises the REAL IndexedDB backend, not the localStorage mock used by
-  // the gate-12 test: the reclaim has issued its get/put requests but the
-  // transaction commit is held open; dispose fires the lifetime signal; the
-  // production abort listener must roll the transaction back BEFORE commit.
+it("GATE14 item 1 (gate 20): dispose during a production-IDB fire-time READ imports nothing and never delivers — the read-only fire critical section is teardown-safe", async () => {
+  // Post gate 20 the deadline fire runs a READ-only critical section under
+  // the instance lock (no fire-time reclaim write). A read resumed after
+  // dispose must still be inert: the authoritative row another tab committed
+  // while the read was suspended (sent) must not reach this cache, no wake
+  // re-arms, no delivery hook fires.
   const db = installFakeIndexedDB();
   const originalLocks = (globalThis.navigator as { locks?: LockManager }).locks;
   Object.defineProperty(globalThis.navigator, "locks", { value: undefined, configurable: true });
@@ -548,48 +567,46 @@ it("GATE14 item 1: Outbox.dispose during a production IDB reclaim (requests issu
       lease: { owner, until: T },
     });
     const box = await Outbox.load(storage, owner);
-    expect(box.pendingClaimWakeups()).toEqual(["cmd_idb_dispose_wake"]);
+    await box.refreshDurable();
+    expect(box.pendingLeaseWakeups()).toEqual(["cmd_idb_dispose_wake"]);
     const wakes = vi.fn();
     box.onClaimWake = wakes;
 
-    // Deadline fires: the wake reads and enters the reclaim transaction. Hold
-    // its COMMIT open (post get+put, pre oncomplete) and wait SPECIFICALLY for
-    // the target row's reclaim write to enter the gate — not an unrelated
-    // probe/seed write (gate 15 item 4 tightens the old '>= 2 puts' check).
-    let releaseCommit: (() => void) | null = null;
-    let gateEntered = false;
-    db.commitGate = new Promise<void>((r) => void (releaseCommit = r));
-    db.gatedCommitEntered = (commandId: string) => {
-      if (commandId === "cmd_idb_dispose_wake") gateEntered = true;
-    };
+    // load read (#1) and boot refresh (#2) are done; from here every READ
+    // suspends post-onsuccess. The deadline fire issues read #3.
+    let releaseRead: (() => void) | null = null;
+    db.readGate = new Promise<void>((r) => void (releaseRead = r));
+    const getAllCount = () => db.requestsIssued.filter((r) => r === "getAll").length;
     await vi.advanceTimersByTimeAsync(30_000);
-    for (let i = 0; i < 50 && !gateEntered; i += 1) {
+    for (let i = 0; i < 50 && getAllCount() < 3; i += 1) {
       await Promise.resolve();
     }
-    expect(gateEntered).toBe(true);
+    expect(getAllCount()).toBe(3);
+    await Promise.resolve();
+    await Promise.resolve(); // the fire read is now suspended on the gate
 
-    // Exactly the target reclaim transaction is suspended.
-    const abortsBeforeDispose = db.abortCount;
-    // Teardown while THAT transaction is uncommitted.
+    // Another tab commits sent while the read is suspended.
+    db.rows.set("cmd_idb_dispose_wake", {
+      ...(db.rows.get("cmd_idb_dispose_wake") as OutboxRecord),
+      state: "sent",
+      gotResponse: true,
+      lease: undefined,
+    });
+
+    // Teardown, then release the held read.
     box.dispose();
-    for (let i = 0; i < 20 && db.abortCount === abortsBeforeDispose; i += 1) {
-      await Promise.resolve(); // signal abort -> t.abort -> onabort settled
-    }
-    // The reclaim transaction itself fired an abort event.
-    expect(db.abortCount).toBe(abortsBeforeDispose + 1);
-    // Release the held commit: the aborted transaction must NOT commit.
-    releaseCommit!();
+    releaseRead!();
     await Promise.resolve();
     await vi.advanceTimersByTimeAsync(60_000);
 
-    // The durable row is unchanged (no rolled-back pending write), no delivery
+    // The resumed read imported nothing into the torn-down cache; no delivery
     // trigger, no wake left behind.
-    expect(db.rows.get("cmd_idb_dispose_wake")?.state).toBe("inflight");
-    expect(db.rows.get("cmd_idb_dispose_wake")?.lease?.until).toBe(T);
+    expect(db.rows.get("cmd_idb_dispose_wake")?.state).toBe("sent");
     expect(box.get("cmd_idb_dispose_wake")?.state).toBe("inflight");
     expect(wakes).not.toHaveBeenCalled();
-    expect(box.pendingClaimWakeups()).toEqual([]);
+    expect(box.pendingLeaseWakeups()).toEqual([]);
   } finally {
+    db.readGate = null;
     vi.useRealTimers();
     Object.defineProperty(globalThis.navigator, "locks", {
       value: originalLocks,

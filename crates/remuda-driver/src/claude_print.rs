@@ -680,24 +680,32 @@ impl ClaudePrintDriver {
         test_barrier::arm(&self.inner.barrier)
     }
 
-    /// Test-only (`test-stub`, r9 item 3): a handle on the real writer task's
-    /// in-window gate (closes UserWrite inside the writer, after FIFO accept
-    /// and before the write/ack).
+    /// Test-only (`test-stub`, r9 item 3; r12 item 3): a handle on the real
+    /// writer task's in-window gate (closes UserWrite inside the writer, after
+    /// FIFO accept and before the write/ack). The `live` mutex acquisition is
+    /// bounded by a NAMED wait: a stuck launch must fail the test at this
+    /// helper's message, not hang the binary somewhere before the assertion.
     #[cfg(feature = "test-stub")]
     #[must_use]
-    pub async fn write_window(&self) -> remuda_claude_wire::write_gate::WriteGate {
-        let live = self.inner.live.lock().await;
-        live.as_ref()
-            .expect("test access: live process")
-            .process
-            .write_gate_for_test()
+    pub async fn bounded_write_window(
+        &self,
+        timeout: Duration,
+    ) -> remuda_claude_wire::write_gate::WriteGate {
+        tokio::time::timeout(timeout, async {
+            let live = self.inner.live.lock().await;
+            live.as_ref()
+                .expect("test access: live process")
+                .process
+                .write_gate_for_test()
+        })
+        .await
+        .expect("bounded test wait timed out: acquiring live to open the writer window")
     }
 
     /// Test-only (`test-stub`, r9 item 4): enqueue an ordered publication fence
     /// and return its receiver, which resolves once every earlier publication
     /// (including a deferred settle enqueued ahead of the fence) is drained.
-    #[cfg(feature = "test-stub")]
-    pub async fn publication_fence(&self) -> tokio::sync::oneshot::Receiver<()> {
+    async fn enqueue_publication_fence(&self) -> tokio::sync::oneshot::Receiver<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if let Some(publisher) = self.inner.publish.lock().await.clone() {
             let _ = publisher.admit_control(PublishJob::Fence(tx));
@@ -705,46 +713,83 @@ impl ClaudePrintDriver {
         rx
     }
 
-    /// Test-only (`test-stub`, r10 item 1): hold the publication mutex so a
-    /// concurrent send parks on it BEFORE opening its book entry. Drop the
+    /// Test-only (`test-stub`, r9 item 4; r12 item 3): the
+    /// [`Self::enqueue_publication_fence`] acquisition through its NAMED
+    /// bounded wait (the enqueue takes the publish mutex). Shared by every
+    /// scheduling test and by the bound proofs, so removing the bound here is
+    /// the single RED switch for this wait class.
+    #[cfg(feature = "test-stub")]
+    pub async fn bounded_publication_fence(
+        &self,
+        timeout: Duration,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        tokio::time::timeout(timeout, self.enqueue_publication_fence())
+            .await
+            .expect("bounded test wait timed out: enqueuing a publication fence (publish mutex)")
+    }
+
+    /// Test-only (`test-stub`, r10 item 1; r12 item 3): hold the publication
+    /// mutex so a concurrent send parks on it BEFORE opening its book entry.
+    /// Bounded by a NAMED wait. Drop the returned hold to release.
+    #[cfg(feature = "test-stub")]
+    pub async fn bounded_hold_publish_mutex_for_test(
+        &self,
+        timeout: Duration,
+    ) -> PublishMutexHold<'_> {
+        tokio::time::timeout(timeout, async {
+            PublishMutexHold(self.inner.publish.lock().await)
+        })
+        .await
+        .expect("bounded test wait timed out: acquiring the publication mutex hold")
+    }
+
+    /// Test-only (`test-stub`, r10 item 3; r11 item 4b; r12 item 3): hold the
+    /// `write_seq` lock directly, so a test can deterministically queue a stale
+    /// cleanup BEHIND a later send and prove ordering. Notes a write_seq wait
+    /// like the send path, so a test can ACKNOWLEDGE this holder parked behind
+    /// queued sends (count includes the holder) before it aborts the suspended
+    /// send. The lock acquisition runs under a NAMED bounded wait. Drop the
     /// returned hold to release.
     #[cfg(feature = "test-stub")]
-    pub async fn hold_publish_mutex_for_test(&self) -> PublishMutexHold<'_> {
-        PublishMutexHold(self.inner.publish.lock().await)
+    pub async fn bounded_hold_write_seq_for_test(&self, timeout: Duration) -> WriteSeqHold<'_> {
+        tokio::time::timeout(timeout, async {
+            test_barrier::note_write_seq_wait(&self.inner.barrier);
+            WriteSeqHold(self.inner.write_seq.lock().await)
+        })
+        .await
+        .expect("bounded test wait timed out: acquiring the write_seq hold")
     }
 
-    /// Test-only (`test-stub`, r10 item 3; r11 item 4b): hold the `write_seq`
-    /// lock directly, so a test can deterministically queue a stale cleanup
-    /// BEHIND a later send and prove ordering. Notes a write_seq wait like the
-    /// send path, so a test can ACKNOWLEDGE this holder parked behind queued
-    /// sends (count includes the holder) before it aborts the suspended send.
-    /// Drop the returned hold to release.
+    /// Test-only (`test-stub`, r11 item 3; r12 item 3): hold the mapper lock
+    /// directly, so a fail_without_ticket rollback parks deterministically on
+    /// its lock await and a test can abort the caller there. Bounded by a
+    /// NAMED wait. Drop the hold to release.
     #[cfg(feature = "test-stub")]
-    pub async fn hold_write_seq_for_test(&self) -> WriteSeqHold<'_> {
-        test_barrier::note_write_seq_wait(&self.inner.barrier);
-        WriteSeqHold(self.inner.write_seq.lock().await)
+    pub async fn bounded_hold_mapper_for_test(&self, timeout: Duration) -> MapperMutexHold<'_> {
+        tokio::time::timeout(timeout, async {
+            MapperMutexHold(self.inner.mapper.lock().await)
+        })
+        .await
+        .expect("bounded test wait timed out: acquiring the mapper lock hold")
     }
 
-    /// Test-only (`test-stub`, r11 item 3): hold the mapper lock directly, so a
-    /// fail_without_ticket rollback parks deterministically on its lock await
-    /// and a test can abort the caller there. Drop the hold to release.
+    /// Test-only (`test-stub`, r11 item 3; r12 item 3): the seqs of the turns
+    /// the mapper book currently holds outstanding. A cleanup that orphaned a
+    /// reservation leaves its turn here forever. The mapper inspection runs
+    /// under a NAMED bounded wait.
     #[cfg(feature = "test-stub")]
-    pub async fn hold_mapper_for_test(&self) -> MapperMutexHold<'_> {
-        MapperMutexHold(self.inner.mapper.lock().await)
-    }
-
-    /// Test-only (`test-stub`, r11 item 3): the seqs of the turns the mapper
-    /// book currently holds outstanding. A cleanup that orphaned a reservation
-    /// leaves its turn here forever.
-    #[cfg(feature = "test-stub")]
-    pub async fn outstanding_turn_seqs_for_test(&self) -> Vec<u64> {
-        let mapper = self.inner.mapper.lock().await;
-        mapper
-            .turns
-            .outstanding
-            .iter()
-            .map(|turn| turn.seq)
-            .collect()
+    pub async fn bounded_outstanding_turn_seqs_for_test(&self, timeout: Duration) -> Vec<u64> {
+        tokio::time::timeout(timeout, async {
+            let mapper = self.inner.mapper.lock().await;
+            mapper
+                .turns
+                .outstanding
+                .iter()
+                .map(|turn| turn.seq)
+                .collect()
+        })
+        .await
+        .expect("bounded test wait timed out: inspecting outstanding turns (mapper mutex)")
     }
 
     /// ma-sdk-state r12 item 1 (test-stub): shrink the publication backlog

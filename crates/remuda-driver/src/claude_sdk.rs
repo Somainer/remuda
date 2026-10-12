@@ -101,29 +101,47 @@ impl ClaudeSdkDriver {
         self.inner.force_write_failure_from(n);
     }
 
-    /// Test-only (`test-stub`, r9 item 3): real writer in-window gate.
+    /// Test-only (`test-stub`, r9 item 3; r12 item 3): real writer in-window
+    /// gate; the `live` acquisition is a named bounded wait.
     #[cfg(feature = "test-stub")]
     #[must_use]
-    pub async fn write_window(&self) -> remuda_claude_wire::write_gate::WriteGate {
-        self.inner.write_window().await
+    pub async fn bounded_write_window(
+        &self,
+        timeout: std::time::Duration,
+    ) -> remuda_claude_wire::write_gate::WriteGate {
+        self.inner.bounded_write_window(timeout).await
     }
 
-    /// Test-only (`test-stub`, r9 item 4): ordered publication fence receiver.
+    /// Test-only (`test-stub`, r9 item 4; r12 item 3): ordered publication
+    /// fence receiver, enqueued under a named bounded wait.
     #[cfg(feature = "test-stub")]
-    pub async fn publication_fence(&self) -> tokio::sync::oneshot::Receiver<()> {
-        self.inner.publication_fence().await
+    pub async fn bounded_publication_fence(
+        &self,
+        timeout: std::time::Duration,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        self.inner.bounded_publication_fence(timeout).await
     }
 
-    /// Test-only (`test-stub`, r10 item 1): hold the publication mutex.
+    /// Test-only (`test-stub`, r10 item 1; r12 item 3): hold the publication
+    /// mutex under a named bounded wait.
     #[cfg(feature = "test-stub")]
-    pub async fn hold_publish_mutex_for_test(&self) -> crate::claude_print::PublishMutexHold<'_> {
-        self.inner.hold_publish_mutex_for_test().await
+    pub async fn bounded_hold_publish_mutex_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> crate::claude_print::PublishMutexHold<'_> {
+        self.inner
+            .bounded_hold_publish_mutex_for_test(timeout)
+            .await
     }
 
-    /// Test-only (`test-stub`, r10 item 3): hold the `write_seq` lock.
+    /// Test-only (`test-stub`, r10 item 3; r12 item 3): hold the `write_seq`
+    /// lock under a named bounded wait.
     #[cfg(feature = "test-stub")]
-    pub async fn hold_write_seq_for_test(&self) -> crate::claude_print::WriteSeqHold<'_> {
-        self.inner.hold_write_seq_for_test().await
+    pub async fn bounded_hold_write_seq_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> crate::claude_print::WriteSeqHold<'_> {
+        self.inner.bounded_hold_write_seq_for_test(timeout).await
     }
 
     /// Test-only (`test-stub`, r10 item 3): wait for mapped results via the
@@ -140,16 +158,26 @@ impl ClaudeSdkDriver {
         self.inner.force_reserve_send_failure_for_test();
     }
 
-    /// Test-only (`test-stub`, r11 item 3): hold the mapper lock.
+    /// Test-only (`test-stub`, r11 item 3; r12 item 3): hold the mapper lock
+    /// under a named bounded wait.
     #[cfg(feature = "test-stub")]
-    pub async fn hold_mapper_for_test(&self) -> crate::claude_print::MapperMutexHold<'_> {
-        self.inner.hold_mapper_for_test().await
+    pub async fn bounded_hold_mapper_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> crate::claude_print::MapperMutexHold<'_> {
+        self.inner.bounded_hold_mapper_for_test(timeout).await
     }
 
-    /// Test-only (`test-stub`, r11 item 3): outstanding turn seqs in the book.
+    /// Test-only (`test-stub`, r11 item 3; r12 item 3): outstanding turn seqs
+    /// in the book, read under a named bounded wait.
     #[cfg(feature = "test-stub")]
-    pub async fn outstanding_turn_seqs_for_test(&self) -> Vec<u64> {
-        self.inner.outstanding_turn_seqs_for_test().await
+    pub async fn bounded_outstanding_turn_seqs_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Vec<u64> {
+        self.inner
+            .bounded_outstanding_turn_seqs_for_test(timeout)
+            .await
     }
 
     /// Test-only (`test-stub`, r12 item 1): shrink the publication backlog

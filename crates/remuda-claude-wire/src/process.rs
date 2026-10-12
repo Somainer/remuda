@@ -343,6 +343,17 @@ pub mod write_gate {
             }
             notified.await;
         }
+        /// ma-sdk-state r12 item 3 (test-stub): [`Self::wait_until_parked`]
+        /// under a NAMED bounded wait. This is the single helper both the
+        /// scheduling tests and the bound proofs call, so removing the bound
+        /// here is the one RED switch for this wait class.
+        pub async fn wait_until_parked_bounded(&self, timeout: std::time::Duration) {
+            tokio::time::timeout(timeout, self.wait_until_parked())
+                .await
+                .expect(
+                    "bounded test wait timed out: waiting for the writer to park in its window",
+                );
+        }
         /// Let parked (and future) UserWrite calls proceed.
         pub fn open(&self) {
             if !self.inner.1.swap(true, Ordering::AcqRel) {

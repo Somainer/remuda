@@ -199,6 +199,30 @@ fn assert_elapsed<T>(r: Result<T, tokio::time::error::Elapsed>, what: &str) {
     }
 }
 
+/// ma-sdk-state r12 items 3/4: join a spawned task that calls a NAMED bounded
+/// helper and require it to PANIC within `join_bound` with the helper's named
+/// timeout message (`name_fragment` must appear in the panic payload).
+async fn expect_named_timeout_panic<T: Send + std::fmt::Debug>(
+    task: tokio::task::JoinHandle<T>,
+    name_fragment: &str,
+    join_bound: Duration,
+) {
+    let panic = tokio::time::timeout(join_bound, task)
+        .await
+        .expect("the bounded-helper task finishes (panicking) within the join bound")
+        .expect_err("the named bounded wait must panic when its release is withheld");
+    let payload = panic.into_panic();
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+        .unwrap_or("");
+    assert!(
+        message.contains("bounded test wait timed out") && message.contains(name_fragment),
+        "named bounded-wait panic expected to mention {name_fragment:?}, got: {message}"
+    );
+}
+
 fn lifecycle_status(obs: &Observation) -> Option<&str> {
     match &obs.body {
         ObservationPayload::Lifecycle(payload) => match payload.as_ref() {
@@ -1912,7 +1936,9 @@ async fn a_deferred_result_emits_exactly_one_ordered_settlement_when_b_real_writ
     // B's cancelled ticket position — is published, so counting ALL starts and
     // settledRootTurn observations in the drained sequence needs no quiet
     // period and a delayed correction cannot slip past.
-    let fence = driver.publication_fence().await;
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
     let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
 
     assert_eq!(
@@ -1980,7 +2006,9 @@ async fn cancelling_a_pre_accept_b_publishes_a_deferred_a_settle() {
     // cancelled ticket, so it resolves only after the rollback-generated
     // correction is published. One overall timeout, no quiet period; count ALL
     // starts and settlements in the complete sequence.
-    let fence = driver.publication_fence().await;
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
     let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
 
     assert_eq!(
@@ -2051,7 +2079,9 @@ async fn aborting_a_suspended_b_does_not_let_c_result_pop_a_phantom_b() {
     // the worker and never waits on X.
     let dx = driver.clone();
     let seq_holder = tokio::spawn(async move {
-        let hold = dx.hold_write_seq_for_test().await;
+        let hold = dx
+            .bounded_hold_write_seq_for_test(Duration::from_secs(5))
+            .await;
         dx.test_wait_results_mapped(1, Duration::from_secs(5)).await;
         drop(hold);
     });
@@ -2140,10 +2170,9 @@ async fn aborting_while_parked_on_the_publish_mutex_leaves_no_phantom_reservatio
     // Hold the publish mutex (a concurrent fence/close does the same), then
     // send B. Under the fix B parks on the mutex BEFORE its book entry opens.
     // r11 item 4(d): the acquisition itself is bounded with a named failure.
-    let publish_hold =
-        tokio::time::timeout(Duration::from_secs(5), driver.hold_publish_mutex_for_test())
-            .await
-            .expect("publish mutex hold within 5s");
+    let publish_hold = driver
+        .bounded_hold_publish_mutex_for_test(Duration::from_secs(5))
+        .await;
     let db = driver.clone();
     let send_b = tokio::spawn(async move { db.send(prompt_id("second", "msg-b")).await });
     barrier
@@ -2181,9 +2210,9 @@ async fn aborting_while_parked_on_the_publish_mutex_leaves_no_phantom_reservatio
     // Count ALL starts/settlements through one acknowledged fence drain.
     // r11 item 4(d): bound the fence acquisition (it takes the publish mutex)
     // separately from the drain.
-    let fence = tokio::time::timeout(Duration::from_secs(5), driver.publication_fence())
-        .await
-        .expect("publication fence enqueued within 5s");
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
     let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
 
     assert_eq!(
@@ -2302,9 +2331,9 @@ async fn cancelling_b_emits_a_settlement_at_its_ticket_position_before_c_starts(
 
     // r11 item 4(d): bound the fence acquisition (it takes the publish mutex)
     // separately from the acknowledged drain.
-    let fence = tokio::time::timeout(Duration::from_secs(5), driver.publication_fence())
-        .await
-        .expect("publication fence enqueued within 5s");
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
     let mut all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
 
     assert_eq!(
@@ -2486,10 +2515,11 @@ async fn cancelling_a_newer_c_while_older_b_is_active_does_not_release_a_deferre
 
     // ACKNOWLEDGED FENCE: every job up to the withheld-then-released result is
     // published, so the complete observation order is asserted, not sampled.
-    // r12 item 3 replaces this inline bound with the shared named helper.
-    let fence = tokio::time::timeout(Duration::from_secs(5), driver.publication_fence())
-        .await
-        .expect("publication fence enqueued within 5s");
+    // The fence enqueue itself goes through the shared named bounded wait
+    // (r12 item 3).
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
     let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
 
     assert_eq!(
@@ -2576,7 +2606,9 @@ async fn natural_stdout_eof_seals_reservation_admission_and_emits_nothing_after_
     // An acknowledged fence queued after the EOF: the worker maps result_A,
     // emits exited, then signals. Open the worker gate first (drop the
     // barrier), then drain in one overall timeout.
-    let fence = driver.publication_fence().await;
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
     drop(barrier);
     let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
 
@@ -2633,7 +2665,9 @@ async fn aborting_during_fail_without_ticket_rollback_does_not_orphan_the_reserv
 
     // Hold the mapper, then release B INTO the rollback: it parks on the
     // mapper-lock wait. ACKNOWLEDGE that exact wait before aborting B.
-    let mapper_hold = driver.hold_mapper_for_test().await;
+    let mapper_hold = driver
+        .bounded_hold_mapper_for_test(Duration::from_secs(5))
+        .await;
     barrier.release_rollback_without_ticket();
     barrier
         .wait_until_rollback_lock_waits(1, Duration::from_secs(5))
@@ -2650,7 +2684,10 @@ async fn aborting_during_fail_without_ticket_rollback_does_not_orphan_the_reserv
         .wait_until_rollbacks_done(1, Duration::from_secs(5))
         .await;
     assert!(
-        driver.outstanding_turn_seqs_for_test().await.is_empty(),
+        driver
+            .bounded_outstanding_turn_seqs_for_test(Duration::from_secs(5))
+            .await
+            .is_empty(),
         "the aborted caller's reservation is rolled back, not orphaned"
     );
 
@@ -2791,14 +2828,12 @@ async fn aborting_inside_the_real_writer_window_keeps_the_accepted_turn_ordered_
 
     // Close the writer's in-window gate: the writer parks INSIDE UserWrite
     // handling (after FIFO accept, before write_line/ack).
-    let gate = driver.write_window().await;
+    let gate = driver.bounded_write_window(Duration::from_secs(5)).await;
     gate.close();
 
     let mut send_a = Box::pin(driver.send(prompt_id("first", "msg-a")));
     let parked = async {
-        tokio::time::timeout(Duration::from_secs(5), gate.wait_until_parked())
-            .await
-            .expect("writer parks inside its window within 5s")
+        gate.wait_until_parked_bounded(Duration::from_secs(5)).await;
     };
     tokio::select! {
         _ = parked => {}
@@ -2939,8 +2974,10 @@ async fn bound_proof_the_writer_gate_park_wait_fails_fast_when_no_write_arrives(
     let handle = driver.start(spec).await.expect("start");
     assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
 
-    let gate = driver.write_window().await;
+    let gate = driver.bounded_write_window(Duration::from_secs(5)).await;
     gate.close();
+    // r12 item 4 rewrites this to the shared bounded gate wait; this still
+    // exercises the raw wire wait under the external bound.
     let parked = tokio::time::timeout(Duration::from_millis(300), gate.wait_until_parked()).await;
     assert_elapsed(parked, "the writer gate wait_until_parked");
 
@@ -2963,7 +3000,9 @@ async fn bound_proof_contended_mutex_and_fence_acquisitions_fail_fast_with_named
     let (acq_tx, acq_rx) = tokio::sync::oneshot::channel();
     let d = driver.clone();
     let holder = tokio::spawn(async move {
-        let _hold = d.hold_publish_mutex_for_test().await;
+        let _hold = d
+            .bounded_hold_publish_mutex_for_test(Duration::from_secs(5))
+            .await;
         acq_tx
             .send(())
             .expect("acknowledge holder acquired the mutex");
@@ -2974,14 +3013,37 @@ async fn bound_proof_contended_mutex_and_fence_acquisitions_fail_fast_with_named
         .expect("holder acquisition within 5s")
         .expect("oneshot");
 
-    let hold = tokio::time::timeout(
-        Duration::from_millis(300),
-        driver.hold_publish_mutex_for_test(),
+    // r12 item 3: the contended acquisitions go through the SAME named
+    // bounded helpers the scheduling tests use; their named timeout failure is
+    // a panic caught here (r12 item 4 adds the release/completion half).
+    let d = driver.clone();
+    let hold_waiter = tokio::spawn(async move {
+        // Bind the guard inside the task: it borrows the driver moved into
+        // this future, so it must not escape the spawned scope.
+        let _hold = d
+            .bounded_hold_publish_mutex_for_test(Duration::from_millis(300))
+            .await;
+    });
+    expect_named_timeout_panic(
+        hold_waiter,
+        "acquiring the publication mutex hold",
+        Duration::from_secs(5),
     )
     .await;
-    assert_elapsed(hold, "the contended publish-mutex acquisition");
-    let fence = tokio::time::timeout(Duration::from_millis(300), driver.publication_fence()).await;
-    assert_elapsed(fence, "the contended fence acquisition");
+    let d = std::sync::Arc::clone(&driver);
+    let fence_waiter = tokio::spawn(async move {
+        // The returned receiver is itself awaitable; it is irrelevant once the
+        // named bounded enqueue wait has been exercised, so drop it here.
+        let _rx = d
+            .bounded_publication_fence(Duration::from_millis(300))
+            .await;
+    });
+    expect_named_timeout_panic(
+        fence_waiter,
+        "enqueuing a publication fence (publish mutex)",
+        Duration::from_secs(5),
+    )
+    .await;
 
     holder.abort();
     drop(handle);

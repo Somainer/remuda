@@ -62,6 +62,15 @@ pub enum DriverError {
     /// (c-ctxusage r14 item 1).
     #[error("foreign Herdr resource: {0}")]
     ForeignHerdrResource(String),
+    /// The verified connection carrying an ownership audit and its destructive
+    /// pane close dropped (or timed out) after the audit and before the close
+    /// could be confirmed. A replacement Herdr boot may now own the reused
+    /// pane id, so the close was ABORTED and never replayed on another
+    /// connection: the pane's state is UNKNOWN, never reported closed. A fresh
+    /// close re-audits the new state and no-ops or refuses safely
+    /// (c-ctxusage r15 item 1).
+    #[error("Herdr close outcome uncertain: {0}")]
+    CloseOutcomeUncertain(String),
     /// Isolated settings could not be written.
     #[error("settings isolation unavailable: {0}")]
     SettingsIsolationUnavailable(String),
@@ -99,6 +108,9 @@ impl DriverError {
             // A refused foreign-resource close is an invalid launch/carrier
             // state, not a protocol failure: nothing was sent to Herdr.
             Self::ForeignHerdrResource(_) => ErrorCode::InvalidLaunchSpec,
+            // Uncertain is retryable: nothing was confirmed closed, and a fresh
+            // close re-audits instead of replaying the destructive call.
+            Self::CloseOutcomeUncertain(_) => ErrorCode::ControlUnavailable,
             Self::SettingsIsolationUnavailable(_) => ErrorCode::SettingsIsolationUnavailable,
             Self::BinaryNotFound(_) => ErrorCode::InvalidLaunchSpec,
             Self::Io(_) | Self::Json(_) | Self::Protocol(_) => ErrorCode::NativeProtocolError,

@@ -2,20 +2,25 @@
 
 use crate::{DriverError, DriverResult};
 use remuda_herdr::{
-    Client, EventKind, Pong, SessionSnapshot, Subscription, WorkspaceCreateParams, WorkspaceCreated,
+    Client, EventKind, EventStream, PersistentClient, Pong, SessionSnapshot, Subscription,
+    WorkspaceCreateParams, WorkspaceCreated,
 };
 use remuda_protocol::InstanceId;
 use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// How long a stopped agent may take to leave its pane before the pane is
 /// closed anyway. The Instance is already gone from the Hub's point of view,
 /// so waiting longer only leaks panes into the operator's Herdr session.
 pub(crate) const AGENT_EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// Bounded courtesy window between the first Ctrl-C and the re-tap: an
+/// event-driven wait (the pane's exit event resolves it early), never a sleep.
+const RE_TAP_WAIT: Duration = Duration::from_millis(150);
 
 /// Bounded wait for a forced pane close to be reflected by Herdr (the close
 /// RPC itself removes the agent synchronously, so the first verification poll
@@ -136,10 +141,22 @@ impl PtyResource {
         if !self.owned_workspace_present(&client).await? {
             return Ok(InterruptOutcome::Absent);
         }
-        if self.await_polite_exit(&client, grace).await {
+        // Subscribe BEFORE signalling: subscriptions are frozen at request
+        // time and the pane still exists, so the foreground-exit event caused
+        // by the first Ctrl-C (polite path) or by pane.close (force path)
+        // cannot be missed. The same stream drives both waits.
+        let mut events = self
+            .client()
+            .subscribe(vec![
+                Subscription::pane_exited(),
+                Subscription::global("pane.closed"),
+            ])
+            .await
+            .map_err(super::claude_pty::map_herdr)?;
+        if self.await_polite_exit(&client, &mut events, grace).await {
             return Ok(InterruptOutcome::ExitedGracefully);
         }
-        self.force_terminate(&client).await?;
+        self.force_terminate(&client, &mut events).await?;
         Ok(InterruptOutcome::ForceTerminated)
     }
 
@@ -252,6 +269,27 @@ impl PtyResource {
             .session_snapshot()
             .await
             .map_err(super::claude_pty::map_herdr)?;
+        Ok((facet_ok, snapshot))
+    }
+
+    /// Same audit as [`Self::audit`] but on a HELD-OPEN verified connection:
+    /// the `ping` boot facet and the `session.snapshot` ownership proof are
+    /// answered by the SAME server process the subsequent destructive call is
+    /// dispatched to (c-ctxusage r15 item 1). Call sites map the error by the
+    /// phase they are in (nothing destructive yet → plain mapping; after the
+    /// close dispatch → uncertain).
+    async fn audit_verified(
+        &self,
+        conn: &mut PersistentClient,
+    ) -> Result<(bool, SessionSnapshot), remuda_herdr::Error> {
+        let facet_ok = match &self.server_facet {
+            None => true,
+            Some(facet) => {
+                let pong = conn.ping().await?;
+                facet == &ServerFacet::of(&pong)
+            }
+        };
+        let snapshot = conn.session_snapshot().await?;
         Ok((facet_ok, snapshot))
     }
 
@@ -369,76 +407,131 @@ impl PtyResource {
     /// false, so the caller runs the ownership-revalidating forced termination
     /// instead of draining against a writer that may still be alive
     /// (c-ctxusage r13 item 1, r14 item 1).
-    async fn await_polite_exit(&self, client: &Client, grace: Duration) -> bool {
-        /// Result of the grace wait.
+    ///
+    /// There are no sleeps: every wait parks on THIS pane's foreground-exit
+    /// event (subscribed before the first tap) under a bounded deadline, and
+    /// every wake is confirmed by an ownership audit. A server that emits no
+    /// events is simply handled by the force path when the grace elapses.
+    async fn await_polite_exit(
+        &self,
+        client: &Client,
+        events: &mut EventStream,
+        grace: Duration,
+    ) -> bool {
+        /// Result of one ownership-confirmed polite probe.
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum Polite {
             Gone,
             Foreign,
+            Ours,
         }
-        let grace_run = async {
-            let map = super::claude_pty::map_herdr;
-            let _ = client
-                .pane_send_keys(&self.pane_id, vec!["ctrl+c".into()])
-                .await;
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            // Re-validate ownership BEFORE the second tap: the server may have
-            // restarted on the first Ctrl-C and reused our pane id for an
-            // unrelated workspace (c-ctxusage r14 item 1). A second tap, the
-            // shell `exit` below and every later keystroke would then land in a
-            // foreign user's pane.
-            let (facet_ok, snapshot) = self.audit(client).await?;
-            match self.workspace_ownership(facet_ok, &snapshot) {
-                Ownership::Ours => {
-                    client
-                        .pane_send_keys(&self.pane_id, vec!["ctrl+c".into()])
-                        .await
-                        .map_err(map)?;
-                }
-                Ownership::Absent => return Ok(Polite::Gone),
-                Ownership::Foreign => return Ok(Polite::Foreign),
-            }
-            loop {
-                let (facet_ok, snapshot) = self.audit(client).await?;
-                match self.workspace_ownership(facet_ok, &snapshot) {
-                    Ownership::Absent => return Ok(Polite::Gone),
-                    Ownership::Foreign => return Ok(Polite::Foreign),
-                    Ownership::Ours => {}
-                }
-                if !snapshot
-                    .agents
-                    .iter()
-                    .any(|agent| agent.pane_id == self.pane_id)
+
+        let confirm = |snapshot: &SessionSnapshot, facet_ok: bool| -> Polite {
+            match self.workspace_ownership(facet_ok, snapshot) {
+                Ownership::Absent => Polite::Gone,
+                Ownership::Foreign => Polite::Foreign,
+                // The workspace is ours; whether the agent actually left is a
+                // separate question.
+                Ownership::Ours
+                    if snapshot
+                        .agents
+                        .iter()
+                        .any(|agent| agent.pane_id == self.pane_id) =>
                 {
-                    // Only send the shell builtin after the native agent is
-                    // gone AND the pane is still ours; never accidentally turn
-                    // the word exit into a model prompt, and never into a
-                    // foreign shell.
-                    if let Some(process) = client
-                        .pane_process_info(Some(self.pane_id.clone()))
-                        .await
-                        .map_err(map)?
-                        .process_info
+                    Polite::Ours
+                }
+                Ownership::Ours => Polite::Gone,
+            }
+        };
+
+        // Ownership-confirmed probe; on Gone, ask the now-foreground shell to
+        // exit as well (only after the native agent is gone AND the pane is
+        // still ours, so the word never reaches a model prompt or a foreign
+        // shell).
+        macro_rules! probe {
+            () => {{
+                let mut state = Polite::Foreign;
+                if let Ok((facet_ok, snapshot)) = self.audit(client).await {
+                    state = confirm(&snapshot, facet_ok);
+                    if state == Polite::Gone
+                        && let Ok(Some(process)) = client
+                            .pane_process_info(Some(self.pane_id.clone()))
+                            .await
+                            .map(|result| result.process_info)
                         && process.shell_pid.is_some()
                         && process
                             .foreground_processes
                             .iter()
                             .all(|p| Some(p.pid) == process.shell_pid)
                     {
-                        client
-                            .pane_send_text(&self.pane_id, "exit\r")
-                            .await
-                            .map_err(map)?;
+                        let _ = client.pane_send_text(&self.pane_id, "exit\r").await;
                     }
-                    return Ok::<_, DriverError>(Polite::Gone);
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                state
+            }};
+        }
+
+        let _ = client
+            .pane_send_keys(&self.pane_id, vec!["ctrl+c".into()])
+            .await;
+
+        let deadline = Instant::now() + grace;
+        let mut re_tapped = false;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
             }
-        };
-        matches!(
-            tokio::time::timeout(grace, grace_run).await,
-            Ok(Ok(Polite::Gone))
-        )
+            let bound = if re_tapped {
+                deadline - now
+            } else {
+                RE_TAP_WAIT.min(deadline - now)
+            };
+            match tokio::time::timeout(bound, events.next_event()).await {
+                // This pane's foreground process exited or its pane closed:
+                // confirm with an ownership audit before believing it.
+                Ok(Some(Ok(event)))
+                    if matches!(event.kind, EventKind::PaneExited | EventKind::PaneClosed)
+                        && event.pane_id().is_some_and(|id| id == self.pane_id) =>
+                {
+                    match probe!() {
+                        Polite::Gone => return true,
+                        Polite::Foreign => return false,
+                        Polite::Ours => {}
+                    }
+                }
+                // Unrelated event, an error frame, or a dead event stream: the
+                // bounded deadline below decides; a dead stream falls through
+                // to the force path.
+                Ok(Some(_)) => {}
+                Ok(None) => return matches!(probe!(), Polite::Gone),
+                Err(_) => {
+                    if re_tapped {
+                        // Grace elapsed without an observed exit.
+                        return false;
+                    }
+                    // Re-validate ownership BEFORE the second tap: the server
+                    // may have restarted on the first Ctrl-C and reused our
+                    // pane id for an unrelated workspace (c-ctxusage r14
+                    // item 1). The second tap and every later keystroke must
+                    // never land in a foreign user's pane.
+                    match probe!() {
+                        Polite::Gone => return true,
+                        Polite::Foreign => return false,
+                        Polite::Ours => {
+                            if client
+                                .pane_send_keys(&self.pane_id, vec!["ctrl+c".into()])
+                                .await
+                                .is_err()
+                            {
+                                return false;
+                            }
+                            re_tapped = true;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Close the AGENT pane — reaping its foreground process group — and
@@ -448,27 +541,31 @@ impl PtyResource {
     /// runs only after this returns (c-ctxusage r13 item 1). The subsequent
     /// [`Self::reap`] tolerates the pane already being gone.
     ///
-    /// Ownership is re-proven IMMEDIATELY before the destructive `pane.close`
-    /// and again after it (workspace creation label + server boot facet): if
-    /// Herdr restarted during the grace and handed `w1:p1` to an unrelated
-    /// workspace, the close is refused and the foreign pane survives
-    /// (c-ctxusage r14 item 1). There is no verification sleep: a
-    /// pre-close `events.subscribe` captures the pane's exit/close event,
-    /// awaited under the bounded grace, and one post-event snapshot verifies.
-    async fn force_terminate(&self, client: &Client) -> DriverResult<()> {
-        // Subscribe FIRST: subscriptions are frozen at request time and the
-        // pane still exists here, so the pane.exited/pane.closed event emitted
-        // by the close RPC below cannot be missed.
-        let mut events = client
-            .subscribe(vec![
-                Subscription::pane_exited(),
-                Subscription::global("pane.closed"),
-            ])
+    /// The ownership audit, the destructive `pane.close` and the post-close
+    /// verification all run on ONE held-open Herdr connection
+    /// ([`PersistentClient`]): an accepted Unix fd dies with the server
+    /// process that accepted it, so an audit response and the close dispatch
+    /// on the same fd prove the SAME server served both. If the connection
+    /// drops or stalls after the audit — a restarted replacement server has
+    /// re-bound the socket and may have handed the deterministic pane id to an
+    /// unrelated workspace — the destructive sequence is ABORTED with
+    /// [`DriverError::CloseOutcomeUncertain`], never replayed on a fresh
+    /// connection, and the result is never reported as closed. A later close
+    /// re-audits the new state and no-ops or refuses safely
+    /// (c-ctxusage r15 item 1).
+    async fn force_terminate(&self, client: &Client, events: &mut EventStream) -> DriverResult<()> {
+        let mut verified = client
+            .persistent()
             .await
             .map_err(super::claude_pty::map_herdr)?;
 
-        // Ownership proof immediately before the destructive call.
-        let (facet_ok, snapshot) = self.audit(client).await?;
+        // Final ownership audit ON the connection the destructive call will
+        // use. Nothing destructive has happened yet, so ordinary error
+        // mapping applies.
+        let (facet_ok, snapshot) = self
+            .audit_verified(&mut verified)
+            .await
+            .map_err(super::claude_pty::map_herdr)?;
         match self.pane_ownership(&self.pane_id, facet_ok, &snapshot) {
             Ownership::Foreign => return Err(self.foreign_refusal(&self.pane_id)),
             Ownership::Absent => return Ok(()),
@@ -487,10 +584,14 @@ impl PtyResource {
             return Ok(());
         }
 
-        // Best effort: the verification snapshot is authoritative even if this
-        // RPC was refused, and closing an already-gone pane stays harmless —
-        // but only because ownership was proven above.
-        let _ = client.pane_close(&self.pane_id).await;
+        // The destructive dispatch goes out on the SAME held connection. A
+        // disconnect, stalled write or read timeout here means the request may
+        // have reached a dying server but its outcome is unknown: abort as
+        // uncertain. It is NEVER retried on another connection, which could be
+        // a replacement boot that reused the pane id.
+        if let Err(err) = verified.pane_close(self.pane_id.clone()).await {
+            return Err(self.uncertain_close("pane.close dispatch", err));
+        }
 
         // Event-driven, bounded: wake on THIS pane's lifecycle event instead
         // of sleeping between verification polls.
@@ -506,9 +607,15 @@ impl PtyResource {
         };
         let _ = tokio::time::timeout(FORCE_EXIT_GRACE, event_wait).await;
 
-        // One authoritative verification snapshot — ownership re-proven, then
-        // both the agent and the pane gone.
-        let (facet_ok, snapshot) = self.audit(client).await?;
+        // Verification snapshot on the SAME connection — ownership and the
+        // server boot are fixed for the lifetime of the fd, so this proves the
+        // audited server itself reports the agent and the pane gone. A dropped
+        // connection here leaves the close outcome unconfirmed: uncertain,
+        // never closed.
+        let (facet_ok, snapshot) = self
+            .audit_verified(&mut verified)
+            .await
+            .map_err(|err| self.uncertain_close("post-close verification", err))?;
         if self.pane_ownership(&self.pane_id, facet_ok, &snapshot) == Ownership::Foreign {
             return Err(self.foreign_refusal(&self.pane_id));
         }
@@ -526,6 +633,21 @@ impl PtyResource {
             Err(DriverError::InvalidLaunchSpec(
                 "native writer survived forced termination".into(),
             ))
+        }
+    }
+
+    /// Map a failure of the held verified connection at/after the destructive
+    /// dispatch to an UNCERTAIN outcome; ordinary API refusals (the pane was
+    /// already gone, an invalid request, …) keep their normal mapping.
+    fn uncertain_close(&self, phase: &str, err: remuda_herdr::Error) -> DriverError {
+        match err {
+            remuda_herdr::Error::Disconnected { .. }
+            | remuda_herdr::Error::Timeout { .. }
+            | remuda_herdr::Error::Io(_) => DriverError::CloseOutcomeUncertain(format!(
+                "verified Herdr connection failed during {phase} for pane {}: {err}",
+                self.pane_id
+            )),
+            other => super::claude_pty::map_herdr(other),
         }
     }
 }

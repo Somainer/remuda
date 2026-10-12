@@ -4,13 +4,14 @@
 //! holds a dedicated connection because Herdr does not multiplex a subscribe
 //! stream with later requests on that socket.
 
-use std::path::Path;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::net::{UnixStream, unix::OwnedReadHalf, unix::OwnedWriteHalf};
 use tokio::time::timeout;
 use tracing::debug;
 
@@ -161,6 +162,161 @@ fn map_connect(socket: &Path, err: std::io::Error) -> Error {
             socket: socket.to_path_buf(),
         },
         _ => Error::Io(err),
+    }
+}
+
+/// ONE Unix connection kept open across several JSON-RPC calls.
+///
+/// Ordinary calls dial a fresh connection per request and half-close the write
+/// side immediately. Audit-and-destroy sequences cannot use that pattern: the
+/// ownership snapshot and the destructive call would land on DIFFERENT
+/// connections, so a Herdr restart in between (the listening socket is
+/// re-bound by a replacement process handing the deterministic pane ids to
+/// unrelated workspaces) can let the close dispatch against a server the audit
+/// never saw.
+///
+/// This connection instead stays open, never half-closes, and NEVER
+/// reconnects. Every request is written only after the previous response was
+/// read on the SAME fd: a Unix accept fd dies with the server process that
+/// accepted it, so receiving the audit response and dispatching the close on
+/// this connection proves both were served by the SAME server. If the
+/// connection drops at any point — including between the audit and the
+/// destructive write — [`Self::invoke`] returns [`Error::Disconnected`] and
+/// the caller MUST treat the destructive outcome as unknown, never retry the
+/// close on a fresh connection (c-ctxusage r15 item 1).
+pub(crate) struct PersistentConn {
+    socket: PathBuf,
+    lines: tokio::io::Lines<BufReader<OwnedReadHalf>>,
+    writer: OwnedWriteHalf,
+    /// Responses (and events) that arrived ahead of the response currently
+    /// waited for. Requests are sent strictly sequentially, so this normally
+    /// stays empty; it exists so a stray event can never desynchronise id
+    /// matching.
+    buffered: VecDeque<Incoming>,
+}
+
+impl PersistentConn {
+    /// Dial one connection and hold it open. Nothing is written.
+    pub(crate) async fn connect(socket: &Path) -> Result<Self, Error> {
+        let stream = UnixStream::connect(socket)
+            .await
+            .map_err(|err| map_connect(socket, err))?;
+        let (reader, writer) = stream.into_split();
+        Ok(Self {
+            socket: socket.to_path_buf(),
+            lines: BufReader::new(reader).lines(),
+            writer,
+            buffered: VecDeque::new(),
+        })
+    }
+
+    /// Send one request and await ITS response on the held connection.
+    ///
+    /// The write is NOT half-closed, and any I/O failure after dialling —
+    /// write error, EOF, timeout — surfaces as [`Error::Disconnected`] (or
+    /// [`Error::Timeout`]): the request may have been dispatched, so the
+    /// caller must never replay it on another connection.
+    pub(crate) async fn invoke(
+        &mut self,
+        method: &str,
+        params: Value,
+        max_wait: Duration,
+    ) -> Result<Value, Error> {
+        let params = if params.is_null() {
+            Value::Object(serde_json::Map::new())
+        } else {
+            params
+        };
+        let request = RpcRequest {
+            id: next_id(),
+            method: method.to_string(),
+            params,
+        };
+        debug!(method, id = %request.id, socket = %self.socket.display(), "herdr rpc (verified conn)");
+        let write = async {
+            let mut encoded = serde_json::to_vec(&request)?;
+            encoded.push(b'\n');
+            self.writer.write_all(&encoded).await?;
+            self.writer.flush().await?;
+            Ok::<_, Error>(())
+        };
+        match timeout(max_wait, write).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(self.lost(err)),
+            Err(_) => {
+                return Err(Error::Timeout {
+                    method: method.to_string(),
+                    timeout: max_wait,
+                });
+            }
+        }
+        let read = self.read_matching(method, &request.id);
+        timeout(max_wait, read).await.unwrap_or(Err(Error::Timeout {
+            method: method.to_string(),
+            timeout: max_wait,
+        }))
+    }
+
+    /// Read NDJSON frames until the response carrying `wanted_id` shows up;
+    /// everything else is buffered. EOF means the held connection died.
+    async fn read_matching(&mut self, method: &str, wanted_id: &str) -> Result<Value, Error> {
+        loop {
+            if let Some(position) = self.buffered.iter().position(|incoming| match incoming {
+                Incoming::Response { id, .. } => id == wanted_id || id.is_empty(),
+                Incoming::Event(_) => false,
+            }) {
+                let incoming = self.buffered.remove(position).expect("position just found");
+                if let Incoming::Response { result, error, .. } = incoming {
+                    return Self::body(method, result, error);
+                }
+                unreachable!("position matched a response");
+            }
+            let line = match self.lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    return Err(Error::Disconnected {
+                        socket: self.socket.clone(),
+                    });
+                }
+                Err(err) => return Err(self.lost(Error::Io(err))),
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let incoming = parse_line(&line)?;
+            if let Incoming::Response { id, result, error } = &incoming
+                && (id == wanted_id || id.is_empty())
+            {
+                return Self::body(method, result.clone(), error.clone());
+            }
+            self.buffered.push_back(incoming);
+        }
+    }
+
+    fn body(
+        method: &str,
+        result: Option<Value>,
+        error: Option<RpcErrorBody>,
+    ) -> Result<Value, Error> {
+        if let Some(error) = error {
+            return Err(Error::Api {
+                method: method.to_string(),
+                code: error.code,
+                message: error.message,
+            });
+        }
+        Ok(result.unwrap_or(Value::Null))
+    }
+
+    /// Classify a mid-sequence failure: the held fd is gone, so the server
+    /// that answered the audit may be gone too.
+    fn lost(&self, err: Error) -> Error {
+        match err {
+            Error::Unreachable { .. } => Error::Disconnected {
+                socket: self.socket.clone(),
+            },
+            other => other,
+        }
     }
 }
 

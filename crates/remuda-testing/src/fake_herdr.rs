@@ -148,6 +148,17 @@ pub struct FakeHerdrOptions {
     /// and its own live agent. A closer that does not re-validate ownership
     /// kills the foreign pane.
     pub restart_reuses_ids_on_ctrlc: bool,
+    /// Restart barrier between the ownership audit and the destructive
+    /// `pane.close` (c-ctxusage r15 item 1). The barrier fires ONCE, the first
+    /// time a `pane.close` is processed after the barrier is armed:
+    /// * on a connection that served a `session.snapshot` (a verified
+    ///   audit-and-close connection), the state is swapped to the foreign
+    ///   boot and THAT connection is dropped WITHOUT processing the close —
+    ///   the replacement-server model; the close never lands;
+    /// * on a connection that served no snapshot (one RPC per connection), the
+    ///   state is swapped first and the close is then processed against the
+    ///   replacement boot — the gap-race model that kills the foreign pane.
+    pub restart_barrier_on_close: bool,
 }
 
 /// Creation label the simulated restart hands the reused `w1` workspace to.
@@ -169,6 +180,7 @@ impl FakeHerdrOptions {
             force_close_transcript: None,
             force_close_record_file: None,
             restart_reuses_ids_on_ctrlc: false,
+            restart_barrier_on_close: false,
         }
     }
 
@@ -232,6 +244,18 @@ impl FakeHerdrOptions {
     #[must_use]
     pub fn restart_reuses_ids_on_ctrlc(mut self) -> Self {
         self.restart_reuses_ids_on_ctrlc = true;
+        self
+    }
+
+    /// Model a Herdr restart in the gap between the final ownership audit and
+    /// the destructive `pane.close` (c-ctxusage r15 item 1). A close sent on
+    /// the SAME connection that carried the audit snapshot is never processed
+    /// (that connection dies with the replaced boot); a close sent on a fresh
+    /// connection lands against the replacement boot and kills the foreign
+    /// pane.
+    #[must_use]
+    pub fn restart_barrier_on_close(mut self) -> Self {
+        self.restart_barrier_on_close = true;
         self
     }
 }
@@ -318,6 +342,9 @@ impl FakeHerdrServer {
         }
         if options.restart_reuses_ids_on_ctrlc {
             command.env("FAKE_HERDR_RESTART_REUSES_IDS", "1");
+        }
+        if options.restart_barrier_on_close {
+            command.env("FAKE_HERDR_RESTART_BARRIER_ON_CLOSE", "1");
         }
 
         let mut child = command
@@ -496,6 +523,8 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         .map(PathBuf::from);
     let mut restart_reuses_ids_on_ctrlc = std::env::var("FAKE_HERDR_RESTART_REUSES_IDS")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
+    let mut restart_barrier_on_close = std::env::var("FAKE_HERDR_RESTART_BARRIER_ON_CLOSE")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -549,6 +578,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             }
             "--exit-after-unavailable" => exit_after_unavailable = true,
             "--restart-reuses-ids-on-ctrlc" => restart_reuses_ids_on_ctrlc = true,
+            "--restart-barrier-on-close" => restart_barrier_on_close = true,
             "--session" | "--takeover" => {
                 if args[i] == "--session" {
                     i += 1;
@@ -590,6 +620,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             force_close_transcript,
             force_close_record_file,
             restart_reuses_ids_on_ctrlc,
+            restart_barrier_on_close,
         }));
     }
     Err(FakeHerdrError::Args(format!(
@@ -701,6 +732,7 @@ async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
         options.force_close_transcript,
         options.force_close_record_file,
         options.restart_reuses_ids_on_ctrlc,
+        options.restart_barrier_on_close,
     )));
     // Only the scripted shutdown window (`exit_after_unavailable`) stops the
     // accept loop. Parent death is handled by the outer `parent_watch`
@@ -763,6 +795,10 @@ struct State {
     restart_on_ctrlc: bool,
     /// The simulated restart fires once.
     restart_done: bool,
+    /// Restart barrier on the close path (c-ctxusage r15 item 1).
+    restart_barrier_on_close: bool,
+    /// The close barrier fires once.
+    close_barrier_done: bool,
     /// Bumped by the simulated restart; surfaced in `ping` capabilities.
     server_generation: u32,
 }
@@ -779,6 +815,7 @@ impl State {
         force_close_transcript: Option<PathBuf>,
         force_close_record_file: Option<PathBuf>,
         restart_on_ctrlc: bool,
+        restart_barrier_on_close: bool,
     ) -> Self {
         Self {
             script,
@@ -804,6 +841,8 @@ impl State {
             force_close_record_file,
             restart_on_ctrlc,
             restart_done: false,
+            restart_barrier_on_close,
+            close_barrier_done: false,
             server_generation: 1,
         }
     }
@@ -850,6 +889,10 @@ async fn handle_conn(
 ) -> Result<(), FakeHerdrError> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
+    // c-ctxusage r15 item 1: whether THIS connection carried an ownership
+    // snapshot. A verified audit-and-close connection sends both on one fd;
+    // the ordinary client dials a fresh fd per RPC.
+    let mut served_snapshot = false;
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
@@ -892,6 +935,40 @@ async fn handle_conn(
         if req.method == "agent.start" {
             let delay = lock_state(&state)?.agent_start_delay;
             tokio::time::sleep(delay).await;
+        }
+        // c-ctxusage r15 item 1: restart barrier between the ownership audit
+        // and the destructive close. Fires once. On a connection that served
+        // the audit snapshot, the boot is replaced (state swapped to the
+        // foreign-labelled reuse) and the dying server's connection is closed
+        // WITHOUT processing pane.close: the close never lands. On a
+        // one-RPC-per-call client the close lands against the replacement
+        // boot and removes the foreign pane — the race this guard exists to
+        // make unrepresentable.
+        if req.method == "pane.close" {
+            let kill_conn_after_swap = {
+                let mut st = lock_state(&state)?;
+                if st.restart_barrier_on_close && !st.close_barrier_done {
+                    let pane_id = req
+                        .params
+                        .get("pane_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    st.close_barrier_done = true;
+                    simulate_restart_with_id_reuse(&mut st, &pane_id);
+                    served_snapshot
+                } else {
+                    false
+                }
+            };
+            if kill_conn_after_swap {
+                // Dropping the writer closes the accepted fd: the client sees
+                // EOF and must report the close outcome as uncertain.
+                return Ok(());
+            }
+        }
+        if req.method == "session.snapshot" {
+            served_snapshot = true;
         }
         let reply = match handle_rpc(&state, &req) {
             Ok(value) => success(&req, value),
@@ -1352,6 +1429,16 @@ fn interrupt_live_agent(st: &mut State, pane_id: &str) {
     if let Some(pane) = st.panes.get_mut(pane_id) {
         pane.agent = None;
         pane.agent_status = AgentStatus::Unknown;
+        // Foreground process (the native agent) exited; the pane reverts to
+        // its root shell. Herdr emits pane.exited per foreground-process exit,
+        // which is the closer's event-driven polite-exit signal
+        // (c-ctxusage r15 item 1).
+        let workspace_id = pane.workspace_id.clone();
+        emit(
+            st,
+            "pane_exited",
+            json!({"type":"pane_exited","pane_id": pane_id, "workspace_id": workspace_id}),
+        );
     }
 }
 

@@ -14,7 +14,7 @@ use tracing::debug;
 
 use crate::error::Error;
 use crate::events::{Event, EventsSubscribeParams, Subscription};
-use crate::rpc::{Incoming, call, connect_subscribe, next_id, parse_line};
+use crate::rpc::{Incoming, PersistentConn, call, connect_subscribe, next_id, parse_line};
 use crate::types::*;
 
 /// Default RPC timeout for methods that do not wait on an agent turn.
@@ -83,6 +83,19 @@ impl Client {
     #[must_use]
     pub fn binary(&self) -> &Path {
         &self.binary
+    }
+
+    /// Open a PERSISTENT connection that stays open across several calls.
+    ///
+    /// Use it for audit-and-destroy sequences (ownership snapshot followed by
+    /// a destructive call): unlike the one-shot methods, the connection is
+    /// never reconnected and never half-closes, so every response and dispatch
+    /// is provably served by the same server process. If it drops mid-sequence
+    /// its calls return [`Error::Disconnected`] and the caller must treat the
+    /// destructive outcome as unknown rather than replaying the call
+    /// (c-ctxusage r15 item 1).
+    pub async fn persistent(&self) -> Result<PersistentClient, Error> {
+        PersistentClient::open(&self.socket_path, self.timeout).await
     }
 
     /// Raw RPC. `params` may be `null` (sent as `{}`).
@@ -412,6 +425,69 @@ impl Client {
             rx,
             _writer: conn.writer,
         })
+    }
+}
+
+/// A single held-open Herdr connection for audit-and-destroy sequences.
+///
+/// Obtain from [`Client::persistent`]. Every call goes over the SAME Unix
+/// connection, in send order, with no reconnect: a dropped connection is a
+/// failed sequence, never a transparent retry. See [`PersistentConn`] for the
+/// guarantee (c-ctxusage r15 item 1).
+pub struct PersistentClient {
+    conn: PersistentConn,
+    timeout: Duration,
+}
+
+impl PersistentClient {
+    async fn open(socket_path: &Path, timeout: Duration) -> Result<Self, Error> {
+        let conn = PersistentConn::connect(socket_path).await?;
+        Ok(Self { conn, timeout })
+    }
+
+    async fn typed<T: DeserializeOwned>(
+        &mut self,
+        method: &str,
+        params: Value,
+        wanted: &'static str,
+    ) -> Result<T, Error> {
+        let value = self.conn.invoke(method, params, self.timeout).await?;
+        let found = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>")
+            .to_string();
+        if found != wanted && wanted != "*" {
+            return Err(Error::UnexpectedResult { wanted, found });
+        }
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// `ping` on the held connection.
+    pub async fn ping(&mut self) -> Result<Pong, Error> {
+        self.typed("ping", json!({}), "pong").await
+    }
+
+    /// `session.snapshot` on the held connection.
+    pub async fn session_snapshot(&mut self) -> Result<SessionSnapshot, Error> {
+        let result: SessionSnapshotResult = self
+            .typed("session.snapshot", json!({}), "session_snapshot")
+            .await?;
+        Ok(result.snapshot)
+    }
+
+    /// `pane.close` on the held connection. A disconnect here means the close
+    /// outcome is unknown; the caller must never replay it on another
+    /// connection.
+    pub async fn pane_close(&mut self, pane_id: impl Into<String>) -> Result<OkResult, Error> {
+        self.typed(
+            "pane.close",
+            serde_json::to_value(PaneTarget {
+                pane_id: pane_id.into(),
+            })?,
+            "ok",
+        )
+        .await
     }
 }
 

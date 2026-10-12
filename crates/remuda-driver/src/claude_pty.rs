@@ -2888,7 +2888,6 @@ mod tests {
     async fn r12_item1_slash_binds_its_own_tuple_when_rearm_hits_snapshot_gap() {
         use crate::effort::{EffortBridge, EffortRequest};
         use remuda_protocol::EffortAxis::Flag;
-        use remuda_protocol::EffortName::High;
         use remuda_protocol::EffortSemantics::Decoupled;
 
         let bridge = Arc::new(EffortBridge::new());

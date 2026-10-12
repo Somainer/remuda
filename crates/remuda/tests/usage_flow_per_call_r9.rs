@@ -306,22 +306,19 @@ fn an_unmatched_turn_only_call_and_a_message_call_sum_to_120() {
     let instance = aggregate_instance(&conn, INSTANCE).unwrap();
     assert_eq!(instance.output_tokens, 120, "aggregate keeps the Turn call");
     assert_eq!(instance.input_tokens, 100);
-    // The real adapter also emitted priced cumulative Session points, which
-    // under the r8 stock-priced rule are the bill (r9 item 5 lets the old
-    // Turn's 0.10 supplement that when the session stock misses the call).
-    let priced_stock: f64 = conn
-        .query_row(
-            "SELECT CAST(cost_usd AS REAL) FROM usage_events
-             WHERE instance_id = ?1 AND scope = 'session' AND cost_usd IS NOT NULL
-             ORDER BY observed_at DESC, seq DESC LIMIT 1",
-            [INSTANCE],
-            |row| row.get(0),
-        )
-        .unwrap();
+    // c-usagefu r10 item 6 (Ruling B): eligible flow EXISTS (the old Turn t1
+    // plus the new Message), so COST follows the flow and the priced Session
+    // stock is ignored: bill = the unmatched historical Turn's 0.10 + the new
+    // Message's own priced cost.
+    let expected_cost = 0.10 + message_cost(&conn);
     let supply = aggregate_supply(&conn, PROFILE, MODEL).unwrap();
-    assert!((instance.cost_usd - priced_stock).abs() < 1e-9);
+    assert!(
+        (instance.cost_usd - expected_cost).abs() < 1e-9,
+        "flow cost 0.10 + message, not the priced stock, got {}",
+        instance.cost_usd
+    );
     assert_eq!(supply.output_tokens, 120);
-    assert!((supply.cost_usd - priced_stock).abs() < 1e-9);
+    assert!((supply.cost_usd - expected_cost).abs() < 1e-9);
 }
 
 #[test]

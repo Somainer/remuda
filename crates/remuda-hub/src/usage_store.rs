@@ -1036,11 +1036,15 @@ fn eligible_flow_predicate(outer: &str) -> String {
 /// - at least one linked Message carries a persisted response-level identity
 ///   (`scope_id`, a real response id or the durable fallback id the adapter
 ///   mints for a record without one);
-/// - the linked Messages' summed token buckets and cost EQUAL the Turn row's
-///   (NULL-safe). Equality is the only proof the data contains: when a response
-///   record was not persisted, its tokens are missing from the sum and the
-///   Turn is billed instead. The adapter emits every accepted record (fallback
-///   identity included) so normal turns reach equality and bill per response.
+/// - for every TOKEN bucket the Turn row actually reports, the linked Messages'
+///   sum EQUALS it. A bucket the Turn leaves NULL (a sparse historical Turn
+///   never carried total/cache-write) cannot disprove coverage and is not
+///   compared; the Messages may additionally report buckets the Turn omitted.
+///   When a response record was not persisted the bucket sum falls short of the
+///   Turn and the Turn is billed instead. Cost is deliberately NOT part of the
+///   proof: it is a priced projection that may legitimately differ from a
+///   historical Turn, and item 6 makes cost follow the SAME eligible-flow
+///   selection (covered → Message cost; uncovered → Turn cost).
 fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
     let buckets = [
         "total_tokens",
@@ -1059,28 +1063,23 @@ fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
         )"
     )];
     for bucket in buckets {
+        // Each condition is a full OR and MUST be parenthesized: the list is
+        // joined with AND, and a bare `A IS NULL OR B = C` would let AND bind
+        // tighter and silently flatten the coverage proof across buckets.
         conds.push(format!(
-            "COALESCE((
+            "((SELECT _fc_t.{bucket} FROM usage_events _fc_t
+              WHERE _fc_t.instance_id = {inst}
+                AND _fc_t.scope = 'turn' AND _fc_t.scope_id = {tid}) IS NULL
+             OR COALESCE((
                 SELECT SUM(_fc_s.{bucket}) FROM usage_events _fc_s
                 WHERE _fc_s.instance_id = {inst}
                   AND _fc_s.scope = 'message' AND _fc_s.turn_id = {tid}
              ), 0)
-             IS COALESCE((
-                SELECT _fc_t.{bucket} FROM usage_events _fc_t
-                WHERE _fc_t.instance_id = {inst}
-                  AND _fc_t.scope = 'turn' AND _fc_t.scope_id = {tid}
-             ), 0)"
+             = (SELECT _fc_t2.{bucket} FROM usage_events _fc_t2
+                WHERE _fc_t2.instance_id = {inst}
+                  AND _fc_t2.scope = 'turn' AND _fc_t2.scope_id = {tid}))"
         ));
     }
-    // Cost: NULL-safe (an unpriced turn and unpriced messages are both NULL).
-    conds.push(format!(
-        "(SELECT CAST(SUM(_fc_sc.cost_usd) AS REAL) FROM usage_events _fc_sc
-          WHERE _fc_sc.instance_id = {inst}
-            AND _fc_sc.scope = 'message' AND _fc_sc.turn_id = {tid})
-         IS (SELECT CAST(_fc_tc.cost_usd AS REAL) FROM usage_events _fc_tc
-             WHERE _fc_tc.instance_id = {inst}
-               AND _fc_tc.scope = 'turn' AND _fc_tc.scope_id = {tid})"
-    ));
     conds.join(" AND ")
 }
 

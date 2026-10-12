@@ -2770,11 +2770,16 @@ it("r12 item 5: a replaced request A resolving late never re-arms over B's recon
 
   // A's POST hangs; B (requested next) accepts immediately and arms its
   // reconciliation. Then A's POST resolves late and tries to arm too.
-  let resolveA: (v: unknown) => void = () => {};
+  let resolveA: () => void = () => {};
   let configureCalls = 0;
   vi.spyOn(api, "instanceConfigure").mockImplementation(async () => {
     const n = configureCalls++;
-    if (n === 0) return await new Promise((resolve) => { resolveA = resolve; });
+    if (n === 0) {
+      const result = await new Promise<never>((resolve) => {
+        resolveA = () => resolve(undefined as never);
+      });
+      return result;
+    }
     return {} as never;
   });
 
@@ -2789,7 +2794,7 @@ it("r12 item 5: a replaced request A resolving late never re-arms over B's recon
 
   // A resolves after B has armed: A's arm must NOT replace B's slot/timer.
   await advanceEffortReconcile(14_000);
-  resolveA({});
+  resolveA();
   await a;
   await Promise.resolve();
   await Promise.resolve();

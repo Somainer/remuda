@@ -2304,15 +2304,25 @@ async fn map_loop(
         // sent after the child's natural exit can never start a turn.
         let overflow_owns_terminal;
         {
-            // ma-sdk-state r18 item 2 (test-stub): acknowledge the natural-EOF
-            // reader's guard acquisition at BOTH ends — immediately BEFORE the
-            // lock await and again once it ENTERS. With an overflow decision
-            // parked holding the gate, a regression proves the reader is
-            // BLOCKED on the guard (the entry ack stays absent inside a
-            // bounded check after the pre-lock ack) rather than running its
-            // seal gate-free.
+            // ma-sdk-state r19 item 1 (test-stub): POSITIVE proof the natural-
+            // EOF reader is blocked ON this guard at the acquisition point.
+            // The reader announces it reached the point, then probes with a
+            // non-awaiting try_lock: a `WouldBlock` answer reports the gate is
+            // held AT THAT INSTANT — unlike the r18 item 2 absence window, a
+            // merely-descheduled reader reports nothing. During the proof the
+            // only holder there can be is the overflowing send parked in its
+            // admission section: the spawned overflow shutdown is itself a
+            // queued waiter behind that send (it takes this same gate only
+            // after the send releases), and no fence/close acquisition runs.
+            // On a free gate the probe acquires and drops a scratch guard and
+            // reports nothing; the real acquisition then proceeds gate-free.
             #[cfg(feature = "test-stub")]
-            test_barrier::note_eof_seal_lock_wait(&inner.barrier);
+            {
+                test_barrier::note_eof_seal_lock_wait(&inner.barrier);
+                if Arc::clone(&launch.publish).try_lock_owned().is_err() {
+                    test_barrier::note_eof_seal_lock_contended(&inner.barrier);
+                }
+            }
             let gate = launch.publish.lock().await;
             #[cfg(feature = "test-stub")]
             test_barrier::note_eof_seal_entered(&inner.barrier);
@@ -3357,11 +3367,19 @@ pub mod test_barrier {
         overflow_shutdown_registered: AtomicUsize,
         /// ma-sdk-state r18 item 2: number of natural-EOF readers that
         /// reached the publish-gate acquisition, fired immediately BEFORE the
-        /// lock await. Paired with [`Self::eof_seal_entered_count`]: with an
-        /// overflow decision parked holding the gate, the second count staying
-        /// 0 while the first is set proves — after a bounded check — that the
-        /// reader is BLOCKED on the held guard rather than sealing gate-free.
+        /// lock await.
         eof_seal_lock_wait_count: AtomicUsize,
+        /// ma-sdk-state r19 item 1: number of natural-EOF readers whose
+        /// acquisition-point probe found the publish gate ALREADY HELD (a
+        /// `try_lock` answered `WouldBlock`). This POSITIVE contention report
+        /// replaces the r18 item 2 absence window: the reader has provably
+        /// reached the acquisition (its lock-wait ack fired) and the gate is
+        /// held at that same instant, so the reader is blocked ON the guard —
+        /// a reader that merely has not been scheduled yet reports nothing.
+        /// While the proof runs the only possible holder is the overflowing
+        /// send parked in its admission section: the spawned shutdown is a
+        /// queued waiter behind it, and fence/close acquisitions are absent.
+        eof_seal_lock_contended_count: AtomicUsize,
         /// ma-sdk-state r18 item 2: number of natural-EOF readers that
         /// ENTERED the publish gate for the seal (lock acquired; the latch
         /// load/seal decision has not run yet).
@@ -3437,10 +3455,11 @@ pub mod test_barrier {
             overflow_spawn_gate_open: AtomicBool::new(true),
             overflow_spawn_gate: tokio::sync::Notify::new(),
             overflow_spawn_standdowns: AtomicUsize::new(0),
-            // r18 items 1/2: registration and EOF acquisition counters start
-            // clean per arm.
+            // r18 items 1/2; r19 item 1: registration and EOF acquisition
+            // counters start clean per arm.
             overflow_shutdown_registered: AtomicUsize::new(0),
             eof_seal_lock_wait_count: AtomicUsize::new(0),
+            eof_seal_lock_contended_count: AtomicUsize::new(0),
             eof_seal_entered_count: AtomicUsize::new(0),
         });
         *slot.lock().expect("barrier lock") = Some(state.clone());
@@ -3754,6 +3773,20 @@ pub mod test_barrier {
         if let Some(state) = current(slot) {
             state
                 .eof_seal_lock_wait_count
+                .fetch_add(1, Ordering::AcqRel);
+            state.state_changed.notify_waiters();
+        }
+    }
+
+    /// ma-sdk-state r19 item 1 hook: the natural-EOF reader's acquisition-
+    /// point `try_lock` found the publish gate ALREADY HELD (`WouldBlock`).
+    /// The positive counterpart of [`note_eof_seal_lock_wait`]: paired with
+    /// it, a regression proves the reader is blocked ON the held guard at the
+    /// exact acquisition point rather than merely not yet scheduled.
+    pub(super) fn note_eof_seal_lock_contended(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state
+                .eof_seal_lock_contended_count
                 .fetch_add(1, Ordering::AcqRel);
             state.state_changed.notify_waiters();
         }
@@ -4308,6 +4341,31 @@ pub mod test_barrier {
                     format!(
                         "write_commit barrier: timed out waiting for {n} EOF readers to reach \
                          the publish-gate acquisition (lock waits={})",
+                        self.state.eof_seal_lock_wait_count.load(Ordering::Acquire)
+                    )
+                },
+            )
+            .await;
+        }
+
+        /// ma-sdk-state r19 item 1: wait until `n` natural-EOF readers report
+        /// the publish gate HELD at their acquisition-point probe (a
+        /// `try_lock` that answered `WouldBlock`). This POSITIVE contention
+        /// handshake replaces the absence window: it completes only when a
+        /// reader actually reached the acquisition and found the guard held.
+        pub async fn wait_until_eof_seal_lock_contended(&self, n: usize, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            wait_until_with(
+                &self.state,
+                deadline,
+                move |state| state.eof_seal_lock_contended_count.load(Ordering::Acquire) >= n,
+                || {
+                    format!(
+                        "write_commit barrier: timed out waiting for {n} EOF readers to find the \
+                         publish gate held at the acquisition point (contended={}, lock waits={})",
+                        self.state
+                            .eof_seal_lock_contended_count
+                            .load(Ordering::Acquire),
                         self.state.eof_seal_lock_wait_count.load(Ordering::Acquire)
                     )
                 },

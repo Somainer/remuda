@@ -2060,33 +2060,30 @@ async fn a_genuine_eof_while_the_overflow_shutdown_is_paused_leaves_it_the_one_t
         .expect("the RunHandle reaches recv=None after close");
 }
 
-/// ma-sdk-state r17 item 1 race regression, strengthened in ma-sdk-state r18
-/// item 2 for the r18 item 1 synchronous ownership decision.
+/// ma-sdk-state r17 item 1 race regression, re-sequenced in r18 item 2 and
+/// given a POSITIVE contention proof in ma-sdk-state r19 item 1.
 ///
 /// The breaching RESERVATION decides ownership WHILE holding the publish
 /// admission gate (latch swap, closed check, task registration one
 /// synchronous section) and then parks at its relocated post-decision gate
 /// STILL HOLDING the gate. A genuine reader EOF must then BLOCK on the
-/// publication guard: this is proved with a NAMED bounded handshake — the
-/// reader's pre-lock acquisition ack, then a bounded window in which its
-/// entry ack stays absent — BEFORE either gate is released. The pre-fix code
-/// dropped the guard and parked the send OUTSIDE it, so the EOF reader
-/// entered and sealed gate-free (the entry ack fires immediately) and the
-/// overflow decision raced the sealed ordinary EOF terminal. Only after the
-/// blocked-on-guard proof does the test release the send: the reader enters,
-/// loads the already-set latch and SUPPRESSES the ordinary StdoutEof,
-/// leaving the registered overflow shutdown to deliver the single
+/// publication guard: this is proved with a NAMED bounded handshake at the
+/// reader's acquisition point — after the reader announces it reached the
+/// point, a non-awaiting `try_lock` must ANSWER `WouldBlock` and that positive
+/// contention report is awaited through a bounded wait (a timeout FAILS the
+/// proof; a merely descheduled reader reports nothing, so it can no longer
+/// satisfy the check the way the old 750 ms absence window allowed). Every
+/// other possible holder is gated while the proof runs — the spawned
+/// overflow shutdown is itself queued BEHIND the send, and no fence or close
+/// acquisition exists — so contention names the send as the holder. Only
+/// after that positive proof does the test release the send: the reader
+/// enters, loads the already-set latch and SUPPRESSES the ordinary
+/// StdoutEof, leaving the registered overflow shutdown to deliver the single
 /// publication_backlog_overflow terminal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_overflow_decided_under_the_admission_gate_suppresses_a_later_genuine_eof() {
     const ITEM_CAP: usize = 256;
     const BYTE_CAP: usize = 256 * 1024;
-    /// Bounded window in which the parked EOF reader must NOT enter the guard
-    /// the overflowing send holds. Long enough that a gate-free entry (an
-    /// uncontended mutex acquisition) can never miss it on a loaded shared
-    /// box, short enough that the reader actually holding the guard cannot
-    /// enter at all before the send releases.
-    const BLOCKED_PROOF: Duration = Duration::from_millis(750);
 
     // Silent prompts trip the RESERVATION backlog without producing a single
     // stdout frame (same flood shape as the r16 item 1 proof).
@@ -2140,22 +2137,17 @@ async fn an_overflow_decided_under_the_admission_gate_suppresses_a_later_genuine
         .wait_until_eof_seal_lock_waits(1, Duration::from_secs(10))
         .await;
 
-    // NAMED bounded handshake: with the overflowing send holding the guard,
-    // the EOF reader's seal must NOT have run — its gate-entry ack stays
-    // absent for the whole window. With the decision guard reverted the
-    // reader enters the free guard and the ack fires immediately, failing
-    // this assertion with the defect named.
-    let entered = wait_bounded(
-        barrier.wait_until_eof_seal_entered(1, Duration::from_secs(30)),
-        BLOCKED_PROOF,
-        "the parked EOF reader must not enter the guard the overflow decision holds",
-    )
-    .await;
-    assert_elapsed(
-        entered,
-        "the EOF reader entered the publish guard while the overflowing send was parked \
-         holding it: the ownership decision was not serialized with the EOF seal",
-    );
+    // POSITIVE bounded handshake (r19 item 1): the reader reached the
+    // acquisition and its acquisition-point try_lock FOUND THE GATE HELD.
+    // That report can only come from a contended try_lock — a reader that has
+    // merely not been polled yet reports nothing, and with the decision guard
+    // reverted the reader's probe takes the free guard, so the wait times
+    // out and FAILS the proof with the defect named (it is never allowed to
+    // pass on a timeout). The spawned overflow shutdown is queued behind the
+    // send and no fence/close runs here, so the holder is the parked send.
+    barrier
+        .wait_until_eof_seal_lock_contended(1, Duration::from_secs(10))
+        .await;
 
     // Only NOW release the send. It drops the admission gate and returns its
     // refusal; the reader enters, loads the already-set latch and parks

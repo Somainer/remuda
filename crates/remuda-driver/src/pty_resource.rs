@@ -45,23 +45,37 @@ impl PtyResource {
         Client::connect(&self.socket_path).with_timeout(Duration::from_secs(2))
     }
 
-    /// Interrupt the agent, then close and verify every pane, tab and the
-    /// workspace this Instance owns.
+    /// Phase 1 of close: interrupt the native writer (Ctrl-C) and wait a
+    /// bounded grace for it to leave, while every pane, tab and the workspace
+    /// stay alive.
     ///
-    /// The interrupt is a courtesy with a bounded grace: an agent that ignores
-    /// `ctrl+c` must not keep a pane alive, because the Instance is already
-    /// gone as far as the Hub is concerned and the pane would be an orphan in
-    /// the operator's Herdr session forever. After the grace the panes are
-    /// closed explicitly — closing the tab alone is not enough, since
-    /// `pane.split` may have landed the agent outside the recorded tab.
+    /// The collector drains the usage record the native appends WHILE HANDLING
+    /// the interrupt (the interrupted turn) only if it is still reading when
+    /// that append lands, so callers must run this BEFORE their final
+    /// transcript drain and [`Self::reap`] only afterwards
+    /// (c-ctxusage r12 item 1).
     ///
-    /// Success proves carrier removal, never task success.
-    pub async fn close(&self) -> DriverResult<()> {
+    /// Best effort throughout: the caller reaps either way, so a Herdr RPC
+    /// failure here must not abort reclamation.
+    pub async fn interrupt(&self) -> DriverResult<()> {
         let client = self.client();
         if !self.owned_workspace_present(&client).await? {
             return Ok(());
         }
         self.interrupt_agent(&client).await;
+        Ok(())
+    }
+
+    /// Phase 2 of close: close and verify every pane, tab and the workspace
+    /// this Instance owns, AFTER the caller drained the final transcript
+    /// append.
+    ///
+    /// Success proves carrier removal, never task success.
+    pub async fn reap(&self) -> DriverResult<()> {
+        let client = self.client();
+        if !self.owned_workspace_present(&client).await? {
+            return Ok(());
+        }
         // Every pane here belongs to this Instance: the workspace was created
         // for it with a unique label, and the check above proved this is still
         // that workspace and not an id reused after a server restart.
@@ -86,6 +100,24 @@ impl PtyResource {
             )));
         }
         Ok(())
+    }
+
+    /// Interrupt the agent, then close and verify every pane, tab and the
+    /// workspace this Instance owns. Equivalent to [`Self::interrupt`]
+    /// followed by [`Self::reap`]; callers that must drain a native
+    /// transcript append between the two phases call them separately.
+    ///
+    /// The interrupt is a courtesy with a bounded grace: an agent that ignores
+    /// `ctrl+c` must not keep a pane alive, because the Instance is already
+    /// gone as far as the Hub is concerned and the pane would be an orphan in
+    /// the operator's Herdr session forever. After the grace the panes are
+    /// closed explicitly — closing the tab alone is not enough, since
+    /// `pane.split` may have landed the agent outside the recorded tab.
+    ///
+    /// Success proves carrier removal, never task success.
+    pub async fn close(&self) -> DriverResult<()> {
+        self.interrupt().await?;
+        self.reap().await
     }
 
     /// Is this exact workspace — same id *and* creation label — still present?
@@ -261,10 +293,25 @@ impl PtyResources {
         Ok(())
     }
 
-    pub async fn close(&self) -> DriverResult<()> {
+    /// Phase 1 of close: interrupt every owned native writer and wait a bound
+    /// for it to leave, keeping the panes/workspaces alive so the caller can
+    /// drain the interrupted turn's final transcript append before reaping
+    /// (c-ctxusage r12 item 1).
+    pub async fn interrupt(&self) -> DriverResult<()> {
+        let resources = self.resources.lock().await;
+        for resource in resources.iter().rev() {
+            resource.interrupt().await?;
+        }
+        Ok(())
+    }
+
+    /// Phase 2 of close: tear down and verify every pane/tab/workspace and
+    /// forget ownership. Call ONLY after the final transcript drain
+    /// ([`Self::interrupt`] ran first).
+    pub async fn reap(&self) -> DriverResult<()> {
         let mut resources = self.resources.lock().await;
         while let Some(resource) = resources.last() {
-            resource.close().await?;
+            resource.reap().await?;
             if let Some((_, store)) = self
                 .owner
                 .lock()
@@ -276,5 +323,10 @@ impl PtyResources {
             resources.pop();
         }
         Ok(())
+    }
+
+    pub async fn close(&self) -> DriverResult<()> {
+        self.interrupt().await?;
+        self.reap().await
     }
 }

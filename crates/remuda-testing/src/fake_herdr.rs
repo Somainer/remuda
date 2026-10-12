@@ -122,6 +122,15 @@ pub struct FakeHerdrOptions {
     /// Unlink the socket and stop serving once the shutdown window ends,
     /// modelling a server that actually exits.
     pub exit_after_unavailable: bool,
+    /// When set, a `pane.send_keys` carrying ctrl+c against a LIVE agent
+    /// appends the contents of `interrupt_record_file` to this transcript
+    /// (modelling the native writer appending the interrupted turn's usage
+    /// record while handling Ctrl-C) and then drops the agent from the agent
+    /// list (modelling its termination).
+    pub interrupt_transcript: Option<PathBuf>,
+    /// File whose contents are appended to `interrupt_transcript` on the first
+    /// live-agent ctrl+c.
+    pub interrupt_record_file: Option<PathBuf>,
 }
 
 impl FakeHerdrOptions {
@@ -134,6 +143,8 @@ impl FakeHerdrOptions {
             agent_start_delay: Duration::ZERO,
             unavailable_calls: 0,
             exit_after_unavailable: false,
+            interrupt_transcript: None,
+            interrupt_record_file: None,
         }
     }
 
@@ -157,6 +168,19 @@ impl FakeHerdrOptions {
     #[must_use]
     pub fn exiting_after_shutdown(mut self) -> Self {
         self.exit_after_unavailable = true;
+        self
+    }
+
+    /// Model a native writer that appends `record_file`'s contents to
+    /// `transcript` and then terminates when a LIVE agent receives ctrl+c.
+    #[must_use]
+    pub fn interrupt_appends_record(
+        mut self,
+        transcript: impl Into<PathBuf>,
+        record_file: impl Into<PathBuf>,
+    ) -> Self {
+        self.interrupt_transcript = Some(transcript.into());
+        self.interrupt_record_file = Some(record_file.into());
         self
     }
 }
@@ -228,6 +252,12 @@ impl FakeHerdrServer {
                 "FAKE_HERDR_START_DELAY_MS",
                 options.agent_start_delay.as_millis().to_string(),
             );
+        }
+        if let Some(transcript) = &options.interrupt_transcript {
+            command.env("FAKE_HERDR_INTERRUPT_TRANSCRIPT", transcript);
+        }
+        if let Some(record_file) = &options.interrupt_record_file {
+            command.env("FAKE_HERDR_INTERRUPT_RECORD", record_file);
         }
 
         let mut child = command
@@ -388,6 +418,14 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(Duration::ZERO);
+    let interrupt_transcript = std::env::var("FAKE_HERDR_INTERRUPT_TRANSCRIPT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let interrupt_record_file = std::env::var("FAKE_HERDR_INTERRUPT_RECORD")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -476,6 +514,8 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             agent_start_delay,
             unavailable_calls,
             exit_after_unavailable,
+            interrupt_transcript,
+            interrupt_record_file,
         }));
     }
     Err(FakeHerdrError::Args(format!(
@@ -582,6 +622,8 @@ async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
         options.agent_start_delay,
         options.unavailable_calls,
         options.exit_after_unavailable,
+        options.interrupt_transcript,
+        options.interrupt_record_file,
     )));
     // Only the scripted shutdown window (`exit_after_unavailable`) stops the
     // accept loop. Parent death is handled by the outer `parent_watch`
@@ -631,6 +673,11 @@ struct State {
     slow_until: HashMap<String, Instant>,
     /// Index into [`ONBOARDING_STEPS`] per agent, for the `onboarding` script.
     onboarding_step: HashMap<String, usize>,
+    /// When set, the first ctrl+c sent to a pane with a live agent appends
+    /// `interrupt_record_file` to `interrupt_transcript` and then removes the
+    /// agent (the native-writer-finishes-on-Ctrl-C-C test model).
+    interrupt_transcript: Option<PathBuf>,
+    interrupt_record_file: Option<PathBuf>,
 }
 
 impl State {
@@ -639,6 +686,8 @@ impl State {
         agent_start_delay: Duration,
         unavailable_calls: usize,
         exit_after_unavailable: bool,
+        interrupt_transcript: Option<PathBuf>,
+        interrupt_record_file: Option<PathBuf>,
     ) -> Self {
         Self {
             script,
@@ -658,6 +707,8 @@ impl State {
             shell_panes: HashSet::new(),
             slow_until: HashMap::new(),
             onboarding_step: HashMap::new(),
+            interrupt_transcript,
+            interrupt_record_file,
         }
     }
 
@@ -1108,6 +1159,19 @@ fn pane_send_keys(st: &mut State, params: &Value) -> Result<Value, (&'static str
         .get("pane_id")
         .and_then(Value::as_str)
         .ok_or(("invalid_request", "missing pane_id".into()))?;
+    let keys: Vec<String> = params
+        .get("keys")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if keys.iter().any(|key| key == "ctrl+c") {
+        interrupt_live_agent(st, pane_id);
+    }
     if let Some(name) = st
         .agents
         .iter()
@@ -1118,6 +1182,37 @@ fn pane_send_keys(st: &mut State, params: &Value) -> Result<Value, (&'static str
         advance_onboarding(st, &name);
     }
     ok()
+}
+
+/// Model the native writer's Ctrl-C handling: append the interrupted turn's
+/// record to the transcript and terminate (leave the agent list; the pane
+/// reverts to its root shell). Fires only for a pane that still has a live
+/// agent, so the courtesy double-tap appends exactly once.
+fn interrupt_live_agent(st: &mut State, pane_id: &str) {
+    if !st.agents.values().any(|agent| agent.pane_id == pane_id) {
+        return;
+    }
+    if let (Some(transcript), Some(record_file)) =
+        (&st.interrupt_transcript, &st.interrupt_record_file)
+    {
+        if let Ok(record) = std::fs::read_to_string(record_file) {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(transcript)
+                && file.write_all(record.as_bytes()).is_ok()
+            {
+                let _ = file.sync_all();
+            }
+        }
+    }
+    st.agents.retain(|_, agent| agent.pane_id != pane_id);
+    st.shell_panes.insert(pane_id.to_string());
+    if let Some(pane) = st.panes.get_mut(pane_id) {
+        pane.agent = None;
+        pane.agent_status = AgentStatus::Unknown;
+    }
 }
 
 fn pane_process_info(st: &mut State, params: &Value) -> Result<Value, (&'static str, String)> {

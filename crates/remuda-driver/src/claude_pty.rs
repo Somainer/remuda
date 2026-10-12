@@ -1207,6 +1207,14 @@ impl Driver for ClaudePtyDriver {
         if let Some(task) = live.catalog_task.take() {
             task.abort();
         }
+        // c-ctxusage r12 item 1: stop the native writer FIRST and wait a bound
+        // for it to leave, while the transcript collector and observation
+        // sender stay alive. Claude appends the interrupted turn's usage
+        // record WHILE HANDLING Ctrl-C; signalling only after the final drain
+        // (the old order) let that append land past the pump's retirement and
+        // lost it. The final drain below reads the append; the panes and the
+        // workspace are reaped only after that.
+        self.resources.interrupt().await?;
         // c-ctxusage r4 item 2: cooperative transcript shutdown — signal, let
         // the pump read the final append and publish a finalised last turn,
         // then wait one poll window before forcing the issue.
@@ -1239,7 +1247,9 @@ impl Driver for ClaudePtyDriver {
         let ctx = live.ctx.clone();
         let recipe = live.recipe.clone();
         drop(inner);
-        self.resources.close().await?;
+        // Phase 2 of close: the final transcript append interrupted by Ctrl-C
+        // is drained above; tear down the panes/tab/workspace now.
+        self.resources.reap().await?;
         // S5: the pane is closed, so the launch overlays can go.
         crate::recipe::report_launch_cleanup(&recipe, "claude-pty");
         crate::claude_pty::emit_pty_closed(&events, &self.seq, &ctx).await?;

@@ -1765,6 +1765,11 @@ async fn map_loop(
         // result is queued behind the parked ticket (ma-sdk-state r6 item 3).
         #[cfg(feature = "test-stub")]
         let is_turn_result = matches!(&frame, Outbound::Result(_));
+        // test-stub (r12 item 2): optionally withhold a result frame from the
+        // queue until the test releases it, so a later turn's result cannot
+        // race the ordered processing of an earlier cancelled ticket.
+        #[cfg(feature = "test-stub")]
+        test_barrier::hold_result_enqueue(&inner.barrier, &frame).await;
         match publisher.admit_frame(PublishJob::Frame(Box::new(frame))) {
             Ok(()) => {}
             Err((BacklogAdmitError::Closed, _)) => break,
@@ -2435,6 +2440,17 @@ pub mod test_barrier {
         cancelled_ticket_reached: AtomicBool,
         cancelled_gate_open: AtomicBool,
         cancelled_gate: tokio::sync::Notify,
+        /// r12 item 2: number of CANCELLED tickets whose at-position rollback
+        /// the worker COMPLETED (not merely reached), so a test can prove a
+        /// newer turn's cancellation was fully processed BEFORE releasing an
+        /// older turn's result frame.
+        cancelled_rollback_done: AtomicUsize,
+        /// r12 item 2: reader gate that withholds a turn RESULT frame from the
+        /// publication queue. Open by default; a test shuts it to stop a later
+        /// turn's result racing ahead of a cancelled ticket's processing.
+        result_enqueue_parked: AtomicBool,
+        result_enqueue_open: AtomicBool,
+        result_enqueue_gate: tokio::sync::Notify,
         /// r11 item 2: the reader observed natural stdout EOF, sealed
         /// reservation admission, and queued StdoutEof from the seal critical
         /// section. A send attempted only after this is set must lose the
@@ -2490,6 +2506,10 @@ pub mod test_barrier {
             // cancelled ticket and its rollback shuts this explicitly.
             cancelled_gate_open: AtomicBool::new(true),
             cancelled_gate: tokio::sync::Notify::new(),
+            cancelled_rollback_done: AtomicUsize::new(0),
+            result_enqueue_parked: AtomicBool::new(false),
+            result_enqueue_open: AtomicBool::new(true),
+            result_enqueue_gate: tokio::sync::Notify::new(),
             stdout_eof_queued: AtomicBool::new(false),
             backlog_overflowed: AtomicBool::new(false),
             rollback_wait_count: AtomicUsize::new(0),
@@ -2587,6 +2607,38 @@ pub mod test_barrier {
         if let Some(state) = current(slot) {
             state.result_queued.store(true, Ordering::Release);
             state.result_enqueued_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// r12 item 2 reader hook: while the result-enqueue gate is shut, park the
+    /// READER before admitting a turn `result` frame to the publication queue.
+    /// This withholds the later turn's result deterministically (no queue-order
+    /// race) until the test releases it. Non-result frames and periods with no
+    /// armed/shut gate pass straight through.
+    pub(super) async fn hold_result_enqueue(slot: &Slot, frame: &remuda_claude_wire::Outbound) {
+        if !matches!(frame, remuda_claude_wire::Outbound::Result(_)) {
+            return;
+        }
+        let Some(state) = current(slot) else {
+            return;
+        };
+        state.result_enqueue_parked.store(true, Ordering::Release);
+        if state.result_enqueue_open.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = state.result_enqueue_gate.notified();
+        if state.result_enqueue_open.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+
+    /// r12 item 2 worker hook: a cancelled ticket's at-position rollback has
+    /// COMPLETED (the book was rolled back and any released correction decided
+    /// and emitted or suppressed at the ticket position).
+    pub(super) fn note_cancelled_rollback_done(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state.cancelled_rollback_done.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -2776,6 +2828,67 @@ pub mod test_barrier {
         pub fn release_cancelled_ticket(&self) {
             if !self.state.cancelled_gate_open.swap(true, Ordering::AcqRel) {
                 self.state.cancelled_gate.notify_waiters();
+            }
+        }
+
+        /// r12 item 2: wait until `n` cancelled tickets have been fully rolled
+        /// back AT THEIR TICKET POSITIONS (not merely reached by the worker).
+        pub async fn wait_until_cancelled_rollbacks_done(&self, n: usize, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.cancelled_rollback_done.load(Ordering::Acquire) >= n {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "write_commit barrier: timed out waiting for {n} cancelled-ticket \
+                         rollbacks to complete (done={})",
+                        self.state.cancelled_rollback_done.load(Ordering::Acquire)
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        /// r12 item 2: SHUT the reader result-enqueue gate so the next turn
+        /// `result` frame is withheld from the publication queue until
+        /// [`Self::release_result_enqueue`]. Resets the parked marker so a
+        /// result that reached the gate while it was still open cannot satisfy
+        /// a later "withheld" acknowledgement.
+        pub fn hold_result_enqueue(&self) {
+            self.state
+                .result_enqueue_parked
+                .store(false, Ordering::Release);
+            self.state
+                .result_enqueue_open
+                .store(false, Ordering::Release);
+        }
+
+        /// r12 item 2: release a withheld turn result into the publication
+        /// queue.
+        pub fn release_result_enqueue(&self) {
+            if !self.state.result_enqueue_open.swap(true, Ordering::AcqRel) {
+                self.state.result_enqueue_gate.notify_waiters();
+            }
+        }
+
+        /// r12 item 2: wait until the reader reached a result frame and is
+        /// parked on the shut enqueue gate — the result is provably withheld.
+        pub async fn wait_until_result_enqueue_parked(&self, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if self.state.result_enqueue_parked.load(Ordering::Acquire)
+                    && !self.state.result_enqueue_open.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "write_commit barrier: timed out waiting for the reader to park on \
+                         the shut result-enqueue gate"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
             }
         }
 
@@ -3175,7 +3288,13 @@ async fn publish_worker(inner: Arc<Inner>, mut rx: mpsc::UnboundedReceiver<Publi
                         // ordered rollback fires.
                         #[cfg(feature = "test-stub")]
                         test_barrier::hold_cancelled_ticket(&inner.barrier).await;
-                        rollback_reservation_at_ticket(&inner, reservation.seq).await
+                        let rolled_back =
+                            rollback_reservation_at_ticket(&inner, reservation.seq).await;
+                        // r12 item 2: acknowledge the rollback COMPLETED at the
+                        // ticket position before any later job is handled.
+                        #[cfg(feature = "test-stub")]
+                        test_barrier::note_cancelled_rollback_done(&inner.barrier);
+                        rolled_back
                     }
                 }
                 .await

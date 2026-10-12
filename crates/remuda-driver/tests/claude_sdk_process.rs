@@ -2382,6 +2382,17 @@ async fn cancelling_b_emits_a_settlement_at_its_ticket_position_before_c_starts(
 /// mid-turn (Node/Hub would otherwise read the session idle mid-turn). B's own
 /// result settles the root ordinarily. Pre-fix, C's cancel released the
 /// deferral purely because one existed, emitting a bogus correction.
+///
+/// r12 item 2: the schedule is now ACKNOWLEDGED end to end rather than raced.
+/// `prepare_prompt_write` releases `write_seq` at writer-enqueue acceptance,
+/// before the detached write ack, so releasing B also lets C proceed and B's
+/// result could race C's reservation — the old test could pass with the bug
+/// (B's ordinary settle cleared the deferral before C's rollback ran) or fail
+/// correct code. The controlled order here is: B COMMITted before A's result
+/// is released to the mapper; the reader WITHHOLDS B's result frame until C's
+/// cancelled ticket is fully rolled back AT ITS TICKET POSITION; only then is
+/// B's result released, so the rollback provably runs with B still active and
+/// A's settle still deferred.
 #[tokio::test]
 async fn cancelling_a_newer_c_while_older_b_is_active_does_not_release_a_deferred_settle() {
     let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
@@ -2404,31 +2415,40 @@ async fn cancelling_a_newer_c_while_older_b_is_active_does_not_release_a_deferre
         .expect("send_a task within 5s")
         .expect("send_a joined")
         .expect("A acked");
+    // A committed: the worker emitted start_A and is parked after it with the
+    // worker gate STILL shut — result_A (queued ahead of B's ticket) is not
+    // mapped yet.
 
-    // B reserves; its book is open when the worker maps A's result -> deferred.
+    // B reserves; acknowledge its ticket before anything else moves.
     let db = driver.clone();
     let send_b = tokio::spawn(async move { db.send(prompt_id("second", "msg-b")).await });
     barrier
         .wait_until_reserves_enqueued(2, Duration::from_secs(5))
         .await;
-    barrier.resume_worker();
-    barrier
-        .wait_until_results_mapped(1, Duration::from_secs(5))
-        .await;
 
     // C queues behind B on write_seq; its write will take the forced fault.
+    // ACKNOWLEDGE C is actually parked on write_seq behind B (count 2: B holds
+    // it, C waits) before B is released.
     driver.force_write_failure_from(3);
     let dc = driver.clone();
     let send_c = tokio::spawn(async move { dc.send(prompt_id("never-written-c", "msg-c")).await });
+    barrier
+        .wait_until_write_seq_waits(2, Duration::from_secs(5))
+        .await;
 
-    // Open the pre-ack gate: B proceeds to its writer and commits, releasing
-    // write_seq to C; C enqueues its ticket (count 3) and takes the forced
-    // fault before the writer accepts it.
+    // WITHHOLD B's result frame from the publication queue BEFORE B writes, so
+    // it cannot race C's ticket (the r12 item 2 defect).
+    barrier.hold_result_enqueue();
+
+    // Open the pre-ack gate: B proceeds to its writer, enqueues (releasing
+    // write_seq at acceptance), its detached task COMMITs; C enqueues its
+    // ticket (count 3) and takes the forced fault before the writer accepts.
+    // The worker gate is still shut, so neither result_A nor any ticket moves
+    // while this plays out.
     barrier.release_write_ack();
     barrier
         .wait_until_reserves_enqueued(3, Duration::from_secs(5))
         .await;
-
     let b = tokio::time::timeout(Duration::from_secs(5), send_b)
         .await
         .expect("send_b task within 5s")
@@ -2439,13 +2459,37 @@ async fn cancelling_a_newer_c_while_older_b_is_active_does_not_release_a_deferre
         .expect("send_c task within 5s")
         .expect("send_c joined");
     assert!(c.is_err(), "C's forced-fault write fails: {c:?}");
+    // B is now COMMITTED (mid-turn) before A's result is released.
 
-    // ACKNOWLEDGED FENCE: B's result (the ordinary settle) is mapped before the
-    // fence, so every start/settlement in publication order is counted.
+    // Release the worker: it maps result_A (deferred behind B), emits start_B
+    // at B's ticket, then reaches C's cancelled ticket.
+    barrier.resume_worker();
+    barrier
+        .wait_until_results_mapped(1, Duration::from_secs(5))
+        .await;
+    // C's cancelled ticket is fully rolled back AT ITS POSITION while B is
+    // still active and result_B is withheld from the queue.
+    barrier
+        .wait_until_cancelled_rollbacks_done(1, Duration::from_secs(5))
+        .await;
+    // Acknowledge the reader really is holding result_B at the shut gate —
+    // not merely that no result happened to arrive yet.
+    barrier
+        .wait_until_result_enqueue_parked(Duration::from_secs(5))
+        .await;
+
+    // NOW release B's result: it maps and settles B's own root ordinarily.
+    barrier.release_result_enqueue();
     barrier
         .wait_until_results_mapped(2, Duration::from_secs(5))
         .await;
-    let fence = driver.publication_fence().await;
+
+    // ACKNOWLEDGED FENCE: every job up to the withheld-then-released result is
+    // published, so the complete observation order is asserted, not sampled.
+    // r12 item 3 replaces this inline bound with the shared named helper.
+    let fence = tokio::time::timeout(Duration::from_secs(5), driver.publication_fence())
+        .await
+        .expect("publication fence enqueued within 5s");
     let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
 
     assert_eq!(

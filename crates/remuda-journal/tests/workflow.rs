@@ -2316,3 +2316,112 @@ fn a_pending_record_that_grew_then_shrank_back_invalidates_its_cover() {
         "the shrink removed grown bytes: the cover is gone and the different retry is genuine"
     );
 }
+
+/// c-cardsettle-fu2 r9 item 4: a Complete cover must not survive an observed
+/// truncation INTO its record. The complete attempt-2 start (no newline yet)
+/// is covered at W; the writer truncates to W+1 (keeping "{"), the shrink is
+/// observed, and the rest of a BYTE-IDENTICAL retry is appended afterwards.
+/// r8 retired a Complete cover only once the file shrank to/below its start
+/// offset, so the byte-identical rewrite matched the digest and stayed
+/// Failed; the independent cover binds the whole covered byte range and is
+/// retired as soon as any of those bytes is removed — sticky across a later
+/// (other-member) peek — so the physically rewritten, byte-identical record
+/// is a genuine retry and resurrects.
+#[test]
+fn a_byte_identical_retry_after_a_shrink_into_the_cover_is_genuine() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_r9_shrink_into_complete";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    std::fs::write(run_dir.join("agent-a2.jsonl"), "{}\n").unwrap();
+    let prefix = "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n\
+{\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n";
+    std::fs::write(run_dir.join("journal.jsonl"), prefix).unwrap();
+    let w = prefix.len() as u64;
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Failed),
+        "attempt 1 ends Failed and is consumed through W"
+    );
+
+    // Complete attempt-2 start WITHOUT its newline.
+    let attempt2 = "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}";
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        write!(journal, "{attempt2}").unwrap();
+    }
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+
+    // Truncate INTO the covered record: keep only "{" at W.
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        file.set_len(w + 1).unwrap();
+    }
+    let shrink_poll: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        shrink_poll
+            .iter()
+            .all(|state| *state == WorkflowState::Failed),
+        "the one-byte remnant folds nothing; a1 stays Failed for now: {shrink_poll:?}"
+    );
+
+    // A later OTHER-member failure peek must not re-arm a1's retired cover.
+    tailer
+        .agent_event("a2", true, Some(&run_dir.join("agent-a2.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a2", Some(&run_dir.join("agent-a2.jsonl")))
+        .unwrap();
+
+    // Append the remainder of a BYTE-IDENTICAL genuine retry plus newline.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(journal, "{}", &attempt2[1..]).unwrap();
+    }
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Running),
+        "the covered bytes were physically rewritten after a shrink into them; the \
+         byte-identical record is a genuine retry"
+    );
+}

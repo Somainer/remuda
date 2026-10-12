@@ -562,8 +562,8 @@ pub struct EffortTracker {
     /// (a refusal/timeout, drained by the mapper) ONLY when it still differs
     /// from the last published state, or cleared by the next authoritative
     /// effective-state publication (owned accept, assistant read-back, the
-    /// `/model` effort clause, or the ultra attachment). Its source is
-    /// terminal-side.
+    /// `/model` effort clause, the ultra attachment, or `/effort status`).
+    /// Its source is terminal-side.
     deferred: Option<ObservedEffort>,
 }
 
@@ -1020,6 +1020,14 @@ impl EffortTracker {
     /// ): it reports the current state rather than changing it. The reported
     /// level is ignored while an assistant record has established the
     /// effective level (the two can disagree — launch case g).
+    ///
+    /// c-effortread r20 ruling B′: status is an AUTHORITATIVE read-back like
+    /// the other channels and goes through the one shared reconcile, whether
+    /// or not it produces an edge. In particular a same-level status WITHOUT
+    /// the ` · Ultracode on` suffix is positive flag-OFF evidence: even when
+    /// its tuple equals the last published one it latches the flag off and
+    /// clears BOTH deferred copies, so a suppressed `{max, on}` cannot be
+    /// published by B's later refusal.
     pub fn note_status(
         &mut self,
         parsed: ObservedEffort,
@@ -1035,18 +1043,7 @@ impl EffortTracker {
             name,
             ultracode: self.flag,
         };
-        let edge = self.last != Some(observed);
-        self.last = Some(observed);
-        if edge {
-            // An authoritative status read-back differing from the last
-            // published state supersedes any suppressed acceptance held for
-            // later (r18 item 3). A same-value status settles nothing and must
-            // not swallow a deferred newer value.
-            self.deferred = None;
-            Some((observed, EffortSource::Unknown))
-        } else {
-            None
-        }
+        self.reconcile_authoritative(observed, EffortSource::Unknown)
     }
 
     /// Feed the `ultra_effort_enter|exit` attachment riding the next prompt.
@@ -2389,6 +2386,63 @@ mod tests {
         );
         // A repeat exit is a dedup.
         assert!(tracker.note_ultra_attachment(false).is_none());
+    }
+
+    #[test]
+    fn a_same_level_status_without_the_ultracode_suffix_clears_the_deferred_slot() {
+        // c-effortread r20 item 2 ruling B′: published {high, off}; while
+        // B=max is armed a suppressed "… max · Ultracode on" acceptance
+        // latches {max, on} and moves the flag latch on. A same-level status
+        // WITHOUT the ultracode suffix is positive flag-OFF evidence: it emits
+        // no edge but still goes through the shared reconcile — it latches the
+        // flag off and clears the deferred slot, so B's later refusal cannot
+        // publish the stale {max, on}.
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.289");
+        tracker.observe(Some("high"), None);
+        tracker.note_slash("high", false);
+        tracker
+            .note_stdout("Set effort level to high · Ultracode off", false)
+            .expect("the high/off baseline publishes");
+        tracker.note_slash("max", false);
+        tracker
+            .note_unowned_stdout("Set effort level to max · Ultracode on")
+            .expect("the suppressed max/on acceptance is latched");
+        let EffortStdout::Status(parsed) = parse_effort_stdout(
+            "Current effort level: high (Comprehensive implementation with extensive testing \
+             and documentation)",
+            EffortSemantics::Decoupled,
+        ) else {
+            panic!("the status line parses");
+        };
+        assert!(
+            tracker.note_status(parsed).is_none(),
+            "a same-level flag-off status changes no published tuple"
+        );
+        assert!(
+            tracker.deferred_observation().is_none(),
+            "the status clears the deferred {{max, on}} even without an edge"
+        );
+        // The flag is positively off: an exit attachment is a dedup.
+        assert!(
+            tracker.note_ultra_attachment(false).is_none(),
+            "the status latched the flag off"
+        );
+        // B refuses: nothing folds and the effective state stays {high, off}.
+        assert!(
+            tracker
+                .note_stdout("Kept effort level as max", true)
+                .is_none()
+        );
+        assert_eq!(
+            tracker.last_observed(),
+            Some(ObservedEffort {
+                name: EffortName::High,
+                ultracode: Some(false),
+            })
+        );
+        // A repeated same-level status stays silent.
+        assert!(tracker.note_status(parsed).is_none());
     }
 
     #[test]

@@ -3368,14 +3368,19 @@ impl TranscriptMapper {
                     .as_ref()
                     .and_then(|bridge| bridge.pending())
                     .is_some();
-                if let Some((observed, source)) = self.effort.note_stdout(&stdout, from_remuda) {
-                    // The authoritative status edge supersedes a stashed
-                    // suppressed acceptance (r18 item 3). A same-value status
-                    // settles nothing and deliberately does NOT clear the
-                    // stash (status is not an effort-level publication).
-                    if self.effort.deferred_observation().is_none() {
-                        self.deferred_effort_edge = None;
-                    }
+                // c-effortread r20 ruling B′: /effort status is an
+                // AUTHORITATIVE read-back. The tracker reconciled it through
+                // the shared path (latch + clear its deferred slot); drop
+                // THIS mapper's stashed edge in lockstep EVEN when the status
+                // emits no edge — a same-level status with no ultracode suffix
+                // is positive flag-OFF evidence and must not leave a
+                // suppressed {max, on} for B's later refusal to publish.
+                // Replayed pre-launch status reaches neither side.
+                let status_edge = self.effort.note_stdout(&stdout, from_remuda);
+                if self.effort.is_current_process() {
+                    self.invalidate_deferred_effort();
+                }
+                if let Some((observed, source)) = status_edge {
                     observations = self.effort_observation(
                         value,
                         observed,
@@ -3468,11 +3473,12 @@ impl TranscriptMapper {
         Ok(observations)
     }
 
-    /// c-effortread r19 item 2 ruling B: the ONE shared invalidation of the
-    /// suppressed-acceptance slot. An AUTHORITATIVE effective-state
-    /// publication — an owned accept, an assistant read-back, the effort
-    /// clause of a `/model` verdict, an `ultra_effort_enter|exit` attachment
-    /// — clears BOTH the tracker's deferred state and this mapper's stashed
+    /// c-effortread r19 item 2 ruling B / r20 ruling B′: the ONE shared
+    /// invalidation of the suppressed-acceptance slot. An AUTHORITATIVE
+    /// effective-state publication — an owned accept, an assistant read-back,
+    /// the effort clause of a `/model` verdict, an
+    /// `ultra_effort_enter|exit` attachment, or a `/effort status` read-back —
+    /// clears BOTH the tracker's deferred state and this mapper's stashed
     /// edge, so a suppressed acceptance can never be published after it was
     /// superseded. The end-of-switch deferred publish also drains through the
     /// tracker side here (after taking the slot for emission).

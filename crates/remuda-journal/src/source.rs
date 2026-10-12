@@ -641,26 +641,37 @@ fn partial_started_prefix(line: &[u8], agent_id: &str) -> bool {
 /// Parse ONE JSON string (the slice begins at its opening quote), returning
 /// its decoded value and the number of input bytes consumed through the
 /// closing quote. `None` when the closing quote has not been written yet
-/// (the record is torn). Escape sequences are followed so a backslash
-/// inside the torn tail is not mistaken for termination.
+/// (the record is torn) or the span is not yet a valid JSON string (e.g. a
+/// dangling escape). Escapes (`\"`, `\\`, `\/`, `\b\f\n\r\t`, `\uXXXX`
+/// including surrogate pairs) are decoded EXACTLY as serde_json would, so an
+/// agentId whose on-disk JSON escapes a quote (raw a-backslash-quote-1,
+/// decoded a-quote-1) or encodes a character with the backslash-u form
+/// matches the member's real id when the failure peek compares it.
 fn read_json_string(input: &[u8]) -> Option<(String, usize)> {
     debug_assert_eq!(input.first(), Some(&b'"'));
-    let mut value: Vec<u8> = Vec::new();
+    // Find the raw token span: from the opening quote through the first
+    // UNESCAPED closing quote. A backslash only escapes the single following
+    // byte while scanning, so a quote in the torn tail after a dangling
+    // backslash is never mistaken for the end.
     let mut escaped = false;
+    let mut end = None;
     for (index, byte) in input.iter().enumerate().skip(1) {
         if escaped {
-            value.push(*byte);
             escaped = false;
         } else if *byte == b'\\' {
-            value.push(b'\\');
             escaped = true;
         } else if *byte == b'"' {
-            return Some((String::from_utf8_lossy(&value).into_owned(), index + 1));
-        } else {
-            value.push(*byte);
+            end = Some(index + 1);
+            break;
         }
     }
-    None
+    let end = end?;
+    // Delegate the actual decoding to serde_json so every escape — including
+    // \uXXXX and surrogate pairs — comes out byte-identical to the completed
+    // record the fold will parse. A malformed span (bad escape, lone
+    // surrogate) simply has not finished writing yet.
+    let value = serde_json::from_slice::<String>(&input[..end]).ok()?;
+    Some((value, end))
 }
 
 #[cfg(test)]
@@ -710,5 +721,57 @@ mod torn_start_tests {
         ));
         // Garbage that cannot begin a JSON object is never captured.
         assert!(!partial_started_prefix(br#"nonsense {"#, "a1"));
+    }
+
+    #[test]
+    fn a_torn_record_with_an_escaped_agent_id_is_armed_for_that_member() {
+        // r9 item 6: the raw on-disk agentId is a\"1; the member's real id is
+        // a"1. The escapes must be decoded as serde_json decodes them before
+        // the peek compares, or no cover is armed and the settled attempt
+        // resurrects.
+        assert!(partial_started_prefix(
+            br#"{"type":"started","key":"v2:k","agentId":"a\"1""#,
+            "a\"1"
+        ));
+        // A backslash-u escape decodes exactly like serde_json: the written
+        // digits spell '1'.
+        let unicode_torn = concat!(
+            "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a",
+            "\\u0031",
+            "\""
+        );
+        assert!(partial_started_prefix(unicode_torn.as_bytes(), "a1"));
+        // A surrogate pair decodes to its scalar.
+        let surrogate_torn = concat!(
+            "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a",
+            "\\uD83D\\uDE00",
+            "\""
+        );
+        assert!(partial_started_prefix(
+            surrogate_torn.as_bytes(),
+            "a\u{1F600}"
+        ));
+        // The short escapes \/ \b \f \n \r \t decode to their characters.
+        assert!(partial_started_prefix(
+            br#"{"type":"started","key":"v2:k","agentId":"a\/b\nc""#,
+            "a/b\nc"
+        ));
+        // A fully written, escaped DIFFERENT id is still resolved not-ours.
+        assert!(!partial_started_prefix(
+            br#"{"type":"started","key":"v2:k","agentId":"a\"2""#,
+            "a\"1"
+        ));
+        // A tear inside the escape (dangling backslash) is unresolved and
+        // armed anyway; completion validates the real id.
+        assert!(partial_started_prefix(
+            br#"{"type":"started","key":"v2:k","agentId":"a1\"#,
+            "a1"
+        ));
+        // A type value whose decoded content is not exactly "started"
+        // (escapes that make it `"failed"` with literal quotes) rejects.
+        assert!(!partial_started_prefix(
+            br#"{"type":"\"failed\"","key":"v2:k","agentId":"a1""#,
+            "a1"
+        ));
     }
 }

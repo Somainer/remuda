@@ -2425,3 +2425,135 @@ fn a_byte_identical_retry_after_a_shrink_into_the_cover_is_genuine() {
          byte-identical record is a genuine retry"
     );
 }
+
+/// c-cardsettle-fu2 r9 item 6: an agentId whose JSON escapes a quote (on disk
+/// a\"1, real id a"1) must be decoded as serde_json decodes it when the
+/// failure peek arms a cover over its torn start; r8 kept the backslash and
+/// armed nothing, so the settled attempt folded as a fresh Running member.
+#[test]
+fn a_torn_start_with_an_escaped_agent_id_stays_covered() {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = "wf_fu2_r9_escaped_id";
+    let run_dir = session.join("subagents/workflows").join(run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join(r#"agent-a"1.jsonl"#), "{}\n").unwrap();
+    // Attempt 1: started then failed, agentId JSON-escaped on disk.
+    std::fs::write(
+        run_dir.join("journal.jsonl"),
+        r#"{"type":"started","key":"v2:k","agentId":"a\"1"}"#.to_owned()
+            + "\n"
+            + r#"{"type":"failed","key":"v2:k","agentId":"a\"1"}"#
+            + "\n",
+    )
+    .unwrap();
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id: run_id.into(),
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        bodies(tailer.poll().unwrap())
+            .iter()
+            .rev()
+            .find_map(|body| match body {
+                ObservationPayload::WorkflowMember(m)
+                    if m.native_agent_id
+                        == Knowledge::Known {
+                            value: r#"a"1"#.into()
+                        } =>
+                {
+                    Some(m.state)
+                }
+                _ => None,
+            })
+            .expect("escaped-id member observed"),
+        WorkflowState::Failed,
+        "attempt 1 ends Failed"
+    );
+
+    // Attempt 2's start torn INSIDE the JSON: full escaped agentId, no
+    // closing brace or newline.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        journal
+            .write_all(r#"{"type":"started","key":"v2:k","agentId":"a\"1""#.as_bytes())
+            .unwrap();
+    }
+    tailer
+        .agent_event(r#"a"1"#, true, Some(&run_dir.join(r#"agent-a"1.jsonl"#)))
+        .unwrap();
+    tailer
+        .agent_failed(r#"a"1"#, Some(&run_dir.join(r#"agent-a"1.jsonl"#)))
+        .unwrap();
+
+    // Complete the settled record.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(journal, "}}").unwrap();
+    }
+    let covered: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id
+                    == Knowledge::Known {
+                        value: r#"a"1"#.into(),
+                    } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        covered.iter().all(|state| *state == WorkflowState::Failed),
+        "the escaped-id start the peek covered stays Failed: {covered:?}"
+    );
+
+    // A genuinely different retry appended afterwards resurrects.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        journal
+            .write_all(
+                r#"{"type":"started","key":"v2:k","agentId":"a\"1","label":"genuine"}"#.as_bytes(),
+            )
+            .unwrap();
+        journal.write_all(b"\n").unwrap();
+    }
+    let final_state = bodies(tailer.poll().unwrap())
+        .iter()
+        .rev()
+        .find_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id
+                    == Knowledge::Known {
+                        value: r#"a"1"#.into(),
+                    } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .expect("escaped-id member observed after the retry");
+    assert_eq!(final_state, WorkflowState::Running, "the retry is genuine");
+}

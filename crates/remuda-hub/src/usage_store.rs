@@ -162,15 +162,18 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 /// in ONE transaction (c-usagefu r9 item 3).
 ///
 /// The survivor is the FIRST write (lowest rowid, preserving ingest
-/// ordering); every nullable attribute is upgraded with the best value ANY
-/// sibling carried:
-/// - counters/cost/profile/model: the first non-NULL value (a later replay
-///   with known counters repairs the ingest-time row that lacked them);
-/// - turn id: any non-NULL sibling;
-/// - observed_at: the sibling's native time when one exists (an
-///   ingest-stamped first row is repaired by the native replay), never the
-///   reverse;
-/// - revision: the maximum.
+/// ordering). Ruling C (c-usagefu r10 item 3):
+/// - counters/cost (total/input/output/cache buckets, cost_usd) are
+///   ACCOUNTING and come from the AUTHORITATIVE sibling — the highest
+///   metric_revision row that reports each value, newest rowid breaking a
+///   revision tie. A rev-1 row reporting output 10/cost 0.01 and a rev-2 row
+///   reporting output 20/cost 0.02 leave the survivor at 20/0.02, never the
+///   first non-NULL 10/0.01. A bucket no sibling reports stays NULL (a
+///   NULL-to-known repair still arrives from whichever revision carries it);
+/// - revision: the maximum;
+/// - profile/model/turn id/native context window/observed time are
+///   ATTRIBUTION and merge best-known (any non-NULL sibling; native time over
+///   ingest time), independent of which revision owned the accounting.
 ///
 /// A second run changes nothing: one row per key makes the UPDATE/DELETE
 /// no-ops and the index creates are `IF NOT EXISTS`.
@@ -200,36 +203,42 @@ fn consolidate_message_duplicates(conn: &Connection) -> rusqlite::Result<()> {
                  SELECT MAX(m2.metric_revision) FROM usage_events m2
                  WHERE m2.instance_id = usage_events.instance_id
                    AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id),
-             total_tokens = COALESCE(total_tokens,
-             (SELECT m2.total_tokens FROM usage_events m2
-              WHERE m2.instance_id = usage_events.instance_id
-                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
-                AND m2.total_tokens IS NOT NULL LIMIT 1)),
-             input_tokens = COALESCE(input_tokens,
-             (SELECT m2.input_tokens FROM usage_events m2
-              WHERE m2.instance_id = usage_events.instance_id
-                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
-                AND m2.input_tokens IS NOT NULL LIMIT 1)),
-             output_tokens = COALESCE(output_tokens,
-             (SELECT m2.output_tokens FROM usage_events m2
-              WHERE m2.instance_id = usage_events.instance_id
-                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
-                AND m2.output_tokens IS NOT NULL LIMIT 1)),
-             cache_read_tokens = COALESCE(cache_read_tokens,
-             (SELECT m2.cache_read_tokens FROM usage_events m2
-              WHERE m2.instance_id = usage_events.instance_id
-                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
-                AND m2.cache_read_tokens IS NOT NULL LIMIT 1)),
-             cache_write_tokens = COALESCE(cache_write_tokens,
-             (SELECT m2.cache_write_tokens FROM usage_events m2
-              WHERE m2.instance_id = usage_events.instance_id
-                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
-                AND m2.cache_write_tokens IS NOT NULL LIMIT 1)),
-             cost_usd = COALESCE(cost_usd,
-             (SELECT m2.cost_usd FROM usage_events m2
-              WHERE m2.instance_id = usage_events.instance_id
-                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
-                AND m2.cost_usd IS NOT NULL LIMIT 1)),
+             total_tokens = (
+                 SELECT m2.total_tokens FROM usage_events m2
+                 WHERE m2.instance_id = usage_events.instance_id
+                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                   AND m2.total_tokens IS NOT NULL
+                 ORDER BY m2.metric_revision DESC, m2.rowid DESC LIMIT 1),
+             input_tokens = (
+                 SELECT m2.input_tokens FROM usage_events m2
+                 WHERE m2.instance_id = usage_events.instance_id
+                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                   AND m2.input_tokens IS NOT NULL
+                 ORDER BY m2.metric_revision DESC, m2.rowid DESC LIMIT 1),
+             output_tokens = (
+                 SELECT m2.output_tokens FROM usage_events m2
+                 WHERE m2.instance_id = usage_events.instance_id
+                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                   AND m2.output_tokens IS NOT NULL
+                 ORDER BY m2.metric_revision DESC, m2.rowid DESC LIMIT 1),
+             cache_read_tokens = (
+                 SELECT m2.cache_read_tokens FROM usage_events m2
+                 WHERE m2.instance_id = usage_events.instance_id
+                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                   AND m2.cache_read_tokens IS NOT NULL
+                 ORDER BY m2.metric_revision DESC, m2.rowid DESC LIMIT 1),
+             cache_write_tokens = (
+                 SELECT m2.cache_write_tokens FROM usage_events m2
+                 WHERE m2.instance_id = usage_events.instance_id
+                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                   AND m2.cache_write_tokens IS NOT NULL
+                 ORDER BY m2.metric_revision DESC, m2.rowid DESC LIMIT 1),
+             cost_usd = (
+                 SELECT m2.cost_usd FROM usage_events m2
+                 WHERE m2.instance_id = usage_events.instance_id
+                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                   AND m2.cost_usd IS NOT NULL
+                 ORDER BY m2.metric_revision DESC, m2.rowid DESC LIMIT 1),
              native_context_window = COALESCE(native_context_window,
              (SELECT m2.native_context_window FROM usage_events m2
               WHERE m2.instance_id = usage_events.instance_id
@@ -2117,6 +2126,150 @@ mod tests {
             dup_insert.is_err(),
             "unique message index blocks duplicates"
         );
+    }
+
+    #[test]
+    fn migration_accounting_comes_from_the_highest_revision_survivor() {
+        // c-usagefu r10 item 3 (Ruling C): BOTH duplicates already carry known
+        // accounting at DIFFERENT revisions — rev 1 reports output 10 / cost
+        // 0.01, a rev-2 replay reports output 20 / cost 0.02. Keeping the
+        // first non-NULL froze the survivor at 10 / 0.01 even though revision
+        // 2 is authoritative. Counters/cost must follow the HIGHEST revision
+        // (with a NULL bucket repaired from a known lower revision), while
+        // attribution (turn id, native time, profile, model, mode, context
+        // window) merges best-known. A second migration must be a no-op.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                scope_id TEXT,
+                turn_id TEXT,
+                mode TEXT NOT NULL,
+                metric_revision INTEGER NOT NULL DEFAULT 1,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                observed_at_source TEXT NOT NULL DEFAULT 'ingest',
+                native_context_window INTEGER,
+                PRIMARY KEY (instance_id, seq)
+             );",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode, metric_revision,
+                 total_tokens, input_tokens, output_tokens,
+                 cache_read_tokens, cache_write_tokens, cost_usd,
+                 observed_at, observed_at_source, profile_id, model,
+                 native_context_window)
+             VALUES
+                ('ins_rev', 1, 'message', 'r1', NULL, 'snapshot', 1,
+                 10, 7, 10, NULL, NULL, '0.01',
+                 '2026-09-15T00:00:00.000Z', 'ingest', NULL, NULL, NULL),
+                ('ins_rev', 2, 'message', 'r1', 't1', 'snapshot', 2,
+                 20, NULL, 20, 50, 3, '0.02',
+                 '2026-09-15T00:00:05.000Z', 'native', 'pvp_rev', 'gpt-5.4',
+                 200000);",
+        )
+        .unwrap();
+
+        #[derive(Debug, PartialEq)]
+        struct Survivor {
+            seq: i64,
+            revision: i64,
+            mode: String,
+            total: Option<i64>,
+            input: Option<i64>,
+            output: Option<i64>,
+            cache_read: Option<i64>,
+            cache_write: Option<i64>,
+            cost: Option<String>,
+            turn_id: Option<String>,
+            profile: Option<String>,
+            model: Option<String>,
+            context_window: Option<i64>,
+            observed_at: String,
+            source: String,
+        }
+        let read_survivor = |conn: &Connection| -> Survivor {
+            conn.query_row(
+                "SELECT seq, metric_revision, mode,
+                        total_tokens, input_tokens, output_tokens,
+                        cache_read_tokens, cache_write_tokens, cost_usd,
+                        turn_id, profile_id, model, native_context_window,
+                        observed_at, observed_at_source
+                 FROM usage_events WHERE scope_id='r1'",
+                [],
+                |r| {
+                    Ok(Survivor {
+                        seq: r.get(0)?,
+                        revision: r.get(1)?,
+                        mode: r.get(2)?,
+                        total: r.get(3)?,
+                        input: r.get(4)?,
+                        output: r.get(5)?,
+                        cache_read: r.get(6)?,
+                        cache_write: r.get(7)?,
+                        cost: r.get(8)?,
+                        turn_id: r.get(9)?,
+                        profile: r.get(10)?,
+                        model: r.get(11)?,
+                        context_window: r.get(12)?,
+                        observed_at: r.get(13)?,
+                        source: r.get(14)?,
+                    })
+                },
+            )
+            .unwrap()
+        };
+
+        migrate(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "the two revisions consolidate to one survivor");
+        let first = read_survivor(&conn);
+        assert_eq!(first.seq, 1, "the first write's row remains the survivor");
+        assert_eq!(first.revision, 2, "revision is the authoritative max");
+        assert_eq!(first.total, Some(20), "rev-2 total wins over rev-1 10");
+        assert_eq!(
+            first.input,
+            Some(7),
+            "rev-2 leaves input NULL: the NULL is repaired from known rev-1 7"
+        );
+        assert_eq!(first.output, Some(20), "rev-2 output 20 wins over rev-1 10");
+        assert_eq!(first.cache_read, Some(50));
+        assert_eq!(first.cache_write, Some(3));
+        assert_eq!(
+            first.cost.as_deref(),
+            Some("0.02"),
+            "cost is accounting: rev-2 0.02 wins, never the first non-NULL 0.01"
+        );
+        // Attribution merges best-known from either revision.
+        assert_eq!(first.turn_id.as_deref(), Some("t1"));
+        assert_eq!(first.profile.as_deref(), Some("pvp_rev"));
+        assert_eq!(first.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(first.context_window, Some(200000));
+        assert_eq!(first.mode, "snapshot");
+        assert_eq!(first.observed_at, "2026-09-15T00:00:05.000Z");
+        assert_eq!(first.source, "native");
+
+        // A second migration is a no-op: the COMPLETE survivor is unchanged.
+        migrate(&conn).unwrap();
+        let count2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count2, 1);
+        assert_eq!(read_survivor(&conn), first, "re-migrating changes nothing");
     }
 
     #[test]

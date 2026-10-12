@@ -17,8 +17,10 @@
 use anyhow::{Context, Result, anyhow};
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 
 /// WebSocket the fake Node drives the Hub over.
@@ -199,6 +201,142 @@ pub(crate) async fn wait_frame_ack(
     }
 }
 
+/// How the shared durable append waits for its ack.
+#[derive(Clone)]
+pub(crate) enum AckBarrier {
+    /// Consume the ack as soon as it arrives.
+    Immediate,
+    /// c-hubfakeack determinism barrier: do not consume the append ack until a
+    /// FURTHER Hub→Node RPC (the web poll's `interaction.list`) has actually
+    /// arrived on the socket and been stashed behind it. This makes the "RPC
+    /// buffered behind an outstanding ack" race structural instead of relying
+    /// on scheduler timing, while keeping the SAME strict ack validation as
+    /// the immediate path.
+    InterveningRpc {
+        /// Hub port; names the queue marker file (`remuda-e2e-ackqueue-<port>`).
+        port: u16,
+        /// Receives the buffered RPC id so the dispatch loop's
+        /// interaction.list arm can write its REPLY marker.
+        tracked: Arc<Mutex<Option<Value>>>,
+    },
+}
+
+/// How long the deterministic barrier waits for the intervening RPC.
+/// Deliberately below the Hub's command-accept budget: a missed RPC fails
+/// loudly in the Node before the Hub gives up and returns reconciling.
+pub(crate) const ACK_BARRIER_TIMEOUT: Duration = Duration::from_millis(2_000);
+
+/// Test-only negative control: HUB_E2E_ACK_DISCARD=1 makes the barrier RECORD
+/// the intervening interaction.list (and its marker) but DROP the frame,
+/// reproducing the old swallowed-frame bug while keeping the new markers.
+pub(crate) fn ack_discard_enabled() -> bool {
+    std::env::var("HUB_E2E_ACK_DISCARD").as_deref() == Ok("1")
+}
+
+/// The interaction.list frame the ack barrier is waiting for, if `frame` is
+/// one: returns its parsed JSON-RPC id.
+fn interaction_list_id(frame: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(frame).ok()?;
+    if value.get("method").and_then(Value::as_str) == Some("interaction.list") {
+        value.get("id").cloned()
+    } else {
+        None
+    }
+}
+
+/// Park behind the append ack `want` until an `interaction.list` RPC is
+/// buffered (the spec issues that GET itself). Records the RPC's id in
+/// `tracked` and writes the QUEUE marker (`<id> interaction.list`) the moment
+/// the frame arrives. Under HUB_E2E_ACK_DISCARD=1 the frame is recorded but
+/// then DROPPED (negative control): the interaction.list arm can never answer
+/// it, so the separate REPLY marker never appears even though the queue marker
+/// does — exactly the gap this regression must catch.
+pub(crate) async fn ensure_intervening_rpc(
+    ws: &mut NodeWs,
+    queue: &mut FrameQueue,
+    want: &str,
+    port: u16,
+    tracked: Arc<Mutex<Option<Value>>>,
+) -> Result<()> {
+    let queue_marker = std::env::temp_dir().join(format!("remuda-e2e-ackqueue-{port}"));
+    let record = |rpc_id: &Value| {
+        let body = format!("{rpc_id} interaction.list");
+        std::fs::write(&queue_marker, body)
+            .with_context(|| format!("write ack queue marker {}", queue_marker.display()))
+    };
+
+    // 1. Already buffered ahead of the wait; remember its QUEUE POSITION so the
+    // discard negative control can remove THAT entry (removing only a clone
+    // would leave the original queued, answered, and wrongly reply-marked).
+    let mut found: Option<(Value, String, Option<usize>)> = queue
+        .iter()
+        .position(|f| interaction_list_id(f).is_some())
+        .map(|pos| {
+            let frame = &queue[pos];
+            (
+                interaction_list_id(frame).expect("just matched"),
+                frame.clone(),
+                Some(pos),
+            )
+        });
+
+    let deadline = Instant::now() + ACK_BARRIER_TIMEOUT;
+    while found.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "ack barrier: no interaction.list arrived behind append ack {want} within {} ms",
+                ACK_BARRIER_TIMEOUT.as_millis()
+            );
+        }
+        match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let text = text.to_string();
+                if interaction_list_id(&text).is_some() {
+                    // A frame just read: not in the queue yet (position None).
+                    let id = interaction_list_id(&text).expect("matched above");
+                    found = Some((id, text, None));
+                } else if queue.len() < PENDING_FRAME_QUEUE_CAP {
+                    // A journal ack or other RPC: stash for the dispatch loop.
+                    queue.push_back(text);
+                } else {
+                    anyhow::bail!("pending frame queue overflow in ack barrier for {want}");
+                }
+            }
+            Ok(_) => anyhow::bail!("hub connection closed during ack barrier for {want}"),
+            Err(_) => {
+                anyhow::bail!(
+                    "ack barrier: no interaction.list arrived behind append ack {want} within {} ms",
+                    ACK_BARRIER_TIMEOUT.as_millis()
+                )
+            }
+        }
+    }
+
+    let (rpc_id, frame, queued_pos) = found.expect("an interaction.list was observed");
+    record(&rpc_id)?;
+    *tracked.lock().await = Some(rpc_id);
+    if ack_discard_enabled() {
+        // NEGATIVE CONTROL: record + marker written, then REMOVE the frame for
+        // real. If it was already queued, drop the entry at its captured
+        // position; otherwise simply do not enqueue the freshly read frame.
+        if let Some(pos) = queued_pos {
+            if pos < queue.len() && queue[pos] == frame {
+                queue.remove(pos);
+            } else if let Some(eq) = queue.iter().position(|f| f == &frame) {
+                queue.remove(eq);
+            }
+        }
+        tracing::warn!("HUB_E2E_ACK_DISCARD=1: dropped queued interaction.list behind {want}");
+    } else if queued_pos.is_none() && queue.len() < PENDING_FRAME_QUEUE_CAP {
+        // Normal mode, freshly read frame: enqueue it, preserving order.
+        queue.push_back(frame);
+    }
+    // Normal mode with queued_pos = Some: the frame is already in the queue at
+    // its original position; leave it there (do not move it to the back).
+    Ok(())
+}
+
 /// Derive the user node id a command-delivered prompt is journaled under:
 /// `obj_<uuid>` for a `cmd_<uuid>` command, falling back to a per-seq legacy
 /// id when the command id is missing or unexpectedly shaped.
@@ -317,8 +455,13 @@ pub(crate) async fn append_command_user(
 /// validated ack result object (`seq` / `eventId` / `durableSeq`) and the
 /// frame seq, so a caller can correlate the durable journal message.
 ///
+/// `barrier` optionally forces a further Hub RPC to be buffered behind the
+/// outstanding ack FIRST (the deterministic c-hubfakeack interleaving) — the
+/// strict ack validation is identical either way.
+///
 /// A caller that gets `Err` here must answer `instance.send` with an RPC
 /// error, never an accepted envelope — the intent was not durable.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn durable_command_append(
     ws: &mut NodeWs,
     queue: &mut FrameQueue,
@@ -327,12 +470,16 @@ pub(crate) async fn durable_command_append(
     text: &str,
     command_id: Option<&str>,
     seq_hint: Option<i64>,
+    barrier: &AckBarrier,
 ) -> Result<(u64, Value)> {
     let node = command_user_node(command_id, n);
     let seq =
         send_user_message_frame_with_seq(ws, instance_id, n, text, command_id, &node, seq_hint)
             .await?;
     let want = format!("j{seq}");
+    if let AckBarrier::InterveningRpc { port, tracked } = barrier {
+        ensure_intervening_rpc(ws, queue, &want, *port, tracked.clone()).await?;
+    }
     let ack = match await_ack_frame(ws, queue, &want).await? {
         AckFrame::Accepted(result) => result,
         AckFrame::Rejected(response) => {
@@ -473,6 +620,7 @@ pub(crate) async fn send_command_result_reply(
 
 /// Everything [`accept_instance_send`] produced, so a caller (the regression)
 /// can assert every half of the acceptance contract.
+#[derive(Debug)]
 pub(crate) struct DurableSendAcceptance {
     /// Append seq after the durable user message (`append_n` for the next
     /// append).
@@ -505,9 +653,19 @@ pub(crate) async fn accept_instance_send(
     text: &str,
     command_id: &str,
     seq_hint: Option<i64>,
+    barrier: &AckBarrier,
 ) -> Result<DurableSendAcceptance> {
-    let (append_seq, append_ack) =
-        durable_command_append(ws, queue, instance_id, n, text, Some(command_id), seq_hint).await?;
+    let (append_seq, append_ack) = durable_command_append(
+        ws,
+        queue,
+        instance_id,
+        n,
+        text,
+        Some(command_id),
+        seq_hint,
+        barrier,
+    )
+    .await?;
     let send_result = send_command_result_reply(ws, rpc_id, command_id, instance_id).await?;
     Ok(DurableSendAcceptance {
         append_seq,

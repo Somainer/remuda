@@ -28,8 +28,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::client::IntoClientRequest};
 
 use support::{
-    AckFrame, FrameQueue, InstanceSendReply, NodeWs, accept_instance_send, await_ack_frame,
-    durable_command_append, send_instance_send_rpc, send_rpc_error, send_rpc_ok,
+    AckBarrier, AckFrame, FrameQueue, InstanceSendReply, NodeWs, accept_instance_send,
+    await_ack_frame, durable_command_append, send_instance_send_rpc, send_rpc_error, send_rpc_ok,
 };
 
 const PROMPT: &str = "acceptrace prompt";
@@ -179,6 +179,7 @@ async fn spawn_fake_node(
                                         PROMPT,
                                         &command_id,
                                         None,
+                                        &AckBarrier::Immediate,
                                     )
                                     .await?;
                                     append_n = accepted.append_seq;
@@ -197,6 +198,7 @@ async fn spawn_fake_node(
                                         PROMPT,
                                         Some(&command_id),
                                         None,
+                                        &AckBarrier::Immediate,
                                     )
                                     .await?;
                                     append_n = new_n;
@@ -219,6 +221,7 @@ async fn spawn_fake_node(
                                         PROMPT,
                                         &command_id,
                                         Some(GAP_SEQ),
+                                        &AckBarrier::Immediate,
                                     )
                                     .await
                                     {
@@ -601,5 +604,67 @@ async fn ack_wait_surfaces_an_rpc_error() -> anyhow::Result<()> {
         AckFrame::Accepted(value) => panic!("expected error ack, got success: {value}"),
     }
     assert!(queue.is_empty());
+    Ok(())
+}
+
+/// The deterministic ack barrier runs INSIDE the shared accept path: even with
+/// a further RPC forced to buffer behind the outstanding append ack, an empty
+/// `result:{}` ack (no seq/eventId/durableSeq) must be REJECTED rather than
+/// treated as a durable acceptance. The old barrier helper had its own
+/// wait_frame_ack that accepted any object result, so `{}` passed and the send
+/// answered accepted.
+#[tokio::test]
+async fn barrier_mode_rejects_an_empty_ack_result() -> anyhow::Result<()> {
+    let marker = std::env::temp_dir().join("remuda-e2e-ackqueue-65535");
+    let _ = std::fs::remove_file(&marker);
+    let tracked = Arc::new(Mutex::new(None));
+    // The intervening interaction.list the barrier parks for, then the ack
+    // carrying an EMPTY result object.
+    let mut ws = frame_server(vec![
+        json!({"id": "rpc-42", "method": "interaction.list", "params": {}}),
+        json!({"id": "j1", "result": {}}),
+    ])
+    .await?;
+    let mut queue: FrameQueue = std::collections::VecDeque::new();
+    let command_id = remuda_protocol::CommandId::new();
+    let instance_id = remuda_protocol::InstanceId::new();
+    let outcome = accept_instance_send(
+        &mut ws,
+        &mut queue,
+        json!("send-1"),
+        instance_id.as_id().as_str(),
+        0,
+        PROMPT,
+        command_id.as_id().as_str(),
+        None,
+        &AckBarrier::InterveningRpc {
+            port: u16::MAX,
+            tracked: tracked.clone(),
+        },
+    )
+    .await;
+    // The empty {} ack must fail the strict durable validation — and no send
+    // reply may have been accepted.
+    let error = outcome.expect_err("an empty ack result must not be accepted");
+    assert!(
+        error.to_string().contains("seq"),
+        "expected a durable-seq validation error, got: {error}"
+    );
+    // The forced interleaving really happened: the intervening RPC was tracked
+    // (so the dispatch loop would later answer it), queued for that processing,
+    // and the queue marker written.
+    assert_eq!(*tracked.lock().await, Some(json!("rpc-42")));
+    assert_eq!(
+        std::fs::read_to_string(&marker).ok().as_deref(),
+        Some("\"rpc-42\" interaction.list")
+    );
+    assert!(
+        queue
+            .iter()
+            .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+            .any(|f| f.get("id") == Some(&json!("rpc-42"))),
+        "the intervening interaction.list must stay queued: {queue:?}"
+    );
+    let _ = std::fs::remove_file(&marker);
     Ok(())
 }

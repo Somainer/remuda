@@ -131,11 +131,6 @@ pub struct FileTail {
     /// EVERY open by poll or peek revalidates the whole set against the
     /// opened file before any record is folded.
     covers: CoverSet,
-    /// Unread bytes from the read cursor captured by the most recent open
-    /// (BEFORE that open's poll advances the cursor); also consumed by
-    /// rotation detection when the cursor is anchored at offset 0.
-    last_rest_base: u64,
-    last_rest: Vec<u8>,
 }
 
 /// Completed JSONL lines with their file cursors, as a poll folds them.
@@ -162,8 +157,6 @@ impl FileTail {
             last_len: None,
             file_id: None,
             covers: CoverSet::new(),
-            last_rest_base: 0,
-            last_rest: Vec::new(),
         })
     }
 
@@ -188,8 +181,6 @@ impl FileTail {
             last_len: None,
             file_id: None,
             covers: CoverSet::new(),
-            last_rest_base: 0,
-            last_rest: Vec::new(),
         })
     }
 
@@ -204,8 +195,6 @@ impl FileTail {
             last_len: None,
             file_id: None,
             covers: CoverSet::new(),
-            last_rest_base: 0,
-            last_rest: Vec::new(),
         }
     }
 
@@ -242,10 +231,11 @@ impl FileTail {
     /// members' covers are untouched).
     ///
     /// Does NOT consume records, but it applies the same rotation
-    /// normalisation against the opened file as [`Self::poll`] (a
-    /// replace/truncate or prefix rewrite since the last poll starts a fresh
-    /// generation here too), so positions are reported in the generation the
-    /// next fold will use. A live StopFailure uses the covers as terminal
+    /// normalisation against the opened file as [`Self::poll`] (a replacement
+    /// at the path, or a truncate/rewrite through the consumed cursor, starts a
+    /// fresh generation here too), so positions are reported in the generation
+    /// the next fold will use. A same-inode change confined to unread bytes at
+    /// cursor 0 leaves the generation alone and is settled per cover instead. A live StopFailure uses the covers as terminal
     /// watermarks: a folded `started` is suppressed only when its identity and
     /// bytes match a live cover; a start appended AFTER the failure resurrects
     /// the member even when both fold in the same poll.
@@ -393,12 +383,15 @@ impl FileTail {
 
     /// Open the journal and apply the SAME rotation / effective-cursor
     /// normalisation that the folding poll uses, before any unread bytes are
-    /// located: a file shorter than the cursor, or one whose consumed prefix
-    /// was rewritten, starts a new generation at offset 0. This is shared by
-    /// the live-failure peek and [`Self::poll`] so a watermark armed from the
-    /// peek binds to the generation its record will actually fold in, rather
-    /// than to a stale cached generation/offset beyond EOF. Returns `None`
-    /// when the file does not exist yet.
+    /// located: a replacement at the path, a file shorter than the cursor, or
+    /// one whose consumed prefix was rewritten, starts a new generation at
+    /// offset 0. A same-inode truncate/rewrite while the cursor is anchored at
+    /// offset 0 does NOT rotate: the bytes are all unread and each armed cover
+    /// revalidates its own range instead. This is shared by the live-failure
+    /// peek and [`Self::poll`] so a watermark armed from the peek binds to the
+    /// generation its record will actually fold in, rather than to a stale
+    /// cached generation/offset beyond EOF. Returns `None` when the file does
+    /// not exist yet.
     fn open_normalised(&mut self) -> Result<Option<OpenedTail>, Error> {
         use std::os::unix::fs::MetadataExt;
         let mut file = match File::open(&self.path) {
@@ -422,13 +415,9 @@ impl FileTail {
         file.seek(SeekFrom::Start(rest_base))?;
         let mut rest = Vec::new();
         file.read_to_end(&mut rest)?;
-        // Remember the observed extent and identity for the next open. The
-        // rest window is anchored to the cursor BEFORE this open's poll
-        // consumes it, so rotation detection at offset 0 can still compare it.
+        // Remember the observed extent and identity for the next open.
         self.last_len = Some(len);
         self.file_id = Some(opened_id);
-        self.last_rest_base = rest_base;
-        self.last_rest = rest.clone();
         // Revalidate (and grow pending tails of) EVERY armed cover against
         // THIS open before poll folds or peek re-arms. Poll and peek share
         // this path, so a cover is contradicted the first open that sees it,
@@ -461,44 +450,16 @@ impl FileTail {
             self.rotate();
             return Ok(());
         }
-        if self.offset == 0 {
-            // Anchored at offset 0 (typically right after a failure peek
-            // normalised a rotation): an in-place truncate+rewrite of the SAME
-            // inode cannot reuse this generation. The previous open captured
-            // unread bytes (`last_rest` at base 0); a shrink below their
-            // extent, or any byte change in the shared prefix, means the bytes
-            // a cover was armed against no longer exist.
-            if !self.last_rest.is_empty() {
-                let prev_extent = self.last_rest_base + self.last_rest.len() as u64;
-                if len < prev_extent {
-                    tracing::warn!(
-                        path = %self.path.display(),
-                        generation = self.generation,
-                        prev_extent,
-                        len,
-                        "jsonl rewritten from offset 0; starting new file generation"
-                    );
-                    self.rotate();
-                    return Ok(());
-                }
-                let check = std::cmp::min(prev_extent, len) as usize;
-                if check > 0 {
-                    let mut buf = vec![0u8; check];
-                    file.seek(SeekFrom::Start(0))?;
-                    file.read_exact(&mut buf)?;
-                    if buf != self.last_rest[..check] {
-                        tracing::warn!(
-                            path = %self.path.display(),
-                            generation = self.generation,
-                            "jsonl unread prefix rewritten at offset 0; starting new file \
-                             generation"
-                        );
-                        self.rotate();
-                    }
-                }
-            }
-            return Ok(());
-        }
+        // No blanket rotation when the cursor is anchored at offset 0 (the
+        // typical state right after a failure peek normalised a replacement):
+        // an in-place truncate/rewrite confined to UNREAD bytes of the SAME
+        // inode must not bump the generation, or a change elsewhere in the
+        // unread window (e.g. truncating only a lone trailing brace) would
+        // discard every independently verified cover, including an intact
+        // complete record before the changed bytes. Each cover revalidates its
+        // OWN byte range in covers.observe below, so a same-inode shrink or
+        // rewrite retires exactly the covers it contradicts. A replacement
+        // (different inode, handled above) still starts a fresh generation.
         if len < self.offset {
             tracing::warn!(
                 path = %self.path.display(),

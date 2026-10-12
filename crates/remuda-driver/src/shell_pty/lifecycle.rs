@@ -377,6 +377,46 @@ pub async fn wait_child_exit(pid: i32, timeout: Duration) -> bool {
     join.await.unwrap_or_default()
 }
 
+/// What one bounded event wait ended on (ma-sdk-state r16 item 2).
+#[cfg(all(any(test, feature = "test-stub"), unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptibleEventWait {
+    /// The termination event fired.
+    Fired,
+    /// The single bound elapsed without an event.
+    TimedOut,
+}
+
+/// Drive an interruptible bounded event wait against ONE monotonic deadline
+/// (ma-sdk-state r16 item 2).
+///
+/// `wait_once` performs ONE blocking wait and receives the time REMAINING at the
+/// deadline on every call — never the original timeout. `EINTR` restarts the
+/// wait with that remainder (so a signal interrupting a parked `poll(2)` /
+/// `kevent(2)` fails the waiter neither early nor after a freshly renewed full
+/// timeout); any other error propagates immediately, and a deadline already
+/// consumed ends the wait as [`InterruptibleEventWait::TimedOut`]. The event
+/// source is level-triggered on Linux (a pidfd stays readable), so restarting
+/// the wait loses no event.
+#[cfg(all(any(test, feature = "test-stub"), unix))]
+fn wait_with_eintr_retry(
+    timeout: Duration,
+    mut wait_once: impl FnMut(Duration) -> std::io::Result<InterruptibleEventWait>,
+) -> std::io::Result<InterruptibleEventWait> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining == Duration::ZERO {
+            return Ok(InterruptibleEventWait::TimedOut);
+        }
+        match wait_once(remaining) {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[cfg(all(any(test, feature = "test-stub"), unix, target_os = "linux"))]
 fn wait_child_exit_blocking(pid: i32, timeout: Duration) -> bool {
     // A pidfd is a pollable fd that becomes readable when the process EXITS
@@ -402,9 +442,21 @@ fn wait_child_exit_blocking(pid: i32, timeout: Duration) -> bool {
         Err(_) => return false,
     };
     let mut fds = [PollFd::new(&fd, PollFlags::IN)];
-    let deadline = Timespec::try_from(timeout).ok();
-    let ready = poll(&mut fds, deadline.as_ref()).is_ok_and(|n| n == 1);
-    ready
+    // One monotonic deadline across EINTR restarts (r16 item 2): each poll gets
+    // only the time remaining, so a signal storm can neither fail the wait
+    // early nor renew the bound.
+    let waited = wait_with_eintr_retry(timeout, |remaining| {
+        let Some(timespec) = Timespec::try_from(remaining).ok() else {
+            return Ok(InterruptibleEventWait::TimedOut);
+        };
+        match poll(&mut fds, Some(&timespec)) {
+            Ok(1) => Ok(InterruptibleEventWait::Fired),
+            Ok(_) => Ok(InterruptibleEventWait::TimedOut),
+            Err(rustix::io::Errno::INTR) => Err(std::io::Error::from(rustix::io::Errno::INTR)),
+            Err(other) => Err(std::io::Error::from(other)),
+        }
+    });
+    matches!(waited, Ok(InterruptibleEventWait::Fired))
         && matches!(
             child_disposition(pid),
             ChildDisposition::Gone | ChildDisposition::Zombie
@@ -438,14 +490,22 @@ fn wait_child_exit_blocking(pid: i32, timeout: Duration) -> bool {
         0,
         0,
     )];
-    let deadline = Some(nix::libc::timespec {
-        tv_sec: timeout.as_secs() as nix::libc::time_t,
-        tv_nsec: timeout.subsec_nanos() as nix::libc::c_long,
-    });
     // A delivered NOTE_EXIT and a changelist EV_ERROR (the process was
-    // already gone) both return 1; 0 is the timeout.
-    let fired = matches!(kq.kevent(&[change], &mut events, deadline), Ok(1));
-    fired
+    // already gone) both return 1; 0 is the timeout. EINTR retries against
+    // the ONE monotonic deadline with the remaining time (r16 item 2).
+    let waited = wait_with_eintr_retry(timeout, |remaining| {
+        let deadline = Some(nix::libc::timespec {
+            tv_sec: remaining.as_secs() as nix::libc::time_t,
+            tv_nsec: remaining.subsec_nanos() as nix::libc::c_long,
+        });
+        match kq.kevent(&[change], &mut events, deadline) {
+            Ok(1) => Ok(InterruptibleEventWait::Fired),
+            Ok(_) => Ok(InterruptibleEventWait::TimedOut),
+            Err(nix::errno::Errno::EINTR) => Err(std::io::Error::from(nix::errno::Errno::EINTR)),
+            Err(other) => Err(std::io::Error::from(other)),
+        }
+    });
+    matches!(waited, Ok(InterruptibleEventWait::Fired))
         && matches!(
             child_disposition(pid),
             ChildDisposition::Gone | ChildDisposition::Zombie
@@ -1333,6 +1393,187 @@ mod tests {
             );
             let _ = live.wait();
         });
+    }
+
+    /// r16 item 2 (injectable): three injected EINTR answers restart the wait
+    /// with the shrinking remaining time and the fourth fires — the bound is one
+    /// monotonic deadline, not four retries with the full timeout.
+    #[cfg(unix)]
+    #[test]
+    fn eintr_restarts_the_exit_wait_with_the_remaining_time_until_it_fires() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const TIMEOUT: Duration = Duration::from_secs(60); // never elapses
+
+        let calls = AtomicUsize::new(0);
+        let outcome = wait_with_eintr_retry(TIMEOUT, |remaining| {
+            let n = calls.fetch_add(1, Ordering::AcqRel);
+            assert!(
+                remaining <= TIMEOUT,
+                "every attempt gets the remaining time at the single deadline"
+            );
+            if n > 0 {
+                assert!(remaining < TIMEOUT, "a retry gets a strictly shorter bound");
+            }
+            match n {
+                0..=2 => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                _ => Ok(InterruptibleEventWait::Fired),
+            }
+        })
+        .expect("the wait itself never returns an error");
+        assert_eq!(outcome, InterruptibleEventWait::Fired);
+        assert_eq!(calls.load(Ordering::Acquire), 4);
+    }
+
+    /// r16 item 2 (injectable): uninterrupted EINTR answers keep restarting
+    /// until the one deadline elapses — without sleeping the caller — and then
+    /// answer TimedOut.
+    #[cfg(unix)]
+    #[test]
+    fn eintr_retries_until_the_single_deadline_elapses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const BOUND: Duration = Duration::from_millis(20);
+
+        let calls = AtomicUsize::new(0);
+        let start = std::time::Instant::now();
+        let outcome = wait_with_eintr_retry(BOUND, |_| {
+            calls.fetch_add(1, Ordering::AcqRel);
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        })
+        .expect("the wait itself never returns an error");
+        assert_eq!(outcome, InterruptibleEventWait::TimedOut);
+        assert!(
+            start.elapsed() >= BOUND,
+            "the retries continue until the bound elapses, not failing at the first EINTR"
+        );
+        assert!(
+            calls.load(Ordering::Acquire) > 1,
+            "a continuously interrupting wait retries against the same deadline"
+        );
+    }
+
+    /// r16 item 2 (injectable): any error other than EINTR propagates on the
+    /// first attempt — an unexpected syscall failure still fails honestly.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_eintr_wait_error_propagates_immediately() {
+        let error = wait_with_eintr_retry(Duration::from_secs(60), |_| {
+            Err(std::io::Error::other("boom"))
+        })
+        .expect_err("the non-EINTR error propagates");
+        assert_eq!(error.to_string(), "boom");
+    }
+
+    /// r16 item 2 (injectable): the first attempt may already see an elapsed
+    /// bound and answers TimedOut without ever entering the syscall.
+    #[cfg(unix)]
+    #[test]
+    fn a_zero_remaining_bound_times_out_without_a_wait() {
+        let outcome = wait_with_eintr_retry(
+            Duration::ZERO,
+            |_| -> std::io::Result<InterruptibleEventWait> {
+                unreachable!("no wait attempt happens after the deadline is gone")
+            },
+        )
+        .expect("the wait itself never returns an error");
+        assert_eq!(outcome, InterruptibleEventWait::TimedOut);
+    }
+
+    /// r16 item 2, Linux: a signal delivered to the WAITING thread while the
+    /// pidfd wait is parked interrupts the syscall (EINTR); the retry keeps
+    /// waiting against the SAME monotonic deadline and answers false only when
+    /// the live child's bound elapses.
+    ///
+    /// A signal only produces a userspace EINTR when CAUGHT, and a thread-
+    /// directed signal needs a pthread handle: the workspace forbids `unsafe`,
+    /// so the empty handler is installed through `signal-hook`'s safe
+    /// registration and delivery is `pthread_kill(3)` (nix's safe wrapper).
+    /// `ppoll(2)` returns EINTR even though the registry installs SA_RESTART
+    /// (poll is never auto-restarted per POSIX). The pre-fix waiter failed the
+    /// wait at the interruption (~a few ms in); the fixed waiter continues to
+    /// the bound.
+    #[cfg(all(unix, target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn an_interrupted_active_exit_wait_continues_until_the_deadline() {
+        use nix::sys::pthread::{Pthread, pthread_kill, pthread_self};
+        use nix::sys::signal::Signal;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+
+        /// The bound: short enough for a hot EINTR retry loop, long enough to
+        /// separate the old fail-immediate behavior from a continued wait.
+        const WAIT: Duration = Duration::from_millis(400);
+        /// ppoll(2) on x86_64.
+        const PPOLL_NR: i32 = 271;
+
+        // Install the empty handler BEFORE the waiter exists. process-wide,
+        // but SIGUSR1 is only ever sent thread-directed at the waiter below, so
+        // no other test observes it; the flag additionally records delivery.
+        let caught = Arc::new(AtomicBool::new(false));
+        signal_hook::flag::register(nix::libc::SIGUSR1, Arc::clone(&caught))
+            .expect("register the safe SIGUSR1 handler");
+
+        let mut live = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .expect("spawn");
+        let live_pid = i32::try_from(live.id()).expect("pid");
+
+        let waiter_tid = Arc::new(AtomicI32::new(0));
+        let waiter_pthread = Arc::new(AtomicUsize::new(0));
+        let (waiter_tid_for_ack, waiter_pthread_for_signal) =
+            (Arc::clone(&waiter_tid), Arc::clone(&waiter_pthread));
+        let waiter = std::thread::spawn(move || {
+            waiter_pthread_for_signal.store(pthread_self() as usize, Ordering::Release);
+            waiter_tid_for_ack.store(nix::unistd::gettid().as_raw(), Ordering::Release);
+
+            let started = std::time::Instant::now();
+            let answered = wait_child_exit_blocking(live_pid, WAIT);
+            (answered, started.elapsed())
+        });
+
+        // ACKNOWLEDGE the wait is ACTIVELY parked in ppoll (no sleep): read
+        // the waiter's syscall file until it names ppoll, bounded by the named
+        // ack deadline below.
+        let ack_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (tid, pthread) = loop {
+            let stored_tid = waiter_tid.load(Ordering::Acquire);
+            let stored_pthread = waiter_pthread.load(Ordering::Acquire);
+            if stored_tid != 0 && stored_pthread != 0 {
+                let path = format!("/proc/{stored_tid}/syscall");
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    let mut parts = text.split_whitespace();
+                    if parts.next().and_then(|nr| nr.parse::<i32>().ok()) == Some(PPOLL_NR) {
+                        break (stored_tid, stored_pthread);
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < ack_deadline,
+                "timed out acknowledging the exit wait parked in ppoll"
+            );
+            std::thread::yield_now();
+        };
+        let _ = tid;
+
+        // Interrupt the parked wait ONCE, directed at the waiter thread.
+        pthread_kill(pthread as Pthread, Some(Signal::SIGUSR1))
+            .expect("interrupt the waiting thread");
+
+        let (answered, elapsed) = waiter.join().expect("the waiter thread returns");
+        assert!(
+            caught.load(Ordering::Acquire),
+            "the signal reached the caught handler"
+        );
+        assert!(
+            !answered,
+            "a live child still does not satisfy the exit wait"
+        );
+        assert!(
+            elapsed >= WAIT - Duration::from_millis(150),
+            "EINTR must not fail the exit wait early: it continues until the same deadline ({elapsed:?})"
+        );
+        let _ = live.kill();
+        let _ = live.wait();
     }
 }
 

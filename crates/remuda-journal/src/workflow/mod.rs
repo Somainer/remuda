@@ -1389,29 +1389,37 @@ impl RunState {
                 //   different agent id already bumped (started(k,a0) then
                 //   started(k,a1) counts the key to 2, but a1 never consumed
                 //   a start).
-                // r6 item 1 / r7 items 1+3: it also must not fire when this
-                // start record is covered by the terminal watermark of a live
-                // StopFailure — an earlier catch-up position in the same
-                // generation, or the settled record AT its position. A
+                // r6 item 1 / r7 items 1+3 / r8 item 1: it also must not fire
+                // when this start record is covered by the terminal watermark
+                // of a live StopFailure — an earlier catch-up position in the
+                // same generation, or the settled record AT its position. A
                 // Complete cover additionally requires the SAME record digest
                 // (a different record reusing the offset via in-place
                 // truncate+rewrite is a genuine retry); a Pending boundary
-                // armed from a record torn INSIDE its JSON has no digest yet,
-                // so its agent identity is matched now that the record is
-                // whole (this fold only reaches the member the record routes
-                // to). A start at a later offset, including one folded later
-                // in the SAME poll, resurrects.
+                // captured mid-write matches only the record completing AT
+                // ITS EXACT OFFSET — this branch guarantees the completed
+                // JSON's type is `started`, and routing to this member
+                // guarantees its agent identity — while its digest-bound
+                // fallback still covers a complete start seen earlier in the
+                // same peek. A start at a later offset, including one folded
+                // later in the SAME poll, resurrects.
                 let settled_by_watermark = member.failure_watermark.as_ref().is_some_and(|cover| {
-                    cursor.file_generation.0 == cover.generation()
-                        && (cursor.offset.0 < cover.offset()
-                            || (cursor.offset.0 == cover.offset()
-                                && match cover {
-                                    UnreadCover::Complete(mark) => cursor.digest == mark.digest,
-                                    // Boundary captured mid-write; verify
-                                    // the completed record's identity is
-                                    // this member before covering it.
-                                    UnreadCover::Pending { .. } => agent_id == member.agent_id,
-                                }))
+                    if cursor.file_generation.0 != cover.generation() {
+                        return false;
+                    }
+                    match cover {
+                        UnreadCover::Complete(mark) => {
+                            cursor.offset.0 < mark.offset
+                                || (cursor.offset.0 == mark.offset && cursor.digest == mark.digest)
+                        }
+                        UnreadCover::Pending(boundary) => {
+                            boundary.fallback.as_ref().is_some_and(|mark| {
+                                cursor.offset.0 < mark.offset
+                                    || (cursor.offset.0 == mark.offset
+                                        && cursor.digest == mark.digest)
+                            }) || cursor.offset.0 == boundary.offset
+                        }
+                    }
                 });
                 let genuine_retry =
                     is_newer_attempt && member.consumed_journal_start && !settled_by_watermark;
@@ -1425,18 +1433,35 @@ impl RunState {
                     // force one file-catch-up convergence emission.
                     self.force_member_refresh.insert(agent_id.clone());
                 }
-                // r6 item 1 / r7 items 1+3: the cover is spent once the fold
-                // reaches its position — this record itself (cursor at the
-                // boundary, whether it matched by digest, identity or reused
-                // the offset), or a journal rotation (different generation).
-                // A genuinely newer start at a LATER offset that resurrects
-                // also clears it via the `>=` comparison. Empty polls never
-                // reach here and therefore keep it armed.
-                if let Some(cover) = member.failure_watermark.as_ref()
-                    && (cursor.file_generation.0 != cover.generation()
-                        || cursor.offset.0 >= cover.offset())
-                {
-                    member.failure_watermark = None;
+                // r6 item 1 / r7 items 1+3 / r8 item 1: each boundary is
+                // spent once the fold reaches its position — this record
+                // itself (whether it matched by digest, fallback or the
+                // pending position) or a journal rotation (different
+                // generation). A Pending boundary whose digest-bound fallback
+                // is reached drops only the fallback and stays armed for the
+                // trailing record. A genuinely newer start at a LATER offset
+                // that resurrects clears everything via the `>=` comparison.
+                // Empty polls never reach here and therefore keep it armed.
+                if let Some(mut cover) = member.failure_watermark.take() {
+                    let retain = match &mut cover {
+                        UnreadCover::Complete(mark) => {
+                            cursor.file_generation.0 == mark.generation
+                                && cursor.offset.0 < mark.offset
+                        }
+                        UnreadCover::Pending(boundary) => {
+                            if let Some(mark) = boundary.fallback.as_ref()
+                                && !(cursor.file_generation.0 == mark.generation
+                                    && cursor.offset.0 < mark.offset)
+                            {
+                                boundary.fallback = None;
+                            }
+                            cursor.file_generation.0 == boundary.generation
+                                && cursor.offset.0 < boundary.offset
+                        }
+                    };
+                    if retain {
+                        member.failure_watermark = Some(cover);
+                    }
                 }
                 // This journal `started` has now been consumed by THIS member,
                 // regardless of whether it resurrected it or was held terminal;

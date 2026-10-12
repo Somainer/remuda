@@ -143,25 +143,44 @@ pub struct UnreadStart {
     pub extent: u64,
 }
 
+/// A trailing record still TORN INSIDE its bytes at peek time. Its type
+/// and/or agent identity may not be written yet; both are validated against
+/// the COMPLETED record when the fold consumes it (it only covers a start of
+/// the failing member at its exact start offset).
+///
+/// The boundary binds to the exact bytes observed (`prefix` over
+/// `offset..extent`): a later file state must keep that prefix byte-for-byte
+/// and must never have shrunk below `extent`, or the completion belongs to a
+/// different write and the boundary is invalidated. When the trailing record
+/// is still unresolved but an EARLIER complete `started` for the same agent
+/// sits in the unread tail, that record is kept as a digest-bound `fallback`
+/// so the failure stays settled even if the trailing record completes as
+/// something other than the member's start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingBoundary {
+    /// File generation the partial record is being written in.
+    pub generation: u64,
+    /// Byte offset of the partial record's first byte.
+    pub offset: u64,
+    /// File length observed at peek time.
+    pub extent: u64,
+    /// Raw bytes observed at `offset..extent`; the completion must continue
+    /// exactly these bytes.
+    pub prefix: Vec<u8>,
+    /// Newest complete matching `started` earlier in the same peek, kept
+    /// while the trailing record's type/identity is unresolved.
+    pub fallback: Option<UnreadStart>,
+}
+
 /// What a live-failure peek found at the newest unread position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnreadCover {
     /// A complete `started` record on disk (terminated, or awaiting only its
     /// newline). Bound by record digest.
     Complete(UnreadStart),
-    /// A trailing record still TORN INSIDE its bytes at peek time that
-    /// already declares a `started` (its identity may still be incomplete).
-    /// Only a generation-scoped boundary is known; the record's identity is
-    /// matched against the failing member when the record completes, and the
-    /// boundary is retired once consumed or invalidated.
-    Pending {
-        /// Generation the partial record is being written in.
-        generation: u64,
-        /// Byte offset of the partial record's first byte.
-        offset: u64,
-        /// File length observed at peek time.
-        extent: u64,
-    },
+    /// A trailing record captured mid-write; type and agent identity are
+    /// validated against the completed JSON when it folds.
+    Pending(PendingBoundary),
 }
 
 impl UnreadCover {
@@ -169,7 +188,7 @@ impl UnreadCover {
     pub fn generation(&self) -> u64 {
         match self {
             UnreadCover::Complete(mark) => mark.generation,
-            UnreadCover::Pending { generation, .. } => *generation,
+            UnreadCover::Pending(boundary) => boundary.generation,
         }
     }
 
@@ -177,7 +196,7 @@ impl UnreadCover {
     pub fn offset(&self) -> u64 {
         match self {
             UnreadCover::Complete(mark) => mark.offset,
-            UnreadCover::Pending { offset, .. } => *offset,
+            UnreadCover::Pending(boundary) => boundary.offset,
         }
     }
 
@@ -185,7 +204,7 @@ impl UnreadCover {
     pub fn extent(&self) -> u64 {
         match self {
             UnreadCover::Complete(mark) => mark.extent,
-            UnreadCover::Pending { extent, .. } => *extent,
+            UnreadCover::Pending(boundary) => boundary.extent,
         }
     }
 }
@@ -268,10 +287,16 @@ impl FileTail {
     /// Find the NEWEST unread `started` for `agent_id` as an [`UnreadCover`]
     /// — or `None`. A terminated record, or a trailing newline-free segment
     /// that already parses whole, is a digest-bound [`UnreadCover::Complete`];
-    /// a trailing segment torn INSIDE its JSON that already declares a
-    /// `started` arms an [`UnreadCover::Pending`] boundary (identity is
-    /// verified by the caller once the record completes). Matches on
-    /// `agentId`, falling back to `key` for records that omit it.
+    /// a trailing segment torn while its type/identity could still resolve to
+    /// this member's start arms an [`UnreadCover::Pending`] boundary carrying
+    /// the exact observed prefix bytes; type and identity are validated
+    /// against the completed record when it folds.
+    ///
+    /// A Pending boundary also carries the newest digest-bound COMPLETE match
+    /// earlier in the same tail as a fallback, so an unresolved trailing
+    /// record never costs the failure coverage the earlier record provides.
+    /// Matches on `agentId`, falling back to `key` for complete records that
+    /// omit it.
     ///
     /// Does NOT consume records, but it DOES apply the same rotation
     /// normalisation against the opened file as [`Self::poll`] (a
@@ -335,20 +360,27 @@ impl FileTail {
             start = i + 1;
         }
         // Trailing newline-free segment: either a complete record awaiting
-        // only its newline, or a record torn inside its JSON (Pending).
+        // only its newline, or a record torn inside its JSON (Pending) —
+        // including a tear BEFORE the type/identity values resolve.
         if start < rest.len() {
-            let mut line = &rest[start..];
+            let raw = &rest[start..];
+            let mut line = raw;
             if let Some(without_cr) = line.strip_suffix(b"\r") {
                 line = without_cr;
             }
             if serde_json::from_slice::<serde_json::Value>(line).is_ok() {
                 record_start(line, start, &mut newest);
             } else if partial_started_prefix(line, agent_id) {
-                return Ok(Some(UnreadCover::Pending {
+                return Ok(Some(UnreadCover::Pending(PendingBoundary {
                     generation: self.generation,
                     offset: self.offset + start as u64,
                     extent: len,
-                }));
+                    prefix: raw.to_vec(),
+                    // The trailing record could still resolve to something
+                    // other than the failing member's start; the newest
+                    // complete match earlier in the tail remains covered.
+                    fallback: newest,
+                })));
             }
         }
         Ok(newest.map(UnreadCover::Complete))
@@ -491,18 +523,19 @@ impl FileTail {
     }
 }
 
-/// Whether a trailing segment that does NOT yet parse as JSON is a torn
-/// `started` record for `agent_id` — a generation-scoped boundary worth
-/// covering before the rest of the record lands.
+/// Whether a trailing segment that does NOT yet parse as JSON is worth a
+/// pending boundary for `agent_id` — the beginning of a record whose type
+/// and/or identity have not finished writing.
 ///
-/// Only complete `"key":"value"` string pairs already on disk are inspected,
-/// so a tear anywhere (even inside a pair) is tolerated. `type` must be
-/// present and equal `started`. Identity: a complete `agentId` pair must
-/// equal `agent_id`; if the `agentId` key is present but its value is still
-/// torn, the identity is undecided and the boundary is armed anyway (the
-/// caller verifies identity once the record completes); with no `agentId`
-/// key at all, the `key` fallback must equal `agent_id`. A fully resolved
-/// different identity returns false.
+/// The boundary is captured as soon as the bytes could still become THIS
+/// member's `started`: only a RESOLVED contradiction rejects the segment
+/// (a complete `type` pair naming another record type, or a complete
+/// `agentId` pair naming another agent). A tear anywhere — inside the type
+/// value, before the identity key, before its colon, inside its value, or
+/// even before any pair is written — leaves type/identity unresolved, so the
+/// boundary is armed and both are validated against the completed JSON when
+/// the record folds (a completion that resolves differently retires the
+/// boundary without covering it).
 fn partial_started_prefix(line: &[u8], agent_id: &str) -> bool {
     let mut i = line
         .iter()
@@ -514,8 +547,6 @@ fn partial_started_prefix(line: &[u8], agent_id: &str) -> bool {
     i += 1;
     let mut record_type: Option<String> = None;
     let mut agent_id_value: Option<String> = None;
-    let mut agent_id_key_seen = false;
-    let mut key_value: Option<String> = None;
     // Read `"key":"value"` pairs (all journal fields are strings) until the
     // object closes or the torn end stops a pair from being read whole.
     loop {
@@ -529,6 +560,8 @@ fn partial_started_prefix(line: &[u8], agent_id: &str) -> bool {
             break;
         }
         let Some((pair_key, next)) = read_json_string(&line[i..]) else {
+            // A key name still mid-write (e.g. `"agentI`): nothing after it
+            // is resolved.
             break;
         };
         i += next;
@@ -536,6 +569,7 @@ fn partial_started_prefix(line: &[u8], agent_id: &str) -> bool {
             i += 1;
         }
         if i >= line.len() || line[i] != b':' {
+            // The key is on disk but its colon/value never arrived.
             break;
         }
         i += 1;
@@ -543,23 +577,18 @@ fn partial_started_prefix(line: &[u8], agent_id: &str) -> bool {
             i += 1;
         }
         if i >= line.len() || line[i] != b'"' {
-            // The agentId key was read but its string value is the torn part.
-            if pair_key == "agentId" {
-                agent_id_key_seen = true;
-            }
+            // The value is the torn part (missing opening quote included).
             break;
         }
         let Some((value, next)) = read_json_string(&line[i..]) else {
-            if pair_key == "agentId" {
-                agent_id_key_seen = true;
-            }
+            // The string value is still being written (a tear inside it, a
+            // dangling escape, a missing closing quote).
             break;
         };
         i += next;
         match pair_key.as_str() {
             "type" => record_type = Some(value),
             "agentId" => agent_id_value = Some(value),
-            "key" => key_value = Some(value),
             _ => {}
         }
         while i < line.len() && line[i].is_ascii_whitespace() {
@@ -571,13 +600,16 @@ fn partial_started_prefix(line: &[u8], agent_id: &str) -> bool {
             _ => break,
         }
     }
-    if record_type.as_deref() != Some("started") {
+    // Reject only a RESOLVED non-match; everything unresolved is validated
+    // against the completed record on the fold.
+    if let Some(record_type) = record_type.as_deref()
+        && record_type != "started"
+    {
         return false;
     }
     match agent_id_value {
         Some(value) => value == agent_id,
-        None if agent_id_key_seen => true,
-        None => key_value.as_deref() == Some(agent_id),
+        None => true,
     }
 }
 
@@ -611,34 +643,47 @@ mod torn_start_tests {
     use super::partial_started_prefix;
 
     #[test]
-    fn torn_inside_json_identity_edges() {
+    fn torn_around_identity_is_captured_until_completion() {
         // Full agentId, closing brace missing -> the failing agent's record.
         assert!(partial_started_prefix(
             br#"{"type":"started","key":"v2:k","agentId":"a1""#,
             "a1"
         ));
-        // Torn inside the agentId VALUE: identity undecided, armed anyway.
+        // Torn INSIDE the agentId VALUE: identity unresolved, armed anyway.
         assert!(partial_started_prefix(
             br#"{"type":"started","key":"v2:k","agentId":"a"#,
             "a1"
         ));
-        // A complete DIFFERENT agentId is not this member's record.
+        // Torn BEFORE the identity value's COLON (key complete, colon gone).
+        assert!(partial_started_prefix(
+            br#"{"type":"started","key":"v2:k","agentId""#,
+            "a1"
+        ));
+        // Torn BEFORE the identity KEY (nothing of agentId written yet).
+        assert!(partial_started_prefix(
+            br#"{"type":"started","key":"v2:k","#,
+            "a1"
+        ));
+        // Torn mid-key while the identity key begins.
+        assert!(partial_started_prefix(
+            br#"{"type":"started","key":"v2:k","agentI"#,
+            "a1"
+        ));
+        // Torn inside the TYPE value: type unresolved, validated later.
+        assert!(partial_started_prefix(br#"{"type":"starte"#, "a1"));
+        // Torn before any pair at all.
+        assert!(partial_started_prefix(br#"{"#, "a1"));
+        // A complete DIFFERENT agentId is resolved not-ours.
         assert!(!partial_started_prefix(
             br#"{"type":"started","key":"v2:k","agentId":"a2""#,
             "a1"
         ));
-        // type not yet present/complete -> not a started record.
-        assert!(!partial_started_prefix(br#"{"type":"faile"#, "a1"));
-        assert!(!partial_started_prefix(br#"nonsense {"#, "a1"));
-        // key fallback before the agentId key is written.
-        assert!(partial_started_prefix(
-            br#"{"type":"started","key":"a1","agentI"#,
-            "a1"
-        ));
-        // Escaped quote inside an in-progress value never terminates early.
+        // A complete non-started type is resolved not-ours.
         assert!(!partial_started_prefix(
-            br#"{"type":"started","key":"a\"x","#,
+            br#"{"type":"failed","agentId":"a1""#,
             "a1"
         ));
+        // Garbage that cannot begin a JSON object is never captured.
+        assert!(!partial_started_prefix(br#"nonsense {"#, "a1"));
     }
 }

@@ -1541,3 +1541,149 @@ fn a_start_torn_inside_its_json_at_failure_time_stays_covered() {
         "a start after the covered record is a genuine retry"
     );
 }
+
+/// c-cardsettle-fu2 r8 item 1: a start torn BEFORE its identity resolves
+/// (the bytes stop after `...,"agentId` — key present, colon/value gone)
+/// must already carry the pending boundary; the completed record stays the
+/// failed attempt once the rest of its JSON lands. Splits covered here:
+/// before the identity key, before its colon, inside its value.
+fn a1_state_after(bodies: &[ObservationPayload]) -> Option<WorkflowState> {
+    bodies.iter().rev().find_map(|body| match body {
+        ObservationPayload::WorkflowMember(m)
+            if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+        {
+            Some(m.state)
+        }
+        _ => None,
+    })
+}
+
+fn r8_torn_identity_split(tag: &str, torn_prefix: &str, completion: &str) {
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session");
+    let run_id = format!("wf_fu2_r8_{tag}");
+    let run_dir = session.join("subagents/workflows").join(&run_id);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("agent-a1.jsonl"), "{}\n").unwrap();
+    std::fs::write(
+        run_dir.join("journal.jsonl"),
+        "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n\
+         {\"type\":\"failed\",\"key\":\"v2:k\",\"agentId\":\"a1\"}\n",
+    )
+    .unwrap();
+
+    let mut tailer = WorkflowJournalTailer::new(&session, context("sess"));
+    tailer
+        .launch(WorkflowLaunch {
+            run_id,
+            task_id: Some("t1".into()),
+            tool_call_id: Some("tc".into()),
+            transcript_dir: Some(run_dir.clone()),
+            script_path: None,
+            script_source: None,
+        })
+        .unwrap();
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Failed),
+        "attempt 1 ends Failed"
+    );
+
+    // Attempt 2's start, torn before the identity value resolves.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        write!(journal, "{torn_prefix}").unwrap();
+    }
+    tailer
+        .agent_event("a1", true, Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+    tailer
+        .agent_failed("a1", Some(&run_dir.join("agent-a1.jsonl")))
+        .unwrap();
+
+    // Still torn: nothing folds, a1 stays Failed (an unchanged member may
+    // not be re-emitted at all on this empty poll).
+    let torn_poll: Vec<_> = bodies(tailer.poll().unwrap())
+        .iter()
+        .filter_map(|body| match body {
+            ObservationPayload::WorkflowMember(m)
+                if m.native_agent_id == Knowledge::Known { value: "a1".into() } =>
+            {
+                Some(m.state)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        torn_poll
+            .iter()
+            .all(|state| *state == WorkflowState::Failed),
+        "the torn prefix folds nothing; a1 stays Failed: {torn_poll:?}"
+    );
+
+    // Complete exactly the record that was being written.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        write!(journal, "{completion}").unwrap();
+    }
+    let completed = bodies(tailer.poll().unwrap());
+    assert_eq!(
+        a1_state_after(&completed),
+        Some(WorkflowState::Failed),
+        "the start captured before its identity resolved is the settled attempt"
+    );
+
+    // A genuinely newer attempt appended afterwards resurrects.
+    {
+        use std::io::Write;
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(run_dir.join("journal.jsonl"))
+            .unwrap();
+        writeln!(
+            journal,
+            "{{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a1\"}}"
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        a1_state_after(&bodies(tailer.poll().unwrap())),
+        Some(WorkflowState::Running),
+        "a start after the covered record is a genuine retry"
+    );
+}
+
+#[test]
+fn a_start_torn_before_the_identity_key_stays_covered() {
+    r8_torn_identity_split(
+        "beforekey",
+        "{\"type\":\"started\",\"key\":\"v2:k\",",
+        "\"agentId\":\"a1\"}\n",
+    );
+}
+
+#[test]
+fn a_start_torn_before_the_identity_colon_stays_covered() {
+    r8_torn_identity_split(
+        "beforecolon",
+        "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\"",
+        ":\"a1\"}\n",
+    );
+}
+
+#[test]
+fn a_start_torn_inside_the_identity_value_stays_covered() {
+    r8_torn_identity_split(
+        "insidevalue",
+        "{\"type\":\"started\",\"key\":\"v2:k\",\"agentId\":\"a",
+        "1\"}\n",
+    );
+}

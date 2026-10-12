@@ -1384,6 +1384,29 @@ pub(crate) async fn apply_result(
         barrier.note_completed();
         return;
     }
+    // r14 R2 — authority is CURRENT, not merely granted. A takeover hello
+    // supersedes the granted socket while its Landing push is still running:
+    // the superseded socket keeps the persisted session identity (and passes
+    // the equality above), but it is no longer the host's live session. Its
+    // late Finished/RPC verdict and its run-log evidence stand down here; the
+    // row stays Landing and the remote reconciler establishes the outcome.
+    if existing.state == GateJobState::Landing
+        && let Some(session) = grant_session_u64
+        && let Some(host) = existing.host_id.as_ref()
+        && !state
+            .nodes
+            .is_current_session(host.as_id().as_str(), session)
+            .await
+    {
+        tracing::warn!(
+            job_id,
+            granted_session = session,
+            "dropping Landing verdict from the granted session after it was superseded"
+        );
+        #[cfg(any(test, feature = "test-faults"))]
+        barrier.note_completed();
+        return;
+    }
     // r13 item 5: a granted land child that hit its budget reports UNCERTAIN —
     // its group is terminated on the Node, but the remote may already have taken
     // the ref. Never turn that into Failed/landed from the verdict: keep the
@@ -2314,6 +2337,10 @@ pub(crate) struct LandingRow {
     job: GateJob,
     landing_at: Option<String>,
     probed_at: Option<String>,
+    /// The authenticated carrier session the LIVE grant belongs to (Hub-only
+    /// column). A read-only probe settles nothing unless the row it lands on is
+    /// still the same granted (attempt, merge, session).
+    grant_session: Option<i64>,
 }
 
 /// Force one bounded Landing reconciliation pass for a host (or all hosts) off
@@ -2385,6 +2412,7 @@ pub(crate) async fn reconcile_landings(state: &AppState, force_host: Option<&str
             job,
             landing_at,
             probed_at,
+            grant_session,
         } = row;
         let Some(lane_host) = landing_lane_host(state, &job).await else {
             continue;
@@ -2421,7 +2449,7 @@ pub(crate) async fn reconcile_landings(state: &AppState, force_host: Option<&str
         let expired =
             elapsed_since(&now, landing_at.as_deref()).is_some_and(|age| age >= recovery_ms);
         match outcome {
-            LandingProbe::Landed => settle_landing_landed(state, &job).await,
+            LandingProbe::Landed => settle_landing_landed(state, &job, grant_session).await,
             LandingProbe::Absent => {
                 // The lane only attests groups IT spawned. A `pushFrom: home`
                 // push is driven by the home host, whose process liveness the
@@ -2441,7 +2469,7 @@ pub(crate) async fn reconcile_landings(state: &AppState, force_host: Option<&str
                     // Established: nothing was pushed and the only process group
                     // that could push is verified dead — safe to re-queue (bounded
                     // by the same attempt cap) or fail at the cap.
-                    settle_landing_absent(state, &job).await;
+                    settle_landing_absent(state, &job, grant_session).await;
                 }
             }
             LandingProbe::Unknown => {
@@ -2558,25 +2586,13 @@ async fn mark_landing_unknown(state: &AppState, job: &GateJob, note: &str) {
 
 /// Settle a Landing whose exact granted merge the probe confirmed on the
 /// remote. Never re-queues or re-pushes.
-async fn settle_landing_landed(state: &AppState, job: &GateJob) {
-    let job_id = job.id.as_id().to_string();
+/// Settle a Landing whose exact granted merge the probe confirmed on the
+/// remote. Never re-queues or re-pushes. R2: the probe settles ONLY the live
+/// granted attempt it ran against — same (attempts, merge, session).
+async fn settle_landing_landed(state: &AppState, job: &GateJob, grant_session: Option<i64>) {
     let outcome = state
         .store
-        .mutate_gate_job(&job_id, move |row| {
-            if row.state != GateJobState::Landing {
-                return None;
-            }
-            row.home_land_in_flight = false;
-            row.landing_session_epoch = None;
-            row.landing_outcome_unknown = false;
-            row.finished_at = Some(now_ts());
-            row.state = GateJobState::Landed;
-            row.error = None;
-            if row.reason.is_none() {
-                row.reason = Some("landed; confirmed on remote main by reconciliation".into());
-            }
-            Some(())
-        })
+        .settle_landing_probe(job, grant_session, true)
         .await;
     if let Ok(Some(settled)) = outcome {
         journal(state, &settled.requested_by, "gate.landed", &settled).await;
@@ -2587,56 +2603,21 @@ async fn settle_landing_landed(state: &AppState, job: &GateJob) {
 
 /// Settle a Landing the probe established ABSENT: a fresh remote fetch does not
 /// contain the granted merge AND the lane verified the land process group dead.
-/// Nothing was pushed and nothing can still push, so the job re-enters the
-/// queue for a fresh attempt, or fails once the attempt cap is reached. r14 R1.
-async fn settle_landing_absent(state: &AppState, job: &GateJob) {
-    let job_id = job.id.as_id().to_string();
+/// Nothing was pushed and nothing can still push, so the job re-enters the queue
+/// for a fresh attempt, or fails once the attempt cap is reached. R2: only the
+/// live granted attempt (attempts/merge/session unchanged through the probe) is
+/// re-queued this way.
+async fn settle_landing_absent(state: &AppState, job: &GateJob, grant_session: Option<i64>) {
     let outcome = state
         .store
-        .mutate_gate_job(&job_id, move |row| {
-            if row.state != GateJobState::Landing {
-                return None;
-            }
-            row.home_land_in_flight = false;
-            row.landing_session_epoch = None;
-            row.landing_outcome_unknown = false;
-            if row.attempts < MAX_LAND_ATTEMPTS {
-                row.state = GateJobState::Queued;
-                row.started_at = None;
-                row.host_id = None;
-                row.lane_id = None;
-                row.finished_at = None;
-                row.current_main_sha = None;
-                row.merge_ref = None;
-                row.merge_sha = None;
-                row.failed_step = None;
-                row.reason = None;
-                row.log_object_id = None;
-                row.error = Some(
-                    "landing provably absent on the remote and the land process group is verified \
-                     dead; re-queued for a fresh attempt"
-                        .into(),
-                );
-            } else {
-                row.state = GateJobState::Failed;
-                row.finished_at = Some(now_ts());
-                row.error = Some(
-                    "landing provably absent on the remote with the land process group verified \
-                     dead; the attempt cap is reached, so the job is not re-run automatically"
-                        .into(),
-                );
-                row.reason =
-                    Some("failed; landing provably absent and the land group is dead".into());
-            }
-            Some(())
-        })
+        .settle_landing_probe(job, grant_session, false)
         .await;
     if let Ok(Some(settled)) = outcome {
+        // Normally the run is already gone (the probe required a verified-dead
+        // group); make sure before re-dispatching or dropping refs.
+        abort_landing_run(state, &settled).await;
         match settled.state {
             GateJobState::Queued => {
-                // Normally the run is already gone (the probe required a
-                // verified-dead group); make sure before re-dispatching.
-                abort_landing_run(state, job).await;
                 journal(
                     state,
                     &settled.requested_by,
@@ -2647,7 +2628,6 @@ async fn settle_landing_absent(state: &AppState, job: &GateJob) {
                 schedule_once(state);
             }
             GateJobState::Failed => {
-                abort_landing_run(state, job).await;
                 journal(state, &settled.requested_by, "gate.failed", &settled).await;
                 drop_job_refs(state, &settled).await;
             }
@@ -2655,20 +2635,6 @@ async fn settle_landing_absent(state: &AppState, job: &GateJob) {
         }
     }
 }
-
-/// Reconcile a host's gate jobs when an authenticated carrier session ENDS
-/// (its socket/SSH link dropped). A pre-grant (`running`/`canceling`) job the
-/// Hub dispatched on EXACTLY that session has lost the only carrier allowed to
-/// run it: re-enter the queue (a `canceling` one finishes canceled) so a fresh
-/// session can pick it up, rather than strand it Running forever. Keyed to the
-/// CLOSED session specifically, so a takeover (new session while the old socket
-/// is still open) does NOT yank a still-verifying run off its lane — that run's
-/// grant is fenced by current-session checks and it is requeued here only once
-/// its own socket actually closes.
-///
-/// `landing` rows are deliberately not requeued: the grant authorized a push
-/// that may be in flight, so they keep occupancy and are settled by the
-/// bounded Landing reconciliation against the remote.
 pub(crate) async fn recover_ended_session(state: &AppState, host_id: &str, session: u64) {
     if session == 0 {
         return;
@@ -2832,23 +2798,26 @@ impl Store {
     ) -> Result<Vec<LandingRow>, crate::store::StoreError> {
         self.run_named("list_landing_jobs", |conn| {
             let mut statement = conn.prepare(
-                "SELECT doc_json, landing_at, landing_probed_at FROM gate_jobs
+                "SELECT doc_json, landing_at, landing_probed_at, dispatch_session
+                  FROM gate_jobs
                   WHERE state = 'landing' ORDER BY queued_at ASC, rowid ASC",
             )?;
             let rows = statement.query_map([], |row| {
                 let doc: String = row.get(0)?;
                 let landing_at: Option<String> = row.get(1)?;
                 let probed_at: Option<String> = row.get(2)?;
-                Ok((doc, landing_at, probed_at))
+                let grant_session: Option<i64> = row.get(3)?;
+                Ok((doc, landing_at, probed_at, grant_session))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (doc, landing_at, probed_at) = row?;
+                let (doc, landing_at, probed_at, grant_session) = row?;
                 if let Ok(job) = serde_json::from_str::<GateJob>(&doc) {
                     out.push(LandingRow {
                         job,
                         landing_at,
                         probed_at,
+                        grant_session,
                     });
                 }
             }
@@ -3603,6 +3572,124 @@ impl Store {
                 recovered.push(job);
             }
             Ok(recovered)
+        })
+        .await
+    }
+
+    /// r14 R2: apply a read-only landing probe verdict (`landed` or
+    /// `absent`) inside ONE immediate transaction, and only when the row is
+    /// still the live granted attempt the probe ran against: state Landing,
+    /// `attempts` and `mergeSha` equal the snapshot, and the Hub-only
+    /// `dispatch_session` equals the granted carrier session. A newer attempt
+    /// (re-queued and re-granted while the probe was in flight) makes the
+    /// predicate match nothing and the stale probe stands down.
+    pub(crate) async fn settle_landing_probe(
+        &self,
+        snapshot: &GateJob,
+        grant_session: Option<i64>,
+        landed: bool,
+    ) -> Result<Option<GateJob>, crate::store::StoreError> {
+        let job_id = snapshot.id.as_id().to_string();
+        let expected_attempts = snapshot.attempts;
+        let expected_merge = snapshot.merge_sha.clone().unwrap_or_default();
+        let expected_session = grant_session;
+        self.run_named("settle_landing_probe", move |conn| {
+            let tx = crate::store::immediate_tx(conn)?;
+            let current_state: Option<String> = tx
+                .query_row(
+                    "SELECT json_extract(doc_json,'$.state') FROM gate_jobs WHERE id = ?1",
+                    params![job_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current_state.as_deref() != Some(GateJobState::Landing.as_str()) {
+                tx.commit()?;
+                return Ok(None);
+            }
+            // Identity of the granted attempt, checked INSIDE the writer job:
+            // attempts + merge from the doc, the bound session from its column.
+            let same_attempt: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM gate_jobs
+                  WHERE id = ?1
+                    AND json_extract(doc_json,'$.state') = 'landing'
+                    AND json_extract(doc_json,'$.attempts') = ?2
+                    AND json_extract(doc_json,'$.mergeSha') = ?3
+                    AND dispatch_session IS ?4",
+                params![job_id, expected_attempts, expected_merge, expected_session],
+                |row| row.get(0),
+            )?;
+            if same_attempt == 0 {
+                // The probe is for an older attempt; nothing moves.
+                tx.commit()?;
+                return Ok(None);
+            }
+            let Some(mut job) = tx
+                .query_row(
+                    "SELECT doc_json FROM gate_jobs WHERE id = ?1",
+                    params![job_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .and_then(|text| serde_json::from_str::<GateJob>(&text).ok())
+            else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let now = now();
+            if landed {
+                job.home_land_in_flight = false;
+                job.landing_session_epoch = None;
+                job.landing_outcome_unknown = false;
+                job.finished_at = Some(now_ts());
+                job.state = GateJobState::Landed;
+                job.error = None;
+                if job.reason.is_none() {
+                    job.reason = Some("landed; confirmed on remote main by reconciliation".into());
+                }
+            } else if job.attempts < MAX_LAND_ATTEMPTS {
+                job.home_land_in_flight = false;
+                job.landing_session_epoch = None;
+                job.landing_outcome_unknown = false;
+                job.state = GateJobState::Queued;
+                job.started_at = None;
+                job.host_id = None;
+                job.lane_id = None;
+                job.finished_at = None;
+                job.current_main_sha = None;
+                job.merge_ref = None;
+                job.merge_sha = None;
+                job.failed_step = None;
+                job.reason = None;
+                job.log_object_id = None;
+                job.error = Some(
+                    "landing provably absent on the remote and the land process group is verified \
+                     dead; re-queued for a fresh attempt"
+                        .into(),
+                );
+            } else {
+                job.home_land_in_flight = false;
+                job.landing_session_epoch = None;
+                job.landing_outcome_unknown = false;
+                job.state = GateJobState::Failed;
+                job.finished_at = Some(now_ts());
+                job.error = Some(
+                    "landing provably absent on the remote with the land process group verified \
+                     dead; the attempt cap is reached, so the job is not re-run automatically"
+                        .into(),
+                );
+                job.reason =
+                    Some("failed; landing provably absent and the land group is dead".into());
+            }
+            let doc = serde_json::to_string(&job)?;
+            tx.execute(
+                "UPDATE gate_jobs
+                    SET doc_json = ?1, state = ?2, landing_at = NULL,
+                        dispatch_session = NULL, revision = revision + 1, updated_at = ?3
+                  WHERE id = ?4",
+                params![doc, job.state.as_str(), now, job_id],
+            )?;
+            tx.commit()?;
+            Ok(Some(job))
         })
         .await
     }

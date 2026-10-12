@@ -746,6 +746,81 @@ impl RunningHub {
             .map_err(|err| anyhow::anyhow!("{err}"))
     }
 
+    /// Test-only: drive the production landing-probe writer with the exact
+    /// (attempts, merge, session) tuple the probe was taken for. Returns the
+    /// settled job JSON only when the live row still names that attempt (r14 R2).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_settle_landing_probe(
+        &self,
+        job_id: &str,
+        expected_attempts: u32,
+        expected_merge: String,
+        expected_session: Option<i64>,
+        landed: bool,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let store = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let mut snapshot = store
+            .get_gate_job(job_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("job missing"))?;
+        snapshot.attempts = expected_attempts;
+        snapshot.merge_sha = Some(expected_merge);
+        let settled = store
+            .settle_landing_probe(&snapshot, expected_session, landed)
+            .await?;
+        Ok(settled.map(|job| serde_json::to_value(job).expect("gate job serializes")))
+    }
+
+    /// Test-only: take the Running → Landing grant for the live claimed attempt.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_gate_land_grant(
+        &self,
+        job_id: &str,
+        host_id: &str,
+        merge_sha: &str,
+        session: u64,
+    ) -> anyhow::Result<serde_json::Value> {
+        let store = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let job = store
+            .get_gate_job(job_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("job missing"))?;
+        let host: remuda_protocol::HostId = host_id
+            .parse()
+            .map_err(|err: remuda_protocol::WireValueError| anyhow::anyhow!("{err}"))?;
+        // The production dispatcher stamps the bound socket session before the
+        // grant frame is sent; mirror that so the grant tuple is complete.
+        let session_i64 = i64::try_from(session)?;
+        store
+            .set_gate_dispatch_session(job_id, session)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        let answer = store
+            .gate_land_grant(
+                job_id,
+                host_id,
+                job.attempts,
+                "test-epoch",
+                merge_sha,
+                session,
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        let _ = host;
+        let _ = session_i64;
+        Ok(serde_json::json!({
+            "granted": answer.granted,
+            "landingInProgress": answer.landing_in_progress,
+            "state": answer.state,
+        }))
+    }
+
     /// Test-only: run the §7.5 direct-op admission (check + `admitted` row)
     /// without a live Node, for worker.provision/remove coverage while the
     /// worker routes themselves stay Agent-403 (ma-admission opens them).

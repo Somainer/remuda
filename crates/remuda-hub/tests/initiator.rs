@@ -3608,3 +3608,77 @@ async fn attempt_one_log_cannot_replace_attempt_two_after_a_genuine_requeue() {
         "the gated transaction replaced attempt 2's log: {after}"
     );
 }
+
+/// r14 item 2 (R2), probe half: a read-only landing probe carries the exact
+/// (attempts, merge, session) it was taken against. After the row is requeued
+/// and a NEWER attempt is granted (new generation, new granted merge on a new
+/// carrier session), the stale probe result must settle nothing. Only the probe
+/// for the CURRENT granted tuple may settle the row.
+#[tokio::test]
+async fn a_probe_for_an_older_attempt_never_settles_a_newer_landing() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+
+    // Attempt 1: enqueue, claim, and take the Running → Landing grant.
+    let job_id = queued_land_job(&ctx).await;
+    let claimed = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("attempt 1 claimed");
+    assert_eq!(claimed["state"], json!("running"));
+    let merge1 = "1111111111111111111111111111111111111111";
+    let session1: i64 = 0x1_0000_0001;
+    let grant1 = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge1, session1 as u64)
+        .await
+        .unwrap();
+    assert_eq!(grant1["granted"], json!(true), "{grant1}");
+    assert_eq!(
+        ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap()["state"],
+        json!("landing")
+    );
+
+    // Attempt 1 is requeued (a genuine base-moved verdict), then claimed and
+    // granted AGAIN as attempt 2 with a different merge and carrier session.
+    genuine_requeue_to_attempt_two(&ctx, &job_id).await;
+    let merge2 = "2222222222222222222222222222222222222222";
+    let session2: i64 = 0x2_0000_0002;
+    let grant2 = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge2, session2 as u64)
+        .await
+        .unwrap();
+    assert_eq!(grant2["granted"], json!(true), "{grant2}");
+    let live = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(live["state"], json!("landing"), "{live}");
+    assert_eq!(live["attempts"], json!(2), "{live}");
+
+    // The STALE probe — attempt 1's tuple, even reporting landed — settles
+    // nothing: the row is a newer Landing now.
+    let stale = ctx
+        .hub
+        .test_settle_landing_probe(&job_id, 1, merge1.to_owned(), Some(session1), true)
+        .await
+        .unwrap();
+    assert!(
+        stale.is_none(),
+        "an old generation probe must not settle a newer Landing: {stale:?}"
+    );
+    let still = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(still["state"], json!("landing"), "{still}");
+    assert_eq!(still["attempts"], json!(2), "{still}");
+    assert_eq!(still["mergeSha"], json!(merge2), "{still}");
+
+    // The CURRENT attempt's probe settles landed.
+    let current = ctx
+        .hub
+        .test_settle_landing_probe(&job_id, 2, merge2.to_owned(), Some(session2), true)
+        .await
+        .unwrap()
+        .expect("the current granted attempt probe settles");
+    assert_eq!(current["state"], json!("landed"), "{current}");
+    assert_eq!(current["mergeSha"], json!(merge2), "{current}");
+}

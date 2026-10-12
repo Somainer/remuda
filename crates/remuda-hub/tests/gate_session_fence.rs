@@ -437,13 +437,14 @@ async fn full_disconnect_requeues_and_a_fresh_session_is_dispatched_and_grants()
     assert_eq!(h.job(&job).await["state"], json!("landing"));
 }
 
-/// r13 item 4: a granted Landing can only be settled by the authenticated
-/// session that holds the grant. After A is granted and B takes over the host,
-/// a Finished verdict B sends (same host, same generation, even carrying the
-/// exact merge) must be dropped — the row stays Landing; only A's own Finished
-/// (the granted session) settles it landed.
+/// r14 item 2 (R2): authority is CURRENT, not merely granted. After A is
+/// granted and B takes over the host, NEITHER forged/superseded session may
+/// settle the Landing — B (a different session) is refused, and A's own late
+/// Finished is ALSO refused because the granted socket is no longer the live
+/// current one. The row stays Landing for the read-only remote reconciler; no
+/// verdict from either socket moves it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_replacement_session_finished_cannot_settle_a_granted_landing() {
+async fn neither_a_replacement_nor_the_superseded_granted_session_settles_a_landing() {
     let (h, a) = Harness::new().await;
     let a_token = a.node_token().to_owned();
 
@@ -485,12 +486,21 @@ async fn a_replacement_session_finished_cannot_settle_a_granted_landing() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // The granted session A sends the identical verdict: it settles landed.
+    // R2: the granted session A is itself superseded now. Its identical late
+    // Finished verdict must ALSO stand down — elapsed time or a matching
+    // generation cannot make a non-current session authoritative.
     a.notify("gate.event", finished(a_gen));
-    let settled = h.wait_state(&job, &["landed", "failed"]).await;
-    assert_eq!(
-        settled["state"],
-        json!("landed"),
-        "only the granted session settles: {settled}"
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(
+            h.job(&job).await["state"],
+            json!("landing"),
+            "the superseded granted session must not settle either"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Neither socket may settle the row: only the read-only remote reconciler
+    // (or the operator) establishes a Landing outcome after takeover.
+    assert_eq!(h.job(&job).await["state"], json!("landing"));
 }

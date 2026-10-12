@@ -100,9 +100,11 @@ pub struct CodexAdapter {
     window: Option<crate::adapters::codex_discovery::DiscoveryWindow>,
     /// r9 item 1: the instance's live interval in its cwd, registered BEFORE
     /// launch (production) and retained through close independent of binding.
-    /// Clones are held by the live driver slot and by this adapter; the
-    /// interval closes when the last one drops. None for a promoted/attach
-    /// adapter and for non-codex launches.
+    /// The live driver slot owns the cohort and closes it only after the
+    /// process stops (Ruling A2, r11 item 3); the adapter's clone is a
+    /// non-closing witness that can be torn down before the stop ladder
+    /// without ending the interval. None for a promoted/attach adapter and
+    /// for non-codex launches.
     lifetime: Option<crate::adapters::codex_discovery::LifetimeGuard>,
     /// r8 item 1 tier b: process-tree ownership probe + live agent roots.
     ownership: Option<std::sync::Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>>,

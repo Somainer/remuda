@@ -106,39 +106,67 @@ static REJECTED_CANDIDATES: LazyLock<Mutex<HashMap<(String, PathBuf), String>>> 
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// RAII owner of one registered instance lifetime. The interval opens in
-/// [`begin_lifetime`] (production: before the agent process is launched) and
-/// is marked closed when the LAST clone drops — the live driver slot and the
-/// file adapter each hold one. Closing is independent of bind: a bound
+/// [`begin_lifetime`] (production: before the agent process is launched).
+/// Exactly ONE guard per cohort is the OWNER (the one [`begin_lifetime`]
+/// returns, held by the live driver slot); every [clone](Self::clone) is a
+/// non-closing WITNESS (a file adapter). The interval is closed explicitly by
+/// the owner only AFTER the process has stopped — [`LifetimeGuard::close`]
+/// (c-usagefu r11 item 3, Ruling A2) — never when close merely begins and
+/// never on a witness drop. Owner Drop is the safety net for a teardown that
+/// did not reach the stop ladder. Closing is independent of bind: a bound
 /// instance stays live for the whole driver run.
 pub(crate) struct LifetimeGuard {
     inner: Arc<LifetimeGuardInner>,
+    owner: bool,
 }
 
 struct LifetimeGuardInner {
     key: PathBuf,
     owner: String,
-    /// Registration cohort this guard belongs to. Drop closes the interval
-    /// only if it is still the current cohort (resume bumps the epoch).
+    /// Registration cohort this guard belongs to. A close is recorded only if
+    /// it is still the current cohort (resume bumps the epoch).
     epoch: u64,
-    /// Test clock: when set, Drop records this as the close time instead of
+    /// Set once the interval has been closed, so an explicit close followed by
+    /// owner Drop cannot move the recorded close time later.
+    closed: std::sync::atomic::AtomicBool,
+    /// Test clock: when set, the close is recorded at this time instead of
     /// wall-clock now, so regressions can place launches/closes on a
     /// deterministic timeline.
     #[cfg(test)]
     closed_at: std::sync::Mutex<Option<OffsetDateTime>>,
 }
 
-impl Clone for LifetimeGuard {
-    fn clone(&self) -> Self {
+impl LifetimeGuard {
+    /// Witness clone: shares the cohort but its Drop never closes the interval
+    /// (file adapters are torn down BEFORE the stop ladder runs).
+    pub(crate) fn witness(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            owner: false,
         }
     }
-}
 
-impl Drop for LifetimeGuardInner {
-    fn drop(&mut self) {
+    /// Close the interval NOW: the owner calls this only after the agent
+    /// process has actually stopped (Ruling A2, r11 item 3), so a rollout
+    /// created while close was in flight is still attributed under the LIVE
+    /// census. Idempotent; witnesses calling it would do nothing (there is
+    /// exactly one owner per cohort).
+    pub(crate) fn close_interval(&self) {
+        self.record_close();
+    }
+
+    fn record_close(&self) {
+        if !self.owner
+            || self
+                .inner
+                .closed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
         #[cfg(test)]
         let at = self
+            .inner
             .closed_at
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -146,12 +174,29 @@ impl Drop for LifetimeGuardInner {
         #[cfg(not(test))]
         let at = OffsetDateTime::now_utc();
         let mut map = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
-        if let Some(by_instance) = map.get_mut(&self.key)
-            && let Some(lifetime) = by_instance.get_mut(&self.owner)
-            && lifetime.epoch == self.epoch
+        if let Some(by_instance) = map.get_mut(&self.inner.key)
+            && let Some(lifetime) = by_instance.get_mut(&self.inner.owner)
+            && lifetime.epoch == self.inner.epoch
         {
             lifetime.closed_at = Some(at);
         }
+    }
+}
+
+impl Clone for LifetimeGuard {
+    /// Cloning the owner yields a non-closing witness; the original keeps the
+    /// sole right to close the cohort.
+    fn clone(&self) -> Self {
+        self.witness()
+    }
+}
+
+impl Drop for LifetimeGuard {
+    fn drop(&mut self) {
+        // Safety net only: a normal teardown already called close_interval()
+        // after the stop ladder (the AtomicBool then makes this a no-op). A
+        // witness drop never closes.
+        self.record_close();
     }
 }
 
@@ -213,9 +258,11 @@ pub(crate) fn begin_lifetime_at(
             key,
             owner: owner.to_owned(),
             epoch,
+            closed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             closed_at: std::sync::Mutex::new(None),
         }),
+        owner: true,
     }
 }
 

@@ -475,13 +475,14 @@ pub struct ShellPtyDriver {
     /// File-tail signal adapters (codex rollout, grok ACP files). Dropped on
     /// close, which stops their poll tasks (D-028 P6).
     adapters: Mutex<Option<crate::adapters::supervisor::AdapterHandle>>,
-    /// c-usagefu r10 item 1: codex instance-lifetime cohort for a
-    /// driver-launched (native/resumed) codex agent, held for the whole run
-    /// independent of whether/when its file adapter binds. The last clone
-    /// drops on close (or on resume adoption) to close the interval. Kept here
-    /// separately from the adapter handle so an aborted/re-spawned tail never
-    /// ends the census interval early. None for shells, grok and promoted
-    /// attaches (the promoted watch owns its own unknown-boundary guard).
+    /// c-usagefu r10 item 1; r11 items 2/3 (Ruling A2): the OWNER guard of the
+    /// codex instance-lifetime cohort for a driver-launched (native/resumed)
+    /// codex, held for the whole run independent of whether its file adapter
+    /// binds (the adapter holds a non-closing witness). The interval is closed
+    /// explicitly in close() only after the stop ladder confirms the process
+    /// is gone (or transferred on resume adoption), so aborting adapters never
+    /// ends it early. None for shells, grok and promoted attaches (the
+    /// promotion poller owns the promoted unknown-boundary cohort).
     codex_lifetime: Mutex<Option<crate::adapters::codex_discovery::LifetimeGuard>>,
     /// Recipe from the last start, reused by [`Driver::close`] to journal what
     /// it stopped and by the Node to audit what was launched.
@@ -1302,11 +1303,18 @@ impl ShellPtyDriver {
         // GROK_HOME), follow the child pid, and emit on the instance's one
         // ordered observation channel. Hook-confirmed session identity wins
         // over file discovery (Hook > File) via the adapter confirm path.
-        if let Some(guard) = &native_lifetime {
-            *self.codex_lifetime.lock().await = Some(guard.clone());
+        // The DRIVER keeps the cohort OWNER registered before the child was
+        // spawned; the file adapter receives a non-closing WITNESS. The owner
+        // is closed explicitly in close() only AFTER the stop ladder confirms
+        // the process is gone (Ruling A2), so tearing the adapter down before
+        // the ladder — or a witness dropping at any point — can never close
+        // the interval early (c-usagefu r11 item 3).
+        let adapter_lifetime = native_lifetime.as_ref().map(|guard| guard.witness());
+        if let Some(guard) = native_lifetime {
+            *self.codex_lifetime.lock().await = Some(guard);
         }
         if let Some(handle) =
-            self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd, native_lifetime)?
+            self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd, adapter_lifetime)?
         {
             *self.adapters.lock().await = Some(handle);
         }
@@ -2815,11 +2823,15 @@ impl Driver for ShellPtyDriver {
         if let Some(handle) = self.adapters.lock().await.take() {
             handle.abort();
         }
-        // Release this run's codex census interval (the aborted adapter holds
-        // the other clone; the last drop records the close). A resume adopts a
-        // newer cohort before this point, so dropping a superseded guard never
-        // closes a continued session (c-usagefu r10 item 1).
-        self.codex_lifetime.lock().await.take();
+        // The codex census interval is NOT released here. close() is only
+        // beginning: the agent process is still live until the stop ladder
+        // below confirms it is gone, and Ruling A2 (c-usagefu r11 item 3)
+        // requires the interval to stay LIVE through this whole window so a
+        // rollout created during close is still attributed under the census.
+        // The file adapter held only a non-closing witness, so aborting it
+        // above changes nothing. The owner is taken and closed after the
+        // ladder. A resume adopted a newer cohort before this point, so the
+        // owner's epoch check protects a continued session regardless.
         self.interrupt_pid.store(0, Ordering::SeqCst);
         // Drop any transcript claim so a respawn starts a fresh epoch.
         self.bindings.demobilize();
@@ -2833,8 +2845,10 @@ impl Driver for ShellPtyDriver {
         if let Some(waiter) = self.waiter.lock().await.take() {
             waiter.abort();
         }
+        let mut group_gone = false;
         match outcome {
             Ok(outcome) if outcome.group_gone => {
+                group_gone = true;
                 tracing::info!(
                     rung = outcome.rung.label(),
                     pgid = outcome.pgid,
@@ -2851,6 +2865,19 @@ impl Driver for ShellPtyDriver {
                 );
             }
             Err(error) => tracing::error!(%error, "pty stop ladder failed"),
+        }
+        // Ruling A2: close the census interval only AFTER the process has
+        // actually stopped — a record the agent writes while this teardown was
+        // in flight must find a live census. When the group is NOT gone
+        // (stop-incomplete: a survivor outlived SIGKILL), leave the interval
+        // live rather than record a false close: forget the owner so even its
+        // Drop safety net cannot close it.
+        if let Some(lifetime) = self.codex_lifetime.lock().await.take() {
+            if group_gone {
+                lifetime.close_interval();
+            } else {
+                std::mem::forget(lifetime);
+            }
         }
         Ok(DriverAck::not_dispatched())
     }
@@ -4543,6 +4570,77 @@ mod tests {
 
         releaser.join().unwrap();
         Driver::close(&driver).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_codex_census_interval_stays_live_until_the_process_has_stopped() {
+        // c-usagefu r11 item 3 (Ruling A2): the lifetime interval closes only
+        // AFTER the agent process has stopped, not when close() begins. r10
+        // dropped the driver's guard BEFORE the stop ladder even ran (while the
+        // aborted adapter's clone also went away), so a rollout the agent
+        // created during teardown found a closed census and a later same-cwd
+        // launch could become its owner.
+        //
+        // The child ignores SIGINT and SIGHUP (ignored dispositions survive
+        // the exec); on this box the group still answers throughout the 2 s
+        // interrupt grace and dies during the later hangup grace (~3.5 s into
+        // the ladder, when the master closes). A 2.5 s observation window sits
+        // fully inside that: it proves the interval is LIVE throughout close,
+        // including after a witness clone drops mid-ladder. The old code
+        // dropped the guard before the first rung, failing the first sample.
+        // After close returns (group gone) the interval is closed-but-retained.
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let owner = "native-codex-close-order";
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap '' INT HUP TERM; exec sleep 60".into(),
+        ];
+        let driver = ShellPtyDriver::new(options);
+        let _run = driver.spawn().await.expect("spawns");
+
+        // Exactly what a Target::Agent Codex spawn does: the driver slot owns
+        // the cohort; the adapter side is a non-closing witness.
+        let lifetime = crate::adapters::codex_discovery::begin_lifetime(
+            &cwd,
+            owner,
+            Some(time::OffsetDateTime::now_utc()),
+        );
+        let witness = lifetime.witness();
+        let mut witness = Some(witness);
+        *driver.codex_lifetime.lock().await = Some(lifetime);
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let closer = tokio::spawn(async move {
+            let ok = Driver::close(&driver).await.is_ok();
+            let _ = done_tx.send(());
+            ok
+        });
+
+        for tick in 0..250u32 {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+                "the census must stay LIVE while close is stopping the process (tick {tick})"
+            );
+            // The adapter witness vanishes ~1 s into the ladder (it was
+            // aborted before the ladder started); the owner keeps it live.
+            if tick == 100 {
+                witness.take();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        done_rx.await.unwrap();
+        assert!(closer.await.unwrap(), "close completes on the killed group");
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+            "closed only once the process group is actually gone"
+        );
+        assert!(
+            crate::adapters::codex_discovery::census_contains(&cwd, owner),
+            "the closed interval is retained for pending discovery decisions"
+        );
     }
 
     /// A driver whose PTY runs an inert process, carrying `kind` as its

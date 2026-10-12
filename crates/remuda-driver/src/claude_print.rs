@@ -2304,7 +2304,18 @@ async fn map_loop(
         // sent after the child's natural exit can never start a turn.
         let overflow_owns_terminal;
         {
+            // ma-sdk-state r18 item 2 (test-stub): acknowledge the natural-EOF
+            // reader's guard acquisition at BOTH ends — immediately BEFORE the
+            // lock await and again once it ENTERS. With an overflow decision
+            // parked holding the gate, a regression proves the reader is
+            // BLOCKED on the guard (the entry ack stays absent inside a
+            // bounded check after the pre-lock ack) rather than running its
+            // seal gate-free.
+            #[cfg(feature = "test-stub")]
+            test_barrier::note_eof_seal_lock_wait(&inner.barrier);
             let gate = launch.publish.lock().await;
+            #[cfg(feature = "test-stub")]
+            test_barrier::note_eof_seal_entered(&inner.barrier);
             // The reservation overflow decision sets the latch synchronously
             // inside ITS held admission section (r18 item 1), so observing it
             // here means the overflow terminal is already owned (its seal
@@ -3344,6 +3355,17 @@ pub mod test_barrier {
         /// which is how a regression proves aborting the parked send cannot
         /// discard the latch or the tracked task.
         overflow_shutdown_registered: AtomicUsize,
+        /// ma-sdk-state r18 item 2: number of natural-EOF readers that
+        /// reached the publish-gate acquisition, fired immediately BEFORE the
+        /// lock await. Paired with [`Self::eof_seal_entered_count`]: with an
+        /// overflow decision parked holding the gate, the second count staying
+        /// 0 while the first is set proves — after a bounded check — that the
+        /// reader is BLOCKED on the held guard rather than sealing gate-free.
+        eof_seal_lock_wait_count: AtomicUsize,
+        /// ma-sdk-state r18 item 2: number of natural-EOF readers that
+        /// ENTERED the publish gate for the seal (lock acquired; the latch
+        /// load/seal decision has not run yet).
+        eof_seal_entered_count: AtomicUsize,
     }
 
     /// An armed write-commit barrier. Releases on drop.
@@ -3415,8 +3437,11 @@ pub mod test_barrier {
             overflow_spawn_gate_open: AtomicBool::new(true),
             overflow_spawn_gate: tokio::sync::Notify::new(),
             overflow_spawn_standdowns: AtomicUsize::new(0),
-            // r18 item 1: the registration counter starts clean per arm.
+            // r18 items 1/2: registration and EOF acquisition counters start
+            // clean per arm.
             overflow_shutdown_registered: AtomicUsize::new(0),
+            eof_seal_lock_wait_count: AtomicUsize::new(0),
+            eof_seal_entered_count: AtomicUsize::new(0),
         });
         *slot.lock().expect("barrier lock") = Some(state.clone());
         WriteCommitBarrier { state }
@@ -3719,6 +3744,28 @@ pub mod test_barrier {
             state
                 .overflow_shutdown_registered
                 .fetch_add(1, Ordering::AcqRel);
+            state.state_changed.notify_waiters();
+        }
+    }
+
+    /// ma-sdk-state r18 item 2 hook: the natural-EOF reader is about to await
+    /// the publish gate for its seal (fired immediately BEFORE the lock).
+    pub(super) fn note_eof_seal_lock_wait(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state
+                .eof_seal_lock_wait_count
+                .fetch_add(1, Ordering::AcqRel);
+            state.state_changed.notify_waiters();
+        }
+    }
+
+    /// ma-sdk-state r18 item 2 hook: the natural-EOF reader ENTERED the
+    /// publish gate (lock acquired; the latch load/seal decision has not run
+    /// yet). With this count still 0 after the lock-wait ack, a bounded check
+    /// proves the reader is blocked ON the held guard.
+    pub(super) fn note_eof_seal_entered(slot: &Slot) {
+        if let Some(state) = current(slot) {
+            state.eof_seal_entered_count.fetch_add(1, Ordering::AcqRel);
             state.state_changed.notify_waiters();
         }
     }
@@ -4243,6 +4290,44 @@ pub mod test_barrier {
                         self.state
                             .overflow_shutdown_registered
                             .load(Ordering::Acquire)
+                    )
+                },
+            )
+            .await;
+        }
+
+        /// ma-sdk-state r18 item 2: wait until `n` natural-EOF readers reached
+        /// the publish-gate acquisition (the ack fired right before the lock).
+        pub async fn wait_until_eof_seal_lock_waits(&self, n: usize, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            wait_until_with(
+                &self.state,
+                deadline,
+                move |state| state.eof_seal_lock_wait_count.load(Ordering::Acquire) >= n,
+                || {
+                    format!(
+                        "write_commit barrier: timed out waiting for {n} EOF readers to reach \
+                         the publish-gate acquisition (lock waits={})",
+                        self.state.eof_seal_lock_wait_count.load(Ordering::Acquire)
+                    )
+                },
+            )
+            .await;
+        }
+
+        /// ma-sdk-state r18 item 2: wait until `n` natural-EOF readers
+        /// ENTERED the publish gate (lock acquired, latch not yet loaded).
+        pub async fn wait_until_eof_seal_entered(&self, n: usize, timeout: Duration) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            wait_until_with(
+                &self.state,
+                deadline,
+                move |state| state.eof_seal_entered_count.load(Ordering::Acquire) >= n,
+                || {
+                    format!(
+                        "write_commit barrier: timed out waiting for {n} EOF readers to enter \
+                         the publish gate (entered={})",
+                        self.state.eof_seal_entered_count.load(Ordering::Acquire)
                     )
                 },
             )

@@ -82,12 +82,6 @@ pub struct AdapterHandle {
 }
 
 impl AdapterHandle {
-    /// Test-only: number of live (not-yet-finished) adapter tasks.
-    #[cfg(test)]
-    pub(crate) fn live_task_count(&self) -> usize {
-        self.tasks.iter().filter(|t| !t.is_finished()).count()
-    }
-
     /// Stop the adapter tasks. The tails and state die with them;
     /// `instance.purge` removes the files.
     pub fn abort(&self) {

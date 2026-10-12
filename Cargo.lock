@@ -3180,6 +3180,7 @@ dependencies = [
  "remuda-signal",
  "remuda-ssh",
  "remuda-testing",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",

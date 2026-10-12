@@ -957,6 +957,50 @@ pub enum BudgetStatus {
     Stop,
 }
 
+/// c-usagefu r9 items 4/5: ONE shared eligible-FLOW relation by CALL
+/// identity, used by the rollup, both aggregates and the TPM windows.
+///
+/// Keep every Message row; keep a Turn row only when NO Message represents
+/// the same call (`message.turn_id = turn.scope_id`, same instance).
+/// Pre-r6 databases wrote both rows per codex call; per-instance gating hid
+/// an unrelated Turn-only call whenever the instance had ANY Message. A
+/// legacy NULL-scope_id Turn can never match a Message and is always kept.
+fn eligible_flow_predicate(outer: &str, matched: &str) -> String {
+    format!(
+        "({outer}.scope = 'message'
+            OR ({outer}.scope = 'turn' AND NOT EXISTS (
+                SELECT 1 FROM usage_events {matched}
+                WHERE {matched}.instance_id = {outer}.instance_id
+                  AND {matched}.scope = 'message'
+                  AND {matched}.turn_id = {outer}.scope_id
+            )))"
+    )
+}
+
+/// True when instance `instance_expr` has at least one eligible flow row
+/// (see [`eligible_flow_predicate`]). Legacy NULL-scope Turn rows count.
+#[allow(dead_code)] // r9 item 5 wires it into the stock decision
+fn has_eligible_flow_sql(instance_expr: &str) -> String {
+    format!(
+        "EXISTS (
+            SELECT 1 FROM usage_events _ef_e
+            WHERE _ef_e.instance_id = {instance_expr}
+              AND {}
+        )",
+        eligible_flow_predicate("_ef_e", "_ef_m")
+    )
+}
+
+/// Token-sum CASE arm for the shared flow relation (`column` is one token
+/// bucket on the outer `usage_events` row): a `WHEN … THEN …` fragment to
+/// embed inside an outer CASE.
+fn flow_case_arm(column: &str) -> String {
+    format!(
+        "WHEN {} THEN {column}",
+        eligible_flow_predicate("usage_events", "_ef_c")
+    )
+}
+
 /// Cost column for an aggregate query.
 ///
 /// Stock vs flow, per session then per instance (c-usagefu r4 item 1; r5
@@ -976,19 +1020,20 @@ pub enum BudgetStatus {
 ///   instance is STOCK-LESS for billing and its per-call FLOW estimates are
 ///   summed instead, so the budget band keeps advancing;
 /// - per-call (`turn`/`message`) rows therefore count for exactly the
-///   instances not in the stock-eligible set.
+///   instances not fully covered by priced stock.
 ///
-/// r7 item 4: pre-r6 databases hold BOTH a Message and a Turn row per priced
-/// codex call. The two are alternative billable streams for the SAME calls,
-/// not additive: when an instance has any Message rows, tokens and non-session
-/// cost come from Message rows ONLY; Turn rows are used only for instances (or
-/// calls) with no Message coverage.
+/// r9 items 4/5: eligible FLOW is the shared call-identity relation
+/// ([`eligible_flow_predicate`]) — every Message plus unmatched Turns.
+/// Session STOCK is used, per instance/session, ONLY when no eligible flow
+/// exists at all (legacy NULL-scope Turns included in that decision);
+/// cumulative stock is never added to, or used as a smaller-flow fallback
+/// against, the per-call sums.
 ///
 /// `r5_` CTEs: `r5_scoped_instances` (instances with any scoped session
 /// row), `r5_eligible_stock` (newest point per scoped partition, plus the
 /// legacy NULL chain where no scoped row exists), `r5_stock_instances`
-/// (instances whose every newest point is priced), `r7_message_instances`
-/// (instances with at least one message-scope row). Pricing decisions are
+/// (instances whose every newest point is priced), `r9_stock_only_instances`
+/// (instances with session rows and NO eligible flow). Pricing decisions are
 /// precomputed once per statement; the flow subquery joins the CTEs rather
 /// than running a correlated NOT EXISTS per row.
 fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate: &str) -> String {
@@ -1002,14 +1047,12 @@ fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate:
             WHERE {stock_predicate} AND scope = 'message'
          ),
          r8_turn_instances AS (
-            -- Instances with non-legacy Turn flow rows (c-usagefu r8 item 4).
             SELECT DISTINCT instance_id FROM usage_events
             WHERE {stock_predicate} AND scope = 'turn' AND scope_id IS NOT NULL
          ),
          r8_flow_only_stock_instances AS (
-            -- Session STOCK counts only for instances with NEITHER message nor
-            -- modern turn rows: otherwise it is cumulative history that must
-            -- never be added to the per-call flow.
+            -- r8 stock rule (refined per-call in r9 item 5): session stock
+            -- counts only for instances with neither message nor modern turn.
             SELECT DISTINCT instance_id FROM usage_events
             WHERE {stock_predicate} AND scope = 'session'
               AND instance_id NOT IN (SELECT instance_id FROM r7_message_instances)
@@ -1049,37 +1092,30 @@ fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate:
             SELECT instance_id FROM r5_stock_instances
          )
          SELECT COUNT(*),
-                -- r8 item 4: ONE token representation per call.
-                --  - message rows for message instances;
-                --  - turn rows for instances with no message coverage;
-                --  - session stock ONLY for instances with neither flow kind.
-                -- Cumulative Session history is never summed onto flow.
+                -- r9 items 4/5: ONE token representation per call — the
+                -- shared eligible-flow relation; session stock ONLY for
+                -- instances with no eligible flow. Cumulative Session
+                -- history is never summed onto flow.
                 COALESCE(SUM(CASE
-                    WHEN scope = 'message' THEN total_tokens
-                    WHEN scope = 'turn'
-                         AND instance_id NOT IN (SELECT instance_id FROM r7_message_instances)
+                    WHEN usage_events.scope = 'session'
+                         AND usage_events.instance_id
+                             IN (SELECT instance_id FROM r8_flow_only_stock_instances)
                          THEN total_tokens
-                    WHEN scope = 'session'
-                         AND instance_id IN (SELECT instance_id FROM r8_flow_only_stock_instances)
-                         THEN total_tokens
+                    {flow_total}
                 END), 0),
                 COALESCE(SUM(CASE
-                    WHEN scope = 'message' THEN input_tokens
-                    WHEN scope = 'turn'
-                         AND instance_id NOT IN (SELECT instance_id FROM r7_message_instances)
+                    WHEN usage_events.scope = 'session'
+                         AND usage_events.instance_id
+                             IN (SELECT instance_id FROM r8_flow_only_stock_instances)
                          THEN input_tokens
-                    WHEN scope = 'session'
-                         AND instance_id IN (SELECT instance_id FROM r8_flow_only_stock_instances)
-                         THEN input_tokens
+                    {flow_input}
                 END), 0),
                 COALESCE(SUM(CASE
-                    WHEN scope = 'message' THEN output_tokens
-                    WHEN scope = 'turn'
-                         AND instance_id NOT IN (SELECT instance_id FROM r7_message_instances)
+                    WHEN usage_events.scope = 'session'
+                         AND usage_events.instance_id
+                             IN (SELECT instance_id FROM r8_flow_only_stock_instances)
                          THEN output_tokens
-                    WHEN scope = 'session'
-                         AND instance_id IN (SELECT instance_id FROM r8_flow_only_stock_instances)
-                         THEN output_tokens
+                    {flow_output}
                 END), 0),
                 (SELECT COALESCE(SUM(cost), 0.0) FROM r5_eligible_stock
                  WHERE instance_id IN (SELECT instance_id FROM r5_stock_instances))
@@ -1090,14 +1126,12 @@ fn cost_select_sql(stock_predicate: &str, flow_predicate: &str, outer_predicate:
                    ON r5_flow_instances.instance_id = flow.instance_id
                  WHERE {flow_predicate}
                    AND flow.scope != 'session'
-                   -- r7 item 4: message and turn are alternative streams.
-                   AND (
-                       flow.scope = 'message'
-                       OR flow.instance_id NOT IN (
-                           SELECT instance_id FROM r7_message_instances
-                       )
-                   ))
-         FROM usage_events WHERE {outer_predicate}"
+                   AND {flow_cost})
+         FROM usage_events WHERE {outer_predicate}",
+        flow_total = flow_case_arm("total_tokens"),
+        flow_input = flow_case_arm("input_tokens"),
+        flow_output = flow_case_arm("output_tokens"),
+        flow_cost = eligible_flow_predicate("flow", "flowm"),
     )
 }
 
@@ -1215,32 +1249,26 @@ fn threshold_rfc3339(seconds: i64) -> String {
     )
 }
 
-/// Sum the per-call (scope='turn') token flow within a rate window. Session
-/// snapshots are a CUMULATIVE STOCK replaced in place, never a per-window flow,
-/// so they are excluded here; the caller substitutes timestamped stock
-/// increments only when the harness emits no turn rows at all (Grok) —
-/// c-ctxusage r3 item 6 / r4 item 6.
+/// Sum the per-call token FLOW within a rate window (r9 item 4: the shared
+/// call-identity relation — every Message plus unmatched Turns, legacy
+/// NULL-scope Turns included). Session snapshots are a CUMULATIVE STOCK
+/// replaced in place, never a per-window flow, so they are excluded here; the
+/// caller substitutes timestamped stock increments only when the harness
+/// emits no native flow (Grok) — c-ctxusage r3 item 6 / r4 item 6.
 fn sum_turn_tokens_since(
     conn: &Connection,
     instance_id: &str,
     since: &str,
 ) -> rusqlite::Result<(Option<i64>, Option<i64>)> {
-    // r8 item 4: one flow representation per call — Message rows when the
-    // instance has any, else Turn rows. Never both; never Session stock.
     conn.query_row(
-        "SELECT SUM(input_tokens), SUM(output_tokens)
-         FROM usage_events
-         WHERE instance_id = ?1 AND observed_at >= ?2
-           AND observed_at_source = 'native'
-           AND (
-               (scope = 'message')
-               OR (scope = 'turn'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM usage_events m
-                       WHERE m.instance_id = usage_events.instance_id
-                         AND m.scope = 'message'
-                   ))
-           )",
+        &format!(
+            "SELECT SUM(input_tokens), SUM(output_tokens)
+             FROM usage_events
+             WHERE instance_id = ?1 AND observed_at >= ?2
+               AND observed_at_source = 'native'
+               AND {eligible}",
+            eligible = eligible_flow_predicate("usage_events", "_ef_w")
+        ),
         params![instance_id, since],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
@@ -1642,11 +1670,26 @@ fn kind_fallback(kind: &str) -> (Option<i64>, bool) {
     }
 }
 
+/// Per-bucket coverage: do the additive flow sums cover (reach) every bucket
+/// the authoritative cumulative session snapshot reports? `None` incoming
+/// imposes no constraint. A flow total below the session stock means
+/// incomplete coverage (a tail bound mid-session / interrupted replay), so
+/// the cumulative total is used instead (c-usagefu (b)). r9 item 5 removes
+/// this fallback.
+fn bucket_covers(flow: Option<i64>, session: Option<i64>) -> bool {
+    match (flow, session) {
+        (_, None) => true,
+        (Some(flow), Some(session)) => flow >= session,
+        (None, Some(_)) => false,
+    }
+}
+
 /// Session-wide totals of one rollup query.
 struct RollupTotals {
     turns: i64,
-    /// Additive sums over scope='turn' rows; used for totals when they cover
-    /// the cumulative session stock (or when no session stock exists).
+    /// Additive sums over the ELIGIBLE flow rows (r9 items 4/5): every
+    /// Message plus Turn rows no matching Message represents. Used for
+    /// totals whenever the instance has any eligible flow.
     turn_input: Option<i64>,
     turn_output: Option<i64>,
     turn_cache_read: Option<i64>,
@@ -1655,67 +1698,49 @@ struct RollupTotals {
     last_turn_at: Option<String>,
 }
 
-/// Per-bucket coverage: do the additive turn sums cover (reach) every bucket
-/// the authoritative cumulative session snapshot reports? `None` incoming
-/// imposes no constraint. A turn total below the session stock means turn
-/// coverage is incomplete (a tail bound mid-session / interrupted replay), so
-/// the cumulative session total must be used instead (c-usagefu (b)).
-fn bucket_covers(turn: Option<i64>, session: Option<i64>) -> bool {
-    match (turn, session) {
-        (_, None) => true,
-        (Some(turn), Some(session)) => turn >= session,
-        (None, Some(_)) => false,
-    }
-}
-
 /// Fold every persisted usage event of one instance into
 /// [`InstanceUsageRollup`]. Returns `None` when the session has no usage
 /// observations yet, so the field stays off the instance record entirely.
 ///
-/// Stock vs flow:
+/// Stock vs flow (c-usagefu r9 items 4/5):
 /// - A **Session** row is an append-only cumulative STOCK growth point
-///   (Grok/Codex); the latest accepted point is the current stock.
-/// - **Turn** rows are per-turn FLOW (Claude emits only those); **Message**
-///   rows are per-response flow (Codex).
+///   (Grok/Codex); the latest accepted point per instance/session is the
+///   current stock.
+/// - **Message** rows are per-call flow (Codex) and **Turn** rows are
+///   per-call flow (Claude; legacy codex too): ONE shared eligible-flow
+///   relation by call identity keeps every Message and drops only Turns a
+///   matching Message already represents.
 ///
-/// Totals come from the turn sums when they COVER the session stock and from
-/// the latest stock otherwise (c-usagefu (b)): an interrupted replay must not
-/// let a partial turn sum replace the authoritative cumulative total. The
-/// context basket is the newest message/turn call, falling back to the stock.
-/// Rate windows sum turn flows; a stock-only harness contributes timestamped
-/// increments between successive growth points (never the whole stock).
+/// Totals are the eligible flow sums whenever ANY eligible flow exists; the
+/// latest cumulative stock is used ONLY when no eligible flow exists — stock
+/// is never added to flow and never used as a smaller-flow fallback. The
+/// context basket is the newest message/turn call, falling back to the
+/// stock. Rate windows sum native flow; a stock-only harness contributes
+/// timestamped increments between successive growth points (never the whole
+/// stock).
 pub fn rollup_instance(
     conn: &Connection,
     req: &RollupRequest<'_>,
 ) -> rusqlite::Result<Option<InstanceUsageRollup>> {
     let instance_id = req.instance_id;
-    // Flow rows are 'turn' (Claude print/SDK; scope_id is the turn id) or
-    // 'message' (codex per-call, its single billable stream since c-usagefu r6
-    // item 5; scope_id is the RESPONSE id but the row carries turn_id). The
-    // turn count is therefore the number of DISTINCT turns: scope_id for
-    // turn rows, turn_id (stamped on every adapter observation) for messages.
-    // Legacy pre-scopeId Turn rows (NULL scope_id, one per seq) are counted by
-    // seq fallback so upgraded instances do not report zero turns (r7 item 8).
-    // r8 item 4: ONE token representation per call in the FLOW sums. Message
-    // rows when the instance emits any; otherwise Turn rows. Cumulative
-    // Session stock is NEVER added here — the use_turn/latest_session_stock
-    // decision below supplies stock as the fallback for flow-less/partial
-    // instances.
-    let has_message: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM usage_events WHERE instance_id=?1 AND scope='message')",
-        params![instance_id],
-        |row| row.get(0),
-    )?;
-    // Per-call tokens: message when present, otherwise turn (modern+legacy).
-    let flow_scope = if has_message { "message" } else { "turn" };
-    let flow_pred =
-        |col: &str| -> String { format!("SUM(CASE WHEN scope='{flow_scope}' THEN {col} END)") };
+    // Turn count over the ELIGIBLE flow rows: distinct turn id of every
+    // Message, distinct scope_id of every unmatched modern Turn, plus one
+    // per legacy NULL-scope_id Turn (r7 item 8). Legacy pre-scopeId Turns
+    // counted by seq fallback so upgraded instances do not report zero.
+    //
+    // Token sums use the same relation: a native Turn-only call and a
+    // Message-represented call both contribute exactly once.
+    let flow_input = format!("SUM(CASE {} END)", flow_case_arm("input_tokens"));
+    let flow_output = format!("SUM(CASE {} END)", flow_case_arm("output_tokens"));
+    let flow_cache_read = format!("SUM(CASE {} END)", flow_case_arm("cache_read_tokens"));
+    let flow_cache_write = format!("SUM(CASE {} END)", flow_case_arm("cache_write_tokens"));
     let totals = conn.query_row(
         &format!(
             "SELECT
-            COUNT(DISTINCT CASE WHEN scope='turn' AND scope_id IS NOT NULL THEN scope_id
-                                WHEN scope='message' THEN turn_id
-                                WHEN scope='workflow-member' THEN scope_id END)
+            COUNT(DISTINCT CASE
+                WHEN scope='message' THEN turn_id
+                WHEN scope='turn' AND scope_id IS NOT NULL AND NOT {matched} THEN scope_id
+                WHEN scope='workflow-member' THEN scope_id END)
             + COUNT(CASE WHEN scope='turn' AND scope_id IS NULL THEN 1 END),
             {flow_input},
             {flow_output},
@@ -1725,10 +1750,10 @@ pub fn rollup_instance(
             COUNT(*),
             MAX(CASE WHEN scope IN ('turn','message') AND observed_at_source='native' THEN observed_at END)
          FROM usage_events WHERE instance_id = ?1",
-            flow_input = flow_pred("input_tokens"),
-            flow_output = flow_pred("output_tokens"),
-            flow_cache_read = flow_pred("cache_read_tokens"),
-            flow_cache_write = flow_pred("cache_write_tokens"),
+            matched = "EXISTS (SELECT 1 FROM usage_events _ef_n
+                              WHERE _ef_n.instance_id = usage_events.instance_id
+                                AND _ef_n.scope = 'message'
+                                AND _ef_n.turn_id = usage_events.scope_id)",
         ),
         params![instance_id],
         |row| {
@@ -1762,14 +1787,15 @@ pub fn rollup_instance(
         (SessionStock::default(), false)
     };
 
-    // Totals: turn sums when they cover the authoritative stock in every
-    // reported bucket (or when there is no stock), else the current stock.
-    let use_turn = !totals.has_session
+    // Totals (r8 coverage rule): flow sums when they cover the authoritative
+    // stock in every reported bucket (or when there is no stock), else the
+    // current stock. r9 item 5 replaces this with a strict flow-exists rule.
+    let use_flow = !totals.has_session
         || (bucket_covers(totals.turn_input, stock.input)
             && bucket_covers(totals.turn_output, stock.output)
             && bucket_covers(totals.turn_cache_read, stock.cache_read)
             && bucket_covers(totals.turn_cache_write, stock.cache_write));
-    let (session_input, session_output, cache_read, cache_creation) = if use_turn {
+    let (session_input, session_output, cache_read, cache_creation) = if use_flow {
         (
             totals.turn_input,
             totals.turn_output,
@@ -4199,6 +4225,9 @@ mod tests {
 
     #[test]
     fn codex_mixed_turn_and_session_rows_use_one_stock_flow_rule() {
+        // Two per-call Turn flows only PARTIALLY cover a cumulative Session
+        // snapshot (300/120): the r8 coverage rule keeps the authoritative
+        // stock for totals, while rates use the flow alone.
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         let now = time::OffsetDateTime::now_utc();
@@ -4272,7 +4301,7 @@ mod tests {
         assert_eq!(
             rollup.session_input_tokens,
             Some(300),
-            "authoritative cumulative stock"
+            "partial turn coverage falls back to authoritative stock"
         );
         assert_eq!(rollup.session_output_tokens, Some(120));
         assert_eq!(rollup.turns, 2);

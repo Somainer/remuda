@@ -244,7 +244,8 @@ pub mod usage_store_test_support {
 
     pub use crate::store::JournalRecord;
     pub use crate::usage_store::{
-        RollupRequest, insert_usage_event, project_usage_event, rollup_instance,
+        RollupRequest, aggregate_instance, aggregate_supply, insert_usage_event, migrate,
+        project_usage_event, rollup_instance,
     };
 
     /// An in-memory, fully migrated Hub DB for projection/rollup tests that do

@@ -471,6 +471,20 @@ pub(crate) struct InsertedSession {
 #[derive(Clone)]
 pub struct ConnectedNodes {
     inner: Arc<Mutex<HashMap<String, NodeSlot>>>,
+    /// Per-host authority lock. A Landing settlement/evidence/grant WRITER
+    /// takes a shared (read) guard from its current-session pre-check through
+    /// its store commit; a session replacement (hello insert / socket teardown)
+    /// takes the exclusive (write) guard around changing the host's live
+    /// session. They therefore serialize: either the writer commits while its
+    /// session is still current, or the replacement completes first and the
+    /// writer's commit predicate matches nothing (r15 item 3, R2).
+    authority: Arc<Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>>,
+    /// Test-only: notified once per host when a session replacement (insert)
+    /// has to WAIT for an in-flight Landing authority decision to commit — the
+    /// deterministic witness that takeover and verdict-writer are serialized
+    /// (r15 item 3).
+    #[cfg(any(test, feature = "test-faults"))]
+    authority_contention: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     /// Boot epoch minted in the Hub DB and incremented at EVERY Hub boot. A
     /// session identity is `(boot_epoch << 32) | per-boot counter`, so an id
     /// handed out by a previous Hub process can NEVER be minted again after a
@@ -495,9 +509,17 @@ impl ConnectedNodes {
         tracing::info!(boot_epoch, "gate carrier session boot epoch allocated");
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            authority: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-faults"))]
+            authority_contention: Arc::new(Mutex::new(HashMap::new())),
             boot_epoch,
             next_session: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// This Hub process's boot epoch (high 32 bits of every session id).
+    pub(crate) fn boot_epoch(&self) -> u64 {
+        self.boot_epoch
     }
 
     /// Test-only: an empty registry with a fixed boot epoch.
@@ -505,9 +527,23 @@ impl ConnectedNodes {
     fn for_tests(boot_epoch: u64) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            authority: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-faults"))]
+            authority_contention: Arc::new(Mutex::new(HashMap::new())),
             boot_epoch,
             next_session: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// The per-host authority lock (r15 item 3). Shared guards pin the live
+    /// session across a writer's pre-check → commit stretch; the exclusive
+    /// guard is held while a hello/takedown replaces the session.
+    pub(crate) async fn host_authority(&self, host_id: &str) -> Arc<tokio::sync::RwLock<()>> {
+        let mut authority = self.authority.lock().await;
+        authority
+            .entry(host_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone()
     }
 
     /// Call a JSON-RPC method on a connected Node. `Ok(None)` = not connected.
@@ -559,6 +595,31 @@ impl ConnectedNodes {
         host_id: String,
         link: Arc<dyn NodeTransport>,
     ) -> InsertedSession {
+        // Exclusive with every in-flight Landing authority decision for this
+        // host (r15 item 3): a writer that passed its current-session pre-check
+        // must commit before this socket becomes current, and vice versa.
+        let lock = self.host_authority(host_id.as_str()).await;
+        // Fast path under no contention; when a reader (a parked settlement)
+        // holds the guard, notify test waiters BEFORE awaiting.
+        if let Ok(guard) = lock.try_write() {
+            let _authority = guard;
+            return self.insert_locked(host_id, link).await;
+        }
+        #[cfg(any(test, feature = "test-faults"))]
+        {
+            let notify = self.authority_write_notify(host_id.as_str()).await;
+            notify.notify_waiters();
+        }
+        let _authority = lock.write_owned().await;
+        self.insert_locked(host_id, link).await
+    }
+
+    /// Register the new session with the authority guard already held.
+    async fn insert_locked(
+        &self,
+        host_id: String,
+        link: Arc<dyn NodeTransport>,
+    ) -> InsertedSession {
         let mut inner = self.inner.lock().await;
         let counter = self.next_session.fetch_add(1, AtomicOrdering::Relaxed) + 1;
         // Pack the persisted boot epoch and this boot's monotonic counter so the
@@ -566,6 +627,18 @@ impl ConnectedNodes {
         let generation = self.boot_epoch << 32 | u64::from(counter);
         inner.insert(host_id, NodeSlot { generation, link });
         InsertedSession { generation }
+    }
+
+    /// Test-only: latch for "an insert is waiting on this host's authority
+    /// guard".
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn authority_write_notify(&self, host_id: &str) -> Arc<tokio::sync::Notify> {
+        let mut contention = self.authority_contention.lock().await;
+        contention
+            .entry(host_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone()
     }
 
     /// True iff `session` is the CURRENT live session registered for this host.
@@ -581,11 +654,14 @@ impl ConnectedNodes {
 
     /// Drop the live session (does not kill the native Node process).
     pub async fn remove(&self, host_id: &str) {
+        // Exclusive with in-flight authority decisions, like insert (r15 item 3).
+        let _authority = self.host_authority(host_id).await.write_owned().await;
         self.inner.lock().await.remove(host_id);
     }
 
     /// Drop the session only if `generation` is still current (stale WS must not offline a live host).
     pub async fn remove_generation(&self, host_id: &str, generation: u64) -> bool {
+        let _authority = self.host_authority(host_id).await.write_owned().await;
         let mut inner = self.inner.lock().await;
         match inner.get(host_id) {
             Some(slot) if slot.generation == generation => {

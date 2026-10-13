@@ -1356,6 +1356,28 @@ pub(crate) async fn apply_result(
         barrier.note_completed();
         return;
     }
+    // r15 item 3 (R2): for a Landing verdict, PIN the lane host's live carrier
+    // session for the whole decision stretch — session/grant/current checks,
+    // the evidence transaction, and the verdict writer — with the per-host
+    // shared authority guard. A hello replacement takes the guard exclusively,
+    // so it can only happen entirely before this stretch or entirely after the
+    // commit: a takeover between the pre-check and the writer is impossible.
+    let _host_decision = if existing.state == GateJobState::Landing {
+        if let Some(host) = existing.host_id.as_ref() {
+            Some(
+                state
+                    .nodes
+                    .host_authority(host.as_id().as_str())
+                    .await
+                    .read_owned()
+                    .await,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     // r13 item 4 SESSION FENCE: a Landing can only be settled by the exact
     // authenticated carrier session the grant was bound to. A replacement
     // carrier B that received A's delayed Finished/reply (generation and host
@@ -1389,7 +1411,8 @@ pub(crate) async fn apply_result(
     // the superseded socket keeps the persisted session identity (and passes
     // the equality above), but it is no longer the host's live session. Its
     // late Finished/RPC verdict and its run-log evidence stand down here; the
-    // row stays Landing and the remote reconciler establishes the outcome.
+    // row stays Landing and the remote reconciler establishes the outcome. The
+    // host guard above keeps this check true through the commit (r15 item 3).
     if existing.state == GateJobState::Landing
         && let Some(session) = grant_session_u64
         && let Some(host) = existing.host_id.as_ref()
@@ -1452,6 +1475,7 @@ pub(crate) async fn apply_result(
                     generation: result.generation,
                     session: source_session,
                 },
+                existing.host_id.as_ref().map(|host| host.as_id().as_str()),
             )
             .await
             {
@@ -1537,6 +1561,26 @@ pub(crate) async fn apply_result(
                         ?source_session,
                         ?grant_session_u64,
                         "dropping Landing verdict in writer from a non-granted session"
+                    );
+                    return None;
+                }
+                // r15 item 3: re-assert the HOST inside the writer too — the
+                // row must still be bound to the host the authenticated verdict
+                // arrived on (the closure's captured pre-read host), so a
+                // settle can never cross hosts even if the doc was swapped.
+                let verdict_host = existing
+                    .host_id
+                    .as_ref()
+                    .map(|host| host.as_id().as_str())
+                    .unwrap_or("");
+                if row
+                    .host_id
+                    .as_ref()
+                    .is_none_or(|host| host.as_id().as_str() != verdict_host)
+                {
+                    tracing::info!(
+                        ?verdict_host,
+                        "dropping Landing verdict in writer: row host no longer matches"
                     );
                     return None;
                 }
@@ -1810,6 +1854,7 @@ async fn persist_run_log(
     created_by: &str,
     run_log: &remuda_protocol::GateRunLog,
     auth: LogAuth,
+    host: Option<&str>,
 ) -> Result<Option<String>, HubError> {
     let bytes =
         serde_json::to_vec(run_log).map_err(|error| HubError::Internal(error.to_string()))?;
@@ -1822,7 +1867,7 @@ async fn persist_run_log(
     let digest = crate::config::sha256_hex(&bytes);
     state
         .store
-        .insert_gate_log(project_id, job_id, bytes, digest, created_by, auth)
+        .insert_gate_log(project_id, job_id, bytes, digest, created_by, auth, host)
         .await
         .map_err(HubError::Store)
 }
@@ -2417,16 +2462,22 @@ pub(crate) async fn reconcile_landings(state: &AppState, force_host: Option<&str
         let Some(lane_host) = landing_lane_host(state, &job).await else {
             continue;
         };
+        // r15 item 3 (R2): only probe/settle through the host's CURRENT carrier
+        // session, and pin it with the shared authority guard so a hello
+        // replacement cannot land between the probe and the probe-settlement
+        // commit. The carried responder identity is validated at commit.
+        let _host_decision = state
+            .nodes
+            .host_authority(lane_host.as_id().as_str())
+            .await
+            .read_owned()
+            .await;
         // Only reconcile when the lane host has a live carrier; otherwise the
         // outcome genuinely cannot be established yet — keep occupancy.
-        if state
-            .nodes
-            .generation_of(lane_host.as_id().as_str())
-            .await
-            .is_none()
-        {
+        let Some(responder_session) = state.nodes.generation_of(lane_host.as_id().as_str()).await
+        else {
             continue;
-        }
+        };
         let forced = force_host.is_some_and(|host| host == lane_host.as_id().as_str());
         let now = now();
         if !forced
@@ -2449,7 +2500,10 @@ pub(crate) async fn reconcile_landings(state: &AppState, force_host: Option<&str
         let expired =
             elapsed_since(&now, landing_at.as_deref()).is_some_and(|age| age >= recovery_ms);
         match outcome {
-            LandingProbe::Landed => settle_landing_landed(state, &job, grant_session).await,
+            LandingProbe::Landed => {
+                settle_landing_landed(state, &job, grant_session, responder_session, &lane_host)
+                    .await
+            }
             LandingProbe::Absent => {
                 // The lane only attests groups IT spawned. A `pushFrom: home`
                 // push is driven by the home host, whose process liveness the
@@ -2469,7 +2523,14 @@ pub(crate) async fn reconcile_landings(state: &AppState, force_host: Option<&str
                     // Established: nothing was pushed and the only process group
                     // that could push is verified dead — safe to re-queue (bounded
                     // by the same attempt cap) or fail at the cap.
-                    settle_landing_absent(state, &job, grant_session).await;
+                    settle_landing_absent(
+                        state,
+                        &job,
+                        grant_session,
+                        responder_session,
+                        &lane_host,
+                    )
+                    .await;
                 }
             }
             LandingProbe::Unknown => {
@@ -2587,12 +2648,22 @@ async fn mark_landing_unknown(state: &AppState, job: &GateJob, note: &str) {
 /// Settle a Landing whose exact granted merge the probe confirmed on the
 /// remote. Never re-queues or re-pushes.
 /// Settle a Landing whose exact granted merge the probe confirmed on the
-/// remote. Never re-queues or re-pushes. R2: the probe settles ONLY the live
-/// granted attempt it ran against — same (attempts, merge, session).
-async fn settle_landing_landed(state: &AppState, job: &GateJob, grant_session: Option<i64>) {
+/// remote. Never re-queues or re-pushes. R2: the probe settles ONLY inside one
+/// transaction matching the live granted attempt it ran against — same
+/// (host, attempts, merge, session). `responder_session` is the authenticated
+/// carrier session the probe reply rode, validated against the persisted grant
+/// at commit (r15 item 3).
+async fn settle_landing_landed(
+    state: &AppState,
+    job: &GateJob,
+    grant_session: Option<i64>,
+    responder_session: u64,
+    host: &remuda_protocol::HostId,
+) {
+    let expected_session = probe_expected_session(state, grant_session, responder_session);
     let outcome = state
         .store
-        .settle_landing_probe(job, grant_session, true)
+        .settle_landing_probe(job, expected_session, host.as_id().as_str(), true)
         .await;
     if let Ok(Some(settled)) = outcome {
         journal(state, &settled.requested_by, "gate.landed", &settled).await;
@@ -2605,12 +2676,19 @@ async fn settle_landing_landed(state: &AppState, job: &GateJob, grant_session: O
 /// contain the granted merge AND the lane verified the land process group dead.
 /// Nothing was pushed and nothing can still push, so the job re-enters the queue
 /// for a fresh attempt, or fails once the attempt cap is reached. R2: only the
-/// live granted attempt (attempts/merge/session unchanged through the probe) is
-/// re-queued this way.
-async fn settle_landing_absent(state: &AppState, job: &GateJob, grant_session: Option<i64>) {
+/// live granted attempt (host/attempts/merge/session unchanged through the
+/// probe) is re-queued this way.
+async fn settle_landing_absent(
+    state: &AppState,
+    job: &GateJob,
+    grant_session: Option<i64>,
+    responder_session: u64,
+    host: &remuda_protocol::HostId,
+) {
+    let expected_session = probe_expected_session(state, grant_session, responder_session);
     let outcome = state
         .store
-        .settle_landing_probe(job, grant_session, false)
+        .settle_landing_probe(job, expected_session, host.as_id().as_str(), false)
         .await;
     if let Ok(Some(settled)) = outcome {
         // Normally the run is already gone (the probe required a verified-dead
@@ -2635,6 +2713,28 @@ async fn settle_landing_absent(state: &AppState, job: &GateJob, grant_session: O
         }
     }
 }
+/// The session the probe-settlement writer must match against the row's
+/// `dispatch_session` (r15 item 3):
+/// * a grant minted by THIS Hub process can only be settled by the exact
+///   CURRENT carrier session the authenticated probe rode — `responder`;
+/// * a grant minted by a PREVIOUS Hub process (its high 32 bits differ from
+///   this boot epoch, e.g. after a Hub restart) can never be live again, so the
+///   row keeps naming that stale session while the current authenticated host
+///   establishes the remote fact (this preserves restart Landing recovery).
+fn probe_expected_session(
+    state: &AppState,
+    grant_session: Option<i64>,
+    responder_session: u64,
+) -> Option<i64> {
+    let boot_epoch = state.nodes.boot_epoch();
+    match grant_session {
+        Some(grant) if u64::try_from(grant).unwrap_or(0) >> 32 == boot_epoch => {
+            Some(i64::try_from(responder_session).unwrap_or(0))
+        }
+        other => other,
+    }
+}
+
 pub(crate) async fn recover_ended_session(state: &AppState, host_id: &str, session: u64) {
     if session == 0 {
         return;
@@ -3333,13 +3433,14 @@ impl Store {
         digest: String,
         created_by: &str,
         auth: LogAuth,
+        host: Option<&str>,
     ) -> Result<Option<String>, crate::store::StoreError> {
         let project_id = project_id.to_owned();
         let job_id = job_id.to_owned();
         let created_by = created_by.to_owned();
         let source_session_i64 = auth.session.map(|s| i64::try_from(s).unwrap_or(0));
-        let generation = auth.generation;
-        // Drain the one-shot insert fault before the 'static writer closure.
+        let source_host = host.map(str::to_owned);
+        let generation = auth.generation; // Drain the one-shot insert fault before the 'static writer closure.
         #[cfg(any(test, feature = "test-faults"))]
         let insert_fault = self.take_gate_log_insert_fault();
         self.run_named("insert_gate_log", move |conn| {
@@ -3365,23 +3466,27 @@ impl Store {
                 tx.commit()?;
                 return Ok(None);
             }
-            // r13 item 4: while the row is Landing the evidence belongs to the
-            // GRANTED carrier session only. A verdict carrying run_log from a
-            // replacement session must not replace the granted attempt's
-            // evidence, checked in the SAME immediate transaction.
-            if let Some(source) = source_session_i64 {
-                let landing_for_other: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM gate_jobs
-                      WHERE id = ?1
-                        AND state = 'landing'
-                        AND (dispatch_session IS NULL OR dispatch_session != ?2)",
-                    params![job_id, source],
-                    |row| row.get(0),
-                )?;
-                if landing_for_other > 0 {
-                    tx.commit()?;
-                    return Ok(None);
-                }
+            // r13 item 4 + r15 item 3: while the row is Landing the evidence
+            // belongs to the GRANTED carrier session on the GRANTED host only.
+            // An evidence write from a replacement session/host must not
+            // replace the granted attempt's evidence, checked in the SAME
+            // immediate transaction. A Landing verdict must always carry an
+            // authenticated session: a NULL source is passed as sentinel -1 and
+            // never matches a real dispatch_session.
+            let source_or_sentinel = source_session_i64.unwrap_or(-1);
+            let landing_for_other: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM gate_jobs
+                  WHERE id = ?1
+                    AND state = 'landing'
+                    AND (dispatch_session IS NULL
+                         OR dispatch_session != ?2
+                         OR (?3 IS NOT NULL AND json_extract(doc_json, '$.hostId') != ?3))",
+                params![job_id, source_or_sentinel, source_host],
+                |row| row.get(0),
+            )?;
+            if landing_for_other > 0 {
+                tx.commit()?;
+                return Ok(None);
             }
             // The id this job already references, read under the same
             // transaction before any delete. Covers legacy random ids; only
@@ -3586,13 +3691,14 @@ impl Store {
     pub(crate) async fn settle_landing_probe(
         &self,
         snapshot: &GateJob,
-        grant_session: Option<i64>,
+        expected_session: Option<i64>,
+        expected_host: &str,
         landed: bool,
     ) -> Result<Option<GateJob>, crate::store::StoreError> {
         let job_id = snapshot.id.as_id().to_string();
         let expected_attempts = snapshot.attempts;
         let expected_merge = snapshot.merge_sha.clone().unwrap_or_default();
-        let expected_session = grant_session;
+        let expected_host = expected_host.to_owned();
         self.run_named("settle_landing_probe", move |conn| {
             let tx = crate::store::immediate_tx(conn)?;
             let current_state: Option<String> = tx
@@ -3607,15 +3713,24 @@ impl Store {
                 return Ok(None);
             }
             // Identity of the granted attempt, checked INSIDE the writer job:
-            // attempts + merge from the doc, the bound session from its column.
+            // host + attempts + merge from the doc, the bound session from its
+            // column. r15 item 3 adds the authenticated responder host: a probe
+            // can only settle a row still dispatched to the host that answered.
             let same_attempt: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM gate_jobs
                   WHERE id = ?1
                     AND json_extract(doc_json,'$.state') = 'landing'
                     AND json_extract(doc_json,'$.attempts') = ?2
                     AND json_extract(doc_json,'$.mergeSha') = ?3
+                    AND json_extract(doc_json,'$.hostId') = ?5
                     AND dispatch_session IS ?4",
-                params![job_id, expected_attempts, expected_merge, expected_session],
+                params![
+                    job_id,
+                    expected_attempts,
+                    expected_merge,
+                    expected_session,
+                    expected_host
+                ],
                 |row| row.get(0),
             )?;
             if same_attempt == 0 {

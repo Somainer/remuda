@@ -916,12 +916,12 @@ impl GateRegistry {
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-faults"))]
     pub async fn gate_test_live_run_state(&self, job_id: &str) -> Option<(u32, bool)> {
-        self.runs.lock().await.runs.get(job_id).map(|run| {
-            (
-                run.generation,
-                *run.cancel.borrow(),
-            )
-        })
+        self.runs
+            .lock()
+            .await
+            .runs
+            .get(job_id)
+            .map(|run| (run.generation, *run.cancel.borrow()))
     }
 
     /// Test-only: drop all local canceled records, simulating a Node process
@@ -1220,8 +1220,7 @@ impl DevNode {
             // generation and the stale cancel has no authority over it.
             if run.generation == request.generation {
                 run.cancel.send(true).ok();
-                if let Some(pgid) = *run.pgid.lock().unwrap_or_else(|poison| poison.into_inner())
-                {
+                if let Some(pgid) = *run.pgid.lock().unwrap_or_else(|poison| poison.into_inner()) {
                     group_to_kill = Some(pgid);
                 }
             }
@@ -4205,10 +4204,8 @@ JSON
         // Bounded latch: the live gen-2 run is registered with a group.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if let Some((generation, canceled)) = fixture
-                .node
-                .gate_test_live_run_state(&job_id)
-                .await
+            if let Some((generation, canceled)) =
+                fixture.node.gate_test_live_run_state(&job_id).await
             {
                 assert_eq!(generation, 2);
                 assert!(!canceled);
@@ -4315,8 +4312,7 @@ JSON
             .unwrap()
             .unwrap();
         assert_eq!(
-            result.status,
-            "canceled",
+            result.status, "canceled",
             "the same-generation abort must terminate the live run: {:?}",
             result.status
         );

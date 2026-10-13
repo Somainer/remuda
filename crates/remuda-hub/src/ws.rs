@@ -894,12 +894,28 @@ pub(crate) async fn handle_node_method(
             // session. A superseded socket (a replacement carrier connected
             // while this one stayed open) is refused here even though it is
             // still readable — its authority was revoked at takeover.
+            // r15 item 3: the read guard pins the live session across the check
+            // AND the store commit, serializing with a hello that replaces it.
             let socket_session = session_generation.unwrap_or(0);
-            if socket_session == 0
-                || !state
-                    .nodes
-                    .is_current_session(host_id.as_str(), socket_session)
-                    .await
+            if socket_session == 0 {
+                let result = serde_json::to_value(remuda_protocol::GateAuthorizeResult {
+                    authorized: false,
+                    generation: typed.generation,
+                    state: Some("session-superseded".into()),
+                })
+                .map_err(|error| HubError::Internal(error.to_string()))?;
+                return Ok(Some(result));
+            }
+            let _authority = state
+                .nodes
+                .host_authority(host_id.as_str())
+                .await
+                .read_owned()
+                .await;
+            if !state
+                .nodes
+                .is_current_session(host_id.as_str(), socket_session)
+                .await
             {
                 let result = serde_json::to_value(remuda_protocol::GateAuthorizeResult {
                     authorized: false,
@@ -952,12 +968,30 @@ pub(crate) async fn handle_node_method(
             // take a grant. A paused frame on a socket a replacement carrier
             // superseded is refused even when job/generation/host still match,
             // in BOTH the already-Landing and the Running → Landing branches.
+            // r15 item 3: the read guard pins the session through the store
+            // commit so a takeover cannot land between the check and the
+            // Running → Landing writer.
             let socket_session = session_generation.unwrap_or(0);
-            if socket_session == 0
-                || !state
-                    .nodes
-                    .is_current_session(host_id.as_str(), socket_session)
-                    .await
+            if socket_session == 0 {
+                let result = serde_json::to_value(remuda_protocol::GateLandGrantResult {
+                    granted: false,
+                    generation: typed.generation,
+                    state: Some("session-superseded".into()),
+                    landing_in_progress: false,
+                })
+                .map_err(|error| HubError::Internal(error.to_string()))?;
+                return Ok(Some(result));
+            }
+            let _authority = state
+                .nodes
+                .host_authority(host_id.as_str())
+                .await
+                .read_owned()
+                .await;
+            if !state
+                .nodes
+                .is_current_session(host_id.as_str(), socket_session)
+                .await
             {
                 let result = serde_json::to_value(remuda_protocol::GateLandGrantResult {
                     granted: false,

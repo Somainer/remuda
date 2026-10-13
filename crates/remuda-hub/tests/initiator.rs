@@ -3639,7 +3639,16 @@ async fn attempt_one_log_cannot_replace_attempt_two_after_a_genuine_requeue() {
     let stale_digest = "stale-digest".to_owned();
     let gated = ctx
         .hub
-        .test_insert_gate_log(&ctx.project, &job_id, stale_bytes, stale_digest, "dev", 1)
+        .test_insert_gate_log(
+            &ctx.project,
+            &job_id,
+            stale_bytes,
+            stale_digest,
+            "dev",
+            1,
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -3714,7 +3723,14 @@ async fn a_probe_for_an_older_attempt_never_settles_a_newer_landing() {
     // nothing: the row is a newer Landing now.
     let stale = ctx
         .hub
-        .test_settle_landing_probe(&job_id, 1, merge1.to_owned(), Some(session1), true)
+        .test_settle_landing_probe(
+            &job_id,
+            1,
+            merge1.to_owned(),
+            Some(session1),
+            &ctx.host,
+            true,
+        )
         .await
         .unwrap();
     assert!(
@@ -3729,10 +3745,228 @@ async fn a_probe_for_an_older_attempt_never_settles_a_newer_landing() {
     // The CURRENT attempt's probe settles landed.
     let current = ctx
         .hub
-        .test_settle_landing_probe(&job_id, 2, merge2.to_owned(), Some(session2), true)
+        .test_settle_landing_probe(
+            &job_id,
+            2,
+            merge2.to_owned(),
+            Some(session2),
+            &ctx.host,
+            true,
+        )
         .await
         .unwrap()
         .expect("the current granted attempt probe settles");
     assert_eq!(current["state"], json!("landed"), "{current}");
     assert_eq!(current["mergeSha"], json!(merge2), "{current}");
+}
+
+/// r15 item 3 (R2): a carrier TAKEOVER landing in the window between a
+/// Landing verdict's current-session pre-check and its writer commit is
+/// serialized WITH the writer. While the verdict is parked the replacement
+/// hello blocks on the per-host authority guard (the host stays on session A);
+/// the verdict commits while A is still the live session, then the takeover
+/// completes exactly once. The old session can never settle the row AFTER it
+/// was superseded.
+#[tokio::test]
+async fn a_takeover_between_the_precheck_and_the_writer_is_serialized() {
+    let (ctx, node_a) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let job_id = queued_land_job(&ctx).await;
+    let claimed = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("attempt 1 claimed");
+    assert_eq!(claimed["state"], json!("running"));
+    let session_a = ctx
+        .hub
+        .test_node_session(&ctx.host)
+        .await
+        .expect("node A is live");
+    let merge = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge, session_a)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+
+    let barrier = ctx.store().gate_apply_barrier();
+    barrier.arm();
+    // A's terminal `landed` verdict rides A's authenticated session.
+    node_a.send_raw(json!({
+        "jsonrpc": "2.0", "method": "gate.event",
+        "params": {
+            "jobId": job_id, "generation": 1, "kind": "finished",
+            "result": {
+                "jobId": job_id, "generation": 1, "status": "landed",
+                "mergeSha": merge,
+            },
+        },
+    }));
+    barrier.wait_parked(1).await;
+
+    // Replacement carrier connects while the verdict writer holds the guard.
+    let reconnect = Box::pin(FakeNode::reconnect(&ctx.hub, &ctx.creds, &ctx.workspace));
+    let contended = std::pin::pin!(ctx.hub.test_wait_node_authority_contended(&ctx.host));
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        futures::future::select(reconnect, contended),
+    )
+    .await
+    .expect("the replacement hello never reached the authority guard")
+    {
+        futures::future::Either::Right(((), _)) => {}
+        futures::future::Either::Left(_) => {
+            panic!("the takeover completed before the parked writer");
+        }
+    }
+    // The host is still on A while the writer is parked.
+    assert_eq!(
+        ctx.hub.test_node_session(&ctx.host).await,
+        Some(session_a),
+        "the replacement session must not register while the writer is parked"
+    );
+
+    barrier.release();
+    barrier.wait_completed(1).await;
+    // The verdict settled exactly once, while A was still the CURRENT session.
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("landed"), "{doc}");
+    assert_eq!(doc["mergeSha"], json!(merge), "{doc}");
+}
+
+/// r15 item 3 (R2), evidence/commit predicate half: while the row is Landing,
+/// evidence and probe writers validate host AND authenticated session at
+/// commit. A NULL source session, a different session, or a different host all
+/// refuse; the exact granted (host, session) tuple commits.
+#[tokio::test]
+async fn landing_evidence_and_probe_writers_validate_host_and_session_at_commit() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let job_id = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let session_a = ctx.hub.test_node_session(&ctx.host).await.unwrap();
+    let merge = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge, session_a)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+
+    // Evidence with NO authenticated session: refused for a Landing row
+    // (previously the session fence was skipped when the source was null).
+    let none_session = ctx
+        .hub
+        .test_insert_gate_log(
+            &ctx.project,
+            &job_id,
+            br#"{"headline":"NO-SESSION"}"#.to_vec(),
+            "digest-none".into(),
+            "dev",
+            1,
+            None,
+            Some(&ctx.host),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        none_session, None,
+        "Landing evidence without a session refuses"
+    );
+
+    // Evidence on the granted host but a DIFFERENT session: refused.
+    let other_session = ctx
+        .hub
+        .test_insert_gate_log(
+            &ctx.project,
+            &job_id,
+            br#"{"headline":"OTHER-SESSION"}"#.to_vec(),
+            "digest-other".into(),
+            "dev",
+            1,
+            Some(session_a.wrapping_add(999)),
+            Some(&ctx.host),
+        )
+        .await
+        .unwrap();
+    assert_eq!(other_session, None, "evidence from another session refuses");
+
+    // Evidence on a different HOST id with the right session number: refused.
+    let other_host = ctx
+        .hub
+        .test_insert_gate_log(
+            &ctx.project,
+            &job_id,
+            br#"{"headline":"OTHER-HOST"}"#.to_vec(),
+            "digest-host".into(),
+            "dev",
+            1,
+            Some(session_a),
+            Some("hst_different_host_id"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(other_host, None, "evidence with a mismatched host refuses");
+
+    // The exact (host, session) tuple commits.
+    let committed = ctx
+        .hub
+        .test_insert_gate_log(
+            &ctx.project,
+            &job_id,
+            br#"{"headline":"GRANTED"}"#.to_vec(),
+            "digest-granted".into(),
+            "dev",
+            1,
+            Some(session_a),
+            Some(&ctx.host),
+        )
+        .await
+        .unwrap()
+        .expect("the granted host/session evidence commits");
+
+    // A probe settle carrying a different responder host refuses, even with
+    // the right (attempts, merge, session).
+    let wrong_host = ctx
+        .hub
+        .test_settle_landing_probe(
+            &job_id,
+            1,
+            merge.to_owned(),
+            Some(session_a as i64),
+            "hst_different_host_id",
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(
+        wrong_host.is_none(),
+        "a probe from another host must not settle the Landing"
+    );
+    let still = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(still["state"], json!("landing"), "{still}");
+
+    // The matching tuple settles landed.
+    let settled = ctx
+        .hub
+        .test_settle_landing_probe(
+            &job_id,
+            1,
+            merge.to_owned(),
+            Some(session_a as i64),
+            &ctx.host,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("the granted tuple probe settles");
+    assert_eq!(settled["state"], json!("landed"), "{settled}");
+    let _ = committed;
 }

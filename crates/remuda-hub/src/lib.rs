@@ -605,6 +605,31 @@ impl RunningHub {
         self.state.nodes.remove(host_id).await;
     }
 
+    /// Test helper: the host's CURRENT authenticated carrier session, if any.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_node_session(&self, host_id: &str) -> Option<u64> {
+        self.state.nodes.generation_of(host_id).await
+    }
+
+    /// Test helper: this Hub process's boot epoch.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_boot_epoch(&self) -> u64 {
+        self.state.nodes.boot_epoch()
+    }
+
+    /// Test helper: resolve once a carrier hello replacement for `host_id` is
+    /// BLOCKED on the per-host authority guard (an in-flight Landing verdict
+    /// writer is holding it). Deterministic witness for the r15 item 3
+    /// takeover/writer serialization.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_wait_node_authority_contended(&self, host_id: &str) {
+        let notify = self.state.nodes.authority_write_notify(host_id).await;
+        notify.notified().await;
+    }
+
     /// Test helper: run the restart reconcile pass against the live state, as
     /// `spawn` does on startup. Models a Hub restart re-entering reconcile
     /// without tearing down the process.
@@ -728,6 +753,8 @@ impl RunningHub {
         digest: String,
         created_by: &str,
         generation: u32,
+        session: Option<u64>,
+        host: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
         self.store()
             .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
@@ -739,8 +766,9 @@ impl RunningHub {
                 created_by,
                 crate::gatequeue::LogAuth {
                     generation,
-                    session: None,
+                    session,
                 },
+                host,
             )
             .await
             .map_err(|err| anyhow::anyhow!("{err}"))
@@ -757,6 +785,7 @@ impl RunningHub {
         expected_attempts: u32,
         expected_merge: String,
         expected_session: Option<i64>,
+        expected_host: &str,
         landed: bool,
     ) -> anyhow::Result<Option<serde_json::Value>> {
         let store = self
@@ -769,7 +798,7 @@ impl RunningHub {
         snapshot.attempts = expected_attempts;
         snapshot.merge_sha = Some(expected_merge);
         let settled = store
-            .settle_landing_probe(&snapshot, expected_session, landed)
+            .settle_landing_probe(&snapshot, expected_session, expected_host, landed)
             .await?;
         Ok(settled.map(|job| serde_json::to_value(job).expect("gate job serializes")))
     }

@@ -1153,6 +1153,31 @@ export class Outbox {
   }
 
   /**
+   * Drive one command through the OUTBOX side of a real accepted delivery
+   * (c-reconnfu gate 31 item 4 test helper): storage-first enqueue → a
+   * COMMITTED claim that stamps the current (epoch, lifetime) issuer → the
+   * terminal sent patch → the acceptance compare-and-set. No API POST and no
+   * store/connection machinery; this is exactly the durable path a live
+   * accepted delivery runs. Returns true when the CAS flipped (first
+   * observation), false once recorded.
+   */
+  async deliverAcceptedForTest(
+    rec: Omit<OutboxRecord, "attempts" | "state"> & { state?: OutboxState },
+    issuerEpoch: Id,
+  ): Promise<boolean> {
+    const full = await this.enqueue(rec);
+    await this.patch(full.commandId, {
+      state: "inflight",
+      attempts: 1,
+      lease: { owner: this.ownerId, until: Date.now() + LEASE_TTL_MS },
+      issuerEpoch,
+      issuerLifetime: this.lifetimeId,
+    });
+    await this.patch(full.commandId, { state: "sent", gotResponse: true });
+    return await this.casProgressRecorded(full.commandId, issuerEpoch, this.lifetimeId);
+  }
+
+  /**
    * Storage-first state write with an ATOMIC terminal guarantee: the stored
    * row is re-read inside the same readwrite transaction that writes it, so a
    * `done` committed by a journal callback sharing the connection (its write

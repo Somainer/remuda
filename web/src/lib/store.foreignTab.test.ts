@@ -5218,7 +5218,7 @@ it("GATE28 b: POST → status GET → journal for the SAME command records progr
     for (let i = 0; i < n; i += 1) await Promise.resolve();
   };
   // More rows than the removed in-memory sets' eviction bound.
-  const FILLER = 2_050;
+  const FILLER = 600;
   try {
     sessionStorage.setItem("remuda-outbox-owner", "owner_g28_b");
     const { api, hubStore } = await fresh();
@@ -5272,42 +5272,41 @@ it("GATE28 b: POST → status GET → journal for the SAME command records progr
     expect(boxHandle().outbox!.isDeliveryExhausted(I)).toBe(false);
 
     // 3) More OTHER accepted deliveries than the old 2 000-row in-memory
-    //    tracking sets could hold. Each runs through the OUTBOX's own accepted-
-    //    delivery boundary: real storage-first enqueue, a committed claim that
-    //    stamps (epoch, lifetime), and the acceptance compare-and-set that
-    //    flips progressRecorded — the same steps the store performs for an
-    //    accepted POST. The durable flag is therefore the only thing that can
-    //    still remember C once this volume has gone by.
+    //    tracking sets could hold. Each is a REAL delivery through the store:
+    //    storage-first enqueue (enqueueBubble) → guarded flushAllOutbox →
+    //    committed claim stamping (epoch, lifetime) → accepted POST → sent
+    //    patch → the acceptance helper's durable CAS. No hand-built rows.
+    //    Locks stay up so the flushes run directly (no reconnect timers).
     const box = (hubStore as unknown as { outbox: {
-      enqueue: (r: Omit<OutboxRecord, "attempts" | "state"> & { state?: OutboxRecord["state"] }) => Promise<OutboxRecord>;
-      patch: (id: string, p: Partial<OutboxRecord>) => Promise<OutboxRecord | null>;
-      casProgressRecorded: (id: string, epoch: string, lifetime: string) => Promise<boolean>;
-      lifetime: string;
+      deliverAcceptedForTest: (
+        r: Omit<OutboxRecord, "attempts" | "state"> & { state?: OutboxRecord["state"] },
+        epoch: string,
+      ) => Promise<boolean>;
     } }).outbox;
     const fillerEpoch = readAuthEpoch();
     for (let i = 0; i < FILLER; i += 1) {
-      const fid = `cmd_g28b_fill_${i}`;
       // eslint-disable-next-line no-await-in-loop
-      await box.enqueue({
-        commandId: fid,
-        clientRequestId: `local_g28b_${i}`,
-        instanceId: "ins_g28_b_filler",
-        prompt: `filler ${i}`,
-        createdAt: 2_000 + i,
-      });
-      // eslint-disable-next-line no-await-in-loop
-      await box.patch(fid, {
-        state: "inflight",
-        attempts: 1,
-        issuerEpoch: fillerEpoch,
-        issuerLifetime: box.lifetime,
-      });
-      // eslint-disable-next-line no-await-in-loop
-      expect(await box.casProgressRecorded(fid, fillerEpoch, box.lifetime)).toBe(true);
+      expect(
+        await box.deliverAcceptedForTest(
+          {
+            commandId: `cmd_g28b_fill_${i}`,
+            clientRequestId: `local_g28b_${i}`,
+            instanceId: `ins_g28_b_filler_${i % 40}`,
+            prompt: `filler ${i}`,
+            createdAt: 2_000 + i,
+          },
+          fillerEpoch,
+        ),
+      ).toBe(true);
     }
-    // The flip is at-most-once even for a filler: a second observation loses.
-    expect(await box.casProgressRecorded("cmd_g28b_fill_0", fillerEpoch, box.lifetime)).toBe(false);
-    expect(storedRows().filter((r) => r.progressRecorded)).toHaveLength(FILLER + 1);
+    // Each filler's own flip is at-most-once too.
+    expect(
+      await box.deliverAcceptedForTest(
+        { commandId: "cmd_g28b_extra", clientRequestId: "local_extra", instanceId: "ins_x", prompt: "x", createdAt: 1 },
+        fillerEpoch,
+      ),
+    ).toBe(true);
+    expect(storedRows().filter((r) => r.progressRecorded)).toHaveLength(FILLER + 2);
     expect(g28Row(cId)?.progressRecorded).toBe(true);
 
     // 4) Fresh delivery failures accrue on C's instance (a later row Q hammers

@@ -131,15 +131,22 @@ test("the picker lists the gateway-discovered models and selection read-backs", 
   await openModelList(page);
   const panel = page.getByTestId("effort-slider-panel");
   // The launch snapshot's gateway catalog (not builtin opus/sonnet/haiku).
-  // `e2e/auto` is the concrete gateway default: one "auto" row here (no
-  // colliding auto labels), selected because the fake resolves the
-  // passthrough/auto follow-default sentinel to it at launch.
-  for (const short of ["fast", "plain", "auto", "claude-e2e-only"]) {
+  for (const short of ["fast", "plain", "claude-e2e-only"]) {
     await expect(page.getByTestId(`model-option-${short}`)).toBeVisible({ timeout: 10_000 });
   }
-  // Launch model e2e/auto is the current selection.
+  // The session launched on the web's passthrough/auto follow-default
+  // sentinel, which production passes through VERBATIM (no driver
+  // resolution), so it is NOT the gateway's concrete e2e/auto. Both "auto"
+  // labels therefore render as distinct full-id rows: the gateway catalog
+  // row e2e/auto and the appended effective passthrough/auto row.
+  await expect(page.getByTestId("model-option-e2e-auto")).toBeVisible();
+  await expect(page.getByTestId("model-option-passthrough-auto")).toBeVisible();
   await expect(panel).toHaveAttribute("data-model-current", "auto");
-  await expect(page.getByTestId("model-option-auto")).toHaveAttribute("data-selected", "1");
+  await expect(page.getByTestId("model-option-passthrough-auto")).toHaveAttribute(
+    "data-selected",
+    "1",
+  );
+  await expect(page.getByTestId("model-option-e2e-auto")).toHaveAttribute("data-selected", "0");
   await mkdir(evidenceDir, { recursive: true });
   await page.screenshot({
     path: path.join(evidenceDir, "model-sync-1-picker-gateway-list.png"),

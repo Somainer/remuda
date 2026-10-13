@@ -31,6 +31,16 @@ import {
 
 export type PopoverPlacement = "up" | "down";
 
+/**
+ * Geometry constants shared by the placement math and the e2e/unit geometry
+ * assertions (c-effortread r10 item 10), so the spec computes the card-cleared
+ * strip with BOTH gaps instead of its own one-gap constant.
+ */
+export const POPOVER_GAP_PX = 8;
+export const POPOVER_MARGIN_PX = 8;
+/** Minimum usable panel height for dodging below / capping a card-cleared strip. */
+export const POPOVER_DOWN_USABLE_PX = 120;
+
 export interface AnchoredStyle {
   placement: PopoverPlacement;
   /** Inline style to put on the positioned panel element. */
@@ -92,8 +102,8 @@ export function computeAnchored(
     avoidBottom?: number;
   },
 ): Measured {
-  const gap = options.gap ?? 8;
-  const margin = options.margin ?? 8;
+  const gap = options.gap ?? POPOVER_GAP_PX;
+  const margin = options.margin ?? POPOVER_MARGIN_PX;
   const align = options.align ?? "start";
   const maxHeightVh = options.maxHeightVh ?? 0.6;
   const preferUp = options.preferUp ?? true;
@@ -115,7 +125,7 @@ export function computeAnchored(
   // the viewport bottom (no room below) opening down would push the controls
   // off-screen, so stay up — covering a dismissible card is the lesser evil
   // over an unreachable menu.
-  const DOWN_USABLE = 120;
+  const DOWN_USABLE = POPOVER_DOWN_USABLE_PX;
   const canDodgeDown = roomBelow >= DOWN_USABLE;
 
   // Side choice:
@@ -132,8 +142,33 @@ export function computeAnchored(
   } else {
     placement = !blockedUpByCard && roomAbove > roomBelow ? "up" : "down";
   }
-  const room = placement === "up" ? roomAbove : roomBelow;
-  const cap = Math.min(vhCap, room);
+  // A panel staying UP with a parked card below:
+  // - when the card-cleared strip is at least DOWN_USABLE tall, cap to the
+  //   strip so the panel's bottom edge clears the card (inner region scrolls);
+  // - when the strip is UNDER the usable minimum, fall back to the plain
+  //   above-room cap. The panel may then overlap the DISMISSIBLE card — the
+  //   pre-dodge documented lesser evil — but its controls (e.g. the effort
+  //   track) stay fully reachable, which the strict strip could clip. (The
+  //   composer-effort overlap e2e asserts non-overlap only for the geometry
+  //   with a usable strip; the docked narrow case covers the card.)
+  const room =
+    placement === "up"
+      ? blockedUpByCard
+        ? roomAboveCleared
+        : roomAbove
+      : roomBelow;
+  let cap = Math.min(vhCap, room);
+  if (placement === "up" && blockedUpByCard && 0 < cap && cap < DOWN_USABLE) {
+    cap = Math.min(vhCap, roomAbove);
+  }
+  // c-effortui r6 item 12: a plain (no-card) up panel must never GROW beyond
+  // the room above the trigger — a usable-min floor here painted a 120px panel
+  // over a 40px strip, covering the trigger itself. The panel shrinks and its
+  // inner region scrolls instead. (The card-blocked lesser-evil fallback above
+  // is deliberate: a fully parked card is dismissible, the trigger is not.)
+  if (cap <= 0) {
+    cap = Math.min(vhCap, placement === "up" ? roomAbove : vhCap);
+  }
   const maxHeight = cap > 0 ? cap : undefined;
   const panelHeight = Math.min(need, maxHeight ?? need);
 
@@ -149,10 +184,18 @@ export function computeAnchored(
   const maxLeft = Math.max(margin, viewport.width - margin - panel.width);
   left = Math.min(Math.max(margin, left), maxLeft);
 
-  const top =
+  let top =
     placement === "up"
       ? triggerRect.top - gap - panelHeight
       : triggerRect.bottom + gap;
+  // c-effortui r5 item 5: an unavoidable up panel whose content exceeds the
+  // room above can still compute a negative top (no cap, or a capped panel
+  // taller than the strip after rounding). Clamp to the margin; when below IS
+  // usable the placement logic above would have flipped down, so this only
+  // trims a panel that cannot go anywhere else.
+  if (placement === "up" && top < margin) {
+    top = margin;
+  }
   return { placement, left, top, maxHeight };
 }
 
@@ -196,12 +239,25 @@ export function useAnchoredPopover(
   // instead reconstruct the natural panel height as the inner content extent
   // plus the panel's fixed chrome (head/footer/border), which the clamp
   // shrinks by exactly the same amount it shrinks the inner offsetHeight.
+  //
+  // When the wrapper is itself a flex COLUMN (so a nested card with its OWN
+  // `[data-popover-scroll-region]` scrollport sits inside it), the clamp is
+  // absorbed by the nested region: the wrapper's scrollHeight then equals
+  // its clamped clientHeight and under-reports the content. Add the nested
+  // region's hidden overflow back so `need` stays the true content height
+  // and the popover settles once on the strip cap instead of oscillating
+  // between the strip and the plain above-room cap.
+  //
   // When there is no inner scroll wrapper (the short slider card, which is
   // never content-clamped) the panel's own offsetHeight is used.
   const naturalHeightOf = (panel: HTMLElement): number => {
     const inner = panel.querySelector<HTMLElement>("[data-popover-scroll='1']");
     if (inner) {
       const chrome = panel.offsetHeight - inner.offsetHeight;
+      const region = inner.querySelector<HTMLElement>("[data-popover-scroll-region='1']");
+      if (region) {
+        return inner.scrollHeight + (region.scrollHeight - region.clientHeight) + chrome;
+      }
       return inner.scrollHeight + chrome;
     }
     return panel.offsetHeight;

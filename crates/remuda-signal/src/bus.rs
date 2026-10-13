@@ -55,6 +55,12 @@ pub struct SessionBinding {
     pub session_id: String,
     /// Transcript the agent is writing.
     pub transcript_path: Option<String>,
+    /// SessionStart hook `source` as folded from the native payload:
+    /// `"startup" | "clear" | "compact" | "resume"` (c-effortread r9 item 1).
+    /// `None` for an older payload that omits it; consumers then fall back to
+    /// transcript sizing. Captured at hook delivery, before any prompt reaches
+    /// the rebound transcript.
+    pub source: Option<String>,
 }
 
 /// Receives hook events, journals them, answers the agent.
@@ -584,6 +590,13 @@ impl SignalBus {
                 pid: event.ppid,
                 session_id,
                 transcript_path: mapped.transcript_path.clone(),
+                // c-effortread r9 item 1: carry the native SessionStart source
+                // (mapped into the lifecycle related_ids at hook delivery). A
+                // `/clear` is classified Fresh even when Z.jsonl already holds
+                // the queued prompt at the first poll tick.
+                source: native_lifecycle(&mapped.payload)
+                    .and_then(|lifecycle| lifecycle.related_ids.get("source"))
+                    .cloned(),
             });
         }
         if mapped.kind == MappedKind::SessionStarted && mapped.session_id.is_some() {
@@ -1685,6 +1698,7 @@ mod tests {
                 pid: 4242,
                 session_id: "0199a1f0-0000-7000-8000-000000000000".into(),
                 transcript_path: Some("/w/s.jsonl".into()),
+                source: None,
             })
         );
         let observation = rx.recv().await.unwrap();
@@ -1693,6 +1707,56 @@ mod tests {
             Knowledge::Known {
                 value: "0199a1f0-0000-7000-8000-000000000000".into()
             }
+        );
+    }
+
+    /// c-effortread r9 item 1: the SessionStart hook's `source`
+    /// (startup/clear/compact/resume) rides on the folded SessionBinding, so a
+    /// consumer that binds off the bus at the first poll tick classifies a
+    /// `/clear` from the hook payload instead of sizing the (already non-empty)
+    /// rebound transcript.
+    #[tokio::test]
+    async fn session_start_carries_the_hook_source_on_its_binding() {
+        let (bus, _rx) = bus();
+        bus.handle(envelope(
+            "SessionStart",
+            serde_json::json!({
+                "session_id": "clear-z",
+                "transcript_path": "/w/z.jsonl",
+                "source": "clear",
+            }),
+        ))
+        .await;
+        assert_eq!(
+            bus.binding().as_ref().and_then(|b| b.source.as_deref()),
+            Some("clear"),
+            "the /clear source is carried on the folded binding"
+        );
+
+        // A subsequent resume rebind replaces the source too (never sticky).
+        bus.handle(envelope(
+            "SessionStart",
+            serde_json::json!({
+                "session_id": "resumed-x",
+                "transcript_path": "/w/x.jsonl",
+                "source": "resume",
+            }),
+        ))
+        .await;
+        assert_eq!(
+            bus.binding().as_ref().and_then(|b| b.source.as_deref()),
+            Some("resume")
+        );
+
+        // An older payload omitting source binds with an explicit None.
+        bus.handle(envelope(
+            "SessionStart",
+            serde_json::json!({"session_id": "legacy", "transcript_path": "/w/l.jsonl"}),
+        ))
+        .await;
+        assert_eq!(
+            bus.binding().as_ref().and_then(|b| b.source.as_deref()),
+            None
         );
     }
 

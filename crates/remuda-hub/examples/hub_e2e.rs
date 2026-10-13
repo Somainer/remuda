@@ -500,10 +500,41 @@ fn bulk_catalog() -> String {
 /// taller than the viewport. Returns the JSON payload fragment and the id
 /// vector (also remembered per instance for listed/typed attribution).
 fn fake_launch_catalog(prompt: Option<&str>) -> (Value, Vec<String>) {
+    // Each trigger is a DISTINCT substring — check the more specific ones
+    // first ("-spelling" before "-same" etc.) so a prompt never matches the
+    // wrong branch.
     let models: Vec<String> = if prompt.is_some_and(|text| text.contains("tall-catalog")) {
         std::iter::once("e2e/auto".to_owned())
             .chain((0..80).map(|i| format!("e2e/m-{i:02}")))
             .collect()
+    } else if prompt.is_some_and(|text| text.contains("auto-vendor-spelling")) {
+        // The cross-spelling case: /auto vs /auto_model across vendors.
+        vec![
+            "vendor-a/auto".to_owned(),
+            "vendor-b/auto_model".to_owned(),
+            "e2e/fast".to_owned(),
+        ]
+    } else if prompt.is_some_and(|text| text.contains("auto-vendor-same")) {
+        // Two CONCRETE vendor models whose final segment is the provider's own
+        // automatic choice. They are distinct full ids and never merge with
+        // each other or with the bare-auto alias.
+        vec![
+            "vendor-a/auto".to_owned(),
+            "vendor-b/auto".to_owned(),
+            "e2e/fast".to_owned(),
+        ]
+    } else if prompt.is_some_and(|text| text.contains("auto-vendor-append")) {
+        // Catalog lists ONLY vendor-a/auto: a read-back of vendor-b/auto must
+        // append that unlisted running id as its own row.
+        vec!["vendor-a/auto".to_owned(), "e2e/fast".to_owned()]
+    } else if prompt.is_some_and(|text| text.contains("shared-tail-collision")) {
+        // Two DISTINCT full ids sharing one final segment: the driver matches
+        // models verbatim, so the web picker renders/selects them by full id.
+        vec![
+            "vendor-a/shared".to_owned(),
+            "vendor-b/shared".to_owned(),
+            "e2e/fast".to_owned(),
+        ]
     } else {
         vec![
             "e2e/auto".to_owned(),
@@ -661,9 +692,13 @@ fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[St
                 "maxInstances": 8,
                 // Inventory only: this harness never launches herdr.
                 "herdr": { "version": "e2e-fake" },
+                // Report the current decoupled build: the effort-sync suite
+                // drives the orthogonal switch (flag on at any tier without
+                // moving the slider) and the live version gate derives from
+                // this inventory when the instance carries no own snapshot.
                 "cli": [{
                     "kind": "claude",
-                    "version": "2.1.268",
+                    "version": "2.1.289",
                     "absolutePath": "/usr/bin/claude",
                     "authState": "logged_in"
                 }, {
@@ -1257,7 +1292,11 @@ async fn fake_node(
                         .await?;
                         // §9.1 model-sync: the driver's launch snapshot carries the
                         // gateway-discovered catalog and the launch model so the
-                        // picker shows the real list immediately.
+                        // picker shows the real list immediately. The effective id
+                        // is the requested id VERBATIM — production passes the
+                        // model through unchanged (launch/user.rs merges it as-is;
+                        // there is no passthrough/auto → gateway-id resolution in
+                        // the driver), so the fake invents none.
                         let launch_model = spec
                             .get("modelId")
                             .or_else(|| spec.get("model"))
@@ -1287,6 +1326,12 @@ async fn fake_node(
                             }),
                         )
                         .await?;
+                        // A freshly launched claude-pty is at its prompt: the
+                        // real driver reports Turn agent_status idle, which is
+                        // what the composer reads to send an Enter prompt
+                        // immediately (busy/blocked would queue it as held).
+                        append_n =
+                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                         send_rpc_ok(&mut ws, id, create_result(spec, &instance_id)).await?;
                         continue;
                     }
@@ -1696,6 +1741,8 @@ async fn fake_node(
                     // carrier (claude-pty emits in its own branch above; shell-pty
                     // and print land here).
                     if kind == "claude" {
+                        // Verbatim effective id (no invented resolution; see the
+                        // claude-pty create arm above).
                         let launch_model = spec
                             .get("modelId")
                             .or_else(|| spec.get("model"))
@@ -2262,6 +2309,7 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("model-queued:{mid}"),
+                                None,
                             )
                             .await?;
                         } else if let Some(mid) = requested.strip_prefix("__notfound__:") {
@@ -2271,6 +2319,7 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("model-degraded:{mid}:not-found"),
+                                None,
                             )
                             .await?;
                         } else {
@@ -2341,6 +2390,17 @@ async fn fake_node(
                     if let Some(effort) = params.get("effort")
                         && let Some(requested) = effort.get("name").and_then(Value::as_str)
                     {
+                        let effort_request_id = effort
+                            .get("requestId")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty());
+                        // D-056: the wire is a native level word plus an
+                        // orthogonal ultracode boolean. Test-only sentinels
+                        // (the UI sends real words, never these):
+                        //   "__queued__:<word>"              → queued lifecycle
+                        //   "__degrade__:<word>:<reason>"    → degraded lifecycle
+                        //   "__ultra_refuse_model__"         → switch refused (model)
+                        //   "__ultra_refuse_workflows__"     → switch refused (workflows)
                         if let Some(word) = requested.strip_prefix("__queued__:") {
                             append_n = append_configure_status(
                                 &mut ws,
@@ -2348,53 +2408,94 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("effort-queued:{word}"),
+                                effort_request_id,
                             )
                             .await?;
-                        } else if let Some(word) = requested.strip_prefix("__degrade__:") {
+                        } else if let Some(rest) = requested.strip_prefix("__degrade__:") {
                             append_n = append_configure_status(
                                 &mut ws,
                                 &mut frame_queue,
                                 &instance_id,
                                 append_n,
-                                &format!("effort-degraded:{word}:dialog-kept"),
+                                &format!("effort-degraded:{rest}"),
+                                effort_request_id,
+                            )
+                            .await?;
+                        } else if requested == "__ultra_refuse_model__"
+                            || requested == "__ultra_refuse_workflows__"
+                        {
+                            let reason = if requested == "__ultra_refuse_model__" {
+                                "ultracode:ultracode-unavailable-for-model"
+                            } else {
+                                "ultracode:ultracode-workflows-disabled"
+                            };
+                            append_n = append_configure_status(
+                                &mut ws,
+                                &mut frame_queue,
+                                &instance_id,
+                                append_n,
+                                &format!("effort-degraded:{reason}"),
+                                effort_request_id,
                             )
                             .await?;
                         } else {
-                            // Keep the Claude mismatch fixture; Codex must echo
-                            // both max and ultra unchanged through the Hub.
-                            let clamped = requested == "max"
-                                && instance_kinds.get(&instance_id).map(String::as_str)
-                                    == Some("claude");
-                            let ultra = requested == "ultracode";
-                            // ultracode reads back as tier xhigh on Claude; a
-                            // clamped max reads back xhigh too.
-                            let tier = if clamped || ultra { "xhigh" } else { requested };
+                            let want_ultra = effort
+                                .get("ultracode")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                                || requested == "ultracode";
+                            // "__clamp__" opts into the clamp explicitly; a
+                            // plain Claude max with the switch OFF also clamps
+                            // (the 2.1.289 case-g model without xhigh), but
+                            // max WITH ultracode on stays on max (D-056).
+                            let clamp_word = requested == "__clamp__"
+                                || requested == "ultracode"
+                                || (requested == "max"
+                                    && instance_kinds.get(&instance_id).map(String::as_str)
+                                        == Some("claude")
+                                    && !want_ultra);
+                            let tier = if clamp_word { "xhigh" } else { requested };
                             let observed_at = monotonic_effort_observed_at();
-                            let event = json!({
-                                "kind": "effort",
-                                "completeness": "structured",
-                                "payload": {
-                                    "requested": {"name": requested,
-                                        "ultracode": effort.get("ultracode").and_then(Value::as_bool).unwrap_or(false)},
-                                    "effective": {
-                                        // Measured 2.1.272: ultracode carries the
-                                        // workflow flag; a plain level accept
-                                        // positively clears it; an unrelated clamp
-                                        // leaves the flag unknown.
-                                        "name": tier,
-                                        "ultracode": if ultra {
-                                            serde_json::Value::Bool(true)
-                                        } else if clamped {
-                                            serde_json::Value::Null
-                                        } else {
-                                            serde_json::Value::Bool(false)
+                            // The flag is its OWN axis. On is positively
+                            // confirmed at the requested level; a plain level
+                            // request reports positive off; the opt-in clamp
+                            // leaves the flag unconfirmed (null).
+                            let flag: serde_json::Value = if want_ultra {
+                                serde_json::Value::Bool(true)
+                            } else if clamp_word {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::Value::Bool(false)
+                            };
+                            let event = {
+                                // c-effortread r11: a real driver stamps the
+                                // verdict observation with the configure's own
+                                // request id, so the web settles (and accepts a
+                                // clamped/opposite outcome) on that echo instead
+                                // of the stricter id-less legacy fallback.
+                                let request_id = effort
+                                    .get("requestId")
+                                    .and_then(Value::as_str)
+                                    .filter(|id| !id.is_empty());
+                                let mut event = json!({
+                                    "kind": "effort",
+                                    "completeness": "structured",
+                                    "payload": {
+                                        "requested": {"name": requested, "ultracode": want_ultra},
+                                        "effective": {
+                                            "name": tier,
+                                            "ultracode": flag,
+                                            "source": "remuda",
+                                            "observedAt": observed_at
                                         },
-                                        "source": "remuda",
-                                        "observedAt": observed_at
-                                    },
-                                    "raw": tier
+                                        "raw": tier
+                                    }
+                                });
+                                if let Some(id) = request_id {
+                                    event["payload"]["requestId"] = json!(id);
                                 }
-                            });
+                                event
+                            };
                             append_n = append_event(
                                 &mut ws,
                                 &mut frame_queue,
@@ -2420,6 +2521,7 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("permission-queued:{word}"),
+                                None,
                             )
                             .await?;
                         } else if let Some(word) = requested.strip_prefix("__degrade__:") {
@@ -2429,6 +2531,7 @@ async fn fake_node(
                                 &instance_id,
                                 append_n,
                                 &format!("permission-degraded:{word}:no-status-line"),
+                                None,
                             )
                             .await?;
                         } else {
@@ -4836,8 +4939,23 @@ async fn append_configure_status(
     instance_id: &str,
     n: u64,
     status: &str,
+    effort_request_id: Option<&str>,
 ) -> Result<u64> {
     let seq = n + 1;
+    let mut event = json!({
+        "kind": "lifecycle",
+        "payload": {
+            "type": "native",
+            "nativeName": "instance.configure",
+            "status": status
+        }
+    });
+    // c-effortread r11: the fake driver echoes the configure's request id on
+    // lifecycle edges, exactly like the real driver; the web binds queued/
+    // degraded edges to that request rather than the id-less legacy matcher.
+    if let Some(id) = effort_request_id.filter(|id| !id.is_empty()) {
+        event["payload"]["relatedIds"] = json!({ "effortRequestId": id });
+    }
     ws.send(Message::Text(
         json!({
             "jsonrpc": "2.0",
@@ -4845,14 +4963,7 @@ async fn append_configure_status(
             "method": "journal.append",
             "params": {
                 "instanceId": instance_id,
-                "event": {
-                    "kind": "lifecycle",
-                    "payload": {
-                        "type": "native",
-                        "nativeName": "instance.configure",
-                        "status": status
-                    }
-                }
+                "event": event
             }
         })
         .to_string()

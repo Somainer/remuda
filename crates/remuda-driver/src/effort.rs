@@ -15,7 +15,13 @@
 //! * **Live two-way sync** — below the launch section: Remuda → Claude writes
 //!   `/effort <level>` and waits for transcript read-back; Claude → Remuda
 //!   feeds assistant records through `remuda_protocol::EffortTracker`.
-//!   Measured on claude 2.1.221 (`docs/design/evidence/effort-sync-1.md`).
+//!   Measured on claude 2.1.221 (`docs/design/evidence/effort-sync-1.md`) and
+//!   re-measured on 2.1.272/2.1.273 (coupled) and 2.1.289 (decoupled
+//!   ultracode, `effort-sync-2.md`…`effort-sync-4.md`, ADR D-056). On
+//!   ≥ 2.1.284 the toggle is its own `/effort ultracode on|off` command and
+//!   its verdict ("Effort stays <level>") settles the bridge without a level
+//!   await; on coupled builds the bare `/effort ultracode` is the xhigh
+//!   level-plus-flag command.
 //!
 //! One rule for the live direction: the transcript is the only authority on
 //! what is actually in effect.
@@ -125,6 +131,39 @@ fn grok_reasoning_value(name: EffortName) -> DriverResult<&'static str> {
     }
 }
 
+/// D-056 (2) launch gate for the Claude ultracode flag.
+///
+/// Refuse `ultracode: true` unless the PINNED binary is a build that has the
+/// feature: coupled `2.1.203–2.1.283` or decoupled `≥ 2.1.284`. A build below
+/// `2.1.203` prints `Unknown --effort value 'ultracode'` and starts at the
+/// default level, and a version that cannot be determined fails closed rather
+/// than guessing. Plain levels (`ultracode: false`) are unaffected at any
+/// version. `pinned_version` is the first line of the binary's `--version`
+/// (e.g. `2.1.277 (Claude Code)`).
+pub fn ensure_claude_ultracode_version(
+    pinned_version: &str,
+    effort: Option<EffortSelection>,
+) -> DriverResult<()> {
+    if !effort.is_some_and(|selection| selection.ultracode) {
+        return Ok(());
+    }
+    let supported = remuda_protocol::parse_effort_version(pinned_version)
+        .map(remuda_protocol::ultracode_supported)
+        .unwrap_or(false);
+    if supported {
+        return Ok(());
+    }
+    Err(DriverError::InvalidLaunchSpec(format!(
+        "ultracode requires Claude Code 2.1.203–2.1.283 (coupled) or 2.1.284+ (decoupled); the \
+         pinned binary reports {} and does not accept it",
+        if pinned_version.trim().is_empty() {
+            "an undetermined version"
+        } else {
+            pinned_version.trim()
+        }
+    )))
+}
+
 /// Reject effort flags a caller smuggled through `spec.args`: the materializer
 /// owns this axis per-kind, and a hand-written flag would either repeat the
 /// emitted token or use the wrong vocabulary (codex parses no `--effort` at
@@ -186,62 +225,270 @@ pub(crate) const IN_SESSION_LEVELS: &[&str] =
     &["low", "medium", "high", "xhigh", "max", "ultracode", "auto"];
 
 /// What the switch was asked to change to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EffortRequest {
-    /// Level to type (`ultracode` spelled out so `/effort ultracode` works).
+    /// Level to type. For a decoupled flag-only switch this is unused on the
+    /// wire (the toggle keeps the current level); the configure writer is
+    /// expected to send the current level alongside in real use (D-056).
     pub(crate) name: EffortName,
+    /// Desired ultracode flag state for a flag toggle.
     pub(crate) ultracode: bool,
+    /// Exact argument word(s) after `/effort `: a level word, the bare
+    /// `ultracode`, or `ultracode on` / `ultracode off`.
+    pub(crate) word: &'static str,
+    /// c-effortread r10 items 1–4: per-request id minted by the web and
+    /// carried on the configure. Every lifecycle edge this switch journals
+    /// (`effort-queued|applied|degraded`) and the transcript mapper's
+    /// requested echo carry it back, so the client settles only its own
+    /// request. `None` for a launch-argv request or an id-less legacy client.
+    pub(crate) request_id: Option<String>,
 }
 
 impl EffortRequest {
+    /// Attach the configure's per-request id (builder).
+    pub(crate) fn with_request_id(mut self, request_id: Option<&str>) -> Self {
+        self.request_id = request_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        self
+    }
+
     pub(crate) fn from_level(level: &str) -> Option<Self> {
         match level.trim().to_ascii_lowercase().as_str() {
             "low" => Some(Self {
                 name: EffortName::Low,
                 ultracode: false,
+                word: "low",
+                request_id: None,
             }),
             "medium" => Some(Self {
                 name: EffortName::Medium,
                 ultracode: false,
+                word: "medium",
+                request_id: None,
             }),
             "high" => Some(Self {
                 name: EffortName::High,
                 ultracode: false,
+                word: "high",
+                request_id: None,
             }),
             "xhigh" => Some(Self {
                 name: EffortName::Xhigh,
                 ultracode: false,
+                word: "xhigh",
+                request_id: None,
             }),
             "max" => Some(Self {
                 name: EffortName::Max,
                 ultracode: false,
+                word: "max",
+                request_id: None,
             }),
+            // Coupled input alias AND the decoupled bare toggle. The version
+            // gate decides what the word means (see `awaits_level`).
             "ultracode" => Some(Self {
                 name: EffortName::Xhigh,
                 ultracode: true,
+                word: "ultracode",
+                request_id: None,
+            }),
+            "ultracode on" => Some(Self {
+                name: EffortName::Xhigh,
+                ultracode: true,
+                word: "ultracode on",
+                request_id: None,
+            }),
+            "ultracode off" => Some(Self {
+                name: EffortName::Xhigh,
+                ultracode: false,
+                word: "ultracode off",
+                request_id: None,
             }),
             _ => None,
         }
     }
 
-    /// The native spelling to type after `/effort ` — `ultracode` is its own
-    /// word; the five levels spell themselves.
-    pub(crate) fn command_word(&self) -> &'static str {
-        if self.ultracode {
-            "ultracode"
-        } else {
-            match self.name {
-                EffortName::Low => "low",
-                EffortName::Medium => "medium",
-                EffortName::High => "high",
-                EffortName::Xhigh => "xhigh",
-                EffortName::Max => "max",
-                // Neither the legacy `minimal` nor Codex `ultra` is a Claude
-                // `/effort` level; EffortRequest::from_level produces neither.
-                EffortName::Minimal => "minimal",
-                EffortName::Ultra => "ultra",
-            }
+    /// Whether this switch is the decoupled flag-only toggle
+    /// (`/effort ultracode on|off`, or the bare word on ≥ 2.1.284).
+    fn is_flag_only(&self, semantics: remuda_protocol::EffortSemantics) -> bool {
+        if semantics == remuda_protocol::EffortSemantics::Coupled {
+            // On coupled builds the bare word is the xhigh level command.
+            return false;
         }
+        self.ultracode || self.word == "ultracode off"
+    }
+
+    /// Build the launch-time request from a protocol [`EffortSelection`].
+    ///
+    /// This is launch provenance for a shell-pty launch that can target ANY
+    /// harness: a codex launch legitimately carries `ultra` (and an older
+    /// Claude launch `minimal`), neither of which is a Claude `/effort` word.
+    /// Map the fields directly instead of round-tripping through
+    /// [`Self::from_level`], which panics on those words — a panic here ran
+    /// AFTER the child was spawned and orphaned it.
+    pub(crate) fn from_selection(selection: EffortSelection) -> Self {
+        Self {
+            name: selection.name,
+            ultracode: selection.ultracode,
+            word: selection.flag_value(),
+            request_id: None,
+        }
+    }
+
+    /// The provenance choice for a live configure classification
+    /// (c-effortui r5 item 1): observed read-back wins; the launch REQUESTED
+    /// selection is the only fallback. Centralised here (and on the bridge) so
+    /// the Herdr carrier and the classifier can never disagree, and unit
+    /// tests can pin the exact observed-or-requested behaviour without a
+    /// PTY/herdr end-to-end harness.
+    ///
+    /// Returns `None` only when there is neither a read-back nor a launch
+    /// request — a true cold start.
+    pub(crate) fn classify_provenance(
+        observed: Option<ObservedSelection>,
+        requested: Option<EffortSelection>,
+    ) -> Option<ObservedSelection> {
+        observed.or(requested.map(|selection| ObservedSelection {
+            name: selection.name,
+            ultracode: Some(selection.ultracode),
+        }))
+    }
+
+    /// Build the in-session request for a LIVE configure from the two D-056
+    /// axes (`{name, ultracode}`), the explicit intent `axis`, and the
+    /// reported build semantics.
+    ///
+    /// Classification (c-effortui r4 item 2, tightened in r5 item 1, intent
+    /// made explicit in c-effortread r9 item 6) is against the driver's latest
+    /// OBSERVED effective selection, falling back to the launch REQUESTED
+    /// selection — never a guessed toggle with no provenance:
+    ///
+    /// - Coupled (2.1.203–2.1.283): a flag-on request is the single bare
+    ///   `/effort ultracode` — on those builds that word IS the xhigh-tier
+    ///   command; anything else is a plain level word. The UI guarantees it
+    ///   never asks for `{non-xhigh, true}`. An explicit flag axis with no
+    ///   boolean or an explicit flag-off is refused before dispatch
+    ///   (c-effortread r12 item 4).
+    /// - Decoupled (≥2.1.284):
+    ///   * explicit `axis = Flag` → the orthogonal toggle
+    ///     (`/effort ultracode on|off`) at the given tier, executed exactly —
+    ///     even with no proven selection, because the client disambiguated it;
+    ///   * explicit `axis = Tier` → a plain `/effort <level>`;
+    ///   * `axis = None` (legacy client) → same-tier provenance is required to
+    ///     read a flag-on as a toggle; a flag-on with no same-tier provenance
+    ///     is AMBIGUOUS and returns `None` (the caller refuses it) rather than
+    ///     typing a different, tier-changing command.
+    /// - Legacy/unknown: a flag-on request is rejected (the caller's version
+    ///   gate already blocks it); here only plain level words are produced.
+    pub(crate) fn for_configure(
+        level: &str,
+        ultracode: Option<bool>,
+        axis: Option<remuda_protocol::EffortAxis>,
+        semantics: remuda_protocol::EffortSemantics,
+        observed: Option<ObservedSelection>,
+        requested: Option<EffortSelection>,
+        request_id: Option<&str>,
+    ) -> Option<Self> {
+        let normalized = level.trim().to_ascii_lowercase();
+        // c-effortread r12 item 4: an explicit FLAG operation is validated
+        // BEFORE the semantics/carrier dispatch. It REQUIRES an explicit
+        // boolean on every build — `ultracode` None means the boolean was
+        // absent or carried a non-boolean JSON value (the node maps both to
+        // None). The r11 gate lived inside the decoupled arm, so on a coupled
+        // CLI (e.g. 2.1.273, flag ON at xhigh) `{"name":"high","axis":"flag"}`
+        // fell through and typed `/effort high`, and an explicit flag-OFF on a
+        // build without the orthogonal toggle silently executed a level move.
+        if axis == Some(remuda_protocol::EffortAxis::Flag) {
+            let flag = ultracode?;
+            return match semantics {
+                remuda_protocol::EffortSemantics::Decoupled => {
+                    let name = parse_plain_effort_name(&normalized)?;
+                    Some(
+                        Self {
+                            name,
+                            ultracode: flag,
+                            word: if flag {
+                                "ultracode on"
+                            } else {
+                                "ultracode off"
+                            },
+                            request_id: None,
+                        }
+                        .with_request_id(request_id),
+                    )
+                }
+                // Coupled builds express flag-ON only, as the one bare
+                // xhigh-level-plus-flag word.
+                remuda_protocol::EffortSemantics::Coupled if flag => {
+                    Self::from_level("ultracode").map(|req| req.with_request_id(request_id))
+                }
+                // Coupled flag-OFF and every flag operation on legacy/unknown
+                // builds cannot be expressed AS A FLAG OPERATION: refuse
+                // instead of substituting a level command.
+                _ => None,
+            };
+        }
+        if semantics == remuda_protocol::EffortSemantics::Coupled && ultracode == Some(true) {
+            return Self::from_level("ultracode").map(|req| req.with_request_id(request_id));
+        }
+        if semantics == remuda_protocol::EffortSemantics::Decoupled {
+            let target_name = parse_plain_effort_name(&normalized);
+            // Explicit tier intent: a plain level move; the orthogonal flag
+            // stays where the running session had it. (An explicit Flag axis
+            // already returned above.)
+            if let Some(remuda_protocol::EffortAxis::Tier) = axis {
+                return Self::from_level(&normalized).map(|req| req.with_request_id(request_id));
+            }
+            // axis is None here: a legacy client that did not state intent.
+            // c-effortread r10 item 5: a legacy tier-only request carries NO
+            // boolean (`ultracode` absent). It is the plain level word BEFORE
+            // any toggle inference — even when the observed session has the
+            // flag ON at the same tier. An ON/OFF command requires an explicit
+            // boolean.
+            if ultracode.is_none() {
+                return Self::from_level(&normalized)
+                    .map(|request| request.with_request_id(request_id));
+            }
+            // Legacy client with an explicit boolean: a same-tier proven
+            // selection lets either flag direction mean the toggle.
+            let proven = Self::classify_provenance(observed, requested);
+            if let Some(name) =
+                target_name.filter(|name| proven.as_ref().is_some_and(|obs| obs.name == *name))
+            {
+                return Some(
+                    Self {
+                        name,
+                        ultracode: ultracode == Some(true),
+                        word: if ultracode == Some(true) {
+                            "ultracode on"
+                        } else {
+                            "ultracode off"
+                        },
+                        request_id: None,
+                    }
+                    .with_request_id(request_id),
+                );
+            }
+            // A cold flag-ON with no axis is ambiguous: do not execute a
+            // different (tier) operation — refuse. A flag-off or a plain level
+            // is still just the level word.
+            if ultracode == Some(true) {
+                return None;
+            }
+        } else if ultracode == Some(true) {
+            // Legacy/unknown build: the flag cannot be expressed; refuse
+            // rather than typing a bare level and claiming the flag.
+            return None;
+        }
+        Self::from_level(&normalized).map(|req| req.with_request_id(request_id))
+    }
+
+    /// The native spelling to type after `/effort ` — a level word,
+    /// `ultracode`, or `ultracode on` / `ultracode off`.
+    pub(crate) fn command_word(&self) -> &'static str {
+        self.word
     }
 
     /// The whole slash command body, without the submitting CR.
@@ -271,11 +518,26 @@ impl EffortRequest {
     }
 
     /// Level the transcript must report for this switch to count as observed.
-    ///
-    /// `ultracode` reads back as `xhigh` — Claude does not repeat the workflow
-    /// flag on assistant records.
-    pub(crate) fn observed_name(&self) -> EffortName {
-        self.name
+    /// On coupled builds the bare `ultracode` word is the xhigh level command,
+    /// so it awaits xhigh; decoupled flag toggles await no level.
+    pub(crate) fn awaits_level(
+        &self,
+        semantics: remuda_protocol::EffortSemantics,
+    ) -> Option<EffortName> {
+        (!self.is_flag_only(semantics)).then_some(self.name)
+    }
+}
+
+/// Parse just the five plain Claude tier names (no `ultracode` alias, no
+/// toggle words) into an `EffortName`. c-effortui r4 item 2.
+pub(crate) fn parse_plain_effort_name(word: &str) -> Option<EffortName> {
+    match word.trim().to_ascii_lowercase().as_str() {
+        "low" => Some(EffortName::Low),
+        "medium" => Some(EffortName::Medium),
+        "high" => Some(EffortName::High),
+        "xhigh" => Some(EffortName::Xhigh),
+        "max" => Some(EffortName::Max),
+        _ => None,
     }
 }
 
@@ -313,10 +575,11 @@ impl SwitchOutcome {
 pub enum Readback {
     /// The stdout verdict accepted the level; this is what is now in effect.
     Applied(remuda_protocol::ObservedEffort),
-    /// Claude refused the switch (dialog dismissed with Esc, invalid argument)
-    /// and the journaled reason names why.
+    /// Claude refused the switch and the journaled reason names why:
+    /// `dialog-kept`, `invalid-argument`, `ultracode-workflows-disabled`,
+    /// `ultracode-unavailable-for-model`, or `env-override` (D-056).
     Rejected {
-        /// Stable reason code (`dialog-kept`, `invalid-argument`).
+        /// Stable reason code.
         reason: String,
     },
 }
@@ -329,20 +592,77 @@ pub enum Readback {
 /// for the next turn's assistant record. The bridge is that rendezvous. A
 /// much later natural change to the same level is not mis-attributed: the
 /// generation only resolves on the verdict of its own command.
+/// Latest OBSERVED effective selection used to classify a live configure
+/// (c-effortui r4 item 2). Unlike [`EffortRequest`] the flag is tri-state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObservedSelection {
+    pub(crate) name: EffortName,
+    pub(crate) ultracode: Option<bool>,
+}
+
 pub(crate) struct EffortBridge {
     state: Mutex<BridgeState>,
     notify: Notify,
 }
 
+/// Verified submission provenance captured immediately BEFORE an effort
+/// command is typed (c-effortread r16 item 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmissionProvenance {
+    /// The bound transcript EOF was verified immediately before submission:
+    /// the mapper attributes only slash records starting at or after this byte
+    /// offset (the command's own record starts exactly at the file length).
+    Floor(u64),
+    /// The carrier could NOT verify a floor (no bound transcript, or the stat
+    /// failed — a rotated/removed file). The mapper attributes NOTHING to the
+    /// switch: neither a restored older same-word command nor the switch's own
+    /// read-back can settle it. The switch still types and the command can
+    /// apply in the TUI, but the request ends through its own bounded
+    /// no-readback/unconfirmed path — never by word-only matching.
+    Unavailable,
+}
+
+/// An armed switch awaiting its transcript verdict.
+#[derive(Clone)]
+pub(crate) struct PendingSwitch {
+    pub(crate) generation: u64,
+    pub(crate) request: EffortRequest,
+    /// c-effortread r15 item 4, r16 items 1/3: submission provenance captured
+    /// immediately BEFORE the command was submitted. `Some(Floor(L))`
+    /// attributes a slash record to the switch only when it starts at or after
+    /// L; `Some(Unavailable)` attributes nothing; `None` is the direct-unit-test
+    /// seam ([`EffortBridge::arm`]) where the word match alone governs.
+    pub(crate) submit_floor: Option<SubmissionProvenance>,
+}
+
 #[derive(Default)]
 struct BridgeState {
     /// A switch waiting for its command verdict.
-    pending: Option<(u64, EffortRequest)>,
+    pending: Option<PendingSwitch>,
     /// Generation whose verdict has arrived.
     verdict_gen: u64,
     verdict: Option<Readback>,
-    /// The latest thing any side asked for (payload `requested` field).
+    /// The latest thing any side ASKED FOR (payload `requested` echo field).
+    /// Written by both the launch argv and every armed live switch; a write
+    /// failure leaves the failed attempt here because the echo reports what
+    /// was attempted, not what provenance may classify a later configure.
     requested: Option<EffortRequest>,
+    /// c-effortread r15 item 5: valid LAUNCH-argv provenance ONLY. Written by
+    /// `note_launch_request`; an armed live switch (and its failure) never
+    /// touches it. Together with the OBSERVED read-back this is the sole
+    /// fallback that may establish the tier for legacy classification — a
+    /// failed `arm()` used to linger in `requested` and let a later cold
+    /// flag-on configure masquerade as a same-tier toggle.
+    launch: Option<EffortRequest>,
+    /// c-effortui r4 item 2: the latest OBSERVED effective selection (from
+    /// transcript read-back — verdicts, assistant records, attachments). The
+    /// live configure path classifies a new configure against THIS, not
+    /// against `requested` (which only arm/note_launch_request write and goes
+    /// stale across a terminal-typed /effort, a resume, or an unpinned
+    /// launch). None until the first read-back of the current process. The
+    /// flag stays tri-state (None = never observed in this process), so a
+    /// tier move against a flag-unknown session is not mistaken for a toggle.
+    observed: Option<ObservedSelection>,
     generation: u64,
 }
 
@@ -360,29 +680,71 @@ impl EffortBridge {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// Arm a new Remuda switch; returns its generation token.
+    /// Arm a new Remuda switch with no transcript submission floor; returns
+    /// its generation token. Production switch typing goes through
+    /// [`Self::arm_with_floor`] with the pre-submit EOF position. This seam is
+    /// retained for tests and the test-stub fake binary.
+    ///
+    /// Records the attempt as the latest `requested` for the payload echo but
+    /// never overwrites the valid LAUNCH provenance (c-effortread r15 item 5).
+    #[cfg(any(test, feature = "test-stub"))]
     pub(crate) fn arm(&self, request: EffortRequest) -> u64 {
+        self.arm_with_floor(request, None)
+    }
+
+    /// Arm a switch with the submission provenance captured immediately before
+    /// its command was submitted (c-effortread r15 item 4, r16 items 1/3): a
+    /// verified floor the switch's own slash starts AT, or explicit provenance
+    /// loss under which the mapper attributes nothing.
+    pub(crate) fn arm_with_floor(
+        &self,
+        request: EffortRequest,
+        submit_floor: Option<SubmissionProvenance>,
+    ) -> u64 {
         let mut state = self.lock();
         state.generation += 1;
         let generation = state.generation;
-        state.pending = Some((generation, request));
+        state.pending = Some(PendingSwitch {
+            generation,
+            request: request.clone(),
+            submit_floor,
+        });
         state.requested = Some(request);
         generation
     }
 
     /// Record the launch-time requested selection (payload provenance only).
+    ///
+    /// This is the ONLY non-observed provenance a later legacy configure may
+    /// classify against (c-effortread r15 item 5): a live `arm`/`fail` cycle
+    /// never overwrites it.
     pub(crate) fn note_launch_request(&self, request: EffortRequest) {
-        self.lock().requested = Some(request);
+        let mut state = self.lock();
+        state.launch = Some(request.clone());
+        state.requested = Some(request);
+    }
+
+    /// The valid launch REQUESTED selection, for a live configure's
+    /// same-tier-provenance fallback. An armed live switch never replaces it
+    /// (c-effortread r15 item 5).
+    pub(crate) fn launch_selection(&self) -> Option<EffortSelection> {
+        self.lock().launch.as_ref().map(|request| EffortSelection {
+            name: request.name,
+            ultracode: request.ultracode,
+        })
     }
 
     /// The pending switch the mapper should arm its tracker with, if any.
     pub(crate) fn pending(&self) -> Option<EffortRequest> {
-        self.lock().pending.map(|(_, request)| request)
+        self.lock()
+            .pending
+            .as_ref()
+            .map(|pending| pending.request.clone())
     }
 
     /// Pending switch together with its generation, for the mapper to arm once.
-    pub(crate) fn pending_with_gen(&self) -> Option<(u64, EffortRequest)> {
-        self.lock().pending
+    pub(crate) fn pending_with_gen(&self) -> Option<PendingSwitch> {
+        self.lock().pending.clone()
     }
 
     /// Whether a switch is currently awaiting read-back.
@@ -392,18 +754,51 @@ impl EffortBridge {
 
     /// Latest requested selection, for the emitted payload.
     pub(crate) fn requested(&self) -> Option<EffortRequest> {
-        self.lock().requested
+        self.lock().requested.clone()
+    }
+
+    /// c-effortui r5 item 1: the proven selection for classifying a live
+    /// configure — OBSERVED read-back if present, else the valid LAUNCH
+    /// REQUESTED selection. This is the single source the Herdr carrier uses
+    /// (no inline `observed ?? requested` that can drift from the classifier).
+    ///
+    /// c-effortread r15 item 5: the fallback is launch provenance ONLY — the
+    /// latest armed attempt lives in `requested` for the payload echo but must
+    /// never classify a later configure (its write may have failed before a
+    /// single byte reached the composer).
+    pub(crate) fn proven_selection(&self) -> Option<ObservedSelection> {
+        let state = self.lock();
+        EffortRequest::classify_provenance(
+            state.observed,
+            state.launch.as_ref().map(|request| EffortSelection {
+                name: request.name,
+                ultracode: request.ultracode,
+            }),
+        )
+    }
+
+    /// Mapper side: record the latest effective selection observed in the
+    /// CURRENT process (a /effort verdict, assistant record or attachment).
+    pub(crate) fn note_observed(&self, observed: remuda_protocol::ObservedEffort) {
+        self.lock().observed = Some(ObservedSelection {
+            name: observed.name,
+            ultracode: observed.ultracode,
+        });
     }
 
     /// Mapper side: the command verdict `generation` was waiting for arrived.
     pub(crate) fn resolve(&self, generation: u64, observed: remuda_protocol::ObservedEffort) {
         {
             let mut state = self.lock();
-            if let Some((pending_gen, _)) = state.pending
-                && pending_gen == generation
+            if let Some(pending) = &state.pending
+                && pending.generation == generation
             {
                 state.pending = None;
             }
+            state.observed = Some(ObservedSelection {
+                name: observed.name,
+                ultracode: observed.ultracode,
+            });
             state.verdict = Some(Readback::Applied(observed));
             state.verdict_gen = generation;
         }
@@ -415,8 +810,8 @@ impl EffortBridge {
     pub(crate) fn reject(&self, generation: u64, reason: impl Into<String>) {
         {
             let mut state = self.lock();
-            if let Some((pending_gen, _)) = state.pending
-                && pending_gen == generation
+            if let Some(pending) = &state.pending
+                && pending.generation == generation
             {
                 state.pending = None;
             }
@@ -432,8 +827,8 @@ impl EffortBridge {
     pub(crate) fn fail(&self, generation: u64) {
         {
             let mut state = self.lock();
-            if let Some((pending_gen, _)) = state.pending
-                && pending_gen == generation
+            if let Some(pending) = &state.pending
+                && pending.generation == generation
             {
                 state.pending = None;
             }
@@ -486,8 +881,30 @@ pub(crate) trait EffortSwitchIo: Send + Sync {
     /// Current visible screen text, ANSI stripped.
     async fn screen_text(&self) -> crate::DriverResult<String>;
 
+    /// c-effortread r15 item 4, r16 items 1/3: submission provenance captured
+    /// immediately BEFORE the command is typed. A verified [`Floor`] is the
+    /// bound transcript's EOF (the command's own slash is appended starting at
+    /// that offset); [`Unavailable`] means the carrier could not verify a
+    /// floor, in which case the mapper attributes no slash record to this
+    /// switch and it ends through its bounded no-readback path. Production
+    /// carriers always implement this; the test mock defaults to
+    /// [`Unavailable`] (it resolves the bridge directly, never via the mapper).
+    ///
+    /// [`Floor`]: SubmissionProvenance::Floor
+    /// [`Unavailable`]: SubmissionProvenance::Unavailable
+    async fn submission_floor(&self) -> SubmissionProvenance {
+        SubmissionProvenance::Unavailable
+    }
+
     /// Journal an `instance.configure` effort lifecycle from the worker.
-    async fn journal(&self, status: String, severity: Severity);
+    ///
+    /// Distinctly named (not `journal`) because the same IO adapters also
+    /// implement the model/permission switch traits' `journal`.
+    ///
+    /// `request_id` is the configure's per-request id (c-effortread r10): it
+    /// is echoed on the lifecycle's related-ids so the web can bind the edge
+    /// to the exact switch; `None` for an id-less legacy configure.
+    async fn journal_effort(&self, status: String, severity: Severity, request_id: Option<String>);
 }
 
 /// Type the slash command, clear the confirmation dialog Claude opens for a
@@ -525,9 +942,17 @@ pub(crate) async fn perform_switch(
 ) -> SwitchOutcome {
     let word = request.command_word();
     let target = request.dialog_target_word();
-    // Arm before typing so the mapper correlates the slash record the command
-    // produces with this generation.
-    let generation = bridge.arm(request);
+    let request_id = request.request_id.clone();
+    // Capture the transcript EOF and arm BEFORE typing, so the mapper
+    // correlates only a slash record produced AT OR AFTER this instant with
+    // this generation (c-effortread r15 item 4, r16 item 1): the command's own
+    // record is appended starting exactly at this offset; an older same-word
+    // slash still unread by the pump when this request was armed starts below
+    // it and can never claim it. When the carrier cannot verify a floor the
+    // mapper attributes NOTHING and the switch ends on its bounded read-back
+    // wait (c-effortread r16 item 3).
+    let submit_floor = Some(io.submission_floor().await);
+    let generation = bridge.arm_with_floor(request.clone(), submit_floor);
 
     // Snapshot before typing: a dialog the previous switch left rendered is
     // stale and must not receive this switch's Enter.
@@ -537,9 +962,10 @@ pub(crate) async fn perform_switch(
     if let Err(error) = io.type_body(&request.command_body()).await {
         tracing::warn!(%error, "effort switch: body write failed");
         bridge.fail(generation);
-        io.journal(
+        io.journal_effort(
             SwitchOutcome::ControlUnavailable.journal_status(word, &error.to_string()),
             Severity::Error,
+            request_id.clone(),
         )
         .await;
         return SwitchOutcome::ControlUnavailable;
@@ -548,9 +974,10 @@ pub(crate) async fn perform_switch(
     if let Err(error) = io.press_enter().await {
         tracing::warn!(%error, "effort switch: submit write failed");
         bridge.fail(generation);
-        io.journal(
+        io.journal_effort(
             SwitchOutcome::ControlUnavailable.journal_status(word, &error.to_string()),
             Severity::Error,
+            request_id.clone(),
         )
         .await;
         return SwitchOutcome::ControlUnavailable;
@@ -668,9 +1095,10 @@ pub(crate) async fn perform_switch(
             // The dialog was dismissed (Esc) or the argument rejected. The
             // effective level never changed; the UI reverts on this lifecycle.
             bridge.fail(generation);
-            io.journal(
+            io.journal_effort(
                 SwitchOutcome::Degraded.journal_status(word, &reason),
                 Severity::Warning,
+                request_id.clone(),
             )
             .await;
             SwitchOutcome::Degraded
@@ -679,9 +1107,10 @@ pub(crate) async fn perform_switch(
             // Never claim applied without a verdict. A switch the user does
             // nothing after simply has no command record to read.
             bridge.fail(generation);
-            io.journal(
+            io.journal_effort(
                 SwitchOutcome::Degraded.journal_status(word, "no-readback-within-window"),
                 Severity::Warning,
+                request_id.clone(),
             )
             .await;
             SwitchOutcome::Degraded
@@ -710,14 +1139,46 @@ fn screen_names_target(screen_lowercased: &str, tier: &str) -> bool {
 /// A switch held for the next idle moment (D-028 §9.1 ready ladder).
 struct QueuedSwitch {
     request: EffortRequest,
+    /// Global enqueue order; the worker drains the two axis slots FIFO.
+    seq: u64,
     /// When present the caller is awaiting the outcome (idle fast path); when
     /// absent the worker journals the terminal status itself (working path).
     done: Option<oneshot::Sender<SwitchOutcome>>,
 }
 
-/// Queue of at most one pending switch (a newer switch replaces an older one).
+/// Which native axis one operation moves. On decoupled builds the orthogonal
+/// toggle is its own command; a level word (and the coupled bare `ultracode`)
+/// moves the tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuedAxis {
+    Tier,
+    Flag,
+}
+
+impl EffortRequest {
+    /// The native axis queuing must keep a separate slot for (c-effortread
+    /// r10 item 4).
+    fn queued_axis(&self) -> QueuedAxis {
+        match self.word {
+            "ultracode on" | "ultracode off" => QueuedAxis::Flag,
+            // Plain level words and the coupled bare `ultracode` (which IS the
+            // xhigh level command) move the tier.
+            _ => QueuedAxis::Tier,
+        }
+    }
+}
+
+/// Pending switches kept PER AXIS (c-effortread r10 item 4).
+///
+/// Selecting max (tier) and then ultracode ON (flag) while the agent is busy
+/// enqueues TWO operations: a newer op replaces only an older op on the SAME
+/// axis, and the worker executes every needed native command, each with its
+/// own read-back. Neither operation can be lost (the old queue had one slot,
+/// so the second enqueue overwrote the first).
 pub(crate) struct EffortQueue {
-    pending: Mutex<Option<QueuedSwitch>>,
+    tier: Mutex<Option<QueuedSwitch>>,
+    flag: Mutex<Option<QueuedSwitch>>,
+    enqueue_seq: std::sync::atomic::AtomicU64,
     notify: Notify,
     closed: AtomicBool,
 }
@@ -725,27 +1186,63 @@ pub(crate) struct EffortQueue {
 impl EffortQueue {
     pub(crate) fn new() -> Self {
         Self {
-            pending: Mutex::new(None),
+            tier: Mutex::new(None),
+            flag: Mutex::new(None),
+            enqueue_seq: std::sync::atomic::AtomicU64::new(0),
             notify: Notify::new(),
             closed: AtomicBool::new(false),
         }
     }
 
-    /// Queue a switch. `done` is handed back when it has been applied.
+    fn slot(&self, axis: QueuedAxis) -> &Mutex<Option<QueuedSwitch>> {
+        match axis {
+            QueuedAxis::Tier => &self.tier,
+            QueuedAxis::Flag => &self.flag,
+        }
+    }
+
+    /// Queue a switch on its axis slot. A newer op on the SAME axis replaces
+    /// the older one (its waiter, if any, is told `Queued`); an op on the
+    /// other axis is kept and also executed.
     pub(crate) fn enqueue(
         &self,
         request: EffortRequest,
         done: Option<oneshot::Sender<SwitchOutcome>>,
     ) {
-        if let Ok(mut pending) = self.pending.lock() {
-            *pending = Some(QueuedSwitch { request, done });
+        let seq = self.enqueue_seq.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        if let Ok(mut slot) = self.slot(request.queued_axis()).lock()
+            && let Some(previous) = slot.replace(QueuedSwitch { request, seq, done })
+            && let Some(previous_done) = previous.done
+        {
+            // The replaced operation never goes out; report it still
+            // queued so its idle fast-path caller never awaits a verdict
+            // that belongs to a dead generation.
+            let _ = previous_done.send(SwitchOutcome::Queued);
         }
         self.notify.notify_one();
     }
 
-    /// Take the queued switch, if any.
-    fn take(&self) -> Option<QueuedSwitch> {
-        self.pending.lock().ok().and_then(|mut guard| guard.take())
+    /// Take the oldest pending switch across BOTH axis slots (FIFO).
+    fn take_oldest(&self) -> Option<QueuedSwitch> {
+        // Lock the two slots in a fixed order (no await is held across either).
+        let mut tier = self.tier.lock().ok()?;
+        let mut flag = self.flag.lock().ok()?;
+        let take_tier = match (&*tier, &*flag) {
+            (Some(t), Some(f)) => t.seq <= f.seq,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return None,
+        };
+        if take_tier { tier.take() } else { flag.take() }
+    }
+
+    /// Whether a NEWER operation already replaced the dequeued `seq` on its
+    /// axis (the worker only discovers this while waiting out a running turn).
+    fn same_axis_was_replaced(&self, axis: QueuedAxis, seq: u64) -> bool {
+        self.slot(axis)
+            .lock()
+            .map(|slot| slot.as_ref().is_some_and(|queued| queued.seq > seq))
+            .unwrap_or(false)
     }
 
     pub(crate) fn close(&self) {
@@ -760,7 +1257,8 @@ impl EffortQueue {
 /// single serialization point; its `oneshot` carries the outcome straight
 /// back, so no final lifecycle is journaled. The working path journaled
 /// `queued` at enqueue time and gets its terminal `applied` / `degraded`
-/// lifecycle from this worker.
+/// lifecycle from this worker. Both axis slots are drained FIFO, so a tier
+/// move and a flag toggle queued together are BOTH typed and read back.
 pub(crate) fn spawn_worker(
     bridge: Arc<EffortBridge>,
     queue: Arc<EffortQueue>,
@@ -770,13 +1268,16 @@ pub(crate) fn spawn_worker(
         while !queue.closed.load(AtomicOrdering::SeqCst) {
             // Arm the waiter before checking, so an enqueue cannot be missed.
             let notified = queue.notify.notified();
-            let queued = queue.take();
-            match queued {
-                Some(QueuedSwitch { request, done }) => {
+            match queue.take_oldest() {
+                Some(QueuedSwitch { request, seq, done }) => {
                     let word = request.command_word();
+                    let request_id = request.request_id.clone();
+                    let axis = request.queued_axis();
                     // Wait out a running turn on the ready ladder. A newer
-                    // switch arriving meanwhile replaces this one, which never
-                    // goes out and is reported back as still `queued`.
+                    // switch arriving on the SAME axis meanwhile replaces
+                    // this one, which never goes out and is reported back as
+                    // still `queued`; a switch on the OTHER axis sits in its
+                    // own slot and runs next.
                     let mut replaced = false;
                     while !io.is_idle().await {
                         if queue.closed.load(AtomicOrdering::SeqCst) {
@@ -786,18 +1287,17 @@ pub(crate) fn spawn_worker(
                             EFFORT_READBACK_POLL_MS,
                         ))
                         .await;
-                        if queue.pending.lock().map(|p| p.is_some()).unwrap_or(false) {
+                        if queue.same_axis_was_replaced(axis, seq) {
                             replaced = true;
                             break;
                         }
                     }
-                    if replaced || queue.pending.lock().map(|p| p.is_some()).unwrap_or(false) {
-                        // The enqueue's notify_one was consumed by us; wake the
-                        // outer iteration for the replacement explicitly.
-                        queue.notify.notify_one();
+                    if replaced {
                         if let Some(done) = done {
                             let _ = done.send(SwitchOutcome::Queued);
                         }
+                        // The replacement sits in its axis slot; the next
+                        // iteration takes it (and any other-axis operation).
                         continue;
                     }
                     let outcome = perform_switch(request, &bridge, io.as_ref()).await;
@@ -812,7 +1312,12 @@ pub(crate) fn spawn_worker(
                                 SwitchOutcome::Degraded => Severity::Warning,
                                 SwitchOutcome::ControlUnavailable => Severity::Error,
                             };
-                            io.journal(outcome.journal_status(word, ""), severity).await;
+                            io.journal_effort(
+                                outcome.journal_status(word, ""),
+                                severity,
+                                request_id,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -872,6 +1377,64 @@ mod argv_tests {
                 Err(DriverError::InvalidLaunchSpec(_))
             ));
         }
+    }
+
+    #[test]
+    fn launch_ultracode_version_gate_refuses_below_the_floor_or_unknown() {
+        // D-056 (2): only 2.1.203–2.1.283 (coupled) and >=2.1.284 (decoupled)
+        // pinned builds accept the ultracode flag at launch.
+        let on = Some(sel(EffortName::Xhigh, true));
+        for version in [
+            "2.1.289",
+            "2.1.289 (Claude Code)",
+            "2.1.284",
+            "2.1.283",
+            "2.1.277",
+        ] {
+            assert!(
+                ensure_claude_ultracode_version(version, on).is_ok(),
+                "{version} supports ultracode"
+            );
+        }
+        for version in ["2.1.202", "2.1.180", "stub", "", "unpinned"] {
+            assert!(
+                matches!(
+                    ensure_claude_ultracode_version(version, on),
+                    Err(DriverError::InvalidLaunchSpec(_))
+                ),
+                "{version:?} must refuse ultracode"
+            );
+        }
+        // Plain levels are never gated, even below the floor.
+        for version in ["2.1.180", "stub", ""] {
+            assert!(
+                ensure_claude_ultracode_version(version, Some(sel(EffortName::High, false)))
+                    .is_ok(),
+                "plain high on {version:?} must launch"
+            );
+        }
+        assert!(ensure_claude_ultracode_version("2.1.180", None).is_ok());
+    }
+
+    #[test]
+    fn launch_provenance_never_panics_on_non_claude_words() {
+        // c-effortread r2: from_selection runs after the child has been
+        // spawned for a shell-pty launch, which can target any harness. A
+        // codex `ultra` launch (and a legacy `minimal`) used to panic here and
+        // orphan the spawned child.
+        let ultra = EffortRequest::from_selection(sel(EffortName::Ultra, false));
+        assert_eq!(ultra.name, EffortName::Ultra);
+        assert!(!ultra.ultracode);
+        assert_eq!(ultra.word, "ultra");
+        let minimal = EffortRequest::from_selection(sel(EffortName::Minimal, false));
+        assert_eq!(minimal.name, EffortName::Minimal);
+        assert_eq!(minimal.word, "minimal");
+        let flag = EffortRequest::from_selection(sel(EffortName::Xhigh, true));
+        assert_eq!(flag.name, EffortName::Xhigh);
+        assert!(flag.ultracode);
+        assert_eq!(flag.word, "ultracode");
+        let plain = EffortRequest::from_selection(sel(EffortName::Max, false));
+        assert_eq!(plain.word, "max");
     }
 
     #[test]
@@ -962,11 +1525,633 @@ mod sync_tests {
         ] {
             let request = EffortRequest::from_level(level).expect(level);
             assert_eq!(request.command_body(), word);
-            assert_eq!(request.observed_name(), observed);
+            assert_eq!(request.name, observed);
+        }
+        for (word, body) in [
+            ("ultracode on", "/effort ultracode on"),
+            ("ultracode off", "/effort ultracode off"),
+        ] {
+            let request = EffortRequest::from_level(word).expect(word);
+            assert_eq!(request.command_body(), body);
         }
         assert!(EffortRequest::from_level("bogus").is_none());
         assert!(EffortRequest::from_level("auto").is_none());
         assert!(EffortRequest::from_level("ultra").is_none());
+    }
+
+    #[test]
+    fn flag_toggles_await_no_level_when_decoupled() {
+        use remuda_protocol::EffortSemantics::{Coupled, Decoupled};
+        // Levels await in both eras.
+        let high = EffortRequest::from_level("high").unwrap();
+        assert_eq!(high.awaits_level(Decoupled), Some(EffortName::High));
+        assert_eq!(high.awaits_level(Coupled), Some(EffortName::High));
+        // The bare word awaits xhigh only on coupled builds.
+        let bare = EffortRequest::from_level("ultracode").unwrap();
+        assert_eq!(bare.awaits_level(Coupled), Some(EffortName::Xhigh));
+        assert_eq!(bare.awaits_level(Decoupled), None);
+        // Explicit on/off never await a level.
+        assert_eq!(
+            EffortRequest::from_level("ultracode on")
+                .unwrap()
+                .awaits_level(Decoupled),
+            None
+        );
+        assert_eq!(
+            EffortRequest::from_level("ultracode off")
+                .unwrap()
+                .awaits_level(Decoupled),
+            None
+        );
+    }
+
+    #[test]
+    fn live_configure_picks_the_command_word_for_each_gate() {
+        use remuda_protocol::EffortAxis::{Flag, Tier};
+        use remuda_protocol::EffortSemantics::{Coupled, Decoupled, Unknown};
+
+        // Coupled: {xhigh,true} is the single bare word regardless of axis.
+        let coupled_on =
+            EffortRequest::for_configure("xhigh", Some(true), None, Coupled, None, None, None)
+                .unwrap();
+        assert_eq!(coupled_on.command_word(), "ultracode");
+        assert_eq!(coupled_on.name, EffortName::Xhigh);
+        // Coupled: a plain level never gains the flag, even with a stale true.
+        let coupled_level =
+            EffortRequest::for_configure("max", Some(false), None, Coupled, None, None, None)
+                .unwrap();
+        assert_eq!(coupled_level.command_word(), "max");
+
+        // Decoupled, no provenance, LEGACY client (no axis): flag-off posts the
+        // plain level word; a cold flag-ON is ambiguous and is REFUSED rather
+        // than substituted to a different (tier) command (c-effortread r9
+        // item 6).
+        let cold =
+            EffortRequest::for_configure("high", Some(false), None, Decoupled, None, None, None)
+                .unwrap();
+        assert_eq!(cold.command_word(), "high");
+        assert!(
+            EffortRequest::for_configure("high", Some(true), None, Decoupled, None, None, None)
+                .is_none(),
+            "a cold legacy flag-on is ambiguous and is refused, never a level word"
+        );
+
+        // Decoupled, explicit FLAG axis at a cold start: execute EXACTLY the
+        // toggle — no provenance needed because the client stated the intent.
+        let cold_flag_on = EffortRequest::for_configure(
+            "high",
+            Some(true),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cold_flag_on.command_word(), "ultracode on");
+        assert_eq!(cold_flag_on.name, EffortName::High);
+        let cold_flag_off = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cold_flag_off.command_word(), "ultracode off");
+        assert_eq!(cold_flag_off.name, EffortName::High);
+
+        // Explicit TIER axis is a plain level move even with the flag riding
+        // along from a different observed tier.
+        let obs_high_on = ObservedSelection {
+            name: EffortName::High,
+            ultracode: Some(true),
+        };
+        let drag = EffortRequest::for_configure(
+            "max",
+            Some(true),
+            Some(Tier),
+            Decoupled,
+            Some(obs_high_on),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(drag.command_word(), "max");
+        assert_eq!(drag.name, EffortName::Max);
+
+        // Decoupled, same tier as the OBSERVED selection, LEGACY client: the
+        // flag toggles on the proven word for either direction.
+        let obs_high_off = ObservedSelection {
+            name: EffortName::High,
+            ultracode: Some(false),
+        };
+        let on = EffortRequest::for_configure(
+            "high",
+            Some(true),
+            None,
+            Decoupled,
+            Some(obs_high_off),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(on.command_word(), "ultracode on");
+        assert_eq!(
+            on.name,
+            EffortName::High,
+            "the flag toggle keeps the real tier"
+        );
+        let obs_high_on = ObservedSelection {
+            name: EffortName::High,
+            ultracode: Some(true),
+        };
+        let off = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            None,
+            Decoupled,
+            Some(obs_high_on),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(off.command_word(), "ultracode off");
+        assert_eq!(off.name, EffortName::High);
+
+        // Unknown gate: only levels are produced; a flag-on is refused.
+        assert_eq!(
+            EffortRequest::for_configure("xhigh", Some(false), None, Unknown, None, None, None)
+                .unwrap()
+                .command_word(),
+            "xhigh"
+        );
+        assert!(
+            EffortRequest::for_configure("high", Some(true), Some(Flag), Unknown, None, None, None)
+                .is_none(),
+            "an unsupported build refuses the flag even with explicit intent"
+        );
+        assert!(
+            EffortRequest::for_configure("bogus", None, None, Coupled, None, None, None).is_none()
+        );
+    }
+
+    /// c-effortread r11 item 5: an explicit `axis: Flag` with a MISSING
+    /// boolean (`ultracode` None) must be refused at the classifier boundary —
+    /// even on a decoupled build and even when provenance says the flag is ON
+    /// (the old classifier read None as false and typed `/effort ultracode
+    /// off`, switching a flag it was never told to switch). Only an explicit
+    /// `true`/`false` produces the toggle word.
+    #[test]
+    fn r11_item5_explicit_flag_axis_requires_an_explicit_boolean() {
+        use remuda_protocol::EffortAxis::Flag;
+        use remuda_protocol::EffortSemantics::Decoupled;
+        let proven_on = Some(ObservedSelection {
+            name: EffortName::High,
+            ultracode: Some(true),
+        });
+        for proven in [None, proven_on] {
+            assert!(
+                EffortRequest::for_configure(
+                    "high",
+                    None,
+                    Some(Flag),
+                    Decoupled,
+                    proven,
+                    None,
+                    Some("effreq_missing"),
+                )
+                .is_none(),
+                "axis=flag with ultracode None is refused, proven={proven:?}"
+            );
+        }
+        // An explicit false is still the exact OFF toggle (and carries the
+        // request id); an explicit true is ON.
+        let off = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            Some("effreq_off"),
+        )
+        .expect("an explicit boolean authorizes the flag toggle");
+        assert_eq!(off.command_word(), "ultracode off");
+        assert!(!off.ultracode);
+        assert_eq!(off.request_id.as_deref(), Some("effreq_off"));
+        let on = EffortRequest::for_configure(
+            "high",
+            Some(true),
+            Some(Flag),
+            Decoupled,
+            None,
+            None,
+            Some("effreq_on"),
+        )
+        .expect("an explicit true types ultracode on");
+        assert_eq!(on.command_word(), "ultracode on");
+        assert!(on.ultracode);
+    }
+
+    /// c-effortread r12 item 4: the explicit-boolean gate for a FLAG axis runs
+    /// BEFORE the semantics dispatch. On a coupled CLI (2.1.273, flag ON at
+    /// xhigh) the r11 gate only covered decoupled builds, so a missing
+    /// boolean (`{"name":"high","axis":"flag"}` — the node maps an absent OR
+    /// non-boolean JSON value to None) fell through and typed `/effort high`;
+    /// an explicit flag-OFF was substituted with a level move too. Only flag-ON
+    /// maps to the one coupled bare word; every other flag op is refused.
+    #[test]
+    fn r12_item4_coupled_flag_operations_are_validated_before_semantics() {
+        use remuda_protocol::EffortAxis::{Flag, Tier};
+        use remuda_protocol::EffortSemantics::{Coupled, Decoupled, Unknown};
+
+        // The headline regression: axis=flag with NO boolean on a coupled
+        // build is refused, not executed as `/effort high`.
+        assert!(
+            EffortRequest::for_configure(
+                "high",
+                None,
+                Some(Flag),
+                Coupled,
+                None,
+                None,
+                Some("effreq_missing_coupled"),
+            )
+            .is_none(),
+            "coupled axis=flag with ultracode None must not type a level"
+        );
+        // Explicit flag-ON is the one bare coupled word (xhigh + flag), even
+        // with the explicit axis.
+        let on = EffortRequest::for_configure(
+            "xhigh",
+            Some(true),
+            Some(Flag),
+            Coupled,
+            None,
+            None,
+            Some("effreq_on_coupled"),
+        )
+        .expect("coupled flag-on is the bare ultracode word");
+        assert_eq!(on.command_word(), "ultracode");
+        assert_eq!(on.name, EffortName::Xhigh);
+        assert_eq!(on.request_id.as_deref(), Some("effreq_on_coupled"));
+        // Explicit flag-OFF is NOT expressible as a flag operation on coupled
+        // builds (the web sends that intent as a TIER move): refuse, never a
+        // substituted `/effort high`.
+        assert!(
+            EffortRequest::for_configure(
+                "high",
+                Some(false),
+                Some(Flag),
+                Coupled,
+                None,
+                None,
+                Some("effreq_off_coupled"),
+            )
+            .is_none(),
+            "coupled flag-off is an unsupported flag operation, not a level word"
+        );
+        // The same missing-boolean request on an unknown/legacy build is
+        // refused as well.
+        assert!(
+            EffortRequest::for_configure("high", None, Some(Flag), Unknown, None, None, None)
+                .is_none()
+        );
+        // And explicit flag-OFF on legacy builds no longer falls through to
+        // the plain-level fallback.
+        assert!(
+            EffortRequest::for_configure(
+                "high",
+                Some(false),
+                Some(Flag),
+                Unknown,
+                None,
+                None,
+                None
+            )
+            .is_none(),
+            "an unsupported build refuses flag-off with explicit intent"
+        );
+        // Decoupled behaviour is unchanged by the earlier gate: missing
+        // boolean refused, explicit on/off exact toggles, explicit tier a
+        // plain level.
+        assert!(
+            EffortRequest::for_configure("high", None, Some(Flag), Decoupled, None, None, None)
+                .is_none()
+        );
+        assert_eq!(
+            EffortRequest::for_configure(
+                "high",
+                Some(false),
+                Some(Flag),
+                Decoupled,
+                None,
+                None,
+                None
+            )
+            .unwrap()
+            .command_word(),
+            "ultracode off"
+        );
+        assert_eq!(
+            EffortRequest::for_configure("max", None, Some(Tier), Coupled, None, None, None)
+                .unwrap()
+                .command_word(),
+            "max",
+            "an explicit tier axis still produces the plain level on coupled builds"
+        );
+    }
+
+    /// c-effortui r4 item 2 trigger A: Remuda drags high→max; the USER then
+    /// types `/effort max` in the terminal (observed becomes {max,false}),
+    /// after which Remuda drags BACK to high posting {high,false}. Against
+    /// stale requested "high" that looked like a same-tier toggle; against the
+    /// OBSERVED {max} it is a tier move → plain `/effort high`, never
+    /// `ultracode off`.
+    #[test]
+    fn r4_trigger_a_terminal_max_then_remuda_drag_back_to_high_is_a_level_word() {
+        use remuda_protocol::EffortSemantics::Decoupled;
+        let observed = ObservedSelection {
+            name: EffortName::Max,
+            ultracode: Some(false),
+        };
+        let req = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            None,
+            Decoupled,
+            Some(observed),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.command_word(), "high");
+        assert_eq!(req.name, EffortName::High);
+        assert!(!req.ultracode);
+    }
+
+    /// c-effortui r4 item 2 trigger B: an unpinned decoupled launch with the
+    /// flag already on, then a drag to max posts {max,true}. With no
+    /// read-back yet the observed slot is None; the launch-requested
+    /// provenance is a DIFFERENT tier (high), so this is a tier move, not the
+    /// cold-start toggle → plain `/effort max` (flag stays on, untouched),
+    /// never `ultracode on`.
+    #[test]
+    fn r4_trigger_b_unpinned_flag_on_launch_drag_to_max_is_a_level_word() {
+        use remuda_protocol::EffortSemantics::Decoupled;
+        // Simulate the caller fallback: observed None, requested {high,true}.
+        let requested = EffortSelection {
+            name: EffortName::High,
+            ultracode: true,
+        };
+        let req = EffortRequest::for_configure(
+            "max",
+            Some(true),
+            Some(remuda_protocol::EffortAxis::Tier),
+            Decoupled,
+            None,
+            Some(requested),
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.command_word(), "max");
+        assert_eq!(req.name, EffortName::Max);
+    }
+
+    /// c-effortui r4 item 2 trigger C: observed high with flag on; the live
+    /// terminal is actually at max (a tier moved terminal-side but the
+    /// observed record is stale high). User flips the switch on posting
+    /// {max,true}: different tier → plain `/effort max` is correct HERE, but
+    /// this test pins that observed-high NEVER produces a toggle for a max
+    /// request (the real fix is read-back freshness: observed updates from
+    /// every edge, so once max is observed the toggle target is max).
+    #[test]
+    fn r4_trigger_c_flag_on_at_a_different_observed_tier_is_a_level_word() {
+        use remuda_protocol::EffortSemantics::Decoupled;
+        let observed = ObservedSelection {
+            name: EffortName::High,
+            ultracode: Some(false),
+        };
+        let req = EffortRequest::for_configure(
+            "max",
+            Some(true),
+            Some(remuda_protocol::EffortAxis::Tier),
+            Decoupled,
+            Some(observed),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.command_word(), "max");
+        assert_eq!(req.name, EffortName::Max);
+    }
+
+    /// c-effortread r10 item 5: a legacy TIER-ONLY request (no axis,
+    /// `ultracode` absent) on an observed `{high, flag ON}` session must be
+    /// the plain level word — never `ultracode off`. The toggle inference
+    /// fires only for an explicit boolean, and a cold flag-on with no proven
+    /// same tier is still refused.
+    #[test]
+    fn r10_item5_legacy_tier_only_request_never_infers_a_toggle_against_flag_on() {
+        use remuda_protocol::EffortSemantics::Decoupled;
+        let observed_on = ObservedSelection {
+            name: EffortName::High,
+            ultracode: Some(true),
+        };
+        // {name:"high"} with ultracode None at the same tier the flag is on:
+        // plain `/effort high`, flag left untouched.
+        let req = EffortRequest::for_configure(
+            "high",
+            None,
+            None,
+            Decoupled,
+            Some(observed_on),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.command_word(), "high", "tier-only is never a toggle");
+        assert_eq!(req.name, EffortName::High);
+        assert!(!req.ultracode);
+
+        // Another tier (max) with no boolean is the level word too.
+        let req = EffortRequest::for_configure(
+            "max",
+            None,
+            None,
+            Decoupled,
+            Some(observed_on),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.command_word(), "max");
+
+        // The request id still rides the plain level command.
+        let req = EffortRequest::for_configure(
+            "high",
+            None,
+            None,
+            Decoupled,
+            Some(observed_on),
+            None,
+            Some("req-42"),
+        )
+        .unwrap();
+        assert_eq!(req.request_id.as_deref(), Some("req-42"));
+
+        // An explicit boolean still drives the toggle on same-tier provenance…
+        let off = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            None,
+            Decoupled,
+            Some(observed_on),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(off.command_word(), "ultracode off");
+        // …and a cold explicit flag-ON with no proven same tier is rejected.
+        assert!(
+            EffortRequest::for_configure("max", Some(true), None, Decoupled, None, None, None)
+                .is_none(),
+            "the remaining ambiguous request (cold flag-on, no provenance) is refused"
+        );
+    }
+
+    /// c-effortui r4 item 2: the bridge records observed selections from
+    /// mapper read-back, and observed wins over requested when both exist.
+    #[test]
+    fn r4_bridge_observed_outranks_requested_for_classification() {
+        use remuda_protocol::EffortSemantics::Decoupled;
+        let bridge = EffortBridge::new();
+        bridge.note_launch_request(EffortRequest::from_selection(EffortSelection {
+            name: EffortName::High,
+            ultracode: false,
+        }));
+        // A terminal /effort max settles read-back at {max,false}.
+        bridge.note_observed(remuda_protocol::ObservedEffort {
+            name: EffortName::Max,
+            ultracode: Some(false),
+        });
+        let observed = bridge.proven_selection().expect("observed recorded");
+        assert_eq!(observed.name, EffortName::Max);
+        // A subsequent {high,false} configure is a tier move vs the observed
+        // max even though the launch requested was high.
+        let req = EffortRequest::for_configure(
+            "high",
+            Some(false),
+            None,
+            Decoupled,
+            Some(observed),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.command_word(), "high");
+    }
+
+    /// c-effortui r5 item 1: classify_provenance observes read-back first and
+    /// falls back to the launch REQUESTED selection; proven_selection on the
+    /// bridge returns the same. With neither, a flag-on configure is a plain
+    /// level (no cold toggle guess).
+    #[test]
+    fn r5_provenance_observed_first_then_requested_and_no_cold_toggle() {
+        use remuda_protocol::EffortSemantics::Decoupled;
+        let requested = EffortSelection {
+            name: EffortName::High,
+            ultracode: false,
+        };
+        // Observed wins.
+        let observed = ObservedSelection {
+            name: EffortName::Max,
+            ultracode: Some(true),
+        };
+        let proven =
+            EffortRequest::classify_provenance(Some(observed), Some(requested)).expect("proven");
+        assert_eq!(proven.name, EffortName::Max);
+        assert_eq!(proven.ultracode, Some(true));
+        // Requested fallback.
+        let proven = EffortRequest::classify_provenance(
+            None,
+            Some(EffortSelection {
+                name: EffortName::High,
+                ultracode: true,
+            }),
+        )
+        .expect("requested fallback");
+        assert_eq!(proven.name, EffortName::High);
+        assert_eq!(proven.ultracode, Some(true));
+        // Neither → None.
+        assert!(EffortRequest::classify_provenance(None, None).is_none());
+        // The bridge exposes the same choice.
+        let bridge = EffortBridge::new();
+        bridge.note_launch_request(EffortRequest::from_selection(EffortSelection {
+            name: EffortName::High,
+            ultracode: false,
+        }));
+        assert_eq!(
+            bridge.proven_selection().map(|s| s.name),
+            Some(EffortName::High),
+            "requested is the provenance before read-back"
+        );
+        bridge.note_observed(remuda_protocol::ObservedEffort {
+            name: EffortName::Max,
+            ultracode: Some(false),
+        });
+        assert_eq!(
+            bridge.proven_selection().map(|s| s.name),
+            Some(EffortName::Max),
+            "observed replaces requested"
+        );
+        // A same-tier flag flip with REQUESTED high,false (LEGACY client, no
+        // axis) types the toggle because the provenance matches.
+        let on = EffortRequest::for_configure(
+            "high",
+            Some(true),
+            None,
+            Decoupled,
+            None,
+            Some(EffortSelection {
+                name: EffortName::High,
+                ultracode: false,
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(on.command_word(), "ultracode on");
+        // True cold start (no observed, no requested): an explicit FLAG axis
+        // executes the toggle exactly, while a LEGACY client's cold flag-ON is
+        // ambiguous and REFUSED (never substituted to the level word); flag-off
+        // and a plain level still type the level word.
+        assert_eq!(
+            EffortRequest::for_configure(
+                "high",
+                Some(true),
+                Some(remuda_protocol::EffortAxis::Flag),
+                Decoupled,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .command_word(),
+            "ultracode on"
+        );
+        assert!(
+            EffortRequest::for_configure("high", Some(true), None, Decoupled, None, None, None)
+                .is_none()
+        );
+        assert_eq!(
+            EffortRequest::for_configure("high", Some(false), None, Decoupled, None, None, None)
+                .unwrap()
+                .command_word(),
+            "high"
+        );
     }
 
     #[tokio::test]
@@ -1048,6 +2233,9 @@ mod switch_tests {
         bridge: Mutex<Option<Arc<EffortBridge>>>,
         /// Resolve the read-back once this many writes have happened.
         resolve_after: usize,
+        /// c-effortread r15 item 5: make `type_body` fail (write never lands),
+        /// so `perform_switch` records `fail` on the armed generation.
+        fail_body: AtomicBool,
         /// Reject the pending generation (with `invalid-argument`) the first
         /// time a screen containing the invalid marker is observed.
         reject_on_invalid: bool,
@@ -1076,12 +2264,20 @@ mod switch_tests {
             if self.resolve_after != 0
                 && n >= self.resolve_after
                 && let Some(bridge) = self.bridge.lock().unwrap().clone()
-                && let Some((generation, request)) = bridge.pending_with_gen()
+                && let Some(PendingSwitch {
+                    generation,
+                    request,
+                    submit_floor: _,
+                }) = bridge.pending_with_gen()
             {
                 bridge.resolve(
                     generation,
                     remuda_protocol::ObservedEffort {
-                        name: request.observed_name(),
+                        // These mock switches model the coupled (2.1.272)
+                        // dialog behaviour the switch tests exercise.
+                        name: request
+                            .awaits_level(remuda_protocol::EffortSemantics::Coupled)
+                            .unwrap_or(request.name),
                         ultracode: None,
                     },
                 );
@@ -1092,7 +2288,7 @@ mod switch_tests {
                 && screen.contains(INVALID_MARKER)
                 && !self.invalid_rejected.swap(true, Ordering::SeqCst)
                 && let Some(bridge) = self.bridge.lock().unwrap().clone()
-                && let Some((generation, _)) = bridge.pending_with_gen()
+                && let Some(PendingSwitch { generation, .. }) = bridge.pending_with_gen()
             {
                 bridge.reject(generation, "invalid-argument");
             }
@@ -1105,6 +2301,9 @@ mod switch_tests {
             self.idle.load(Ordering::SeqCst)
         }
         async fn type_body(&self, body: &str) -> DriverResult<()> {
+            if self.fail_body.load(Ordering::SeqCst) {
+                return Err(crate::DriverError::ControlUnavailable);
+            }
             self.writes.lock().unwrap().push(format!("body:{body}"));
             self.maybe_resolve();
             Ok(())
@@ -1127,7 +2326,12 @@ mod switch_tests {
             self.maybe_reject_invalid(&screen.to_ascii_lowercase());
             Ok(screen)
         }
-        async fn journal(&self, status: String, severity: Severity) {
+        async fn journal_effort(
+            &self,
+            status: String,
+            severity: Severity,
+            _request_id: Option<String>,
+        ) {
             self.journals.lock().unwrap().push((status, severity));
         }
     }
@@ -1367,9 +2571,10 @@ mod switch_tests {
             Arc::clone(&io) as Arc<dyn EffortSwitchIo>,
         );
         let request = EffortRequest::from_level("xhigh").unwrap();
-        io.journal(
+        io.journal_effort(
             SwitchOutcome::Queued.journal_status("xhigh", ""),
             Severity::Info,
+            None,
         )
         .await;
         queue.enqueue(request, None);
@@ -1387,6 +2592,193 @@ mod switch_tests {
                 "cr".to_string(),
                 "cr".to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn r10_item4_tier_then_flag_while_busy_both_commands_execute_with_their_own_readback() {
+        two_axis_queued_while_busy_execute_both(
+            [
+                EffortRequest::from_level("max").unwrap(),
+                EffortRequest::from_level("ultracode on").unwrap(),
+            ],
+            ["", MAX_DIALOG, ""],
+            ["body:/effort max", "body:/effort ultracode on"],
+            ["effort-applied:max", "effort-applied:ultracode on"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn r10_item4_flag_then_tier_while_busy_both_commands_execute_with_their_own_readback() {
+        two_axis_queued_while_busy_execute_both(
+            [
+                EffortRequest::from_level("ultracode on").unwrap(),
+                EffortRequest::from_level("max").unwrap(),
+            ],
+            ["", XHIGH_DIALOG, ""],
+            ["body:/effort ultracode on", "body:/effort max"],
+            ["effort-applied:ultracode on", "effort-applied:max"],
+        )
+        .await;
+    }
+
+    /// Drive the REAL queue → worker → perform_switch production path with two
+    /// operations on DIFFERENT axes queued while the agent is busy, in either
+    /// enqueue order: the old single-slot queue lost one; per-axis slots keep
+    /// both and the worker types and journals each one with its own read-back.
+    async fn two_axis_queued_while_busy_execute_both(
+        requests: [EffortRequest; 2],
+        screens: [&str; 3],
+        expected_bodies: [&str; 2],
+        expected_journals: [&str; 2],
+    ) {
+        let bridge = Arc::new(EffortBridge::new());
+        let io = Arc::new(MockIo {
+            // Each perform_switch resolves once its dialog confirm lands; the
+            // global write counter keeps resolving the second switch too
+            // (sequential generations, own read-backs).
+            resolve_after: 3,
+            ..Default::default()
+        });
+        io.set_idle(false);
+        io.script(&screens);
+        *io.bridge.lock().unwrap() = Some(Arc::clone(&bridge));
+        let queue = Arc::new(EffortQueue::new());
+        let _worker = spawn_worker(
+            Arc::clone(&bridge),
+            Arc::clone(&queue),
+            Arc::clone(&io) as Arc<dyn EffortSwitchIo>,
+        );
+
+        // Two DIFFERENT-axis configures arrive while the turn is still
+        // running; the caller journals `queued` for each (as claude_pty does)
+        // and enqueues both, each with no done channel (working path).
+        for request in &requests {
+            io.journal_effort(
+                SwitchOutcome::Queued.journal_status(request.command_word(), ""),
+                Severity::Info,
+                request.request_id.clone(),
+            )
+            .await;
+            queue.enqueue(request.clone(), None);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            io.writes().is_empty(),
+            "neither command goes out while the agent is working"
+        );
+
+        // Idle: BOTH queued operations must run, in enqueue order.
+        io.set_idle(true);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(5_000);
+        while io
+            .journals()
+            .iter()
+            .filter(|(status, _)| {
+                expected_journals
+                    .iter()
+                    .any(|want| status.starts_with(want))
+            })
+            .count()
+            < 2
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let bodies: Vec<String> = io
+            .writes()
+            .iter()
+            .filter(|write| write.starts_with("body:"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            bodies,
+            expected_bodies
+                .iter()
+                .map(|body| (*body).to_owned())
+                .collect::<Vec<_>>(),
+            "both native commands are typed in enqueue order"
+        );
+        for want in expected_journals {
+            assert!(
+                io.journals()
+                    .iter()
+                    .any(|(status, _)| status.starts_with(want)),
+                "missing terminal journal {want}; got {:?}",
+                io.journals()
+            );
+        }
+    }
+
+    /// c-effortread r15 item 5: a live switch whose WRITE FAILS arms and then
+    /// fails a generation, but that attempted request must never become
+    /// provenance for a later LEGACY configure. Production sequence through
+    /// the real `perform_switch` seam: launch high/off → arm an explicit
+    /// max/on flag switch → body write fails (nothing was typed) → a later
+    /// legacy `{max, on}` without an axis is REFUSED rather than being
+    /// classified as `ultracode on` against the launch high tier.
+    #[tokio::test]
+    async fn r15_item5_a_failed_arm_does_not_establish_tier_for_legacy_configure() {
+        use remuda_protocol::EffortSemantics::Decoupled;
+        let bridge = Arc::new(EffortBridge::new());
+        // Valid launch provenance: high, flag off.
+        bridge.note_launch_request(EffortRequest::from_selection(EffortSelection {
+            name: EffortName::High,
+            ultracode: false,
+        }));
+
+        let io = Arc::new(MockIo {
+            fail_body: AtomicBool::new(true),
+            ..Default::default()
+        });
+        io.set_idle(true);
+        *io.bridge.lock().unwrap() = Some(Arc::clone(&bridge));
+
+        // B is an explicit flag-axis switch at max — unambiguous on its own,
+        // so the worker arms it; the write then fails and perform_switch
+        // records fail() on the generation.
+        let b = EffortRequest::for_configure(
+            "max",
+            Some(true),
+            Some(remuda_protocol::EffortAxis::Flag),
+            Decoupled,
+            bridge.proven_selection(),
+            bridge.launch_selection(),
+            Some("req-b"),
+        )
+        .expect("the explicit flag axis disambiguates B");
+        let outcome = perform_switch(b, &bridge, io.as_ref()).await;
+        assert_eq!(outcome, SwitchOutcome::ControlUnavailable);
+        assert!(!bridge.has_pending(), "the failed generation is cleared");
+        assert!(
+            io.writes().is_empty(),
+            "the failed body write means nothing reached the composer"
+        );
+
+        // The classification provenance stays the LAUNCH high/off: the failed
+        // attempt must not appear as observed-or-requested tier.
+        let proven = bridge
+            .proven_selection()
+            .expect("launch provenance remains");
+        assert_eq!(proven.name, EffortName::High);
+        assert_eq!(proven.ultracode, Some(false));
+
+        // A later LEGACY client (no axis) asking max/on cannot prove a
+        // same-tier toggle against the launch high tier: refused, no command.
+        let later = EffortRequest::for_configure(
+            "max",
+            Some(true),
+            None,
+            Decoupled,
+            bridge.proven_selection(),
+            bridge.launch_selection(),
+            Some("req-c"),
+        );
+        assert!(
+            later.is_none(),
+            "a failed arm must never make a cold flag-on look same-tier"
         );
     }
 }

@@ -371,7 +371,7 @@ test("a tall catalog list over the parked approval card caps to the strip, scrol
 
 test("distinct full ids sharing one final segment stay separate and post the full id", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
-  const instanceId = await createSession(page, "Model picker colliding-catalog");
+  const instanceId = await createSession(page, "Model picker shared-tail-collision");
   await page.reload();
   await page.getByTestId("model-effort-chip").waitFor({ timeout: 20_000 });
   await clearApprovals(page, instanceId);
@@ -456,8 +456,8 @@ test("vendor /auto ids are distinct full models: selection, pending and posting 
 
   // Case 1+2: both vendor ids listed (same-spelling and /auto vs /auto_model).
   for (const { prompt, other, current } of [
-    { prompt: "Model colliding-auto-model identity", other: "vendor-a/auto", current: "vendor-b/auto" },
-    { prompt: "Model colliding-auto-model-2 identity", other: "vendor-a/auto", current: "vendor-b/auto_model" },
+    { prompt: "Model auto-vendor-same identity", other: "vendor-a/auto", current: "vendor-b/auto" },
+    { prompt: "Model auto-vendor-spelling identity", other: "vendor-a/auto", current: "vendor-b/auto_model" },
   ] as const) {
     const instanceId = await createSession(page, prompt);
     await page.reload();
@@ -471,13 +471,21 @@ test("vendor /auto ids are distinct full models: selection, pending and posting 
     await waitForJournal(instanceId, "model-queued");
 
     await openModelList(page);
+    // The intended fixture was actually served (distinct auto labels prove the
+    // cross-spelling catalog branch ran rather than the same-spelling one).
     await expect(page.getByTestId(tid(other))).toBeVisible();
     await expect(page.getByTestId(tid(current))).toBeVisible();
-    expect(await page.getByTestId("model-option-auto").count()).toBe(0);
-    expect(page.getByTestId(tid(current))).toHaveAttribute("data-selected", "1");
-    expect(page.getByTestId(tid(other))).toHaveAttribute("data-selected", "0");
-    expect(page.getByTestId(tid(other))).toHaveAttribute("data-model-pending", "queued");
-    expect(page.getByTestId(tid(current))).toHaveAttribute("data-model-pending", "0");
+    if (current.endsWith("auto_model")) {
+      expect(await page.getByTestId("model-option-vendor-b-auto").count()).toBe(0);
+      expect(await page.getByTestId("model-option-vendor-b-auto-model").count()).toBe(1);
+    }
+    await expect(page.getByTestId("model-option-auto")).toHaveCount(0);
+    // Retrying web-first assertions: these attributes must already hold at
+    // open time (before the click), so poll them instead of one-shot reads.
+    await expect(page.getByTestId(tid(current))).toHaveAttribute("data-selected", "1");
+    await expect(page.getByTestId(tid(other))).toHaveAttribute("data-selected", "0");
+    await expect(page.getByTestId(tid(other))).toHaveAttribute("data-model-pending", "queued");
+    await expect(page.getByTestId(tid(current))).toHaveAttribute("data-model-pending", "0");
 
     // Clicking posts the exact full id.
     const request = page.waitForRequest(
@@ -492,7 +500,7 @@ test("vendor /auto ids are distinct full models: selection, pending and posting 
 
   // Case 3: catalog lists ONLY vendor-a/auto; the vendor-b read-back is an
   // unlisted running model and must be appended as its own selected row.
-  const instanceId = await createSession(page, "Model auto-append identity");
+  const instanceId = await createSession(page, "Model auto-vendor-append identity");
   await page.reload();
   await page.getByTestId("model-effort-chip").waitFor({ timeout: 20_000 });
   await clearApprovals(page, instanceId);
@@ -502,9 +510,9 @@ test("vendor /auto ids are distinct full models: selection, pending and posting 
   await expect(page.getByTestId(tid("vendor-a/auto"))).toBeVisible();
   const appended = page.getByTestId(tid("vendor-b/auto"));
   await expect(appended).toBeVisible();
-  expect(appended).toHaveAttribute("data-selected", "1");
-  expect(page.getByTestId(tid("vendor-a/auto"))).toHaveAttribute("data-selected", "0");
-  expect(await page.getByTestId("model-option-auto").count()).toBe(0);
+  await expect(appended).toHaveAttribute("data-selected", "1");
+  await expect(page.getByTestId(tid("vendor-a/auto"))).toHaveAttribute("data-selected", "0");
+  await expect(page.getByTestId("model-option-auto")).toHaveCount(0);
 });
 
 test.afterEach(async ({ page }) => {

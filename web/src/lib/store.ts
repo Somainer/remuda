@@ -2258,17 +2258,18 @@ class HubStore {
     const box = origin ?? this.outbox;
     if (this.pageIsUnloading || !box || this.outbox !== box) return;
     const epoch = readAuthEpoch();
+    const lifetime = box.lifetime;
     let flipped = false;
     try {
-      flipped = await box.casProgressRecorded(commandId, epoch);
+      flipped = await box.casProgressRecorded(commandId, epoch, lifetime);
     } catch {
       // The Hub already accepted the command, but the durable CAS write
       // failed: the GET poll is over and the journal will not replay, so
       // swallowing here would lose the acceptance for good. Keep the
       // observation pending in the outbox's bounded, lifetime-aware recovery
       // (c-reconnfu gate 29 item 2): it re-tries until the CAS commits, the
-      // row is gone/re-epoch'd, teardown, or the bounded cap.
-      box.retryAcceptedProgress(instanceId, commandId, epoch);
+      // row is gone/re-issued, teardown, or the bounded cap.
+      box.retryAcceptedProgress(instanceId, commandId, epoch, lifetime);
       return;
     }
     if (!flipped) return;
@@ -2351,18 +2352,21 @@ class HubStore {
     // previous delivery whose finishing write aborted) is stale and must not
     // be POSTed under.
     const claimToken = localId();
-    // c-reconnfu gate 28: the COMMITTED claim stamps the durable row with the
-    // issuing auth epoch (this logged-in device session, surviving reload of
-    // the same login, changed by logout/reinit). Only this write commits does
-    // the stamp exist — a failed/never-attempted claim leaves it unset.
+    // c-reconnfu gate 28/30: the COMMITTED claim stamps the durable row with
+    // the issuing auth epoch AND this outbox's page-lifetime id (the single
+    // writer for the command). The epoch survives reloads of the same login
+    // but changes on logout/reinit; the lifetime id is fresh per page. Only
+    // this write committing stamps either — a failed/never-attempted claim
+    // leaves both unset.
     const claimEpoch = readAuthEpoch();
+    const claimLifetime = box.lifetime;
     let claimed;
     try {
       claimed = await box.patch(commandId, {
         state: "inflight",
         attempts: isFreshAttempt ? current0.attempts + 1 : current0.attempts,
         lease: { owner: box.ownerId, until: Date.now() + LEASE_TTL_MS, claimToken },
-        ...(claimEpoch ? { issuerEpoch: claimEpoch } : {}),
+        ...(claimEpoch ? { issuerEpoch: claimEpoch, issuerLifetime: claimLifetime } : {}),
       });
     } catch {
       // Gate 22 item 1 (coordinator ruling): a durable mutation that COMMITTED

@@ -85,9 +85,19 @@ export type OutboxRecord = {
   /** Set when state === "inflight": the durable single-deliverer lease. */
   lease?: Lease;
   /**
+   * The OUTBOX LIFETIME (one tab/page instance) that ISSUED the command —
+   * stamped durably by the COMMITTED claim write together with
+   * {@link issuerEpoch} (c-reconnfu gate 30 single-writer ruling). Combined
+   * they identify the unique outbox that may record acceptance progress for
+   * the row: another tab or a later page instance (same auth epoch but a new
+   * lifetime id) observes the acceptance but leaves ITS OWN exhaustion alone.
+   * A failed or never-attempted claim stamps nothing.
+   */
+  issuerLifetime?: Id;
+  /**
    * Auth epoch (logged-in device session id) that ISSUED the command — stamped
    * durably by the COMMITTED claim write, surviving page reloads of the same
-   * login but changing on logout/reinit (c-reconnfu gate 28). Acceptance
+   * login but changing on logout/reinit (c-reconnfu gate 28/30). Acceptance
    * progress for the row is recorded only on an outbox whose current epoch
    * matches. A failed or never-attempted claim stamps nothing.
    */
@@ -205,18 +215,19 @@ export interface OutboxStorage {
    */
   mergeUnlessDone(commandId: Id, patch: Partial<OutboxRecord>): Promise<OutboxRecord | null>;
   /**
-   * Durable compare-and-set for acceptance progress (c-reconnfu gate 28). In
-   * ONE readwrite transaction the stored row is read and
+   * Durable compare-and-set for acceptance progress (c-reconnfu gate 28/30).
+   * In ONE readwrite transaction the stored row is read and
    * `progressRecorded` is flipped false → true ONLY when the row exists AND
-   * its {@link OutboxRecord.issuerEpoch} equals `issuerEpoch` AND the flag is
-   * not already true. Resolves true when THIS call made the flip (the caller
-   * may then clear in-memory backoff/exhaustion and reconcile), false
-   * otherwise — a missing row, a command issued by another auth epoch, or a
-   * second observation already recorded. Nothing in-memory is consulted, so
-   * the decision survives reload/cancelled-navigation/BFCache and can never
-   * record twice. A storage failure rejects.
+   * its {@link OutboxRecord.issuerEpoch} equals `issuerEpoch` AND its
+   * {@link OutboxRecord.issuerLifetime} equals `issuerLifetime` (the single
+   * writer) AND the flag is not already true. Resolves true when THIS call
+   * made the flip (the caller may then clear in-memory backoff/exhaustion
+   * and reconcile), false otherwise — a missing row, a command issued by
+   * another auth epoch/tab/page instance, or a second observation already
+   * recorded. Only the issuing outbox can win, so localStorage needs no
+   * cross-tab lease; a storage failure rejects.
    */
-  casProgressRecorded(commandId: Id, issuerEpoch: Id): Promise<boolean>;
+  casProgressRecorded(commandId: Id, issuerEpoch: Id, issuerLifetime: Id): Promise<boolean>;
   /**
    * Atomically reclaim (load-time) a row THIS context observed inflight with a
    * lease snapshot `{ owner, until }`. In ONE readwrite transaction the stored
@@ -270,17 +281,6 @@ export const CLAIM_WAKE_MAX_RETRY_MS = 5_000;
  */
 export function instanceDeliveryLockName(instanceId: Id): string {
   return `remuda-outbox-${instanceId}`;
-}
-
-/**
- * Cross-tab exclusion for ONE command's acceptance compare-and-set
- * (c-reconnfu gate 29 item 1). Distinct from the instance delivery lock so a
- * CAS taken from the delivery turn (which already holds the instance lock)
- * can never deadlock; nothing ever takes the instance lock while holding this
- * one.
- */
-function acceptanceCasLockName(commandId: Id): string {
-  return `remuda-outbox-cas-${commandId}`;
 }
 
 const IDB_NAME = "remuda-outbox";
@@ -456,11 +456,11 @@ class IdbOutboxStorage implements OutboxStorage {
 
   /**
    * Durable acceptance compare-and-set in ONE readwrite transaction (same
-   * serialization as {@link mergeUnlessDone}): get, epoch/flag check and put
-   * share `t`, so two concurrent observations of a row cannot both flip the
-   * flag — exactly one resolves true.
+   * serialization as {@link mergeUnlessDone}): get, issuer/flag check and put
+   * share `t`, so the single issuing outbox flips the flag exactly once;
+   * another epoch/tab/page instance or a repeat observation never wins.
    */
-  async casProgressRecorded(commandId: Id, issuerEpoch: Id): Promise<boolean> {
+  async casProgressRecorded(commandId: Id, issuerEpoch: Id, issuerLifetime: Id): Promise<boolean> {
     return await new Promise<boolean>((resolve, reject) => {
       const t = this.db.transaction(IDB_STORE, "readwrite");
       const store = t.objectStore(IDB_STORE);
@@ -470,6 +470,7 @@ class IdbOutboxStorage implements OutboxStorage {
         const existing = getReq.result as OutboxRecord | undefined;
         if (!existing) return; // missing: no flip
         if (existing.issuerEpoch !== issuerEpoch) return; // another auth epoch
+        if (existing.issuerLifetime !== issuerLifetime) return; // another writer
         if (existing.progressRecorded) return; // already recorded
         const marked: OutboxRecord = { ...existing, progressRecorded: true };
         store.put(marked);
@@ -646,13 +647,19 @@ class LocalStorageOutboxStorage implements OutboxStorage {
   }
 
   /**
-   * Synchronous read-check-write turn for the acceptance CAS — atomic within
-   * the supported single-tab degraded case the same way mergeUnlessDone is.
+   * Synchronous read-check-write turn for the acceptance CAS. Only the single
+   * issuing outbox (epoch AND page-lifetime match) can flip; another tab or
+   * page instance loses outright, so no cross-tab lock is needed.
    */
-  async casProgressRecorded(commandId: Id, issuerEpoch: Id): Promise<boolean> {
+  async casProgressRecorded(commandId: Id, issuerEpoch: Id, issuerLifetime: Id): Promise<boolean> {
     const recs = this.read();
     const existing = recs.find((r) => r.commandId === commandId);
-    if (!existing || existing.issuerEpoch !== issuerEpoch || existing.progressRecorded) {
+    if (
+      !existing ||
+      existing.issuerEpoch !== issuerEpoch ||
+      existing.issuerLifetime !== issuerLifetime ||
+      existing.progressRecorded
+    ) {
       return false;
     }
     const marked = { ...existing, progressRecorded: true as const };
@@ -740,6 +747,14 @@ export class Outbox {
    */
   private readonly leaseToken: Id = newCommandId();
   /**
+   * OUTBOX LIFETIME id (c-reconnfu gate 30): unique per Outbox instance /
+   * page, intentionally NOT persisted across reloads. Together with the auth
+   * epoch it identifies the single writer for a command's acceptance progress
+   * — a restored row from a previous page instance keeps its old lifetime and
+   * so never records progress on the new one (documented/accepted).
+   */
+  private readonly lifetimeId: Id = newCommandId();
+  /**
    * The SINGLE lease-wake bookkeeping (c-reconnfu gate 20): one armed wake per
    * command this document is not itself POSTing but owes recovery for.
    *
@@ -786,19 +801,21 @@ export class Outbox {
    */
   private deliveryExhausted = new Set<Id>();
   /**
-   * A pending ACCEPTANCE whose durable CAS storage write keeps failing
-   * (c-reconnfu gate 29 item 2). The Hub has already accepted the command —
-   * the only thing outstanding is flipping progressRecorded durably — so the
-   * observation is kept and retried through the same bounded, lifetime-aware
-   * envelope as the read recovery, rather than dropped (the GET poll has
-   * ended and the journal never replays). One pending chain per command; it
-   * stops on success, a missing row, a changed/absent issuer epoch, teardown
-   * or the attempt cap.
+   * Pending ACCEPTANCEs whose durable CAS write keeps failing (c-reconnfu
+   * gate 29 item 2; gate 30 item 3: a bounded PER-COMMAND map so two failed
+   * commands are not dropped by one slot). The Hub has accepted each — only
+   * the progressRecorded flip is outstanding — so each is retried through the
+   * same bounded, lifetime-aware envelope as the read recovery. Every retry
+   * re-reads the row and stops on success, a missing row, a changed issuer
+   * (epoch/lifetime), teardown or the attempt cap; the CURRENT epoch is
+   * always read from the row, never assumed, so an epoch another tab/page
+   * changed cannot be credited.
    */
   private pendingAcceptance: {
     instanceId: Id;
     commandId: Id;
     issuerEpoch: Id;
+    issuerLifetime: Id;
     failures: number;
     handle: ReturnType<typeof setTimeout> | null;
   } | null = null;
@@ -1045,6 +1062,10 @@ export class Outbox {
   get ownerId(): Id {
     return this.owner;
   }
+  /** This outbox instance's unique page-lifetime id (c-reconnfu gate 30). */
+  get lifetime(): Id {
+    return this.lifetimeId;
+  }
 
   subscribe(fn: () => void): () => void {
     this.listeners.add(fn);
@@ -1267,9 +1288,10 @@ export class Outbox {
     this.deliveryPasses.clear();
     this.deliverySuppressed.clear();
     this.storeRetryPending.clear();
-    // Cancel a pending acceptance CAS (c-reconnfu gate 29 item 2): lifetime-
-    // aware like the read chain — a cancelled-navigation restore re-arms from
-    // a fresh observation, a disposed outbox never completes it.
+    // Cancel every pending acceptance CAS (c-reconnfu gate 29 item 2; gate
+    // 30 item 3 per-command map): lifetime-aware like the read chain — a
+    // cancelled-navigation restore re-arms from a fresh observation, a
+    // disposed outbox never completes any of them.
     this.clearPendingAcceptance();
   }
 
@@ -1296,18 +1318,30 @@ export class Outbox {
   /**
    * Keep an observed ACCEPTANCE pending after its CAS storage write failed and
    * retry the durable flip through the bounded, lifetime-aware recovery
-   * (c-reconnfu gate 29 item 2). Uses the same 250 ms·2ⁿ / 5 s backoff and
-   * {@link CLAIM_WAKE_MAX_FAILURES} cap as the other delivery recoveries. Each
-   * attempt first re-reads the row and stops when the row is gone, its issuer
-   * epoch changed or the flag is already set; a successful flip records
-   * progress and runs the fresh delivery epilogue, exactly as the direct path.
+   * (c-reconnfu gate 29 item 2; per-command map in gate 30 item 3). Uses the
+   * same 250 ms·2ⁿ / 5 s backoff and {@link CLAIM_WAKE_MAX_FAILURES} cap as
+   * the other delivery recoveries. Each attempt re-reads the CURRENT issuer
+   * (epoch + lifetime) off the row and stops when the row is gone, its issuer
+   * no longer matches the observing outbox or the flag is already set; a
+   * successful flip ALWAYS records progress and runs the fresh delivery
+   * epilogue.
    */
-  retryAcceptedProgress(instanceId: Id, commandId: Id, issuerEpoch: Id): void {
+  retryAcceptedProgress(
+    instanceId: Id,
+    commandId: Id,
+    issuerEpoch: Id,
+    issuerLifetime: Id,
+  ): void {
     if (this.disposed || this.unloading) return;
     if (this.pendingAcceptance?.commandId === commandId) return;
-    this.pendingAcceptance = { instanceId, commandId, issuerEpoch, failures: 1, handle: null };
-    // The immediate CAS already failed once; the first RECOVERY attempt waits
-    // the base backoff, then each further failure grows it (bounded).
+    this.pendingAcceptance = {
+      instanceId,
+      commandId,
+      issuerEpoch,
+      issuerLifetime,
+      failures: 1,
+      handle: null,
+    };
     const pending = this.pendingAcceptance;
     pending.handle = setTimeout(() => void this.attemptAcceptedProgress(), this.acceptanceRetryDelay(1));
   }
@@ -1315,32 +1349,37 @@ export class Outbox {
   private async attemptAcceptedProgress(): Promise<void> {
     const pending = this.pendingAcceptance;
     if (!pending || this.disposed || this.unloading) return;
-    let proceed = false;
+    let row: OutboxRecord | undefined;
     try {
       const rows = await this.readDurable();
-      const row = rows.find((r) => r.commandId === pending.commandId);
-      // Row gone (retract/cleanup) or the command no longer belongs to this
-      // auth epoch (logout/reinit/re-issue): nothing left to record.
-      if (row && row.issuerEpoch === pending.issuerEpoch && !row.progressRecorded) {
-        proceed = true;
-      }
+      row = rows.find((r) => r.commandId === pending.commandId);
     } catch {
-      // The re-read failed: treat it like a failed CAS attempt and back off.
-      proceed = true;
+      pending.failures += 1;
+      if (pending.failures >= CLAIM_WAKE_MAX_FAILURES) {
+        this.clearPendingAcceptance();
+        this.onReadRecoveryExhausted?.();
+        return;
+      }
+      pending.handle = setTimeout(() => void this.attemptAcceptedProgress(), this.acceptanceRetryDelay(pending.failures));
+      return;
     }
-    if (!proceed) {
+    if (
+      !row ||
+      row.issuerEpoch !== pending.issuerEpoch ||
+      row.issuerLifetime !== pending.issuerLifetime ||
+      row.progressRecorded
+    ) {
       this.clearPendingAcceptance();
       return;
     }
     let flipped = false;
     let casThrew = false;
     try {
-      flipped = await this.casProgressRecorded(pending.commandId, pending.issuerEpoch);
+      flipped = await this.casProgressRecorded(pending.commandId, pending.issuerEpoch, pending.issuerLifetime);
     } catch {
       flipped = false;
       casThrew = true;
     }
-    // The pending slot may have been cancelled (teardown) while the CAS ran.
     if (this.disposed || this.unloading || this.pendingAcceptance !== pending) return;
     if (flipped) {
       this.noteDeliveryProgress(pending.instanceId);
@@ -1348,22 +1387,9 @@ export class Outbox {
       await this.deliveryEpilogue().catch(() => undefined);
       return;
     }
-    // No flip. Classify with a fresh read: row gone, epoch changed, or the
-    // flag already set (another tab/document recorded it) are TERMINAL — stop
-    // quietly. Only an actual storage failure keeps the bounded retry alive.
     if (!casThrew) {
       this.clearPendingAcceptance();
       return;
-    }
-    try {
-      const rows = await this.readDurable();
-      const row = rows.find((r) => r.commandId === pending.commandId);
-      if (!row || row.issuerEpoch !== pending.issuerEpoch || row.progressRecorded) {
-        this.clearPendingAcceptance();
-        return;
-      }
-    } catch {
-      /* read failed too: fall through to the backoff and retry. */
     }
     pending.failures += 1;
     if (pending.failures >= CLAIM_WAKE_MAX_FAILURES) {
@@ -1383,55 +1409,16 @@ export class Outbox {
     this.pendingAcceptance = null;
   }
 
-
-  async casProgressRecorded(commandId: Id, issuerEpoch: Id): Promise<boolean> {
-    const locks = (globalThis as { navigator?: Navigator & { locks?: LockManager } }).navigator?.locks;
-    if (locks?.request) {
-      return await locks.request(acceptanceCasLockName(commandId), { mode: "exclusive" }, () =>
-        this.storage.casProgressRecorded(commandId, issuerEpoch),
-      );
-    }
-    return await this.runCasWithLease(commandId, issuerEpoch);
-  }
-
   /**
-   * No-Web-Locks fallback for the acceptance CAS: claim a per-command durable
-   * lease row (`__caslock__:<id>`, invisible to delivery — filtered as a
-   * non-command key) via the same atomic acquireLease/releaseLease pair the
-   * delivery mutex uses, so a second tab's CAS parks until the winner's
-   * compare-and-set has committed and then observes the flag set.
+   * Durable acceptance compare-and-set (c-reconnfu gate 30 single-writer):
+   * the issuing outbox = (auth epoch, page-lifetime id) is the ONLY writer
+   * for the row, so there is no cross-tab race to exclude — another tab or a
+   * later page instance simply fails the issuer comparison in storage. No Web
+   * Lock and no __caslock__ lease; localStorage's single-turn read/check/write
+   * is sufficient for the one permitted writer.
    */
-  private async runCasWithLease(commandId: Id, issuerEpoch: Id): Promise<boolean> {
-    const key = `__caslock__:${commandId}`;
-    const deadline = Date.now() + LEASE_TTL_MS + 5_000;
-    for (;;) {
-      const now = Date.now();
-      const leaseRec: OutboxRecord = {
-        commandId: key,
-        clientRequestId: key,
-        instanceId: key,
-        prompt: "",
-        createdAt: now,
-        attempts: 0,
-        state: "inflight",
-        lease: { owner: this.leaseToken, until: now + LEASE_TTL_MS },
-      };
-      let acquired = false;
-      try {
-        acquired = await this.storage.acquireLease(key, leaseRec, now);
-      } catch {
-        acquired = false;
-      }
-      if (acquired) {
-        try {
-          return await this.storage.casProgressRecorded(commandId, issuerEpoch);
-        } finally {
-          await this.storage.releaseLease(key, this.leaseToken).catch(() => undefined);
-        }
-      }
-      if (Date.now() > deadline) throw new Error("outbox acceptance CAS lease wait timed out");
-      await new Promise((r) => setTimeout(r, 250));
-    }
+  async casProgressRecorded(commandId: Id, issuerEpoch: Id, issuerLifetime: Id): Promise<boolean> {
+    return await this.storage.casProgressRecorded(commandId, issuerEpoch, issuerLifetime);
   }
 
   /**

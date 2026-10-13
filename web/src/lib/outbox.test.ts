@@ -90,11 +90,11 @@ class MemStorage implements OutboxStorage {
     return await run;
   }
   /** Atomic acceptance compare-and-set on the same serialized chain. */
-  async casProgressRecorded(commandId: string, issuerEpoch: string): Promise<boolean> {
+  async casProgressRecorded(commandId: string, issuerEpoch: string, issuerLifetime: string): Promise<boolean> {
     const run = this.writeChain.then(async () => {
       await new Promise((r) => setTimeout(r, 1));
       const existing = this.map.get(commandId);
-      if (!existing || existing.issuerEpoch !== issuerEpoch || existing.progressRecorded) {
+      if (!existing || existing.issuerEpoch !== issuerEpoch || existing.issuerLifetime !== issuerLifetime || existing.progressRecorded) {
         return false;
       }
       const marked: OutboxRecord = { ...existing, progressRecorded: true };
@@ -2190,66 +2190,37 @@ describe("Outbox", () => {
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     }
   });
-});
-
-it("GATE29 item 1: two outboxes racing one acceptance CAS on the lease fallback — exactly one tab records progress", async () => {
-  // No Web Locks: the CAS must run under the same durable-lease exclusion as a
-  // delivery claim. The storage below is deliberately RACY (it yields between
-  // check and write, modelling two documents interleaving on a backend
-  // without transactions); without the guard both racers observe the flag
-  // unset and both win.
+});it("GATE30 item 2: single-writer acceptance CAS — only the issuing (epoch + lifetime) outbox records; another page instance observing first must lose", async () => {
+  // gate 30 single-writer ruling on a real backend: the row is stamped with
+  // (epoch_1, life_issuer). Outbox B — same epoch but its OWN page-lifetime
+  // id — observes the acceptance FIRST while progressRecorded is still unset.
+  // It must lose purely on the lifetime comparison; the issuing outbox then
+  // flips exactly once. No __caslock__ lease row is ever written.
   const shared = new MemStorage();
-  await shared.put(rec({ commandId: "cmd_cas_race", issuerEpoch: "epoch_1" }));
-  const racy: OutboxStorage = {
-    all: () => shared.all(),
-    put: (r) => shared.put(r),
-    delete: (id) => shared.delete(id),
-    // Lease primitives stay atomic (the exclusion relies on them).
-    acquireLease: (key, r, now) => shared.acquireLease(key, r, now),
-    releaseLease: (key, owner) => shared.releaseLease(key, owner),
-    mergeUnlessDone: (id, patch) => shared.mergeUnlessDone(id, patch),
-    // Non-atomic CAS across two documents: each tab parses its OWN copy
-    // (no shared references), then yields BEFORE the check/write.
-    async casProgressRecorded(commandId, issuerEpoch) {
-      const rows = await shared.all();
-      const snapshot = rows.find((r) => r.commandId === commandId);
-      const seenUnset =
-        !!snapshot && snapshot.issuerEpoch === issuerEpoch && !snapshot.progressRecorded;
-      await new Promise((r) => setTimeout(r, 5));
-      if (!seenUnset) return false;
-      const current = (await shared.all()).find((r) => r.commandId === commandId);
-      const marked = { ...(current ?? snapshot), progressRecorded: true as const };
-      await shared.put(marked);
-      return true;
-    },
-    reclaimInflight: (id, expected, opts) => shared.reclaimInflight(id, expected, opts),
-  };
+  await shared.put(
+    rec({ commandId: "cmd_single_writer", issuerEpoch: "epoch_1", issuerLifetime: "life_issuer" }),
+  );
   const originalLocks = (globalThis.navigator as { locks?: LockManager }).locks;
-  Object.defineProperty(globalThis.navigator, "locks", {
-    configurable: true,
-    value: undefined,
-  });
+  Object.defineProperty(globalThis.navigator, "locks", { configurable: true, value: undefined });
   try {
     const [a, b] = await Promise.all([
-      Outbox.load(racy, "owner_cas_a"),
-      Outbox.load(racy, "owner_cas_b"),
+      Outbox.load(shared, "owner_sw_a"),
+      Outbox.load(shared, "owner_sw_b"),
     ]);
-    const outcomes = await Promise.all([
-      a.casProgressRecorded("cmd_cas_race", "epoch_1"),
-      b.casProgressRecorded("cmd_cas_race", "epoch_1"),
-    ]);
-    expect(outcomes.filter(Boolean)).toHaveLength(1);
-    const stored = (await shared.all()).find((r) => r.commandId === "cmd_cas_race");
+    // Foreign-lifetime observer first, flag unset: must not record.
+    expect(await b.casProgressRecorded("cmd_single_writer", "epoch_1", b.lifetime)).toBe(false);
+    // The issuer then wins exactly once; its repeat observation loses on the
+    // flag.
+    expect(await a.casProgressRecorded("cmd_single_writer", "epoch_1", "life_issuer")).toBe(true);
+    expect(await a.casProgressRecorded("cmd_single_writer", "epoch_1", "life_issuer")).toBe(false);
+    // B still loses afterwards.
+    expect(await b.casProgressRecorded("cmd_single_writer", "epoch_1", b.lifetime)).toBe(false);
+    const stored = (await shared.all()).find((r) => r.commandId === "cmd_single_writer");
     expect(stored?.progressRecorded).toBe(true);
-    // The lease row used to serialise the CAS is gone (released).
-    expect((await shared.all()).find((r) => r.commandId === "__caslock__:cmd_cas_race")).toBeUndefined();
-
-    // A CAS for an epoch that never issued still loses, guarded or not.
-    const second = await Promise.all([
-      a.casProgressRecorded("cmd_cas_race", "epoch_2"),
-      b.casProgressRecorded("cmd_cas_race", "epoch_2"),
-    ]);
-    expect(second).toEqual([false, false]);
+    expect(stored?.issuerLifetime).toBe("life_issuer");
+    expect((await shared.all()).find((r) => r.commandId.startsWith("__caslock__"))).toBeUndefined();
+    // A different epoch loses regardless of lifetime.
+    expect(await a.casProgressRecorded("cmd_single_writer", "epoch_2", "life_issuer")).toBe(false);
   } finally {
     Object.defineProperty(globalThis.navigator, "locks", {
       configurable: true,

@@ -24,6 +24,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+nix = { version = "0.28", default-features = false, features = ["socket"] }
 remuda-testing.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

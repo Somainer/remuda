@@ -55,6 +55,12 @@ export function writeSession(session: DeviceSession, { mock = false } = {}): voi
 
 export function clearSession(): void {
   memorySession = null;
+  // Logout/reinit ROTATES the auth epoch (c-reconnfu gate 30 item 1): drop the
+  // persisted anon epoch AND the page-lifetime cached one, so the next
+  // readAuthEpoch() mints a brand-new id rather than resurrecting the
+  // previous epoch from the cache. A device-session epoch is gone with the
+  // session itself.
+  memoryAnonEpoch = null;
   try {
     localStorage.removeItem(LEGACY_ACCESS_KEY);
     localStorage.removeItem(SESSION_KEY);

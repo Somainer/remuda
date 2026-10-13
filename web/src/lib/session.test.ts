@@ -70,3 +70,36 @@ it("readAuthEpoch mints the anon epoch once per page lifetime even when storage 
   setItem.mockRestore();
   vi.resetModules();
 });
+
+it("logout rotates the persisted anon auth epoch (c-reconnfu gate 30)", async () => {
+  clearSession();
+  localStorage.clear();
+  vi.resetModules();
+  const first = await import("./session");
+  const before = first.readAuthEpoch();
+  expect(localStorage.getItem("runtime.outbox-auth-epoch")).toBe(before);
+  first.clearSession();
+  const after = first.readAuthEpoch();
+  expect(after).toBeTruthy();
+  expect(after).not.toBe(before);
+  // The rotated epoch is the one now persisted; the old id is gone.
+  expect(localStorage.getItem("runtime.outbox-auth-epoch")).toBe(after);
+  vi.resetModules();
+});
+
+it("logout rotates the anon epoch even while storage cannot persist it (no cache resurrection)", async () => {
+  clearSession();
+  localStorage.clear();
+  vi.resetModules();
+  const mod = await import("./session");
+  const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation((key: string) => {
+    if (key === "runtime.outbox-auth-epoch") throw new DOMException("quota", "QuotaExceededError");
+  });
+  const before = mod.readAuthEpoch();
+  expect(mod.readAuthEpoch()).toBe(before); // stable across calls
+  mod.clearSession();
+  const after = mod.readAuthEpoch();
+  expect(after).not.toBe(before); // rotated from the page cache, not resurrected
+  setItem.mockRestore();
+  vi.resetModules();
+});

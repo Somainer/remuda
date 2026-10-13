@@ -177,6 +177,11 @@ pub struct FakeHerdrOptions {
     /// the courtesy and continue the polite/force path into reap, not abort
     /// the interrupt with an uncertain/error outcome.
     pub refuse_shell_exit_send_text: bool,
+    /// While set, close-PHASE lifecycle `events.subscribe` RPCs are refused
+    /// with a live-boot `server_unavailable` (c-ctxusage r25 item 3). The path
+    /// points at a marker FILE: the server refuses while the file exists, so a
+    /// test can arm/disarm deterministically without races.
+    pub refuse_close_subscribes_marker: Option<PathBuf>,
 }
 
 /// Creation label the simulated restart hands the reused `w1` workspace to.
@@ -202,6 +207,7 @@ impl FakeHerdrOptions {
             restart_barrier_close_ordinal: 1,
             subscribe_never_acks: false,
             refuse_shell_exit_send_text: false,
+            refuse_close_subscribes_marker: None,
         }
     }
 
@@ -306,6 +312,12 @@ impl FakeHerdrOptions {
         self.refuse_shell_exit_send_text = true;
         self
     }
+
+    /// Refuse close lifecycle subscriptions while `marker` exists.
+    pub fn refuse_close_subscribes_while(mut self, marker: impl Into<PathBuf>) -> Self {
+        self.refuse_close_subscribes_marker = Some(marker.into());
+        self
+    }
 }
 
 /// Bundled `terminal.frame` JSONL.
@@ -369,6 +381,9 @@ impl FakeHerdrServer {
         }
         if options.exit_after_unavailable {
             command.arg("--exit-after-unavailable");
+        }
+        if let Some(marker) = &options.refuse_close_subscribes_marker {
+            command.env("FAKE_HERDR_REFUSE_CLOSE_SUBSCRIBES_MARKER", marker);
         }
         if options.agent_start_delay != Duration::ZERO {
             command.env(
@@ -558,6 +573,10 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
         .unwrap_or(0);
     let mut exit_after_unavailable = std::env::var("FAKE_HERDR_EXIT_AFTER_UNAVAILABLE")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
+    let refuse_close_subscribes_marker: Option<PathBuf> =
+        std::env::var("FAKE_HERDR_REFUSE_CLOSE_SUBSCRIBES_MARKER")
+            .ok()
+            .map(PathBuf::from);
     let agent_start_delay = std::env::var("FAKE_HERDR_START_DELAY_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -706,6 +725,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             restart_barrier_close_ordinal,
             subscribe_never_acks,
             refuse_shell_exit_send_text,
+            refuse_close_subscribes_marker: refuse_close_subscribes_marker.clone(),
         }));
     }
     Err(FakeHerdrError::Args(format!(
@@ -821,6 +841,7 @@ async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
         options.restart_barrier_close_ordinal,
         options.subscribe_never_acks,
         options.refuse_shell_exit_send_text,
+        options.refuse_close_subscribes_marker.clone(),
     )));
     // Only the scripted shutdown window (`exit_after_unavailable`) stops the
     // accept loop. Parent death is handled by the outer `parent_watch`
@@ -895,6 +916,9 @@ struct State {
     subscribe_never_acks: bool,
     /// Refuse every pane.send_text with a live-boot API error (r17 item 7).
     refuse_shell_exit_send_text: bool,
+    /// c-ctxusage r25 item 3: marker file; refuse closes-subscribes while it
+    /// exists.
+    refuse_close_subscribes_marker: Option<PathBuf>,
     /// Bumped by the simulated restart; surfaced in `ping` capabilities.
     server_generation: u32,
 }
@@ -915,6 +939,7 @@ impl State {
         close_barrier_ordinal: u32,
         subscribe_never_acks: bool,
         refuse_shell_exit_send_text: bool,
+        refuse_close_subscribes_marker: Option<PathBuf>,
     ) -> Self {
         Self {
             script,
@@ -946,6 +971,7 @@ impl State {
             close_barrier_done: false,
             subscribe_never_acks,
             refuse_shell_exit_send_text,
+            refuse_close_subscribes_marker,
             server_generation: 1,
         }
     }
@@ -1026,6 +1052,38 @@ async fn handle_conn(
             }
         }
         if req.method == "events.subscribe" {
+            // c-ctxusage r25 item 3: transiently refuse the first N close
+            // lifecycle subscriptions. Only the close interrupt phase
+            // subscribes to pane.exited/pane.closed; launch subscribes to
+            // pane.agent_status_changed only, so this is a close-only refusal
+            // that models a transient carrier hiccup at close start.
+            let is_close_subscription = req
+                .params
+                .get("subscriptions")
+                .and_then(Value::as_array)
+                .is_some_and(|subs| {
+                    subs.iter().any(|sub| {
+                        matches!(
+                            sub.get("type").and_then(Value::as_str),
+                            Some("pane.exited" | "pane.closed")
+                        )
+                    })
+                });
+            if is_close_subscription {
+                let refuse = {
+                    let st = lock_state(&state)?;
+                    st.refuse_close_subscribes_marker
+                        .as_ref()
+                        .is_some_and(|marker| marker.exists())
+                };
+                if refuse {
+                    let body =
+                        error_reply(&req, "server_unavailable", "server is shutting down".into());
+                    writer.write_all(body.as_bytes()).await?;
+                    writer.flush().await?;
+                    continue;
+                }
+            }
             // c-ctxusage r15 item 6: the wedged-carrier model. Only the
             // close-path lifecycle handshake (pane.exited / pane.closed)
             // parks; other subscriptions the driver uses at startup

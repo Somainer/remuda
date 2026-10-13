@@ -1367,15 +1367,36 @@ fn sum_session_increments_since(
         // No trustworthy increment inside the window — unknown, never stock.
         return Ok((None, None));
     }
-    let mut input: Option<i64> = None;
-    let mut output: Option<i64> = None;
+    let mut input: Option<i64> = Some(0);
+    let mut output: Option<i64> = Some(0);
+    let mut input_unknown = false;
+    let mut output_unknown = false;
     for increment in in_window {
-        if let Some(value) = increment.input {
-            *input.get_or_insert(0) += value;
+        // U1 (c-ctxusage r17 item 6): a bucket omitted by ANY in-window
+        // increment makes the folded rate bucket Unknown, even when other
+        // increments are Known. The `*_unknown` latches keep the
+        // accumulator distinct from "no increments" (handled above) and from
+        // a sum of only the known intervals.
+        match increment.input {
+            Some(value) if !input_unknown => {
+                input = Some(input.unwrap_or(0).saturating_add(value));
+            }
+            None => input_unknown = true,
+            Some(_) => {}
         }
-        if let Some(value) = increment.output {
-            *output.get_or_insert(0) += value;
+        match increment.output {
+            Some(value) if !output_unknown => {
+                output = Some(output.unwrap_or(0).saturating_add(value));
+            }
+            None => output_unknown = true,
+            Some(_) => {}
         }
+    }
+    if input_unknown {
+        input = None;
+    }
+    if output_unknown {
+        output = None;
     }
     Ok((input, output))
 }
@@ -1437,9 +1458,21 @@ fn latest_session_stock(
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if !points.is_empty() {
+    if let Some((first, rest)) = points.split_first() {
         let mut stock = SessionStock::default();
-        for (input, output, cache_read, cache_write, observed_at) in &points {
+        // The FIRST point seeds every bucket: an empty accumulator must be
+        // distinguished from one holding an unknown contribution, so a single
+        // session whose latest point knows input reports a known input even
+        // before any fold. Later sessions fold under U1 — an unknown bucket in
+        // ANY constituent session makes the cross-session total Unknown
+        // (c-ctxusage r17 item 6).
+        let (input, output, cache_read, cache_write, observed_at) = first;
+        stock.input = *input;
+        stock.output = *output;
+        stock.cache_read = *cache_read;
+        stock.cache_write = *cache_write;
+        stock.latest_observed_at = Some(observed_at.clone());
+        for (input, output, cache_read, cache_write, observed_at) in rest {
             stock.input = add_optional(stock.input, *input);
             stock.output = add_optional(stock.output, *output);
             stock.cache_read = add_optional(stock.cache_read, *cache_read);
@@ -1487,13 +1520,24 @@ fn latest_session_stock(
     Ok((stock, false))
 }
 
+/// Sum two constituent session buckets under U1 (c-ctxusage r17 item 6): the
+/// total is Known only when EVERY constituent session reports the bucket. An
+/// unknown session bucket makes the folded total Unknown — it is never taken
+/// as zero and the known sessions alone can never produce a total.
 fn add_optional(a: Option<i64>, b: Option<i64>) -> Option<i64> {
     match (a, b) {
-        (Some(a), Some(b)) => Some(a + b),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        _ => None,
     }
+}
+
+/// Sum a fixed set of context baskets under U1: Known only when EVERY bucket
+/// is Known (the source reporting no explicit total). `input 100` with an
+/// unknown cache bucket is Unknown context, not 100 (c-ctxusage r17 item 6).
+fn known_context_total(buckets: [Option<i64>; 3]) -> Option<i64> {
+    buckets.into_iter().try_fold(0_i64, |total, bucket| {
+        bucket.map(|value| total.saturating_add(value))
+    })
 }
 
 /// The newest per-call (scope='turn') basket: fresh input plus every cached
@@ -1516,10 +1560,11 @@ fn latest_turn_basket(conn: &Connection, instance_id: &str) -> rusqlite::Result<
             let input: Option<i64> = row.get(0)?;
             let cache_read: Option<i64> = row.get(1)?;
             let cache_write: Option<i64> = row.get(2)?;
-            Ok([input, cache_read, cache_write]
-                .into_iter()
-                .flatten()
-                .reduce(i64::saturating_add))
+            // U1 (c-ctxusage r17 item 6): the next request's context is Known
+            // only when the newest call reported input AND both cache buckets;
+            // flatten() here used to read input 100 with an unknown cache as
+            // a known 100.
+            Ok(known_context_total([input, cache_read, cache_write]))
         },
     )
 }
@@ -1647,10 +1692,10 @@ pub fn rollup_instance(
     let context_used_tokens = if totals.has_turn {
         latest_turn_basket(conn, instance_id)?
     } else {
-        [stock.input, stock.cache_read, stock.cache_write]
-            .into_iter()
-            .flatten()
-            .reduce(i64::saturating_add)
+        // U1: a stock-only harness reports a known context only when the
+        // current stock knows input and both cache buckets (c-ctxusage
+        // r17 item 6).
+        known_context_total([stock.input, stock.cache_read, stock.cache_write])
     };
 
     let context_window_tokens = context_window_tokens(kind, model);
@@ -2233,6 +2278,221 @@ mod tests {
             Some(0),
             "2 output / 5 minutes rounds to 0"
         );
+    }
+
+    /// U1 (c-ctxusage r17 item 6), turn context basket: the newest call's
+    /// `input + cache_read + cache_write` is Known only when ALL THREE buckets
+    /// are reported. Input 100 with an unknown cache is Unknown context, never
+    /// a known 100.
+    #[test]
+    fn a_turn_call_with_an_unknown_cache_bucket_has_unknown_context() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let mut turn = row(1, &ago(2), Some(100), Some(10), None, None);
+        turn.instance_id = "ins_u1a".into();
+        insert_usage_event(&conn, &turn).unwrap();
+
+        let rollup = rollup_instance(&conn, "ins_u1a", "claude", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.context_used_tokens, None,
+            "input 100 with unknown cache buckets is Unknown context"
+        );
+        assert_eq!(rollup.context_pct, None);
+        // The reported input flow itself stays Known on its own bucket.
+        assert_eq!(rollup.session_input_tokens, Some(100));
+    }
+
+    /// U1, stock-only context fallback: a cumulative stock whose latest point
+    /// reports input but not a cache bucket yields Unknown context rather than
+    /// summing only the known baskets.
+    #[test]
+    fn a_stock_with_an_unknown_cache_bucket_has_unknown_context() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let mut point = scoped_record(
+            1,
+            "ins_u1b",
+            "session",
+            Some("s1"),
+            1,
+            100,
+            10,
+            0,
+            0,
+            Some(&ago(2)),
+        );
+        point.event["payload"]["cacheReadTokens"] =
+            json!({ "state": "unknown", "reason": "unreported" });
+        point.event["payload"]["cacheWriteTokens"] =
+            json!({ "state": "unknown", "reason": "unreported" });
+        assert!(insert(&conn, &point));
+
+        let rollup = rollup_instance(&conn, "ins_u1b", "grok", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.context_used_tokens, None,
+            "stock input 100 with unknown cache is Unknown context"
+        );
+        assert_eq!(rollup.context_pct, None);
+        assert_eq!(rollup.session_input_tokens, Some(100));
+        assert_eq!(rollup.session_output_tokens, Some(10));
+    }
+
+    /// U1, cross-session stock addition: the total across sessions is Known
+    /// only when EVERY session's latest point reports the bucket. One session
+    /// with unknown input makes the folded input Unknown even though another
+    /// session reports 100; independently-known output still sums. Two fully
+    /// known sessions (the control instance) sum normally.
+    #[test]
+    fn one_session_with_unknown_input_makes_the_cross_session_total_unknown() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let s1 = scoped_record(
+            1,
+            "ins_u1c",
+            "session",
+            Some("s1"),
+            1,
+            100,
+            10,
+            0,
+            0,
+            Some(&ago(5)),
+        );
+        // s2 reports output only: its input bucket is genuinely unknown.
+        let mut s2 = scoped_record(
+            2,
+            "ins_u1c",
+            "session",
+            Some("s2"),
+            1,
+            0,
+            5,
+            0,
+            0,
+            Some(&ago(4)),
+        );
+        s2.event["payload"]["inputTokens"] = json!({ "state": "unknown", "reason": "unreported" });
+        assert!(insert(&conn, &s1));
+        assert!(insert(&conn, &s2));
+
+        let rollup = rollup_instance(&conn, "ins_u1c", "grok", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.session_input_tokens, None,
+            "s1's 100 cannot total with s2's unknown input"
+        );
+        assert_eq!(rollup.session_output_tokens, Some(15), "10 + 5 both known");
+
+        // Control: two fully-known sessions sum to a known total.
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                11,
+                "ins_u1c2",
+                "session",
+                Some("s1"),
+                1,
+                100,
+                10,
+                0,
+                0,
+                Some(&ago(5))
+            )
+        ));
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                12,
+                "ins_u1c2",
+                "session",
+                Some("s2"),
+                1,
+                50,
+                5,
+                0,
+                0,
+                Some(&ago(4))
+            )
+        ));
+        let rollup = rollup_instance(&conn, "ins_u1c2", "grok", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_input_tokens, Some(150));
+        assert_eq!(rollup.session_output_tokens, Some(15));
+    }
+
+    /// U1, session rate folding: a rate-window bucket is Unknown when ANY
+    /// in-window increment omits it, even alongside a known increment. Two
+    /// native intervals land inside 60 s — input +50 then an interval whose
+    /// input is unknown (output +5 both times) — so tpm_in is Unknown while
+    /// tpm_out is the known sum 10.
+    #[test]
+    fn an_unknown_in_window_increment_makes_the_rate_bucket_unknown() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                1,
+                "ins_u1d",
+                "session",
+                Some("s1"),
+                1,
+                100,
+                10,
+                0,
+                0,
+                Some(&ago(100))
+            )
+        ));
+        assert!(insert(
+            &conn,
+            &scoped_record(
+                2,
+                "ins_u1d",
+                "session",
+                Some("s1"),
+                2,
+                150,
+                15,
+                0,
+                0,
+                Some(&ago(8))
+            )
+        ));
+        let mut third = scoped_record(
+            3,
+            "ins_u1d",
+            "session",
+            Some("s1"),
+            3,
+            0,
+            20,
+            0,
+            0,
+            Some(&ago(3)),
+        );
+        third.event["payload"]["inputTokens"] =
+            json!({ "state": "unknown", "reason": "unreported" });
+        // The source-derived total is unknown for the same reason (U1); a
+        // known total of 20 would otherwise floor as a backwards stock.
+        third.event["payload"]["totalTokens"] =
+            json!({ "state": "unknown", "reason": "unreported" });
+        assert!(insert(&conn, &third));
+
+        let rollup = rollup_instance(&conn, "ins_u1d", "grok", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.tpm_in_60s, None,
+            "the known +50 increment can't total past the unknown interval"
+        );
+        assert_eq!(rollup.tpm_out_60s, Some(10), "5 + 15->20 and 10->15 = 10");
     }
 
     /// Codex/Grok-shaped observations report only some channels. Missing

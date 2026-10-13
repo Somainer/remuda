@@ -318,3 +318,69 @@ async fn a_send_lands_when_idle_and_is_held_until_a_running_turn_ends() {
 
     Driver::close(&driver).await.unwrap();
 }
+
+/// c-effortread r12 item 4: the explicit flag axis rides through the
+/// promoted-shell `send → switch_effort` dispatch. That carrier cannot report
+/// the binary version, so a FLAG configure — missing boolean, explicit OFF, or
+/// the legacy ultracode-ON spelling — fails closed with CapabilityUnsupported
+/// and TYPES NOTHING. The old dispatch dropped the axis, so the missing-boolean
+/// and flag-off requests silently typed a plain `/effort high`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_promoted_shell_refuses_every_flag_axis_configure_and_types_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let scenario_path = root.join("scenario.json");
+    std::fs::write(&scenario_path, SCENARIO).unwrap();
+    let events_path = root.join("harness-events.jsonl");
+
+    let driver = driver_for(root, &scenario_path, &events_path);
+    let spec = spec_for(&root.join("workspace"));
+    let _events = driver.start(spec).await.expect("start").into_events();
+
+    let flag_switch = |ultracode: Option<bool>| {
+        DriverInput::ModelSwitch(Box::new(remuda_protocol::ModelSwitchInput {
+            model_id: String::new(),
+            effective: remuda_protocol::ModelEffective::NextTurn,
+            effort: Some("high".into()),
+            effort_ultracode: ultracode,
+            effort_axis: Some(remuda_protocol::EffortAxis::Flag),
+            effort_request_id: Some("effreq-flag".into()),
+            permission_mode: None,
+        }))
+    };
+
+    // Missing/invalid boolean (the node maps both JSON shapes to None)...
+    for input in [
+        flag_switch(None),
+        flag_switch(Some(false)),
+        flag_switch(Some(true)),
+    ] {
+        let err = driver
+            .send(input)
+            .await
+            .expect_err("every flag-axis configure is refused on the promoted-shell carrier");
+        assert!(
+            matches!(err, remuda_driver::DriverError::CapabilityUnsupported(_)),
+            "expected CapabilityUnsupported, got {err:?}"
+        );
+    }
+
+    // Nothing was typed: the harness saw no /effort submit (or any submit).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let all = harness_events(&events_path);
+    let effort_submits = all
+        .iter()
+        .filter(|e| {
+            e.get("event").and_then(Value::as_str) == Some("submit")
+                && e.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.contains("/effort"))
+        })
+        .count();
+    assert_eq!(
+        effort_submits, 0,
+        "a refused flag configure must type nothing: {all:?}"
+    );
+
+    Driver::close(&driver).await.unwrap();
+}

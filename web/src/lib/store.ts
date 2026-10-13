@@ -35,17 +35,24 @@ import {
   type ServerRequestOptions,
 } from "./passkeys";
 import {
+  CLAUDE_XHIGH_INDEX,
   DEFAULT_EFFORT_INDEX,
+  coupledSelection,
   effortAt,
   effortFromRecord,
+  claudeVersionGate,
   effortWireName,
   mapEffort,
+  type ClaudeVersionGate,
+  type EffortAxis,
   type EffortKind,
   type EffortSelection,
+  type ModelEffortCatalogRow,
 } from "../features/session/effort";
 import {
   effectiveFromObservation,
   effectiveFromRecord,
+  effortFlagSettles,
   type EffortEffectiveView,
 } from "../features/session/effortEffective";
 import type { UsageRollup } from "../features/session/contextUsage";
@@ -88,6 +95,7 @@ const HELD_RETRY_BASE_MS = 2_000;
 const HELD_RETRY_MAX_MS = 30_000;
 import { liveSummary } from "../features/session/liveSummary";
 import { HubHttpError, isUnauthorized } from "./httpError";
+import { hostClaudeVersion } from "./driverMatrix";
 import { e2eSeamsEnabled } from "./e2eSeams";
 import { JournalClient, type JournalRead } from "./journal";
 import { id, now } from "./ids";
@@ -105,33 +113,225 @@ import {
   type PairedDevice,
 } from "./session";
 
-/** A push-down in flight (chip shows 切换中 / 排队中 until it settles). */
+/**
+ * A push-down in flight (chip shows 切换中 / 排队中 until BOTH requested axes
+ * settle). D-056: the request is two axes — level `low…max` and the
+ * orthogonal ultracode flag — each confirmed by its own read-back.
+ */
 export type EffortPending = {
-  /** Wire word the user chose (`low…max | ultracode`). */
-  word: string;
+  /** Per-instance nonce identifying one switch; stale lifecycles are dropped. */
+  nonce: number;
+  /**
+   * Per-request id (c-effortread r10 items 1–4 / r19 item 1) minted for THIS
+   * switch and carried web → Hub → Node → driver. Lifecycle edges and the
+   * requested echo settle/clear this pending ONLY when they carry the same
+   * id. An id-less projection settles NOTHING — a missing id is not
+   * legacy-driver evidence — so an unknown request otherwise waits for its
+   * bounded unconfirmed outcome.
+   */
+  requestId: string;
+  /** Axis this switch moves ("flag" = orthogonal toggle, "tier" = level). */
+  axis: EffortAxis;
+  /** Requested native level word. */
+  name: string;
+  /** Requested switch state. */
+  ultracode: boolean;
   /** True while the agent is working — it applies at the next idle. */
   queued: boolean;
   /** Wall-clock ms the pending state was entered (stale-state safety net). */
   at: number;
   /**
-   * §9.1 effective-level `observedAt` the push-down started from (null when
-   * nothing had been read back). A read-back newer than this settles the
-   * push-down; an equal/older projection leaves a queued push pending.
+   * Effective `observedAt` of the newest projection BEFORE this request.
+   * Records the pre-switch baseline this request was made against
+   * (c-effortread r10 item 1); since r19 item 1 settlement is own-id only and
+   * no longer compares read-back times against it, it is retained as
+   * provenance metadata.
    */
   baselineObservedAt: string | null;
   /**
-   * `observedAt` of the configure lifecycle that put the switch in the
-   * queue. A queued switch must be cleared ONLY by an effective read-back at
-   * least as new as the queued REQUEST: a projection newer than the old
-   * baseline but older than the request (a stale in-flight poll) must not
-   * settle it. Null for an optimistic setEffort that has not been journaled
-   * yet (falls back to the baseline rule).
+   * `observedAt` of THIS request's own `effort-queued` lifecycle; null until
+   * that edge arrives. Kept separately from the pre-request baseline.
    */
-  requestObservedAt: string | null;
+  queuedObservedAt: string | null;
+  /**
+   * c-effortread r16 item 5: the JOURNAL SEQ of THIS request's own
+   * `effort-queued` lifecycle (lifecycle-owned pendings only). Protocol
+   * timestamps have millisecond resolution, so two queued lifecycles emitted
+   * in the same millisecond tie on {@link queuedObservedAt}; the journal seq
+   * is the total order that disambiguates them. Null on client-owned
+   * pendings (their nonce/afterReplacement protection does not use this).
+   */
+  queuedSeq: string | null;
+  /** Level axis confirmed by a newer projection. */
+  levelSettled: boolean;
+  /** Switch axis confirmed by a newer projection. */
+  flagSettled: boolean;
+  /**
+   * Who owns this in-flight request: "client" when this tab posted the
+   * configure (its axes are the nonce-identified request), "lifecycle" when
+   * the only evidence is a wire `effort-queued` edge (configure posted outside
+   * the UI). A mismatched degraded verdict is trusted as terminal only for a
+   * wire-owned request; against a client request it is a replaced request's
+   * stale verdict and is ignored (c-effortui r2 item 2).
+   */
+  source: "client" | "lifecycle";
+  /**
+   * c-effortread r13 item 1: this client request replaced an earlier
+   * in-flight request (A→B→C). It records replacement provenance for the
+   * request's nonce/debug state. Since r19 item 1 an ID-LESS edge settles
+   * NOTHING regardless, so the word-ambiguity guard that used this flag to
+   * reject a same-word queued bound is moot; the request fails closed on its
+   * own id evidence until its bounded reconciliation ends it.
+   */
+  afterReplacement: boolean;
+  /**
+   * The exact command word the DRIVER types for this configure
+   * (c-effortui r4 item 3). On decoupled builds a TIER move with the flag on
+   * is a plain level word (`/effort max` leaves the ortho flag as-is), so its
+   * `effort-queued/applied/degraded:<word>` lifecycle carries the LEVEL even
+   * though the request's flag is true. Matching purely on
+   * `{name,ultracode}` rejected that word (flag-on pending vs level word) and
+   * stuck the indicator; the matcher compares the lifecycle word to this.
+   * `null` for wire-owned pendings synthesized from the word itself.
+   */
+  commandWord: string | null;
+  /**
+   * c-effortread r18 item 2 / r19 item 1: the per-SESSION driver id-capability
+   * captured for THIS request — "unknown" or "id-capable". It is a persisted
+   * fact about the session's driver, carried across requests, NOT inferred
+   * from this request's own first queued frame:
+   *  - unknown: no own-id evidence yet (a fresh session, another client's
+   *    id-less configure, or a poll that arrives before the first id-bearing
+   *    frame). The request settles ONLY on its own id-bearing evidence, or via
+   *    its bounded unconfirmed outcome — never from an id-less matching
+   *    projection or an instance-list poll. An ID-LESS lifecycle is NOT legacy
+   *    evidence: the current driver emits one whenever the incoming configure
+   *    omitted its optional requestId (another client), so capability is
+   *    unknown until proven.
+   *  - id-capable: an edge carrying a real effort request id ECHOED BY THIS
+   *    SESSION was seen. Monotonic: an id-less edge (an unowned verdict the
+   *    mapper could not pair, provenance loss) never downgrades it.
+   */
+  idCapability: EffortDriverIdCapability;
+  /**
+   * c-effortread r13 item 2 / r14 item 2: wall-clock ms at which CURRENT
+   * ACTIVITY EVIDENCE showed this request leaving the driver queue (the turn
+   * becoming idle — directly, or via waiting-interaction on a
+   * PermissionRequest/Elicitation before Stop/StopFailure). The bounded
+   * reconciliation is anchored HERE, not at the immutable `queued` snapshot
+   * taken at send time: a request queued behind a running turn gets its full
+   * request-owned bound only AFTER the turn ends. Null while the turn is still
+   * running; an idle-at-send request initializes it to the send time.
+   */
+  leftQueueAt: number | null;
 };
+
+/**
+ * A refusal that keeps the ultracode switch disabled, projected from an
+ * `effort-degraded` lifecycle. Model-scoped refusals clear on a model
+ * change; process-scoped ones last the process (D-056 owner rule: this is a
+ * configure OUTCOME, never a session end — retry is allowed, not blocked).
+ */
+export type UltraRefusal = {
+  reason: string;
+  scope: "model" | "process";
+  modelId: string | null;
+  at: string;
+};
+
+/**
+ * c-effortread r18 item 2 / r19 item 1: per-SESSION knowledge of whether the
+ * driver handling the session echoes the configure's per-request effort id on
+ * its lifecycle/verdict frames.
+ *  - unknown: no own-id evidence yet. Fail closed: only own-id evidence
+ *    settles. An id-less lifecycle is NOT legacy evidence — the current driver
+ *    emits one whenever the configure omitted its optional requestId (another
+ *    client) — so it leaves the capability unchanged.
+ *  - id-capable: an own-id echo was seen; monotonic, never downgraded by
+ *    later id-less evidence.
+ */
+export type EffortDriverIdCapability = "unknown" | "id-capable";
+
+/** Parse of an effort lifecycle status word into its two axes. */
+type EffortLifecycleRequest = {
+  name?: string;
+  ultracode?: boolean;
+};
+
+/** Stable reason codes that keep the switch disabled (D-056 §5). */
+const ULTRA_MODEL_REASON = "ultracode-unavailable-for-model";
+const ULTRA_WORKFLOWS_REASON = "ultracode-workflows-disabled";
+
+/**
+ * Native-lifecycle `relatedIds` key carrying the effort configure's
+ * per-request id (c-effortread r10 items 1–4); mirrors
+ * `remuda_protocol::EFFORT_REQUEST_ID_KEY`.
+ */
+const EFFORT_REQUEST_ID_KEY = "effortRequestId";
 
 /** Pending entries older than this without a verdict are dropped. */
 const EFFORT_PENDING_MAX_AGE_MS = 30 * 60_000;
+
+/**
+ * c-effortread r12 item 5 / r13 item 4: bounded, request-owned reconciliation
+ * for an ID-LESS driver. An older driver that accepts a no-op (the target
+ * already equals the observed state) emits no completion id, and its mapper
+ * suppresses unchanged observations — without this bound the chip sat on
+ * 切换中 for the whole 30-minute max age.
+ *
+ * The bound mirrors the driver's own read-back window (10s) plus a delivery
+ * margin. It NEVER queries the driver for current state: the protocol has no
+ * such operation (r13 item 4 coordinator ruling), so a re-read of the stored
+ * Hub record would be stale-state theatre, not fresh evidence. A genuine
+ * post-command projection instead arrives through the normal channels (a live
+ * follow effort edge, the routine list poll) and settles through the strict
+ * fallback before the deadline; otherwise the request ends in the explicit
+ * "unconfirmed" outcome — never a silent pending.
+ */
+const EFFORT_UNCONFIRMED_BOUND_MS = 15_000;
+
+/**
+ * c-effortread r15 item 1: whether current activity evidence says a queued
+ * effort request is STILL waiting to leave the driver queue. The driver
+ * executes a queued switch only once the agent is Idle/Done AND
+ * interactive_ready — a session parked on a PermissionRequest/Elicitation
+ * reports `waiting-interaction` and is just as unrunnable as a `working`
+ * one (crates/remuda-driver/src/pty_interaction.rs, effort.rs queue worker).
+ * Treating waiting-interaction as idle initialised the execution deadline
+ * immediately, so a request could end "unconfirmed" while the driver was
+ * still waiting to type it. Only authoritative idle evidence anchors the
+ * deadline (see {@link HubStore.emit}'s queue-exit fold).
+ */
+function effortAwaitsQueueExit(activity: Instance["activity"] | undefined): boolean {
+  return (
+    activity?.state === "known" &&
+    (activity.value === "working" || activity.value === "waiting-interaction")
+  );
+}
+
+/**
+ * c-effortread r15 item 3 / r16 item 5: whether an incoming `effort-queued`
+ * lifecycle edge is provably NEWER than the lifecycle-owned pending's own
+ * queued edge. The primary order is the millisecond observedAt; protocol
+ * timestamps have millisecond resolution (crates/remuda-protocol scalar
+ * Timestamp), so two edges emitted within one millisecond tie and fall back
+ * to the journal SEQ — the hub's total order (later seq wins, an older/equal
+ * seq never replaces). Callers must have validated both timestamps finite.
+ */
+function lifecycleEdgeIsNewer(
+  incomingMs: number,
+  incomingSeq: string,
+  establishedMs: number,
+  establishedSeq: string,
+): boolean {
+  if (incomingMs > establishedMs) return true;
+  if (incomingMs < establishedMs) return false;
+  try {
+    return BigInt(incomingSeq) > BigInt(establishedSeq);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Bulk screen reads fan out one per listed row; cap the fan-out so even a long
@@ -214,6 +414,64 @@ function permissionLifecycleStatus(status: unknown):
 
 const PERMISSION_PENDING_MAX_AGE_MS = 30 * 60_000;
 
+/**
+ * Predict the EXACT word the driver types for a live configure
+ * (c-effortui r4 item 3; mirrors remuda-driver `EffortRequest::for_configure`).
+ * The driver journals the typed command word in its queued/applied/degraded
+ * lifecycle; on decoupled builds a TIER move that carries the flag
+ * (`{max,true}`) is typed as the plain level (`/effort max` leaves the ortho
+ * flag untouched), so a flag-ON pending can legitimately carry a level
+ * lifecycle word. Same observed tier + flag change → `ultracode on|off`;
+ * a tier move → the level word; coupled flag-on → `ultracode`.
+ */
+function predictDriverCommandWord(
+  effort: EffortSelection,
+  axis: EffortAxis,
+  instance: Instance | undefined,
+  state: HubState,
+  instanceId: Id,
+): string {
+  const kind = instance?.kind ?? "claude";
+  if (kind !== "claude") return effort.name;
+  // c-effortui r5 item 3: mirror effortVersionGate's carrier lock — a
+  // shell-pty driver never types the ultracode words; its predictor is always
+  // the plain level (the shell-pty carrier fails flag-on configure itself).
+  if (instance?.driver === "shell-pty") return effort.name;
+  // Snapshot reported version first, then the host's pinned CLI (the store's
+  // documented source order), mirroring HubStore.effortVersionGate.
+  const hostId =
+    instance?.hostId ??
+    state.instances.find((row) => row.id === instanceId)?.hostId;
+  const host = state.hosts.find((h) => h.id === hostId);
+  const reported = instance?.capabilities?.binaryVersion;
+  const gate = claudeVersionGate(reported ?? hostClaudeVersion(host) ?? "");
+  if (gate === "coupled" && effort.ultracode) return "ultracode";
+  if (gate === "decoupled") {
+    // c-effortread r9 item 6: an explicit FLAG axis is the orthogonal toggle
+    // even at a cold start (no proven tier needed) — the driver executes
+    // exactly that word. An explicit TIER axis is the plain level. Only a
+    // legacy request (no axis) falls back to same-tier provenance.
+    if (axis === "flag") {
+      return effort.ultracode ? "ultracode on" : "ultracode off";
+    }
+    if (axis === "tier") return effort.name;
+    // c-effortui r5 item 2: mirror the driver's provenance fallback —
+    // observed effective, optimistic selection, then the durable instance
+    // record (effortName/effortUltracode) — so a session opened on another
+    // device / created outside this tab predicts the same word the driver
+    // types (driver: bridge.observed() ?? requested()).
+    const currentLevel =
+      state.effortEffective[instanceId]?.name ??
+      state.effort[instanceId]?.name ??
+      instance?.effortName ??
+      null;
+    if (currentLevel === effort.name) {
+      return effort.ultracode ? "ultracode on" : "ultracode off";
+    }
+  }
+  return effort.name;
+}
+
 /** Parse an `instance.configure` effort lifecycle status the driver journals. */
 function effortLifecycleStatus(status: unknown):
   | { kind: "queued" | "applied" | "degraded"; word: string; reason: string }
@@ -237,6 +495,109 @@ function effortLifecycleStatus(status: unknown):
     };
   }
   return null;
+}
+
+/**
+ * Map a lifecycle word onto the two request axes. The driver (D-056) journals
+ * the level word (`max`), the coupled bare word (`ultracode`), or the
+ * decoupled toggle word (`ultracode on` / `ultracode off` — space form, the
+ * actual command; legacy `:`/`-` separators accepted too). Only axes the word
+ * actually names are returned, so a stale lifecycle for a replaced request
+ * can never match the new one.
+ */
+function effortLifecycleRequest(word: string): EffortLifecycleRequest {
+  // Normalize the toggle spelling: "ultracode on/off" with any single
+  // separator (the command itself uses a space) → "ultracode:on|off".
+  const normalized = word.trim().toLowerCase().replace(/^ultracode[\s:_-]+(on|off)$/, "ultracode:$1");
+  // c-effortread r15 item 2: the BARE word is the coupled build's xhigh-tier
+  // command WITH the flag (D-056, driver `EffortRequest::from_level`), not a
+  // flag-only toggle. Returning only {ultracode:true} targeted the default
+  // high tier and a fresh {xhigh, on} read-back could never settle it. The
+  // normalized "ultracode:on" (the decoupled toggle) moves the flag only.
+  if (normalized === "ultracode") {
+    return { name: "xhigh", ultracode: true };
+  }
+  if (normalized === "ultracode:on") {
+    return { ultracode: true };
+  }
+  if (normalized === "ultracode:off") {
+    return { ultracode: false };
+  }
+  return { name: normalized };
+}
+
+/**
+ * Deduplicate an emitted lifecycle edge by request nonce when the wire
+ * carries one (c-effortread r9 item 8). The driver/fake-node may echo the
+ * client nonce on configure statuses; until one is plumbed through this
+ * matcher is axis-value based.
+ */
+type EffortLifecycleKind = "queued" | "applied" | "degraded";
+
+/** Whether a lifecycle word is an ultracode switch word (bare or toggle).
+ *  c-effortui r5 item 2: accept any separator the driver journals — the
+ *  actual command space form (`ultracode on`), plus `:`/`_`/`-`. */
+function lifecycleNamesUltraWord(word: string): boolean {
+  const n = word.trim().toLowerCase();
+  return n === "ultracode" || /^ultracode[\s:_-]+(on|off)$/.test(n);
+}
+
+/**
+ * Whether a parsed lifecycle word refers to the in-flight request.
+ *
+ * c-effortread r9 item 8: queued/applied must match the request's EXACT
+ * identity — comparing the parsed ON/OFF flag value and tier against the
+ * pending request. A delayed `ultracode off` applied for a replaced request A
+ * must never delete newer request B's `ultracode on` indicator (the old
+ * matcher accepted it because B carried ultracode:true). Only genuine
+ * ultracode REFUSALS/degradations get the looser carrying-word matching,
+ * since refusal evidence is process-local, not request-scoped.
+ */
+function effortLifecycleMatches(
+  pending: EffortPending,
+  word: string,
+  kind: EffortLifecycleKind,
+): boolean {
+  const normalized = word.trim().toLowerCase();
+  // A REFUSAL/DEGRADATION names the ultracode SWITCH and may concern a flag
+  // carried on a plain tier command: keep the looser carrying-word rule for
+  // it only. The outer handler additionally treats refusal evidence as
+  // process-local and must not clear a non-matching pending via this result.
+  if (kind === "degraded") {
+    if (
+      pending.commandWord !== null &&
+      (normalized === pending.commandWord ||
+        (pending.commandWord.startsWith("ultracode ") && normalized === "ultracode") ||
+        (pending.ultracode && lifecycleNamesUltraWord(normalized)))
+    ) {
+      return true;
+    }
+  } else if (pending.commandWord !== null) {
+    // Exact predicted command word only — no flag-carries cross-matching.
+    return normalized === pending.commandWord;
+  }
+  // Wire-owned / synthesized pending (no client predicted word): compare the
+  // parsed ON/OFF VALUE and tier against the request identity.
+  const request = effortLifecycleRequest(word);
+  const bareCoupled = normalizedWordIsBareUltracode(word);
+  if (request.name !== undefined) {
+    if (request.name !== pending.name) return false;
+    // A plain level word asserts nothing about the flag, so it cannot
+    // identify a pending that moves the flag — the bare coupled word
+    // asserts BOTH axes (r15 item 2), so it is exempt.
+    if (request.ultracode === undefined && pending.ultracode && !bareCoupled) {
+      return false;
+    }
+  }
+  if (request.ultracode !== undefined) {
+    if (request.ultracode !== pending.ultracode) return false;
+    if (bareCoupled && pending.name !== "xhigh") return false;
+  }
+  return request.name !== undefined || request.ultracode !== undefined;
+}
+
+function normalizedWordIsBareUltracode(word: string): boolean {
+  return word.trim().toLowerCase() === "ultracode";
 }
 
 /**
@@ -368,6 +729,21 @@ export type HubState = {
   effort: Record<string, EffortSelection>;
   /** §9.1 transcript-read-back effective effort per instance; absent = `?`. */
   effortEffective: Record<string, EffortEffectiveView>;
+  /** D-056 §5 refusal that keeps the ultracode switch disabled. */
+  effortRefusal: Record<string, UltraRefusal>;
+  /** Per-instance nonces so a replaced request can't be settled by stale events. */
+  effortNonces: Record<string, number>;
+  /** GET /v1/supply/catalog rows (per-model default + ultracode capability). */
+  supplyCatalog: ModelEffortCatalogRow[] | null;
+  /** r7 item 4(a) / c-effortread r8 item 1: per-instance read-back WITHDRAWAL
+   *  WATERMARK — the parsed observedAt of the latest `readbackAvailable:false`
+   *  edge (or Hub projection level→null). Any level view at or OLDER than the
+   *  watermark is rejected (a "Load earlier" older edge cannot restore a
+   *  withdrawn level); only a strictly newer valid view clears it. Absent =
+   *  not withdrawn. Distinct from "never read back": a pending push-down
+   *  renders `?` only while a watermark exists, never merely because no edge
+   *  arrived. */
+  effortReadbackWithdrawn: Record<string, string>;
   /** context-usage-1 Hub-computed token/context rollup per instance.
    *  Hydrated separately from `instances` for the same reason effort is:
    *  mergeInstanceSnapshots keeps the local instance while its
@@ -420,6 +796,10 @@ const initial: HubState = {
   permissionMode: {},
   effort: {},
   effortEffective: {},
+  effortRefusal: {},
+  effortNonces: {},
+  supplyCatalog: null,
+  effortReadbackWithdrawn: {},
   usageRollup: {},
   effortPending: {},
   permissionEffective: {},
@@ -659,6 +1039,15 @@ class HubStore {
   private journals = new Map<Id, JournalClient>();
   private subs = new Map<Id, Id>();
   /**
+   * c-effortread r9 e2e seam only: instanceId → resolvers notified once the
+   * follow socket has delivered at least one contiguous live batch PAST the
+   * bounded seed cursor (so a configure posted afterwards cannot be absorbed
+   * into the snapshot as replay). Populated solely by
+   * `waitForFollowCaughtUpForTest`, which no-ops unless the e2e marker is set.
+   */
+  private followCaughtUp = new Map<Id, Set<(seq: string) => void>>();
+  private followCaughtUpSeq = new Map<Id, string>();
+  /**
    * §9.1: instanceId → effective `observedAt` of a push-down the durable Hub
    * projection settled before its live follow frame arrived. The matching live
    * observation must STILL be treated as our own push-down (leave the slider
@@ -666,6 +1055,43 @@ class HubStore {
    * terminal-side switch that would fold the slider to the clamped level.
    */
   private settledEffortPushdown = new Map<Id, string>();
+  /**
+   * c-effortread r18 item 2 / r19 item 1: instanceId → this session driver's
+   * known id-capability, persisted ACROSS requests. Absent is "unknown". Only
+   * an edge carrying a real own-id echo upgrades the session to "id-capable",
+   * monotonically. An id-less lifecycle proves NOTHING (the current driver
+   * emits one whenever the configure omitted its optional requestId — e.g.
+   * another client), so it can never mark, settle, or downgrade the session:
+   * unknown requests fail closed on their own id evidence or their bounded
+   * unconfirmed path.
+   */
+  private effortDriverId = new Map<Id, EffortDriverIdCapability>();
+
+  /** The session driver's known id-capability ("unknown" until own-id proof). */
+  effortIdCapability(instanceId: Id): EffortDriverIdCapability {
+    return this.effortDriverId.get(instanceId) ?? "unknown";
+  }
+
+  /**
+   * Record one piece of per-session driver id evidence. Only an edge carrying
+   * a real effort request id proves the driver id-capable (monotonic); an
+   * id-less edge is ignored. Returns the resulting capability.
+   */
+  private noteEffortDriverId(
+    instanceId: Id,
+    carriesId: boolean,
+  ): EffortDriverIdCapability {
+    if (carriesId) this.effortDriverId.set(instanceId, "id-capable");
+    return this.effortDriverId.get(instanceId) ?? "unknown";
+  }
+  /**
+   * The effortEffective each instance carried on the LAST Hub poll (null =
+   * polled but absent, absent from the map = never polled). r6 item 6: a poll
+   * withdraws the live projection only when a previously seen HUB record
+   * becomes null — an unrelated lifecycle write that advances updatedAt while
+   * the Hub never projected effort must not make the chip render "?".
+   */
+  private polledEffort = new Map<Id, EffortEffectiveView | null>();
   private bootGen = 0;
   /**
    * List-fetch sequencing: every refresh() takes a monotonically increasing
@@ -749,6 +1175,16 @@ class HubStore {
   private settlementRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   /** Dev/observability: how many settlement frames THIS store handled. */
   private settlementCount = 0;
+  /**
+   * c-effortread r12 item 5: per-instance bounded reconciliation timers for
+   * client effort requests, keyed by instance and owned by their nonce. A
+   * newer request replaces the slot (the old timer is cancelled); a settled
+   * request's timer fires into a no-op.
+   */
+  private effortReconcileTimers = new Map<
+    Id,
+    { nonce: number; timer: ReturnType<typeof setTimeout> }
+  >();
 
   subscribe = (listener: Listener) => {
     this.listeners.add(listener);
@@ -760,8 +1196,188 @@ class HubStore {
   getSnapshot = () => this.state;
 
   private emit(patch: Partial<HubState>) {
-    this.state = { ...this.state, ...patch };
+    // c-effortread r13 item 2/3, r14 item 2: current activity evidence (live
+    // follow native turn events or full-instance entity snapshots) is the ONLY
+    // authority on when a queued effort request can actually run. A pending
+    // stamped while a turn was running waits for the next idle evidence; at
+    // that instant the exact nonce-guarded pending gets its reconciliation
+    // bound anchored (a client pending also drops the chip's 排队中 flag — its
+    // immutable send-time snapshot could not track this; a wire pending keeps
+    // the driver-provided queue word). Everything happens inside the same
+    // emission so listeners never see split state.
+    //
+    // r14 item 2: the exit is ANY transition of authoritative activity TO
+    // idle, not only a direct working → idle. The production turn end can be
+    // working → waiting-interaction → idle (PermissionRequest/Elicitation
+    // then Stop/StopFailure), and the previous activity may be unknown when a
+    // fresh idle snapshot is the first evidence this store sees. Requiring
+    // prev === "working" left a silent accepted legacy no-op pending until
+    // the 30-minute max age; anchor the deadline whenever a nonce-owned
+    // pending is still awaiting its queue exit and activity is now idle
+    // (idle → idle emissions are no-ops: such a pending already carries its
+    // anchor, and a request can only be queued while a turn was running).
+    let queueExits: Map<Id, number> | null = null;
+    if (patch.instances) {
+      for (const next of patch.instances) {
+        if (next.activity?.state !== "known" || next.activity.value !== "idle") continue;
+        const pending = this.state.effortPending[next.id];
+        if (pending && pending.leftQueueAt == null) {
+          (queueExits ??= new Map()).set(next.id, pending.nonce);
+        }
+      }
+    }
+    let merged = patch;
+    if (queueExits?.size) {
+      const atExit = Date.now();
+      const pendingNext = { ...(patch.effortPending ?? this.state.effortPending) };
+      for (const [id, nonce] of queueExits) {
+        const pending = pendingNext[id];
+        if (!pending || pending.nonce !== nonce || pending.leftQueueAt != null) {
+          queueExits.delete(id);
+          continue;
+        }
+        pendingNext[id] = {
+          ...pending,
+          leftQueueAt: atExit,
+          // Only the client's optimistic snapshot tracks the chip word from
+          // local activity; a wire pending's queued state is driver-provided.
+          ...(pending.source === "client" ? { queued: false } : {}),
+        };
+      }
+      if (queueExits.size) merged = { ...patch, effortPending: pendingNext };
+    }
+    // c-effortread r17 item 2: later busy evidence (working or
+    // waiting-interaction) — in the SAME follow batch as an earlier idle
+    // snapshot, or in any later emission — re-queues the request behind a turn
+    // or a parked interaction. The per-event fold stamps leftQueueAt and arms
+    // the 15 s timer on EACH idle snapshot; without this symmetric fold a batch
+    // shaped [idle snapshot, busy snapshot] left the timer armed, and it fired
+    // an unconfirmed toast while the driver was still blocked. Withdraw the
+    // stamp and cancel THAT nonce's timer; the next authoritative idle
+    // re-stamps leftQueueAt (above) and re-arms the full window.
+    let queueReentries: Map<Id, number> | null = null;
+    if (merged.instances) {
+      const pendingBase = merged.effortPending ?? this.state.effortPending;
+      for (const next of merged.instances) {
+        if (!effortAwaitsQueueExit(next.activity)) continue;
+        const pending = pendingBase[next.id];
+        if (pending && pending.leftQueueAt != null) {
+          (queueReentries ??= new Map()).set(next.id, pending.nonce);
+        }
+      }
+    }
+    if (queueReentries?.size) {
+      const base = merged.effortPending ?? this.state.effortPending;
+      const pendingNext = { ...base };
+      for (const [id, nonce] of queueReentries) {
+        const pending = pendingNext[id];
+        if (!pending || pending.nonce !== nonce || pending.leftQueueAt == null) {
+          queueReentries.delete(id);
+          continue;
+        }
+        pendingNext[id] = {
+          ...pending,
+          leftQueueAt: null,
+          // The optimistic chip re-enters 排队中 for a client request; a wire
+          // pending already carries the driver-provided queue word.
+          ...(pending.source === "client" ? { queued: true } : {}),
+        };
+        const slot = this.effortReconcileTimers.get(id);
+        if (slot?.nonce === nonce) {
+          clearTimeout(slot.timer);
+          this.effortReconcileTimers.delete(id);
+        }
+      }
+      if (queueReentries.size) merged = { ...merged, effortPending: pendingNext };
+    }
+    this.state = { ...this.state, ...merged };
     for (const listener of this.listeners) listener();
+    // Re-arm the request-owned bound for every request that just left its
+    // queue (full window from the idle instant, same nonce ownership rules).
+    if (queueExits?.size) {
+      for (const [id, nonce] of queueExits) this.armEffortReconciliation(id, nonce);
+    }
+  }
+
+  /**
+   * Apply one newer effective projection to an in-flight request, settling the
+   * axes the projection actually confirms (D-056: level and flag are separate
+   * reads). Returns the updated pending entry, or null when BOTH axes have
+   * settled and the indicator must be cleared.
+   *
+   * Request identity (c-effortread r10 items 1–4 / r19 item 1 ruling A) — a
+   * pending request is settled ONLY by a requested echo carrying THIS
+   * request's id (the driver echoed the configure nonce):
+   *  1. an echo that carries ANOTHER id names a replaced request and is
+   *     rejected outright — matching tier or a newer clock can never promote
+   *     it;
+   *  2. an ID-LESS projection settles NOTHING, however fresh or well matched.
+   *     A missing id is not legacy-driver evidence: the current driver emits
+   *     an id-less lifecycle whenever the configure omitted its optional
+   *     requestId (another client), so an unknown session fails closed and
+   *     waits for its own id evidence or its bounded unconfirmed path. A
+   *     clamped or opposite outcome is therefore settled (and rendered as the
+   *     delivered mismatch) only from the request's own id echo.
+   */
+  private settleEffortAxes(
+    instanceId: Id,
+    pending: EffortPending,
+    view: EffortEffectiveView,
+    requestedEcho?: { name?: string; ultracode?: boolean; requestId?: string },
+  ): EffortPending | null {
+    const echoId =
+      typeof requestedEcho?.requestId === "string" && requestedEcho.requestId.trim()
+        ? requestedEcho.requestId
+        : null;
+    // An echo that explicitly names ANOTHER request is never ours.
+    const namesOtherRequest = echoId !== null && echoId !== pending.requestId;
+    const echoNamesThisRequest = echoId !== null && echoId === pending.requestId;
+    // c-effortread r11 item 2: an echo carrying a different request id is an
+    // explicit veto — return the pending UNCHANGED, however many axes were
+    // already settled (and so an untouched-but-settled axis can never combine
+    // with it into the `levelSettled && flagSettled` clear).
+    if (namesOtherRequest) return pending;
+
+    const movesBothEcho = pending.commandWord === "ultracode";
+    const movesLevel = movesBothEcho || pending.axis !== "flag";
+    const movesFlag = movesBothEcho || pending.axis === "flag";
+
+    // An echo naming THIS request is itself id-capability proof for the whole
+    // session (e.g. the verdict echo arrives before the queued edge was
+    // folded). Record it before any settlement return so even a request fully
+    // settled by this echo upgrades the session and every later request fails
+    // closed on id-less projections.
+    const ownEcho = echoNamesThisRequest;
+    if (ownEcho) this.noteEffortDriverId(instanceId, true);
+    // c-effortread r19 item 1: with the legacy capability gone there is no
+    // id-less echo matcher and no value fallback — only THIS request's own id
+    // echo settles. Everything else leaves the pending untouched (the bounded
+    // unconfirmed path ends an unknown request that never gets own-id proof).
+    const ours = ownEcho;
+
+    let { levelSettled, flagSettled } = pending;
+    if (ours && !levelSettled && movesLevel) {
+      // An echo that names this request settles the level even on a clamped
+      // value (it is rendered as the delivered mismatch).
+      levelSettled = true;
+    }
+    if (ours && !flagSettled && movesFlag) {
+      const definitive = effortFlagSettles(view.ultracode);
+      // A definitive flag value from our own verdict settles (an opposite
+      // value is the delivered refusal).
+      if (definitive) {
+        flagSettled = true;
+      }
+    }
+    if (ours && (levelSettled || flagSettled)) {
+      this.settledEffortPushdown.set(instanceId, view.observedAt);
+    }
+    if (levelSettled && flagSettled) return null;
+    const idCapability = ownEcho ? "id-capable" : pending.idCapability;
+    if (idCapability === pending.idCapability) {
+      return { ...pending, levelSettled, flagSettled };
+    }
+    return { ...pending, levelSettled, flagSettled, idCapability };
   }
 
   /**
@@ -773,61 +1389,127 @@ class HubStore {
    * (the client goes `readonly-stale` under load) or a late page attach only
    * reaches us through this poll/refresh path — without settling here the chip
    * would stay on 切换中 forever even though the Hub record already carries
-   * the new level. Only a projection strictly newer than the level the
-   * push-down started from settles, so a queued (working) switch is not
-   * cleared by a poll returning the unchanged baseline.
+   * the new level. Each axis needs a projection strictly newer than the
+   * request threshold, so a queued (working) switch and a replaced request's
+   * stale projection are never cleared by the wrong read-back.
    */
   private hydrateEffortEffective(instances: Instance[]) {
     const next = { ...this.state.effortEffective };
+    const withdrawnNext = { ...this.state.effortReadbackWithdrawn };
     const pendingNext = { ...this.state.effortPending };
     let effectiveUpdated = false;
-    let pendingSettled = false;
+    let pendingChanged = false;
     for (const instance of instances) {
+      const id = instance.id;
       const view = effectiveFromRecord(instance.effortEffective);
-      if (!view) continue;
-      const current = next[instance.id];
-      const foldsEffective =
-        !current ||
-        view.observedAt > current.observedAt ||
-        (view.observedAt === current.observedAt && !structuralEqual(current, view));
-      // Pending settlement is evaluated INDEPENDENTLY of whether the effective
-      // record itself changes. The live socket may already have folded an
-      // equal effective while a historical queued-effort replay (onPrepend)
-      // still carries pending: an identical poll must then clear pending even
-      // though the effective map does not change.
-      const pending = this.state.effortPending[instance.id];
-      // Clear a queued switch only on a read-back at least as new as the
-      // queued request (c-perffu r7): a projection newer than the pre-switch
-      // baseline but older than the configure request is a stale poll and must
-      // leave the pending switch in place. An optimistic (unjournaled)
-      // pending with no request timestamp keeps the baseline-only rule.
-      const settlesPending =
-        pending != null &&
-        (pending.requestObservedAt != null
-          ? view.observedAt >= pending.requestObservedAt &&
-            (!pending.baselineObservedAt || view.observedAt > pending.baselineObservedAt)
-          : !pending.baselineObservedAt || view.observedAt > pending.baselineObservedAt);
-      if (foldsEffective) {
-        // Fold only on a strictly newer observation, or an equal-timestamp
-        // record whose content actually changed — an identical fold is not an
-        // emission (c-perffu: quiet polls render nothing).
-        next[instance.id] = view;
+      const previousPoll = this.polledEffort.get(id);
+      // c-effortread r9 item 7: never let a rejected view advance polled
+      // state. A null poll below sets it to null WITHOUT overwriting the
+      // stored T1 projection, and a watermarked view below continues; storing
+      // either first let a later null lower the watermark and let the rejected
+      // view compare against itself.
+      let pollAccepted = true;
+      if (!view) {
+        // r7 item 4(a): distinguish "the Hub projection went from a level to
+        // null" (an explicit withdrawal) from "never projected". The pending
+        // chip shows `?` only for the former.
+        if (previousPoll) {
+          // c-effortread r8 item 1 / r9 item 7: the watermark is the max of
+          // the previous projection's observedAt and any live edge already
+          // recorded (a readbackAvailable:false can land between polls) —
+          // never lower it. The null record carries no timestamp.
+          const liveWatermark = withdrawnNext[id];
+          const stamp = (() => {
+            const candidates = [previousPoll.observedAt || "", liveWatermark ?? ""].filter(Boolean);
+            return candidates.reduce<string>(
+              (newest, ts) =>
+                newest && Date.parse(newest) > Date.parse(ts) ? newest : ts,
+              "",
+            );
+          })();
+          if (liveWatermark == null) withdrawnNext[id] = stamp || "";
+          else withdrawnNext[id] = stamp || liveWatermark;
+          delete next[id];
+          effectiveUpdated = true;
+        }
+        this.polledEffort.set(id, view);
+        continue;
+      }
+      // c-effortread r8 item 1: a poll carrying a view at or older than the
+      // withdrawal watermark is stale (an in-flight poll with the
+      // pre-withdrawal record) — keep the projection withdrawn, do not clear
+      // the marker or move the slider.
+      const watermark = withdrawnNext[id];
+      if (watermark != null && (!view.observedAt || Date.parse(view.observedAt) <= Date.parse(watermark))) {
+        pollAccepted = false;
+        continue;
+      }
+      // A strictly newer real projection clears the withdrawal watermark.
+      if (withdrawnNext[id] != null) {
+        delete withdrawnNext[id];
         effectiveUpdated = true;
       }
-      if (settlesPending) {
-        delete pendingNext[instance.id];
-        pendingSettled = true;
-        // Remember the read-back that settled it so the same edge arriving
-        // later on the live socket is not mistaken for a terminal switch.
-        this.settledEffortPushdown.set(instance.id, view.observedAt);
+      const current = next[id];
+      // Compare PARSED instants: a same-second write with a different
+      // fractional-second spelling must not look older or newer by string.
+      if (!current || Date.parse(view.observedAt) >= Date.parse(current.observedAt)) {
+        next[id] = view;
+        effectiveUpdated = true;
+        const pending = this.state.effortPending[id];
+        if (pending) {
+          const updated = this.settleEffortAxes(id, pending, view);
+          if (updated) pendingNext[id] = updated;
+          else delete pendingNext[id];
+          pendingChanged = true;
+        }
+        // A positive switch read-back clears the refusal only for the model
+        // the refusal was bound to (same scoping as the live path).
+        if (view.ultracode === true && this.positiveFlagClearsEffortRefusal(id)) {
+          this.clearEffortRefusal(id);
+        }
       }
+      // c-effortread r9 item 7: advance polled state only for an ACCEPTED
+      // view, so a rejected watermarked view is never later compared against
+      // itself and a following null still sees the pre-withdrawal projection.
+      if (pollAccepted) this.polledEffort.set(id, view);
     }
-    if (effectiveUpdated || pendingSettled) {
+    if (effectiveUpdated || pendingChanged) {
       this.emit({
-        ...(effectiveUpdated ? { effortEffective: next } : {}),
-        ...(pendingSettled ? { effortPending: pendingNext } : {}),
+        ...(effectiveUpdated
+          ? { effortEffective: next, effortReadbackWithdrawn: withdrawnNext }
+          : {}),
+        ...(pendingChanged ? { effortPending: pendingNext } : {}),
       });
     }
+  }
+
+  /** Best-known current model for an instance: the transcript read-back, then
+   *  the optimistic picker selection, then the launch spec's model. */
+  private currentEffortModelId(instanceId: Id): string | null {
+    const fromMap =
+      this.state.modelEffective[instanceId]?.id ?? this.state.models[instanceId] ?? null;
+    if (fromMap) return fromMap;
+    const instance = this.state.instances.find((row) => row.id === instanceId);
+    return instance?.model ? String(instance.model) : null;
+  }
+
+  /** Whether a positive ultracode read-back clears THIS refusal (c-effortui r3
+   *  item 4): a process-scoped refusal always clears; a model-scoped one only
+   *  on positive evidence for the model it was bound to. A null-bound refusal
+   *  (older rows / direct seeds) is never auto-cleared. */
+  private positiveFlagClearsEffortRefusal(instanceId: Id): boolean {
+    const refusal = this.state.effortRefusal[instanceId];
+    if (!refusal) return false;
+    if (refusal.scope !== "model") return true;
+    if (refusal.modelId == null) return false;
+    return refusal.modelId === this.currentEffortModelId(instanceId);
+  }
+
+  private clearEffortRefusal(instanceId: Id) {
+    if (!this.state.effortRefusal[instanceId]) return;
+    const refusal = { ...this.state.effortRefusal };
+    delete refusal[instanceId];
+    this.emit({ effortRefusal: refusal });
   }
 
   /** context-usage-1: fold Hub-computed usage rollups from polled instances
@@ -1005,51 +1687,133 @@ class HubStore {
   }
 
   /** Apply one transcript-read-back effort observation to the live map.
-   *  Settles any pending push-down and, when the change came from the
-   *  terminal side, moves the slider to the observed stop (single source of
-   *  truth; never calls configure, so no push-down ping-pong). */
-  private noteEffortObservation(instanceId: Id, observation: Observation): boolean {
+   *  Settles the in-flight request per-axis and, when the change came from the
+   *  terminal side, moves the slider/switch to the observed axes (single
+   *  source of truth; never calls configure, so no push-down ping-pong).
+   *
+   *  `live` = false for replayed history (reconnect/catch-up): it HYDRATES
+   *  effective state only and never settles/clears a pending, folds the
+   *  optimistic selection, records or clears a refusal, or toasts (D-056 r2). */
+  private noteEffortObservation(instanceId: Id, observation: Observation, live = true): boolean {
     const parsed = effectiveFromObservation(observation);
     if (!parsed) return false;
+    // D-056 (4) read-back-unavailable edge: the driver withdrew the
+    // projected level/flag (a verified resume became unverifiable). Clear the
+    // live projection so the chip renders `?`, but do NOT settle or delete the
+    // pending switch and do not move the optimistic slider — the configure
+    // outcome (or its bounded timeout) owns the pending indicator.
+    if (parsed.withdrawn) {
+      const at = parsed.observedAt ?? null;
+      const held = this.state.effortEffective[instanceId];
+      // r6 item 8(a): a withdrawal arriving out of order (e.g. via
+      // "Load earlier" AFTER a later valid edge M) is older history and must
+      // not delete the newer projection.
+      if (held && at && Date.parse(at) < Date.parse(held.observedAt)) {
+        return false;
+      }
+      // c-effortread r8 item 1: raise/keep the watermark even when nothing is
+      // currently held (reload with withdrawal in seed history, or an earlier
+      // edge already cleared the projection), so a following OLDER level edge
+      // (onPrepend replay, in-flight poll with the pre-withdrawal record) can
+      // never re-project a withdrawn level.
+      const watermarks = this.state.effortReadbackWithdrawn;
+      const previous = watermarks[instanceId];
+      if (at && previous && Date.parse(at) <= Date.parse(previous)) {
+        // An older withdrawal changes nothing further; still clear a stale
+        // projection if one exists.
+        if (!held) return true;
+      }
+      const effortEffective = { ...this.state.effortEffective };
+      delete effortEffective[instanceId];
+      const nextWatermarks = { ...watermarks, [instanceId]: at ?? previous ?? "" };
+      this.emit({ effortEffective, effortReadbackWithdrawn: nextWatermarks });
+      return true;
+    }
+    const view = parsed.effective;
+    if (!view) return false;
     const current = this.state.effortEffective[instanceId];
-    if (current && parsed.effective.observedAt < current.observedAt) return false;
+    if (current && Date.parse(view.observedAt) < Date.parse(current.observedAt)) return false;
+    // c-effortread r8 item 1: reject any level view at or OLDER than the
+    // withdrawal watermark — an older edge replayed via "Load earlier" (or an
+    // in-flight poll carrying the pre-withdrawal record) must not restore the
+    // withdrawn level. Only a strictly newer view clears the watermark.
+    const withdrawnAt = this.state.effortReadbackWithdrawn[instanceId];
+    if (withdrawnAt != null) {
+      if (!view.observedAt || Date.parse(view.observedAt) <= Date.parse(withdrawnAt)) {
+        return false;
+      }
+    }
+    const withdrawnClear = withdrawnAt != null;
     const patch: Partial<HubState> = {
       effortEffective: {
         ...this.state.effortEffective,
-        [instanceId]: parsed.effective,
+        [instanceId]: view,
       },
+      ...(withdrawnClear
+        ? {
+            effortReadbackWithdrawn: (() => {
+              const next = { ...this.state.effortReadbackWithdrawn };
+              delete next[instanceId];
+              return next;
+            })(),
+          }
+        : {}),
     };
+
+    // Replayed history is read-only with respect to request-scoped state.
+    if (!live) {
+      this.emit(patch);
+      return true;
+    }
+
+    // A positive switch read-back clears the refusal only on positive evidence
+    // for the model it was bound to (a model-scoped refusal for another model
+    // survives; a null-bound refusal can never be auto-cleared — r2 §5).
+    if (view.ultracode === true && this.positiveFlagClearsEffortRefusal(instanceId)) {
+      patch.effortRefusal = { ...this.state.effortRefusal };
+      delete patch.effortRefusal[instanceId];
+    }
     const pending = this.state.effortPending[instanceId];
     const hydratedAt = this.settledEffortPushdown.get(instanceId);
     // "Ours" = a live push-down still pending, OR one the durable projection
     // already settled whose live frame is only now arriving (same read-back,
     // observedAt no newer than the one the poll folded).
-    const ours = Boolean(pending) || (hydratedAt != null && parsed.effective.observedAt <= hydratedAt);
+    const ours = Boolean(pending) || (hydratedAt != null && view.observedAt <= hydratedAt);
     if (ours) {
-      // Our own push-down settled: leave the slider where the user put it (the
-      // mismatch line renders if the native side clamped it).
       if (pending) {
-        patch.effortPending = { ...this.state.effortPending };
-        delete patch.effortPending[instanceId];
+        const updated = this.settleEffortAxes(
+          instanceId,
+          pending,
+          view,
+          parsed.requested || parsed.requestId
+            ? { ...parsed.requested, requestId: parsed.requestId }
+            : undefined,
+        );
+        if (updated) {
+          patch.effortPending = { ...this.state.effortPending, [instanceId]: updated };
+        } else {
+          patch.effortPending = { ...this.state.effortPending };
+          delete patch.effortPending[instanceId];
+        }
       }
       // Consume the marker once the matching (or an even newer) live edge for
       // our push-down arrives; a genuinely newer terminal switch (observedAt
       // past the marker) is handled in the else branch instead.
-      if (hydratedAt != null && parsed.effective.observedAt >= hydratedAt) {
+      if (hydratedAt != null && view.observedAt >= hydratedAt) {
         this.settledEffortPushdown.delete(instanceId);
       }
     } else {
-      // Terminal-side switch (or a level newer than any push-down we settled):
-      // the observed level is the truth — move the slider to it. This is local
-      // state only, so it cannot re-trigger a configure.
+      // Terminal-side switch (or an edge newer than any push-down we settled):
+      // the observed axes are the truth — move the slider and the switch. This
+      // is local state only, so it cannot re-trigger a configure.
       this.settledEffortPushdown.delete(instanceId);
       const instance = this.state.instances.find((row) => row.id === instanceId);
       const kind = (instance?.kind ?? "claude") as EffortKind;
       const selection = effortFromRecord(
         kind,
-        parsed.effective.name,
+        view.name,
         null,
-        parsed.effective.ultracode === true,
+        view.ultracode === true,
       );
       if (selection) {
         const stored = this.state.effort[instanceId];
@@ -1066,10 +1830,18 @@ class HubStore {
     return true;
   }
 
-  /** Fold one `instance.configure` effort lifecycle into the pending map. */
-  private noteEffortLifecycle(instanceId: Id, observation: Observation) {
+  /** Fold one `instance.configure` effort lifecycle into the pending map.
+   *  Replayed (`live=false`) lifecycles are ignored entirely: they never
+   *  queue, apply, degrade, toast, touch pending, or record a refusal. */
+  private noteEffortLifecycle(instanceId: Id, observation: Observation, live = true) {
+    if (!live) return;
     const payload = observation.payload as
-      | { type?: string; nativeName?: string; status?: unknown }
+      | {
+          type?: string;
+          nativeName?: string;
+          status?: unknown;
+          relatedIds?: Record<string, unknown> | null;
+        }
       | undefined;
     if (payload?.type !== "native" || payload.nativeName !== "instance.configure") return;
     // The journal persists status as a bare string; newer runs may wrap it.
@@ -1081,57 +1853,357 @@ class HubStore {
           : undefined;
     const parsed = effortLifecycleStatus(value);
     if (!parsed) return;
-    const pending = { ...this.state.effortPending };
+    // c-effortread r10: the driver echoes the configure's per-request id in
+    // the lifecycle's related-ids map. An edge carrying an id settles only the
+    // pending with the SAME id; an id-less edge falls back to the strict
+    // command-word/value matcher (older drivers, the e2e fake node).
+    const edgeRequestId =
+      payload.relatedIds && typeof payload.relatedIds === "object"
+        ? payload.relatedIds[EFFORT_REQUEST_ID_KEY]
+        : undefined;
+    const edgeId =
+      typeof edgeRequestId === "string" && edgeRequestId.trim() ? edgeRequestId : null;
+    const current = this.state.effortPending[instanceId];
+    // c-effortread r18 item 2 / r19 item 1: only an id-bearing lifecycle
+    // frame is per-SESSION capability evidence — it proves the driver echoes
+    // per-request ids (id-capable, monotonic). An id-less frame proves NOTHING:
+    // the current driver emits one whenever the configure omitted its OPTIONAL
+    // requestId (e.g. ANOTHER CLIENT), so the capability (and a fresh session)
+    // stays unknown and an unknown request keeps failing closed on its own id
+    // evidence. The fact persists across requests.
+    const frameCapability = this.noteEffortDriverId(instanceId, edgeId !== null);
+    if (current && current.idCapability !== frameCapability) {
+      // The pending snapshots the capability at arm time; keep the in-flight
+      // entry consistent with what this frame proved (an id-bearing frame
+      // upgrades an unknown pending to id-capable).
+      this.emit({
+        effortPending: {
+          ...this.state.effortPending,
+          [instanceId]: { ...current, idCapability: frameCapability },
+        },
+      });
+    }
+    // Whether a QUEUED edge belongs to the current pending: an id is
+    // authoritative; an id-less edge matches only a pending SYNTHESIZED FROM
+    // THE WIRE (a configure posted outside this UI) via the strict word/value
+    // matcher. c-effortread r12 item 2: applied/degraded edges never use this
+    // fallback — clearing and rollback require a non-empty matching id.
+    const edgeBelongsTo = (pending: EffortPending, kind: EffortLifecycleKind): boolean => {
+      if (edgeId !== null) return edgeId === pending.requestId;
+      return (
+        pending.source === "lifecycle" && effortLifecycleMatches(pending, parsed.word, kind)
+      );
+    };
+    // THIS request's queued edge timestamp. Parsed as an instant like every
+    // other observedAt comparison (r6 same-second fix).
+    const queuedThreshold =
+      typeof observation.observedAt === "string" && Number.isFinite(Date.parse(observation.observedAt))
+        ? observation.observedAt
+        : null;
     if (parsed.kind === "queued") {
-      // Preserve the baseline the push-down started from so the queued entry
-      // is settled only by a strictly newer read-back, not a poll returning
-      // the unchanged level.
-      pending[instanceId] = {
-        word: parsed.word,
-        queued: true,
-        at: pending[instanceId]?.at ?? Date.now(),
-        baselineObservedAt: pending[instanceId]?.baselineObservedAt ?? null,
-        // Stamp the request with THIS configure event's time; keep the
-        // earliest one if a queued switch re-announces. Settlement requires a
-        // read-back no older than the request.
-        requestObservedAt:
-          pending[instanceId]?.requestObservedAt ?? observation.observedAt,
-      };
-      this.emit({ effortPending: pending });
+      let current: EffortPending | undefined = this.state.effortPending[instanceId];
+      if (current) {
+        // A queued lifecycle belongs to the REQUEST in flight only. A late
+        // `effort-queued` for request A after the user replaced it with B
+        // carries a different id/axes and is dropped — it must never overwrite
+        // B's pending indicator nor stamp B's queued time (A→B race).
+        // c-effortread r19 item 1: an ID-LESS queued edge claims NOTHING and
+        // stamps nothing on a client request — a missing id is not legacy
+        // evidence (another client's configure omitted its requestId), and the
+        // id-less value fallback it used to bound is gone. It is simply
+        // dropped for a client-owned pending; a request settles only on its
+        // own id evidence or its bounded unconfirmed path.
+        if (!edgeBelongsTo(current, "queued")) {
+          // c-effortread r15 item 3: a PROVABLY NEWER queued lifecycle (its
+          // observedAt is strictly later in journal order than the pending's
+          // own queued stamp) replaces a LIFECYCLE-owned pending — the driver
+          // queue discards a replaced same-axis op, so the older request A
+          // never executes and an observer tracking it would wait for a
+          // verdict that never comes. The replacement gets the new edge's
+          // id/target/timing. A delayed OLDER edge (or an unusable/missing
+          // stamp on either side) is rejected: order unknown fails closed.
+          // Client-owned pendings and their nonce/afterReplacement
+          // protection never enter this path.
+          // c-effortread r16 item 5: protocol timestamps are milliseconds, so
+          // two queued lifecycles in the SAME millisecond tie on observedAt;
+          // the journal SEQ is the total order and a strictly later seq still
+          // proves the incoming edge newer, while an equal ms with an older or
+          // missing seq is rejected.
+          const incomingMs = queuedThreshold != null ? Date.parse(queuedThreshold) : Number.NaN;
+          const establishedMs =
+            current.queuedObservedAt != null ? Date.parse(current.queuedObservedAt) : Number.NaN;
+          const replacesLifecycle =
+            current.source === "lifecycle" &&
+            Number.isFinite(incomingMs) &&
+            Number.isFinite(establishedMs) &&
+            current.queuedSeq != null &&
+            lifecycleEdgeIsNewer(incomingMs, observation.seq, establishedMs, current.queuedSeq);
+          if (!replacesLifecycle) return;
+          // Fall through and synthesize the replacement pending from the
+          // newer edge exactly like a fresh observer-side create below.
+          current = undefined;
+        }
+      }
+      if (!current) {
+        // No client-side pending (the configure was posted outside the UI, or
+        // a newer lifecycle just replaced a lifecycle-owned pending): surface
+        // 排队中 from the lifecycle's own axes.
+        const request = effortLifecycleRequest(parsed.word);
+        const instance = this.state.instances.find((row) => row.id === instanceId);
+        const kind = (instance?.kind ?? "claude") as EffortKind;
+        const fallbackSelection =
+          effortFromRecord(kind, request.name ?? null, null, request.ultracode === true)
+          ?? effortAt(kind, DEFAULT_EFFORT_INDEX, request.ultracode === true);
+        const nonce = (this.state.effortNonces[instanceId] ?? 0) + 1;
+        const lowerWord = parsed.word.trim().toLowerCase();
+        const wireAxis: EffortAxis =
+          lifecycleNamesUltraWord(parsed.word) && lowerWord !== "ultracode" ? "flag" : "tier";
+        const wireMovesBoth = lowerWord === "ultracode";
+        const wireMovesLevel = wireMovesBoth || wireAxis !== "flag";
+        const wireMovesFlag = wireMovesBoth || wireAxis === "flag";
+        const existingView = this.state.effortEffective[instanceId];
+        // c-effortread r13 item 3: the observer tab owns no client send. The
+        // driver's `effort-queued` edge proves the request is queued (the chip
+        // keeps 排队中), but the bounded reconciliation is anchored on CURRENT
+        // activity evidence exactly like a client request: when the session is
+        // already idle at receipt the bound starts now (a backlogged edge / an
+        // accepted no-op); when a turn is running — or the session is parked
+        // on waiting-interaction (r15 item 1) — it starts at the next
+        // authoritative idle.
+        const busyNow = effortAwaitsQueueExit(instance?.activity);
+        const atCreate = Date.now();
+        // The wire lifecycle carries capability only when it bears an id
+        // (r18 item 2 / r19 item 1): an id-bearing queued edge proves
+        // id-capable; an id-less one (another client's configure) leaves the
+        // session unknown. This persists across requests (frameCapability was
+        // recorded at lifecycle entry).
+        const lifecycleCapability = frameCapability;
+        current = {
+          nonce,
+          requestId: edgeId ?? `lifecycle:${nonce}`,
+          // A decoupled toggle word moves the flag; a level word (and the
+          // coupled bare `ultracode`, which is the xhigh level command) moves
+          // the tier.
+          axis: wireAxis,
+          name: fallbackSelection.name,
+          ultracode: fallbackSelection.ultracode === true,
+          queued: true,
+          at: atCreate,
+          baselineObservedAt: existingView?.observedAt ?? null,
+          queuedObservedAt: queuedThreshold,
+          // r16 item 5: journal ordering provenance for equal-ms lifecycles.
+          queuedSeq: String(observation.seq),
+      // Axes this request does not move need no proof; every axis the
+      // request MOVES starts UNSETTLED even when the current projection
+      // already shows the requested value (c-effortread r11 item 2): a queued
+      // B targeting the old observation used to start settled and a later
+      // `levelSettled && flagSettled` cleared it on A's mismatching-id echo
+      // or an unchanged baseline poll. An accepted no-op is settled later by
+      // ITS OWN request-id echo.
+      levelSettled: !wireMovesLevel,
+      flagSettled: !wireMovesFlag,
+          source: "lifecycle",
+          // Synthesized from the driver's own queued word; the coupled bare
+          // word moves BOTH axes (r15 item 2): keep the word itself so
+          // own-id settlement knows the level and the flag are both in play.
+          commandWord: wireMovesBoth ? lowerWord : null,
+          afterReplacement: false,
+          // Capability proven by THIS queued edge: id-bearing → id-capable;
+          // an id-less wire lifecycle (another client) leaves it unknown.
+          idCapability: lifecycleCapability,
+          // Idle-at-receipt arms the bound immediately; a working session arms
+          // it from the working→idle evidence.
+          leftQueueAt: busyNow ? null : atCreate,
+        };
+        this.emit({ effortNonces: { ...this.state.effortNonces, [instanceId]: nonce } });
+      }
+      // Provenance (c-effortui r3 item 3 / r10 item 1): the queued stamp is
+      // THIS request's own queued-lifecycle observedAt, kept SEPARATE from the
+      // pre-request baseline. A duplicate queued edge keeps the same time; an
+      // unparseable timestamp leaves a previous stamp untouched.
+      //
+      // c-effortread r14 item 1: the accepted bound is MONOTONIC for every
+      // pending source. An observer/lifecycle pending bound by an edge
+      // at T3 (B's own effort-queued:max) must not be REPLACED by a delayed
+      // older same-word edge at T1 (the replaced request A's backlogged
+      // queued edge): with T0 < T1 < T2 < T3, taking T1 let A's matching
+      // read-back at T2 settle B. Keep the NEWEST VALID instant of the
+      // existing stamp and the incoming edge. (Only an edge that names the
+      // pending by id, or matches a lifecycle pending by word, reaches here;
+      // an id-less edge for a client pending was dropped above.)
+      const incomingQueuedMs =
+        queuedThreshold != null ? Date.parse(queuedThreshold) : Number.NaN;
+      const establishedQueuedMs =
+        current.queuedObservedAt != null
+          ? Date.parse(current.queuedObservedAt)
+          : Number.NaN;
+      const stamped =
+        Number.isFinite(incomingQueuedMs) &&
+        (!Number.isFinite(establishedQueuedMs) || incomingQueuedMs > establishedQueuedMs)
+          ? queuedThreshold
+          : current.queuedObservedAt;
+      // r16 item 5: keep the queued SEQ monotonic in tandem with the queued
+      // instant (newer ms, or the greater seq within one millisecond) so a
+      // later duplicate/re-queue edge never lets a future replacement compare
+      // against stale ordering provenance.
+      const stampedSeq =
+        Number.isFinite(incomingQueuedMs) &&
+        (!Number.isFinite(establishedQueuedMs) ||
+          lifecycleEdgeIsNewer(
+            incomingQueuedMs,
+            String(observation.seq),
+            establishedQueuedMs,
+            current.queuedSeq ?? "0",
+          ))
+          ? String(observation.seq)
+          : current.queuedSeq;
+      // A lifecycle-created entry carries the queue state derived from current
+      // activity; a queued edge for an EXISTING request really did re-queue it:
+      // if a turn is now running again — or the session parked on a
+      // PermissionRequest/Elicitation (r15 item 1) — the bound waits for the
+      // next authoritative idle evidence (r13 item 2/3).
+      const createdFromWire = this.state.effortPending[instanceId]?.nonce !== current.nonce;
+      const nextActivity = this.state.instances.find((row) => row.id === instanceId)?.activity;
+      const requeuedBehindTurn =
+        !createdFromWire &&
+        effortAwaitsQueueExit(nextActivity) &&
+        current.leftQueueAt != null;
+      // The session map and an existing pending were updated with the frame's
+      // capability at lifecycle entry; a freshly synthesized pending adopted
+      // it directly. An id-less queued frame never downgrades an id-capable
+      // session (noteEffortDriverId is monotonic).
+      this.emit({
+        effortPending: {
+          ...this.state.effortPending,
+          [instanceId]: createdFromWire
+            ? current
+            : {
+                ...current,
+                queued: true,
+                queuedObservedAt: stamped,
+                queuedSeq: stampedSeq,
+                ...(requeuedBehindTurn ? { leftQueueAt: null } : {}),
+              },
+        },
+      });
+      if (createdFromWire) {
+        // c-effortread r13 item 3 / r19 item 1: the observer tab's id-less
+        // wire pending gets the same bounded, request-owned reconciliation as
+        // a client request, owned by ITS nonce (a newer edge replaces;
+        // settlement/cleanup of a stale nonce is a no-op). With the value
+        // fallback gone an id-less wire request can never settle, so a silent
+        // no-op or an unusable queued timestamp ends in the explicit
+        // unconfirmed outcome instead of sitting on 切换中 for the 30-minute
+        // max age.
+        this.armEffortReconciliation(instanceId, current.nonce);
+      }
       return;
     }
-    if (!pending[instanceId] && parsed.kind === "applied") return;
-    delete pending[instanceId];
-    // The push-down ended via a lifecycle, not a projected read-back: no settled
-    // edge owes the later live frame the "our push-down" treatment.
-    this.settledEffortPushdown.delete(instanceId);
-    if (parsed.kind === "degraded") {
-      // The native side refused: revert the slider to the last observed level
-      // (or drop the optimistic request so the record default returns).
-      const effective = this.state.effortEffective[instanceId];
-      const effort = { ...this.state.effort };
+    if (parsed.kind === "applied") {
+      if (!current) return;
+      // c-effortread r12 item 2: clearing a pending from an `applied`
+      // lifecycle requires a NON-EMPTY request id that names THIS pending,
+      // even when the pending was synthesized from a wire lifecycle — an
+      // observer tab's lifecycle pending is its view of another client's
+      // queued request B, and an id-less applied with the same word can be a
+      // replaced request A's stale verdict. An id-less success settles only
+      // on the request's OWN id verdict/echo; with none, the pending ends
+      // through its bounded unconfirmed path, never here.
+      if (edgeId === null || edgeId !== current.requestId) return;
+      // The driver reported acceptance: the projected read-back is the source
+      // of truth, but clear the indicator now rather than leaving it on 切换中
+      // when the observation is delayed. The slider stays where requested.
+      const pendingNext = { ...this.state.effortPending };
+      delete pendingNext[instanceId];
+      this.settledEffortPushdown.delete(instanceId);
+      this.emit({ effortPending: pendingNext });
+      return;
+    }
+    // degraded
+    const isUltraRefusal =
+      parsed.reason === ULTRA_MODEL_REASON || parsed.reason === ULTRA_WORKFLOWS_REASON;
+    // Request identity (c-effortui r2 item 2, r10 item 3, r12 item 2): does
+    // this verdict name the CURRENT request?
+    //  - no pending at all: an unsolicited verdict from a configure posted
+    //    outside the UI — it applies (refusal recorded, tier untouched).
+    //  - an edge carrying a request id: it mutates the pending ONLY when the
+    //    id is the current one. Request A's timeout/cancellation can never
+    //    delete or roll back newer request B.
+    //  - id-less edge: it can NEVER clear or roll back a pending, not even a
+    //    lifecycle-synthesized one (that pending is an observer tab's view of
+    //    a queued request B, and the same word cannot distinguish B from a
+    //    replaced A). An id-less success settles only on the request's own id
+    //    evidence; otherwise the request stays pending until its bounded
+    //    reconciliation (r12 item 5, r19 item 1).
+    //  - genuine ultracode refusals (model/workflow) are environment evidence:
+    //    they are recorded and disable the switch regardless, but mutate the
+    //    pending ONLY when they are this request's verdict.
+    const namesCurrent = current
+      ? edgeId !== null && edgeId === current.requestId
+      : false;
+    const mutatesRequest = !current || namesCurrent;
+    if (!mutatesRequest && !isUltraRefusal) return;
+
+    const pendingNext = { ...this.state.effortPending };
+    if (mutatesRequest) {
+      delete pendingNext[instanceId];
+      // The push-down ended via a lifecycle, not a projected read-back: no
+      // settled edge owes a later live frame the "our push-down" treatment.
+      this.settledEffortPushdown.delete(instanceId);
+    }
+    // The native side refused: revert the affected axes to the last observed
+    // state (or drop the optimistic request so the record default returns).
+    // An unsolicited ultracode refusal (no pending) leaves the tier untouched.
+    const effective = this.state.effortEffective[instanceId];
+    const effort = { ...this.state.effort };
+    if (mutatesRequest && current) {
       if (effective) {
         const instance = this.state.instances.find((row) => row.id === instanceId);
         const kind = (instance?.kind ?? "claude") as EffortKind;
-        const selection = effortFromRecord(
-          kind,
-          effective.name,
-          null,
-          effective.ultracode === true,
-        );
+        const selection = effortFromRecord(kind, effective.name, null, effective.ultracode === true);
         if (selection) effort[instanceId] = selection;
       } else {
         delete effort[instanceId];
       }
-      const reason =
-        { "dialog-kept": "已取消切换", "invalid-argument": "档位无效", "no-readback-within-window": "未收到回读" }[
+    }
+    // D-056 stable reason codes. The two ultracode refusals also DISABLE the
+    // switch (model- or process-scoped); the others are plain rejections the
+    // user can immediately retry.
+    let toastReason: string = parsed.reason;
+    const refusalPatch: Partial<HubState> = {};
+    if (isUltraRefusal) {
+      const scope = parsed.reason === ULTRA_MODEL_REASON ? "model" : "process";
+      // Bind the refusal to the model it actually concerns even when the
+      // verdict arrives before the model catalog/effective state: read-back
+      // id, then the optimistic picker selection, then the launch spec model.
+      // Only a session with no model identity at all is recorded null (c-effortui
+      // r3 item 4 — a null refusal otherwise blocked every later model).
+      const modelId = scope === "model" ? this.currentEffortModelId(instanceId) : null;
+      refusalPatch.effortRefusal = {
+        ...this.state.effortRefusal,
+        [instanceId]: {
+          reason: parsed.reason,
+          scope,
+          modelId,
+          at: observation.observedAt ?? new Date().toISOString(),
+        },
+      };
+      toastReason =
+        scope === "model"
+          ? `模型 ${modelId ?? "当前模型"} 不支持 ultracode`
+          : "需要开启 dynamic workflows";
+    } else if (!mutatesRequest) {
+      // A stale level verdict for a replaced request: no visible mutation, no
+      // toast — B is still in flight.
+      return;
+    } else {
+      toastReason =
+        ({ "dialog-kept": "已取消切换", "invalid-argument": "档位无效", "no-readback-within-window": "未收到回读" } as Record<string, string>)[
           parsed.reason
         ] ?? parsed.reason;
-      this.toast(`effort 切换被拒绝：${reason}`);
-      this.emit({ effortPending: pending, effort });
-    } else {
-      this.emit({ effortPending: pending });
     }
+    this.toast(`effort 切换被拒绝：${toastReason}`);
+    this.emit({ effortPending: pendingNext, effort, ...refusalPatch });
   }
 
   toast(text: string) {
@@ -1413,6 +2485,15 @@ class HubStore {
    * (e.g. the question-alert watcher) can be driven without a live Hub. */
   setSlicesForTest(slices: Partial<HubState>): void {
     this.emit(slices);
+  }
+
+  /**
+   * Test-only: seed the per-session driver id-capability that a real
+   * id-bearing lifecycle/echo would have established (c-effortread r18 item 2
+   * / r19 item 1).
+   */
+  setEffortIdCapabilityForTest(instanceId: Id, capability: EffortDriverIdCapability): void {
+    this.effortDriverId.set(instanceId, capability);
   }
 
   /** Test-only: drive the pagehide/pageshow lifecycle (BFCache, iOS). */
@@ -2095,12 +3176,15 @@ class HubStore {
         stopPoll: () => void;
         settlementCount: () => number;
         interactionState: (id: string) => string | undefined;
+        waitFollowCaughtUp: (id: string, timeoutMs?: number) => Promise<string>;
       };
     }).__remudaHub = {
       stopPoll: () => this.stopPoll(),
       settlementCount: () => this.settlementCount,
       interactionState: (id: string) =>
         this.state.interactions.find((row) => row.id === id)?.state,
+      waitFollowCaughtUp: (id: string, timeoutMs?: number) =>
+        this.waitForFollowCaughtUpForTest(id, timeoutMs),
     };
   }
 
@@ -2137,6 +3221,7 @@ class HubStore {
     // it in its finally.
     ++this.bootGen;
     this.pinnedCreates.clear();
+    this.polledEffort.clear();
     // Tear down the connection machine and its browser listeners (init
     // recreates them at the next bootstrap); the durable outbox itself stays.
     this.connection?.dispose();
@@ -2149,6 +3234,8 @@ class HubStore {
     for (const [, t] of this.heldRetryTimer) clearTimeout(t);
     this.heldRetryTimer.clear();
     this.heldRetryAttempt.clear();
+    for (const [, slot] of this.effortReconcileTimers) clearTimeout(slot.timer);
+    this.effortReconcileTimers.clear();
     if (this.unloadClearTimer) {
       clearTimeout(this.unloadClearTimer);
       this.unloadClearTimer = null;
@@ -2478,9 +3565,10 @@ class HubStore {
     });
     // §9.1: the Hub record usually already carries the latest effective level;
     // replay history effort edges too so a reconnect before refresh is honest.
+    // live=false: hydrate effective only, never settle pending/refusal.
     for (const event of history) {
-      this.noteEffortObservation(instanceId, event);
-      this.noteEffortLifecycle(instanceId, event);
+      this.noteEffortObservation(instanceId, event, false);
+      this.noteEffortLifecycle(instanceId, event, false);
       // History replay hydrates observed model state only; it must not settle a
       // push-down pending or fold the selection (those belong to live events).
       this.noteModelObservation(instanceId, event, false);
@@ -2504,6 +3592,22 @@ class HubStore {
         // §9.1: live effort edges update the effective level immediately —
         // the slider reflects the transcript, not the optimistic request.
         for (const event of fresh) {
+          // c-effortread r16 item 4: fold THIS event's activity evidence
+          // BEFORE its lifecycle reducers, in journal (seq) order. One
+          // follow/catch-up batch can carry both a full-instance snapshot
+          // parking the session on waiting-interaction and a later
+          // effort-queued edge; folding the edge against the PRE-batch idle
+          // activity initialised the execution deadline immediately while the
+          // driver was blocked. The per-event emit commits the activity into
+          // state (and its queue-exit fold) so the effort reducer below reads
+          // the batch's own activity in order; the post-loop emission replays
+          // the whole range over the already-final projection (skipped or
+          // value-identical, so no rollback).
+          const nextInstances = applyInstanceActivity(this.state.instances, [event]);
+          const activityChanged = nextInstances.some(
+            (row, index) => row !== this.state.instances[index],
+          );
+          if (activityChanged) this.emit({ instances: nextInstances });
           this.noteEffortObservation(instanceId, event);
           this.noteEffortLifecycle(instanceId, event);
           this.noteModelObservation(instanceId, event, true);
@@ -2561,9 +3665,10 @@ class HubStore {
         // Load-earlier rows land above every loaded node. Merge by seq rather
         // than trusting arrival order: assemble/Transcript anchor on it.
         const merged = current.concat(fresh).sort((a, b) => Number(a.seq) - Number(b.seq));
+        // Prepended rows are HISTORY, not live frames: hydrate effective only.
         for (const event of fresh) {
-          this.noteEffortObservation(instanceId, event);
-          this.noteEffortLifecycle(instanceId, event);
+          this.noteEffortObservation(instanceId, event, false);
+          this.noteEffortLifecycle(instanceId, event, false);
           this.noteModelObservation(instanceId, event, false);
           this.noteModelLifecycle(instanceId, event, false);
           this.notePermissionObservation(instanceId, event);
@@ -2685,6 +3790,14 @@ class HubStore {
       // client's existing window floor.
       const seedHistory = seedFloor ?? (sub.windowFromSeq === null ? null : sub.snapshot.history);
       if (seedHistory) client.applySnapshot({ ...sub.snapshot, history: seedHistory });
+      // c-effortread r9 e2e seam: the server subscribes to the live bus BEFORE
+      // reading this snapshot (closing the seed/subscribe window), so once the
+      // snapshot is applied over an open socket, every event PUBLISHED
+      // AFTERWARDS is delivered as a genuine live frame and can never be
+      // absorbed into the seed as replay. Resolve the caught-up waiter here.
+      if (sub.getReadyState() === 1) {
+        this.resolveFollowCaughtUp(instance.id, sub.snapshot.asOfSeq);
+      }
     }
     const tail = mockGappedTail(instance.journalId);
     if (tail) {
@@ -2783,11 +3896,16 @@ class HubStore {
     const result = await api.instanceCreate(spec);
     const createdId = result.instance.id;
     const kind = spec.kind as EffortKind;
+    // c-effortui r3 item 9: seed BOTH axes. The D-056 create wire carries the
+    // flag as its own boolean; ignoring it left a fresh Start showing the
+    // switch off even though the launch argv was --effort ultracode (the next
+    // slider drag would then post ultracode:false). "ultracode" no longer
+    // exists as a tier name — the migration lives inside effortFromRecord.
     const effort =
       spec.effortName != null
-        ? effortFromRecord(kind, spec.effortName, spec.effortIndex) ??
-          effortAt(kind, spec.effortIndex ?? DEFAULT_EFFORT_INDEX)
-        : effortAt(kind, spec.effortIndex ?? DEFAULT_EFFORT_INDEX);
+        ? effortFromRecord(kind, spec.effortName, spec.effortIndex, spec.effortUltracode === true) ??
+          effortAt(kind, spec.effortIndex ?? DEFAULT_EFFORT_INDEX, spec.effortUltracode === true)
+        : effortAt(kind, spec.effortIndex ?? DEFAULT_EFFORT_INDEX, spec.effortUltracode === true);
     this.emit({
       instances: [result.instance, ...this.state.instances.filter((i) => i.id !== createdId)],
       permissionMode: { ...this.state.permissionMode, [createdId]: spec.permissionMode },
@@ -3524,17 +4642,49 @@ class HubStore {
   async configure(
     instanceId: Id,
     permissionMode: string,
-    extras?: { model?: string; effort?: EffortSelection },
+    extras?: {
+      model?: string;
+      effort?: EffortSelection;
+      /** c-effortread r9 item 6: explicit axis intent carried on effort.axis. */
+      effortAxis?: EffortAxis;
+      /** c-effortread r10: per-request id echoed on lifecycle/echo edges. */
+      effortRequestId?: string;
+    },
+    freshness?: { effortNonce?: number },
   ) {
-    // The wire stores an opaque {name,index}; ultracode rides the legacy
-    // "ultracode" name until x-p1-proto lands the {name,ultracode} shape.
+    // D-056 wire: `{name, ultracode, index, axis, requestId}` — a native level
+    // word plus the orthogonal boolean, the explicit axis the driver executes
+    // and the per-request id the driver echoes on its edges; the web never
+    // sends the legacy "ultracode" name.
     const wireExtras = extras?.effort
-      ? { ...extras, effort: { name: effortWireName(extras.effort), index: extras.effort.index } }
+      ? {
+          ...extras,
+          effort: {
+            name: effortWireName(extras.effort),
+            ultracode: extras.effort.ultracode === true,
+            index: extras.effort.index,
+            // c-effortread r9 item 6: state the axis so a cold flag click is
+            // the toggle the driver types ("ultracode on"), never a substituted
+            // tier command.
+            ...(extras.effortAxis ? { axis: extras.effortAxis } : {}),
+            // c-effortread r10: carry the per-request id to the driver.
+            ...(extras.effortRequestId ? { requestId: extras.effortRequestId } : {}),
+          },
+        }
       : extras;
     await api.instanceConfigure(instanceId, permissionMode, wireExtras);
+    // c-effortui r2 item 2: a request's HTTP success lands AFTER the user
+    // replaced it with a newer request must not overwrite the newer choice.
+    // The effort post-emit is gated on the captured request nonce; the
+    // authoritative projection is folded by the caller's bounded refresh.
+    const effortStillCurrent =
+      freshness?.effortNonce == null ||
+      this.state.effortPending[instanceId]?.nonce === freshness.effortNonce;
     this.emit({
       permissionMode: { ...this.state.permissionMode, [instanceId]: permissionMode },
-      ...(extras?.effort ? { effort: { ...this.state.effort, [instanceId]: extras.effort } } : {}),
+      ...(extras?.effort && effortStillCurrent
+        ? { effort: { ...this.state.effort, [instanceId]: extras.effort } }
+        : {}),
       ...(extras?.model ? { models: { ...this.state.models, [instanceId]: extras.model } } : {}),
     });
   }
@@ -3551,42 +4701,379 @@ class HubStore {
     return pending ?? null;
   }
 
-  async setEffort(instanceId: Id, effort: EffortSelection) {
-    const word = effortWireName(effort);
+  /**
+   * Apply the live-session version gate to a requested selection BEFORE it is
+   * shown or posted (D-056 §3/§5):
+   *  - coupled (2.1.203–2.1.283): a flag-only switch ON (same tier) forces the
+   *    slider to xhigh and posts one `/effort ultracode`; a tier drag that
+   *    leaves xhigh switches the flag OFF, and `{non-xhigh, true}` is therefore
+   *    never produced.
+   *  - legacy/unknown: the boolean fails closed (the switch is locked in the
+   *    UI; never post true on the strength of an unreported version).
+   *  - decoupled (≥2.1.284): the two axes stay orthogonal.
+   */
+  private gateLiveEffort(instanceId: Id, requested: EffortSelection): EffortSelection {
     const instance = this.state.instances.find((row) => row.id === instanceId);
-    const busy =
-      instance?.activity?.state === "known" ? instance.activity.value === "working" : false;
-    // Optimistic pending so the chip never shows the old level ambiguously:
-    // 切换中 on the idle fast path, 排队中 while the agent works. The driver's
-    // `effort-queued` lifecycle and the effective read-back settle it.
+    if ((instance?.kind ?? "claude") !== "claude") return requested;
+    const gate = this.effortVersionGate(instanceId);
+    if (gate === "coupled") {
+      // c-effortui r4 item 4: read the CURRENT selection from the same source
+      // the UI renders (`effortOf`), not the optimistic-only `state.effort`
+      // map, which is empty after a reload or on another device. With a
+      // persisted record {xhigh,true} a drag to max otherwise saw no current
+      // selection and re-linked the switch to xhigh, swallowing the first drag
+      // and re-typing `/effort ultracode`.
+      const current = this.effortOf(instanceId, "claude");
+      const currentTier = current.name;
+      // Same tier as the current selection with the flag on = the switch
+      // itself was flipped → link it to xhigh. When the current tier is
+      // unknown (no record and no optimistic choice) the first flag-on links
+      // too, preserving the cold-start switch behaviour.
+      const hasRecord =
+        Boolean(this.state.effort[instanceId]) ||
+        Boolean(instance?.effortName) ||
+        Boolean(this.state.effortEffective[instanceId]);
+      if (requested.ultracode === true && (!hasRecord || currentTier === requested.name)) {
+        return coupledSelection(requested);
+      }
+      // A tier move away from xhigh: the coupled flag exists only at xhigh,
+      // so the flag is OFF no matter what the caller's optimistic axes carried
+      // (e.g. a drag whose input still rides the flag from the old tier).
+      if (requested.name !== "xhigh" || requested.index !== CLAUDE_XHIGH_INDEX) {
+        return { ...requested, ultracode: false };
+      }
+      return requested;
+    }
+    if ((gate === "legacy" || gate === "unknown") && requested.ultracode === true) {
+      return { ...requested, ultracode: false };
+    }
+    return requested;
+  }
+
+  /**
+   * c-effortread r12 item 5 / r19 item 1: arm the bounded, request-owned
+   * reconciliation for one client configure. A current driver settles the
+   * request from its echoed id well before the bound, at which point the timer
+   * fires into a no-op. A request whose own id evidence never arrives (lost
+   * frames, provenance failure) needs this path: it is never settled by an
+   * id-less projection and ends explicitly unconfirmed.
+   */
+  private armEffortReconciliation(instanceId: Id, nonce: number) {
+    // A replaced request's configure can resolve AFTER the newer request
+    // armed its own slot: never let a stale nonce overwrite it.
+    const existing = this.effortReconcileTimers.get(instanceId);
+    if (existing && existing.nonce > nonce) return;
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(() => {
+      void this.runEffortReconciliation(instanceId, nonce);
+    }, EFFORT_UNCONFIRMED_BOUND_MS);
+    this.effortReconcileTimers.set(instanceId, { nonce, timer });
+  }
+
+  /**
+   * Bound expiry for one effort request. The protocol has no operation to
+   * query the driver's current effort (r13 item 4), so this never re-reads
+   * anything: a genuine post-command projection carrying the request's OWN id
+   * arrives over the live journal or the routine poll and settles before the
+   * deadline (r19 item 1: an id-less projection settles nothing); otherwise
+   * the request ends in the explicit "unconfirmed" outcome. The bound is
+   * request-owned FROM THE MOMENT THE REQUEST COULD RUN (r13 item 2/3 — a
+   * client request at the working→idle evidence, a wire pending at receipt
+   * when idle): a request still behind a running turn
+   * (`leftQueueAt == null`) waits instead of burning its bound in the queue;
+   * the 30-minute max-age backstop bounds the total wait.
+   */
+  private runEffortReconciliation(instanceId: Id, nonce: number) {
+    const slot = this.effortReconcileTimers.get(instanceId);
+    const pendingNow = this.state.effortPending[instanceId];
+    // Settled/failed, or replaced by a newer request (which armed its own
+    // slot): never touch another request's pending.
+    if (!pendingNow || pendingNow.nonce !== nonce) {
+      if (slot?.nonce === nonce) this.effortReconcileTimers.delete(instanceId);
+      return;
+    }
+    if (pendingNow.leftQueueAt == null) {
+      // Still behind the running turn: no read-back is even possible yet.
+      // Wait; the working→idle activity evidence stamps leftQueueAt and
+      // re-arms a fresh full bound. Never refresh and never declare
+      // unconfirmed while queued. The 30-minute max-age is the total-wait
+      // backstop: past it (a genuinely lost activity edge) stop rescheduling —
+      // `effortPendingOf` already prunes the chip at the same age.
+      if (Date.now() - pendingNow.at > EFFORT_PENDING_MAX_AGE_MS) {
+        this.effortReconcileTimers.delete(instanceId);
+        return;
+      }
+      const timer = setTimeout(() => {
+        void this.runEffortReconciliation(instanceId, nonce);
+      }, EFFORT_UNCONFIRMED_BOUND_MS);
+      this.effortReconcileTimers.set(instanceId, { nonce, timer });
+      return;
+    }
+    // The request owns its bound from when it could run (an idle-send request
+    // initializes that to the send time). A timer that was armed BEFORE a late
+    // activity exit must not fire early: reschedule the remainder instead of
+    // reconciling on a partial window.
+    const boundStart = pendingNow.leftQueueAt;
+    const elapsed = Date.now() - boundStart;
+    if (elapsed < EFFORT_UNCONFIRMED_BOUND_MS) {
+      const timer = setTimeout(() => {
+        void this.runEffortReconciliation(instanceId, nonce);
+      }, EFFORT_UNCONFIRMED_BOUND_MS - elapsed);
+      this.effortReconcileTimers.set(instanceId, { nonce, timer });
+      return;
+    }
+    // c-effortread r13 item 4 / coordinator ruling: the protocol offers NO
+    // request the web/Hub can send to obtain the driver's CURRENT effort (the
+    // hub-node method set has configure/send/read for other surfaces, nothing
+    // that forces a driver read-back), so the bound must not re-read the Hub
+    // database and present stored state as a FRESH read-back. Genuine driver
+    // projections produced after the command still reach this store through
+    // the normal channels — the live follow effort edge and the routine poll —
+    // and settle via the strict fallback BEFORE this instant. If the pending
+    // is still here, no fresh evidence ever arrived: end the request.
+    const after = this.state.effortPending[instanceId];
+    if (!after || after.nonce !== nonce) {
+      this.effortReconcileTimers.delete(instanceId);
+      return;
+    }
+    if (after.leftQueueAt == null) {
+      // A new turn re-queued the request during the bound: the next
+      // working→idle evidence re-arms it; wait rather than ending it
+      // unconfirmed against a request the driver has not run yet.
+      const timer = setTimeout(() => {
+        void this.runEffortReconciliation(instanceId, nonce);
+      }, EFFORT_UNCONFIRMED_BOUND_MS);
+      this.effortReconcileTimers.set(instanceId, { nonce, timer });
+      return;
+    }
+    // No fresh evidence within the bound: stop the silent 切换中 explicitly.
+    // Keep the optimistic selection — there is no refusal evidence, and an
+    // accepted no-op targeted the observed state — and say so in a toast.
+    const pendingNext = { ...this.state.effortPending };
+    delete pendingNext[instanceId];
     this.settledEffortPushdown.delete(instanceId);
+    this.emit({ effortPending: pendingNext });
+    this.effortReconcileTimers.delete(instanceId);
+    this.toast(
+      `effort 切换结果未确认：驱动未在时限内回读 ${after.name}${after.ultracode ? " · ultracode" : ""}，已保留所选档位，请核对实际状态`,
+    );
+  }
+
+  async setEffort(instanceId: Id, effortIn: EffortSelection, axis: EffortAxis = "tier") {
+    const effort = this.gateLiveEffort(instanceId, effortIn);
+    const instance = this.state.instances.find((row) => row.id === instanceId);
+    // r15 item 1: waiting-interaction (PermissionRequest/Elicitation) is just
+    // as unrunnable as working — the driver needs Idle/Done +
+    // interactive_ready — so the request is queued and its deadline starts
+    // only from authoritative idle evidence.
+    const busy = effortAwaitsQueueExit(instance?.activity);
+    // New per-request provenance (c-effortui): every switch gets a fresh
+    // nonce and its OWN threshold stamped from the current projection. A
+    // replaced request's late events cannot settle this indicator.
+    const nonce = (this.state.effortNonces[instanceId] ?? 0) + 1;
+    // c-effortread r13 item 1: a request that replaces another in flight makes
+    // every later id-less word-only queued edge ambiguous.
+    const afterReplacement = Boolean(this.state.effortPending[instanceId]);
+    // c-effortread r10 items 1–4: the per-request id that rides the configure
+    // to the driver and returns on lifecycle edges and the requested echo.
+    const requestId = id("effreq_") as unknown as string;
+    const currentView = this.state.effortEffective[instanceId] ?? null;
+    // c-effortui r4 item 3: predict the exact word the driver will type so the
+    // queued/applied/degraded lifecycle (which echoes the typed command word)
+    // can be matched even when a decoupled TIER move carries the flag — the
+    // driver then types the plain level word with flag=true in the payload.
+    const commandWord = predictDriverCommandWord(effort, axis, instance, this.state, instanceId);
+    const now = Date.now();
+    // The coupled bare `ultracode` word moves BOTH axes. The decoupled toggle
+    // moves only the flag and a plain tier word only the level (r10 item 4:
+    // the other axis is driven by its OWN configure, so axes this request
+    // does not move start settled rather than waiting for another request's
+    // read-back).
+    const movesBoth = commandWord === "ultracode";
+    const movesLevel = movesBoth || axis !== "flag";
+    const movesFlag = movesBoth || axis === "flag";
+    const pending: EffortPending = {
+      nonce,
+      requestId,
+      axis,
+      name: effort.name,
+      ultracode: effort.ultracode === true,
+      queued: busy,
+      at: now,
+      // r13 item 2: an idle-sent request starts its reconciliation bound at
+      // the send time; a queued one starts it when activity shows it leaving
+      // the queue.
+      leftQueueAt: busy ? null : now,
+      // The pre-request baseline is kept SEPARATE from the queued lifecycle
+      // time (r10 item 1): an id-less read-back settles only when newer than
+      // BOTH and matching the requested axis.
+      baselineObservedAt: currentView?.observedAt ?? null,
+      queuedObservedAt: null,
+      // Client pendings order via the nonce/afterReplacement protection, not
+      // a lifecycle seq (r16 item 5).
+      queuedSeq: null,
+      // Axes this request does not move need no proof; every MOVED axis
+      // starts unsettled even when the projection already shows the target
+      // (c-effortread r11 item 2): pre-settling let a queued B that targeted
+      // the old observation clear itself on A's mismatching-id echo. An
+      // accepted no-op switch settles from its own request-id echo.
+      levelSettled: !movesLevel,
+      flagSettled: !movesFlag,
+      source: "client",
+      commandWord,
+      afterReplacement,
+      // Per-session capability, carried across requests (r18 item 2 / r19
+      // item 1): an unknown session fails closed on id-less evidence and
+      // settles only on this request's own id echo; only a proven id-capable
+      // session is marked as such up front.
+      idCapability: this.effortIdCapability(instanceId),
+    };
+    this.settledEffortPushdown.delete(instanceId);
+    // Optimistically adopt the requested axes SYNCHRONOUSLY, before the
+    // configure POST resolves: a second switch (e.g. the ultracode switch
+    // flipped right after a tier drag) must read the freshest requested tier
+    // from effortOf(), not the pre-POST value (D-056 rapid level→flag race).
     this.emit({
-      effortPending: {
-        ...this.state.effortPending,
-        [instanceId]: {
-          word,
-          queued: busy,
-          at: Date.now(),
-          baselineObservedAt: this.state.effortEffective[instanceId]?.observedAt ?? null,
-          // Optimistic entry before the configure is journaled: no request
-          // timestamp yet; the queued lifecycle event stamps it on arrival.
-          requestObservedAt: this.state.effortPending[instanceId]?.requestObservedAt ?? null,
-        },
-      },
+      effortNonces: { ...this.state.effortNonces, [instanceId]: nonce },
+      effortPending: { ...this.state.effortPending, [instanceId]: pending },
+      effort: { ...this.state.effort, [instanceId]: effort },
     });
     try {
-      await this.configure(instanceId, this.permissionModeOf(instanceId), { effort });
+      await this.configure(
+        instanceId,
+        this.permissionModeOf(instanceId),
+        { effort, effortAxis: axis, effortRequestId: requestId },
+        { effortNonce: nonce },
+      );
       // Re-request authoritative state once the command is accepted. The
       // driver projects the read-back before acking, so folding the durable
       // record settles the chip from the Hub even when this client's live
       // follow frame was gapped/coalesced; the 2s poll keeps settling it if
       // this read races. Bounded by one network round trip — no timer.
       await this.refresh().catch(() => undefined);
+      // c-effortread r12 item 5 / r13 item 4: arm the bounded reconciliation.
+      // A new driver's id-bearing completion settles the request long before
+      // the bound; an id-less driver's silent accepted no-op gets no extra
+      // query (the protocol has none) — a genuinely newer projection still
+      // arrives over the live journal or routine poll, otherwise the bound
+      // ends it in an explicit unconfirmed outcome instead of sitting on
+      // 切换中 for the 30-minute max age.
+      this.armEffortReconciliation(instanceId, nonce);
     } catch (error) {
-      const pending = { ...this.state.effortPending };
-      delete pending[instanceId];
-      this.emit({ effortPending: pending });
-      throw error;
+      // A failed configure (offline node, network, 4xx) must not leave an
+      // optimistic tier/flag, an unhandled rejection, or a stuck indicator.
+      // Roll back ONLY when this is still the current request: a later switch
+      // has already replaced it, and reverting would clobber the newer choice.
+      const stillCurrent =
+        (this.state.effortPending[instanceId]?.nonce ?? -1) === nonce;
+      const nextPatch: Partial<HubState> = {};
+      if (stillCurrent) {
+        // The pending indicator belongs to THIS request — clear it, and roll
+        // the optimistic axes back to the last observed state. A replaced
+        // request's late failure must not touch B's 切换中 indicator
+        // (c-effortui r3 item 8).
+        nextPatch.effortPending = { ...this.state.effortPending };
+        delete nextPatch.effortPending[instanceId];
+        const effective = this.state.effortEffective[instanceId];
+        const effState = { ...this.state.effort };
+        if (effective) {
+          const inst = this.state.instances.find((row) => row.id === instanceId);
+          const kind = (inst?.kind ?? "claude") as EffortKind;
+          const reverted = effortFromRecord(
+            kind,
+            effective.name,
+            null,
+            effective.ultracode === true,
+          );
+          if (reverted) effState[instanceId] = reverted;
+          else delete effState[instanceId];
+        } else {
+          delete effState[instanceId];
+        }
+        nextPatch.effort = effState;
+        this.emit(nextPatch);
+      }
+      // A replaced request still gets its failure surfaced (no silent loss),
+      // but the toast never names the newer in-flight request as failed.
+      this.toast(
+        stillCurrent
+          ? `effort 切换失败：${error instanceof Error ? error.message : String(error)}`
+          : `上一次 effort 切换失败：${error instanceof Error ? error.message : String(error)}`,
+      );
+      // Do NOT rethrow: the UI already shows the failure via the toast and the
+      // rolled-back state; an unhandled promise rejection would crash tests.
+    }
+  }
+
+  /**
+   * Flip ONLY the ultracode switch axis, leaving the tier untouched on
+   * decoupled builds (D-056 ≥2.1.284). On coupled builds the gate linkage in
+   * {@link gateLiveEffort} moves the slider to xhigh when the switch turns on
+   * (one `/effort ultracode`); on legacy/unknown builds the flag fails closed.
+   */
+  async setUltracode(instanceId: Id, ultracode: boolean) {
+    const current = this.effortOf(instanceId);
+    // c-effortread r9 item 6: the switch moves ONLY the flag axis.
+    await this.setEffort(instanceId, { ...current, ultracode }, "flag");
+  }
+
+  /** Claude Code version gate for a session.
+   *  Source order (c-effortui r2 item 1): the per-instance capability
+   *  snapshot's reported binaryVersion (transcript/launch read-back), then the
+   *  host's PINNED claude CLI inventory version, then unknown (which disables
+   *  only the ultracode switch with a named reason). Never a fabricated
+   *  version. */
+  effortVersionGate(instanceId: Id): ClaudeVersionGate {
+    const instance = this.state.instances.find((row) => row.id === instanceId);
+    // c-effortui r4 item 5(c) / r5 item 3: the shell-pty CARRIER (promoted or
+    // generic) cannot type the version-gated ultracode words — only the Herdr
+    // claude_pty carrier accepts live flag-on configure (its driver refuses
+    // them for shell-pty). Key on the driver, not isGenericPty (which returns
+    // false for promoted shells and for shell-pty with a structured tier,
+    // leaving the switch enabled on a carrier that rejects every flag-on POST).
+    if (instance?.driver === "shell-pty") return "unknown";
+    const reported = instance?.capabilities?.binaryVersion;
+    if (reported) return claudeVersionGate(reported);
+    if (instance) {
+      const host = this.state.hosts.find((row) => row.id === instance.hostId);
+      const pinned = hostClaudeVersion(host);
+      if (pinned) return claudeVersionGate(pinned);
+    }
+    return claudeVersionGate(null);
+  }
+
+  /** Per-session switch refusal, applying the model-scoped expiry (D-056 §5). */
+  effortRefusalOf(instanceId: Id): UltraRefusal | null {
+    const refusal = this.state.effortRefusal[instanceId];
+    if (!refusal) return null;
+    if (refusal.scope === "model") {
+      // Bound to the model the driver named; a different current model
+      // re-enables the switch immediately.
+      const currentModel = this.currentEffortModelId(instanceId);
+      if (currentModel && refusal.modelId && currentModel !== refusal.modelId) {
+        return null;
+      }
+    }
+    return refusal;
+  }
+
+  /** Static capability rows (per-model default + ultracode), Hub or null. */
+  supplyCatalogRows(): ModelEffortCatalogRow[] | null {
+    return this.state.supplyCatalog;
+  }
+
+  /** Fetch GET /v1/supply/catalog once (best-effort; fallback rows live in the
+   *  effort module). */
+  async loadSupplyCatalog(): Promise<void> {
+    if (this.state.supplyCatalog) return;
+    try {
+      const body = await api.supplyCatalog();
+      const rows = Array.isArray(body?.models)
+        ? (body.models as ModelEffortCatalogRow[]).filter((row) => row && typeof row.id === "string")
+        : [];
+      if (rows.length) this.emit({ supplyCatalog: rows });
+    } catch {
+      // Operator/network unavailable: keep the built-in fallback table.
     }
   }
 
@@ -3825,7 +5312,15 @@ class HubStore {
       if (kind && stored.kind !== kind) return mapEffort(stored, kind);
       return stored;
     }
-    const recorded = effortFromRecord(fallbackKind, instance?.effortName, instance?.effortIndex);
+    // c-effortui r2 item 4: restore BOTH the level and the durable flag from
+    // the Hub record when no live selection is present (e.g. after a reload
+    // whose effort event has aged out of the journal tail).
+    const recorded = effortFromRecord(
+      fallbackKind,
+      instance?.effortName,
+      instance?.effortIndex,
+      instance?.effortUltracode === true,
+    );
     if (recorded) return recorded;
     return effortAt(fallbackKind, readDeviceSettings().defaultEffortIndex ?? DEFAULT_EFFORT_INDEX);
   }
@@ -3833,6 +5328,20 @@ class HubStore {
   /** §9.1: transcript-read-back effective effort, or `null` when unobserved. */
   effortEffectiveOf(instanceId: Id): EffortEffectiveView | null {
     return this.state.effortEffective[instanceId] ?? null;
+  }
+
+  /** r7 item 4(a): true only after an explicit read-back-unavailable edge (or
+   *  a Hub projection going from a level to null). A session that simply never
+   *  read back a level returns false, so a pending chip there shows the
+   *  pending word rather than a false "?". */
+  effortReadbackWithdrawnOf(instanceId: Id): boolean {
+    return this.state.effortReadbackWithdrawn[instanceId] != null;
+  }
+
+  /** c-effortread r8 item 1: the withdrawal watermark observedAt for an
+   *  instance, or null when read-back is currently available. */
+  effortWithdrawnAtOf(instanceId: Id): string | null {
+    return this.state.effortReadbackWithdrawn[instanceId] ?? null;
   }
 
   /** context-usage-1: Hub-computed per-session usage rollup; null until the
@@ -3852,6 +5361,38 @@ class HubStore {
   setUsageRollupForTest(instanceId: Id, rollup: UsageRollup) {
     if (!e2eSeamsEnabled()) return;
     this.emit({ usageRollup: { ...this.state.usageRollup, [instanceId]: rollup } });
+  }
+
+  /** c-effortread r9 e2e seam: resolve (now if already live) when the follow
+   *  socket for `instanceId` has delivered its first contiguous live batch past
+   *  the seed cursor. Returns the acked seq. Inert without the e2e marker. */
+  waitForFollowCaughtUpForTest(instanceId: Id, timeoutMs = 10_000): Promise<string> {
+    if (!e2eSeamsEnabled()) return Promise.resolve("");
+    const already = this.followCaughtUpSeq.get(instanceId);
+    if (already !== undefined) return Promise.resolve(already);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`follow not caught up for ${instanceId}`)),
+        timeoutMs,
+      );
+      const set = this.followCaughtUp.get(instanceId) ?? new Set();
+      set.add((seq) => {
+        clearTimeout(timer);
+        resolve(seq);
+      });
+      this.followCaughtUp.set(instanceId, set);
+    });
+  }
+
+  /** Internal: fire and remember the caught-up seam for an instance. */
+  private resolveFollowCaughtUp(instanceId: Id, seq: string) {
+    if (!e2eSeamsEnabled()) return;
+    if (!this.followCaughtUpSeq.has(instanceId)) {
+      this.followCaughtUpSeq.set(instanceId, seq);
+      const waiters = this.followCaughtUp.get(instanceId);
+      this.followCaughtUp.delete(instanceId);
+      for (const resolve of waiters ?? []) resolve(seq);
+    }
   }
 
   /** The word the slider last requested for this instance (wire spelling). */

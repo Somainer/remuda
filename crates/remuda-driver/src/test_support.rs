@@ -41,14 +41,42 @@ impl Bridge {
     }
 
     /// Arm an arbitrary `/effort <word>` switch; returns its generation.
+    /// Accepts level words, the bare `ultracode`, and `ultracode on|off`.
     pub fn arm_word(&self, word: &str) -> u64 {
         self.inner
             .arm(EffortRequest::from_level(word).expect("level"))
     }
 
+    /// Arm an `/effort <word>` switch carrying a REAL per-request id exactly
+    /// like a web configure does (c-effortread r10/r25), so the mapper's
+    /// completion echo can be asserted against
+    /// [`remuda_protocol::EFFORT_REQUEST_ID_KEY`]. Returns its generation.
+    pub fn arm_word_with_id(&self, word: &str, request_id: &str) -> u64 {
+        let request = EffortRequest::from_level(word)
+            .expect("level")
+            .with_request_id(Some(request_id));
+        self.inner.arm(request)
+    }
+
+    /// Arm a switch from raw slash args; `None` for words Remuda cannot send
+    /// (`auto`, `status`, `bogus`, `ultracode bogus`).
+    #[must_use]
+    pub fn arm_args(&self, args: &str) -> Option<u64> {
+        EffortRequest::from_level(args).map(|request| self.inner.arm(request))
+    }
+
     /// Whether a switch is still awaiting its verdict.
     pub fn has_pending(&self) -> bool {
         self.inner.has_pending()
+    }
+
+    /// c-effortui r5 item 1: the observed-or-requested proven selection a live
+    /// configure would classify against.
+    #[must_use]
+    pub fn proven_selection(&self) -> Option<(remuda_protocol::EffortName, Option<bool>)> {
+        self.inner
+            .proven_selection()
+            .map(|selection| (selection.name, selection.ultracode))
     }
 
     /// Give up on a generation without a verdict (bounded timeout / reject).
@@ -66,6 +94,31 @@ impl Default for Bridge {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// c-effortread r9 items 6 / 9c: classify a live `instance.configure` exactly
+/// as the claude-pty driver does and return the in-session `/effort` word it
+/// would type (`None` = the configure is refused). Integration tests use this
+/// after driving the real mapper → bridge provenance path.
+#[must_use]
+pub fn configure_word(
+    level: &str,
+    ultracode: Option<bool>,
+    axis: Option<remuda_protocol::EffortAxis>,
+    semantics: remuda_protocol::EffortSemantics,
+    observed: Option<(remuda_protocol::EffortName, Option<bool>)>,
+    requested: Option<(remuda_protocol::EffortName, bool)>,
+) -> Option<&'static str> {
+    EffortRequest::for_configure(
+        level,
+        ultracode,
+        axis,
+        semantics,
+        observed.map(|(name, ultracode)| crate::effort::ObservedSelection { name, ultracode }),
+        requested.map(|(name, ultracode)| remuda_protocol::EffortSelection { name, ultracode }),
+        None,
+    )
+    .map(|request| request.command_word())
 }
 
 /// Test handle over one [`ModelBridge`].
@@ -117,6 +170,29 @@ pub fn mapper_with_bridge(
         version.to_owned(),
     )
     .with_effort_bridge(Arc::clone(&bridge.inner), None)
+}
+
+/// Put a mapper in pre-launch (unverified/history) mode, as a resume
+/// transcript pump does for a batch whose current-process provenance cannot be
+/// established (D-056 (4)).
+#[must_use]
+pub fn resume_mapper(mapper: TranscriptMapper) -> TranscriptMapper {
+    let mut mapper = mapper;
+    mapper.set_effort_current_process(false);
+    mapper
+}
+
+/// Set the mapper's current-process provenance, as the transcript pump does
+/// per tail batch (`true` for current-process records, `false` for an
+/// unverified/displaced resume batch).
+pub fn mark_current_process(mapper: &mut TranscriptMapper, current: bool) {
+    mapper.set_effort_current_process(current);
+}
+
+/// Whether the mapper is accepting current-process effort records.
+#[must_use]
+pub fn is_current_process(mapper: &TranscriptMapper) -> bool {
+    mapper.is_current_process()
 }
 
 /// Build a mapper attached to a test model bridge.

@@ -945,14 +945,28 @@ impl Driver for NativeAdapter {
                     model,
                     effort,
                     effort_index,
+                    effort_ultracode,
+                    effort_axis,
+                    effort_request_id,
                     permission_mode,
                 } => {
                     let effort = effort.filter(|value| !value.is_empty());
                     let permission_mode = permission_mode.filter(|value| !value.is_empty());
+                    // c-effortread r9 item 6: parse the explicit axis the
+                    // client stated; an unknown value falls back to None
+                    // (legacy/provenance disambiguation in the driver).
+                    let effort_axis = effort_axis.as_deref().and_then(|axis| match axis {
+                        "flag" => Some(remuda_protocol::EffortAxis::Flag),
+                        "tier" => Some(remuda_protocol::EffortAxis::Tier),
+                        _ => None,
+                    });
                     let switch = remuda_protocol::ModelSwitchInput {
                         model_id: model.clone().unwrap_or_default(),
                         effective: remuda_protocol::ModelEffective::NextTurn,
                         effort: effort.clone(),
+                        effort_ultracode,
+                        effort_axis,
+                        effort_request_id,
                         permission_mode: permission_mode.clone(),
                     };
                     // §9.1: an effort/permission switch with no model id reports
@@ -968,12 +982,15 @@ impl Driver for NativeAdapter {
                         return Ok(Vec::new());
                     }
                     let applied = format!(
-                        "model={} effort={} index={} permission={}",
+                        "model={} effort={} index={} ultracode={} permission={}",
                         model.as_deref().unwrap_or("-"),
                         effort.as_deref().unwrap_or("-"),
                         effort_index
                             .map(|n| n.to_string())
                             .unwrap_or_else(|| "-".into()),
+                        effort_ultracode
+                            .map(|on| if on { "true" } else { "false" })
+                            .unwrap_or("-"),
                         permission_mode.as_deref().unwrap_or("-")
                     );
                     let emissions = vec![crate::driver::DriverEmission::NativeLifecycle {

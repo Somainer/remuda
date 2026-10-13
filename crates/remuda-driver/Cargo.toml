@@ -14,9 +14,6 @@ workspace = true
 default = []
 # In-process FakeDriver for Node/Web loopback. Not installed in release images.
 test-stub = ["remuda-claude-wire/test-stub"]
-# Deterministic close/abort fault injection for integration tests. Never
-# enabled by release binaries; dev-dependencies only.
-test-faults = []
 # macOS `security` CLI keychain backend. Tests are `#[ignore]`.
 keychain = []
 
@@ -63,6 +60,10 @@ rustix = { version = "1", features = ["process", "event"] }
 # Enable the test-only surface (`StdoutMapper`) for this crate's own
 # integration tests, which do not see `cfg(test)` of the lib target.
 remuda-driver = { path = ".", features = ["test-stub"] }
+# Journal/live effort read-back parity replays the same transcript through
+# both mappers.
+remuda-journal = { path = "../remuda-journal" }
+anyhow.workspace = true
 remuda-testing.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

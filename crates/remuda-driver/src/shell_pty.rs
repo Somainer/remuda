@@ -105,17 +105,6 @@ const EXIT_STATUS_GRACE: std::time::Duration = std::time::Duration::from_millis(
 /// (a zombie the reaper had not reached), which the driver test caught.
 const REAP_EXITING_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Bounded flush of one live transcript drain between the promoted close
-/// ladder's rungs (c-ctxusage r15 item 7). A dying writer that appended its
-/// termination record has already settled; this only covers the poller tail
-/// read and queue flush, so it stays tight while still bounded on a loaded
-/// host.
-const PROMOTER_LIVE_DRAIN: std::time::Duration = std::time::Duration::from_secs(3);
-/// Bound on the poller handoff barrier at the start of a promoted close
-/// (P1, c-ctxusage r16 item 6). Generous against one in-flight blocking
-/// collect over a large transcript; a miss makes the close retryable.
-const PROMOTER_CLOSE_BARRIER: std::time::Duration = std::time::Duration::from_secs(15);
-
 /// Native lifecycle name for a PTY process that ended (§5.5).
 pub const NATIVE_EXIT: &str = "native_exit";
 
@@ -236,6 +225,14 @@ pub struct ShellPtyOptions {
     /// `None` only for a driver built outside a Node (tests,
     /// [`ShellPtyDriver::spawn`]), which mints one.
     pub instance_id: Option<InstanceId>,
+    /// Fault injection: make `spawn_at` fail at the post-spawn adapter-setup
+    /// decision — AFTER the child spawned and the switch workers started — so a
+    /// test can drive the real launch path into its failure cleanup (reap the
+    /// child, abort workers, clear `inner`) instead of calling the cleanup
+    /// primitive directly. Only compiled under the test/fake-harness build;
+    /// absent from release code.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fail_after_spawn: bool,
 }
 
 /// What the driver needs to stand up this instance's hook path.
@@ -271,6 +268,8 @@ impl ShellPtyOptions {
             auto_trust_workspace: false,
             agent: None,
             instance_id: None,
+            #[cfg(any(test, feature = "test-stub"))]
+            fail_after_spawn: false,
         }
     }
 
@@ -463,38 +462,14 @@ const FALLBACK_CONFIRM_POLL: std::time::Duration = std::time::Duration::from_mil
 pub struct ShellPtyDriver {
     options: ShellPtyOptions,
     inner: Mutex<Option<Arc<PtyState>>>,
-    /// Set by the CURRENT run's poller while a known agent CLI holds the
-    /// foreground. Per-run detection state (c-ctxusage r20 item 1): the outer
-    /// mutex swaps which inner slot is current when a same-driver resume adopts
-    /// a new run, while the running poller keeps its own inner `Arc`.
-    promoted: std::sync::Mutex<Arc<std::sync::Mutex<Option<Detected>>>>,
-    /// Screen-derived readiness of the current run's agent, when promoted.
-    status: std::sync::Mutex<Arc<std::sync::Mutex<Option<ScreenStatus>>>>,
-    /// Per-run transcript-binding claim (c-ctxusage r21 item 1). Like the
-    /// promoted/status slots, each run owns its OWN `BindingHandle`; the outer
-    /// mutex swaps which handle is current when a same-driver resume adopts a
-    /// new run. Sharing one handle across two live pollers let the resumed run
-    /// bind the predecessor's transcript via its inherited claim.
-    bindings: std::sync::Mutex<promotion::BindingHandle>,
+    /// Set by the poller while a known agent CLI holds the foreground.
+    promoted: Arc<std::sync::Mutex<Option<Detected>>>,
+    /// Screen-derived readiness of that agent, when promoted.
+    status: Arc<std::sync::Mutex<Option<ScreenStatus>>>,
+    /// Deterministic transcript binding for the current promotion epoch.
+    bindings: promotion::BindingHandle,
     /// Promotion poller, stopped on close.
     poller: Mutex<Option<JoinHandle<()>>>,
-    /// One close owner for the whole close (c-ctxusage r17 item 3): an
-    /// overlapping close queues here instead of interleaving a second close
-    /// body — two bodies used to arm two LiveDrain handoff barriers, the
-    /// second arm cancelling the first close's oneshot, which was wrongly
-    /// treated as an acknowledgement so two stop ladders raced the writer.
-    /// The guard drops on every early `?`, so a failed close stays retryable.
-    close_phase: tokio::sync::Mutex<()>,
-    /// Cooperative-shutdown signal for the promotion poller and the channel its
-    /// `finish()` completes on (c-ctxusage r5 item 6): close waits for the last
-    /// hydrator finalise instead of aborting mid-pump.
-    poller_shutdown: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
-    poller_finalised: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
-    /// Non-destructive live drain of the promotion poller (c-ctxusage r15
-    /// item 7): the promoted close stops the native writer first and flushes
-    /// its termination append between the stop-ladder rungs while the
-    /// hydrator and sender are still live.
-    live_drain: std::sync::Mutex<promotion::LiveDrain>,
     /// Exit waiter (§5.5), stopped on close.
     waiter: Mutex<Option<JoinHandle<()>>>,
     /// Process table behind detection; a fixture in tests.
@@ -524,11 +499,6 @@ pub struct ShellPtyDriver {
     permission_bridge: Mutex<Arc<crate::permission::PermissionBridge>>,
     permission_queue: Mutex<Arc<crate::permission::PermissionQueue>>,
     permission_worker: Mutex<Option<JoinHandle<()>>>,
-    /// One-shot scoped catalog refresh task; detached on spawn but it holds an
-    /// event-sender clone, so it is tracked here and cancelled at close (and
-    /// on a restart) for the event channel to close with the session
-    /// (c-ctxusage r10 item 5).
-    catalog_refresh: Mutex<Option<JoinHandle<()>>>,
     /// Event sender for the current run, retained so an effort switch can
     /// journal `queued`/`degraded` without going through the worker.
     events_tx: Mutex<Option<mpsc::Sender<remuda_protocol::Observation>>>,
@@ -543,157 +513,17 @@ pub struct ShellPtyDriver {
     interrupt_pid: Arc<AtomicI32>,
     interrupt_screen_markers: Arc<std::sync::Mutex<promotion::InterruptBaseline>>,
     seq: Arc<AtomicU64>,
-    /// Test-only close/abort fault injection (c-ctxusage r8 item 6); injected
-    /// before `start`, always `None` in production.
-    test_faults: std::sync::Mutex<Option<Arc<crate::test_faults::FaultState>>>,
 }
+
+/// Master endpoint plus its dup'd writer, carried only between spawn and the
+/// [`PtyState`] so a launch failure in that window can hang the slave up.
+type PtyEndpoints = (Box<dyn MasterPty + Send>, Option<Box<dyn io::Write + Send>>);
 
 impl ShellPtyDriver {
     /// Build an unstarted driver.
     #[must_use]
     pub fn new(options: ShellPtyOptions) -> Self {
         Self::with_process_table(options, Arc::new(SystemProcessTable))
-    }
-
-    /// Inject deterministic close/abort faults before `start`. Test builds
-    /// only (`test-faults` feature); release binaries cannot construct the
-    /// handle.
-    #[cfg(feature = "test-faults")]
-    pub fn set_test_faults(&self, faults: crate::test_faults::TranscriptFaults) {
-        *self
-            .test_faults
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(faults.inner);
-    }
-
-    /// Test-only: replace the drain close arms on with a DIFFERENT
-    /// [`LiveDrain`] while the running poller keeps the original — exactly the
-    /// invariant violation a resumed/start_resumed promoted close had before
-    /// the poller adopted the parent driver's drain (P1, c-ctxusage r16
-    /// item 6). The opaque handle returned restores the original drain for a
-    /// retried close via [`Self::test_restore_live_drain`]. Call BEFORE close,
-    /// never while one is in flight.
-    #[cfg(feature = "test-faults")]
-    pub fn test_swap_live_drain(&self) -> Box<dyn std::any::Any + Send> {
-        let original = self
-            .live_drain
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        *self
-            .live_drain
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = promotion::LiveDrain::new();
-        Box::new(original)
-    }
-
-    /// Test-only: restore the drain returned by [`Self::test_swap_live_drain`].
-    #[cfg(feature = "test-faults")]
-    pub fn test_restore_live_drain(&self, drain: Box<dyn std::any::Any + Send>) {
-        let drain = *drain
-            .downcast::<promotion::LiveDrain>()
-            .expect("the restore handle came from test_swap_live_drain");
-        *self
-            .live_drain
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = drain;
-    }
-
-    /// Test-only: whether this driver's current run drain is armed for close.
-    /// A resumed run starts from a FRESH drain, so this reads false right
-    /// after resume even when the previous run was fully closed
-    /// (c-ctxusage r17 item 4).
-    #[cfg(feature = "test-faults")]
-    pub fn test_live_drain_is_closing(&self) -> bool {
-        self.live_drain
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_closing()
-    }
-
-    /// Test-only: drop the close handoff sender the current drain holds
-    /// WITHOUT firing it, so the waiting close receives a Canceled — exactly
-    /// what a concurrent close re-arming the barrier used to produce. Canceled
-    /// is not an ack: the close must stay retryable (c-ctxusage r17 item 3).
-    #[cfg(feature = "test-faults")]
-    pub async fn test_cancel_close_barrier(&self) -> bool {
-        let drain = self
-            .live_drain
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        drain.cancel_close_barrier().await
-    }
-
-    /// Test-only: whether the spawned promotion poller task has already
-    /// RETURNED while its slot is still occupied (its observation receiver
-    /// was dropped, so events closed and the loop exited). `None` means no
-    /// poller was ever spawned. A promoted close must treat `Some(true)` as a
-    /// satisfied handoff and still signal the writer (c-ctxusage r17 item 2).
-    #[cfg(feature = "test-faults")]
-    pub async fn test_poller_is_finished(&self) -> Option<bool> {
-        self.poller
-            .lock()
-            .await
-            .as_ref()
-            .map(tokio::task::JoinHandle::is_finished)
-    }
-
-    /// Test-only: wait for the spawned promotion poller task to RETURN via its
-    /// own `finalised` handshake (the same channel close's teardown awaits),
-    /// bounded. The caller first closes the observation channel; the poller
-    /// then breaks its loop at the next tick. Consumes the receiver, so a
-    /// later close awaits the task handle directly (c-ctxusage r17 item 2).
-    #[cfg(feature = "test-faults")]
-    pub async fn test_wait_poller_exited(&self, bound: std::time::Duration) -> bool {
-        let fired = match self.poller_finalised.lock().await.take() {
-            Some(receiver) => tokio::time::timeout(bound, receiver).await.is_ok(),
-            None => return false,
-        };
-        if !fired {
-            return false;
-        }
-        // `finalised` is the task's last statement; completion lands a beat
-        // later. Cooperatively wait for the handle itself (no wall-clock
-        // sleep); the bound only guards a genuinely wedged task.
-        let deadline = tokio::time::Instant::now() + bound;
-        loop {
-            if self
-                .poller
-                .lock()
-                .await
-                .as_ref()
-                .is_none_or(tokio::task::JoinHandle::is_finished)
-            {
-                return true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::task::yield_now().await;
-        }
-    }
-
-    /// Test-only: stop the long-lived effort/model/permission worker tasks
-    /// and wait for their event-sender clones to drop, so the last senders of
-    /// the event channel are gone and a receiver observes closure. These
-    /// workers outlive `close()` by design (they are per-started-session
-    /// tasks torn down with the driver); exactly-once tests must await
-    /// RECEIVER COMPLETION rather than aborting the drainer while a duplicate
-    /// could still be buffered (c-ctxusage r10 item 5). The promoter, its
-    /// flusher and the adapters have already shut down in `close()`.
-    #[cfg(feature = "test-faults")]
-    pub async fn abort_event_workers_for_test(&self) {
-        for slot in [
-            &self.effort_worker,
-            &self.model_worker,
-            &self.permission_worker,
-        ] {
-            if let Some(worker) = slot.lock().await.take() {
-                worker.abort();
-                let _ = worker.await;
-            }
-        }
     }
 
     /// Build a driver whose promotion detection reads `table` instead of the
@@ -703,14 +533,10 @@ impl ShellPtyDriver {
         Self {
             options,
             inner: Mutex::new(None),
-            promoted: std::sync::Mutex::new(Arc::new(std::sync::Mutex::new(None))),
-            status: std::sync::Mutex::new(Arc::new(std::sync::Mutex::new(None))),
-            bindings: std::sync::Mutex::new(promotion::BindingHandle::empty()),
+            promoted: Arc::new(std::sync::Mutex::new(None)),
+            status: Arc::new(std::sync::Mutex::new(None)),
+            bindings: promotion::BindingHandle::empty(),
             poller: Mutex::new(None),
-            close_phase: tokio::sync::Mutex::new(()),
-            poller_shutdown: Mutex::new(None),
-            poller_finalised: Mutex::new(None),
-            live_drain: std::sync::Mutex::new(promotion::LiveDrain::new()),
             waiter: Mutex::new(None),
             table,
             fallbacks: crate::hook_answer::FallbackLedger::new(),
@@ -729,7 +555,6 @@ impl ShellPtyDriver {
             ))),
             permission_queue: Mutex::new(Arc::new(crate::permission::PermissionQueue::new())),
             permission_worker: Mutex::new(None),
-            catalog_refresh: Mutex::new(None),
             events_tx: Mutex::new(None),
             promote_ctx: Mutex::new(None),
             interrupt_pid: Arc::new(AtomicI32::new(0)),
@@ -737,7 +562,6 @@ impl ShellPtyDriver {
                 promotion::InterruptBaseline::default(),
             )),
             seq: Arc::new(AtomicU64::new(0)),
-            test_faults: std::sync::Mutex::new(None),
         }
     }
 
@@ -749,15 +573,16 @@ impl ShellPtyDriver {
     /// Safe to call when promotion is off or no agent is foreground — the
     /// report is matched at the next promotion tick.
     pub fn ingest_session_start(&self, report: crate::claude_transcript::SessionStartReport) {
-        self.current_bindings().ingest_session_start(report);
+        self.bindings.ingest_session_start(report);
     }
 
     /// Currently promoted agent kind, if the PTY's foreground is an agent CLI.
     #[must_use]
     pub fn promoted_kind(&self) -> Option<AgentKind> {
-        let promoted = self.promoted.lock().ok()?;
-        let slot = promoted.lock().ok()?;
-        slot.as_ref().map(|found| found.kind)
+        self.promoted
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|found| found.kind))
     }
 
     /// Whether the hook path has produced a session binding for this PTY.
@@ -789,78 +614,7 @@ impl ShellPtyDriver {
     /// `idle` — so a caller guarding on idleness gets a conservative answer.
     #[must_use]
     pub fn screen_status(&self) -> Option<ScreenStatus> {
-        let status = self.status.lock().ok()?;
-        status.lock().ok().and_then(|slot| *slot)
-    }
-
-    /// Clone the current run's inner promoted slot (c-ctxusage r20 item 1).
-    fn current_promoted(&self) -> Arc<std::sync::Mutex<Option<Detected>>> {
-        Arc::clone(
-            &*self
-                .promoted
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-    }
-
-    /// Clone the current run's inner status slot.
-    fn current_status(&self) -> Arc<std::sync::Mutex<Option<ScreenStatus>>> {
-        Arc::clone(
-            &*self
-                .status
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-    }
-
-    /// Stable identity (inner-Arc pointer) of the driver's CURRENT promoted
-    /// slot (c-ctxusage r20 item 2). A resume swaps this pointer when it adopts
-    /// the new run's slots, so a test can prove the current slot is still the
-    /// predecessor's while retirement is parked and changes after adoption.
-    #[cfg(feature = "test-faults")]
-    #[must_use]
-    pub fn test_promoted_slot_id(&self) -> usize {
-        Arc::as_ptr(
-            &*self
-                .promoted
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-        .addr()
-    }
-
-    /// Clone the current run's binding handle (c-ctxusage r21 item 1): the
-    /// poller captures the handle at spawn, and a resume swaps the current one
-    /// only after the predecessor retires.
-    fn current_bindings(&self) -> promotion::BindingHandle {
-        self.bindings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    /// Whether the current run's binding handle holds an established transcript
-    /// claim (c-ctxusage r21 item 1 test seam).
-    #[cfg(feature = "test-faults")]
-    #[must_use]
-    pub fn test_bindings_is_bound(&self) -> bool {
-        self.bindings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_bound()
-    }
-
-    /// Fire a live-drain request WITHOUT arming close (c-ctxusage r22 item 4);
-    /// resolves once the poller drains and acknowledges it.
-    #[cfg(feature = "test-faults")]
-    pub async fn test_request_drain_only(&self) {
-        let drain = self
-            .live_drain
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let rx = drain.test_request_drain_only().await;
-        let _ = rx.await;
+        self.status.lock().ok().and_then(|slot| *slot)
     }
 
     /// Answer an ignored hook decision on the agent's own dialog, once (§14 risk 1).
@@ -985,9 +739,12 @@ impl ShellPtyDriver {
     /// The live promoted process, or our direct agent child before detection.
     /// A login shell's PID is never evidence for a hand-typed agent.
     fn session_pid(&self) -> Option<i32> {
-        if let Ok(slot) = self.promoted.lock()
-            && let Ok(inner) = slot.lock()
-            && let Some(pid) = inner.as_ref().map(|found| found.pid).filter(|pid| *pid > 0)
+        if let Some(pid) = self
+            .promoted
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|found| found.pid))
+            .filter(|pid| *pid > 0)
         {
             return Some(pid);
         }
@@ -1090,11 +847,34 @@ impl ShellPtyDriver {
 
     /// §9.1: queue `/effort <level>` for the composer, ready-ladder gated, and
     /// wait for transcript read-back while the composer is idle.
-    async fn switch_effort(&self, level: &str) -> DriverResult<DriverAck> {
-        let Some(request) = crate::effort::EffortRequest::from_level(level) else {
+    async fn switch_effort(
+        &self,
+        level: &str,
+        ultracode: Option<bool>,
+        axis: Option<remuda_protocol::EffortAxis>,
+        request_id: Option<String>,
+    ) -> DriverResult<DriverAck> {
+        // The promoted-shell carrier does not hold the agent's reported binary
+        // version, so the version-gated ultracode axis fails closed here (the
+        // Herdr `claude_pty` carrier is the version-aware one and types
+        // `ultracode` / `ultracode on|off` itself). Plain level switches work.
+        // c-effortread r12 item 4: the explicit axis is threaded all the way
+        // here (send() used to drop it). ANY explicit flag operation — on,
+        // off, or one whose boolean is missing/non-boolean (None) — is refused
+        // rather than silently typing a plain `/effort <level>` for it.
+        if axis == Some(remuda_protocol::EffortAxis::Flag) || ultracode == Some(true) {
+            return Err(DriverError::CapabilityUnsupported(
+                "ultracode cannot be switched from a promoted-shell carrier; \
+                 use the managed Claude session"
+                    .to_owned(),
+            ));
+        }
+        let Some(request) = crate::effort::EffortRequest::from_level(level)
+            .map(|request| request.with_request_id(request_id.as_deref()))
+        else {
             return Err(DriverError::CapabilityUnsupported(format!(
                 "claude /effort does not accept {level:?} in-session; \
-                 valid: low, medium, high, xhigh, max, ultracode"
+                 valid: low, medium, high, xhigh, max, ultracode, ultracode on, ultracode off"
             )));
         };
         let state = self.state().await?;
@@ -1120,6 +900,7 @@ impl ShellPtyDriver {
             events,
             seq: Arc::clone(&self.seq),
             ctx,
+            bindings: self.bindings.clone(),
         });
         let ready = io.is_idle().await;
         if ready {
@@ -1135,9 +916,10 @@ impl ShellPtyDriver {
         } else {
             // The agent is working (or the screen is not provably idle). Hold
             // for the next idle and let the worker journal the terminal state.
-            io.journal(
+            io.journal_effort(
                 crate::effort::SwitchOutcome::Queued.journal_status(request.command_word(), ""),
                 remuda_protocol::Severity::Info,
+                request.request_id.clone(),
             )
             .await;
             queue.enqueue(request, None);
@@ -1176,6 +958,7 @@ impl ShellPtyDriver {
             events,
             seq: Arc::clone(&self.seq),
             ctx,
+            bindings: self.bindings.clone(),
         });
         if io.is_idle().await {
             let (done, rx_outcome) = tokio::sync::oneshot::channel();
@@ -1186,9 +969,10 @@ impl ShellPtyDriver {
                 // Never claim applied without a terminal outcome.
             }
         } else {
-            io.journal(
+            io.journal_effort(
                 crate::model::ModelSwitchOutcome::Queued.journal_status(&request.id, ""),
                 remuda_protocol::Severity::Info,
+                None,
             )
             .await;
             queue.enqueue(request, None);
@@ -1308,22 +1092,37 @@ impl ShellPtyDriver {
                 pty_err(io::Error::other(format!("materialize panicked: {error}")))
             })??
         };
+        // D-056 (r4 items 1 & 3), r5 item 7: build the resume mode BEFORE the
+        // child spawns against the ONE config dir the child actually receives
+        // (child_env_layers), and put that same dir on the promotion ctx so the
+        // hydrator discovers transcripts in exactly the directory the child
+        // writes to. build_command reassembles the same deterministic layers.
+        let launch_cwd = spec
+            .as_ref()
+            .map(|s| std::path::PathBuf::from(&s.cwd))
+            .unwrap_or_else(|| self.options.cwd.clone());
+        let child_env = child_env_layers(&self.options, &recipe)?;
+        let config_dir = child_env.claude_config_dir(&self.options);
+        let mut hook_ctx = hook_ctx;
+        hook_ctx.claude_home = config_dir.clone();
         let cmd = build_command(&self.options, cwd, &recipe, hooks.as_ref())?;
-        // Test-only spawn failure (c-ctxusage r20 item 1): fail AFTER launch
-        // materialization and BEFORE spawn_command, so no child process exists
-        // and dropping this run leaves nothing running — used to prove a failed
-        // same-driver resume does not touch the predecessor run.
-        let spawn_fails = self
-            .test_faults
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_deref()
-            .is_some_and(crate::test_faults::FaultState::take_spawn_failure);
-        if spawn_fails {
-            return Err(pty_err(io::Error::other(
-                "injected shell-pty spawn failure after materialization",
-            )));
-        }
+        let pre_resume_mode: Option<crate::claude_transcript::ResumeMode> =
+            match &self.options.target {
+                Target::Agent {
+                    resume: Some(session_id),
+                    ..
+                } => Some(
+                    match crate::claude_transcript::ResumeBoundary::for_resume(
+                        &config_dir,
+                        &launch_cwd,
+                        session_id,
+                    ) {
+                        Some(boundary) => crate::claude_transcript::ResumeMode::Boundary(boundary),
+                        None => crate::claude_transcript::ResumeMode::Unverified,
+                    },
+                ),
+                _ => None,
+            };
         let child = pair.slave.spawn_command(cmd).map_err(pty_err)?;
         drop(pair.slave);
         // `portable-pty` calls `setsid()` before `exec`, so the child leads its
@@ -1331,8 +1130,22 @@ impl ShellPtyDriver {
         let pgid = child.process_id().and_then(|pid| i32::try_from(pid).ok());
         let killer = child.clone_killer();
         let master = pair.master;
-        let writer = master.take_writer().map_err(pty_err)?;
-        let reader = master.try_clone_reader().map_err(pty_err)?;
+        // Each of the next steps can fail; the spawned child must be killed and
+        // reaped on any of those errors rather than orphaned.
+        let writer = match master.take_writer() {
+            Ok(writer) => writer,
+            Err(error) => {
+                Self::abort_failed_launch(child, pgid, Some((master, None))).await;
+                return Err(pty_err(error));
+            }
+        };
+        let reader = match master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                Self::abort_failed_launch(child, pgid, Some((master, Some(writer)))).await;
+                return Err(pty_err(error));
+            }
+        };
         let (output, _) = broadcast::channel(64);
         let emulator = self.options.emulator.then(|| {
             tracing::info!(
@@ -1360,7 +1173,7 @@ impl ShellPtyDriver {
         });
         let pump = Arc::clone(&state);
         let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("remuda-shell-pty".into())
             .spawn(move || {
                 read_pty(pump, reader);
@@ -1368,7 +1181,14 @@ impl ShellPtyDriver {
                 // closed at both ends. It frequently beats `wait()`.
                 let _ = eof_tx.send(());
             })
-            .map_err(DriverError::Io)?;
+        {
+            // The reader never started: run the stop ladder so the spawned
+            // child is killed and reaped, not orphaned.
+            if let Err(stop_error) = self.stop_tree(&state).await {
+                tracing::warn!(%stop_error, "cleanup after failed launch failed");
+            }
+            return Err(DriverError::Io(error));
+        }
         *self.inner.lock().await = Some(Arc::clone(&state));
         *self.hooks.lock().await = hooks.clone();
         *self.events_tx.lock().await = Some(tx.clone());
@@ -1377,16 +1197,14 @@ impl ShellPtyDriver {
         // adopts the previous bridge afterwards when a switch was in flight.
         let effort_bridge = Arc::new(crate::effort::EffortBridge::new());
         if let Some(effort) = spec.and_then(|spec| spec.effort) {
-            effort_bridge.note_launch_request(crate::effort::EffortRequest {
-                name: effort.name,
-                ultracode: effort.ultracode,
-            });
+            effort_bridge.note_launch_request(crate::effort::EffortRequest::from_selection(effort));
         }
         let effort_io: Arc<dyn crate::effort::EffortSwitchIo> = Arc::new(ShellEffortIo {
             state: Arc::clone(&state),
             events: tx.clone(),
             seq: Arc::clone(&self.seq),
             ctx: hook_ctx.clone(),
+            bindings: self.bindings.clone(),
         });
         // A fresh run needs a fresh queue: stop the previous worker and close
         // its queue before swapping.
@@ -1417,17 +1235,13 @@ impl ShellPtyDriver {
                     .parent()
                     .map(std::path::Path::to_path_buf)
             });
-        let catalog_env: Vec<(String, String)> =
-            agent_env(&self.options.target, &recipe, self.options.pin_native_home)
-                .into_iter()
-                .chain(
-                    self.options
-                        .extra_env
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone())),
-                )
-                .filter(|(key, _)| !crate::child_env::is_denied(key))
-                .collect();
+        // r6 item 2 / r7 item 4(b): the catalog/settings refresh must read the
+        // SAME env and config dir the child receives (the pin overrides
+        // extra_env). Reuse the env layers built BEFORE the child spawned
+        // (line above): recomputing them here was a second fallible call
+        // AFTER spawn whose `?` returned straight through spawn_at, skipping
+        // the launch-failure teardown and orphaning the child.
+        let catalog_env: Vec<(String, String)> = child_env.entries.clone();
         let model_catalog = crate::model_discovery::resolve_catalog(
             Some(std::path::Path::new(&recipe.native_home)),
             host_config_dir.as_deref(),
@@ -1443,7 +1257,7 @@ impl ShellPtyDriver {
         // is missing the promotion-time answer may be the host fallback.
         // Re-resolve when the session's own cache lands and re-stamp the
         // catalog so the picker never freezes on the fallback list.
-        {
+        let mut catalog_refresh_task: Option<JoinHandle<()>> = {
             let bridge = Arc::clone(&model_bridge);
             let events = tx.clone();
             let seq = Arc::clone(&self.seq);
@@ -1454,11 +1268,9 @@ impl ShellPtyDriver {
             let host_dir = host_config_dir.clone();
             let current = launch_model.clone();
             let env = catalog_env.clone();
-            // Cancel any prior run's still-pending refresh.
-            if let Some(previous) = self.catalog_refresh.lock().await.take() {
-                previous.abort();
-            }
-            let refresh = tokio::spawn(async move {
+            // The one-shot catalog-refresh task; aborted on a post-spawn
+            // launch failure, otherwise detached to run once after launch.
+            Some(tokio::spawn(async move {
                 let payload = crate::model_discovery::scoped_refresh_payload(
                     std::path::PathBuf::from(native_home),
                     host_dir,
@@ -1482,14 +1294,14 @@ impl ShellPtyDriver {
                 {
                     tracing::debug!(%error, "model catalog refresh: event channel closed");
                 }
-            });
-            *self.catalog_refresh.lock().await = Some(refresh);
-        }
+            }))
+        };
         let model_io: Arc<dyn crate::model::SwitchIo> = Arc::new(ShellEffortIo {
             state: Arc::clone(&state),
             events: tx.clone(),
             seq: Arc::clone(&self.seq),
             ctx: hook_ctx.clone(),
+            bindings: self.bindings.clone(),
         });
         if let Some(worker) = self.model_worker.lock().await.take() {
             worker.abort();
@@ -1547,9 +1359,71 @@ impl ShellPtyDriver {
         // GROK_HOME), follow the child pid, and emit on the instance's one
         // ordered observation channel. Hook-confirmed session identity wins
         // over file discovery (Hook > File) via the adapter confirm path.
-        if let Some(handle) = self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd)? {
-            *self.adapters.lock().await = Some(handle);
+        // Fault injection (test/fake-harness only): fail the post-spawn
+        // adapter-setup step so the real launch path runs its failure cleanup.
+        #[cfg(any(test, feature = "test-stub"))]
+        let adapter_setup: DriverResult<
+            Option<crate::adapters::supervisor::AdapterHandle>,
+        > = if self.options.fail_after_spawn {
+            Err(DriverError::Io(io::Error::other(
+                "injected post-spawn adapter-setup failure",
+            )))
+        } else {
+            self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd)
+        };
+        #[cfg(not(any(test, feature = "test-stub")))]
+        let adapter_setup = self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd);
+        match adapter_setup {
+            Ok(Some(handle)) => *self.adapters.lock().await = Some(handle),
+            Ok(None) => {}
+            Err(error) => {
+                // The child is already running: kill and reap it so an adapter
+                // setup failure does not orphan the launched agent.
+                if let Err(stop_error) = self.stop_tree(&state).await {
+                    tracing::warn!(%stop_error, "cleanup after failed launch failed");
+                }
+                // Tear down every coordination task this launch started and
+                // clear `inner`, exactly as a successful stop does: a failed
+                // launch must not leave detached effort/model/permission
+                // workers (or the one-shot catalog refresh) holding stale
+                // bridges, nor leave a dead PtyState that a later resume could
+                // adopt. The poller never started at this point.
+                self.effort_queue.lock().await.close();
+                if let Some(worker) = self.effort_worker.lock().await.take() {
+                    worker.abort();
+                }
+                self.model_queue.lock().await.close();
+                if let Some(worker) = self.model_worker.lock().await.take() {
+                    worker.abort();
+                }
+                self.permission_queue.lock().await.close();
+                if let Some(worker) = self.permission_worker.lock().await.take() {
+                    worker.abort();
+                }
+                if let Some(task) = catalog_refresh_task.take() {
+                    task.abort();
+                }
+                self.events_tx.lock().await.take();
+                self.interrupt_pid.store(0, Ordering::SeqCst);
+                // Item 8: release the hook server/socket and anything parked
+                // on it, and drop the transcript claim — exactly what close()
+                // does. Without this the per-instance socket stayed bound
+                // (retire_parked held its agents' turns and the socket file
+                // remained), so the retry after this failed launch could not
+                // bind and inherited a stale epoch.
+                if let Some(hooks) = self.hooks.lock().await.as_ref() {
+                    hooks.retire_parked();
+                }
+                self.hooks.lock().await.take();
+                self.bindings.demobilize();
+                *self.inner.lock().await = None;
+                return Err(error);
+            }
         }
+        // On a successful launch the one-shot catalog refresh outlives this
+        // function and must keep running detached; dropping its JoinHandle
+        // (without abort) does exactly that.
+        drop(catalog_refresh_task);
         if self.options.promote {
             // Built before `hooks` moves into the poller: the silence probe
             // needs the live session's *real* socket path. Under a long data
@@ -1562,35 +1436,15 @@ impl ShellPtyDriver {
                     socket: session.socket_path.clone(),
                 })
             });
-            // c-ctxusage r5 item 6: cooperative poller shutdown.
-            let (poller_tx, poller_rx) = tokio::sync::watch::channel(false);
-            let (finalised_tx, finalised_rx) = tokio::sync::oneshot::channel();
-            // Clone the test-only fault handle BEFORE any await so the std
-            // mutex guard never crosses an await point.
-            let test_faults = self
-                .test_faults
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            *self.poller_shutdown.lock().await = Some(poller_tx);
-            *self.poller_finalised.lock().await = Some(finalised_rx);
-            // Clone under the std mutex and DROP the guard before the await
-            // below: a non-Send guard must not cross the poller lock.
-            let live_drain = self
-                .live_drain
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            // Hand the poller the CURRENT inner detection slots.
-            let promoted = self.current_promoted();
-            let status = self.current_status();
+            // The pre-spawn resume boundary (None for a login shell, which
+            // bounds a hand-typed resume per detected process instead).
             *self.poller.lock().await = Some(promotion::spawn(
                 Arc::clone(&state),
                 hook_ctx.clone(),
                 Arc::clone(&self.table),
-                promoted,
-                status,
-                self.current_bindings(),
+                Arc::clone(&self.promoted),
+                Arc::clone(&self.status),
+                self.bindings.clone(),
                 hooks,
                 matches!(self.options.target, Target::Shell),
                 self.options.auto_trust_workspace,
@@ -1607,6 +1461,7 @@ impl ShellPtyDriver {
                 }),
                 Some(Arc::clone(&permission_bridge)),
                 launch_permission,
+                pre_resume_mode,
                 // c-wfdrill2 B: the pinned path this launch exec'd, so
                 // detection does not depend on the executable's basename
                 // being one the agent table has heard of. Only for an agent
@@ -1619,10 +1474,6 @@ impl ShellPtyDriver {
                 // socket the poller probes when a quiet hook tier goes silent
                 // (captured above before `hooks` moved into the poller).
                 silence_paths,
-                poller_rx,
-                finalised_tx,
-                test_faults,
-                live_drain,
             ));
             // A login shell has no agent at spawn; once promotion identifies a
             // hand-typed codex/grok, start its file adapter against the native
@@ -1658,7 +1509,7 @@ impl ShellPtyDriver {
             tx,
             Arc::clone(&self.seq),
             Arc::clone(&self.exited),
-            self.current_promoted(),
+            Arc::clone(&self.promoted),
             eof_rx,
         ));
         if let Ok(mut slot) = self.recipe.lock() {
@@ -1733,7 +1584,7 @@ impl ShellPtyDriver {
         ctx: &promotion::PromoteCtx,
         events: mpsc::Sender<remuda_protocol::Observation>,
     ) -> crate::adapters::supervisor::AdapterHandle {
-        let promoted = self.current_promoted();
+        let promoted = Arc::clone(&self.promoted);
         let options_cwd = self.options.cwd.clone();
         let seq = Arc::clone(&self.seq);
         let stamp_ctx = crate::adapters::supervisor::stamp_ctx(
@@ -1802,314 +1653,7 @@ impl ShellPtyDriver {
     /// signal — a platform without them, or a child that reported no pid. That
     /// fallback is the pre-D-028 behaviour and inherits its weakness (it
     /// reaches the direct child only), which is why it is last and logged.
-    /// Run the stop ladder against the PTY group.
-    ///
-    /// `live_drain` (c-ctxusage r15 item 7): when the instance is a promoted
-    /// shell, close keeps the transcript poller, hydrator and event sender
-    /// live through the ladder, and after every rung the poller flushes any
-    /// record the dying native writer appended (bounded). In that mode
-    /// `state.closed` is left clear so the poller keeps draining; the caller
-    /// sets it only after the ladder verifies the group is gone.
-    /// Promoted close, phase 1 (c-ctxusage r15 item 7): stop the native
-    /// writer and verify the process group is gone WHILE the transcript
-    /// poller, hydrator and event sender are still live, draining the
-    /// writer's termination append after every stop-ladder rung. The
-    /// promoter itself is retired afterwards by close's normal poller
-    /// shutdown block.
-    /// Retire the PREVIOUS run's promotion poller and exit waiter before a
-    /// resumed run adopts this driver's shared handles (c-ctxusage r18
-    /// item 3). After a natural exit the poller is still running — the
-    /// writer's death demotes it, it does not stop it — and resume used to
-    /// overwrite `poller`/`poller_shutdown` outright: dropping the JoinHandle
-    /// DETACHED the task and dropping its watch sender only closed the
-    /// channel, which the poll loop treated as a no-op tick. The detached
-    /// predecessor kept its event-sender clone alive and kept tailing the
-    /// old transcript forever.
-    ///
-    /// Mirrors close's cooperative poller shutdown: signal the watch, wait
-    /// bounded for the finalise/task, abort only a genuinely wedged poller;
-    /// the exit waiter is cancelled and joined the same way close does, so no
-    /// predecessor sender clone survives into the new run.
-    async fn retire_predecessor_run(&self) {
-        if let Some(shutdown) = self.poller_shutdown.lock().await.take() {
-            let _ = shutdown.send(true);
-        }
-        let promoter_timeout = self
-            .test_faults
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_deref()
-            .and_then(crate::test_faults::FaultState::close_timeout)
-            .unwrap_or_else(|| std::time::Duration::from_secs(15));
-        let finalised = self.poller_finalised.lock().await.take();
-        if let Some(mut poller) = self.poller.lock().await.take() {
-            let mut finalised = finalised;
-            let finished = if let Some(finalised) = finalised.as_mut() {
-                tokio::pin!(finalised);
-                tokio::time::timeout(promoter_timeout, async {
-                    tokio::select! {
-                        _ = finalised => {}
-                        _ = &mut poller => {}
-                    }
-                })
-                .await
-                .is_ok()
-            } else {
-                tokio::time::timeout(promoter_timeout, &mut poller)
-                    .await
-                    .is_ok()
-            };
-            if !finished {
-                // c-ctxusage r21 item 4: the poller may be parked in an
-                // injected finalise/collect gate. A bound that simply abandons
-                // it leaves a parked blocking thread behind. Release the gate
-                // first (test-only), then give the task a short bounded grace
-                // to actually complete; abort only if it is genuinely wedged.
-                #[cfg(feature = "test-faults")]
-                if let Some(faults) = self
-                    .test_faults
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .as_deref()
-                {
-                    faults.open_blocking_gate();
-                }
-                let released = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                    if let Some(finalised) = finalised.as_mut() {
-                        tokio::pin!(finalised);
-                        tokio::select! {
-                            _ = finalised => {}
-                            _ = &mut poller => {}
-                        }
-                    } else {
-                        let _ = (&mut poller).await;
-                    }
-                })
-                .await
-                .is_ok();
-                if !released {
-                    poller.abort();
-                    let _ =
-                        tokio::time::timeout(std::time::Duration::from_secs(2), &mut poller).await;
-                }
-            }
-        }
-        if let Some(mut waiter) = self.waiter.lock().await.take() {
-            waiter.abort();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut waiter).await;
-        }
-        // The predecessor's detection slots are stale; the new run's poller
-        // repopulates them on its own bind/demote. This clears the CURRENT
-        // (predecessor, at retirement time) inner slots; the resumed run owns
-        // separate slots and is unaffected (c-ctxusage r20 item 1).
-        self.clear_current_detection_slots();
-    }
-
-    /// Clear the promoted/status values held in the current run's inner slots.
-    /// The outer current-run pointer is left in place.
-    fn clear_current_detection_slots(&self) {
-        if let Ok(slot) = self.promoted.lock()
-            && let Ok(mut inner) = slot.lock()
-        {
-            *inner = None;
-        }
-        if let Ok(slot) = self.status.lock()
-            && let Ok(mut inner) = slot.lock()
-        {
-            *inner = None;
-        }
-    }
-
-    async fn stop_promoted_writer_before_retire(&self) -> DriverResult<()> {
-        let state = self.state().await?;
-        // From here the poller only tail-reads the bound transcript; it does
-        // not demote or finish the hydrator on an epoch boundary.
-        let drain = self
-            .live_drain
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        // Concurrent closes are serialized by close()'s close_phase guard, so
-        // no other close can re-arm this drain barrier while this one is in
-        // flight: a re-arm used to drop this wait's oneshot sender and the
-        // resulting Canceled was wrongly read as an ack (c-ctxusage r17
-        // item 3).
-        let close_barrier = drain.arm_close().await;
-        if let Some(faults) = self
-            .test_faults
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_deref()
-        {
-            faults.note_close_barrier_armed();
-        }
-        // The handoff barrier exists to serialize with an IN-FLIGHT poll. The
-        // slot being occupied only means a poller was SPAWNED; the task may
-        // already have RETURNED — its observation receiver was dropped, so
-        // events closed and the poll loop broke. A finished task cannot be
-        // mid sample/demote/finalise, so it satisfies the handoff exactly
-        // like the no-poller login-option setup. The same is re-checked after
-        // a barrier timeout: a task that exits WHILE close waits is not a live
-        // poll refusing to acknowledge (c-ctxusage r17 item 2).
-        let poller_running = self
-            .poller
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|handle| !handle.is_finished());
-        if poller_running {
-            // P1 (c-ctxusage r16 item 6): wait for the poller's handoff ack
-            // BEFORE signalling the writer. An in-flight normal tick may
-            // already have passed its closing check and be about to
-            // demote/finalise the hydrator; the ack fires only after that tick
-            // completed and the next iteration entered the non-terminal tail
-            // branch. Without the barrier that demote/finalise could retire
-            // the hydrator under the ladder and eat the writer's termination
-            // append. A poller that cannot reach the branch in time makes the
-            // close retryable rather than racing.
-            if let Some(faults) = self
-                .test_faults
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_deref()
-            {
-                faults.note_close_barrier_waiting();
-            }
-            let barrier_bound = self
-                .test_faults
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_deref()
-                .and_then(crate::test_faults::FaultState::close_barrier_timeout)
-                .unwrap_or(PROMOTER_CLOSE_BARRIER);
-            match tokio::time::timeout(barrier_bound, close_barrier).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_canceled)) => {
-                    // The sender was dropped WITHOUT sending. With closes
-                    // serialized this can only be a drain replacement (a
-                    // resumed/foreign drain) or a test fault, never an ack:
-                    // signal nothing and stay retryable, and the next close
-                    // arms a fresh barrier (c-ctxusage r17 item 3).
-                    tracing::warn!(
-                        "promoted close handoff barrier was canceled without an \
-                         acknowledgement; close stays retryable"
-                    );
-                    return Err(DriverError::WriterStillLive(
-                        "the close handoff barrier was canceled without an acknowledgement".into(),
-                    ));
-                }
-                Err(_elapsed) => {
-                    // The poller never reached the closing branch. Two cases:
-                    //
-                    // 1. A blocking collect is genuinely parked (in production a
-                    //    stalled collect; in tests the injected pump gate). Close
-                    //    must still complete: run the writer stop ladder below,
-                    //    and let the poller teardown abort the parked task with
-                    //    its FinaliseGuard rescue — the collected frames cannot
-                    //    demote/finalise from inside a parked collect.
-                    //
-                    // 2. The poller is observing a DIFFERENT drain (the
-                    //    start_resumed foreign-drain defect): nothing is parked,
-                    //    so keep the close retryable rather than racing a live
-                    //    normal poll.
-                    let parked_pump = self
-                        .test_faults
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .as_deref()
-                        .is_some_and(crate::test_faults::FaultState::pump_gate_holds);
-                    // A task that finished while close waited (its event receiver
-                    // closed mid-barrier) has no in-flight poll either; its
-                    // handoff is satisfied and the writer must be signalled.
-                    let poller_finished = self
-                        .poller
-                        .lock()
-                        .await
-                        .as_ref()
-                        .is_some_and(tokio::task::JoinHandle::is_finished);
-                    if !parked_pump && !poller_finished {
-                        tracing::warn!(
-                            "promoted close barrier was not acknowledged; close stays retryable"
-                        );
-                        return Err(DriverError::WriterStillLive(
-                            "the poller never acknowledged the close handoff barrier".into(),
-                        ));
-                    }
-                    tracing::warn!(
-                        "promoted close barrier timed out against a parked blocking collect \
-                         or a poller that exited mid-barrier; proceeding to the stop ladder \
-                         (and the poller abort-rescue path when it is still parked)"
-                    );
-                }
-            }
-        }
-        let outcome = self.stop_tree(&state, true).await;
-
-        // Test-only fault (P1, c-ctxusage r16 item 5): synthesize a writer
-        // that survives the ladder so the retryable-incomplete path is
-        // exercised deterministically.
-        let force_incomplete = self
-            .test_faults
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_deref()
-            .is_some_and(crate::test_faults::FaultState::take_promoted_stop_incomplete);
-
-        // P1 (c-ctxusage r16 item 5): the hydrator is retired and close
-        // ownership dropped ONLY when the writer's process group is verified
-        // gone. A survivor — or a ladder that could not verify — makes close
-        // return a RETRYABLE error now, with state.closed left clear and the
-        // poller, hydrator, exit waiter and sender untouched, so monitoring
-        // continues (including a natural-exit observation) and a later append
-        // is still delivered; the next close retries.
-        match outcome {
-            Ok(outcome) if outcome.group_gone && !force_incomplete => {
-                // Now that the writer is verified gone the poller may observe
-                // the closed epoch; close's poller-shutdown block retires it
-                // next. The exit waiter is cancelled only here — on the failed
-                // path it stays live as part of the continued monitoring.
-                state.closed.store(true, Ordering::SeqCst);
-                if let Some(mut waiter) = self.waiter.lock().await.take() {
-                    waiter.abort();
-                    let _ =
-                        tokio::time::timeout(std::time::Duration::from_secs(2), &mut waiter).await;
-                }
-                tracing::info!(
-                    rung = outcome.rung.label(),
-                    pgid = outcome.pgid,
-                    "promoted pty process group stopped before hydrator retirement"
-                );
-                Ok(())
-            }
-            Ok(outcome) => {
-                tracing::warn!(
-                    rung = outcome.rung.label(),
-                    pgid = outcome.pgid,
-                    survivors = ?outcome.survivors,
-                    forced = force_incomplete,
-                    "stop-incomplete: the promoted process group is not verified gone; \
-                     close stays live and is retryable"
-                );
-                Err(DriverError::WriterStillLive(format!(
-                    "stop ladder rung {} left live group members: {:?}",
-                    outcome.rung.label(),
-                    outcome.survivors
-                )))
-            }
-            Err(error) => {
-                tracing::warn!(%error, "promoted pty stop ladder failed; close stays live");
-                Err(DriverError::WriterStillLive(format!(
-                    "stop ladder could not verify the process group: {error}"
-                )))
-            }
-        }
-    }
-
-    async fn stop_tree(
-        &self,
-        state: &Arc<PtyState>,
-        live_drain: bool,
-    ) -> DriverResult<StopOutcome> {
+    async fn stop_tree(&self, state: &Arc<PtyState>) -> DriverResult<StopOutcome> {
         let pgid = state.pgid.load(Ordering::SeqCst);
         if pgid <= 0 {
             tracing::warn!(
@@ -2138,11 +1682,7 @@ impl ShellPtyDriver {
         // closes itself: this drop is what makes its blocking read see EOF.
         let mut master = state.master.lock().await.take();
         let mut writer = state.writer.lock().await.take();
-        if !live_drain {
-            // The promoted draining path sets this only after the ladder,
-            // when the writer is verified gone and the hydrator is retiring.
-            state.closed.store(true, Ordering::SeqCst);
-        }
+        state.closed.store(true, Ordering::SeqCst);
         // Hold the child across the ladder so this is the only task reaping it.
         // The leader is our direct child; a SIGKILLed child sits as a zombie
         // until `wait`, and a zombie still answers killpg — that produced the
@@ -2165,27 +1705,15 @@ impl ShellPtyDriver {
                 }
             }
         };
-        let close_master = move || {
-            drop(writer.take());
-            drop(master.take());
-        };
-        let ladder = if live_drain {
-            lifecycle::stop_group_draining(pgid, close_master, reaper, |_rung| async move {
-                // Bounded live flush of the writer's termination append
-                // while the poller, hydrator and event sender are still up.
-                let drain = self
-                    .live_drain
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                let ack = drain.request().await;
-                let _ = tokio::time::timeout(PROMOTER_LIVE_DRAIN, ack).await;
-            })
-            .await
-        } else {
-            lifecycle::stop_group(pgid, close_master, reaper).await
-        };
-        let outcome = ladder?;
+        let outcome = lifecycle::stop_group(
+            pgid,
+            move || {
+                drop(writer.take());
+                drop(master.take());
+            },
+            reaper,
+        )
+        .await?;
         // The leader can be classified dead while the kernel has not made it
         // reapable yet: on macOS a SIGKILLed session leader sits in `E`
         // (exiting) before it becomes a zombie. `stop_group` correctly reports
@@ -2228,6 +1756,82 @@ impl ShellPtyDriver {
         Ok(outcome)
     }
 
+    /// Tear down a child whose launch failed BEFORE its [`PtyState`] existed
+    /// (writer/reader setup failed). A launch error after spawn must never
+    /// orphan the child, so this runs the same close-first stop ladder as
+    /// [`Self::stop_tree`], then makes one bounded attempt to reap the leader.
+    async fn abort_failed_launch(
+        mut child: Box<dyn portable_pty::Child + Send + Sync>,
+        pgid: Option<i32>,
+        mut pty: Option<PtyEndpoints>,
+    ) {
+        let mut close = move || {
+            if let Some((master, writer)) = pty.take() {
+                // Close the writer first, then the master box: the slave's
+                // last endpoint going is what delivers SIGHUP.
+                drop(writer);
+                drop(master);
+            }
+        };
+        let reaped = match pgid {
+            Some(pgid) if pgid > 0 => {
+                let mut reaped = false;
+                let ladder = {
+                    let mut reap = || {
+                        if reaped {
+                            return true;
+                        }
+                        match child.try_wait() {
+                            Ok(Some(_status)) => {
+                                reaped = true;
+                                true
+                            }
+                            Ok(None) => false,
+                            Err(error) => {
+                                tracing::debug!(%error, "failed-launch pty child reap failed");
+                                true
+                            }
+                        }
+                    };
+                    lifecycle::stop_group(pgid, &mut close, &mut reap).await
+                };
+                if let Err(error) = ladder {
+                    tracing::warn!(%error, pgid, "failed-launch stop ladder errored");
+                }
+                reaped
+            }
+            _ => {
+                // No process group (or no pid): hang up, then kill the direct
+                // child and mark it for one bounded reap below.
+                close();
+                if let Err(error) = child.kill() {
+                    tracing::debug!(%error, "failed-launch direct child kill failed");
+                }
+                false
+            }
+        };
+        if !reaped {
+            // Same bounded transition-to-zombie wait as the regular stop path.
+            let deadline = tokio::time::Instant::now() + REAP_EXITING_GRACE;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(lifecycle::EXIT_REAP_POLL).await;
+                    }
+                    Ok(None) => {
+                        tracing::error!(
+                            pgid,
+                            "reap-incomplete after a failed launch: the process group is dead \
+                             but the leader has not become reapable; it stays a child of this Node"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     /// Shared body of [`Driver::resume`] and [`Driver::start_resumed`].
     ///
     /// `spec` is `Some` for the cross-instance case (D-026), where the new
@@ -2260,136 +1864,25 @@ impl ShellPtyDriver {
             },
             Arc::clone(&self.table),
         );
-        // The resumed run gets its OWN fresh detection AND binding state
-        // (c-ctxusage r20 item 1 / r21 item 1): promoted/status are per-run
-        // state the poller writes, and the BindingHandle is the run's own
-        // transcript claim. It is spawned with those fresh handles FIRST;
-        // only after a SUCCESSFUL spawn is the predecessor retired and the new
-        // run's handles adopted as this driver's current ones. Sharing self's
-        // slots/bindings here (the old shape) meant run 2 could bind the
-        // predecessor's transcript via its inherited claim and race
-        // predecessor retirement. `resumed` already constructed its own empty
-        // BindingHandle, so nothing is assigned here. Pid/interrupt/seq
-        // coordination and the exit journal stay shared — they are not
-        // per-run detection or binding state.
+        // The adopted poller/bus must update the same control handles that
+        // callers retain on `self`, including native cancel confirmation.
+        resumed.promoted = Arc::clone(&self.promoted);
+        resumed.status = Arc::clone(&self.status);
+        resumed.bindings = self.bindings.clone();
         resumed.interrupt_pid = Arc::clone(&self.interrupt_pid);
         resumed.interrupt_screen_markers = Arc::clone(&self.interrupt_screen_markers);
         resumed.exited = Arc::clone(&self.exited);
         resumed.seq = Arc::clone(&self.seq);
-        // Drain coordination belongs to the RUN (P1, c-ctxusage r17 item 4):
-        // build ONE fresh LiveDrain for the resumed run. The previous run's
-        // drain is permanently armed once it was close-armed (`closing` is
-        // never reset), and cloning it here made the resumed poller enter the
-        // non-terminal tail branch from its first tick — no sampling, no hook
-        // binding, no promotion, ever. The fresh drain is handed to the
-        // resumed driver BEFORE spawn so its poller captures it, then adopted
-        // onto THIS driver after the spawn, so close() on the retained driver
-        // arms exactly the drain the adopted poller observes.
-        let run_drain = promotion::LiveDrain::new();
-        *resumed
-            .live_drain
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = run_drain.clone();
-        if let Some(faults) = self
-            .test_faults
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
-            *resumed
-                .test_faults
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(faults);
-        }
-        // Spawn the new run FIRST, on its own fresh detection slots. A spawn
-        // failure (materialize / PTY-open / spawn_command) must leave the
-        // predecessor completely intact: return before retiring anything, so
-        // `resumed` — and the failed run's slots/poller it never finished
-        // installing — simply drop while self's poller, exit waiter and
-        // promoted/status keep owning the live writer (c-ctxusage r20 item 1).
-        let spawn_result = match spec {
-            Some(spec) => resumed.spawn_at(&spec.cwd.clone(), Some(&spec)).await,
-            None => resumed.spawn().await,
+        let handle = match spec {
+            Some(spec) => resumed.spawn_at(&spec.cwd.clone(), Some(&spec)).await?,
+            None => resumed.spawn().await?,
         };
-        let handle = match spawn_result {
-            Ok(handle) => handle,
-            Err(error) => return Err(error),
-        };
-        // Test-only hard barrier (c-ctxusage r20 item 2): do not retire the
-        // predecessor until the new run's poller task is actually live
-        // (two poller spawns: predecessor + run 2). In production the spawn
-        // handle already implies the task is registered. Compiled ONLY with
-        // the test-faults feature — zero cost in release (c-ctxusage r21
-        // item 2).
-        #[cfg(feature = "test-faults")]
-        if self
-            .test_faults
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_deref()
-            .is_some_and(|faults| {
-                !faults.wait_promoter_starts_state(2, std::time::Duration::from_secs(10))
-            })
-        {
-            return Err(DriverError::Io(io::Error::other(
-                "resumed poller did not acknowledge startup before predecessor retirement",
-            )));
-        }
-        // The new run is up: now retire the predecessor (bounded) — its poller
-        // and exit waiter stop, and its detection slots are discarded. The new
-        // run's slots are independent, so a predecessor finalise that lands
-        // here can never clear a slot the new poller has written.
-        self.retire_predecessor_run().await;
         // Adopt the new PTY: the caller holds *this* driver, so control
         // operations have to reach the process that was just started.
         *self.inner.lock().await = resumed.inner.lock().await.take();
         *self.hooks.lock().await = resumed.hooks.lock().await.take();
-        // The detection slots become the NEW run's own slots (adopted, not
-        // shared-then-cleared): from here close() and the poller agree on the
-        // current promotion.
-        if let Ok(mut promoted) = self.promoted.lock() {
-            *promoted = resumed.current_promoted();
-        }
-        if let Ok(mut status) = self.status.lock() {
-            *status = resumed.current_status();
-        }
-        // Adopt the NEW run's binding handle (c-ctxusage r21 item 1): the
-        // resumed poller captured this same handle at spawn; from here the
-        // driver's picker/SessionStart ingest operates the current run's
-        // claim, never the predecessor's.
-        if let Ok(mut bindings) = self.bindings.lock() {
-            *bindings = resumed.current_bindings();
-        }
         *self.poller.lock().await = resumed.poller.lock().await.take();
-        *self.poller_shutdown.lock().await = resumed.poller_shutdown.lock().await.take();
-        *self.poller_finalised.lock().await = resumed.poller_finalised.lock().await.take();
         *self.waiter.lock().await = resumed.waiter.lock().await.take();
-        // Adopt the resumed run's remaining run-scoped event senders. Without
-        // this they stay owned by the temporary `resumed` driver, which drops
-        // at the end of this function: the catalog refresh handle would
-        // DETACH (a JoinHandle drop does not stop the task) and the adapter
-        // tasks would only be aborted asynchronously, each keeping an event
-        // sender clone alive past a later close() on THIS driver
-        // (c-ctxusage r17 item 4).
-        if let Some(mut previous) = self.catalog_refresh.lock().await.take() {
-            previous.abort();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut previous).await;
-        }
-        *self.catalog_refresh.lock().await = resumed.catalog_refresh.lock().await.take();
-        if let Some(mut previous) = self.adapters.lock().await.take() {
-            previous.abort();
-            for task in &mut previous.tasks {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
-            }
-        }
-        *self.adapters.lock().await = resumed.adapters.lock().await.take();
-        // Adopt the resumed RUN's drain: the adopted poller above is already
-        // watching `run_drain`, so a later close on this driver must arm the
-        // same one (c-ctxusage r17 item 4).
-        *self
-            .live_drain
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = run_drain;
         // §9.1: adopt the resumed run's switch coordination. Its worker and
         // mapper share a bridge, and its event sender is the live one. When a
         // switch was mid-flight at resume, adopt the resumed bridge so the
@@ -3117,7 +2610,14 @@ impl Driver for ShellPtyDriver {
             && !level.is_empty()
             && switch.model_id.is_empty()
         {
-            return self.switch_effort(level).await;
+            return self
+                .switch_effort(
+                    level,
+                    switch.effort_ultracode,
+                    switch.effort_axis,
+                    switch.effort_request_id.clone(),
+                )
+                .await;
         }
         // §9.1: a model switch is `/model <id>` proven by the verdict.
         if self.session_kind() == Some(AgentKind::Claude)
@@ -3360,7 +2860,7 @@ impl Driver for ShellPtyDriver {
         }
         // The only structured question a shell-pty asks is the manual
         // transcript picker; its answer deterministically binds the epoch.
-        self.current_bindings()
+        self.bindings
             .answer(&id, &answer)
             .map_err(DriverError::InvalidLaunchSpec)?;
         Ok(DriverAck::transport_written())
@@ -3382,38 +2882,6 @@ impl Driver for ShellPtyDriver {
     /// not, that is journaled as `stop-incomplete`; §5.3 step 4 forbids
     /// reporting `exited` over a process tree that is still there.
     async fn close(&self) -> DriverResult<DriverAck> {
-        // c-ctxusage r17 item 3: one close owner for the WHOLE close, matching
-        // claude_pty's close_phase. An overlapping close (a purge racing the
-        // queued instance.close) used to interleave two close bodies: the
-        // second re-armed the LiveDrain handoff barrier, dropping the first
-        // close's oneshot sender, and the resulting Canceled was read as an
-        // ack — so two stop ladders raced the same native writer. The queued
-        // close settles here after the owner finishes, finding the teardown
-        // already done (all phases are take-based/idempotent). The guard drops
-        // on the retryable `?` early return below, so a failed close stays
-        // resumable rather than blocking every later attempt.
-        let _close_guard = self.close_phase.lock().await;
-        // Is a promoted native agent live in the foreground? The native writer
-        // must be verified gone BEFORE anything is torn down.
-        //
-        // P1 (c-ctxusage r16 item 5): when the promoted writer survives the
-        // stop ladder (or the ladder cannot verify it),
-        // stop_promoted_writer_before_retire returns a RETRYABLE
-        // WriterStillLive error. This early return must happen before the
-        // effort/model/permission queues, the events sender or the poller are
-        // touched: the hydrator and transcript monitoring stay live, close
-        // ownership is retained, the writer's later append is still delivered,
-        // and the next close() re-runs the verification and completes the
-        // teardown.
-        let promoted = self
-            .promoted
-            .lock()
-            .ok()
-            .and_then(|slot| slot.lock().ok().map(|inner| inner.is_some()))
-            .unwrap_or(false);
-        if promoted {
-            self.stop_promoted_writer_before_retire().await?;
-        }
         // §9.1: stop the effort switch before the PTY it types into goes away.
         self.effort_queue.lock().await.close();
         if let Some(worker) = self.effort_worker.lock().await.take() {
@@ -3429,67 +2897,15 @@ impl Driver for ShellPtyDriver {
             worker.abort();
         }
         self.events_tx.lock().await.take();
-        // The promoted writer was stopped and verified with the poller,
-        // hydrator and sender still live above; the promoter is retired only
-        // below, after the final drain (c-ctxusage r15 item 7). A plain login
-        // shell instead retires the promoter here and stops its group at the
-        // end of close.
-        // c-ctxusage r4 item 2: cooperative poller shutdown. Signal closure
-        // first, then give the poller one window to read the final append and
-        // publish its last turn via `finish()` (an assistant record with usage
-        // and no stop_reason would otherwise never reach usage_events). The
-        // poller holds its own events sender clone, so finalised observations
-        // still reach the RunHandle while it winds down. In the promoted
-        // draining path state.closed was set AFTER the ladder; here it is set
-        // BEFORE the poller retires.
-        if let Some(inner) = self.inner.lock().await.as_ref() {
-            inner.closed.store(true, Ordering::SeqCst);
-        }
-        // Wake the poller's select so a close between ticks is observed
-        // immediately, then await its finalise.
-        if let Some(shutdown) = self.poller_shutdown.lock().await.take() {
-            let _ = shutdown.send(true);
-        }
         if let Some(poller) = self.poller.lock().await.take() {
-            // c-ctxusage r5 item 6: the poller may be mid first-bind pump over a
-            // large transcript. It finalises the hydrator AFTER its current pump
-            // returns and signals once that is done; wait for that signal rather
-            // than aborting on a fixed 2 s deadline while `finish()` is running.
-            // 15 s only bounds a genuinely wedged pump; on timeout the abort is
-            // covered by the FinaliseGuard's synchronous best-effort finish.
-            // (c-ctxusage r8 item 6: a test-only fault handle may shorten the
-            // bound so abort tests stay deterministic and fast.)
-            let promoter_timeout = self
-                .test_faults
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_deref()
-                .and_then(crate::test_faults::FaultState::close_timeout)
-                .unwrap_or_else(|| std::time::Duration::from_secs(15));
-            let finalised = self.poller_finalised.lock().await.take();
-            let mut poller = poller;
-            let finished = if let Some(finalised) = finalised {
-                tokio::pin!(finalised);
-                tokio::time::timeout(promoter_timeout, async {
-                    // The finalise signal wins; task completion covers the
-                    // no-hydrator / already-finished paths.
-                    tokio::select! {
-                        _ = &mut finalised => true,
-                        _ = &mut poller => true,
-                    }
-                })
-                .await
-                .is_ok()
-            } else {
-                tokio::time::timeout(promoter_timeout, &mut poller)
-                    .await
-                    .is_ok()
-            };
-            if !finished {
-                poller.abort();
-            }
+            poller.abort();
         }
-        self.clear_current_detection_slots();
+        if let Ok(mut slot) = self.promoted.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.status.lock() {
+            *slot = None;
+        }
         // Release any hook parked on an approval before the socket goes away.
         // Otherwise each one holds its agent's turn open until its own
         // deadline, minutes after the session has stopped.
@@ -3502,46 +2918,21 @@ impl Driver for ShellPtyDriver {
         self.hooks.lock().await.take();
         // Stop the file-tail adapters; their shadow files likewise survive for
         // purge as audit evidence.
-        if let Some(mut handle) = self.adapters.lock().await.take() {
+        if let Some(handle) = self.adapters.lock().await.take() {
             handle.abort();
-            // Wait for the cancellations to land so the adapters' event-sender
-            // clones drop inside close() (r10 item 5): close returning while
-            // sender clones linger lets the event channel outlive shutdown.
-            for task in &mut handle.tasks {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
-            }
-        }
-        if let Some(mut refresh) = self.catalog_refresh.lock().await.take() {
-            refresh.abort();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut refresh).await;
         }
         self.interrupt_pid.store(0, Ordering::SeqCst);
         // Drop any transcript claim so a respawn starts a fresh epoch.
-        self.current_bindings().demobilize();
+        self.bindings.demobilize();
         let Some(state) = self.inner.lock().await.take() else {
             return Ok(DriverAck::not_dispatched());
         };
-        if promoted {
-            // c-ctxusage r15 item 7: the writer was already stopped and
-            // verified with live drains before the promoter retired. Only the
-            // exit waiter remains to cancel.
-            if let Some(mut waiter) = self.waiter.lock().await.take() {
-                waiter.abort();
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut waiter).await;
-            }
-            return Ok(DriverAck::not_dispatched());
-        }
         // Set before the ladder runs so the exit waiter reads this exit as the
         // ladder working rather than as an unexplained crash.
         state.closed.store(true, Ordering::SeqCst);
-        let outcome = self.stop_tree(&state, false).await;
-        if let Some(mut waiter) = self.waiter.lock().await.take() {
+        let outcome = self.stop_tree(&state).await;
+        if let Some(waiter) = self.waiter.lock().await.take() {
             waiter.abort();
-            // Wait for the cancellation to land so the waiter's event-sender
-            // clone drops inside close() (the waiter parks on a 50 ms poll, so
-            // this returns immediately): a close that returns while sender
-            // clones linger lets the event channel outlive shutdown.
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut waiter).await;
         }
         match outcome {
             Ok(outcome) if outcome.group_gone => {
@@ -3607,6 +2998,90 @@ fn pty_err(err: impl std::fmt::Display) -> DriverError {
     DriverError::Io(io::Error::other(err.to_string()))
 }
 
+/// Assemble the child env in its exact application order and track which keys
+/// are set. r5/r6: the env map is built ONCE so the launch command, the
+/// pre-spawn resume-boundary snapshot and the promotion hydrator all derive the
+/// SAME `CLAUDE_CONFIG_DIR`.
+///
+/// Layers in order: base allowlist → TERM/COLORTERM → per-launch extra_env
+/// (deny-list filtered) → native-home pin / recipe allowlist → MCP env.
+///
+/// For a PINNED Claude agent the pin is authoritative and overrides an
+/// extra_env `CLAUDE_CONFIG_DIR` (with the empty securestorage override the
+/// login keychain needs, r6 item 2); for an UNPINNED launch nothing is
+/// injected and the child writes under its own `$HOME/.claude` (r6 item 1),
+/// which is exactly where the snapshot/hydrator look.
+fn child_env_layers(options: &ShellPtyOptions, recipe: &LaunchRecipe) -> DriverResult<ChildEnv> {
+    let mut map = std::collections::BTreeMap::new();
+    for (key, value) in crate::child_env::base_env() {
+        map.insert(key, value);
+    }
+    map.insert("TERM".to_owned(), "xterm-256color".to_owned());
+    map.insert("COLORTERM".to_owned(), "truecolor".to_owned());
+    for (key, value) in &options.extra_env {
+        if !crate::child_env::is_denied(key) {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    // The native-home pin is applied AFTER extra_env and wins for a pinned
+    // Claude agent (r6 item 2); agent_env overwrites any earlier
+    // CLAUDE_CONFIG_DIR and supplies the securestorage override.
+    for (key, value) in agent_env(&options.target, recipe, options.pin_native_home) {
+        if crate::child_env::is_denied(&key) {
+            tracing::warn!(%key, "recipe env entry is on the deny list; not forwarding");
+            continue;
+        }
+        map.insert(key, value);
+    }
+    if let Some(context) = &options.agent_mcp {
+        for (key, value) in context.environment()? {
+            map.insert(key, value);
+        }
+    }
+    Ok(ChildEnv {
+        entries: map.into_iter().collect(),
+    })
+}
+
+struct ChildEnv {
+    entries: Vec<(String, String)>,
+}
+
+impl ChildEnv {
+    /// The single effective `CLAUDE_CONFIG_DIR` the child actually uses, so
+    /// the boundary snapshot and PromoteCtx open the directory the child
+    /// writes to. Resolution: the assembled child env's CLAUDE_CONFIG_DIR
+    /// (the pinned native home or an explicit override) → an explicit
+    /// `options.claude_home` → the CHILD's HOME from the SAME assembled map
+    /// joined with `.claude` (Claude's default) → the ambient fallback. The
+    /// parent driver process environment is never read directly: an
+    /// unpinned, env_clear'd child inherits neither the driver's
+    /// CLAUDE_CONFIG_DIR (r6 item 1).
+    fn claude_config_dir(&self, options: &ShellPtyOptions) -> PathBuf {
+        self.entries
+            .iter()
+            .find_map(|(key, value)| {
+                (key == "CLAUDE_CONFIG_DIR" && !value.is_empty()).then(|| PathBuf::from(value))
+            })
+            .or_else(|| options.claude_home.clone())
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .find_map(|(key, value)| {
+                        (key == "HOME" && !value.is_empty()).then(|| PathBuf::from(value))
+                    })
+                    .map(|home| home.join(".claude"))
+            })
+            .unwrap_or_else(default_claude_home)
+    }
+
+    fn apply(&self, cmd: &mut CommandBuilder) {
+        for (key, value) in &self.entries {
+            cmd.env(key, value);
+        }
+    }
+}
+
 fn build_command(
     options: &ShellPtyOptions,
     spec_cwd: &str,
@@ -3637,43 +3112,18 @@ fn build_command(
     };
     cmd.cwd(cwd);
     cmd.env_clear();
-    let base = crate::child_env::base_env();
-    for (key, value) in &base {
-        cmd.env(key, value);
-    }
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    for (key, value) in &options.extra_env {
-        if !crate::child_env::is_denied(key) {
-            cmd.env(key, value);
-        }
-    }
-    // §5.1 step 1 / §9.1: an inherited `CLAUDE_CODE_EFFORT_LEVEL` outranks the
-    // in-session `/effort` command, so a value leaking in from the operator's
-    // shell would pin the effort for the whole session and make the UI's
-    // "effective" readout a lie. `child_env` denies it, and this loop honours
-    // that; the assertion is that nothing below re-adds it.
-    for (key, value) in agent_env(&options.target, recipe, options.pin_native_home) {
-        if crate::child_env::is_denied(&key) {
-            tracing::warn!(%key, "recipe env entry is on the deny list; not forwarding");
-            continue;
-        }
-        cmd.env(key, value);
-    }
-    if let Some(context) = &options.agent_mcp {
-        for (key, value) in context.environment()? {
-            cmd.env(key, value);
-        }
-    }
+    // r5 item 7: the SAME env map the boundary snapshot and hydrator use.
+    let child_env = child_env_layers(options, recipe)?;
+    child_env.apply(&mut cmd);
     // Last, and deliberately past the allowlist: the shim PATH and the hook
     // credential are values the *driver computed*, not values it inherited
     // (D-028 §4.2). The inherit allowlist exists to keep the Node's own
     // credentials and any `LD_PRELOAD`/proxy/CA injection out of a process the
     // model can read; it is not the channel for something we minted ourselves.
     if let Some(session) = hooks {
-        let inherited = base
-            .get("PATH")
-            .cloned()
+        let inherited = crate::child_env::base_env()
+            .into_iter()
+            .find_map(|(key, value)| (key == "PATH").then_some(value))
             .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
         for (key, value) in session.child_env(&inherited) {
             cmd.env(key, value);
@@ -3729,10 +3179,15 @@ fn agent_env(
             _ => None,
         })
         .collect::<Vec<_>>();
+    // r6 item 2: for a PINNED Claude agent the managed native home is
+    // authoritative — it overrides any extra_env CLAUDE_CONFIG_DIR (the
+    // materializer guarantees the child, the boundary snapshot and the
+    // catalog/settings all use recipe.native_home), and the empty
+    // securestorage override keeps the macOS keychain namespace the
+    // operator logged into.
     if pin_native_home
         && target.agent_kind() == Some(AgentKind::Claude)
         && !recipe.native_home.is_empty()
-        && !entries.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR")
     {
         entries.push(("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone()));
         // Keep the *credentials* where the operator logged in, while the
@@ -3759,7 +3214,6 @@ fn agent_env(
     }
     entries
 }
-
 fn read_pty(state: Arc<PtyState>, mut reader: Box<dyn Read + Send>) {
     let mut buf = [0_u8; 4096];
     loop {
@@ -4018,6 +3472,9 @@ struct ShellEffortIo {
     events: mpsc::Sender<remuda_protocol::Observation>,
     seq: Arc<AtomicU64>,
     ctx: promotion::PromoteCtx,
+    /// Current deterministic transcript binding, for the c-effortread r15
+    /// item 4 submission floor (EOF captured immediately before typing).
+    bindings: promotion::BindingHandle,
 }
 
 #[async_trait]
@@ -4049,8 +3506,40 @@ impl crate::effort::EffortSwitchIo for ShellEffortIo {
         Ok(self.state.screen_grid().text())
     }
 
-    async fn journal(&self, status: String, severity: remuda_protocol::Severity) {
-        let payload = promotion::effort_lifecycle(&status, severity);
+    async fn submission_floor(&self) -> crate::effort::SubmissionProvenance {
+        use crate::effort::SubmissionProvenance;
+        // The hydrator follows the same binding; stat the bound transcript's
+        // current EOF so the switch's own slash (appended starting AT this
+        // offset) attributes to the switch while an older unread slash cannot
+        // (c-effortread r15 item 4, r16 item 1). No binding or a failed stat is
+        // explicit provenance loss (r16 item 3): attribute nothing rather than
+        // falling back to word-only matching.
+        let Some(binding) = self.bindings.binding() else {
+            return SubmissionProvenance::Unavailable;
+        };
+        match std::fs::metadata(binding.path) {
+            Ok(metadata) => SubmissionProvenance::Floor(metadata.len()),
+            Err(_) => SubmissionProvenance::Unavailable,
+        }
+    }
+
+    async fn journal_effort(
+        &self,
+        status: String,
+        severity: remuda_protocol::Severity,
+        request_id: Option<String>,
+    ) {
+        // c-effortread r10: echo the configure's per-request id so the web
+        // binds the lifecycle edge to the exact in-flight switch.
+        let related_ids = request_id
+            .map(|id| {
+                std::collections::BTreeMap::from([(
+                    remuda_protocol::EFFORT_REQUEST_ID_KEY.to_owned(),
+                    id,
+                )])
+            })
+            .unwrap_or_default();
+        let payload = promotion::effort_lifecycle(&status, severity, related_ids);
         if promotion::emit_payload(
             &self.events,
             &self.seq,
@@ -4149,6 +3638,603 @@ mod tests {
             Ok(())
         }
     }
+
+    /// r5/r6 items 1+2+7: launch env, boundary snapshot and hydrator derive
+    /// ONE `CLAUDE_CONFIG_DIR` from the env the child actually receives.
+    ///
+    /// - pin=true: the managed native home is authoritative even with an
+    ///   extra_env CLAUDE_CONFIG_DIR, and CLAUDE_SECURESTORAGE_CONFIG_DIR is
+    ///   forced empty (macOS keychain namespace);
+    /// - pin=false + override: the override survives;
+    /// - pin=false with no override: the child's own $HOME/.claude from the
+    ///   ASSEMBLED env map — never the parent driver process's
+    ///   CLAUDE_CONFIG_DIR.
+    #[test]
+    fn child_env_derives_one_config_dir_for_pinned_and_unpinned_launches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let native_home = tmp.path().join("native-home");
+        let custom = tmp.path().join("custom");
+        let child_home = tmp.path().join("child-home");
+        let recipe = LaunchRecipe {
+            native_home: native_home.to_string_lossy().into_owned(),
+            ..shell_recipe(
+                &ShellPtyOptions::login(tmp.path().to_path_buf()),
+                &tmp.path().to_string_lossy(),
+            )
+            .expect("recipe")
+        };
+        let claude_target = Target::Agent {
+            kind: AgentKind::Claude,
+            resume: None,
+        };
+        let value_of = |entries: &[(String, String)], key: &str| {
+            entries
+                .iter()
+                .find_map(|(name, value)| (name == key).then(|| value.clone()))
+        };
+        let with_child_home = |mut options: ShellPtyOptions| {
+            options
+                .extra_env
+                .insert("HOME".to_owned(), child_home.to_string_lossy().into_owned());
+            options
+        };
+
+        // pin=true, no override: native_home + empty securestorage.
+        let pinned = with_child_home(ShellPtyOptions {
+            target: claude_target.clone(),
+            pin_native_home: true,
+            ..ShellPtyOptions::login(tmp.path().to_path_buf())
+        });
+        let env = child_env_layers(&pinned, &recipe).expect("env");
+        assert_eq!(env.claude_config_dir(&pinned), native_home);
+        assert_eq!(
+            value_of(&env.entries, "CLAUDE_CONFIG_DIR"),
+            Some(native_home.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            value_of(&env.entries, "CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+            Some(String::new())
+        );
+
+        // pin=true WITH an extra_env CLAUDE_CONFIG_DIR: the PIN wins
+        // (r6 item 2), securestorage is still forced, and the dir appears
+        // once.
+        let mut pinned_custom = pinned.clone();
+        pinned_custom.extra_env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            custom.to_string_lossy().into_owned(),
+        );
+        let env = child_env_layers(&pinned_custom, &recipe).expect("env");
+        assert_eq!(env.claude_config_dir(&pinned_custom), native_home);
+        assert_eq!(
+            value_of(&env.entries, "CLAUDE_CONFIG_DIR"),
+            Some(native_home.to_string_lossy().into_owned()),
+            "the managed pin overrides an extra_env dir"
+        );
+        assert_eq!(
+            value_of(&env.entries, "CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+            Some(String::new())
+        );
+        assert_eq!(
+            env.entries
+                .iter()
+                .filter(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+                .count(),
+            1,
+            "the dir appears exactly once"
+        );
+
+        // pin=false + explicit override: the custom dir survives (no pin is
+        // injected).
+        let unpinned_custom = with_child_home(ShellPtyOptions {
+            target: claude_target.clone(),
+            pin_native_home: false,
+            ..ShellPtyOptions::login(tmp.path().to_path_buf())
+        });
+        let mut unpinned_custom = unpinned_custom;
+        unpinned_custom.extra_env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            custom.to_string_lossy().into_owned(),
+        );
+        let env = child_env_layers(&unpinned_custom, &recipe).expect("env");
+        assert_eq!(env.claude_config_dir(&unpinned_custom), custom);
+        assert!(
+            value_of(&env.entries, "CLAUDE_SECURESTORAGE_CONFIG_DIR").is_none(),
+            "no pin, no managed securestorage override"
+        );
+
+        // pin=false and no override: the child writes to its OWN
+        // $HOME/.claude resolved from the ASSEMBLED env map (r6 item 1).
+        // CLAUDE_CONFIG_DIR is not on the child_env inherit allowlist, so a
+        // value exported by the parent driver can never enter the map or the
+        // resolution — no parent-process env lookup is needed.
+        let unpinned = with_child_home(ShellPtyOptions {
+            target: claude_target,
+            pin_native_home: false,
+            claude_home: None,
+            ..ShellPtyOptions::login(tmp.path().to_path_buf())
+        });
+        let env = child_env_layers(&unpinned, &recipe).expect("env");
+        assert!(
+            value_of(&env.entries, "CLAUDE_CONFIG_DIR").is_none(),
+            "an unpinned launch invents no config-dir env"
+        );
+        assert_eq!(
+            env.claude_config_dir(&unpinned),
+            child_home.join(".claude"),
+            "the unpinned child's own HOME/.claude, never the parent config dir"
+        );
+    }
+
+    /// r7 item 3 (r6 item 1 end to end): with a PARENT driver-process
+    /// CLAUDE_CONFIG_DIR that differs from the child's $HOME/.claude, a real
+    /// agent launch must make the child's EFFECTIVE command-env config dir,
+    /// the resume boundary's directory and PromoteCtx.claude_home ALL THE
+    /// SAME — for both native-home pin values. The parent value never appears.
+    ///
+    /// The workspace forbids unsafe code (edition-2024 `env::set_var`), so the
+    /// driver process's parent env is set by RE-EXECUTING this test binary
+    /// with CLAUDE_CONFIG_DIR on the child Command (same convention as
+    /// remuda config/remuda-signal env tests).
+    #[test]
+    fn item3_one_config_dir_command_env_boundary_promote_ctx_both_pins() {
+        if std::env::var_os(R7_CONFIG_CHILD_MARKER).is_some() {
+            return;
+        }
+        for pin in ["true", "false"] {
+            let parent_dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "shell_pty::tests::item3_config_dir_child_body",
+                    "--nocapture",
+                ])
+                .env(R7_CONFIG_CHILD_MARKER, pin)
+                .env("CLAUDE_CONFIG_DIR", parent_dir.path())
+                .output()
+                .expect("spawn child");
+            assert!(
+                output.status.success(),
+                "pin={pin} child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// Child body for [`item3_one_config_dir_command_env_boundary_promote_ctx_both_pins`].
+    #[tokio::test]
+    async fn item3_config_dir_child_body() {
+        let pin_native_home = match std::env::var(R7_CONFIG_CHILD_MARKER).as_deref() {
+            Ok("true") => true,
+            Ok("false") => false,
+            _ => return,
+        };
+        let parent_home = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("the parent CLAUDE_CONFIG_DIR is set by the re-exec");
+        let dir = tempfile::tempdir().unwrap();
+        let child_home = dir.path().join("child-home");
+        let native_home = dir.path().join("managed-native-home");
+        std::fs::create_dir_all(&child_home).unwrap();
+        std::fs::create_dir_all(&native_home).unwrap();
+        let env_dump = dir.path().join("env.txt");
+        // The stub answers probes, then dumps its REAL environment and sleeps
+        // as the live child.
+        let claude_bin = remuda_testing::install_executable(
+            dir.path(),
+            "claude",
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.289'; exit 0;; esac\n\
+                 env > {dump}\nexec sleep 30\n",
+                dump = env_dump.display(),
+            ),
+        );
+
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.kind = AgentKind::Claude;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+        spec.effort = None;
+        let mut options = ShellPtyOptions::agent(
+            dir.path().to_path_buf(),
+            AgentKind::Claude,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::Anthropic,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["claude".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: dir.path().join("launch"),
+                native_home: native_home.clone(),
+                binary: Some(claude_bin),
+                origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: pin_native_home,
+                settings_overlay: None,
+            },
+        );
+        options.pin_native_home = pin_native_home;
+        // Deliberately NO options.claude_home: resolution must come from the
+        // assembled child env, and the parent driver env must not leak in.
+        options.claude_home = None;
+        options
+            .extra_env
+            .insert("HOME".to_owned(), child_home.to_string_lossy().into_owned());
+
+        let driver = ShellPtyDriver::new(options);
+        driver
+            .spawn_at(&spec.cwd, Some(&spec))
+            .await
+            .expect("real agent launch");
+        let dump = async {
+            for _ in 0..100 {
+                if let Ok(text) = std::fs::read_to_string(&env_dump)
+                    && text.contains("HOME=")
+                {
+                    return text;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("child env dump never appeared at {}", env_dump.display());
+        }
+        .await;
+        let env: std::collections::BTreeMap<String, String> = dump
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+        let ctx = driver
+            .promote_ctx
+            .lock()
+            .await
+            .clone()
+            .expect("promote ctx set on spawn");
+        Driver::close(&driver).await.expect("clean close");
+
+        // 1. The child's effective config dir: its CLAUDE_CONFIG_DIR, or its
+        //    own $HOME/.claude — never the parent driver's value.
+        let child_env_dir = env
+            .get("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| child_home.join(".claude"));
+        assert_ne!(
+            child_env_dir, parent_home,
+            "pin={pin_native_home}: the parent CLAUDE_CONFIG_DIR must not reach the child"
+        );
+        if pin_native_home {
+            assert_eq!(
+                env.get("CLAUDE_CONFIG_DIR").map(std::path::Path::new),
+                Some(native_home.as_path()),
+                "pin={pin_native_home}: the managed native home is pinned"
+            );
+            assert_eq!(
+                env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+                    .map(String::as_str),
+                Some(""),
+                "pin={pin_native_home}: the macOS keychain namespace is forced"
+            );
+        } else {
+            assert!(
+                !env.contains_key("CLAUDE_CONFIG_DIR"),
+                "pin={pin_native_home}: no dir is invented; the child default applies"
+            );
+            assert_eq!(child_env_dir, child_home.join(".claude"));
+        }
+        // 2. PromoteCtx resolves the SAME directory the child uses.
+        assert_eq!(
+            ctx.claude_home, child_env_dir,
+            "pin={pin_native_home}: PromoteCtx.claude_home must be the child env dir"
+        );
+        // 3. The pre-spawn resume boundary for any session lands under exactly
+        //    that directory (same cwd slug rule the hydrator uses).
+        let session_id = "dddddddd-2222-4333-8444-eeeeeeeeeeee";
+        let cwd = std::path::PathBuf::from(&spec.cwd);
+        let session_path = crate::claude_transcript::ResumeBoundary::session_path(
+            &ctx.claude_home,
+            &cwd,
+            session_id,
+        );
+        assert!(
+            session_path.starts_with(&ctx.claude_home),
+            "pin={pin_native_home}: boundary {session_path:?} must live under {:?}",
+            ctx.claude_home
+        );
+        std::fs::create_dir_all(session_path.parent().unwrap()).unwrap();
+        std::fs::write(&session_path, "").unwrap();
+        let boundary = crate::claude_transcript::ResumeBoundary::for_resume(
+            &ctx.claude_home,
+            &cwd,
+            session_id,
+        );
+        assert!(
+            boundary.is_some(),
+            "pin={pin_native_home}: a resume snapshot resolves through the one config dir"
+        );
+    }
+
+    /// c-effortread r9 item 9a: the REAL driver, launching the fake-harness
+    /// `claude` with `--resume <id>`, must snapshot the pre-spawn resume
+    /// boundary through the CHILD config dir for BOTH native-home pin values,
+    /// under a PARENT driver CLAUDE_CONFIG_DIR that names a different dir.
+    /// Pre-anchor history never publishes; an effort record appended after
+    /// spawn publishes. Goes red if spawn_at resolves the boundary through the
+    /// parent dir (the decoy xhigh history leaks).
+    #[test]
+    fn r9_item9a_real_resume_spawn_uses_child_config_dir_for_both_pins() {
+        if std::env::var_os(R7_CONFIG_CHILD_MARKER).is_some() {
+            return;
+        }
+        for pin in ["true", "false"] {
+            let parent_dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "shell_pty::tests::r9_item9a_real_resume_child_body",
+                    "--nocapture",
+                ])
+                .env(R7_CONFIG_CHILD_MARKER, pin)
+                .env("CLAUDE_CONFIG_DIR", parent_dir.path())
+                .output()
+                .expect("spawn child");
+            assert!(
+                output.status.success(),
+                "pin={pin} child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// Child body for [`r9_item9a_real_resume_spawn_uses_child_config_dir_for_both_pins`].
+    #[tokio::test]
+    async fn r9_item9a_real_resume_child_body() {
+        use remuda_testing::fake_harness::artifacts::{SessionMeta, claude_assistant_block};
+        use remuda_testing::fake_harness::clock::FakeClock;
+        use remuda_testing::fake_harness::script::UsageSpec;
+
+        let pin_native_home = match std::env::var(R7_CONFIG_CHILD_MARKER).as_deref() {
+            Ok("true") => true,
+            Ok("false") => false,
+            _ => return,
+        };
+        let parent_home = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("the parent CLAUDE_CONFIG_DIR is set by the re-exec");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = std::fs::canonicalize(&workspace).unwrap();
+        let child_home = root.join("child-home");
+        let native_home = root.join("managed-native-home");
+        std::fs::create_dir_all(&child_home).unwrap();
+        std::fs::create_dir_all(&native_home).unwrap();
+        let instance_dir = root.join("instance");
+
+        // Install the deterministic fake-harness as the child `claude`.
+        let install = root.join("opt/bin");
+        std::fs::create_dir_all(&install).unwrap();
+        let harness = remuda_testing::ensure_workspace_bin("fake-harness");
+        let claude_bin = install.join("claude");
+        std::fs::copy(&harness, &claude_bin).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&claude_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Locate the real relay binary the hook overlay invokes.
+        let deps_dir = std::env::current_exe().unwrap();
+        let deps_dir = deps_dir.parent().unwrap();
+        let relay_binary = [deps_dir.join("remuda"), deps_dir.join("../remuda")]
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| remuda_testing::workspace_root().join("target/debug/remuda"));
+
+        let session_id = "aaaaaaaa-r9a0-4333-8444-aaaaaaaaaaaa";
+        let child_config = if pin_native_home {
+            native_home.clone()
+        } else {
+            child_home.join(".claude")
+        };
+        let meta = SessionMeta {
+            session_id: session_id.to_owned(),
+            cwd: workspace.clone(),
+            model: "claude".into(),
+            version: "2.1.270".into(),
+        };
+        let session_path = crate::claude_transcript::ResumeBoundary::session_path(
+            &child_config,
+            &workspace,
+            session_id,
+        );
+        std::fs::create_dir_all(session_path.parent().unwrap()).unwrap();
+        let history_clock = FakeClock::new(1_700_000_000_000);
+        let history = serde_json::to_string(&claude_assistant_block(
+            &meta,
+            &history_clock,
+            "msg-history",
+            0,
+            serde_json::json!({"type": "text", "text": "HISTORY-PRE-ANCHOR-MARKER"}),
+            "end_turn",
+            &UsageSpec::default(),
+            Some("high"),
+        ))
+        .unwrap();
+        std::fs::write(&session_path, history + "\n").unwrap();
+
+        // The parent driver CLAUDE_CONFIG_DIR carries a same-id DECOY
+        // transcript. If spawn_at wrongly resolves the boundary through it,
+        // this xhigh read-back leaks as current.
+        let parent_path = crate::claude_transcript::ResumeBoundary::session_path(
+            &parent_home,
+            &workspace,
+            session_id,
+        );
+        std::fs::create_dir_all(parent_path.parent().unwrap()).unwrap();
+        let decoy = serde_json::to_string(&claude_assistant_block(
+            &meta,
+            &history_clock,
+            "msg-parent",
+            0,
+            serde_json::json!({"type": "text", "text": "PARENT-DECOY-MARKER"}),
+            "end_turn",
+            &UsageSpec::default(),
+            Some("xhigh"),
+        ))
+        .unwrap();
+        std::fs::write(&parent_path, decoy + "\n").unwrap();
+
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.kind = AgentKind::Claude;
+        spec.cwd = workspace.to_string_lossy().into_owned();
+        spec.effort = None;
+
+        let launch = ShellPtyOptions::agent(
+            workspace.clone(),
+            AgentKind::Claude,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::Anthropic,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["claude".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: instance_dir.join("launch"),
+                native_home: native_home.clone(),
+                binary: Some(claude_bin),
+                origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: pin_native_home,
+                settings_overlay: None,
+            },
+        );
+        let mut options = launch.resuming(session_id);
+        options.pin_native_home = pin_native_home;
+        // Deliberately no options.claude_home: the child env resolves it.
+        options.claude_home = None;
+        options
+            .extra_env
+            .insert("HOME".to_owned(), child_home.to_string_lossy().into_owned());
+        options
+            .extra_env
+            .insert("FAKE_HARNESS_DIALECT_VERSION".into(), "modern".into());
+        options.hooks = Some(HookConfig {
+            instance_dir: instance_dir.clone(),
+            relay_binary,
+            tui: crate::launch::TuiMode::Default,
+        });
+
+        let driver = ShellPtyDriver::new(options);
+        let mut events = driver
+            .start(spec)
+            .await
+            .expect("real resume launch")
+            .into_events();
+
+        // The boundary was snapped at spawn: the pre-anchor history must not
+        // publish while promotion binds and starts pumping.
+        let settle = std::time::Duration::from_secs(6);
+        let early = r9a_collect(&mut events, settle).await;
+        assert!(
+            !r9a_blob_contains(&early, "HISTORY-PRE-ANCHOR-MARKER"),
+            "pin={pin_native_home}: pre-anchor history must never hydrate as current"
+        );
+        assert!(
+            !r9a_blob_contains(&early, "PARENT-DECOY-MARKER"),
+            "pin={pin_native_home}: the parent CLAUDE_CONFIG_DIR transcript must never be read"
+        );
+        assert!(
+            !r9a_effort_names(&early).contains(&Some(remuda_protocol::EffortName::High)),
+            "pin={pin_native_home}: the pre-anchor high read-back must not publish"
+        );
+        assert!(
+            !r9a_effort_names(&early).contains(&Some(remuda_protocol::EffortName::Xhigh)),
+            "pin={pin_native_home}: the parent-decoy xhigh read-back must not publish"
+        );
+
+        // After spawn the agent appends a NEW effort record past the boundary.
+        let post_clock = FakeClock::new(1_700_000_100_000);
+        let post = serde_json::to_string(&claude_assistant_block(
+            &meta,
+            &post_clock,
+            "msg-post-anchor",
+            0,
+            serde_json::json!({"type": "text", "text": "POST-ANCHOR-MAX-MARKER"}),
+            "end_turn",
+            &UsageSpec::default(),
+            Some("max"),
+        ))
+        .unwrap();
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&session_path)
+            .unwrap();
+        writeln!(file, "{post}").unwrap();
+        drop(file);
+
+        let later = r9a_collect(&mut events, std::time::Duration::from_secs(20)).await;
+        assert!(
+            r9a_effort_names(&later).contains(&Some(remuda_protocol::EffortName::Max)),
+            "pin={pin_native_home}: the post-spawn max verdict publishes past the resume boundary"
+        );
+        assert!(
+            r9a_blob_contains(&later, "POST-ANCHOR-MAX-MARKER"),
+            "pin={pin_native_home}: post-anchor conversation hydrates"
+        );
+        // Even after pumping the post-boundary record, neither history source
+        // has leaked.
+        let all: Vec<remuda_protocol::Observation> = early.into_iter().chain(later).collect();
+        assert!(!r9a_blob_contains(&all, "HISTORY-PRE-ANCHOR-MARKER"));
+        assert!(!r9a_blob_contains(&all, "PARENT-DECOY-MARKER"));
+
+        Driver::close(&driver).await.expect("clean close");
+    }
+
+    async fn r9a_collect(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+        dur: std::time::Duration,
+    ) -> Vec<remuda_protocol::Observation> {
+        let mut out = Vec::new();
+        let until = std::time::Instant::now() + dur;
+        while std::time::Instant::now() < until {
+            // Stop early once the budget is over or a max edge has landed
+            // (callers that need the full budget pass a fresh receiver).
+            if let Ok(Some(observation)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), events.recv()).await
+            {
+                out.push(observation);
+            }
+        }
+        out
+    }
+
+    fn r9a_blob_contains(observations: &[remuda_protocol::Observation], needle: &str) -> bool {
+        observations.iter().any(|observation| {
+            serde_json::to_string(&observation.body).is_ok_and(|body| body.contains(needle))
+        })
+    }
+
+    fn r9a_effort_names(
+        observations: &[remuda_protocol::Observation],
+    ) -> Vec<Option<remuda_protocol::EffortName>> {
+        observations
+            .iter()
+            .filter_map(|observation| match &observation.body {
+                remuda_protocol::ObservationPayload::Effort(payload) => {
+                    Some(payload.effective.name)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    const R7_CONFIG_CHILD_MARKER: &str = "REMUDA_TEST_R7_CONFIG_CHILD";
 
     /// c-wfdrill2 C. `promote_ctx` minted `InstanceId::new()`, so every id the
     /// driver derived — hook tool nodes through `remuda_signal`, the
@@ -4970,11 +5056,13 @@ mod tests {
         Driver::cancel(&driver).await.unwrap();
         assert_eq!(written.lock().unwrap().as_slice(), b"\x03");
         written.lock().unwrap().clear();
-        *driver.current_promoted().lock().unwrap() = Some(Detected {
+        *driver.promoted.lock().unwrap() = Some(Detected {
             kind: AgentKind::Claude,
             pid: 42,
             session_id: None,
             hydrates_transcript: true,
+            resume: false,
+            session_id_from_hook: false,
         });
         let hooks = driver.hooks.lock().await.clone().unwrap();
         assert!(
@@ -5001,7 +5089,7 @@ mod tests {
         assert!(driver.hook_receipt());
         // The hook has already accepted a turn while the screen still shows
         // the old composer. That stale idle frame must not swallow cancel.
-        *driver.current_status().lock().unwrap() = Some(ScreenStatus::Idle);
+        *driver.status.lock().unwrap() = Some(ScreenStatus::Idle);
         assert!(
             Driver::wait_control(&driver).await.is_err(),
             "a SessionStart receipt cannot admit a prompt during a hook-confirmed turn"
@@ -5015,7 +5103,7 @@ mod tests {
         );
         written.lock().unwrap().clear();
         hooks.confirm_screen_interrupt(42);
-        *driver.current_status().lock().unwrap() = Some(ScreenStatus::Working);
+        *driver.status.lock().unwrap() = Some(ScreenStatus::Working);
         assert!(Driver::wait_control(&driver).await.is_ok());
         let ack = Driver::cancel(&driver).await.unwrap();
         assert_eq!(ack.dispatch, remuda_protocol::DispatchState::NotDispatched);
@@ -5023,7 +5111,7 @@ mod tests {
             written.lock().unwrap().is_empty(),
             "Esc on an idle Claude can quit the session"
         );
-        *driver.current_status().lock().unwrap() = Some(ScreenStatus::Blocked);
+        *driver.status.lock().unwrap() = Some(ScreenStatus::Blocked);
         assert!(Driver::wait_control(&driver).await.is_err());
         Driver::close(&driver).await.unwrap();
     }
@@ -5107,11 +5195,13 @@ mod tests {
         let driver = ShellPtyDriver::new(options);
         driver.spawn().await.expect("spawns");
         if let Some(kind) = kind {
-            *driver.current_promoted().lock().unwrap() = Some(crate::promote::Detected {
+            *driver.promoted.lock().unwrap() = Some(crate::promote::Detected {
                 kind,
                 pid: 1,
                 session_id: None,
                 hydrates_transcript: true,
+                resume: false,
+                session_id_from_hook: false,
             });
         }
         driver
@@ -5135,7 +5225,7 @@ mod tests {
     #[tokio::test]
     async fn an_agent_whose_screen_says_idle_is_ready() {
         let driver = agent_pty(Some(AgentKind::Claude)).await;
-        *driver.current_status().lock().unwrap() = Some(ScreenStatus::Idle);
+        *driver.status.lock().unwrap() = Some(ScreenStatus::Idle);
         assert!(Driver::wait_control(&driver).await.is_ok());
         let _ = Driver::close(&driver).await;
     }
@@ -5145,7 +5235,7 @@ mod tests {
         // Typing into a running turn is how a prompt gets swallowed.
         let driver = agent_pty(Some(AgentKind::Claude)).await;
         for status in [ScreenStatus::Working, ScreenStatus::Blocked] {
-            *driver.current_status().lock().unwrap() = Some(status);
+            *driver.status.lock().unwrap() = Some(status);
             assert!(
                 Driver::wait_control(&driver).await.is_err(),
                 "{status:?} must not accept a prompt"
@@ -5177,13 +5267,15 @@ mod tests {
         // Promoted rather than launched, because the two are the same session
         // to every line of code below this point (§1.0) and the promoted shape
         // needs no materializer inputs.
-        *driver.current_promoted().lock().unwrap() = Some(crate::promote::Detected {
+        *driver.promoted.lock().unwrap() = Some(crate::promote::Detected {
             kind: AgentKind::Claude,
             pid: 1,
             session_id: None,
             hydrates_transcript: true,
+            resume: false,
+            session_id_from_hook: false,
         });
-        *driver.current_status().lock().unwrap() = Some(ScreenStatus::Idle);
+        *driver.status.lock().unwrap() = Some(ScreenStatus::Idle);
 
         let ack = Driver::cancel(&driver)
             .await
@@ -5267,5 +5359,701 @@ mod tests {
             "'/data/it'\\''s.png'",
             "an embedded quote must not end the quoting"
         );
+    }
+
+    /// A post-spawn launch failure driven through the REAL spawn path (not the
+    /// cleanup primitive): the switch workers and catalog task are aborted,
+    /// `inner` is cleared, and the driver stays reusable — c-r3 replaced r2's
+    /// direct `abort_failed_launch` call. Child reaping on the real path is
+    /// asserted by `a_real_codex_ultra_launch_*` via the live state's pgid
+    /// (the failure path tears the child down before it can name itself, so a
+    /// pid-file assertion there races the immediate cleanup).
+    #[tokio::test]
+    async fn a_post_spawn_failure_through_spawn_clears_inner_and_workers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut options = ShellPtyOptions::login(tmp.path().to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        options.fail_after_spawn = true;
+        let mut driver = ShellPtyDriver::new(options);
+        // The real launch spawns the child, then fails at adapter setup.
+        let err = driver.spawn().await.expect_err("injected launch must fail");
+        assert!(matches!(err, DriverError::Io(_)), "got {err:?}");
+
+        // Item 5: a failed launch leaves no live state and no detached
+        // coordination tasks.
+        assert!(driver.inner.lock().await.is_none(), "inner cleared");
+        assert!(driver.effort_worker.lock().await.is_none());
+        assert!(driver.model_worker.lock().await.is_none());
+        assert!(driver.permission_worker.lock().await.is_none());
+        assert!(driver.events_tx.lock().await.is_none());
+
+        // The same driver can launch again (a failed resume must not poison the
+        // driver for the retry), and that launch reaps cleanly.
+        driver.options.fail_after_spawn = false;
+        let pgid = {
+            let handle = driver.spawn().await.expect("relaunches after failure");
+            let state = driver.state().await.expect("live state on relaunch");
+            let pgid = state.pgid.load(Ordering::SeqCst);
+            assert!(lifecycle::group_alive(pgid), "the relaunched child runs");
+            drop(handle);
+            pgid
+        };
+        driver.close().await.expect("clean close");
+        for _ in 0..100 {
+            if !lifecycle::group_alive(pgid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !lifecycle::group_alive(pgid),
+            "close reaps the relaunched child"
+        );
+    }
+
+    /// Item 8: a post-spawn adapter-setup failure with hooks ON must release
+    /// the hook server/socket, retire parked hooks, and drop the transcript
+    /// claim — otherwise the retry cannot bind the per-instance socket. The
+    /// retry through the REAL spawn path reuses the same instance dir.
+    #[tokio::test]
+    async fn a_post_spawn_failure_with_hooks_releases_the_socket_and_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let instance_dir = tmp.path().join("instance");
+        let mut options = ShellPtyOptions::login(tmp.path().to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        options.hooks = Some(HookConfig {
+            instance_dir: instance_dir.clone(),
+            relay_binary: PathBuf::from("/nonexistent/remuda"),
+            tui: crate::launch::TuiMode::Fullscreen,
+        });
+        options.fail_after_spawn = true;
+        let mut driver = ShellPtyDriver::new(options);
+        let err = driver.spawn().await.expect_err("injected launch must fail");
+        assert!(matches!(err, DriverError::Io(_)), "got {err:?}");
+
+        assert!(driver.hook_session().await.is_none(), "hooks taken");
+        assert!(
+            !instance_dir.join("hook.sock").exists(),
+            "the failed launch unbound the hook socket"
+        );
+
+        // The same driver retries in the SAME instance dir: the socket must be
+        // free to bind again (before item 8 the stale server held it). The hook
+        // session reports only after the child's first SessionStart, so the
+        // bound socket file is the assertion here.
+        driver.options.fail_after_spawn = false;
+        driver.spawn().await.expect("the retry launches");
+        assert!(
+            instance_dir.join("hook.sock").exists(),
+            "the retry rebound the hook socket"
+        );
+        driver.close().await.expect("clean close");
+        assert!(
+            !instance_dir.join("hook.sock").exists(),
+            "close unbind after the retry"
+        );
+    }
+
+    // r3 item 4: a Codex carrier launched with the `ultra` level through the
+    // REAL shell-pty spawn path (real materialize → real child, not a unit call
+    // to EffortRequest::from_selection) must not panic and must reap on close.
+    #[tokio::test]
+    async fn a_real_codex_ultra_launch_spawns_and_reaps_without_panic() {
+        use remuda_testing::install_executable;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Stub codex: answers the version probe, otherwise sleeps long enough to
+        // be observed as a live group leader before close reaps it.
+        let codex_bin = install_executable(
+            dir.path(),
+            "codex",
+            "#!/bin/sh\ncase \"$1\" in --version) echo 'codex-cli 0.154.0'; exit 0;; esac\nexec sleep 30\n",
+        );
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.kind = AgentKind::Codex;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+        spec.effort = Some(remuda_protocol::EffortSelection {
+            name: remuda_protocol::EffortName::Ultra,
+            ultracode: false,
+        });
+
+        let mut options = ShellPtyOptions::agent(
+            dir.path().to_path_buf(),
+            AgentKind::Codex,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::OpenaiResponses,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["gpt".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: dir.path().join("launch"),
+                native_home: dir.path().join("native-home"),
+                binary: Some(codex_bin),
+                origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: false,
+                settings_overlay: None,
+            },
+        );
+        options.pin_native_home = false;
+        options.promote = false; // keep the test focused on spawn, not detection
+
+        let driver = ShellPtyDriver::new(options);
+        // The r2 bug panicked inside the spawn task after the child started; the
+        // real path returns a handle and the effort bridge accepts `ultra`.
+        let handle = driver
+            .spawn_at(&spec.cwd, Some(&spec))
+            .await
+            .expect("codex ultra launch succeeds through the real spawn path");
+        assert!(driver.inner.lock().await.is_some(), "the run is live");
+        // The child really is the live process group the real spawn created.
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(
+            pgid > 0 && lifecycle::group_alive(pgid),
+            "the stub child runs"
+        );
+        drop(handle);
+        driver.close().await.expect("clean close reaps the stub");
+        assert!(driver.inner.lock().await.is_none(), "close clears inner");
+        for _ in 0..100 {
+            if !lifecycle::group_alive(pgid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !lifecycle::group_alive(pgid),
+            "close reaped the spawned child"
+        );
+    }
+
+    /// Test table that reports one foreground `claude` row for whatever pgid the
+    /// live driver's child leads, so the real promotion poller detects it.
+    struct ClaudeTable;
+
+    impl crate::promote::ProcessTable for ClaudeTable {
+        fn process_group(&self, pgid: i32) -> Vec<crate::promote::ProcessRow> {
+            if pgid <= 0 {
+                return Vec::new();
+            }
+            vec![crate::promote::ProcessRow {
+                pid: pgid,
+                args: "claude".to_owned(),
+            }]
+        }
+    }
+
+    // c-r3 items 3/4: the promotion pump driven through the live driver's REAL
+    // event channel. A hand-started claude (a login shell whose foreground is a
+    // `claude` per the fixture process table) binds its transcript through the
+    // deterministic pid-file channel, and an assistant effort record appended
+    // after the bind is published on the run's mpsc channel with the
+    // deterministic journal/live event id.
+    #[tokio::test]
+    async fn the_promotion_pump_publishes_effort_through_the_live_channel() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let cwd = dir.path().to_path_buf();
+        let session_id = "01234567-89ab-cdef-0123-456789abcdef";
+        let transcript =
+            crate::claude_transcript::project_dir(&home, &cwd).join(format!("{session_id}.jsonl"));
+
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        options.promote = true;
+        options.claude_home = Some(home.clone());
+        let driver = ShellPtyDriver::with_process_table(
+            options,
+            Arc::new(ClaudeTable) as Arc<dyn crate::promote::ProcessTable>,
+        );
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        // The fixture reports the child leader itself as the foreground claude.
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0);
+
+        // Deterministic channel B: the pid file names the session and cwd.
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("{pgid}.json")),
+            serde_json::json!({ "sessionId": session_id, "cwd": cwd.to_string_lossy() })
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        // One turn must already exist so the content-cwd check has something;
+        // the effort record follows after the hydrator binds.
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"uuid\":\"u0\",\"sessionId\":".to_owned()
+                + &serde_json::to_string(session_id).unwrap()
+                + ",\"version\":\"2.1.289\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
+        )
+        .unwrap();
+
+        // Give the poller (PROMOTE_POLL) a few ticks to detect the foreground
+        // claude and bind the transcript through the pid file.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let mut high_record = serde_json::to_vec(&json!({
+            "type": "assistant",
+            "uuid": "msg-prom",
+            "sessionId": session_id,
+            "version": "2.1.289",
+            "message": {
+                "id": "msg-prom",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "ok"}],
+            },
+            "effort": "high",
+            "perTurnEffort": null,
+        }))
+        .unwrap();
+        high_record.push(b'\n');
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(&high_record)
+            .unwrap();
+
+        // Drain until the effort edge is published on the real channel. The
+        // promoted-shell driver minted its own instance scope in promote_ctx, so
+        // derive the expected id from an observation's instance_id.
+        let mut scope: Option<String> = None;
+        let mut effort_id: Option<remuda_protocol::EventId> = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(obs)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await
+            {
+                scope.get_or_insert_with(|| obs.instance_id.as_id().to_string());
+                if let remuda_protocol::ObservationPayload::Effort(_) = &obs.body {
+                    effort_id = Some(obs.event_id);
+                    break;
+                }
+            }
+        }
+        Driver::close(&driver).await.unwrap();
+        let scope = scope.expect("saw at least one scoped observation");
+        let expected =
+            remuda_protocol::effort_event_id(&scope, "msg-prom", remuda_protocol::EffortName::High);
+        assert_eq!(
+            effort_id,
+            Some(expected),
+            "the promotion pump published the journal-derived effort id on its real channel"
+        );
+    }
+
+    // ----- c-effortread r7 item 1: sticky boundary by the BOUND session -----
+
+    /// One fixture table: the live pgid is always a `claude` whose args the
+    /// test swaps between polls (the process argv never changes on an
+    /// in-TUI /resume, so the test deliberately keeps it on the OLD flag).
+    #[derive(Clone)]
+    struct ScriptedClaudeTable {
+        args: Arc<std::sync::Mutex<String>>,
+    }
+
+    impl crate::promote::ProcessTable for ScriptedClaudeTable {
+        fn process_group(&self, pgid: i32) -> Vec<crate::promote::ProcessRow> {
+            if pgid <= 0 {
+                return Vec::new();
+            }
+            vec![crate::promote::ProcessRow {
+                pid: pgid,
+                args: self.args.lock().unwrap().clone(),
+            }]
+        }
+    }
+
+    const R7_S1: &str = "cccccccc-3333-4333-8333-cccccccccccc";
+    const R7_X: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+    const R7_Y: &str = "dddddddd-4444-4444-8444-dddddddddddd";
+    const R7_Z: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+
+    fn r7_record(session: &str, mut record: serde_json::Value) -> String {
+        record
+            .as_object_mut()
+            .unwrap()
+            .insert("sessionId".into(), serde_json::json!(session));
+        record
+            .as_object_mut()
+            .unwrap()
+            .insert("version".into(), serde_json::json!("2.1.289"));
+        let mut line = record.to_string();
+        line.push('\n');
+        line
+    }
+
+    fn r7_user(session: &str, uuid: &str, text: &str) -> String {
+        r7_record(
+            session,
+            serde_json::json!({
+                "type": "user",
+                "uuid": uuid,
+                "message": {"role": "user", "content": text},
+            }),
+        )
+    }
+
+    fn r7_slash(session: &str, uuid: &str, args: &str) -> String {
+        r7_record(
+            session,
+            serde_json::json!({
+                "type": "user",
+                "uuid": uuid,
+                "message": {
+                    "role": "user",
+                    "content": format!(
+                        "<command-name>/effort</command-name>\n\
+                         <command-message>effort</command-message>\n\
+                         <command-args>{args}</command-args>"
+                    ),
+                },
+            }),
+        )
+    }
+
+    fn r7_verdict(session: &str, uuid: &str, text: &str) -> String {
+        r7_user(
+            session,
+            uuid,
+            &format!("<local-command-stdout>{text}</local-command-stdout>"),
+        )
+    }
+
+    fn r7_assistant(session: &str, uuid: &str, effort: Option<&str>) -> String {
+        let mut record = serde_json::json!({
+            "type": "assistant",
+            "uuid": uuid,
+            "message": {
+                "id": uuid,
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": format!("reply {uuid}")}],
+                "stop_reason": "end_turn",
+            },
+            "perTurnEffort": null,
+        });
+        if let Some(level) = effort {
+            record
+                .as_object_mut()
+                .unwrap()
+                .insert("effort".into(), serde_json::json!(level));
+        }
+        r7_record(session, record)
+    }
+
+    fn r7_effort_names(
+        observations: &[remuda_protocol::Observation],
+    ) -> Vec<Option<remuda_protocol::EffortName>> {
+        observations
+            .iter()
+            .filter_map(|observation| match &observation.body {
+                remuda_protocol::ObservationPayload::Effort(payload) => {
+                    Some(payload.effective.name)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn r7_conversation_has(observations: &[remuda_protocol::Observation], needle: &str) -> bool {
+        observations.iter().any(|observation| {
+            matches!(
+                observation.body,
+                remuda_protocol::ObservationPayload::Message(_)
+                    | remuda_protocol::ObservationPayload::Thought(_)
+                    | remuda_protocol::ObservationPayload::ToolCall(_)
+                    | remuda_protocol::ObservationPayload::ToolResult(_)
+            ) && serde_json::to_string(&observation.body).is_ok_and(|body| body.contains(needle))
+        })
+    }
+
+    async fn r7_collect(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+        dur: std::time::Duration,
+    ) -> Vec<remuda_protocol::Observation> {
+        let mut out = Vec::new();
+        let until = std::time::Instant::now() + dur;
+        while std::time::Instant::now() < until {
+            if let Ok(Some(observation)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), events.recv()).await
+            {
+                out.push(observation);
+            }
+        }
+        out
+    }
+
+    async fn r7_send_session_start(
+        hooks: &crate::launch::HookSession,
+        pid: i32,
+        session_id: &str,
+        path: &std::path::Path,
+    ) {
+        let reply = remuda_signal::send_event(
+            &hooks.socket_path,
+            &remuda_signal::HookEnvelope {
+                credential: hooks.child_env("")["REMUDA_HOOK_CREDENTIAL"].clone(),
+                event: "SessionStart".into(),
+                ppid: pid,
+                payload: serde_json::json!({
+                    "session_id": session_id,
+                    "transcript_path": path.to_string_lossy(),
+                }),
+            },
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(reply.to_hook_json(), serde_json::json!({}));
+    }
+
+    fn r7_login_driver(
+        dir: &std::path::Path,
+        home: &std::path::Path,
+        args: Arc<std::sync::Mutex<String>>,
+    ) -> ShellPtyDriver {
+        let mut options = ShellPtyOptions::login(dir.to_path_buf());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()];
+        options.promote = true;
+        options.claude_home = Some(home.to_path_buf());
+        options.hooks = Some(HookConfig {
+            instance_dir: dir.join("instance"),
+            relay_binary: std::path::PathBuf::from("/nonexistent/remuda"),
+            tui: crate::launch::TuiMode::Fullscreen,
+        });
+        ShellPtyDriver::with_process_table(
+            options,
+            Arc::new(ScriptedClaudeTable { args }) as Arc<dyn crate::promote::ProcessTable>,
+        )
+    }
+
+    /// r7 item 1: a fresh launch argv keeps `--session-id S1` after the user
+    /// runs `/resume Y` in the TUI. The poller must bound Y from Y's OWN
+    /// SessionStart snapshot (unverified EOF anchor): Y's history (a high
+    /// read-back plus a max slash/verdict) neither publishes an effort edge
+    /// nor settles an armed switch, while conversation appended afterwards
+    /// still hydrates.
+    #[tokio::test]
+    async fn item1_resume_after_launch_uses_the_bound_session_not_the_argv_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let cwd = dir.path().to_path_buf();
+        let slug = crate::claude_transcript::project_dir(&home, &cwd);
+        std::fs::create_dir_all(&slug).unwrap();
+        let args = Arc::new(std::sync::Mutex::new(format!(
+            "claude --session-id {R7_S1}"
+        )));
+        let driver = r7_login_driver(dir.path(), &home, Arc::clone(&args));
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        // First tick promotes. S1's authenticated SessionStart fires at TUI
+        // boot, BEFORE the first prompt lazily creates the transcript, so the
+        // sticky entry for S1 is measured while the file is absent.
+        let s1_path = slug.join(format!("{R7_S1}.jsonl"));
+        r7_send_session_start(&hooks, pgid, R7_S1, &s1_path).await;
+        r7_collect(&mut events, std::time::Duration::from_millis(1000)).await;
+        // The prompt then creates S1.jsonl; the next poll binds it Fresh.
+        std::fs::write(&s1_path, r7_user(R7_S1, "s1-prompt", "first prompt")).unwrap();
+        r7_collect(&mut events, std::time::Duration::from_millis(1600)).await;
+
+        // Arm before the rebind: Y's replayed verdict must never settle it.
+        let bridge = driver.effort_bridge.lock().await.clone();
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+
+        // In-TUI /resume Y; argv still says S1. Y carries history with a
+        // high read-back and the exact max slash+verdict that WOULD settle
+        // the armed switch were Y tailed from byte 0 as current.
+        let y_history = format!(
+            "{}{}{}",
+            r7_assistant(R7_Y, "y-old-assistant", Some("high")),
+            r7_slash(R7_Y, "y-old-slash", "max"),
+            r7_verdict(R7_Y, "y-old-verdict", "Set effort level to max"),
+        );
+        let y_path = slug.join(format!("{R7_Y}.jsonl"));
+        std::fs::write(&y_path, y_history).unwrap();
+        r7_send_session_start(&hooks, pgid, R7_Y, &y_path).await;
+        let rebound = r7_collect(&mut events, std::time::Duration::from_millis(2400)).await;
+        assert!(
+            r7_effort_names(&rebound).is_empty(),
+            "Y history must not publish an effort edge: {rebound:?}"
+        );
+        assert!(bridge.has_pending());
+        assert!(
+            bridge
+                .wait(generation, std::time::Duration::from_millis(300))
+                .await
+                .is_none(),
+            "the replayed verdict must not resolve Applied"
+        );
+
+        // Bytes appended AFTER Y's anchor hydrate as conversation only.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&y_path)
+            .unwrap()
+            .write_all(r7_user(R7_Y, "y-new-prompt", "after the resume").as_bytes())
+            .unwrap();
+        let after = r7_collect(&mut events, std::time::Duration::from_millis(1800)).await;
+        assert!(
+            r7_effort_names(&after).is_empty(),
+            "the gate never opens for Y this epoch: {after:?}"
+        );
+        assert!(r7_conversation_has(&after, "after the resume"));
+        assert!(bridge.has_pending());
+
+        Driver::close(&driver).await.unwrap();
+    }
+
+    /// r7 item 1, lazy-create arm: the user /resume's BEFORE ever sending a
+    /// prompt, so the launch session S1 never gets a transcript and no
+    /// binding exists when Y's authenticated SessionStart arrives. The
+    /// argv channel would keep looking for the (still absent) S1 file; the
+    /// hook report must bind Y directly and its history must stay gated.
+    #[tokio::test]
+    async fn item1_resume_before_any_binding_binds_the_reported_session_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let cwd = dir.path().to_path_buf();
+        let slug = crate::claude_transcript::project_dir(&home, &cwd);
+        std::fs::create_dir_all(&slug).unwrap();
+        let args = Arc::new(std::sync::Mutex::new(format!(
+            "claude --session-id {R7_S1}"
+        )));
+        let driver = r7_login_driver(dir.path(), &home, Arc::clone(&args));
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        // S1 reports at boot but its file is never created (no prompt).
+        let s1_path = slug.join(format!("{R7_S1}.jsonl"));
+        r7_send_session_start(&hooks, pgid, R7_S1, &s1_path).await;
+        r7_collect(&mut events, std::time::Duration::from_millis(1000)).await;
+        // Still no binding: the /resume target Y reports with history.
+        let bridge = driver.effort_bridge.lock().await.clone();
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+        let y_path = slug.join(format!("{R7_Y}.jsonl"));
+        std::fs::write(
+            &y_path,
+            format!(
+                "{}{}{}",
+                r7_assistant(R7_Y, "y-old-assistant", Some("high")),
+                r7_slash(R7_Y, "y-old-slash", "max"),
+                r7_verdict(R7_Y, "y-old-verdict", "Set effort level to max"),
+            ),
+        )
+        .unwrap();
+        r7_send_session_start(&hooks, pgid, R7_Y, &y_path).await;
+        let rebound = r7_collect(&mut events, std::time::Duration::from_millis(2400)).await;
+        assert!(
+            r7_effort_names(&rebound).is_empty(),
+            "Y binds directly but its history stays gated: {rebound:?}"
+        );
+        assert!(
+            bridge
+                .wait(generation, std::time::Duration::from_millis(300))
+                .await
+                .is_none(),
+            "the replayed verdict must not resolve Applied"
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&y_path)
+            .unwrap()
+            .write_all(r7_user(R7_Y, "y-new-prompt", "late resume prompt").as_bytes())
+            .unwrap();
+        let after = r7_collect(&mut events, std::time::Duration::from_millis(1800)).await;
+        assert!(r7_effort_names(&after).is_empty(), "{after:?}");
+        assert!(r7_conversation_has(&after, "late resume prompt"));
+
+        Driver::close(&driver).await.unwrap();
+    }
+
+    /// r7 item 1(b): `claude --resume X` (hand-typed; the poller only has the
+    /// argv) followed by `/clear` to Z. X stays an unverified resume, and Z
+    /// is Fresh from its own absent-file SessionStart: once Z's transcript
+    /// appears its records are current, the effort edge publishes and an
+    /// armed switch settles — X history never leaks.
+    #[tokio::test]
+    async fn item1_resume_then_clear_binds_z_fresh_and_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let cwd = dir.path().to_path_buf();
+        let slug = crate::claude_transcript::project_dir(&home, &cwd);
+        std::fs::create_dir_all(&slug).unwrap();
+        let args = Arc::new(std::sync::Mutex::new(format!("claude --resume {R7_X}")));
+        let driver = r7_login_driver(dir.path(), &home, Arc::clone(&args));
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        let x_history = format!(
+            "{}{}{}",
+            r7_assistant(R7_X, "x-old-assistant", Some("high")),
+            r7_slash(R7_X, "x-old-slash", "max"),
+            r7_verdict(R7_X, "x-old-verdict", "Set effort level to max"),
+        );
+        let x_path = slug.join(format!("{R7_X}.jsonl"));
+        std::fs::write(&x_path, x_history).unwrap();
+        r7_send_session_start(&hooks, pgid, R7_X, &x_path).await;
+        let x_phase = r7_collect(&mut events, std::time::Duration::from_millis(1800)).await;
+        assert!(
+            r7_effort_names(&x_phase).is_empty(),
+            "X is an unverified resume: no history edge: {x_phase:?}"
+        );
+
+        let bridge = driver.effort_bridge.lock().await.clone();
+        let generation = bridge.arm(crate::effort::EffortRequest::from_level("max").expect("max"));
+
+        // /clear: the SessionStart arrives while Z's file is still absent
+        // (lazy creation). The sticky mode is Fresh at that instant.
+        let z_path = slug.join(format!("{R7_Z}.jsonl"));
+        r7_send_session_start(&hooks, pgid, R7_Z, &z_path).await;
+        r7_collect(&mut events, std::time::Duration::from_millis(1200)).await;
+        // Z then appears with its own first turn: the slash settles its own
+        // switch and the assistant's max read-back publishes.
+        std::fs::write(
+            &z_path,
+            format!(
+                "{}{}{}",
+                r7_slash(R7_Z, "z-slash", "max"),
+                r7_verdict(R7_Z, "z-verdict", "Set effort level to max"),
+                r7_assistant(R7_Z, "z-assistant", Some("max")),
+            ),
+        )
+        .unwrap();
+        let z_phase = r7_collect(&mut events, std::time::Duration::from_millis(3000)).await;
+        let names = r7_effort_names(&z_phase);
+        assert!(
+            names.contains(&Some(remuda_protocol::EffortName::Max)),
+            "Z is Fresh: its max read-back must publish: {names:?}"
+        );
+        assert!(
+            !names.contains(&Some(remuda_protocol::EffortName::High)),
+            "X's high history must never publish: {names:?}"
+        );
+        assert!(
+            bridge
+                .wait(generation, std::time::Duration::from_secs(2))
+                .await
+                .is_some(),
+            "Z's own verdict settles the armed switch Applied"
+        );
+
+        Driver::close(&driver).await.unwrap();
     }
 }

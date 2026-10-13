@@ -176,7 +176,7 @@ export function findPermissionOption(
 export function normalizePermissionMode(
   kind: PermissionKind | string | undefined,
   value: string | undefined | null,
-  fallback = "manual",
+  fallback = defaultPermissionForKind(kind ?? "claude"),
 ): string {
   const harness = kind ?? "claude";
   if (value) {

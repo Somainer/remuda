@@ -106,7 +106,7 @@ it("does not invent a root for a host with no registered workspace", () => {
 const cliHost = {
   ...host,
   cli: [
-    { kind: "claude", version: "2.1.0", path: "/usr/bin/claude" },
+    { kind: "claude", version: "2.1.289", path: "/usr/bin/claude" },
     { kind: "codex", version: "0.9.0", path: "/usr/bin/codex" },
     { kind: "grok", version: "0.4.0", path: "/usr/bin/grok" },
   ],
@@ -164,25 +164,48 @@ function renderWithLaunchableMatrix() {
   renderAt(["/sessions/new"]);
 }
 
-it("mounts the inline slider (layout A, no card) with the six Claude stops", () => {
+it("mounts the inline slider (layout A, no card) with the five Claude stops and a switch", () => {
   renderWithCli();
   const slider = screen.getByTestId("new-session-effort-slider");
   expect(slider).toHaveAttribute("role", "slider");
-  expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max,ultracode");
-  expect(slider).toHaveAttribute("aria-valuemax", "5");
-  // The device default is Claude `high`, the third of six stops.
+  expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max");
+  expect(slider).toHaveAttribute("aria-valuemax", "4");
+  // No remembered preference: the unpinned draft shows the fallback high.
   expect(slider).toHaveAttribute("data-name", "high");
   expect(slider).toHaveAttribute("data-index", "2");
   expect(screen.getByTestId("new-session-effort-knob")).toBeInTheDocument();
   expect(screen.getByTestId("new-session-effort-track")).toBeInTheDocument();
   // Layout A: the label row and tick labels are present, with no card frame.
   expect(screen.getByTestId("new-session-effort-slider-panel")).toHaveAttribute("data-variant", "inline");
-  // The helper stays user vocabulary; the InstanceSpec implementation name no
-  // longer appears anywhere on the New Session form.
-  expect(screen.getByTestId("new-session-effort-foot")).toHaveTextContent("会话开始后仍可在会话内调整");
-  expect(screen.getByTestId("new-session-effort")).toHaveTextContent("会话开始后仍可在会话内调整");
-  // The standalone ultracode chip is gone; ultracode is the last tick.
-  expect(screen.queryByTestId("new-session-effort-ultracode")).toBeNull();
+  // The unpinned helper names the follow-the-model-default state.
+  expect(screen.getByTestId("new-session-effort-foot")).toHaveTextContent("跟随模型默认");
+  expect(screen.getByTestId("new-session-effort")).toHaveTextContent("跟随模型默认");
+  // D-056: the orthogonal switch is a row under the pill, not a sixth tick.
+  expect(screen.getByTestId("new-session-effort-ultracode")).toBeInTheDocument();
+  expect(screen.queryByTestId("new-session-effort-tier-ultracode")).toBeNull();
+});
+
+
+it("lists every Claude launch mode incl. plan and dontAsk, with native ids (item 5)", () => {
+  renderWithCli();
+  const row = screen.getByTestId("new-session-perm-row");
+  expect(row).toHaveAttribute("data-harness", "claude");
+  // The launch table — not the live four-row wheel.
+  for (const id of ["manual", "acceptEdits", "plan", "auto", "bypassPermissions", "dontAsk"]) {
+    expect(screen.getByTestId(`new-session-perm-${id}`)).toBeVisible();
+  }
+  // The yolo/danger row keeps its danger treatment in the launch grid.
+  expect(screen.getByTestId("new-session-perm-bypassPermissions")).toHaveAttribute("data-danger", "1");
+});
+it("offers each other harness its OWN native permission ids, never Claude ids (item 7)", () => {
+  renderWithCli();
+  fireEvent.click(screen.getByTestId("new-session-kind-grok"));
+  expect(screen.getByTestId("new-session-perm-native-prompt")).toBeVisible();
+  expect(screen.queryByTestId("new-session-perm-acceptEdits")).toBeNull();
+  // Codex keeps its native policy + sandbox axes, including the danger row.
+  fireEvent.click(screen.getByTestId("new-session-kind-codex"));
+  expect(screen.getByTestId("new-session-perm-never")).toHaveAttribute("data-danger", "1");
+  expect(screen.queryByTestId("new-session-perm-bypassPermissions")).toBeNull();
 });
 
 it("re-snaps the slider onto the new harness table when the runtime changes", () => {
@@ -209,29 +232,29 @@ it("re-snaps the slider onto the new harness table when the runtime changes", ()
   expect(slider()).toHaveAttribute("data-ember", "0");
 });
 
-it("keeps the top tier on top across harnesses and drops the draft with it", () => {
+it("keeps the top tier on top across harnesses and drops the flag with it", () => {
   renderWithCli();
   const slider = () => screen.getByTestId("new-session-effort-slider");
   slider().focus();
   fireEvent.keyDown(slider(), { key: "End" });
-  // End lands on the sixth stop, ultracode (xhigh tier + workflow flag).
-  expect(slider()).toHaveAttribute("data-name", "ultracode");
-  expect(slider()).toHaveAttribute("data-index", "5");
-  expect(slider()).toHaveAttribute("data-ember", "1");
+  // End lands on the fifth native stop, max (the flag is the separate row).
+  expect(slider()).toHaveAttribute("data-name", "max");
+  expect(slider()).toHaveAttribute("data-index", "4");
+  expect(slider()).toHaveAttribute("data-effort-look", "top");
 
-  // The ultracode flag is Claude-only; leaving Claude drops it and maps the
-  // xhigh tier (3/4) by ratio onto grok `high` (2/3) — top accents map to the
-  // static accent, the ember never crosses harnesses.
+  // The top tier is Claude-only and drops with the harness; the max RATIO
+  // maps onto each table's own top row; ember never crosses harnesses.
   fireEvent.click(screen.getByTestId("new-session-kind-grok"));
-  expect(slider()).toHaveAttribute("data-name", "high");
-  expect(slider()).toHaveAttribute("data-index", "2");
-  expect(slider()).toHaveAttribute("data-effort-look", "plain");
-  expect(slider()).toHaveAttribute("data-ember", "0");
-
-  // ...and back, without the stale draft the unmounted card held.
-  fireEvent.click(screen.getByTestId("new-session-kind-codex"));
   expect(slider()).toHaveAttribute("data-name", "xhigh");
   expect(slider()).toHaveAttribute("data-index", "3");
+  expect(slider()).toHaveAttribute("data-effort-look", "top");
+  expect(slider()).toHaveAttribute("data-ember", "0");
+
+  // ...and to codex, the same ratio is its native Ultra — but no flag.
+  fireEvent.click(screen.getByTestId("new-session-kind-codex"));
+  expect(slider()).toHaveAttribute("data-name", "ultra");
+  expect(slider()).toHaveAttribute("data-index", "5");
+  expect(slider()).toHaveAttribute("data-ultracode", "0");
   fireEvent.keyDown(slider(), { key: "Home" });
   expect(slider()).toHaveAttribute("data-name", "low");
   fireEvent.click(screen.getByTestId("new-session-kind-grok"));
@@ -239,33 +262,165 @@ it("keeps the top tier on top across harnesses and drops the draft with it", () 
   expect(slider()).toHaveAttribute("data-ember", "0");
 });
 
-it("the ultracode stop is reached on the one slider and the create carries the ultracode wire name", async () => {
+it("r2 item 6: the launch switch couples to xhigh even on a ≥2.1.284 binary and previews the materialized argv", async () => {
+  // cliHost reports 2.1.289 (decoupled CLI), but the launch materializer
+  // (checked on main and c-effortread) emits only the coupled
+  // `--effort ultracode` and never an ultracode settings key. The LAUNCH form
+  // therefore must not promise the independent high+ultracode combination.
   const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
   renderWithCli();
   const slider = () => screen.getByTestId("new-session-effort-slider");
-  // End walks all six stops to ultracode; the track stays an enabled slider.
-  slider().focus();
-  fireEvent.keyDown(slider(), { key: "End" });
-  expect(slider()).toHaveAttribute("data-name", "ultracode");
-  expect(slider()).toHaveAttribute("data-index", "5");
-  expect(slider()).toHaveAttribute("data-tier-index", "3");
+  const sw = screen.getByTestId("new-session-effort-ultracode-switch");
+  expect(sw).toHaveAttribute("aria-checked", "false");
+  expect(slider()).toHaveAttribute("data-name", "high");
+
+  fireEvent.click(sw);
+  expect(sw).toHaveAttribute("aria-checked", "true");
+  // The pill snaps to xhigh — the only combination the backend launches.
+  expect(slider()).toHaveAttribute("data-name", "xhigh");
+  expect(slider()).toHaveAttribute("data-index", "3");
   expect(slider()).toHaveAttribute("data-ultracode", "1");
-  expect(slider()).toHaveAttribute("data-ember", "1");
-  expect(slider()).toHaveAttribute("aria-disabled", "false");
-  expect(screen.getByTestId("new-session-effort-title")).toHaveTextContent("ultracode");
-  // One step back returns to max on the same slider.
-  fireEvent.keyDown(slider(), { key: "ArrowLeft" });
-  expect(slider()).toHaveAttribute("data-name", "max");
-  expect(slider()).toHaveAttribute("data-index", "4");
-  fireEvent.keyDown(slider(), { key: "ArrowRight" });
-  expect(slider()).toHaveAttribute("data-name", "ultracode");
+  expect(screen.getByTestId("new-session-effort")).toHaveAttribute("data-pinned", "1");
+
+  fireEvent.click(screen.getByTestId("new-session-advanced"));
+  // The preview names the single coupled spelling once: no level alongside,
+  // no fabricated overlay key, no second --settings.
+  const previewText = screen.getByTestId("new-session-launch-preview").textContent ?? "";
+  expect(previewText).toContain("--effort ultracode");
+  expect(previewText).not.toContain("--effort high");
+  expect(previewText).not.toContain('{"ultracode"');
+  expect(previewText.match(/--effort/g)).toHaveLength(1);
+  expect(previewText.match(/--settings/g)).toHaveLength(1);
 
   fireEvent.click(screen.getByTestId("new-session-start"));
   await waitFor(() =>
     expect(create).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: "claude", effortIndex: 3, effortName: "ultracode" }),
+      expect.objectContaining({ kind: "claude", effortIndex: 3, effortName: "xhigh", effortUltracode: true }),
     ),
   );
+  expect(create.mock.calls[0][0].effortName).not.toBe("ultracode");
+});
+
+it("r2 item 6: an untouched (unpinned) draft previews and sends NO effort at all", async () => {
+  const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
+  renderWithCli();
+  // The slider shows the model default for context, marked unpinned.
+  expect(screen.getByTestId("new-session-effort")).toHaveAttribute("data-pinned", "0");
+  fireEvent.click(screen.getByTestId("new-session-advanced"));
+  const previewText = screen.getByTestId("new-session-launch-preview").textContent ?? "";
+  expect(previewText).toContain("claude");
+  expect(previewText).not.toContain("--effort");
+  expect(previewText).not.toContain("ultracode");
+
+  fireEvent.change(screen.getByTestId("new-session-cwd"), { target: { value: "src" } });
+  fireEvent.click(screen.getByTestId("new-session-start"));
+  await waitFor(() => expect(create).toHaveBeenCalled());
+  // The create payload omits every effort axis — asserted together with the
+  // preview, since the two previously disagreed.
+  const payload = create.mock.calls[0][0] as Record<string, unknown>;
+  expect(payload).not.toHaveProperty("effortIndex");
+  expect(payload).not.toHaveProperty("effortName");
+  expect(payload).not.toHaveProperty("effortUltracode");
+});
+
+it("r2 item 1/6: an unknown binary version locks the launch switch with a named reason and previews no flag", () => {
+  const unknownHost = {
+    ...cliHost,
+    cli: [{ kind: "claude", version: "", path: "/usr/bin/claude" }],
+  };
+  vi.mocked(store.useHub).mockReturnValue({
+    ...store.hubStore.getSnapshot(), hosts: [unknownHost], workspaces: [workspace], instances: [],
+  });
+  renderAt(["/sessions/new"]);
+  expect(screen.getByTestId("new-session-effort-ultracode-switch")).toBeDisabled();
+  expect(screen.getByTestId("new-session-effort-ultracode-reason").textContent).toContain("版本");
+  // The five stops are still offered; the unpinned preview carries no flag.
+  expect(screen.getByTestId("new-session-effort-slider")).toHaveAttribute("aria-valuemax", "4");
+  fireEvent.click(screen.getByTestId("new-session-advanced"));
+  expect(screen.getByTestId("new-session-launch-preview").textContent ?? "").not.toContain("--effort");
+});
+
+it("r2 item 1: a pre-2.1.203 binary locks the launch switch with the 2.1.203 reason", () => {
+  const legacyHost = {
+    ...cliHost,
+    cli: [{ kind: "claude", version: "2.1.150", path: "/usr/bin/claude" }],
+  };
+  vi.mocked(store.useHub).mockReturnValue({
+    ...store.hubStore.getSnapshot(), hosts: [legacyHost], workspaces: [workspace], instances: [],
+  });
+  renderAt(["/sessions/new"]);
+  expect(screen.getByTestId("new-session-effort-ultracode-switch")).toBeDisabled();
+  expect(screen.getByTestId("new-session-effort-ultracode-reason").textContent).toContain("2.1.203");
+});
+
+it.each([
+  ["legacy", "2.1.150"],
+  ["unknown", ""],
+])("item 10: a stored ultracode pref fails CLOSED on a %s host (preview, display, payload)", async (_label, version) => {
+  // The remembered pref carries the old "ultracode" name (equally covered: a
+  // pinned {xhigh,on} draft — both initialize the effort state with flag on).
+  localStorage.setItem(
+    "runtime.new-session",
+    JSON.stringify({ effortIndex: 5, effortName: "ultracode" }),
+  );
+  const gatedHost = {
+    ...cliHost,
+    cli: [{ kind: "claude", version, path: "/usr/bin/claude" }],
+  };
+  vi.mocked(store.useHub).mockReturnValue({
+    ...store.hubStore.getSnapshot(), hosts: [gatedHost], workspaces: [workspace], instances: [],
+  });
+  const create = vi.spyOn(store.hubStore, "create").mockResolvedValue(mockDb.instances[0]);
+  renderAt(["/sessions/new"]);
+
+  // The switch is locked and the DISPLAY does not carry the flag.
+  const sw = screen.getByTestId("new-session-effort-ultracode-switch");
+  expect(sw).toBeDisabled();
+  expect(sw).toHaveAttribute("aria-checked", "false");
+  expect(screen.getByTestId("new-session-effort-slider")).toHaveAttribute("data-ultracode", "0");
+
+  // The preview never promises `--effort ultracode`.
+  fireEvent.click(screen.getByTestId("new-session-advanced"));
+  const previewText = screen.getByTestId("new-session-launch-preview").textContent ?? "";
+  expect(previewText).not.toContain("ultracode");
+  // (the pinned xhigh level itself may still be named)
+  expect(previewText).not.toMatch(/--effort ultracode/);
+
+  // The payload forces the boolean false — all three together, not just UI.
+  fireEvent.change(screen.getByTestId("new-session-cwd"), { target: { value: "src" } });
+  fireEvent.click(screen.getByTestId("new-session-start"));
+  await waitFor(() => expect(create).toHaveBeenCalled());
+  const payload = create.mock.calls[0][0] as Record<string, unknown>;
+  expect(payload.effortUltracode).toBe(false);
+});
+
+it("item 12c: the per-model catalog default outranks the device default for the unpinned slider", () => {
+  // Device default pins max (index 4)…
+  localStorage.setItem(
+    "runtime.device-settings.v1",
+    JSON.stringify({ defaultEffortIndex: 4 }),
+  );
+  // …but the remembered model is opus, whose catalog default is medium.
+  localStorage.setItem(
+    "runtime.new-session",
+    JSON.stringify({ model: "opus" }),
+  );
+  renderWithCli();
+  const slider = screen.getByTestId("new-session-effort-slider");
+  // Unpinned (no draft effort): the MODEL default wins, not device max.
+  expect(slider).toHaveAttribute("data-name", "medium");
+  expect(slider).toHaveAttribute("data-index", "1");
+  expect(screen.getByTestId("new-session-effort")).toHaveAttribute("data-pinned", "0");
+});
+
+it("item 12c: an unknown model falls back to the device default", () => {
+  localStorage.setItem(
+    "runtime.device-settings.v1",
+    JSON.stringify({ defaultEffortIndex: 4 }),
+  );
+  // No model default exists for passthrough/auto → device default is used.
+  renderWithCli();
+  expect(screen.getByTestId("new-session-effort-slider")).toHaveAttribute("data-index", "4");
 });
 
 it("writes the slider's tier into the instance it creates", async () => {
@@ -292,6 +447,23 @@ it("normalizes a remembered legacy tier name when the sheet opens", () => {
   expect(slider).toHaveAttribute("data-name", "xhigh");
   expect(slider).toHaveAttribute("data-index", "3");
   expect(slider).toHaveAttribute("data-ultracode", "0");
+});
+
+it("loads a stored legacy 'ultracode' pref as xhigh + switch on (D-056)", () => {
+  localStorage.setItem(
+    "runtime.new-session",
+    JSON.stringify({ effortIndex: 5, effortName: "ultracode" }),
+  );
+  renderWithCli();
+  const slider = screen.getByTestId("new-session-effort-slider");
+  // The old sixth stop becomes the xhigh tier with the orthogonal flag on.
+  expect(slider).toHaveAttribute("data-name", "xhigh");
+  expect(slider).toHaveAttribute("data-index", "3");
+  expect(slider).toHaveAttribute("data-ultracode", "1");
+  expect(screen.getByTestId("new-session-effort-ultracode-switch")).toHaveAttribute(
+    "aria-checked",
+    "true",
+  );
 });
 
 it("writes the harness-native tier after a runtime switch", async () => {

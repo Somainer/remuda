@@ -8,8 +8,8 @@ use remuda_journal::{
     fold_prepend_backfill, map_claude_line,
 };
 use remuda_protocol::{
-    ActorRef, ActorType, CommandId, Completeness, DeliveryState, EventId, FileCursor, HostId, Id,
-    InstanceId, Interaction, InteractionAnsweredPayload, InteractionExpiredPayload,
+    ActorRef, ActorType, CommandId, Completeness, DeliveryState, EffortSource, EventId, FileCursor,
+    HostId, Id, InstanceId, Interaction, InteractionAnsweredPayload, InteractionExpiredPayload,
     InteractionExpiredReason, InteractionRequestedPayload, ObservationPayload, SourceChannel, U64,
 };
 use std::fs;
@@ -434,7 +434,7 @@ fn claude_transcript_effort_records_map_to_effort_observations() -> Result<()> {
         .iter()
         .find_map(|env| match &env.body {
             ObservationPayload::Effort(payload)
-                if payload.effective.name == remuda_protocol::EffortName::Max =>
+                if payload.effective.name == Some(remuda_protocol::EffortName::Max) =>
             {
                 Some(env.event_id.clone())
             }
@@ -466,7 +466,7 @@ fn claude_transcript_effort_records_map_to_effort_observations() -> Result<()> {
         .iter()
         .find_map(|env| match &env.body {
             ObservationPayload::Effort(payload)
-                if payload.effective.name == remuda_protocol::EffortName::Max =>
+                if payload.effective.name == Some(remuda_protocol::EffortName::Max) =>
             {
                 Some(env.event_id.clone())
             }
@@ -476,12 +476,18 @@ fn claude_transcript_effort_records_map_to_effort_observations() -> Result<()> {
         .expect("derived again");
     assert_eq!(id_a, id_b, "effort event id is stable across mappings");
 
-    assert_eq!(effort[0].effective.name, remuda_protocol::EffortName::High);
+    assert_eq!(
+        effort[0].effective.name,
+        Some(remuda_protocol::EffortName::High)
+    );
     assert_eq!(
         effort[0].effective.source,
         remuda_protocol::EffortSource::Unknown
     );
-    assert_eq!(effort[1].effective.name, remuda_protocol::EffortName::Max);
+    assert_eq!(
+        effort[1].effective.name,
+        Some(remuda_protocol::EffortName::Max)
+    );
     assert_eq!(
         effort[1].effective.source,
         remuda_protocol::EffortSource::Slash
@@ -495,45 +501,186 @@ fn claude_transcript_effort_records_map_to_effort_observations() -> Result<()> {
 fn real_21272_walk_settles_effort_from_the_stdout_verdict() -> Result<()> {
     let (_, _, _, map) = ctx("effort-session-21272");
     let contents = include_str!("fixtures/effort-21272/effort-walk-21272.jsonl");
-    let envelopes = map_file(contents, &map)?;
-    let edges: Vec<_> = envelopes
+    let edges = effort_triples(&map_file(contents, &map)?);
+    // The exact coupled observation sequence: low baseline; xhigh accepted
+    // (flag off); ultracode accepted at xhigh (flag on); high clears it. The
+    // Esc-on-dialog max never settles.
+    assert_eq!(
+        edges,
+        vec![
+            (
+                remuda_protocol::EffortName::Low,
+                remuda_protocol::EffortSource::Unknown,
+                None
+            ),
+            (
+                remuda_protocol::EffortName::Xhigh,
+                remuda_protocol::EffortSource::Slash,
+                Some(false)
+            ),
+            (
+                remuda_protocol::EffortName::Xhigh,
+                remuda_protocol::EffortSource::Slash,
+                Some(true)
+            ),
+            (
+                remuda_protocol::EffortName::High,
+                remuda_protocol::EffortSource::Slash,
+                Some(false)
+            ),
+        ]
+    );
+    Ok(())
+}
+
+/// Every effort edge `(level, source, ultracode)` in journal order.
+fn effort_triples(
+    envelopes: &[Envelope],
+) -> Vec<(remuda_protocol::EffortName, EffortSource, Option<bool>)> {
+    envelopes
         .iter()
         .filter_map(|env| match &env.body {
             ObservationPayload::Effort(payload) => Some((
-                payload.effective.name,
+                payload
+                    .effective
+                    .name
+                    .expect("normal journal effort edges always carry a level"),
                 payload.effective.source,
                 payload.effective.ultracode,
             )),
             _ => None,
         })
-        .collect();
-    // The stdout verdict — not the next assistant turn — emits the xhigh edge,
-    // the ultracode edge carries Some(true), and high clears the flag.
-    assert!(
-        edges.iter().any(
-            |(name, _, ultra)| *name == remuda_protocol::EffortName::Xhigh && *ultra == Some(false)
+        .collect()
+}
+
+/// Map a 2.1.289 fixture mirrored into the journal test fixtures.
+fn map_21289_fixture(
+    session: &str,
+    name: &str,
+) -> Result<Vec<(remuda_protocol::EffortName, EffortSource, Option<bool>)>> {
+    let (_, _, _, map) = ctx(session);
+    let contents = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/effort-21289")
+            .join(name),
+    )?;
+    Ok(effort_triples(&map_file(&contents, &map)?))
+}
+
+#[test]
+fn real_21289_walk_emits_the_full_decoupled_observation_sequence() -> Result<()> {
+    // Same full sequence the live mapper emits (parity assertion lives in
+    // remuda-driver/tests/effort_transcript.rs); D-056 effort-sync-4 walk.
+    let edges = map_21289_fixture("effort-walk-21289", "effort-walk-21289.jsonl")?;
+    assert_eq!(
+        edges,
+        vec![
+            (
+                remuda_protocol::EffortName::High,
+                remuda_protocol::EffortSource::Unknown,
+                None
+            ),
+            (
+                remuda_protocol::EffortName::High,
+                remuda_protocol::EffortSource::Slash,
+                Some(true)
+            ),
+            (
+                remuda_protocol::EffortName::Max,
+                remuda_protocol::EffortSource::Slash,
+                Some(true)
+            ),
+            (
+                remuda_protocol::EffortName::Max,
+                remuda_protocol::EffortSource::Slash,
+                Some(false)
+            ),
+            (
+                remuda_protocol::EffortName::Max,
+                remuda_protocol::EffortSource::Slash,
+                Some(true)
+            ),
+            (
+                remuda_protocol::EffortName::Xhigh,
+                remuda_protocol::EffortSource::Slash,
+                Some(true)
+            ),
+            (
+                remuda_protocol::EffortName::Medium,
+                remuda_protocol::EffortSource::Unknown,
+                Some(true)
+            ),
+            (
+                remuda_protocol::EffortName::High,
+                remuda_protocol::EffortSource::Slash,
+                Some(false)
+            ),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn real_21289_launch_fixtures_each_emit_their_exact_sequence() -> Result<()> {
+    use remuda_protocol::EffortName::*;
+    /// One expected effort edge: `(level, source, ultracode)`.
+    type Edge = (remuda_protocol::EffortName, EffortSource, Option<bool>);
+    let cases: [(&str, Vec<Edge>); 8] = [
+        (
+            "effort-launch-a-21289.jsonl",
+            vec![(High, remuda_protocol::EffortSource::Unknown, Some(true))],
         ),
-        "xhigh accepted from stdout: {edges:?}"
-    );
-    assert!(
-        edges.iter().any(
-            |(name, _, ultra)| *name == remuda_protocol::EffortName::Xhigh && *ultra == Some(true)
+        (
+            "effort-launch-b-21289.jsonl",
+            vec![(Xhigh, remuda_protocol::EffortSource::Unknown, Some(true))],
         ),
-        "ultracode accepted from stdout: {edges:?}"
-    );
-    assert!(
-        edges.iter().any(
-            |(name, _, ultra)| *name == remuda_protocol::EffortName::High && *ultra == Some(false)
+        (
+            "effort-launch-c1-21289.jsonl",
+            vec![(Medium, remuda_protocol::EffortSource::Unknown, Some(true))],
         ),
-        "high accept clears the flag: {edges:?}"
-    );
-    // The dismissed-dialog max never becomes an edge.
-    assert!(
-        !edges
-            .iter()
-            .any(|(name, _, _)| *name == remuda_protocol::EffortName::Max),
-        "Esc-on-dialog max must not settle: {edges:?}"
-    );
+        (
+            "effort-launch-c2-21289.jsonl",
+            vec![
+                (Medium, remuda_protocol::EffortSource::Unknown, None),
+                (Medium, remuda_protocol::EffortSource::Unknown, Some(false)),
+            ],
+        ),
+        (
+            "effort-launch-d-21289.jsonl",
+            vec![
+                (Medium, remuda_protocol::EffortSource::Unknown, None),
+                (Medium, remuda_protocol::EffortSource::Unknown, Some(false)),
+            ],
+        ),
+        (
+            "effort-launch-e-21289.jsonl",
+            vec![
+                (High, remuda_protocol::EffortSource::Slash, None),
+                (High, remuda_protocol::EffortSource::Unknown, Some(false)),
+            ],
+        ),
+        (
+            "effort-launch-f2-21289.jsonl",
+            vec![
+                (High, remuda_protocol::EffortSource::Slash, Some(true)),
+                (High, remuda_protocol::EffortSource::Slash, Some(false)),
+                (Medium, remuda_protocol::EffortSource::Unknown, Some(false)),
+            ],
+        ),
+        (
+            "effort-launch-g-21289.jsonl",
+            vec![
+                (High, remuda_protocol::EffortSource::Unknown, None),
+                (Xhigh, remuda_protocol::EffortSource::Slash, None),
+                (High, remuda_protocol::EffortSource::Unknown, None),
+                (High, remuda_protocol::EffortSource::Unknown, Some(false)),
+            ],
+        ),
+    ];
+    for (name, expected) in cases {
+        let session = format!("effort-{name}");
+        assert_eq!(map_21289_fixture(&session, name)?, expected, "{name}");
+    }
     Ok(())
 }
 

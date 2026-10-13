@@ -4087,6 +4087,53 @@ async fn landing_evidence_and_probe_writers_validate_host_and_session_at_commit(
 /// Landing writers.
 /// 1. grant idempotence: a re-grant for the same attempt/session but a
 ///    DIFFERENT merge is refused and the recorded merge is untouched;
+/// r17 item 7: the grant session is a packed (epoch<<32 | counter) stored as a
+/// POSITIVE signed i64. The maximum positive value (epoch 2^31-1, counter
+/// 0xFFFFFFFF == i64::MAX) grants and persists verbatim; a session whose epoch
+/// is 2^31 packs negative and is refused rather than collapsed to 0.
+#[tokio::test]
+async fn the_max_positive_i64_session_grants_but_a_2_31_epoch_is_refused() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let merge = "acacacacacacacacacacacacacacacacacacacac";
+    let max_positive: u64 = i64::MAX as u64;
+    assert_eq!(max_positive >> 32, (1u64 << 31) - 1);
+
+    let job = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job, &ctx.host, merge, max_positive)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+    assert_eq!(
+        ctx.hub.test_gate_dispatch_session(&job).await.unwrap(),
+        Some(max_positive as i64),
+        "the max positive session persists, not collapsed to 0"
+    );
+
+    let job2 = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job2, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let overflow: u64 = 1u64 << 63; // epoch 2^31, counter 0 → negative i64
+    let refused = ctx
+        .hub
+        .test_gate_land_grant(&job2, &ctx.host, merge, overflow)
+        .await;
+    assert!(
+        refused.is_err(),
+        "a 2^31-epoch session (negative i64) must not be granted: {refused:?}"
+    );
+}
+
 /// 2. verdict: a `landed` finished frame for a different sha does not settle
 ///    the Landing, while the exact granted merge settles it;
 /// 3. evidence: a log carrying a mismatched merge (or none at all) is rejected

@@ -170,6 +170,13 @@ pub struct FakeHerdrOptions {
     /// forever; other connections keep being served. Models a carrier wedged
     /// during the polite-stop subscribe handshake.
     pub subscribe_never_acks: bool,
+    /// Refuse EVERY `pane.send_text` with an ordinary live-boot API error
+    /// (`pane_not_found`), never a connection drop (c-ctxusage r17 item 7).
+    /// Models the optional polite shell-exit send landing against a pane that
+    /// vanished between the process probe and the send: the closer must skip
+    /// the courtesy and continue the polite/force path into reap, not abort
+    /// the interrupt with an uncertain/error outcome.
+    pub refuse_shell_exit_send_text: bool,
 }
 
 /// Creation label the simulated restart hands the reused `w1` workspace to.
@@ -194,6 +201,7 @@ impl FakeHerdrOptions {
             restart_barrier_on_close: false,
             restart_barrier_close_ordinal: 1,
             subscribe_never_acks: false,
+            refuse_shell_exit_send_text: false,
         }
     }
 
@@ -290,6 +298,14 @@ impl FakeHerdrOptions {
         self.subscribe_never_acks = true;
         self
     }
+
+    /// Refuse every `pane.send_text` with an ordinary live-boot
+    /// `pane_not_found` API error (c-ctxusage r17 item 7).
+    #[must_use]
+    pub fn refuse_shell_exit_send_text(mut self) -> Self {
+        self.refuse_shell_exit_send_text = true;
+        self
+    }
 }
 
 /// Bundled `terminal.frame` JSONL.
@@ -384,6 +400,9 @@ impl FakeHerdrServer {
         }
         if options.subscribe_never_acks {
             command.env("FAKE_HERDR_SUBSCRIBE_NEVER_ACKS", "1");
+        }
+        if options.refuse_shell_exit_send_text {
+            command.env("FAKE_HERDR_REFUSE_SHELL_EXIT_SEND_TEXT", "1");
         }
 
         let mut child = command
@@ -572,6 +591,8 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             .max(1);
     let mut subscribe_never_acks = std::env::var("FAKE_HERDR_SUBSCRIBE_NEVER_ACKS")
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
+    let mut refuse_shell_exit_send_text = std::env::var("FAKE_HERDR_REFUSE_SHELL_EXIT_SEND_TEXT")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true"));
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -639,6 +660,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
                     .max(1);
             }
             "--subscribe-never-acks" => subscribe_never_acks = true,
+            "--refuse-shell-exit-send-text" => refuse_shell_exit_send_text = true,
             "--session" | "--takeover" => {
                 if args[i] == "--session" {
                     i += 1;
@@ -683,6 +705,7 @@ fn parse_args(args: Vec<String>) -> Result<Cli, FakeHerdrError> {
             restart_barrier_on_close,
             restart_barrier_close_ordinal,
             subscribe_never_acks,
+            refuse_shell_exit_send_text,
         }));
     }
     Err(FakeHerdrError::Args(format!(
@@ -797,6 +820,7 @@ async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
         options.restart_barrier_on_close,
         options.restart_barrier_close_ordinal,
         options.subscribe_never_acks,
+        options.refuse_shell_exit_send_text,
     )));
     // Only the scripted shutdown window (`exit_after_unavailable`) stops the
     // accept loop. Parent death is handled by the outer `parent_watch`
@@ -869,6 +893,8 @@ struct State {
     close_barrier_done: bool,
     /// Accept events.subscribe but never acknowledge it (r15 item 6).
     subscribe_never_acks: bool,
+    /// Refuse every pane.send_text with a live-boot API error (r17 item 7).
+    refuse_shell_exit_send_text: bool,
     /// Bumped by the simulated restart; surfaced in `ping` capabilities.
     server_generation: u32,
 }
@@ -888,6 +914,7 @@ impl State {
         restart_barrier_on_close: bool,
         close_barrier_ordinal: u32,
         subscribe_never_acks: bool,
+        refuse_shell_exit_send_text: bool,
     ) -> Self {
         Self {
             script,
@@ -918,6 +945,7 @@ impl State {
             pane_closes_seen: 0,
             close_barrier_done: false,
             subscribe_never_acks,
+            refuse_shell_exit_send_text,
             server_generation: 1,
         }
     }
@@ -1452,6 +1480,16 @@ fn pane_send_text(st: &mut State, params: &Value) -> Result<Value, (&'static str
         .get("pane_id")
         .and_then(Value::as_str)
         .ok_or(("invalid_request", "missing pane_id".into()))?;
+    // c-ctxusage r17 item 7: an ordinary live-boot refusal of the optional
+    // shell-exit send — the pane vanished between the process probe and this
+    // send. It is NOT a connection loss, so the closer skips the courtesy and
+    // continues into reap.
+    if st.refuse_shell_exit_send_text {
+        return Err((
+            "pane_not_found",
+            format!("pane {pane_id} is gone (refused shell-exit send)"),
+        ));
+    }
     let text = params.get("text").and_then(Value::as_str).unwrap_or("");
     st.screens
         .entry(pane_id.to_string())

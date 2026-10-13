@@ -665,9 +665,27 @@ impl PtyResource {
                             .iter()
                             .all(|p| Some(p.pid) == process.shell_pid)
                     {
-                        conn.pane_send_text(self.pane_id.clone(), "exit\r")
-                            .await
-                            .map_err(|err| self.uncertain_close("polite shell exit", err))?;
+                        // The shell `exit` is an OPTIONAL courtesy, not a
+                        // destructive dispatch: only a lost verified connection
+                        // makes the close uncertain. Any other Herdr refusal
+                        // (the pane vanished between probe and send, an invalid
+                        // request, …) is logged and skipped — interrupt must
+                        // continue down the polite/force path and into reap
+                        // (c-ctxusage r17 item 7).
+                        match conn.pane_send_text(self.pane_id.clone(), "exit\r").await {
+                            Ok(_) => {}
+                            Err(err) if Self::is_conn_lost(&err) => {
+                                return Err(self.uncertain_close("polite shell exit", err));
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    pane = %self.pane_id,
+                                    %err,
+                                    "the optional polite shell-exit send was refused; \
+                                     continuing the close"
+                                );
+                            }
+                        }
                     }
                 }
                 Err(err) if Self::is_conn_lost(&err) => {

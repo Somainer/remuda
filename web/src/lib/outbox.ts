@@ -1904,6 +1904,13 @@ export class Outbox {
         (a, b) =>
           this.rank(a) - this.rank(b) || a.createdAt - b.createdAt || a.commandId.localeCompare(b.commandId),
       );
+    // THIS outbox selects each of these rows for one of its delivery turns
+    // (the claim happens inside, on BOTH the Web Lock and durable-lease
+    // paths): it becomes the issuing outbox for them, so its acceptance
+    // observations may later record progress (c-reconnfu gate 27 item 2). A
+    // row whose claim loses to a foreign lease is harmless to mark — progress
+    // is per instance and the journal-done acceptance is authoritative.
+    for (const r of deliverable) this.markIssued(r.commandId);
     return await fn(instanceId, deliverable);
   }
 

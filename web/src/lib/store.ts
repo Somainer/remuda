@@ -2392,11 +2392,6 @@ class HubStore {
     // and continue the flush with B (gate 10 item 7).
     if (claimed.state === "done") return false;
     if (claimed.lease?.owner !== box.ownerId) return "claim-aborted";
-    // THIS outbox is issuing the command's delivery (a durable row restored
-    // from a previous epoch becomes issued by the epoch that really claims and
-    // POSTs it): its later acceptance observations may record progress
-    // (c-reconnfu gate 27 item 2).
-    box.markIssued(commandId);
     this.syncBubbleFromOutbox(commandId);
     // Gate 15 item 2: this document owns the live claim for the duration of the
     // POST — suppress expiry recovery for our own inflight row on refresh.

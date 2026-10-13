@@ -1380,6 +1380,14 @@ export class Outbox {
    */
   private async fireLeaseWake(commandId: Id, instanceId: Id) {
     if (this.disposed || this.unloading) return;
+    // Gate 23 item 2 (exhaustion is per instance and total): the moment this
+    // instance reached its bounded cap the CENTRAL reconciliation cancelled
+    // every deliver wake of the instance. A stale wake whose timer was already
+    // queued when that cancel landed must neither request the delivery lock
+    // (another rejected request past the cap) nor hand a guarded flush off —
+    // a later real success (flush, timer or direct steer) clears the latch
+    // via noteDeliveryProgress and reconciliation re-arms from scratch.
+    if (this.deliveryExhausted.has(instanceId)) return;
     let durable: OutboxRecord[] | undefined;
     let lockEntered = false;
     try {
@@ -1418,6 +1426,11 @@ export class Outbox {
       isActiveDelivery: (id) => this.activeDeliveries.has(id),
     });
     if (decision.kind === "deliver") {
+      // Gate 23 item 2: a sibling fire can have spent the instance's cap while
+      // this wake was reading under the lock; never hand a guarded flush off
+      // past exhaustion — the central reconcile just cancelled all wakes and
+      // progress must clear the latch before any new attempt.
+      if (this.deliveryExhausted.has(instanceId)) return;
       // Exactly one guarded delivery trigger for this wake; the store flush
       // re-reads authoritatively under the lock and makes the durable claim.
       this.emit();
@@ -1499,6 +1512,15 @@ export class Outbox {
       // already-armed deliver wake whose failure count changed moves to the
       // new backoff instant (a failed attempt's recovery re-applies here).
       if (entry.kind === "deliver") {
+        // Gate 23 item 2 (exhaustion is per instance and TOTAL): once the
+        // instance is at its cap, cancel EVERY leftover deliver wake of the
+        // instance — including a sibling row's wake armed at an older failure
+        // count (armDeliverWake's bound used to leave it in place, so it fired
+        // one more rejected lock request past the cap).
+        if (this.deliveryExhausted.has(d.instanceId)) {
+          this.cancelLeaseWake(id);
+          continue;
+        }
         // c-reconnfu gate 22 item 6: when the STORE's bounded jittered retry
         // owns the instance's next delivery (scheduleOutboxRetry after a
         // boundary failure), an already-armed outbox deliver wake must be
@@ -1513,6 +1535,10 @@ export class Outbox {
         }
         const failures = this.deliveryFailures.get(d.instanceId) ?? 0;
         if (entry.failures !== failures) this.armDeliverWake(id, d.instanceId, now);
+        continue;
+      }
+      if (this.deliveryExhausted.has(d.instanceId) && d.kind === "deliver") {
+        this.cancelLeaseWake(id);
         continue;
       }
       if (this.deliveryCovered(d.instanceId)) {
@@ -1536,6 +1562,10 @@ export class Outbox {
         this.onHeldLease?.(d.instanceId);
       } else if (d.kind === "deliver") {
         if (this.deliveryCovered(d.instanceId)) continue;
+        // Gate 23 item 2: a capped instance arms no new deliver wake; a
+        // successful delivery clears the latch and a later reconciliation
+        // re-arms.
+        if (this.deliveryExhausted.has(d.instanceId)) continue;
         this.armDeliverWake(d.commandId, d.instanceId, now);
       }
     }

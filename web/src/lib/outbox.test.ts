@@ -2125,6 +2125,84 @@ describe("Outbox", () => {
     }
   });
 
+  it("GATE23 item 2: exhaustion is per instance and total — with TWO pending rows persistent lock rejections stop at the cap, cancel EVERY deliver wake of the instance, and leave no further request or handoff", async () => {
+    // The gate-22 regression proved the bound for ONE row. With two pending
+    // rows on one instance the two deliver wakes shared ONE per-instance
+    // failure count but were cancelled independently: at the cap the LAST
+    // reconcile silently stopped RE-ARMING (armDeliverWake returns at the
+    // bound) while the sibling row's already-armed wake was left at its old
+    // backoff instant — it kept firing, kept issuing rejected lock requests
+    // past the cap and kept handing off guarded flushes. Per the gate-23
+    // ruling: at the cap the CENTRAL reconciliation cancels EVERY deliver
+    // wake of that instance, and a timer callback checks exhaustion before
+    // requesting the lock or handing off.
+    vi.useFakeTimers();
+    vi.setSystemTime(850_000);
+    const I = "ins_g23_i2";
+    const C1 = "cmd_g23_i2_a";
+    const C2 = "cmd_g23_i2_b";
+    const originalNavigator = globalThis.navigator;
+    let requestCount = 0;
+    const locks = {
+      query: async () => ({ held: [] }),
+      request: vi.fn(() => {
+        requestCount += 1;
+        return Promise.reject(new Error("g23-i2 lock request rejected"));
+      }),
+    };
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks } });
+    try {
+      const store = new MemStorage();
+      const puts = [
+        store.put(rec({ commandId: C1, instanceId: I, createdAt: 1_000 })),
+        store.put(rec({ commandId: C2, instanceId: I, createdAt: 1_001 })),
+      ];
+      await vi.advanceTimersByTimeAsync(5);
+      await Promise.all(puts);
+
+      const box = await Outbox.load(store, "owner_g23_i2");
+      const exhausted = vi.fn();
+      const claimWake = vi.fn();
+      box.onReadRecoveryExhausted = exhausted;
+      box.onClaimWake = claimWake;
+      await box.refreshDurable();
+      expect(box.pendingLeaseWakeups().sort()).toEqual([C1, C2]);
+
+      // Far beyond every bounded delay: the instance reaches its shared cap.
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      // The budget is per INSTANCE and TOTAL: exactly the cap's requests for
+      // BOTH rows together — at the cap the central reconcile cancels the
+      // sibling's still-armed wake, so no request fires past it (pre-fix one
+      // stale deliver wake survived and issued a 13th request).
+      expect(requestCount).toBe(CLAIM_WAKE_MAX_FAILURES);
+      expect(exhausted).toHaveBeenCalledTimes(1);
+      expect(box.isDeliveryExhausted(I)).toBe(true);
+      // No armed wake remains for EITHER row.
+      expect(box.pendingLeaseWakeups()).toEqual([]);
+      // The timer callback never handed a guarded flush off: the lock never
+      // entered, so a flush could not have delivered anything.
+      expect(claimWake).not.toHaveBeenCalled();
+      // Both rows untouched durably.
+      expect(store.map.get(C1)?.state).toBe("pending");
+      expect(store.map.get(C2)?.state).toBe("pending");
+
+      // A second long interval proves quiescence: no further lock requests,
+      // no wake re-armed, no handoff.
+      const requestsAtQuiesce = requestCount;
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(requestCount).toBe(requestsAtQuiesce);
+      expect(box.pendingLeaseWakeups()).toEqual([]);
+      expect(claimWake).not.toHaveBeenCalled();
+      expect(exhausted).toHaveBeenCalledTimes(1);
+
+      box.dispose();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
+
   it("GATE22 item 6: while storeRetryPending owns the instance, a reconcile cancels an already-armed deliver wake; clearing the marker re-arms it", async () => {
     // A boundary failure leaves the row pending and the STORE's jittered
     // retry owns the instance's next delivery. An outbox deliver wake that

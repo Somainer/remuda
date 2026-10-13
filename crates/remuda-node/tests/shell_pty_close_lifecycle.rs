@@ -21,6 +21,12 @@ use std::time::{Duration, Instant};
 
 const FINAL_MSG_ID: &str = "msg_close_final_usage";
 const SESSION_ID: &str = "00000000-0000-4000-8000-000000000001";
+/// Message id of the record the test appends to the transcript AFTER a failed
+/// promoted close, proving monitoring kept running (c-ctxusage r17 item 8).
+const POST_FAILED_CLOSE_MSG_ID: &str = "msg_post_failed_close";
+/// Message id of the record an in-flight normal poll is mapping when the close
+/// barrier arms (c-ctxusage r17 item 8).
+const IN_FLIGHT_RACE_MSG_ID: &str = "msg_in_flight_race";
 
 fn profile() -> ProviderProfile {
     ProviderProfile {
@@ -110,6 +116,59 @@ fn filler(seed: &str, index: u32) -> String {
         }
     });
     format!("{assistant}\n")
+}
+
+/// A complete (end_turn) assistant record whose usage publishes on the very
+/// next transcript poll — what a live writer flushing after a failed close or
+/// an in-flight poll looks like (c-ctxusage r17 item 8). Distinct uuid and
+/// message id so delivery is attributable to exactly this append.
+fn flushing_record(message_id: &str, index: u32) -> String {
+    let assistant = serde_json::json!({
+        "type": "assistant",
+        "uuid": format!("{message_id}-rec-{index}"),
+        "timestamp": "2026-10-09T00:00:00.000Z",
+        "isSidechain": false,
+        "message": {
+            "id": message_id,
+            "role": "assistant",
+            "type": "message",
+            "model": "claude-opus-5-5",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "flushed"}],
+            "usage": {
+                "input_tokens": 401 + (index as i64 % 50),
+                "cache_read_input_tokens": 5_002,
+                "cache_creation_input_tokens": 3,
+                "output_tokens": 9
+            }
+        }
+    });
+    format!("{assistant}\n")
+}
+
+/// Wait for a usage observation with `scope_id == want` to be queued on the
+/// drainer's scope channel, event-driven with a deadline as the sole bound (no
+/// wall-clock poll). Scopes already collected are matched first.
+async fn await_usage_scope(
+    rx: &mut tokio::sync::mpsc::Receiver<String>,
+    want: &str,
+    mut seen: Vec<String>,
+) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if seen.iter().any(|scope| scope == want) {
+            return seen;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("usage scope {want} was never delivered; got {seen:?}");
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(scope)) => seen.push(scope),
+            Ok(None) => panic!("the event channel closed before scope {want} arrived"),
+            Err(_) => panic!("timed out waiting for usage scope {want}; got {seen:?}"),
+        }
+    }
 }
 
 fn seed_transcript(path: &Path, pairs: u32) {
@@ -675,10 +734,11 @@ async fn an_incomplete_promoted_close_stays_live_and_a_retry_completes() {
         .await
         .expect("start");
     let mut events_rx = handle.into_events();
-    let term_count = Arc::new(AtomicUsize::new(0));
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
     let bound_tx = std::sync::Mutex::new(Some(bound_tx));
-    let drainer_count = Arc::clone(&term_count);
+    // Every usage scope is forwarded to this channel: delivery is awaited
+    // event-driven (bounded recv), never with a wall-clock poll.
+    let (scope_tx, scope_rx) = tokio::sync::mpsc::channel::<String>(512);
     let drainer = tokio::spawn(async move {
         while let Some(observation) = events_rx.recv().await {
             if let ObservationPayload::Lifecycle(lc) = &observation.body
@@ -688,13 +748,12 @@ async fn an_incomplete_promoted_close_stays_live_and_a_retry_completes() {
             {
                 let _ = tx.send(());
             }
-            if let ObservationPayload::Usage(payload) = &observation.body
-                && payload.scope_id == TERMINATION_MSG_ID
-            {
-                drainer_count.fetch_add(1, Ordering::SeqCst);
+            if let ObservationPayload::Usage(payload) = &observation.body {
+                let _ = scope_tx.send(payload.scope_id.clone()).await;
             }
         }
     });
+    let mut scope_rx = scope_rx;
 
     tokio::time::timeout(Duration::from_secs(20), bound_rx)
         .await
@@ -712,17 +771,26 @@ async fn an_incomplete_promoted_close_stays_live_and_a_retry_completes() {
         "an unverified promoted close is retryable, got {first:?}"
     );
 
-    // The hydrator/poller/sender were never retired: the writer's SIGINT
-    // append is still delivered through the live channel.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while term_count.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    // Monitoring kept running past the failed close: append a brand-new record
+    // to the transcript AS AN EXTERNAL WRITER and prove the still-live poller
+    // hydrates and delivers it. (c-ctxusage r17 item 8: the proof is a record
+    // appended strictly AFTER the failed close returned, observed event-driven
+    // — not a sleep-poll for the ladder's own SIGINT append.)
+    use std::io::Write;
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .expect("reopen transcript for the post-failure append");
+        file.write_all(flushing_record(POST_FAILED_CLOSE_MSG_ID, 1).as_bytes())
+            .expect("append the post-failure record");
+        file.sync_all().expect("sync the post-failure append");
     }
-    assert_eq!(
-        term_count.load(Ordering::SeqCst),
-        1,
-        "the termination append is delivered while the close is incomplete"
-    );
+    let seen = await_usage_scope(&mut scope_rx, POST_FAILED_CLOSE_MSG_ID, Vec::new()).await;
+
+    // The writer's own SIGINT termination append is delivered while the close
+    // is incomplete as well (it may already be among the received scopes).
+    let seen = await_usage_scope(&mut scope_rx, TERMINATION_MSG_ID, seen).await;
 
     // Attempt 2: the group is really gone, so the verification succeeds and
     // the teardown completes.
@@ -731,15 +799,34 @@ async fn an_incomplete_promoted_close_stays_live_and_a_retry_completes() {
         .expect("the retried close hung past its bound")
         .expect("the retried close completes once the writer is verified gone");
 
+    // Drain every scope the channel still holds until the drainer ends, then
+    // assert delivery counts — both records exactly once across both close
+    // attempts.
     driver.abort_event_workers_for_test().await;
     tokio::time::timeout(Duration::from_secs(30), drainer)
         .await
         .expect("event channel never closed after the retried close")
         .expect("event drainer panicked");
+    let mut all = seen;
+    while let Ok(scope) = tokio::time::timeout(Duration::from_secs(2), scope_rx.recv()).await {
+        match scope {
+            Some(scope) => all.push(scope),
+            None => break,
+        }
+    }
     assert_eq!(
-        term_count.load(Ordering::SeqCst),
+        all.iter()
+            .filter(|scope| **scope == TERMINATION_MSG_ID)
+            .count(),
         1,
-        "the termination usage is delivered exactly once across both attempts"
+        "the writer termination usage is delivered exactly once across both attempts"
+    );
+    assert_eq!(
+        all.iter()
+            .filter(|scope| **scope == POST_FAILED_CLOSE_MSG_ID)
+            .count(),
+        1,
+        "the post-failure append is delivered exactly once"
     );
 }
 
@@ -826,6 +913,10 @@ fn p1_promoted_layout_inner(
 /// branch before signalling the writer. Without the handoff barrier close ran
 /// the stop ladder concurrently with the in-flight normal pump, which could
 /// demote/finalise the hydrator under the writer shutdown.
+///
+/// c-ctxusage r17 item 8: the record that parked collect was mapping must be
+/// ASSERTED DELIVERED (exactly once) — a finalise/demote interleaving the
+/// writer shutdown used to discard it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn promoted_close_waits_for_an_in_flight_poll_to_reach_the_closing_branch() {
     use remuda_driver::test_faults::TranscriptFaults;
@@ -844,6 +935,7 @@ async fn promoted_close_waits_for_an_in_flight_poll_to_reach_the_closing_branch(
     let mut events_rx = handle.into_events();
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
     let bound_tx = std::sync::Mutex::new(Some(bound_tx));
+    let (scope_tx, scope_rx) = tokio::sync::mpsc::channel::<String>(64);
     let drainer = tokio::spawn(async move {
         while let Some(observation) = events_rx.recv().await {
             if let ObservationPayload::Lifecycle(lc) = &observation.body
@@ -853,8 +945,12 @@ async fn promoted_close_waits_for_an_in_flight_poll_to_reach_the_closing_branch(
             {
                 let _ = tx.send(());
             }
+            if let ObservationPayload::Usage(payload) = &observation.body {
+                let _ = scope_tx.send(payload.scope_id.clone()).await;
+            }
         }
     });
+    let mut scope_rx = scope_rx;
     tokio::time::timeout(Duration::from_secs(20), bound_rx)
         .await
         .expect("the seeded replay never bound")
@@ -862,14 +958,14 @@ async fn promoted_close_waits_for_an_in_flight_poll_to_reach_the_closing_branch(
 
     // Now arm the pump gate and append fresh tail bytes: the NEXT normal tick
     // enters its blocking collect and parks there, mid-flight in the NORMAL
-    // (sample/demote/finalise) branch.
+    // (sample/demote/finalise) branch, holding a record that must survive.
     faults.arm_pump_gate();
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(&transcript)
         .expect("open transcript for append");
-    file.write_all(filler("race", 9001).as_bytes())
-        .expect("append fresh record");
+    file.write_all(flushing_record(IN_FLIGHT_RACE_MSG_ID, 9001).as_bytes())
+        .expect("append the in-flight record");
     file.sync_all().expect("sync append");
     drop(file);
     assert!(
@@ -902,11 +998,32 @@ async fn promoted_close_waits_for_an_in_flight_poll_to_reach_the_closing_branch(
         .expect("close timed out after the pump released");
     result.expect("close completes once the poller reaches the closing branch");
 
+    // The parked poll's record was published, not eaten by a demote/finalise
+    // interleaving the writer shutdown. Event-driven, bounded: the delivery
+    // may have landed while the barrier was settling.
+    let mut seen = Vec::new();
+    while let Ok(scope) = tokio::time::timeout(Duration::from_millis(500), scope_rx.recv()).await
+        && let Some(scope) = scope
+    {
+        seen.push(scope);
+    }
     driver.abort_event_workers_for_test().await;
     tokio::time::timeout(Duration::from_secs(30), drainer)
         .await
         .expect("event channel never closed")
         .expect("event drainer panicked");
+    while let Ok(scope) = tokio::time::timeout(Duration::from_secs(2), scope_rx.recv()).await
+        && let Some(scope) = scope
+    {
+        seen.push(scope);
+    }
+    assert_eq!(
+        seen.iter()
+            .filter(|scope| **scope == IN_FLIGHT_RACE_MSG_ID)
+            .count(),
+        1,
+        "the in-flight poll's record is delivered exactly once, not discarded; got {seen:?}"
+    );
 }
 
 /// P1 (c-ctxusage r16 item 6), foreign drain: when the channel close arms is

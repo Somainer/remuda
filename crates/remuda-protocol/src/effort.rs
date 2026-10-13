@@ -683,17 +683,23 @@ impl EffortTracker {
     /// falls back to `?`, per D-028a). It does NOT resolve any awaiting
     /// switch: with read-back gone no switch may report Applied, so the
     /// pending generation keeps waiting for its bounded timeout and degrades
-    /// rather than claiming success. Sticky for the run. Returns the cleared
-    /// observation (if there was a projected state) so the caller can publish
-    /// one explicit read-back-unavailable edge.
+    /// rather than claiming success. Returns the cleared observation (if
+    /// there was a projected state) so the caller can publish one explicit
+    /// read-back-unavailable edge.
+    ///
+    /// c-effortread r22 ruling S (item 3): this is a full reset EVEN when
+    /// nothing was published yet — a suppressed acceptance, an armed switch
+    /// or an ultracode pre-latch may hold latches while `last` is still
+    /// `None`, and provenance can be re-established afterwards. Clear
+    /// LevelSource together with the flag latch, the deferred slot, the
+    /// awaiting switch and the ultracode pre-latch on BOTH paths, so the
+    /// first status after recovery starts clean (publishes) and a second
+    /// status can still move the level.
     pub fn read_back_unavailable(&mut self) -> Option<ObservedEffort> {
-        if self.last.is_none() {
-            self.current_process = false;
-            return None;
-        }
         let cleared = self.last.take();
-        // Drop any process-specific flag/awaiting latch: no later record is
-        // trusted to re-set them, and no pending switch resolves Applied.
+        // Drop every process-specific latch: no record carried over the
+        // unverifiable window is trusted to re-set them, no pending switch
+        // resolves Applied, and a suppressed acceptance must never resurrect.
         self.level_source = LevelSource::None;
         self.flag = None;
         self.awaiting = None;
@@ -2790,9 +2796,11 @@ mod tests {
             .note_unowned_stdout(accept_max)
             .expect("the acceptance is suppressed while B is armed");
         assert_eq!(tracker.level_source(), LevelSource::None);
-        tracker
-            .note_stdout("Kept effort level as max", true)
-            .is_none();
+        assert!(
+            tracker
+                .note_stdout("Kept effort level as max", true)
+                .is_none()
+        );
         let deferred = tracker
             .deferred_observation()
             .expect("the stashed acceptance survived B's refusal");
@@ -2891,6 +2899,74 @@ mod tests {
             .note_status(status("xhigh"))
             .expect("a re-promoted verdict level stays movable by status");
         assert_eq!(xhigh.0.name, EffortName::Xhigh);
+    }
+
+    #[test]
+    fn r22_item3_withdrawal_with_nothing_published_clears_every_latch() {
+        // c-effortread r22 item 3 ruling S: read-back becoming unavailable is
+        // a full reset even when no level was ever published. A suppressed
+        // acceptance (with B armed) holds the flag and the deferred slot while
+        // `last` is still None; withdrawal must clear them together with
+        // LevelSource and awaiting, so after provenance is re-established the
+        // first status publishes and a second status can still move it.
+        fn status(level: &str) -> ObservedEffort {
+            match parse_effort_stdout(
+                &format!("Current effort level: {level} (resolved level)"),
+                EffortSemantics::Coupled,
+            ) {
+                EffortStdout::Status(parsed) => parsed,
+                other => panic!("{other:?}"),
+            }
+        }
+        let mut tracker = EffortTracker::new();
+        tracker.note_version("2.1.272");
+        // B armed, nothing published, then an older unowned acceptance is
+        // suppressed: it latches flag/deferred but publishes nothing.
+        tracker.note_slash("max", true);
+        tracker
+            .note_unowned_stdout(
+                "Set effort level to xhigh (saved as your default for new sessions): …",
+            )
+            .expect("the unowned acceptance is folded and suppressed");
+        assert_eq!(tracker.last_observed(), None);
+        assert_eq!(tracker.awaiting, Some(EffortName::Max));
+        assert!(tracker.deferred.is_some());
+        assert_eq!(
+            tracker.flag,
+            Some(false),
+            "the coupled accept latches flag-off"
+        );
+
+        // Provenance becomes unverifiable BEFORE any publication.
+        assert_eq!(
+            tracker.read_back_unavailable(),
+            None,
+            "nothing was published, so no withdrawal edge is emitted"
+        );
+        assert_eq!(tracker.level_source, LevelSource::None);
+        assert_eq!(tracker.flag, None);
+        assert_eq!(tracker.awaiting, None);
+        assert!(!tracker.ultracode_pending);
+        assert_eq!(
+            tracker.deferred, None,
+            "the suppressed acceptance is withdrawn, never to be released"
+        );
+        assert!(!tracker.is_current_process());
+
+        // Provenance is re-established: a clean slate.
+        tracker.mark_current_process();
+        let first = tracker
+            .note_status(status("high"))
+            .expect("the first status after recovery publishes");
+        assert_eq!(first.0.name, EffortName::High);
+        let second = tracker
+            .note_status(status("medium"))
+            .expect("a second status can still move the status-only level");
+        assert_eq!(second.0.name, EffortName::Medium);
+        assert_eq!(
+            tracker.last_observed().map(|observed| observed.name),
+            Some(EffortName::Medium)
+        );
     }
 
     #[test]

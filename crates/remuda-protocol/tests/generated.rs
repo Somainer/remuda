@@ -137,6 +137,10 @@ fn public_wire_types_are_registered_for_generation() {
         // unowned effort verdict into the tracker's deferred slot — mapper
         // state, never serialized on the wire.
         "UnownedAccept",
+        // c-effortread r22 ruling S: which channel published the tracker's
+        // level (status/verdict/assistant) — in-process tracker bookkeeping
+        // carried across re-promotion, never serialized on the wire.
+        "LevelSource",
         // D-056: version-gated effort semantics and the slash-argument
         // classifier — pure transcript-mapper state/inputs, never on the wire.
         "EffortSemantics",

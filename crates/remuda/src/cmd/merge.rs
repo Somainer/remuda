@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Instant;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 
@@ -1196,14 +1196,126 @@ fn gate_summary(report: &MergeReport) -> String {
     summary
 }
 
+/// Bounded, additive deepen steps used before trusting a "not ancestor" result
+/// in a shallow clone. A deepen only adds objects/history — it never rewrites
+/// refs — so it cannot turn an Established answer into a wrong one. Two steps
+/// cover ~4k commits without an unbounded unshallow on a huge repository.
+const ANCESTRY_DEEPENS: [&str; 2] = ["--deepen=256", "--deepen=4096"];
+
+/// Whether the repository has a shallow boundary that could hide an ancestry
+/// edge. Query errors are themselves Unknown and reported as shallow (so the
+/// caller deepens or refuses rather than trusting exit 1).
+fn repository_is_shallow(repo: &Path) -> bool {
+    match git_output(repo, &["rev-parse", "--is-shallow-repository"]) {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim() == "true"
+        }
+        _ => true,
+    }
+}
+
+/// Count of reachable commits, used to tell whether a shallow `--deepen`
+/// actually added history. A read failure is conservatively reported as `None`
+/// (the caller then cannot prove progress and treats the edge as Unknown).
+fn reachable_commit_count(repo: &Path) -> Option<u64> {
+    let output = git_output(repo, &["rev-list", "--count", "--all"]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// The raw tri-state outcome of one `merge-base --is-ancestor` process, before
+/// any shallow-history refinement (r16 item 3, R5).
+enum RawAncestry {
+    /// Exit 0: the edge is present.
+    Ancestor,
+    /// Exit 1: the edge is absent IN THE HISTORY THAT IS AVAILABLE LOCALLY.
+    /// Only trustworthy once that history is complete (see [`is_ancestor`]).
+    NotAncestor,
+    /// Exit code other than 0/1, death by signal, or unreadable output: the
+    /// edge is Unknown — never a boolean.
+    Abnormal(String),
+}
+
+/// Map a finished git process to [`RawAncestry`], distinguishing exit 0,
+/// exit 1 and every abnormal termination (r16 item 3).
+fn classify_ancestry_output(output: &std::process::Output) -> RawAncestry {
+    match output.status.code() {
+        Some(0) => RawAncestry::Ancestor,
+        Some(1) => RawAncestry::NotAncestor,
+        other => RawAncestry::Abnormal(format!(
+            "merge-base --is-ancestor ended abnormally ({other:?}): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+/// Read `git merge-base --is-ancestor` as a tri-state (r16 item 3, R5):
+/// * exit 0 → `Ok(true)` (ancestor ESTABLISHED);
+/// * exit 1 → `Ok(false)` ONLY when the history spanning both tips is
+///   COMPLETE. In a shallow clone the missing edge may lie below the shallow
+///   boundary, so bounded safe deepens are attempted first and the read is
+///   retried; if the history cannot be completed, an Unknown error is returned
+///   and the caller treats the push outcome as uncertain, never "absent";
+/// * any other exit, death by signal, or spawn failure → Unknown error, never
+///   a false boolean.
 fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
     let output = git_output(repo, &["merge-base", "--is-ancestor", ancestor, descendant])?;
-    match output.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => {
-            successful(&output)?;
-            Ok(false)
+    match classify_ancestry_output(&output) {
+        RawAncestry::Ancestor => Ok(true),
+        RawAncestry::Abnormal(message) => Err(anyhow::Error::msg(message)),
+        RawAncestry::NotAncestor if !repository_is_shallow(repo) => Ok(false),
+        RawAncestry::NotAncestor => {
+            // Shallow: a merge-base "not ancestor" may be a graft illusion.
+            // Deepen safely (additive), then RE-READ — the edge can be
+            // revealed even while the repository stays shallow, once the
+            // boundary has moved past the queried tips.
+            let mut last_count = reachable_commit_count(repo);
+            for deepen in ANCESTRY_DEEPENS {
+                let deepened = git_output(repo, &["fetch", "-q", deepen, "origin"])?;
+                if !deepened.status.success() {
+                    bail!(
+                        "merge-base --is-ancestor exited 1 in a shallow clone and the bounded \
+                         deepen failed ({}); ancestry unknown: {}",
+                        deepened.status,
+                        String::from_utf8_lossy(&deepened.stderr).trim()
+                    );
+                }
+                match classify_ancestry_output(&git_output(
+                    repo,
+                    &["merge-base", "--is-ancestor", ancestor, descendant],
+                )?) {
+                    RawAncestry::Ancestor => return Ok(true),
+                    RawAncestry::Abnormal(message) => {
+                        return Err(anyhow::Error::msg(format!(
+                            "{message} (during shallow deepen)"
+                        )));
+                    }
+                    RawAncestry::NotAncestor => {}
+                }
+                if !repository_is_shallow(repo) {
+                    // History is now complete: the not-ancestor answer is
+                    // established.
+                    return Ok(false);
+                }
+                let next_count = reachable_commit_count(repo);
+                if next_count == last_count {
+                    // The remote itself is shallow at this boundary: no further
+                    // history can ever arrive, so a not-ancestor answer can
+                    // never be confirmed. Unknown.
+                    bail!(
+                        "merge-base --is-ancestor exited 1 in a shallow clone and the bounded \
+                         deepen added no history (a shallow remote?); ancestry of {ancestor} in \
+                         {descendant} is unknown"
+                    );
+                }
+                last_count = next_count;
+            }
+            bail!(
+                "merge-base --is-ancestor still exits 1 after the bounded deepens completed some \
+                 history; ancestry of {ancestor} in {descendant} is unknown"
+            );
         }
     }
 }
@@ -1699,5 +1811,179 @@ mod tests {
         assert!(web_only[..7].iter().all(|step| step.status == "skipped"));
         assert!(web_only[7..10].iter().all(|step| step.status == "planned"));
         assert_eq!(web_only[10].status, "skipped");
+    }
+
+    // ── r16 item 3: merge-base exit tri-state + shallow history ────────────
+
+    fn tgit(repo: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap()
+    }
+
+    fn tgit_ok(repo: &Path, args: &[&str]) -> String {
+        let output = tgit(repo, args);
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// Build: full working repo with 5 main commits + a branch off main~2
+    /// merged BACK into main, a bare origin carrying both refs, and return
+    /// (temp keepalive, origin path, branch-tip sha, main-tip sha).
+    fn ancestry_fixture() -> (tempfile::TempDir, PathBuf, String, String) {
+        let keep = tempfile::tempdir().unwrap();
+        let root = keep.path();
+        let full = root.join("full");
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&full).unwrap();
+        tgit_ok(&full, &["init", "-q", "-b", "main"]);
+        tgit_ok(&full, &["config", "user.email", "t@example.com"]);
+        tgit_ok(&full, &["config", "user.name", "T"]);
+        for index in 1..=5 {
+            std::fs::write(full.join("f"), format!("{index}\n")).unwrap();
+            tgit_ok(&full, &["add", "f"]);
+            tgit_ok(&full, &["commit", "-q", "-m", &format!("c{index}")]);
+        }
+        tgit_ok(&full, &["branch", "topic", "main~2"]);
+        tgit_ok(&full, &["checkout", "-q", "topic"]);
+        std::fs::write(full.join("branch.txt"), "topic\n").unwrap();
+        tgit_ok(&full, &["add", "branch.txt"]);
+        tgit_ok(&full, &["commit", "-q", "-m", "topic work"]);
+        let topic = tgit_ok(&full, &["rev-parse", "topic"]);
+        tgit_ok(&full, &["checkout", "-q", "main"]);
+        tgit_ok(
+            &full,
+            &["merge", "-q", "--no-ff", "-m", "merge topic", "topic"],
+        );
+        let main = tgit_ok(&full, &["rev-parse", "main"]);
+        let _ = std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&origin)
+            .status()
+            .unwrap();
+        tgit_ok(
+            &full,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit_ok(&full, &["push", "-q", "origin", "main", "topic"]);
+        (keep, origin, topic, main)
+    }
+
+    fn shallow_clone(keep: &Path, name: &str, from: &Path, depth: &str) -> PathBuf {
+        let target = keep.join(name);
+        // file:// forces the smart transport: a plain local-path clone
+        // hardlinks objects and ignores --depth.
+        let url = format!("file://{}", from.display());
+        let output = tgit(
+            keep,
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                depth,
+                "--no-single-branch",
+                &url,
+                target.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "shallow clone: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        target
+    }
+
+    /// Exit 0 and exit 1 map to booleans on complete history; a signal death
+    /// (raw wait status 9 = SIGKILL) and an exit 2 are Unknown errors, never a
+    /// false boolean.
+    #[test]
+    fn ancestry_exit_codes_distinguish_zero_one_and_abnormal() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{ExitStatus, Output};
+        fn output_from(raw: i32) -> Output {
+            Output {
+                status: ExitStatus::from_raw(raw),
+                stdout: Vec::new(),
+                stderr: b"boom".to_vec(),
+            }
+        }
+        assert!(matches!(
+            classify_ancestry_output(&output_from(0)),
+            RawAncestry::Ancestor
+        ));
+        assert!(matches!(
+            classify_ancestry_output(&output_from(1 << 8)),
+            RawAncestry::NotAncestor
+        ));
+        assert!(matches!(
+            classify_ancestry_output(&output_from(2 << 8)),
+            RawAncestry::Abnormal(_)
+        ));
+        // Killed by SIGKILL: no exit code → Abnormal/Unknown.
+        assert!(matches!(
+            classify_ancestry_output(&output_from(9)),
+            RawAncestry::Abnormal(_)
+        ));
+    }
+
+    /// A depth-1 clone grafts both tips as roots: merge-base naively says "not
+    /// ancestor" (exit 1), but the topic tip really IS an ancestor of main in
+    /// the full history. The bounded safe deepen must complete the history and
+    /// reveal the edge — trusting exit 1 directly would be a false negative.
+    #[test]
+    fn shallow_not_ancestor_is_deepened_before_it_counts_as_absence() {
+        let (keep, origin, topic, _main) = ancestry_fixture();
+        let client = shallow_clone(keep.path(), "client", &origin, "1");
+        assert_eq!(
+            tgit_ok(&client, &["rev-parse", "--is-shallow-repository"]),
+            "true"
+        );
+        let is_ancestor = is_ancestor(&client, &topic, "origin/main")
+            .expect("the bounded deepen completes the history");
+        assert!(
+            is_ancestor,
+            "the topic tip is an ancestor of main in the complete history"
+        );
+        assert_eq!(
+            tgit_ok(&client, &["rev-parse", "--is-shallow-repository"]),
+            "false",
+            "the safe deepen unshallows the clone"
+        );
+    }
+
+    /// When the remote ITSELF is shallow the bounded deepens cannot complete:
+    /// `git fetch --deepen` exits 0 but the clone stays shallow. The edge stays
+    /// Unknown (an Err), never a false "not ancestor" absence.
+    #[test]
+    fn an_uncompletable_shallow_history_keeps_ancestry_unknown() {
+        let (keep, origin, topic, _main) = ancestry_fixture();
+        // A depth-1 clone is itself a shallow "server": it can serve the two
+        // grafted tips but never their parents, so a client deepen adds zero
+        // history. It serves its LOCAL heads over file://, so give it a local
+        // topic head for the client to fetch.
+        let server = shallow_clone(keep.path(), "server", &origin, "1");
+        tgit_ok(&server, &["branch", "topic", "origin/topic"]);
+        let client = shallow_clone(keep.path(), "client2", &server, "1");
+        let deepened = tgit(&client, &["fetch", "-q", "--deepen=256", "origin"]);
+        assert!(deepened.status.success());
+        assert_eq!(
+            tgit_ok(&client, &["rev-parse", "--is-shallow-repository"]),
+            "true",
+            "the shallow server cannot complete the client's history"
+        );
+        let error = is_ancestor(&client, &topic, "origin/main")
+            .expect_err("an uncompletable shallow edge is Unknown");
+        assert!(
+            error.to_string().contains("added no history"),
+            "the error names the uncompletable shallow deepen: {error}"
+        );
     }
 }

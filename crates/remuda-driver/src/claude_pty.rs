@@ -201,6 +201,17 @@ struct PtyLive {
     tty_task: Option<JoinHandle<()>>,
     /// Current alt-screen mode seen by the attach relay's byte scanner.
     alt_screen: Arc<AtomicBool>,
+    /// Controls are disabled (coordination tasks retired) once close starts.
+    /// The driver-level `closed` flag mirrors this for callers that hold no
+    /// live lock (c-ctxusage r24 item 3).
+    #[allow(dead_code)]
+    controls_disabled: bool,
+    /// Every close phase finished successfully exactly once (carrier closed,
+    /// terminal emission sent, launch cleanup done and live state retired).
+    /// A retry whose first `resources.close()` failed runs the remaining
+    /// phases; a retry after completion is a clean no-op.
+    #[allow(dead_code)]
+    close_complete: bool,
     closed: bool,
 }
 
@@ -730,6 +741,8 @@ impl ClaudePtyDriver {
             transcript_task: Some(transcript_task),
             tty_task: None,
             alt_screen: Arc::new(AtomicBool::new(false)),
+            controls_disabled: false,
+            close_complete: false,
             closed: false,
         });
 
@@ -1194,53 +1207,72 @@ impl Driver for ClaudePtyDriver {
     }
 
     async fn close(&self) -> DriverResult<DriverAck> {
+        // c-ctxusage r24 item 3: `closed` only disables controls; it is NOT
+        // proof the destructive phases finished. Serialize close on the inner
+        // lock, and run the teardown sequence exactly once. If
+        // `resources.close()` fails on the first attempt the live state is kept
+        // (with controls disabled); a later successful retry runs the terminal
+        // emission, launch cleanup and inner retirement instead of returning
+        // early and skipping them forever.
         self.closed.store(true, Ordering::SeqCst);
         let mut inner = self.inner.lock().await;
         let Some(live) = inner.as_mut() else {
+            // No live state at all: still attempt carrier close idempotently.
             drop(inner);
             self.resources.close().await?;
             return Ok(DriverAck::not_dispatched());
         };
-        if live.closed {
-            drop(inner);
-            self.resources.close().await?;
+        if close_action(live.controls_disabled, live.close_complete) == CloseAction::NoOp {
+            // A previous close finished every phase; this is a clean no-op.
             return Ok(DriverAck::not_dispatched());
         }
-        live.closed = true;
-        live.interaction_task.abort();
-        live.effort_queue.close();
-        if let Some(task) = live.effort_worker.take() {
-            task.abort();
+        // First pass (or a retry after a failed first pass): disable the
+        // coordination tasks exactly once. The flag makes a second pass skip
+        // straight to the carrier/terminal phases.
+        if !live.controls_disabled {
+            live.controls_disabled = true;
+            live.interaction_task.abort();
+            live.effort_queue.close();
+            if let Some(task) = live.effort_worker.take() {
+                task.abort();
+            }
+            live.model_queue.close();
+            if let Some(task) = live.model_worker.take() {
+                task.abort();
+            }
+            live.permission_queue.close();
+            if let Some(task) = live.permission_worker.take() {
+                task.abort();
+            }
+            if let Some(task) = live.status_task.take() {
+                task.abort();
+            }
+            if let Some(task) = live.hook_task.take() {
+                task.abort();
+            }
+            if let Some(task) = live.transcript_task.take() {
+                task.abort();
+            }
+            if let Some(task) = live.tty_task.take() {
+                task.abort();
+            }
+            live.interactions.close().await?;
         }
-        live.model_queue.close();
-        if let Some(task) = live.model_worker.take() {
-            task.abort();
-        }
-        live.permission_queue.close();
-        if let Some(task) = live.permission_worker.take() {
-            task.abort();
-        }
-        if let Some(task) = live.status_task.take() {
-            task.abort();
-        }
-        if let Some(task) = live.hook_task.take() {
-            task.abort();
-        }
-        if let Some(task) = live.transcript_task.take() {
-            task.abort();
-        }
-        if let Some(task) = live.tty_task.take() {
-            task.abort();
-        }
-        live.interactions.close().await?;
         let events = live.events.clone();
         let ctx = live.ctx.clone();
         let recipe = live.recipe.clone();
         drop(inner);
+        // Destructive carrier close; on failure keep the live state so a retry
+        // completes the terminal phases below.
         self.resources.close().await?;
         // S5: the pane is closed, so the launch overlays can go.
         crate::recipe::report_launch_cleanup(&recipe, "claude-pty");
         crate::claude_pty::emit_pty_closed(&events, &self.seq, &ctx).await?;
+        let mut inner = self.inner.lock().await;
+        if let Some(live) = inner.as_mut() {
+            live.close_complete = true;
+        }
+        drop(inner);
         self.inner.lock().await.take();
         Ok(DriverAck::not_dispatched())
     }
@@ -2525,6 +2557,29 @@ pub(crate) fn obs_ctx(
     }
 }
 
+/// What a close attempt should do given the live close-phase flags
+/// (c-ctxusage r24 item 3).
+#[derive(Debug, PartialEq, Eq)]
+enum CloseAction {
+    /// The carrier/terminal phases have never completed: run them (a fresh
+    /// close, or a retry after a failed first attempt).
+    RunPhases,
+    /// A previous close finished every phase: return a clean no-op.
+    NoOp,
+}
+
+/// Decide the close action from `controls_disabled` (a close has started and
+/// retired controls) and `close_complete` (the carrier/terminal phases all
+/// succeeded). A disabled-but-not-complete live is a RETRY, not a no-op.
+fn close_action(controls_disabled: bool, close_complete: bool) -> CloseAction {
+    if close_complete {
+        CloseAction::NoOp
+    } else {
+        let _ = controls_disabled;
+        CloseAction::RunPhases
+    }
+}
+
 pub(crate) async fn emit_pty_closed(
     tx: &mpsc::Sender<Observation>,
     seq: &AtomicU64,
@@ -2573,6 +2628,35 @@ pub(crate) async fn emit_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// c-ctxusage r24 item 3: the close phase decision given the live flags.
+    /// `controls_disabled` is set once at the start of the first close;
+    /// `close_complete` only after the carrier/terminal phases succeed.
+    /// A first failed close has disabled=true,complete=false and must RETRY
+    /// the terminal phases; a call after completion (true,true) is a no-op.
+    /// The old single-`closed` short circuit treated disabled as complete.
+    #[test]
+    fn close_phase_flags_separate_disabled_from_complete() {
+        // Fresh live: full first close.
+        assert_eq!(
+            close_action(false, false),
+            CloseAction::RunPhases,
+            "fresh live runs all phases"
+        );
+        // First close already disabled controls but failed before completion:
+        // the retry must still run the phases (NOT short-circuit).
+        assert_eq!(
+            close_action(true, false),
+            CloseAction::RunPhases,
+            "a retry after a failed close completes the phases"
+        );
+        // A previous close finished everything: clean no-op.
+        assert_eq!(
+            close_action(true, true),
+            CloseAction::NoOp,
+            "a completed close retries as a no-op"
+        );
+    }
 
     /// c-ctxusage r24 item 1: the TUI pump's `emit_mapped_obs` rebuilds the
     /// observation with run identity but must PRESERVE the mapper-stamped

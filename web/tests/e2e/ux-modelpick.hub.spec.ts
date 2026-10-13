@@ -463,6 +463,21 @@ test("vendor /auto ids are distinct full models: selection, pending and posting 
     await page.reload();
     await page.getByTestId("model-effort-chip").waitFor({ timeout: 20_000 });
     await clearApprovals(page, instanceId);
+
+    // Verify the intended catalog was served BEFORE any configure: on the
+    // fresh session the running model is still the launch sentinel
+    // (passthrough/auto), so these rows can ONLY come from the launch
+    // catalog. The cross-spelling fixture must list vendor-b/auto_model and
+    // NOT vendor-b/auto (the same-spelling catalog would invert this).
+    await openModelList(page);
+    await expect(page.getByTestId(tid(other))).toBeVisible();
+    if (current.endsWith("auto_model")) {
+      await expect(page.getByTestId("model-option-vendor-b-auto-model")).toBeVisible();
+      await expect(page.getByTestId("model-option-vendor-b-auto")).toHaveCount(0);
+    } else {
+      await expect(page.getByTestId("model-option-vendor-b-auto")).toBeVisible();
+    }
+
     // Resolve the running model to the vendor-b id (accepted configure), then
     // queue a separate pending switch to vendor-a.
     expect(await postConfigure(instanceId, current)).toBe(true);
@@ -471,14 +486,6 @@ test("vendor /auto ids are distinct full models: selection, pending and posting 
     await waitForJournal(instanceId, "model-queued");
 
     await openModelList(page);
-    // The intended fixture was actually served (distinct auto labels prove the
-    // cross-spelling catalog branch ran rather than the same-spelling one).
-    await expect(page.getByTestId(tid(other))).toBeVisible();
-    await expect(page.getByTestId(tid(current))).toBeVisible();
-    if (current.endsWith("auto_model")) {
-      expect(await page.getByTestId("model-option-vendor-b-auto").count()).toBe(0);
-      expect(await page.getByTestId("model-option-vendor-b-auto-model").count()).toBe(1);
-    }
     await expect(page.getByTestId("model-option-auto")).toHaveCount(0);
     // Retrying web-first assertions: these attributes must already hold at
     // open time (before the click), so poll them instead of one-shot reads.

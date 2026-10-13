@@ -512,7 +512,8 @@ pub(crate) fn recorded_prompt_window_count(cwd: &Path, owner: &str) -> usize {
         .map_or(0, |log| log.windows.len())
 }
 
-/// Test seam: retained prompt text is never longer than the storage cap.
+/// Test seam: retained prompt DISPLAY prefixes are never longer than the
+/// storage cap. Matching itself uses the full-text fingerprint, not these.
 #[cfg(test)]
 pub(crate) fn recorded_prompt_texts(cwd: &Path, owner: &str) -> Vec<String> {
     SENT_INPUTS
@@ -520,7 +521,12 @@ pub(crate) fn recorded_prompt_texts(cwd: &Path, owner: &str) -> Vec<String> {
         .expect("codex sent inputs")
         .get(&canonical(cwd))
         .and_then(|by_owner| by_owner.get(owner))
-        .map(|log| log.windows.iter().map(|input| input.text.clone()).collect())
+        .map(|log| {
+            log.windows
+                .iter()
+                .map(|input| input.display_prefix.clone())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1090,15 +1096,12 @@ const INPUT_MATCH_SLACK: time::Duration = time::Duration::seconds(5);
 /// cannot authorize a much-later rollout.
 const INPUT_MAX_AGE: time::Duration = time::Duration::hours(1);
 
-/// Hard bound on the retained TEXT of one prompt window, in chars
-/// (c-usagefu r15 item 4). Prompt evidence is bounded on every axis; a pasted
-/// document-sized prompt must not be retained verbatim for the lifetime of
-/// the process. Stored text and the rollout's first-user text are BOTH
-/// normalized through the same bounded prefix (see [`normalize_input`]), so a
-/// genuine match still compares equal; only two prompts sharing an 8 KiB
-/// prefix become indistinguishable — on top of the sole-live census and the
-/// time window that is not an attribution the file channel could prove
-/// anyway.
+/// Bound on the retained DISPLAY prefix of one prompt window, in chars
+/// (c-usagefu r15 item 4). The full prompt is never retained verbatim: matching
+/// uses a digest of the COMPLETE trimmed prompt (see [`PromptFingerprint`]),
+/// and only this short, human-readable prefix is kept for diagnostics. It never
+/// participates in a match (c-usagefu r16 item 6), so two prompts sharing a
+/// prefix cannot be confused.
 const MAX_PROMPT_CHARS: usize = 8 * 1024;
 
 /// Maximum dispatch windows retained per owner, even while its discovery is
@@ -1145,10 +1148,46 @@ pub(crate) fn evict_expired_inputs(now: OffsetDateTime) {
     });
 }
 
+/// Collision-resistant identity of one COMPLETE trimmed prompt (c-usagefu r16
+/// item 6). The digest is SHA-256 over every byte of the trimmed prompt with NO
+/// truncation, and `len_chars` records its full char length: two prompts that
+/// share a long prefix but differ anywhere (including only after the old
+/// display-prefix bound) get different fingerprints, so a rollout carrying the
+/// wrong suffix can never bind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PromptFingerprint {
+    digest: [u8; 32],
+    len_chars: usize,
+}
+
+/// Compute the [`PromptFingerprint`] of an already-trimmed prompt over its full
+/// content without retaining the text.
+fn prompt_fingerprint(trimmed: &str) -> PromptFingerprint {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(trimmed.as_bytes());
+    PromptFingerprint {
+        digest: hasher.finalize().into(),
+        len_chars: trimmed.chars().count(),
+    }
+}
+
+/// Bounded, human-readable prefix kept for diagnostics only; never used to
+/// match (c-usagefu r16 item 6).
+fn prompt_display_prefix(trimmed: &str) -> String {
+    match trimmed.char_indices().nth(MAX_PROMPT_CHARS) {
+        Some((idx, _)) => trimmed[..idx].to_owned(),
+        None => trimmed.to_owned(),
+    }
+}
+
 #[derive(Clone)]
 struct SentInput {
-    /// Whitespace-trimmed prompt text as the driver sent it.
-    text: String,
+    /// Identity of the COMPLETE trimmed prompt; this is what matching compares.
+    fingerprint: PromptFingerprint,
+    /// Bounded display prefix for diagnostics; never part of the match.
+    #[cfg_attr(not(test), allow(dead_code))]
+    display_prefix: String,
     /// Time this dispatch's evidence window starts: every send gets its own
     /// window, including a resend of an earlier prompt.
     at: OffsetDateTime,
@@ -1187,20 +1226,21 @@ static SENT_INPUTS: LazyLock<Mutex<SentInputs>> = LazyLock::new(|| Mutex::new(Ha
 /// item 4). Both the dispatched prompt and the rollout's first user text pass
 /// through this same form in [`evaluate_prompt`], so a real prompt — even one
 /// longer than the cap — still matches; only a shared bounded prefix collides.
-fn normalize_input(text: &str) -> String {
-    let trimmed = text.trim();
-    match trimmed.char_indices().nth(MAX_PROMPT_CHARS) {
-        Some((idx, _)) => trimmed[..idx].to_owned(),
-        None => trimmed.to_owned(),
-    }
+/// Whitespace-trimmed form of a prompt. The digest is computed over this WHOLE
+/// string (c-usagefu r16 item 6), so a prompt longer than the display bound
+/// still matches its rollout while two prompts sharing a prefix cannot.
+fn trim_prompt(text: &str) -> &str {
+    text.trim()
 }
 
 fn put_input(cwd: &Path, owner: &str, text: &str, at: OffsetDateTime) {
     let cwd_key = canonical(cwd);
-    let text = normalize_input(text);
-    if text.is_empty() {
+    let trimmed = trim_prompt(text);
+    if trimmed.is_empty() {
         return;
     }
+    let fingerprint = prompt_fingerprint(trimmed);
+    let display_prefix = prompt_display_prefix(trimmed);
     let mut map = SENT_INPUTS.lock().expect("codex sent inputs");
     let log = map
         .entry(cwd_key)
@@ -1209,7 +1249,11 @@ fn put_input(cwd: &Path, owner: &str, text: &str, at: OffsetDateTime) {
         .or_default();
     // Every dispatch is a distinct window: even an identical resend is pushed,
     // so the earlier window keeps its own send-time back edge.
-    log.windows.push(SentInput { text, at });
+    log.windows.push(SentInput {
+        fingerprint,
+        display_prefix,
+        at,
+    });
     // c-usagefu r15 item 4: hard per-owner window cap, oldest first — prompt
     // evidence never accumulates without bound, even for a live discoverer.
     if log.windows.len() > MAX_PROMPT_WINDOWS_PER_OWNER {
@@ -1253,8 +1297,12 @@ fn evaluate_prompt(
     session_started: OffsetDateTime,
 ) -> PromptVerdict {
     let cwd_key = canonical(cwd);
-    let wanted = normalize_input(rollout_text);
-    if wanted.is_empty() {
+    // Digest the COMPLETE trimmed rollout prompt: matching compares the
+    // collision-resistant fingerprint (digest + full length), never a truncated
+    // prefix, so a different rollout that shares a prefix cannot bind
+    // (c-usagefu r16 item 6).
+    let wanted = prompt_fingerprint(trim_prompt(rollout_text));
+    if rollout_text.trim().is_empty() {
         return PromptVerdict::Ineligible;
     }
     let blocker = {
@@ -1314,7 +1362,7 @@ fn evaluate_prompt(
             .and_then(|by_owner| by_owner.get(owner))
             .is_some_and(|log| {
                 log.windows().any(|input| {
-                    input.text == wanted
+                    input.fingerprint == wanted
                         && session_started >= input.at - INPUT_MATCH_SLACK
                         && session_started <= input.at + INPUT_MATCH_WINDOW
                 })

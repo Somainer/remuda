@@ -3745,6 +3745,67 @@ fn prompt_evidence_is_bounded_by_text_length_and_window_count_even_while_live() 
 }
 
 #[test]
+fn prompts_sharing_a_long_prefix_but_differing_in_suffix_never_bind() {
+    // c-usagefu r16 item 6: the match key is a collision-resistant digest of
+    // the COMPLETE trimmed prompt plus its length — NOT the bounded display
+    // prefix. Two distinct prompts that are byte-identical for the first 8 KiB
+    // but differ afterwards must never author each other's rollout.
+    use crate::adapters::codex_discovery as disc;
+    use time::OffsetDateTime;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let owner = "r16-item6-prefix";
+    let now = OffsetDateTime::now_utc();
+    let floor = now + time::Duration::minutes(2);
+    let _lifetime = disc::begin_lifetime(&cwd, owner, Some(floor));
+
+    let shared = "z".repeat(8 * 1024);
+    let sent = format!("{shared}suffix-one");
+    let other = format!("{shared}suffix-two");
+    assert_ne!(sent, other);
+    // The exact collision shape the old bounded-prefix compare could not see:
+    // the retained/rollout prefixes are identical through the whole 8 KiB.
+    assert_eq!(sent[..shared.len()], other[..shared.len()]);
+
+    disc::record_input_at(&cwd, owner, &sent, floor);
+    let started = floor + time::Duration::seconds(10);
+
+    // The genuine, COMPLETE prompt still binds (digest over the whole text).
+    assert!(
+        disc::sole_instance_matches(&cwd, owner, &sent, started),
+        "the complete dispatched prompt matches its rollout"
+    );
+    // Whitespace around the full prompt does not change the fingerprint.
+    assert!(
+        disc::sole_instance_matches(&cwd, owner, &format!("  {sent}\n"), started),
+        "trimming is applied before the digest"
+    );
+    // The shared-prefix / different-suffix rollout must NOT bind.
+    assert!(
+        !disc::sole_instance_matches(&cwd, owner, &other, started),
+        "identical prefix, different suffix never bind"
+    );
+
+    // Same refusal through the PRODUCTION discovery entry point (the call the
+    // real adapter poll makes), with a distinct rollout path for each.
+    let wrong_rollout = dir.path().join("rollout-r16item6-wrong.jsonl");
+    let right_rollout = dir.path().join("rollout-r16item6-right.jsonl");
+    std::fs::write(&wrong_rollout, b"x").unwrap();
+    std::fs::write(&right_rollout, b"x").unwrap();
+    assert!(
+        !disc::prompt_candidate_matches(&cwd, owner, &wrong_rollout, &other, started),
+        "production discovery refuses the shared-prefix rollout"
+    );
+    assert!(
+        disc::prompt_candidate_matches(&cwd, owner, &right_rollout, &sent, started),
+        "production discovery binds the exact full-prompt rollout"
+    );
+
+    disc::forget_lifetime(&cwd, owner);
+}
+
+#[test]
 fn dropping_the_barrier_handle_disarms_the_parked_registration_and_clears_the_slot() {
     // c-usagefu r15 item 8(c): the handle returned by arm owns the barrier.
     // Dropping it (even while a parked registration still holds an Arc clone)

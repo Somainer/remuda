@@ -882,14 +882,22 @@ pub(super) fn spawn(
     // observations via try_send before its sender drops. The variable is read
     // only by its Drop impl.
 
-    let finalise_guard = FinaliseGuard {
+    // c-usagefu r18 item 5: the guard OWNS the live hydrator for the whole
+    // poll loop; the task below only borrows it (`hydrator_slot`). When the
+    // task is aborted mid-loop (close's finalise deadline on a wedged pump),
+    // the guard's Drop therefore runs finish_sync() on the LIVE mapper and its
+    // buffered usage instead of on an empty slot. Normal completion marks the
+    // guard done after its async finalise, so Drop never publishes twice.
+    let mut finalise_guard = FinaliseGuard {
         hydrator: None,
         events: events.clone(),
         done: false,
     };
     tokio::spawn(async move {
         let mut promote = PromoteState::default();
-        let mut hydrator: Option<Hydrator> = None;
+        // Borrowed ownership of the live hydrator — created, replaced and
+        // finalised through this reborrow but stored in `finalise_guard`.
+        let hydrator: &mut Option<Hydrator> = &mut finalise_guard.hydrator;
         // Raise-only + blocked latch across the whole promoted session
         // (design §2.4 rule 6, §10 anchor ④). The stateless screen read feeds
         // it; its verdict is what we both journal and expose via the status
@@ -1083,12 +1091,12 @@ pub(super) fn spawn(
                     return;
                 }
                 bindings.demobilize();
-                finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await;
+                finalize_hydrator(hydrator, &events, &seq, &ctx).await;
                 announced = None;
             }
             if saw_promote {
                 bindings.begin_epoch(&ctx.cwd, &ctx.claude_home);
-                finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await;
+                finalize_hydrator(hydrator, &events, &seq, &ctx).await;
                 announced = None;
                 bypass_announced = false;
                 trust_attempted = false;
@@ -1146,7 +1154,7 @@ pub(super) fn spawn(
                     // of the in-flight turn on /clear and /resume rebinds. The
                     // binding seam above and the withdrawal bookkeeping inside
                     // `apply_native_session_binding` are unchanged.
-                    finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await;
+                    finalize_hydrator(hydrator, &events, &seq, &ctx).await;
                     announced = None;
                 }
             }
@@ -1473,7 +1481,7 @@ pub(super) fn spawn(
                         &bindings,
                         &ctx,
                         found,
-                        &mut hydrator,
+                        hydrator,
                         &mut announced,
                         &events,
                         &seq,
@@ -1492,7 +1500,7 @@ pub(super) fn spawn(
                     )
                     .await;
                 }
-                _ => finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await,
+                _ => finalize_hydrator(hydrator, &events, &seq, &ctx).await,
             }
             // c-ctxusage r5 item 6: close can land while this iteration's pump
             // is still mapping. Check before waiting another tick so the final
@@ -1510,23 +1518,30 @@ pub(super) fn spawn(
         // last assistant run (usage with no stop_reason) instead of dropping
         // the hydrator on close/process exit. This awaits the current pump's
         // completion first and must finish before close aborts the task.
-        finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await;
-        // Hand the (now drained) hydrator to the guard and disarm it so the
-        // abort-path Drop does not finalise a second time.
-        finalise_guard.disarm(hydrator);
+        //
+        // c-usagefu r18 items 1/5 test gate: when a test holds the park permit,
+        // the poller stops HERE — after the cooperative break, immediately
+        // before the final finalise — so a close waiting on the poller handle
+        // is deterministically parked and its abort-after-deadline path (which
+        // must run the guard's finish_sync on the live mapper) is drivable.
+        test_park_before_final_finalise().await;
+        finalize_hydrator(hydrator, &events, &seq, &ctx).await;
+        // The async finalise above already drained and published the live
+        // hydrator's group; mark the guard done so its Drop (which still OWNS
+        // the hydrator) does not finish_sync it a second time.
+        finalise_guard.mark_done();
         let _ = finalised.send(());
     })
 }
 
 /// Best-effort abort-path safety net for [`spawn`].
 ///
-/// Normal shutdown runs `Hydrator::finalize` (async, ordered delivery) and
-/// marks `done`. If the runtime aborts the task before that — e.g. a wedged
-/// first-bind pump exceeding close's bounded wait — the guard's Drop still
-/// runs the mapper's synchronous `finish()` and tries to hand the
-/// observations to the still-held channel via `try_send`. Delivery is best
-/// effort, but the final usage mapping is never silently skipped.
-#[allow(dead_code)] // fields are consumed in Drop / disarm
+/// c-usagefu r18 item 5: the guard holds the LIVE hydrator for the whole poll
+/// loop (the task borrows `self.hydrator` mutably). A task aborted while the
+/// poller is wedged drops the guard with the live mapper still buffered; Drop
+/// runs its synchronous `finish()` and tries to hand the observations to the
+/// still-held channel via `try_send`. Delivery is best effort, but the final
+/// usage mapping is never silently skipped.
 struct FinaliseGuard {
     hydrator: Option<Hydrator>,
     events: mpsc::Sender<Observation>,
@@ -1534,10 +1549,11 @@ struct FinaliseGuard {
 }
 
 impl FinaliseGuard {
-    /// Happy-path completion: the async finalise already ran, so just retain
-    /// the drained hydrator and suppress the Drop finalise.
-    fn disarm(mut self, hydrator: Option<Hydrator>) {
-        self.hydrator = hydrator;
+    /// Normal completion: the async finalise already drained and published the
+    /// hydrator; suppress the Drop finalise so its group is never emitted
+    /// twice. The (drained) hydrator keeps living in the guard until the task
+    /// ends — it owns no unpublished observations after `finish()`.
+    fn mark_done(&mut self) {
         self.done = true;
     }
 }
@@ -1547,6 +1563,8 @@ impl Drop for FinaliseGuard {
         if self.done {
             return;
         }
+        // Abort path (c-usagefu r18 item 5): finish the LIVE hydrator the
+        // poller was holding when it was cancelled.
         if let Some(hydrator) = self.hydrator.as_mut()
             && let Ok(observations) = hydrator.finish_sync()
         {
@@ -1558,6 +1576,38 @@ impl Drop for FinaliseGuard {
             }
         }
     }
+}
+
+/// c-usagefu r18 items 1/5 deterministic test gate. A test ACQUIRES the permit
+/// (via [`test_acquire_final_finalise_park`]) and the real promotion poller,
+/// after its cooperative shutdown break and immediately before its final
+/// finalise, parks until the permit is dropped. With nobody holding it the lock
+/// is free and production-shaped tests pass straight through.
+#[cfg(test)]
+static TEST_FINAL_FINALISE_PARK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+#[cfg(test)]
+async fn test_park_before_final_finalise() {
+    let _parked = TEST_FINAL_FINALISE_PARK.lock().await;
+}
+
+/// Non-test builds pass straight through the gate (there is no permit holder).
+#[cfg(not(test))]
+async fn test_park_before_final_finalise() {}
+
+/// Test seam: park every poller at its final-finalise gate until the guard is
+/// dropped.
+#[cfg(test)]
+pub(crate) async fn test_acquire_final_finalise_park() -> tokio::sync::MutexGuard<'static, ()> {
+    TEST_FINAL_FINALISE_PARK.lock().await
+}
+
+/// Test seam: whether a poller is currently parked at the final-finalise gate
+/// (i.e. it has broken out of its loop after the shutdown signal).
+#[cfg(test)]
+pub(crate) fn test_final_finalise_park_held() -> bool {
+    TEST_FINAL_FINALISE_PARK.try_lock().is_err()
 }
 
 /// A shim records its exec PID before Claude can enter the foreground. Missing

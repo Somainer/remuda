@@ -6547,6 +6547,190 @@ mod tests {
         crate::adapters::codex_discovery::shutdown_unconfirmed_guards();
     }
 
+    /// c-usagefu r18 item 5 helper: a promoted login driver whose real poller
+    /// has bound the transcript and is buffering one open-turn usage record
+    /// (counters present, stop_reason null) that no poll has published.
+    async fn driver_with_buffered_open_turn(
+        dir: &Path,
+    ) -> (
+        ShellPtyDriver,
+        mpsc::Receiver<remuda_protocol::Observation>,
+        PathBuf,
+        &'static str,
+    ) {
+        let home = dir.join("claude-home");
+        let cwd = dir.to_path_buf();
+        let slug = crate::claude_transcript::project_dir(&home, &cwd);
+        std::fs::create_dir_all(&slug).unwrap();
+        let session: &'static str = "01234567-89ab-cdef-0123-456789abcdef";
+        let args = Arc::new(std::sync::Mutex::new(format!(
+            "claude --session-id {session}"
+        )));
+        let driver = r7_login_driver(&cwd, &home, args);
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        // Hook binds before the transcript exists (Fresh), then the prompt and
+        // one open assistant turn land.
+        let path = slug.join(format!("{session}.jsonl"));
+        r7_send_session_start(&hooks, pgid, session, &path).await;
+        std::fs::write(
+            &path,
+            format!(
+                "{}{}",
+                r7_user(session, "open-prompt", "working now"),
+                r7_record(
+                    session,
+                    serde_json::json!({
+                        "type": "assistant",
+                        "uuid": "open-assistant",
+                        "timestamp": "2026-10-14T00:00:00.000Z",
+                        "isSidechain": false,
+                        "message": {
+                            "type": "message",
+                            "role": "assistant",
+                            "id": "msg_open_turn",
+                            "model": "claude-opus-5-5",
+                            "content": [{"type": "text", "text": "working on it"}],
+                            "stop_reason": null,
+                            "usage": {
+                                "input_tokens": 5,
+                                "cache_read_input_tokens": 6000,
+                                "cache_creation_input_tokens": 9,
+                                "output_tokens": 13
+                            }
+                        }
+                    })
+                )
+            ),
+        )
+        .unwrap();
+        // Bind + at least two pumps: conversation hydrates, the open usage
+        // stays buffered.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if drain_observations(&mut events, |body| {
+                matches!(body, remuda_protocol::ObservationPayload::Message(_)).then_some(())
+            })
+            .is_empty()
+            {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            } else {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            drain_observations(&mut events, |body| {
+                matches!(body, remuda_protocol::ObservationPayload::Usage(_)).then_some(())
+            })
+            .is_empty(),
+            "the open turn usage is buffered in the live hydrator"
+        );
+        (driver, events, cwd, session)
+    }
+
+    fn buffered_usage_payloads(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+    ) -> Vec<remuda_protocol::UsagePayload> {
+        drain_observations(events, |body| match body {
+            remuda_protocol::ObservationPayload::Usage(payload) => Some((**payload).clone()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn an_aborted_poller_publishes_the_live_hydrators_buffered_usage_exactly_once() {
+        // c-usagefu r18 item 5: close's finalise deadline aborts a wedged
+        // poller. Before the fix the abort guard was constructed with
+        // hydrator: None and only received the hydrator on the NORMAL disarm
+        // path, so the abort dropped the live mapper and its buffered usage.
+        // The guard now owns the live hydrator for the whole loop; its Drop
+        // runs finish_sync into a channel with free capacity.
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
+
+        let park = promotion::test_acquire_final_finalise_park().await;
+        // Signal exactly what close signals before waiting on the poller: the
+        // closed bit and the cooperative watch. The poller breaks its loop and
+        // parks at the gate before its final finalise.
+        driver
+            .state()
+            .await
+            .unwrap()
+            .closed
+            .store(true, Ordering::SeqCst);
+        if let Some(shutdown) = driver.poller_shutdown.lock().await.take() {
+            let _ = shutdown.send(true);
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !promotion::test_final_finalise_park_held() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the poller parks at the gate"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Channel has free capacity: drain anything queued.
+        let _ = drain_observations(&mut events, |body| Some(body.clone())).len();
+
+        // Deterministic abort, exactly like close's deadline path.
+        let poller = driver
+            .poller
+            .lock()
+            .await
+            .take()
+            .expect("the real poller handle");
+        poller.abort();
+        let _ = poller.await;
+        drop(park);
+
+        // The guard's Drop finish_sync delivered the buffered usage.
+        let payloads = buffered_usage_payloads(&mut events);
+        assert_eq!(payloads.len(), 1, "buffered usage survives the abort once");
+        let known = |value: &remuda_protocol::Knowledge<remuda_protocol::U64>| match value {
+            remuda_protocol::Knowledge::Known { value } => value.0,
+            other => panic!("expected Known counter, got {other:?}"),
+        };
+        assert_eq!(known(&payloads[0].input_tokens), 5);
+        assert_eq!(known(&payloads[0].cache_read_tokens), 6_000);
+        assert_eq!(known(&payloads[0].cache_write_tokens), 9);
+        assert_eq!(known(&payloads[0].output_tokens), 13);
+
+        // The real close afterwards (poller already gone) publishes nothing
+        // more: the aborted hydrator owned the only copy.
+        Driver::close(&driver).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            buffered_usage_payloads(&mut events).is_empty(),
+            "no second usage publication after the abort finalise"
+        );
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards();
+    }
+
+    #[tokio::test]
+    async fn a_normal_close_with_guard_owned_hydrator_publishes_buffered_usage_once() {
+        // c-usagefu r18 item 5 normal-path half: with the guard owning the
+        // hydrator, the cooperative close finalises it and marks the guard
+        // done, so the Drop finish_sync never re-emits the same group.
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
+
+        Driver::close(&driver).await.unwrap();
+        // Give any (incorrect) second publication time to land.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let payloads = buffered_usage_payloads(&mut events);
+        assert_eq!(
+            payloads.len(),
+            1,
+            "normal close publishes the open usage once"
+        );
+    }
+
     ///
     /// Promoted rather than launched: §1.0 makes the two the same session to
     /// everything below the spawn, and the promoted shape needs no materializer

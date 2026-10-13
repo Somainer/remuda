@@ -272,6 +272,17 @@ export function instanceDeliveryLockName(instanceId: Id): string {
   return `remuda-outbox-${instanceId}`;
 }
 
+/**
+ * Cross-tab exclusion for ONE command's acceptance compare-and-set
+ * (c-reconnfu gate 29 item 1). Distinct from the instance delivery lock so a
+ * CAS taken from the delivery turn (which already holds the instance lock)
+ * can never deadlock; nothing ever takes the instance lock while holding this
+ * one.
+ */
+function acceptanceCasLockName(commandId: Id): string {
+  return `remuda-outbox-cas-${commandId}`;
+}
+
 const IDB_NAME = "remuda-outbox";
 const IDB_STORE = "commands";
 const LS_KEY = "remuda-outbox-v1";
@@ -1262,13 +1273,62 @@ export class Outbox {
   }
 
   /**
-   * Durable acceptance compare-and-set (c-reconnfu gate 28): flips the row's
-   * progressRecorded false → true only when the row was issued by this auth
-   * epoch and has not been recorded. The returned boolean is the ONLY thing
-   * telling the store to clear per-instance backoff/exhaustion and reconcile.
+   * Durable acceptance compare-and-set (c-reconnfu gate 28), serialised across
+   * tabs with the SAME exclusion the delivery claim uses on this backend
+   * (c-reconnfu gate 29 item 1): a Web Lock on a per-command name when the
+   * API exists, otherwise the durable per-key lease fallback. The IndexedDB
+   * CAS transaction is itself atomic, but the localStorage backend's
+   * read/check/write is only atomic within one document — under the guard
+   * exactly one of two racing tabs observes the flag unset and wins.
    */
   async casProgressRecorded(commandId: Id, issuerEpoch: Id): Promise<boolean> {
-    return await this.storage.casProgressRecorded(commandId, issuerEpoch);
+    const locks = (globalThis as { navigator?: Navigator & { locks?: LockManager } }).navigator?.locks;
+    if (locks?.request) {
+      return await locks.request(acceptanceCasLockName(commandId), { mode: "exclusive" }, () =>
+        this.storage.casProgressRecorded(commandId, issuerEpoch),
+      );
+    }
+    return await this.runCasWithLease(commandId, issuerEpoch);
+  }
+
+  /**
+   * No-Web-Locks fallback for the acceptance CAS: claim a per-command durable
+   * lease row (`__caslock__:<id>`, invisible to delivery — filtered as a
+   * non-command key) via the same atomic acquireLease/releaseLease pair the
+   * delivery mutex uses, so a second tab's CAS parks until the winner's
+   * compare-and-set has committed and then observes the flag set.
+   */
+  private async runCasWithLease(commandId: Id, issuerEpoch: Id): Promise<boolean> {
+    const key = `__caslock__:${commandId}`;
+    const deadline = Date.now() + LEASE_TTL_MS + 5_000;
+    for (;;) {
+      const now = Date.now();
+      const leaseRec: OutboxRecord = {
+        commandId: key,
+        clientRequestId: key,
+        instanceId: key,
+        prompt: "",
+        createdAt: now,
+        attempts: 0,
+        state: "inflight",
+        lease: { owner: this.leaseToken, until: now + LEASE_TTL_MS },
+      };
+      let acquired = false;
+      try {
+        acquired = await this.storage.acquireLease(key, leaseRec, now);
+      } catch {
+        acquired = false;
+      }
+      if (acquired) {
+        try {
+          return await this.storage.casProgressRecorded(commandId, issuerEpoch);
+        } finally {
+          await this.storage.releaseLease(key, this.leaseToken).catch(() => undefined);
+        }
+      }
+      if (Date.now() > deadline) throw new Error("outbox acceptance CAS lease wait timed out");
+      await new Promise((r) => setTimeout(r, 250));
+    }
   }
 
   /**

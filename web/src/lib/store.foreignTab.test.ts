@@ -5662,24 +5662,24 @@ it("GATE29 item 2: one acceptance CAS storage failure keeps the acceptance pendi
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner");
   }
-});it("GATE30 item 2: another page instance (same epoch) observing a command's acceptance while the flag is unset does NOT record it — its own exhaustion is untouched", async () => {
-  // Single-writer ruling at the store boundary: A (issuer lifetime) accepts
-  // steer S but its FIRST progress CAS write aborts, leaving progressRecorded
-  // unset; A is then page-hidden so its bounded retry is cancelled. Tab B —
-  // same auth epoch, a DIFFERENT page lifetime, with S in its cache and its
-  // own instance exhausted on Q — receives S's accepted journal settle. B is
-  // not the issuer, so even with the flag unset the CAS must not flip: B's
-  // exhaustion/backoff stand and it POSTs nothing. Without the lifetime
-  // comparison B would clear the latch and deliver Q.
+});it("GATE31 item 5: the issuing tab records the accepted command exactly once; the foreign same-epoch tab's rejection leaves its exhaustion intact even after the issuer succeeds", async () => {
+  // Two page lifetimes, one auth epoch, one backend. The ISSUER A sends steer
+  // S; its first progress CAS fails and its bounded retry is pending. Tab B
+  // (different lifetime, S in cache) has independently exhausted its own
+  // instance on Q. While the flag is still unset B receives S's acceptance —
+  // it is rejected (lifetime mismatch) and its exhaustion stands. Then A's
+  // retry commits: the flag flips exactly once (the issuer records), S is
+  // delivered once, and B's exhaustion STILL survives because A's epilogue is
+  // local to A.
   vi.useFakeTimers();
-  vi.setSystemTime(1_070_000);
-  const I = "ins_g30_i2";
+  vi.setSystemTime(1_080_000);
+  const I = "ins_g31_i5";
   const originalNavigator = globalThis.navigator;
   const good = fifoWebLocks().locks;
   const bad = {
     query: async () => ({ held: [] as Array<{ name: string }> }),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    request: (): Promise<any> => Promise.reject(new Error("g30 i2 locks down")),
+    request: (): Promise<any> => Promise.reject(new Error("g31 i5 locks down")),
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let locks: { query: () => Promise<unknown>; request: (...args: any[]) => Promise<unknown> } = good;
@@ -5694,13 +5694,13 @@ it("GATE29 item 2: one acceptance CAS storage failure keeps the acceptance pendi
   };
   const rowsOf = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
   try {
-    // Tab A boots, follows, and will fail its FIRST CAS once.
-    sessionStorage.setItem("remuda-outbox-owner", "owner_g30_a");
+    // Issuer A boots and fails its FIRST CAS once; later attempts commit.
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g31_i5_a");
     const { api: apiA, hubStore: a } = await fresh();
     vi.spyOn(apiA, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
     vi.spyOn(apiA, "screenRead").mockResolvedValue({ lines: [] });
     vi.spyOn(apiA, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
-    vi.spyOn(apiA, "eventsSubscribe").mockResolvedValue({ ...g26Subscription(), subscriptionId: "sub_g30" } as never);
+    vi.spyOn(apiA, "eventsSubscribe").mockResolvedValue({ ...g26Subscription(), subscriptionId: "sub_g31_i5" } as never);
     const sendA = vi.spyOn(apiA, "instanceSend").mockImplementation(
       (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
         relatedCommandIds: [],
@@ -5712,28 +5712,37 @@ it("GATE29 item 2: one acceptance CAS storage failure keeps the acceptance pendi
     await a.follow(I);
     const aStorage = (a as unknown as { outbox: { storage: { casProgressRecorded: (id: string, e: string, l: string) => Promise<boolean> } } }).outbox.storage;
     const realCasA = aStorage.casProgressRecorded.bind(aStorage);
-    aStorage.casProgressRecorded = vi.fn(async () => {
-      throw new Error("g30 i2 A CAS write aborted once");
+    let aCasCalls = 0;
+    // First CAS rejects (creates the pending retry); EVERY later CAS parks
+    // until releaseA() — so the issuer retry cannot commit during B's phase.
+    let releaseA: () => void = () => undefined;
+    const aGate = new Promise<void>((resolve) => {
+      releaseA = () => resolve();
+    });
+    aStorage.casProgressRecorded = vi.fn(async (id: string, e: string, l: string) => {
+      aCasCalls += 1;
+      if (aCasCalls === 1) throw new Error("g31 i5 A CAS first failure");
+      await aGate;
+      return await realCasA(id, e, l);
     });
     a.setConnectionStateForTest("live");
-    expect(await a.send(I, "g30 i2 S", [], [], "steer")).toBe(true);
+    expect(await a.send(I, "g31 i5 S", [], [], "steer")).toBe(true);
     await pump(1_000);
     const sId = sendA.mock.calls[0]?.[4] as string;
     const sRow = () => rowsOf().find((r) => r.commandId === sId)!;
     expect(sRow().state).toBe("sent");
-    expect(sRow().progressRecorded).toBeFalsy(); // CAS failed: still unset
+    expect(sRow().progressRecorded).toBeFalsy(); // pending the bounded retry
+    expect(aCasCalls).toBe(1);
     const issuerLife = sRow().issuerLifetime;
-    expect(issuerLife).toBeTruthy();
-    // A page-hides: its bounded CAS retry is cancelled with the outbox.
-    (a as unknown as { onPageHide: (e?: Event) => void }).onPageHide(new Event("pagehide"));
 
-    // Tab B boots on the shared backend (S loads into cache), follows.
-    sessionStorage.setItem("remuda-outbox-owner", "owner_g30_b");
+    // Foreign tab B boots (S loads into cache) and independently exhausts its
+    // own instance on Q with the locks down.
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g31_i5_b");
     const { api: apiB, hubStore: b } = await fresh();
     vi.spyOn(apiB, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
     vi.spyOn(apiB, "screenRead").mockResolvedValue({ lines: [] });
     vi.spyOn(apiB, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
-    vi.spyOn(apiB, "eventsSubscribe").mockResolvedValue({ ...g26Subscription(), subscriptionId: "sub_g30_b" } as never);
+    vi.spyOn(apiB, "eventsSubscribe").mockResolvedValue({ ...g26Subscription(), subscriptionId: "sub_g31_i5_b" } as never);
     const sendB = vi.spyOn(apiB, "instanceSend");
     await bootLive(apiB, b);
     await (b as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
@@ -5742,40 +5751,60 @@ it("GATE29 item 2: one acceptance CAS storage failure keeps the acceptance pendi
     for (let i = 0; i < 2_000 && !subscribeB.mock.calls[0]?.[2]; i += 1) await Promise.resolve();
     const onBatchB = subscribeB.mock.calls[0]?.[2] as (b2: G26Batch) => void;
     const bBox = () => (b as unknown as { outbox: { isDeliveryExhausted: (i: string) => boolean; pendingLeaseWakeups: () => string[] } | null }).outbox;
-    expect(sendB).not.toHaveBeenCalled();
 
-    // B independently exhausts its OWN instance on Q with the locks down.
     locks = bad;
     b.setConnectionStateForTest("offline");
-    expect(await b.send(I, "g30 i2 Q")).toBe(true);
+    expect(await b.send(I, "g31 i5 Q")).toBe(true);
     await pump(200);
-    const qId = rowsOf().find((r) => r.prompt === "g30 i2 Q")!.commandId;
+    const qId = rowsOf().find((r) => r.prompt === "g31 i5 Q")!.commandId;
     await vi.advanceTimersByTimeAsync(120_000);
     expect(bBox()!.isDeliveryExhausted(I)).toBe(true);
 
-    // Restore A's CAS backend (it stays hidden; nothing retries) — proving the
-    // flag is genuinely still unset when B observes the acceptance.
-    aStorage.casProgressRecorded = vi.fn(realCasA);
-
-    // B receives S's accepted journal settle with the flag unset. Not the
-    // issuer (A's lifetime): the durable done patch retires S, but the CAS
-    // does not flip and B's exhaustion/Q cover are untouched.
+    // B receives S's acceptance BEFORE A's retry fires (well inside the 250 ms
+    // backoff). Lifetime mismatch → CAS not flipped, B's latch intact.
     onBatchB({
-      subscriptionId: "sub_g30_b",
+      subscriptionId: "sub_g31_i5_b",
       journalId: JOURNAL,
       fromSeq: "1",
       toSeq: "1",
       durableSeq: "1",
       events: [g26JournalMessage(sId, "1")],
     });
-    await pump(2_000);
-    expect(sRow().state).toBe("done");
-    expect(sRow().progressRecorded).toBeFalsy(); // B did not record
+    await pump(1_000);
+    expect(sRow().progressRecorded).toBeFalsy();
+    expect(bBox()!.isDeliveryExhausted(I)).toBe(true);
+    expect(sendB).not.toHaveBeenCalled();
+
+    // Let the bounded retry timer fire (it parks on the gate), then release
+    // the ISSUER's CAS: the flag flips exactly once.
+    await vi.advanceTimersByTimeAsync(300);
+    await pump(500);
+    expect(aCasCalls).toBe(2); // the parked retry attempt is now in flight
+    releaseA();
+    await pump(1_000);
+    expect(aCasCalls).toBe(2); // one failure + one success, no more
+    expect(sRow().progressRecorded).toBe(true);
     expect(sRow().issuerLifetime).toBe(issuerLife);
+    expect(sendA.mock.calls.map((c) => c[4])).toEqual([sId]); // delivered once
+
+    // A's success must NOT have crossed tabs: B is still exhausted, Q still
+    // pending, B never POSTed, and a replayed batch at B is still a no-op.
     expect(bBox()!.isDeliveryExhausted(I)).toBe(true);
     expect(bBox()!.pendingLeaseWakeups()).toEqual([]);
     expect(rowsOf().find((r) => r.commandId === qId)?.state).toBe("pending");
     expect(sendB).not.toHaveBeenCalled();
+    onBatchB({
+      subscriptionId: "sub_g31_i5_b",
+      journalId: JOURNAL,
+      fromSeq: "2",
+      toSeq: "2",
+      durableSeq: "2",
+      events: [g26JournalMessage(sId, "2")],
+    });
+    await pump(500);
+    expect(sendB).not.toHaveBeenCalled();
+    // No third CAS for S anywhere.
+    expect(aCasCalls).toBe(2);
     a.logout();
     b.logout();
   } finally {
@@ -5783,4 +5812,4 @@ it("GATE29 item 2: one acceptance CAS storage failure keeps the acceptance pendi
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner");
   }
-});
+});;

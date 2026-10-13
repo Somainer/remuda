@@ -362,6 +362,9 @@ fn close_request() -> InstanceCommandRequest {
         model: None,
         effort_name: None,
         effort_index: None,
+        effort_axis: None,
+        effort_request_id: None,
+        effort_ultracode: None,
         permission_mode: None,
     }
 }

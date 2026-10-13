@@ -47,6 +47,17 @@ impl Bridge {
             .arm(EffortRequest::from_level(word).expect("level"))
     }
 
+    /// Arm an `/effort <word>` switch carrying a REAL per-request id exactly
+    /// like a web configure does (c-effortread r10/r25), so the mapper's
+    /// completion echo can be asserted against
+    /// [`remuda_protocol::EFFORT_REQUEST_ID_KEY`]. Returns its generation.
+    pub fn arm_word_with_id(&self, word: &str, request_id: &str) -> u64 {
+        let request = EffortRequest::from_level(word)
+            .expect("level")
+            .with_request_id(Some(request_id));
+        self.inner.arm(request)
+    }
+
     /// Arm a switch from raw slash args; `None` for words Remuda cannot send
     /// (`auto`, `status`, `bogus`, `ultracode bogus`).
     #[must_use]

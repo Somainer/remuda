@@ -1396,15 +1396,21 @@ async fn r24a_suppressed_same_tuple_cycle_keeps_assistant_source_through_the_map
     );
 }
 
-/// c-effortread r24 (b): an OWNED `/effort high` verdict for the state
+/// c-effortread r24 (b) / r25: an OWNED `/effort high` verdict for the state
 /// already in effect changes no tuple, so the mapper settles B through its
 /// no-op completion branch (claude_print.rs: an echoed observation stamped
 /// with B's request id) WITHOUT promoting the level's channel from Assistant
-/// to Verdict. A later status reporting medium must publish no level edge.
+/// to Verdict. B is armed with a REAL per-request id (the configure's
+/// `EFFORT_REQUEST_ID_KEY`, not the id-less `arm_word`), and the no-op echo
+/// must carry exactly that id; a later status reporting medium must publish
+/// no level edge.
 #[tokio::test]
 async fn r24b_owned_noop_completion_settles_without_stealing_the_assistant_channel() {
     use remuda_driver::effort::Readback;
     use std::time::Duration;
+    // A web-minted configure id: production carries it on
+    // EFFORT_REQUEST_ID_KEY and the echo must return it verbatim.
+    const REQUEST_ID: &str = "effreq-r24b-noop-1";
     let bridge = std::sync::Arc::new(remuda_driver::test_support::Bridge::new());
     let mut mapper = remuda_driver::test_support::mapper_with_bridge(
         bridge.clone(),
@@ -1420,18 +1426,25 @@ async fn r24b_owned_noop_completion_settles_without_stealing_the_assistant_chann
     );
     feed_effort(&mut mapper, &mut edges, &assistant(Some("high"), 2));
 
-    // Remuda's own /effort high accepts the state already in effect.
-    let generation = bridge.arm_word("high");
+    // Remuda's own /effort high, carrying a real request id, accepts the
+    // state already in effect.
+    let generation = bridge.arm_word_with_id("high", REQUEST_ID);
     feed_effort(&mut mapper, &mut edges, &slash("high", 3));
-    feed_effort(
-        &mut mapper,
-        &mut edges,
-        &stdout_record_version(
-            "Set effort level to high (saved as your default for new sessions): …",
-            4,
-            "2.1.289",
-        ),
-    );
+    let verdict = mapper
+        .map_line_at(
+            &stdout_record_version(
+                "Set effort level to high (saved as your default for new sessions): …",
+                4,
+                "2.1.289",
+            ),
+            None,
+        )
+        .expect("verdict maps");
+    let echo: Vec<&remuda_protocol::Observation> = verdict
+        .iter()
+        .filter(|obs| matches!(obs.body, ObservationPayload::Effort(_)))
+        .collect();
+    edges.extend(effort_edges(&verdict));
     // The request settles Applied through the no-op completion branch even
     // though the tracker emitted no edge.
     match bridge.wait(generation, Duration::from_secs(1)).await {
@@ -1441,6 +1454,27 @@ async fn r24b_owned_noop_completion_settles_without_stealing_the_assistant_chann
         }
         other => panic!("the no-op switch should settle Applied: {other:?}"),
     }
+    // Exactly ONE observation comes out of the no-op verdict, and it is the
+    // echo stamped with B's configure id (the id under
+    // EFFORT_REQUEST_ID_KEY) plus the requested selection.
+    assert_eq!(echo.len(), 1, "the no-op verdict emits its one echo");
+    let payload = match &echo[0].body {
+        ObservationPayload::Effort(payload) => payload,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        payload.request_id.as_deref(),
+        Some(REQUEST_ID),
+        "the no-op completion echo carries B's {}: {REQUEST_ID}",
+        remuda_protocol::EFFORT_REQUEST_ID_KEY
+    );
+    assert_eq!(
+        payload.requested,
+        Some(remuda_protocol::EffortSelection {
+            name: remuda_protocol::EffortName::High,
+            ultracode: false,
+        })
+    );
     assert_eq!(
         edges,
         vec![

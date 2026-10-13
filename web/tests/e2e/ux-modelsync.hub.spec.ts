@@ -131,6 +131,9 @@ test("the picker lists the gateway-discovered models and selection read-backs", 
   await openModelList(page);
   const panel = page.getByTestId("effort-slider-panel");
   // The launch snapshot's gateway catalog (not builtin opus/sonnet/haiku).
+  // `e2e/auto` is the concrete gateway default: one "auto" row here (no
+  // colliding auto labels), selected because the fake resolves the
+  // passthrough/auto follow-default sentinel to it at launch.
   for (const short of ["fast", "plain", "auto", "claude-e2e-only"]) {
     await expect(page.getByTestId(`model-option-${short}`)).toBeVisible({ timeout: 10_000 });
   }

@@ -504,6 +504,28 @@ fn fake_launch_catalog(prompt: Option<&str>) -> (Value, Vec<String>) {
         std::iter::once("e2e/auto".to_owned())
             .chain((0..80).map(|i| format!("e2e/m-{i:02}")))
             .collect()
+    } else if prompt.is_some_and(|text| text.contains("colliding-auto-model")) {
+        // r26 r3: two CONCRETE vendor models whose final segment is the
+        // provider's own automatic choice. They are distinct full ids and must
+        // never be merged with each other or with the web's passthrough/auto
+        // follow-default sentinel (only bare `auto` / `passthrough/auto` are
+        // that alias).
+        vec![
+            "vendor-a/auto".to_owned(),
+            "vendor-b/auto".to_owned(),
+            "e2e/fast".to_owned(),
+        ]
+    } else if prompt.is_some_and(|text| text.contains("colliding-auto-model-2")) {
+        // The cross-spelling case: /auto vs /auto_model across vendors.
+        vec![
+            "vendor-a/auto".to_owned(),
+            "vendor-b/auto_model".to_owned(),
+            "e2e/fast".to_owned(),
+        ]
+    } else if prompt.is_some_and(|text| text.contains("auto-append")) {
+        // Catalog lists ONLY vendor-a/auto: a configure/read-back resolving to
+        // vendor-b/auto must append that unlisted running id as its own row.
+        vec!["vendor-a/auto".to_owned(), "e2e/fast".to_owned()]
     } else if prompt.is_some_and(|text| text.contains("colliding-catalog")) {
         // Two DISTINCT full ids sharing one final segment: the driver matches
         // models verbatim, so the web picker must render and select them by
@@ -1271,7 +1293,7 @@ async fn fake_node(
                         // §9.1 model-sync: the driver's launch snapshot carries the
                         // gateway-discovered catalog and the launch model so the
                         // picker shows the real list immediately.
-                        let launch_model = spec
+                        let requested_model = spec
                             .get("modelId")
                             .or_else(|| spec.get("model"))
                             .and_then(Value::as_str)
@@ -1281,8 +1303,28 @@ async fn fake_node(
                             .pointer("/initialInput/text")
                             .or_else(|| spec.get("prompt"))
                             .and_then(Value::as_str);
+                        let launch_prompt = spec
+                            .pointer("/initialInput/text")
+                            .or_else(|| spec.get("prompt"))
+                            .and_then(Value::as_str);
                         let (catalog_json, catalog_ids) = fake_launch_catalog(launch_prompt);
-                        model_catalogs.insert(instance_id.clone(), catalog_ids);
+                        // r26 r3: the web's unpinned follow-default sentinel
+                        // (passthrough/auto / bare auto) is NOT a concrete model
+                        // and never matches a gateway id. A real gateway resolves
+                        // it at launch; the fake resolves it to the session's
+                        // first catalog id (its gateway default), keeping the
+                        // requested id distinct from the effective one.
+                        let launch_model = if requested_model == "passthrough/auto"
+                            || requested_model == "auto"
+                        {
+                            catalog_ids
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| requested_model.clone())
+                        } else {
+                            requested_model.clone()
+                        };
+                        model_catalogs.insert(instance_id.clone(), catalog_ids.clone());
                         append_n = append_event(
                             &mut ws,
                             &mut frame_queue,
@@ -1290,7 +1332,7 @@ async fn fake_node(
                             append_n,
                             "model",
                             json!({
-                                "requested": launch_model,
+                                "requested": requested_model,
                                 "effective": {
                                     "id": launch_model,
                                     "source": "launch",
@@ -1715,14 +1757,26 @@ async fn fake_node(
                     // carrier (claude-pty emits in its own branch above; shell-pty
                     // and print land here).
                     if kind == "claude" {
-                        let launch_model = spec
+                        let requested_model = spec
                             .get("modelId")
                             .or_else(|| spec.get("model"))
                             .and_then(Value::as_str)
                             .unwrap_or("e2e/auto")
                             .to_string();
                         let (catalog_json, catalog_ids) = fake_launch_catalog(Some(prompt));
-                        model_catalogs.insert(instance_id.clone(), catalog_ids);
+                        // r26 r3: resolve the web's follow-default sentinel to
+                        // the gateway's first catalog model (see create arm).
+                        let launch_model = if requested_model == "passthrough/auto"
+                            || requested_model == "auto"
+                        {
+                            catalog_ids
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| requested_model.clone())
+                        } else {
+                            requested_model.clone()
+                        };
+                        model_catalogs.insert(instance_id.clone(), catalog_ids.clone());
                         append_n = append_event(
                             &mut ws,
                             &mut frame_queue,
@@ -1730,7 +1784,7 @@ async fn fake_node(
                             append_n,
                             "model",
                             json!({
-                                "requested": launch_model,
+                                "requested": requested_model,
                                 "effective": {
                                     "id": launch_model,
                                     "source": "launch",

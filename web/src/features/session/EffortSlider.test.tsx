@@ -284,42 +284,115 @@ describe("EffortSlider tier/model list", () => {
     expect(onModel).toHaveBeenCalledWith("vendor-a/shared");
   });
 
-  it("collapses only the known automatic-model ids onto one auto row", async () => {
-    // The gateway's e2e/auto and the launch passthrough/auto are the same
-    // AUTOMATIC choice; they collapse to one row (the catalog id survives).
+  it("collapses only the built-in automatic aliases (bare auto and passthrough/auto)", async () => {
+    // r26 r3: the equivalence set is EXPLICIT — the driver builtin alias
+    // `auto` (model_discovery.rs BUILTIN_MODEL_ALIASES) and the web sentinel
+    // `passthrough/auto` name the same follow-default stop.
     const user = userEvent.setup();
     const onModel = vi.fn();
     mount({
       kind: "claude",
       index: 2,
-      model: "passthrough/auto",
-      modelEffective: "e2e/auto",
-      models: ["e2e/auto", "e2e/fast"],
+      model: "auto",
+      modelEffective: "auto",
+      models: ["passthrough/auto", "e2e/fast"],
       onModel,
     });
     await user.click(screen.getByTestId("effort-open-list"));
-    // One auto row (short label, full-id title), not two.
-    expect(screen.getAllByText("auto")).toHaveLength(1);
+    // One auto row, selected; the click posts the concrete catalog id.
     const autoRow = screen.getByTestId("model-option-auto");
+    expect(autoRow).toBeInTheDocument();
+    expect(screen.queryAllByTestId("model-option-auto")).toHaveLength(1);
     expect(autoRow).toHaveAttribute("data-selected", "1");
-    expect(autoRow.getAttribute("title")).toBe("e2e/auto");
-    // auto_model is the same automatic stop too (fresh mount).
-    cleanup();
-    const onModel2 = vi.fn();
-    const remount = render(
-      <EffortSlider
-        kind="claude"
-        index={2}
-        onChange={vi.fn()}
-        model="passthrough/auto_model"
-        modelEffective="passthrough/auto_model"
-        models={["passthrough/auto", "passthrough/auto_model"]}
-        onModel={onModel2}
-      />,
+  });
+
+  it("keeps vendor-prefixed /auto and /auto_model ids distinct from each other and from the sentinel", async () => {
+    // r26 r3 codex: vendor-a/auto vs vendor-b/auto are two real models;
+    // /auto vs /auto_model across providers never merge; e2e/auto is a
+    // concrete gateway model, not the passthrough follow-default sentinel.
+    const cases: Array<{ models: string[]; current: string; a: string; b: string }> = [
+      { models: ["vendor-a/auto", "vendor-b/auto"], current: "vendor-b/auto", a: "vendor-a/auto", b: "vendor-b/auto" },
+      { models: ["vendor-a/auto", "vendor-b/auto_model"], current: "vendor-b/auto_model", a: "vendor-a/auto", b: "vendor-b/auto_model" },
+      { models: ["e2e/auto", "e2e/fast"], current: "passthrough/auto", a: "e2e/auto", b: "passthrough/auto" },
+      { models: ["passthrough/auto", "passthrough/auto_model"], current: "passthrough/auto_model", a: "passthrough/auto", b: "passthrough/auto_model" },
+    ];
+    for (const { models, current, a, b } of cases) {
+      cleanup();
+      const onModel = vi.fn();
+      render(
+        <EffortSlider
+          kind="claude"
+          index={2}
+          onChange={vi.fn()}
+          model={current}
+          modelEffective={current}
+          models={models}
+          onModel={onModel}
+        />,
+      );
+      const user = userEvent.setup();
+      await user.click(screen.getByTestId("effort-open-list"));
+      // Colliding short labels render under full-id testids, never the bare
+      // model-option-auto slot.
+      const rowA = screen.getByTestId(`model-option-${a.replace(/[^a-zA-Z0-9]+/g, "-").toLowerCase()}`);
+      const rowB = screen.getByTestId(`model-option-${b.replace(/[^a-zA-Z0-9]+/g, "-").toLowerCase()}`);
+      expect(rowA).toBeInTheDocument();
+      expect(rowB).toBeInTheDocument();
+      expect(screen.queryAllByTestId("model-option-auto")).toHaveLength(0);
+      // Only the exact current full id is selected.
+      expect(rowA).toHaveAttribute("data-selected", a === current ? "1" : "0");
+      expect(rowB).toHaveAttribute("data-selected", "1");
+      // Each click posts its exact full id (a click closes the list, so
+      // reopen before the second).
+      await user.click(rowA);
+      expect(onModel).toHaveBeenLastCalledWith(a);
+      await user.click(screen.getByTestId("effort-open-list"));
+      await user.click(screen.getByTestId(`model-option-${b.replace(/[^a-zA-Z0-9]+/g, "-").toLowerCase()}`));
+      expect(onModel).toHaveBeenLastCalledWith(b);
+    }
+  });
+
+  it("matches a pending switch by exact full id, never the shared auto tail", async () => {
+    // r26 r3: a pending switch to vendor-b/auto marks only that row; the
+    // vendor-a/auto row must not inherit the pending state.
+    const user = userEvent.setup();
+    mount({
+      kind: "claude",
+      index: 2,
+      model: "vendor-a/auto",
+      modelEffective: "vendor-a/auto",
+      modelPending: { id: "vendor-b/auto", queued: true },
+      models: ["vendor-a/auto", "vendor-b/auto"],
+      onModel: vi.fn(),
+    });
+    await user.click(screen.getByTestId("effort-open-list"));
+    expect(screen.getByTestId("model-option-vendor-a-auto")).toHaveAttribute(
+      "data-model-pending",
+      "0",
     );
-    await user.click(remount.getByTestId("effort-open-list"));
-    expect(remount.getByTestId("model-option-auto")).toHaveAttribute("data-selected", "1");
-    expect(remount.queryAllByTestId("model-option-auto")).toHaveLength(1);
+    expect(screen.getByTestId("model-option-vendor-b-auto")).toHaveAttribute(
+      "data-model-pending",
+      "queued",
+    );
+  });
+
+  it("keeps an unlisted vendor-b/auto read-back as its own row when the catalog lists vendor-a/auto", async () => {
+    // r26 r3: the effective read-back id is appended with full-id identity;
+    // the catalog's vendor-a/auto must not swallow it.
+    const user = userEvent.setup();
+    mount({
+      kind: "claude",
+      index: 2,
+      model: "vendor-b/auto",
+      modelEffective: "vendor-b/auto",
+      models: ["vendor-a/auto", "e2e/fast"],
+      onModel: vi.fn(),
+    });
+    await user.click(screen.getByTestId("effort-open-list"));
+    const appended = screen.getByTestId("model-option-vendor-b-auto");
+    expect(appended).toBeInTheDocument();
+    expect(appended).toHaveAttribute("data-selected", "1");
+    expect(screen.getByTestId("model-option-vendor-a-auto")).toHaveAttribute("data-selected", "0");
   });
 
   it("appends a read-back running model that the catalog does not list", async () => {

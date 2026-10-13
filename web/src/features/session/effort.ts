@@ -640,24 +640,28 @@ export function shortModel(model: string | undefined): string {
   return tail;
 }
 
-/** Final segments that all name the provider's automatic model choice. */
-const AUTOMATIC_MODEL_TAILS = new Set(["auto", "auto_model"]);
-/** Explicit legacy passthrough ids for the automatic choice (no slash tail
- *  ambiguity). */
-const AUTOMATIC_MODEL_EXPLICIT = new Set(["passthrough/auto", "passthrough/auto_model"]);
-
 /**
- * Whether a FULL model id names the provider's automatic selection. This is
- * the ONE cross-id equivalence the picker collapses: `passthrough/auto`,
- * `e2e/auto`, `…/auto_model` all pick "automatic" (the driver resolves the
- * concrete model at launch). Nothing else is aliased — `vendor-a/shared`
- * and `vendor-b/shared` are distinct models matched by full id.
+ * The EXPLICIT full ids the client treats as its single built-in "automatic /
+ * follow model default" stop:
+ *
+ * - bare `auto` — the driver's built-in discovery alias
+ *   (`BUILTIN_MODEL_ALIASES` in model_discovery.rs: opus/sonnet/haiku/auto);
+ * - `passthrough/auto` — the web's unpinned new-session sentinel
+ *   (DEFAULT_MODELS here; the default stored pref).
+ *
+ * These two are the ONLY cross-id equivalence the picker collapses. The
+ * suffix alone is NOT evidence: the Hub and driver pass every other id
+ * verbatim and keep `passthrough/auto_model` distinct (a real
+ * `passthrough/auto_model/alwaysday1_max` id exists; provider_models.rs lists
+ * the two as separate rows), and gateway vendors publish concrete models
+ * named `vendor-a/auto` / `vendor-b/auto` which must stay separate rows with
+ * exact full-id selection, pending and posting.
  */
+const AUTOMATIC_MODEL_IDS = new Set(["auto", "passthrough/auto"]);
+
+/** Whether a FULL model id is one of the built-in automatic-stop aliases. */
 export function isAutomaticModelId(id: string | null | undefined): boolean {
-  const raw = (id ?? "").trim();
-  if (!raw) return false;
-  if (AUTOMATIC_MODEL_EXPLICIT.has(raw)) return true;
-  return AUTOMATIC_MODEL_TAILS.has(raw.split("/").pop() ?? "");
+  return AUTOMATIC_MODEL_IDS.has((id ?? "").trim());
 }
 
 /** Full-id identity with ONLY the known automatic-model fallback equivalence

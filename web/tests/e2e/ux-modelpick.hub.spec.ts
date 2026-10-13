@@ -419,6 +419,94 @@ test("distinct full ids sharing one final segment stay separate and post the ful
   );
 });
 
+test("vendor /auto ids are distinct full models: selection, pending and posting all stay exact", async ({ page }) => {
+  // r26 r3: a final "/auto" segment is NOT a cross-model alias. Only bare
+  // `auto` / `passthrough/auto` collapse; vendor-a/auto, vendor-b/auto and
+  // vendor-b/auto_model are concrete models with exact full-id identity.
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const tid = (id: string) =>
+    `model-option-${id.replace(/[^a-zA-Z0-9]+/g, "-").toLowerCase()}`;
+  const postConfigure = async (id: string, model: string) =>
+    page.evaluate(
+      async ({ id, model }) => {
+        const res = await fetch(`/v1/instances/${id}/commands`, {
+          method: "POST",
+          credentials: "include",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ operation: "instance.configure", payload: { model } }),
+        });
+        return res.ok;
+      },
+      { id, model },
+    );
+  const waitForJournal = async (id: string, needle: string) =>
+    expect
+      .poll(
+        () =>
+          page.evaluate(
+            ({ id, needle }) =>
+              fetch(`/v1/instances/${id}/journal`, { credentials: "include" })
+                .then((r) => r.json())
+                .then((d) => (d.events ?? []).some((e: unknown) => JSON.stringify(e).includes(needle))),
+            { id, needle },
+          ),
+        { timeout: 10_000 },
+      )
+      .toBe(true);
+
+  // Case 1+2: both vendor ids listed (same-spelling and /auto vs /auto_model).
+  for (const { prompt, other, current } of [
+    { prompt: "Model colliding-auto-model identity", other: "vendor-a/auto", current: "vendor-b/auto" },
+    { prompt: "Model colliding-auto-model-2 identity", other: "vendor-a/auto", current: "vendor-b/auto_model" },
+  ] as const) {
+    const instanceId = await createSession(page, prompt);
+    await page.reload();
+    await page.getByTestId("model-effort-chip").waitFor({ timeout: 20_000 });
+    await clearApprovals(page, instanceId);
+    // Resolve the running model to the vendor-b id (accepted configure), then
+    // queue a separate pending switch to vendor-a.
+    expect(await postConfigure(instanceId, current)).toBe(true);
+    await waitForJournal(instanceId, `"id":"${current}"`);
+    expect(await postConfigure(instanceId, `__queued__:${other}`)).toBe(true);
+    await waitForJournal(instanceId, "model-queued");
+
+    await openModelList(page);
+    await expect(page.getByTestId(tid(other))).toBeVisible();
+    await expect(page.getByTestId(tid(current))).toBeVisible();
+    expect(await page.getByTestId("model-option-auto").count()).toBe(0);
+    expect(page.getByTestId(tid(current))).toHaveAttribute("data-selected", "1");
+    expect(page.getByTestId(tid(other))).toHaveAttribute("data-selected", "0");
+    expect(page.getByTestId(tid(other))).toHaveAttribute("data-model-pending", "queued");
+    expect(page.getByTestId(tid(current))).toHaveAttribute("data-model-pending", "0");
+
+    // Clicking posts the exact full id.
+    const request = page.waitForRequest(
+      (r) =>
+        r.method() === "POST" &&
+        r.url().endsWith(`/v1/instances/${instanceId}/commands`) &&
+        r.postDataJSON()?.operation === "instance.configure",
+    );
+    await page.getByTestId(tid(other)).click();
+    expect((await request).postDataJSON().payload.model).toBe(other);
+  }
+
+  // Case 3: catalog lists ONLY vendor-a/auto; the vendor-b read-back is an
+  // unlisted running model and must be appended as its own selected row.
+  const instanceId = await createSession(page, "Model auto-append identity");
+  await page.reload();
+  await page.getByTestId("model-effort-chip").waitFor({ timeout: 20_000 });
+  await clearApprovals(page, instanceId);
+  expect(await postConfigure(instanceId, "vendor-b/auto")).toBe(true);
+  await waitForJournal(instanceId, '"id":"vendor-b/auto"');
+  await openModelList(page);
+  await expect(page.getByTestId(tid("vendor-a/auto"))).toBeVisible();
+  const appended = page.getByTestId(tid("vendor-b/auto"));
+  await expect(appended).toBeVisible();
+  expect(appended).toHaveAttribute("data-selected", "1");
+  expect(page.getByTestId(tid("vendor-a/auto"))).toHaveAttribute("data-selected", "0");
+  expect(await page.getByTestId("model-option-auto").count()).toBe(0);
+});
+
 test.afterEach(async ({ page }) => {
   for (const id of created.splice(0)) {
     await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);

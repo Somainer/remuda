@@ -1557,7 +1557,21 @@ async fn queued_land_job(ctx: &Ctx) -> String {
 /// Drive a GENUINE base-moved requeue through the production path (no raw
 /// SQL): after attempt 1 is claimed, deliver its base-moved verdict through
 /// the real `apply_result` writer (Running → Queued), then claim attempt 2.
+///
+/// r17 item 2: like the production Node's CAS-loss branch, the verdict
+/// PRESERVES the exact granted merge pinned at verify (read from the live row)
+/// — every Landing transition, including a requeue, must name that merge.
 async fn genuine_requeue_to_attempt_two(ctx: &Ctx, job_id: &str) {
+    let granted_merge = ctx
+        .hub
+        .test_get_gate_job(job_id)
+        .await
+        .unwrap()
+        .and_then(|doc| {
+            doc.get("mergeSha")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
     ctx.hub
         .test_apply_gate_result(
             job_id,
@@ -1565,6 +1579,7 @@ async fn genuine_requeue_to_attempt_two(ctx: &Ctx, job_id: &str) {
                 "jobId": job_id,
                 "generation": 1,
                 "status": "base-moved",
+                "mergeSha": granted_merge,
                 "currentMainSha": "0123456789abcdef0123456789abcdef01234567",
             }),
         )
@@ -3750,13 +3765,14 @@ async fn a_probe_for_an_older_attempt_never_settles_a_newer_landing() {
     assert_eq!(current["mergeSha"], json!(merge2), "{current}");
 }
 
-/// r16 item 5: a `base-moved` verdict on a Landing row is the CAS-LOSS
-/// requeue, not a terminal merge outcome — it must requeue even though it
-/// carries no merge sha (the granted merge provably did not land), clearing
-/// the old granted merge for a fresh verify. The merge bind only gates
-/// terminal landed/failed verdicts.
+/// r17 item 2: a `base-moved` verdict is the CAS-LOSS requeue, and like every
+/// other Landing transition it must name the EXACT granted merge (the
+/// production Node preserves the pinned merge on its CAS-loss branch). With
+/// the merge present it requeues and clears mergeSha for a fresh verify; a
+/// base-moved verdict missing the granted merge is a separate regression
+/// below and must NOT discard the Landing.
 #[tokio::test]
-async fn a_base_moved_landing_verdict_without_a_merge_sha_still_requeues() {
+async fn a_base_moved_landing_verdict_naming_the_granted_merge_requeues() {
     let (ctx, _node) = Ctx::boot().await.unwrap();
     ctx.configure_gate_lane().await;
     let job_id = queued_land_job(&ctx).await;
@@ -3774,8 +3790,7 @@ async fn a_base_moved_landing_verdict_without_a_merge_sha_still_requeues() {
         .unwrap();
     assert_eq!(grant["granted"], json!(true), "{grant}");
 
-    // CAS loss, no mergeSha in the verdict (it names the new remote base, not
-    // the old merge).
+    // CAS loss carrying the granted merge (the Node retains the pinned sha).
     ctx.hub
         .test_apply_gate_result(
             &job_id,
@@ -3783,6 +3798,7 @@ async fn a_base_moved_landing_verdict_without_a_merge_sha_still_requeues() {
                 "jobId": job_id,
                 "generation": 1,
                 "status": "base-moved",
+                "mergeSha": merge,
                 "currentMainSha": "fedcba9876543210fedcba9876543210fedcba98",
             }),
         )
@@ -3799,6 +3815,57 @@ async fn a_base_moved_landing_verdict_without_a_merge_sha_still_requeues() {
         doc["mergeSha"].is_null(),
         "the old granted merge is cleared: {doc}"
     );
+}
+
+/// r17 item 2: a `base-moved` verdict that does NOT name the granted merge is
+/// a mismatched outcome and must be dropped, leaving the Landing intact — the
+/// granted merge is required for EVERY Landing transition.
+#[tokio::test]
+async fn a_base_moved_landing_verdict_without_the_granted_merge_is_dropped() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let job_id = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let merge = "3434343434343434343434343434343434343434";
+    let other = "5656565656565656565656565656565656565656";
+    let session = ctx.hub.test_node_session(&ctx.host).await.unwrap();
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge, session)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+
+    for verdict_merge in [None, Some(other)] {
+        ctx.hub
+            .test_apply_gate_result(
+                &job_id,
+                json!({
+                    "jobId": job_id,
+                    "generation": 1,
+                    "status": "base-moved",
+                    "mergeSha": verdict_merge,
+                    "currentMainSha": "fedcba9876543210fedcba9876543210fedcba98",
+                }),
+            )
+            .await
+            .unwrap();
+        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+        assert_eq!(
+            doc["state"],
+            json!("landing"),
+            "a merge-less/wrong-merge base-moved must not discard the Landing: {doc}"
+        );
+        assert_eq!(
+            doc["mergeSha"],
+            json!(merge),
+            "the granted merge is retained: {doc}"
+        );
+    }
 }
 
 /// r15 item 3 (R2): a carrier TAKEOVER landing in the window between a

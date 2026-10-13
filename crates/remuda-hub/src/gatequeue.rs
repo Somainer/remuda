@@ -1898,17 +1898,19 @@ pub(crate) async fn apply_result(
                     );
                     return None;
                 }
-                // r16 item 5: bind the GRANTED MERGE inside the writer for the
-                // TERMINAL merge outcomes. A `landed`/`failed` verdict settles
+                // r16 item 5 / r17 item 2: bind the GRANTED MERGE inside the
+                // writer for EVERY Landing transition that moves the row
+                // (landed / failed / base-moved). A verdict settles or requeues
                 // THIS Landing only when it names the exact merge the grant
-                // recorded; a landed verdict for a different sha or one with no
-                // merge identity stands down and leaves the row Landing.
-                // base-moved is deliberately NOT bound: it is the CAS-loss
-                // requeue transition proving the granted merge did NOT land
-                // (the local main was stale), and it clears mergeSha on the
-                // Queued row below so a re-verification must pin a new merge.
-                if result.status != "base-moved"
-                    && result.status != "uncertain"
+                // recorded; a verdict for a different sha or one with no merge
+                // identity stands down and leaves the row Landing. The
+                // production Node preserves the granted merge on its CAS-loss
+                // (base-moved) branch (the merge was pinned at verify and is
+                // retained on the result), so requiring it there loses no real
+                // verdict but blocks a mismatched frame from discarding the
+                // granted Landing. uncertain is exempt because it never moves
+                // the row.
+                if result.status != "uncertain"
                     && let Some(granted_merge) = row.merge_sha.as_deref()
                     && result.merge_sha.as_deref().filter(|sha| !sha.is_empty())
                         != Some(granted_merge)
@@ -1916,6 +1918,7 @@ pub(crate) async fn apply_result(
                     tracing::info!(
                         ?granted_merge,
                         verdict_merge = ?result.merge_sha,
+                        verdict_status = %result.status,
                         "dropping Landing verdict in writer: merge does not match the granted merge"
                     );
                     return None;

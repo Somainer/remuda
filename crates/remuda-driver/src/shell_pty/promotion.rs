@@ -188,6 +188,16 @@ impl BindingHandle {
         }
     }
 
+    /// Whether this handle's current epoch holds an established transcript
+    /// claim (c-ctxusage r21 item 1 test seam).
+    #[cfg(feature = "test-faults")]
+    pub(super) fn is_bound(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|slot| slot.binding.is_some())
+            .unwrap_or(false)
+    }
+
     /// Start a fresh promotion epoch: drop every claim, the degraded flag, the
     /// picker, and unmatched hook reports, and record the identity paths.
     fn begin_epoch(&self, cwd: &Path, claude_home: &Path) {

@@ -470,8 +470,12 @@ pub struct ShellPtyDriver {
     promoted: std::sync::Mutex<Arc<std::sync::Mutex<Option<Detected>>>>,
     /// Screen-derived readiness of the current run's agent, when promoted.
     status: std::sync::Mutex<Arc<std::sync::Mutex<Option<ScreenStatus>>>>,
-    /// Deterministic transcript binding for the current promotion epoch.
-    bindings: promotion::BindingHandle,
+    /// Per-run transcript-binding claim (c-ctxusage r21 item 1). Like the
+    /// promoted/status slots, each run owns its OWN `BindingHandle`; the outer
+    /// mutex swaps which handle is current when a same-driver resume adopts a
+    /// new run. Sharing one handle across two live pollers let the resumed run
+    /// bind the predecessor's transcript via its inherited claim.
+    bindings: std::sync::Mutex<promotion::BindingHandle>,
     /// Promotion poller, stopped on close.
     poller: Mutex<Option<JoinHandle<()>>>,
     /// One close owner for the whole close (c-ctxusage r17 item 3): an
@@ -701,7 +705,7 @@ impl ShellPtyDriver {
             inner: Mutex::new(None),
             promoted: std::sync::Mutex::new(Arc::new(std::sync::Mutex::new(None))),
             status: std::sync::Mutex::new(Arc::new(std::sync::Mutex::new(None))),
-            bindings: promotion::BindingHandle::empty(),
+            bindings: std::sync::Mutex::new(promotion::BindingHandle::empty()),
             poller: Mutex::new(None),
             close_phase: tokio::sync::Mutex::new(()),
             poller_shutdown: Mutex::new(None),
@@ -745,7 +749,7 @@ impl ShellPtyDriver {
     /// Safe to call when promotion is off or no agent is foreground — the
     /// report is matched at the next promotion tick.
     pub fn ingest_session_start(&self, report: crate::claude_transcript::SessionStartReport) {
-        self.bindings.ingest_session_start(report);
+        self.current_bindings().ingest_session_start(report);
     }
 
     /// Currently promoted agent kind, if the PTY's foreground is an agent CLI.
@@ -823,6 +827,27 @@ impl ShellPtyDriver {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
         .addr()
+    }
+
+    /// Clone the current run's binding handle (c-ctxusage r21 item 1): the
+    /// poller captures the handle at spawn, and a resume swaps the current one
+    /// only after the predecessor retires.
+    fn current_bindings(&self) -> promotion::BindingHandle {
+        self.bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether the current run's binding handle holds an established transcript
+    /// claim (c-ctxusage r21 item 1 test seam).
+    #[cfg(feature = "test-faults")]
+    #[must_use]
+    pub fn test_bindings_is_bound(&self) -> bool {
+        self.bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_bound()
     }
 
     /// Answer an ignored hook decision on the agent's own dialog, once (§14 risk 1).
@@ -1552,7 +1577,7 @@ impl ShellPtyDriver {
                 Arc::clone(&self.table),
                 promoted,
                 status,
-                self.bindings.clone(),
+                self.current_bindings(),
                 hooks,
                 matches!(self.options.target, Target::Shell),
                 self.options.auto_trust_workspace,
@@ -1805,11 +1830,12 @@ impl ShellPtyDriver {
             .unwrap_or_else(|| std::time::Duration::from_secs(15));
         let finalised = self.poller_finalised.lock().await.take();
         if let Some(mut poller) = self.poller.lock().await.take() {
-            let finished = if let Some(finalised) = finalised {
+            let mut finalised = finalised;
+            let finished = if let Some(finalised) = finalised.as_mut() {
                 tokio::pin!(finalised);
                 tokio::time::timeout(promoter_timeout, async {
                     tokio::select! {
-                        _ = &mut finalised => {}
+                        _ = finalised => {}
                         _ = &mut poller => {}
                     }
                 })
@@ -2191,15 +2217,18 @@ impl ShellPtyDriver {
             },
             Arc::clone(&self.table),
         );
-        // The resumed run gets its OWN fresh detection slots (c-ctxusage r20
-        // item 1): promoted/status are per-run state the poller writes. It is
-        // spawned with those fresh slots FIRST; only after a SUCCESSFUL spawn
-        // is the predecessor retired and the new run's slots adopted as this
-        // driver's current ones. Sharing self's slots here (the old shape)
-        // meant a run-2 bind raced predecessor retirement's slot clear.
-        // Bindings, pid/interrupt/seq coordination and the exit journal stay
-        // shared — they are not detection slots.
-        resumed.bindings = self.bindings.clone();
+        // The resumed run gets its OWN fresh detection AND binding state
+        // (c-ctxusage r20 item 1 / r21 item 1): promoted/status are per-run
+        // state the poller writes, and the BindingHandle is the run's own
+        // transcript claim. It is spawned with those fresh handles FIRST;
+        // only after a SUCCESSFUL spawn is the predecessor retired and the new
+        // run's handles adopted as this driver's current ones. Sharing self's
+        // slots/bindings here (the old shape) meant run 2 could bind the
+        // predecessor's transcript via its inherited claim and race
+        // predecessor retirement. `resumed` already constructed its own empty
+        // BindingHandle, so nothing is assigned here. Pid/interrupt/seq
+        // coordination and the exit journal stay shared — they are not
+        // per-run detection or binding state.
         resumed.interrupt_pid = Arc::clone(&self.interrupt_pid);
         resumed.interrupt_screen_markers = Arc::clone(&self.interrupt_screen_markers);
         resumed.exited = Arc::clone(&self.exited);
@@ -2247,8 +2276,7 @@ impl ShellPtyDriver {
         // predecessor until the new run's poller task is actually live
         // (two poller spawns: predecessor + run 2). In production the spawn
         // handle already implies the task is registered; this ack wait exists
-        // only when faults are injected so a race test can assert run 2's
-        // poller exists BEFORE the predecessor finalise parks.
+        // only when faults are injected.
         if self
             .test_faults
             .lock()
@@ -2279,6 +2307,13 @@ impl ShellPtyDriver {
         }
         if let Ok(mut status) = self.status.lock() {
             *status = resumed.current_status();
+        }
+        // Adopt the NEW run's binding handle (c-ctxusage r21 item 1): the
+        // resumed poller captured this same handle at spawn; from here the
+        // driver's picker/SessionStart ingest operates the current run's
+        // claim, never the predecessor's.
+        if let Ok(mut bindings) = self.bindings.lock() {
+            *bindings = resumed.current_bindings();
         }
         *self.poller.lock().await = resumed.poller.lock().await.take();
         *self.poller_shutdown.lock().await = resumed.poller_shutdown.lock().await.take();
@@ -3280,7 +3315,7 @@ impl Driver for ShellPtyDriver {
         }
         // The only structured question a shell-pty asks is the manual
         // transcript picker; its answer deterministically binds the epoch.
-        self.bindings
+        self.current_bindings()
             .answer(&id, &answer)
             .map_err(DriverError::InvalidLaunchSpec)?;
         Ok(DriverAck::transport_written())
@@ -3437,7 +3472,7 @@ impl Driver for ShellPtyDriver {
         }
         self.interrupt_pid.store(0, Ordering::SeqCst);
         // Drop any transcript claim so a respawn starts a fresh epoch.
-        self.bindings.demobilize();
+        self.current_bindings().demobilize();
         let Some(state) = self.inner.lock().await.take() else {
             return Ok(DriverAck::not_dispatched());
         };

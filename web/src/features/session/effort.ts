@@ -641,25 +641,23 @@ export function shortModel(model: string | undefined): string {
 }
 
 /**
- * The EXPLICIT full ids the client treats as its single built-in "automatic /
- * follow model default" stop:
+ * The ONLY automatic-model alias established by production: bare `auto`,
+ * the driver's built-in discovery alias
+ * (`BUILTIN_MODEL_ALIASES` in crates/remuda-driver/src/model_discovery.rs —
+ * opus/sonnet/haiku/auto), which the agent binary itself resolves.
  *
- * - bare `auto` — the driver's built-in discovery alias
- *   (`BUILTIN_MODEL_ALIASES` in model_discovery.rs: opus/sonnet/haiku/auto);
- * - `passthrough/auto` — the web's unpinned new-session sentinel
- *   (DEFAULT_MODELS here; the default stored pref).
- *
- * These two are the ONLY cross-id equivalence the picker collapses. The
- * suffix alone is NOT evidence: the Hub and driver pass every other id
- * verbatim and keep `passthrough/auto_model` distinct (a real
- * `passthrough/auto_model/alwaysday1_max` id exists; provider_models.rs lists
- * the two as separate rows), and gateway vendors publish concrete models
- * named `vendor-a/auto` / `vendor-b/auto` which must stay separate rows with
- * exact full-id selection, pending and posting.
+ * Nothing else is aliased. In particular `passthrough/auto` is a CONCRETE
+ * passthrough-namespace id: the driver writes the requested model verbatim
+ * into the launch settings (crates/remuda-driver/src/launch/user.rs —
+ * merged["model"] is passed through unchanged) and `passthrough/<id>` is a
+ * full model id namespace (crates/remuda-hub/src/supply.rs pin/suggestion
+ * handling, e.g. passthrough/ark/model-y). Production contains no
+ * passthrough/auto → auto mapping, so the picker must not treat them as the
+ * same model. Gateway vendors' own `…/auto` ids are concrete too.
  */
-const AUTOMATIC_MODEL_IDS = new Set(["auto", "passthrough/auto"]);
+const AUTOMATIC_MODEL_IDS = new Set(["auto"]);
 
-/** Whether a FULL model id is one of the built-in automatic-stop aliases. */
+/** Whether a FULL model id is the built-in automatic-stop alias. */
 export function isAutomaticModelId(id: string | null | undefined): boolean {
   return AUTOMATIC_MODEL_IDS.has((id ?? "").trim());
 }

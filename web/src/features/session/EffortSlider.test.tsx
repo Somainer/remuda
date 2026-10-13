@@ -284,10 +284,11 @@ describe("EffortSlider tier/model list", () => {
     expect(onModel).toHaveBeenCalledWith("vendor-a/shared");
   });
 
-  it("collapses only the built-in automatic aliases (bare auto and passthrough/auto)", async () => {
-    // r26 r3: the equivalence set is EXPLICIT — the driver builtin alias
-    // `auto` (model_discovery.rs BUILTIN_MODEL_ALIASES) and the web sentinel
-    // `passthrough/auto` name the same follow-default stop.
+  it("keeps bare auto as the only automatic alias; passthrough/auto is a concrete id", async () => {
+    // r26 r4 item 1: production establishes only bare `auto` as the builtin
+    // alias (model_discovery.rs BUILTIN_MODEL_ALIASES). passthrough/auto is a
+    // passthrough-namespace concrete id passed verbatim, so it stays its own
+    // row even when bare auto is the running model.
     const user = userEvent.setup();
     const onModel = vi.fn();
     mount({
@@ -299,11 +300,15 @@ describe("EffortSlider tier/model list", () => {
       onModel,
     });
     await user.click(screen.getByTestId("effort-open-list"));
-    // One auto row, selected; the click posts the concrete catalog id.
-    const autoRow = screen.getByTestId("model-option-auto");
-    expect(autoRow).toBeInTheDocument();
-    expect(screen.queryAllByTestId("model-option-auto")).toHaveLength(1);
-    expect(autoRow).toHaveAttribute("data-selected", "1");
+    // Bare auto keeps the plain slot and is selected; the passthrough id gets
+    // its own full-id row (short labels collide).
+    const bareAuto = screen.getByTestId("model-option-auto");
+    const passthroughAuto = screen.getByTestId("model-option-passthrough-auto");
+    expect(bareAuto).toHaveAttribute("data-selected", "1");
+    expect(passthroughAuto).toHaveAttribute("data-selected", "0");
+    // Clicking the passthrough row posts its full concrete id, never bare auto.
+    await user.click(passthroughAuto);
+    expect(onModel).toHaveBeenCalledWith("passthrough/auto");
   });
 
   it("keeps vendor-prefixed /auto and /auto_model ids distinct from each other and from the sentinel", async () => {

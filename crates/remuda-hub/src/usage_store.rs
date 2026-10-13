@@ -93,6 +93,45 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     tx.commit()
 }
 
+/// Test-only sentinel table: while it exists, the usage migration fails AFTER
+/// its additive DDL, inside the migration transaction — a deterministic,
+/// per-database stand-in for an exhausted disk / SQL error that rolls the
+/// whole migration back (c-usagefu r15 item 1). Not a global flag, so parallel
+/// tests opening their own stores are unaffected.
+#[cfg(any(test, feature = "test-faults"))]
+const TEST_FORCE_FAILURE_TABLE: &str = "remuda_test_force_usage_migration_failure";
+
+#[cfg(any(test, feature = "test-faults"))]
+fn test_failure_forced(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master
+         WHERE type = 'table' AND name = ?1",
+        [TEST_FORCE_FAILURE_TABLE],
+        |row| row.get(0),
+    )
+}
+
+/// Whether the OPEN database carries the final usage schema. The migration is
+/// ONE atomic transaction (Ruling M1), so every post-main column exists iff a
+/// migration committed; `scope_id` is the first such column the origin/main
+/// shape lacks. A failed migration rolls the DDL back too, leaving the main
+/// shape — reads must then degrade to Unknown instead of issuing SQL that
+/// references missing columns (c-usagefu r15 item 1). A missing
+/// `usage_events` table (nothing ever ingested, migration rolled back) is the
+/// same legacy shape.
+pub(crate) fn usage_schema_is_current(conn: &Connection) -> rusqlite::Result<bool> {
+    let table_exists: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master
+         WHERE type = 'table' AND name = 'usage_events'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(false);
+    }
+    crate::store::column_exists(conn, "usage_events", "scope_id")
+}
+
 /// All usage migration steps, in order. Runs inside [`migrate`]'s single
 /// transaction: every helper here must do its work on `conn` WITHOUT opening
 /// a nested transaction.
@@ -156,17 +195,13 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     // c-usagefu (c): native per-model context window reported on the payload.
     crate::store::ensure_column(conn, "usage_events", "native_context_window", "INTEGER")?;
-    // c-usagefu r13 item 2 (COORDINATOR RULING U1): origin/main's projection
-    // did not persist the payload's scopeId even though main's adapter sent it
-    // and the durable JOURNAL retains it verbatim. A main-shape codex Turn row
-    // therefore arrived here with scope_id NULL; after the upgrade a byte-zero
-    // replay emits the same calls as durable Messages keyed by their native
-    // turn id, and the coverage proof pairs Message.turn_id with the Turn's
-    // scope_id — a NULL there could never match, so the Turn AND its replayed
-    // Messages would both bill. Recover scope_id from the journal for every
-    // still-unscoped usage row (Turn AND Session: main dropped it on both).
-    // Rows this branch wrote already carry it and are untouched; when no
-    // journal table exists (unit fixtures) the guard makes this a no-op.
+    // c-usagefu r15 item 1 test seam: a forced failure AFTER the additive DDL
+    // rolls the columns back too, exercising the legacy-shape fallback. The
+    // failing statement is a real SQL error inside the migration transaction.
+    #[cfg(any(test, feature = "test-faults"))]
+    if test_failure_forced(conn)? {
+        conn.execute_batch("SELECT remuda_test_force_usage_migration_failure();")?;
+    }
     backfill_scope_ids_from_journal(conn)?;
     // Now the columns exist on both a fresh CREATE and an upgraded DB.
     //
@@ -465,6 +500,14 @@ fn consolidate_message_duplicates(conn: &Connection) -> rusqlite::Result<()> {
 /// at one poll and then a later same-message-id record with different counters
 /// (c-ctxusage r3 item 1) replaces the provisional row with the final one.
 pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+    // c-usagefu r15 item 1: on a database whose usage migration never
+    // committed (the legacy origin/main shape), record the event through
+    // main's plain insert path so usage keeps landing durably — a later
+    // successful migration's journal backfill recovers the scope ids. The
+    // scoped upsert paths reference columns the legacy table does not have.
+    if !usage_schema_is_current(conn)? {
+        return insert_legacy_row(conn, row);
+    }
     match (row.scope.as_str(), row.scope_id.as_deref()) {
         ("turn", Some(_)) => upsert_turn_snapshot(conn, row),
         ("session", Some(_)) => insert_session_growth_point(conn, row),
@@ -472,6 +515,37 @@ pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::R
         (_, None) => insert_row(conn, row),
         _ => insert_row(conn, row),
     }
+}
+
+/// origin/main's projection insert: 14 columns, append-only `INSERT OR
+/// IGNORE` on `(instance_id, seq)`. Used ONLY while the database is still on
+/// the legacy shape (a rolled-back migration); the journal retains the full
+/// event, so the post-migration backfill loses nothing.
+fn insert_legacy_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO usage_events
+            (instance_id, seq, profile_id, model, scope, mode, total_tokens,
+             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+             cost_usd, accounting, observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            row.instance_id,
+            row.seq,
+            row.profile_id,
+            row.model,
+            row.scope,
+            row.mode,
+            row.total_tokens,
+            row.input_tokens,
+            row.output_tokens,
+            row.cache_read_tokens,
+            row.cache_write_tokens,
+            row.cost_usd,
+            row.accounting,
+            row.observed_at,
+        ],
+    )?;
+    Ok(inserted > 0)
 }
 
 /// Query every cumulative session stock a new scoped point must not move
@@ -1460,6 +1534,12 @@ pub fn aggregate_instance(
     conn: &Connection,
     instance_id: &str,
 ) -> rusqlite::Result<UsageAggregate> {
+    // c-usagefu r15 item 1: a rolled-back migration leaves a shape the
+    // new-schema aggregate SQL cannot run against; report an empty aggregate
+    // (budget band Ok, no spend evidence) rather than fail the endpoint.
+    if !usage_schema_is_current(conn)? {
+        return Ok(UsageAggregate::default());
+    }
     let sql = cost_select_sql(
         "instance_id = ?1",
         "flow.instance_id = ?2",
@@ -1486,6 +1566,10 @@ pub fn aggregate_supply(
     profile_id: &str,
     model: &str,
 ) -> rusqlite::Result<UsageAggregate> {
+    // c-usagefu r15 item 1: legacy-shape fallback, see [`aggregate_instance`].
+    if !usage_schema_is_current(conn)? {
+        return Ok(UsageAggregate::default());
+    }
     // Six bindings: stock CTE (profile, model), flow subquery (profile,
     // model), outer count/token totals (profile, model).
     let sql = cost_select_sql(
@@ -2028,6 +2112,13 @@ pub fn rollup_instance(
     conn: &Connection,
     req: &RollupRequest<'_>,
 ) -> rusqlite::Result<Option<InstanceUsageRollup>> {
+    // c-usagefu r15 item 1: the rollup SQL references final-schema columns
+    // (scope_id/turn_id/observed_at_source). On a database the usage migration
+    // could not upgrade it reports Unknown (`None`) instead of failing the
+    // instance list/detail load — Hub APIs stay usable on the legacy shape.
+    if !usage_schema_is_current(conn)? {
+        return Ok(None);
+    }
     let instance_id = req.instance_id;
     // Turn count over the ELIGIBLE flow rows: distinct turn id of every
     // Message, distinct scope_id of every unmatched modern Turn, plus one
@@ -4203,6 +4294,220 @@ mod tests {
             row_count, 2,
             "neither original row was collapsed or deleted"
         );
+    }
+
+    #[test]
+    fn a_rolled_back_usage_migration_degrades_reads_to_unknown_and_keeps_recording() {
+        // c-usagefu r15 item 1: after a migration that fails and rolls back
+        // (here the deterministic test sentinel), every usage READ must be
+        // routed by the actual schema shape: the rollup is Unknown and the
+        // aggregates are empty — never a SQL error against the missing
+        // columns. Writes keep landing on the legacy insert path, and a later
+        // successful migration recovers the data.
+        let conn = Connection::open_in_memory().unwrap();
+        create_main_shaped_usage_tables(&conn);
+        let at = "2026-10-13T00:00:00.000Z";
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, mode, input_tokens, output_tokens,
+                 accounting, observed_at)
+             VALUES ('ins_r15legacy', 1, 'turn', 'snapshot', 40, 30,
+                     'estimated', ?1)",
+            params![at],
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TABLE remuda_test_force_usage_migration_failure (x);")
+            .unwrap();
+
+        let failed = migrate(&conn);
+        assert!(
+            failed.is_err(),
+            "the sentinel forces a real failing statement inside the migration tx"
+        );
+        assert!(
+            !crate::store::column_exists(&conn, "usage_events", "scope_id").unwrap(),
+            "the additive DDL rolled back with the failed transaction"
+        );
+
+        // Every read degrades; no "no such column" error.
+        let req = RollupRequest {
+            instance_id: "ins_r15legacy",
+            kind: "codex",
+            spec_model: Some("gpt-5.4"),
+            effective_model: None,
+            profile_id: Some("pvp_r15"),
+        };
+        assert!(
+            rollup_instance(&conn, &req).unwrap().is_none(),
+            "usage reports Unknown on the legacy shape, never a SQL error"
+        );
+        assert_eq!(
+            aggregate_instance(&conn, "ins_r15legacy").unwrap().events,
+            0
+        );
+        assert_eq!(
+            aggregate_supply(&conn, "pvp_r15", "gpt-5.4")
+                .unwrap()
+                .events,
+            0
+        );
+
+        // Writes keep recording through main's insert path (seq 2).
+        let legacy_row = UsageEventRow {
+            instance_id: "ins_r15legacy".into(),
+            seq: 2,
+            profile_id: Some("pvp_r15".into()),
+            model: Some("gpt-5.4".into()),
+            scope: "turn".into(),
+            scope_id: Some("must-not-be-persisted".into()),
+            turn_id: None,
+            mode: "snapshot".into(),
+            total_tokens: Some(70),
+            input_tokens: Some(40),
+            output_tokens: Some(30),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: Some("0.07".into()),
+            accounting: "estimated".into(),
+            observed_at: at.into(),
+            observed_at_source: "native".into(),
+            native_context_window: None,
+            metric_revision: 1,
+        };
+        assert!(insert_usage_event(&conn, &legacy_row).unwrap());
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE instance_id='ins_r15legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "the event was recorded on the legacy shape");
+
+        // Once the failure condition is gone the migration commits and the
+        // rollup reads the recovered rows again.
+        conn.execute_batch("DROP TABLE remuda_test_force_usage_migration_failure;")
+            .unwrap();
+        migrate(&conn).unwrap();
+        assert!(crate::store::column_exists(&conn, "usage_events", "scope_id").unwrap());
+        assert_eq!(
+            rollup_instance(&conn, &req).unwrap().unwrap().turns,
+            2,
+            "the two recorded legacy NULL-scope turns fold again after recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_usage_migration_leaves_every_instance_api_usable_with_usage_unknown() {
+        // c-usagefu r15 item 1, the endpoint regression: with a PERSISTENT
+        // migration failure (the sabotaged index name collides on every open)
+        // the Hub opens and the instance list/detail/usage paths all SUCCEED —
+        // the detail load runs the real rollup SQL, which must route by the
+        // legacy schema shape and report usage Unknown rather than surface a
+        // SQL error.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hub.sqlite");
+        let at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        {
+            let pre = Connection::open(&db_path).unwrap();
+            create_main_shaped_usage_tables(&pre);
+            let row = real_codex_turn_counters(
+                tempfile::tempdir().unwrap().path(),
+                "r15m1api",
+                "t1",
+                1000,
+                100,
+                &at,
+            );
+            insert_main_turn_with_journal(&pre, "ins_r15m1api", 1, "t1", &row, &at);
+            pre.execute_batch("CREATE TABLE usage_events_turn_dedupe(x TEXT NOT NULL);")
+                .unwrap();
+        }
+
+        let store = crate::store::Store::open(dir.path())
+            .expect("Hub opens despite the persistently failing migration");
+
+        // A real enrolled host and instance so list/detail load actual rows.
+        let host_id: String = remuda_protocol::HostId::new().into();
+        // 64 hex chars: the token-prefix index only covers that shape.
+        let token = "a".repeat(64);
+        store
+            .insert_enroll_token(
+                token.clone(),
+                crate::auth::token_prefix(&token).map(str::to_string),
+                "dev_test".into(),
+                "2099-01-01T00:00:00.000Z".into(),
+            )
+            .await
+            .unwrap();
+        store
+            .authenticate_host(
+                crate::store::HostAuthRequest {
+                    presented: token,
+                    hello_host_id: Some(host_id.clone()),
+                    label: Some("r15m1-node".into()),
+                    node_version: Some("test".into()),
+                },
+                |presented, hash| presented == hash,
+                |_| Ok("test-hash".into()),
+            )
+            .await
+            .expect("host enrolls");
+        let instance = store
+            .insert_instance(
+                host_id,
+                None,
+                "codex".into(),
+                "shell-pty".into(),
+                Some("r15m1 instance".into()),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("instance insert");
+        let instance_id = instance.instance_id.clone();
+
+        // LIST: every row runs rollup_instance inside the load mapping.
+        let listed = store
+            .list_instances(None)
+            .await
+            .expect("instance list succeeds on the legacy usage shape");
+        assert!(
+            listed
+                .iter()
+                .any(|record| record.instance_id == instance_id),
+            "the instance is listed"
+        );
+        assert!(
+            listed.iter().all(|record| record.usage_rollup.is_none()),
+            "usage is Unknown for every row on the legacy shape, no SQL error"
+        );
+
+        // DETAIL: same load path, single instance.
+        let detail = store
+            .get_instance(instance_id.clone())
+            .await
+            .expect("instance detail succeeds")
+            .expect("the instance exists");
+        assert!(
+            detail.usage_rollup.is_none(),
+            "detail reports usage Unknown on the legacy shape"
+        );
+
+        // USAGE endpoint query: empty aggregate, never an error.
+        let agg = store
+            .run_named("r15m1_usage", move |conn| {
+                aggregate_instance(conn, &instance_id).map_err(crate::store::StoreError::from)
+            })
+            .await
+            .expect("the usage aggregate query succeeds");
+        assert_eq!(agg.events, 0, "usage Unknown reads as an empty aggregate");
+
+        drop(store);
+        // Reopen still works: the failure persists and is still non-fatal.
+        let reopened = crate::store::Store::open(dir.path()).expect("reopen succeeds");
+        assert!(reopened.list_instances(None).await.is_ok());
     }
 
     #[test]

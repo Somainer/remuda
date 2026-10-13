@@ -417,14 +417,15 @@ impl EintrWaitProbe {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
-    // Read accessors are used only by the Linux x86_64 real-syscall test; on
-    // every other (test or test-stub) build the probe only records.
-    #[cfg(all(test, unix, target_os = "linux", target_arch = "x86_64"))]
+    // Read accessors are used by the Linux x86_64 real-syscall test and by
+    // the r19 item 2 scripted-clock anchor-identity test (all unix targets);
+    // on every other (test or test-stub) build the probe only records.
+    #[cfg(all(test, unix))]
     fn deadline_anchor(&self) -> Option<std::time::Instant> {
         *self.deadline_anchor.lock().expect("eintr probe anchor")
     }
 
-    #[cfg(all(test, unix, target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(test, unix))]
     fn eintr_retries(&self) -> usize {
         self.eintr_retries
             .load(std::sync::atomic::Ordering::Acquire)
@@ -446,6 +447,21 @@ impl EintrWaitProbe {
 fn wait_with_eintr_retry<T>(
     timeout: Duration,
     probe: Option<&EintrWaitProbe>,
+    wait_once: impl FnMut(Duration) -> std::io::Result<InterruptibleEventWait<T>>,
+) -> std::io::Result<InterruptibleEventWait<T>> {
+    wait_with_eintr_retry_clocked(timeout, probe, &mut std::time::Instant::now, wait_once)
+}
+
+/// Clock-seamed core of [`wait_with_eintr_retry`] (ma-sdk-state r19 item 2):
+/// the real waiter passes `Instant::now`; the deterministic anchor-identity
+/// regression passes a scripted clock so it can prove — without sleeps or
+/// timing tolerance — that the probe stamps the SAME instant the deadline is
+/// derived from.
+#[cfg(all(any(test, feature = "test-stub"), unix))]
+fn wait_with_eintr_retry_clocked<T>(
+    timeout: Duration,
+    probe: Option<&EintrWaitProbe>,
+    now: &mut impl FnMut() -> std::time::Instant,
     mut wait_once: impl FnMut(Duration) -> std::io::Result<InterruptibleEventWait<T>>,
 ) -> std::io::Result<InterruptibleEventWait<T>> {
     // ma-sdk-state r18 item 3: sample ONE started instant; the deadline is
@@ -453,13 +469,13 @@ fn wait_with_eintr_retry<T>(
     // test's `completion - started` is measured against the same clock the
     // retry loop uses (previously the deadline used one Instant::now() sample
     // and the probe stamped a later one).
-    let started = std::time::Instant::now();
+    let started = now();
     let deadline = started + timeout;
     if let Some(probe) = probe {
         probe.note_wait_started(started);
     }
     loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(now());
         if remaining == Duration::ZERO {
             return Ok(InterruptibleEventWait::TimedOut);
         }
@@ -1615,6 +1631,78 @@ mod tests {
         assert!(
             calls.load(Ordering::Acquire) > 1,
             "a continuously interrupting wait retries against the same deadline"
+        );
+    }
+
+    /// ma-sdk-state r19 item 2 (injectable, deterministic, no sleeps): the
+    /// probe's deadline anchor is the EXACT instant the deadline is derived
+    /// from, passed through unchanged — not a second clock sample the probe
+    /// reads itself. The fb3c7aca implementation let the probe stamp a fresh
+    /// `Instant::now()` a few dozen nanoseconds after the deadline's own
+    /// sample; that gap is invisible to the real-ppoll timing proof because
+    /// the interrupted syscall returns one to two milliseconds AFTER the
+    /// deadline (verified: the old implementation passes the timing proof
+    /// 20/20). A scripted clock settles the identity EXACTLY: the first
+    /// sample is `t0`, the second — the loop's remaining calculation — is
+    /// `t0 + SHIFT`; the fixed waiter samples once, hands that instant to
+    /// the probe, and its closure sees `WAIT - SHIFT`, while the old probe
+    /// stamped its own real-clock instant and fails the anchor equality by
+    /// name.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_anchor_is_the_exact_started_instant_the_deadline_derives_from() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        const WAIT: Duration = Duration::from_millis(400);
+        const SHIFT: Duration = Duration::from_millis(10);
+
+        let t0 = std::time::Instant::now();
+        // Scripted clock: call 0 (the deadline's started instant) returns t0;
+        // call 1 (the loop's first remaining calculation) returns t0+SHIFT;
+        // every later call returns t0.
+        let calls = AtomicUsize::new(0);
+        let mut now = || {
+            let n = calls.fetch_add(1, AtomicOrdering::AcqRel);
+            match n {
+                0 => t0,
+                1 => t0 + SHIFT,
+                _ => t0,
+            }
+        };
+
+        let probe = EintrWaitProbe::default();
+        let mut first_remaining = None;
+        let outcome = wait_with_eintr_retry_clocked(WAIT, Some(&probe), &mut now, |remaining| {
+            if first_remaining.is_none() {
+                first_remaining = Some(remaining);
+            }
+            Ok(InterruptibleEventWait::Fired(()))
+        })
+        .expect("the wait itself never returns an error");
+        assert_eq!(outcome, InterruptibleEventWait::Fired(()));
+        // The anchor is the SAME instant the deadline derived from. The old
+        // probe stamped a fresh std::time::Instant::now() and fails this
+        // exact equality with the defect named.
+        assert_eq!(
+            probe.deadline_anchor(),
+            Some(t0),
+            "the probe must stamp the exact started instant the deadline is derived from"
+        );
+        // The loop's remaining time derives from the SECOND scripted sample
+        // (t0+SHIFT): this pins the clock wiring — the started sample and the
+        // remaining sample are distinct calls and neither is duplicated.
+        assert_eq!(
+            first_remaining,
+            Some(WAIT - SHIFT),
+            "the first wait receives the remaining time against the one started instant"
+        );
+        // Fixed shape: one started sample and one remaining sample before
+        // the fired closure returns. The old probe's extra sample reads the
+        // REAL clock (not this scripted one), so the count stays two under
+        // both shapes — the anchor equality above is the discriminator.
+        assert_eq!(
+            calls.load(AtomicOrdering::Acquire),
+            2,
+            "one started sample and one remaining sample before the wait fires"
         );
     }
 

@@ -5975,3 +5975,71 @@ it("GATE32 item 1b: a peer tab's session removal observed via storage disposes T
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE33 item 1: every session mutation (logout) bumps the auth generation and disposes the current Outbox — a new outbox gets a fresh lifetime and an old acceptance never credits it", async () => {
+  // Public-path assertion of the single identity-change helper: with a live
+  // outbox (issuer lifetime L1), logout must bump authGen and dispose it; the
+  // post-logout ensureOutbox creates a NEW outbox (L2). A durable command
+  // issued under L1 that settles after the change never flips L2's flag.
+  vi.useFakeTimers();
+  vi.setSystemTime(1_100_000);
+  const I = "ins_g33_1";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g33_1");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (() => new Promise(() => { /* hung: issued, never accepted */ })) as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await hubStore.follow(I);
+    const boxAt = () => (hubStore as unknown as { outbox: { lifetime: string } | null }).outbox;
+    const genAt = () => (hubStore as unknown as { authGenForTest: number }).authGenForTest;
+    const l1 = boxAt()!.lifetime;
+    const gen1 = genAt();
+
+    hubStore.setConnectionStateForTest("live");
+    await hubStore.send(I, "g33 1 C");
+    await pump(2_000);
+    const cId = send.mock.calls[0]?.[4] as string;
+    const rows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(rows().find((r) => r.commandId === cId)?.issuerLifetime).toBe(l1);
+
+    // logout: the SINGLE identity-change helper bumps gen and disposes.
+    hubStore.logout();
+    expect(genAt()).toBe(gen1 + 1);
+    expect(boxAt()).toBeNull();
+
+    // reinit under the new identity: a fresh outbox/lifetime.
+    const reopened = await (hubStore as unknown as { ensureOutbox: () => Promise<boolean> }).ensureOutbox();
+    expect(reopened).toBe(true);
+    const l2 = boxAt()!.lifetime;
+    expect(l2).not.toBe(l1);
+
+    // L1 command settling after the change retires to done but does not flip
+    // L2's progressRecorded.
+    const onBatch = vi.mocked(api.eventsSubscribe).mock.calls[0]?.[2] as (b: G26Batch) => void;
+    onBatch({
+      subscriptionId: "sub_g33_1", journalId: JOURNAL, fromSeq: "1", toSeq: "1", durableSeq: "1",
+      events: [g26JournalMessage(cId, "1")],
+    });
+    await pump(2_000);
+    expect(rows().find((r) => r.commandId === cId)?.state).toBe("done");
+    expect(rows().find((r) => r.commandId === cId)?.progressRecorded).toBeFalsy();
+    expect(rows().find((r) => r.commandId === cId)?.issuerLifetime).toBe(l1);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

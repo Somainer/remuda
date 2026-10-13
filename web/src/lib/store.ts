@@ -1162,6 +1162,17 @@ class HubStore {
    */
   private owedReconcileRunning = new Set<Id>();
   private outboxInit: Promise<boolean> | null = null;
+  /**
+   * Auth-identity generation (c-reconnfu gate 33 item 2). Bumped by EVERY
+   * session mutation via applyAuthIdentityChange (login, passkey login,
+   * logout, bootstrap-401 clear, peer-tab session change). An Outbox
+   * initializer captures the generation when it starts; if the generation has
+   * moved by the time it would install its box, the initialization is
+   * obsolete — it disposes what it built and installs/flushes NOTHING, so a
+   * cross-identity initializer can never publish an outbox (or run its
+   * post-load flush) belonging to the previous identity.
+   */
+  private authGen = 0;
 
   /**
    * Lazily open the durable outbox (also used outside bootstrap, e.g. a
@@ -1169,13 +1180,23 @@ class HubStore {
    * storage backend is writable — send then uses the legacy direct path.
    */
   /**
-   * Dispose the current Outbox INSTANCE for an auth-identity change
-   * (c-reconnfu gate 32 invariant). Idempotent. Durable rows stay in storage;
-   * the next ensureOutbox runs Outbox.load which mints a NEW lifetime id, so a
-   * pending acceptance of the disposed outbox can never record (its retries
-   * re-check the live outbox and lifetime) and no wake can flush under the old
-   * identity. Used by local logout/reinit and by the peer-tab storage listener
-   * when another document removes/replaces the session.
+   * The ONE helper through which every auth-identity mutation must pass
+   * (c-reconnfu gate 33 item 1): login, passkey login, logout, bootstrap's
+   * 401 session clear, and the peer-tab storage event. It disposes the
+   * current Outbox (and invalidates any in-flight initialization) BEFORE the
+   * new identity is used, and bumps {@link authGen} so an initializer that
+   * started under the previous identity can never install/flush. Durable rows
+   * stay in storage; the next ensureOutbox (under the new generation) loads a
+   * fresh Outbox with a new lifetime.
+   */
+  private applyAuthIdentityChange() {
+    this.authGen += 1;
+    this.disposeOutboxForAuthChange();
+  }
+
+  /**
+   * Dispose the current Outbox INSTANCE for an auth-identity change.
+   * Idempotent. See {@link applyAuthIdentityChange} for the invariant.
    */
   private disposeOutboxForAuthChange() {
     this.outbox?.dispose();
@@ -1201,10 +1222,10 @@ class HubStore {
   ]);
   private onPeerAuthChange = (event: StorageEvent) => {
     if (!event.key || !HubStore.SESSION_STORAGE_KEYS.has(event.key)) return;
-    // A peer logged out or replaced the session: drop our outbox so its
-    // lifetime no longer matches any durable issuer. No reconnect here — the
-    // UI/next action decides whether this tab re-auths.
-    this.disposeOutboxForAuthChange();
+    // A peer logged in/out or replaced the session: rotate generation and
+    // dispose our outbox through the single identity-change helper. No
+    // reconnect here — the UI/next action decides whether this tab re-auths.
+    this.applyAuthIdentityChange();
   };
   private peerAuthWatchRegistered = false;
   private registerPeerAuthWatch() {
@@ -1220,6 +1241,9 @@ class HubStore {
     this.registerPeerAuthWatch();
     this.outboxInit = (async () => {
       try {
+        if (this.outboxOpenGateForTest) {
+          await new Promise<void>((resolve) => this.outboxOpenGateForTest?.(resolve));
+        }
         const opened = await openOutboxStorage();
         this.outboxDegraded = opened.degraded;
         const box = await Outbox.load(opened.storage);
@@ -1252,7 +1276,9 @@ class HubStore {
         };
         this.emit({ outboxPending: box.pendingCount() });
         if (opened.degraded) this.toast("本机无法可靠保存待发消息（存储不可用）");
-        // Rows left inflight by a closed tab are due immediately.
+        // Rows left inflight by a closed tab are due immediately — but never
+        // from an initializer whose identity is already obsolete (it may have
+        // been superseded by a newer one that owns the flush).
         void this.flushAllOutbox();
         return true;
       } catch {
@@ -2681,6 +2707,23 @@ class HubStore {
   get pageIsUnloadingForTest(): boolean {
     return this.pageIsUnloading;
   }
+  /**
+   * Test seams for the gate-33 dispose-on-auth-change invariant: expose the
+   * current auth generation, the single identity-change helper, and a gate on
+   * the outbox storage-open so a test can start initialization, change
+   * identity before it completes, and assert the obsolete initializer installs
+   * neither a box nor a flush.
+   */
+  get authGenForTest(): number {
+    return this.authGen;
+  }
+  applyAuthIdentityChangeForTest(): void {
+    this.applyAuthIdentityChange();
+  }
+  private outboxOpenGateForTest: ((resolve: () => void) => void) | null = null;
+  setOutboxOpenGateForTest(gate: ((resolve: () => void) => void) | null): void {
+    this.outboxOpenGateForTest = gate;
+  }
   private connectionStateOverride: ConnectionState | null = null;
   /** True during pagehide/beforeunload: no new outbox POSTs. */
   private pageIsUnloading = false;
@@ -3726,6 +3769,9 @@ class HubStore {
     }
     if (api.mock && !readSession()) {
       const session = await api.login(MOCK_BOOTSTRAP_TOKEN, readDeviceSettings().deviceName);
+      // First identity establishment: route through the same helper so the
+      // initial Outbox initializer starts under a defined, current generation.
+      this.applyAuthIdentityChange();
       writeSession(session, { mock: api.mock });
       this.emit({ session: readSession() });
     }
@@ -3798,6 +3844,10 @@ class HubStore {
       if (gen !== this.bootGen) return;
       const unauth = isUnauthorized(err);
       if (unauth) {
+        // c-reconnfu gate 33 item 1: a 401 means the current session is gone;
+        // dispose the outbox (and invalidate its initializer) before clearing
+        // the session, so no delivery runs under the revoked identity.
+        this.applyAuthIdentityChange();
         clearSession();
         dropDeviceCookie();
       }
@@ -3829,6 +3879,9 @@ class HubStore {
   async login(kind: "bootstrap" | "pair", secret: string, deviceName: string) {
     const session =
       kind === "pair" ? await api.pairRedeem(secret, deviceName) : await api.login(secret, deviceName);
+    // c-reconnfu gate 33 item 1: a new identity — dispose the old outbox and
+    // invalidate any in-flight initialization BEFORE the new session is used.
+    this.applyAuthIdentityChange();
     writeSession(session, { mock: api.mock });
     // bootstrap marks the session authenticated after cookie-backed reads finish.
     this.emit({ session: readSession(), error: null });
@@ -3862,6 +3915,9 @@ class HubStore {
     const options = envelope.options as ServerRequestOptions;
     const assertion = await getPasskey(options, mediation, signal);
     const session = await api.passkeyLoginFinish(envelope.challengeId, assertion, deviceName);
+    // c-reconnfu gate 33 item 1: passkey login is a new identity — dispose the
+    // old outbox before the new session is used.
+    this.applyAuthIdentityChange();
     writeSession(session, { mock: api.mock });
     this.emit({ session: readSession(), error: null });
     await this.bootstrap();
@@ -3987,11 +4043,11 @@ class HubStore {
     this.heldRetryAttempt.clear();
     for (const [, slot] of this.effortReconcileTimers) clearTimeout(slot.timer);
     this.effortReconcileTimers.clear();
-    // Drop the outbox INSTANCE (durable rows stay in storage): dispose()
-    // cancels every central lease/delivery wake and drops the delivery
-    // callbacks so no wake can flush a logged-out auth identity; the next
-    // bootstrap re-runs Outbox.load (a NEW lifetime) and reconciles.
-    this.disposeOutboxForAuthChange();
+    // c-reconnfu gate 33 item 1: logout goes through the single
+    // identity-change helper — bumps authGen and disposes the outbox (and any
+    // in-flight initializer) BEFORE the logged-out identity can be used; the
+    // next bootstrap loads a fresh Outbox with a new lifetime.
+    this.applyAuthIdentityChange();
     if (this.unloadClearTimer) {
       clearTimeout(this.unloadClearTimer);
       this.unloadClearTimer = null;

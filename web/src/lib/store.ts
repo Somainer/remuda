@@ -1176,7 +1176,7 @@ class HubStore {
       try {
         const opened = await openOutboxStorage();
         this.outboxDegraded = opened.degraded;
-        const box = await Outbox.load(opened.storage);
+        const box = await Outbox.load(opened.storage, undefined, readAuthEpoch);
         this.outbox = box;
         this.outboxUnsubscribe = box.subscribe(() => this.emit({ outboxPending: box.pendingCount() }));
         // Gate 11 item 5: a tracked lease-expiry wakeup inside Outbox reclaims

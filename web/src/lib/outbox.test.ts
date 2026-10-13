@@ -2323,3 +2323,39 @@ it("GATE31 item 1: a persistently failing acceptance CAS retries exactly CLAIM_W
     vi.useRealTimers();
   }
 });
+
+it("GATE31 item 2: a logout/epoch rotation between the failed CAS and its retry stops the retry — no credit to the obsolete epoch", async () => {
+  // Seed under real timers; the live epoch provider is mutable.
+  const storage = new MemStorage();
+  let epoch = "ep_before";
+  const seeded = await Outbox.load(storage, "owner_g31_epoch", () => epoch);
+  await storage.put(rec({ commandId: "cmd_g31_rot", instanceId: "ins_rot", state: "sent", issuerEpoch: "ep_before", issuerLifetime: seeded.lifetime }));
+  // The FIRST retry CAS rejects; later ones would succeed.
+  let casAttempts = 0;
+  storage.casProgressRecorded = vi.fn(async (id: string, e: string) => {
+    casAttempts += 1;
+    if (casAttempts === 1) throw new Error("g31 epoch CAS first failure");
+    return storage.map.get(id) ? true : false;
+  });
+  vi.useFakeTimers();
+  try {
+    seeded.retryAcceptedProgress("ins_rot", "cmd_g31_rot", "ep_before", seeded.lifetime);
+    // Logout/reinit rotates the auth epoch BEFORE the scheduled retry fires.
+    epoch = "ep_after";
+    await vi.advanceTimersByTimeAsync(600);
+    await Promise.resolve();
+    await Promise.resolve();
+    // The scheduled retry re-read the CURRENT epoch (ep_after), saw the row
+    // stamped ep_before, and stopped BEFORE touching the CAS: zero retry
+    // writes (the single failed attempt that created the pending entry was the
+    // store-side immediate CAS), and no credit.
+    expect(storage.casProgressRecorded).not.toHaveBeenCalled();
+    expect(storage.map.get("cmd_g31_rot")?.progressRecorded).toBeFalsy();
+    // Advancing further schedules nothing.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(storage.casProgressRecorded).not.toHaveBeenCalled();
+    seeded.dispose();
+  } finally {
+    vi.useRealTimers();
+  }
+});

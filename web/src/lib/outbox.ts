@@ -755,6 +755,15 @@ export class Outbox {
    */
   private readonly lifetimeId: Id = newCommandId();
   /**
+   * Live AUTH-EPOCH provider (c-reconnfu gate 31 item 2): read from the
+   * session on every acceptance-retry attempt — never from the value captured
+   * when the observation failed — so a logout/reinit that rotates the epoch
+   * between the failed CAS and its retry makes the retry stop instead of
+   * crediting an obsolete epoch. Supplied by the store (defaults to the
+   * observation-time epoch for tests/standalone callers).
+   */
+  private readonly currentEpoch: () => Id;
+  /**
    * The SINGLE lease-wake bookkeeping (c-reconnfu gate 20): one armed wake per
    * command this document is not itself POSTing but owes recovery for.
    *
@@ -921,9 +930,12 @@ export class Outbox {
    */
   onReadRecoveryRecovered: (() => void) | null = null;
 
-  private constructor(storage: OutboxStorage, owner?: Id) {
+  private constructor(storage: OutboxStorage, owner?: Id, currentEpoch?: () => Id) {
     this.storage = storage;
     this.owner = owner ?? `owner_${newCommandId()}`;
+    // Default to the observation-time epoch (set via the pending entry) when
+    // no live provider is supplied.
+    this.currentEpoch = currentEpoch ?? (() => "");
   }
 
   /**
@@ -953,8 +965,12 @@ export class Outbox {
     }
   }
 
-  static async load(storage: OutboxStorage, owner?: Id): Promise<Outbox> {
-    const box = new Outbox(storage, owner ?? Outbox.tabOwner());
+  static async load(
+    storage: OutboxStorage,
+    owner?: Id,
+    currentEpoch?: () => Id,
+  ): Promise<Outbox> {
+    const box = new Outbox(storage, owner ?? Outbox.tabOwner(), currentEpoch);
     for (const rec of (await storage.all()).filter((r) => commandIdFromKey(r.commandId))) {
       box.cache.set(rec.commandId, rec);
     }
@@ -1357,9 +1373,16 @@ export class Outbox {
   private async attemptAcceptedProgress(commandId: Id): Promise<void> {
     const pending = this.pendingAcceptances.get(commandId);
     if (!pending || this.disposed || this.unloading) return;
-    // Re-read the row: the CURRENT issuer always comes from storage, never
-    // from the stashed observation, so an epoch/lifetime another tab or page
-    // changed cannot be credited.
+    // Read the CURRENT auth epoch live from the session on EVERY attempt
+    // (c-reconnfu gate 31 item 2): the pending entry captured the epoch at
+    // observation time, but a logout/reinit between the failed CAS and this
+    // retry rotates it — a stale captured epoch could otherwise credit the
+    // obsolete login. Fall back to the captured epoch only when no live
+    // provider exists (standalone/test construction).
+    const liveEpoch = this.currentEpoch();
+    const currentEpoch = liveEpoch || pending.issuerEpoch;
+    const currentLifetime = this.lifetimeId;
+    // Re-read the row: its issuer must match the CURRENT (epoch, lifetime).
     let row: OutboxRecord | undefined;
     try {
       const rows = await this.readDurable();
@@ -1369,12 +1392,12 @@ export class Outbox {
       this.bumpAcceptedRetry(commandId, pending.failures);
       return;
     }
-    // Row gone (retract/cleanup), re-issued to another epoch/lifetime, or
-    // already recorded by the single writer: terminal, stop quietly.
+    // Row gone (retract/cleanup), the auth epoch rotated (logout/reinit), the
+    // page lifetime changed, or it is already recorded: terminal, stop.
     if (
       !row ||
-      row.issuerEpoch !== pending.issuerEpoch ||
-      row.issuerLifetime !== pending.issuerLifetime ||
+      row.issuerEpoch !== currentEpoch ||
+      row.issuerLifetime !== currentLifetime ||
       row.progressRecorded
     ) {
       this.clearPendingAcceptance(commandId);
@@ -1383,7 +1406,7 @@ export class Outbox {
     let flipped = false;
     let casThrew = false;
     try {
-      flipped = await this.casProgressRecorded(commandId, pending.issuerEpoch, pending.issuerLifetime);
+      flipped = await this.casProgressRecorded(commandId, currentEpoch, currentLifetime);
     } catch {
       flipped = false;
       casThrew = true;

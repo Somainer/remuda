@@ -1270,3 +1270,241 @@ async fn r5_terminal_effort_updates_bridge_observed_and_classifies_configure() {
         "an ambiguous cold legacy flag-on is refused, never a tier word"
     );
 }
+
+/// A top-level `ultra_effort_enter|exit` attachment as 2.1.289 writes it.
+fn attachment_21289(kind: &str, n: u64) -> String {
+    json!({
+        "type": "attachment",
+        "uuid": format!("att-{n}"),
+        "sessionId": "effort-session",
+        "version": "2.1.289",
+        "attachment": {"type": kind, "reminderType": "full"}
+    })
+    .to_string()
+}
+
+fn status_stdout_21289(level: &str, n: u64) -> String {
+    stdout_record_version(
+        &format!("Current effort level: {level} (resolved level)"),
+        n,
+        "2.1.289",
+    )
+}
+
+/// Map one line and append its effort edges (driven through the real
+/// `map_line_at`, not the tracker methods directly).
+fn feed_effort(
+    mapper: &mut TranscriptMapper,
+    edges: &mut Vec<(String, EffortSource, Option<bool>)>,
+    line: &str,
+) {
+    let out = mapper.map_line_at(line, None).expect("map");
+    edges.extend(effort_edges(&out));
+}
+
+/// c-effortread r24 (a): end-to-end through `map_line_at` with a real
+/// EffortBridge on a decoupled build. An assistant publishes `{high, off}`
+/// (flag positively known via a pre-level ultra_effort_exit); then a HUMAN
+/// `/effort high` (unowned, older in the FIFO) is folded suppressed while
+/// Remuda's later armed `/effort medium` (B) waits; B ends on a Kept refusal,
+/// so the mapper releases the stashed same-tuple acceptance through
+/// `publish_deferred` and gets `None` (return to baseline). Under ruling S′
+/// none of that may change the published level's channel: the following
+/// status reporting medium must yield on BOTH level and flag and emit NOTHING.
+#[tokio::test]
+async fn r24a_suppressed_same_tuple_cycle_keeps_assistant_source_through_the_mapper_release() {
+    use remuda_driver::effort::Readback;
+    use std::time::Duration;
+    let bridge = std::sync::Arc::new(remuda_driver::test_support::Bridge::new());
+    let mut mapper = remuda_driver::test_support::mapper_with_bridge(
+        bridge.clone(),
+        "effort-session",
+        "2.1.289",
+    );
+    let mut edges: Vec<(String, EffortSource, Option<bool>)> = Vec::new();
+
+    // The flag is positively OFF before any level exists; the attachment
+    // latches alone and publishes nothing.
+    feed_effort(
+        &mut mapper,
+        &mut edges,
+        &attachment_21289("ultra_effort_exit", 1),
+    );
+    assert!(edges.is_empty(), "a pre-level attachment latches only");
+    // The assistant record carries the flag into the level edge and is the
+    // channel of the published level.
+    feed_effort(&mut mapper, &mut edges, &assistant(Some("high"), 2));
+    assert_eq!(
+        edges,
+        vec![("high".to_string(), EffortSource::Unknown, Some(false))]
+    );
+
+    // An OLDER human /effort high lands first (unowned FIFO slot); only THEN
+    // does Remuda arm and type its own /effort medium (B, owned slot behind).
+    feed_effort(&mut mapper, &mut edges, &slash("high", 3));
+    let generation_b = bridge.arm_word("medium");
+    feed_effort(&mut mapper, &mut edges, &slash("medium", 4));
+
+    // The human verdict is folded SUPPRESSED while B is armed: it changes
+    // nothing in the published tuple and emits nothing.
+    feed_effort(
+        &mut mapper,
+        &mut edges,
+        &stdout_record_version(
+            "Set effort level to high (saved as your default for new sessions): …",
+            5,
+            "2.1.289",
+        ),
+    );
+    assert_eq!(
+        edges.len(),
+        1,
+        "the suppressed same-tuple acceptance emits no observation"
+    );
+    assert!(
+        bridge.has_pending(),
+        "B is still waiting for its own verdict"
+    );
+
+    // B's own verdict ends the switch on a Kept refusal; the end-of-switch
+    // release of the stashed {high, off} returns None (return to baseline).
+    feed_effort(
+        &mut mapper,
+        &mut edges,
+        &stdout_record_version("Kept effort level as medium", 6, "2.1.289"),
+    );
+    match bridge.wait(generation_b, Duration::from_secs(1)).await {
+        Some(Readback::Rejected { reason }) => assert_eq!(reason, "dialog-kept"),
+        other => panic!("B should end rejected dialog-kept: {other:?}"),
+    }
+    assert_eq!(
+        edges.len(),
+        1,
+        "B's refusal and the null publish_deferred emit no observation"
+    );
+
+    // A status now reporting medium yields to the assistant-established high;
+    // the flag is already off too, so even a flag-only edge is impossible.
+    feed_effort(&mut mapper, &mut edges, &slash("status", 7));
+    feed_effort(&mut mapper, &mut edges, &status_stdout_21289("medium", 8));
+    edges.extend(effort_edges(&mapper.flush().expect("flush")));
+    assert_eq!(
+        edges,
+        vec![("high".to_string(), EffortSource::Unknown, Some(false))],
+        "the suppressed cycle never demoted the Assistant channel: NO \
+         observation at all follows the first assistant edge"
+    );
+}
+
+/// c-effortread r24 (b): an OWNED `/effort high` verdict for the state
+/// already in effect changes no tuple, so the mapper settles B through its
+/// no-op completion branch (claude_print.rs: an echoed observation stamped
+/// with B's request id) WITHOUT promoting the level's channel from Assistant
+/// to Verdict. A later status reporting medium must publish no level edge.
+#[tokio::test]
+async fn r24b_owned_noop_completion_settles_without_stealing_the_assistant_channel() {
+    use remuda_driver::effort::Readback;
+    use std::time::Duration;
+    let bridge = std::sync::Arc::new(remuda_driver::test_support::Bridge::new());
+    let mut mapper = remuda_driver::test_support::mapper_with_bridge(
+        bridge.clone(),
+        "effort-session",
+        "2.1.289",
+    );
+    let mut edges: Vec<(String, EffortSource, Option<bool>)> = Vec::new();
+
+    feed_effort(
+        &mut mapper,
+        &mut edges,
+        &attachment_21289("ultra_effort_exit", 1),
+    );
+    feed_effort(&mut mapper, &mut edges, &assistant(Some("high"), 2));
+
+    // Remuda's own /effort high accepts the state already in effect.
+    let generation = bridge.arm_word("high");
+    feed_effort(&mut mapper, &mut edges, &slash("high", 3));
+    feed_effort(
+        &mut mapper,
+        &mut edges,
+        &stdout_record_version(
+            "Set effort level to high (saved as your default for new sessions): …",
+            4,
+            "2.1.289",
+        ),
+    );
+    // The request settles Applied through the no-op completion branch even
+    // though the tracker emitted no edge.
+    match bridge.wait(generation, Duration::from_secs(1)).await {
+        Some(Readback::Applied(observed)) => {
+            assert_eq!(observed.name, remuda_protocol::EffortName::High);
+            assert_eq!(observed.ultracode, Some(false));
+        }
+        other => panic!("the no-op switch should settle Applied: {other:?}"),
+    }
+    assert_eq!(
+        edges,
+        vec![
+            ("high".to_string(), EffortSource::Unknown, Some(false)),
+            // The no-op echo stamped with B's request.
+            ("high".to_string(), EffortSource::Remuda, Some(false)),
+        ]
+    );
+
+    // A status reporting medium yields: no level observation follows.
+    feed_effort(&mut mapper, &mut edges, &slash("status", 5));
+    feed_effort(&mut mapper, &mut edges, &status_stdout_21289("medium", 6));
+    edges.extend(effort_edges(&mapper.flush().expect("flush")));
+    assert_eq!(
+        edges.len(),
+        2,
+        "the status must not publish medium past the assistant-established high"
+    );
+    assert_eq!(
+        edges[1].0, "high",
+        "the only post-verdict record is the no-op echo, never a medium edge"
+    );
+}
+
+/// c-effortread r24 (c): a status publishes `{high, off}`; an assistant
+/// high read-back then DEDUPLICATES (same tuple) and must not steal the
+/// channel — the level stays Status-movable — so a later status reporting
+/// medium publishes exactly one `{medium, off}` edge.
+#[tokio::test]
+async fn r24c_a_deduplicated_assistant_readback_keeps_a_status_level_movable() {
+    let bridge = std::sync::Arc::new(remuda_driver::test_support::Bridge::new());
+    let mut mapper = remuda_driver::test_support::mapper_with_bridge(
+        bridge.clone(),
+        "effort-session",
+        "2.1.289",
+    );
+    let mut edges: Vec<(String, EffortSource, Option<bool>)> = Vec::new();
+
+    // The first status publishes {high, off}.
+    feed_effort(&mut mapper, &mut edges, &slash("status", 1));
+    feed_effort(&mut mapper, &mut edges, &status_stdout_21289("high", 2));
+    assert_eq!(
+        edges,
+        vec![("high".to_string(), EffortSource::Unknown, Some(false))]
+    );
+
+    // The assistant read-back confirms the exact tuple: no edge, and under
+    // ruling S′ it does not promote the channel to Assistant.
+    feed_effort(&mut mapper, &mut edges, &assistant(Some("high"), 3));
+    assert_eq!(
+        edges.len(),
+        1,
+        "the deduplicated assistant read-back is silent"
+    );
+
+    // A later status reporting medium therefore DOES move the level.
+    feed_effort(&mut mapper, &mut edges, &slash("status", 4));
+    feed_effort(&mut mapper, &mut edges, &status_stdout_21289("medium", 5));
+    edges.extend(effort_edges(&mapper.flush().expect("flush")));
+    assert_eq!(
+        edges,
+        vec![
+            ("high".to_string(), EffortSource::Unknown, Some(false)),
+            ("medium".to_string(), EffortSource::Unknown, Some(false)),
+        ]
+    );
+}

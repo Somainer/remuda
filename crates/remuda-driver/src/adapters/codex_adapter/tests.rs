@@ -1812,7 +1812,9 @@ fn a_window_releasing_inside_a_pending_launch_registration_cannot_prune_its_inte
     //   in-gap  A's window releases (A's own interval closed at t0-1, so it is
     //           deliberately not a blocker) while B is parked
     //   then    B's window opens; B runs the REAL discover() path.
-    use crate::adapters::codex_discovery::{LifetimeGuardClock as _, PendingLaunchBarrier};
+    use crate::adapters::codex_discovery::{
+        LifetimeGuardClock as _, PendingLaunchBarrierHandle as PendingLaunchBarrier,
+    };
 
     let home = tempfile::tempdir().unwrap();
     let cwd = "/projects/r13-item1-atomic";
@@ -1945,7 +1947,9 @@ fn a_launch_blocked_before_the_lock_samples_its_boundary_after_a_close_and_refus
     // bound a rollout created while a since-closed instance was actually
     // running. B's REAL discover() must now refuse FC on the strict resume
     // floor.
-    use crate::adapters::codex_discovery::{LifetimeGuardClock as _, PendingLaunchBarrier};
+    use crate::adapters::codex_discovery::{
+        LifetimeGuardClock as _, PendingLaunchBarrierHandle as PendingLaunchBarrier,
+    };
 
     let home = tempfile::tempdir().unwrap();
     let cwd = "/projects/r14-item2-boundary";
@@ -1962,12 +1966,12 @@ fn a_launch_blocked_before_the_lock_samples_its_boundary_after_a_close_and_refus
     );
     a.close_lifetime_at(OffsetDateTime::now_utc() - time::Duration::seconds(20));
 
-    // C launched earlier, still live while B decides.
-    let c_guard = crate::adapters::codex_discovery::begin_lifetime(
-        Path::new(cwd),
-        INST_C,
-        Some(OffsetDateTime::now_utc() - time::Duration::seconds(5)),
-    );
+    // C launched earlier, still live while B decides. c-usagefu r15 item 8(b):
+    // C's lifetime comes through the PRODUCTION confirmed-launch registration
+    // (the same path a hook-shadowed codex spawn takes), never a hand-built
+    // guard — its boundary is whatever the production path samples.
+    let (c_guard, _c_boundary) =
+        crate::adapters::codex_discovery::register_confirmed_launch(Path::new(cwd), INST_C);
 
     // B registers on another thread and parks before the lock.
     let barrier = PendingLaunchBarrier::arm_pre_lock(Path::new(cwd));
@@ -2052,7 +2056,7 @@ fn arming_a_second_barrier_disarms_the_first_and_releases_its_parked_registratio
     // registration parked on the old barrier must be released by the new arm
     // itself, without anyone calling the old barrier's release(). A stale arm
     // that merely overwrote the slot left the thread parked forever.
-    use crate::adapters::codex_discovery::PendingLaunchBarrier;
+    use crate::adapters::codex_discovery::PendingLaunchBarrierHandle as PendingLaunchBarrier;
 
     let cwd = "/projects/r14-item6-disarm";
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2087,7 +2091,7 @@ fn dropping_a_replaced_barrier_never_clears_the_currently_armed_barrier() {
     // first, dropping the first Arc must leave the new barrier armed — a
     // later registration parks on it. Unconditional clearing made a later
     // test's registration sail past an armed barrier.
-    use crate::adapters::codex_discovery::PendingLaunchBarrier;
+    use crate::adapters::codex_discovery::PendingLaunchBarrierHandle as PendingLaunchBarrier;
 
     let cwd = "/projects/r14-item6-ptr-eq";
     let first = PendingLaunchBarrier::arm_pre_lock(Path::new(cwd));
@@ -3581,7 +3585,7 @@ fn a_confirmed_launch_samples_its_boundary_inside_the_registration_lock() {
     // register_confirmed_launch samples the boundary INSIDE
     // LAUNCH_REGISTRATION. A registration parked before the lock must carry
     // the post-release instant, never the instant it decided to launch.
-    use crate::adapters::codex_discovery::PendingLaunchBarrier;
+    use crate::adapters::codex_discovery::PendingLaunchBarrierHandle as PendingLaunchBarrier;
     use std::time::Duration as StdDuration;
     use time::OffsetDateTime;
 
@@ -3738,4 +3742,76 @@ fn prompt_evidence_is_bounded_by_text_length_and_window_count_even_while_live() 
         "a real over-cap prompt still matches its rollout through the shared bounded prefix"
     );
     crate::adapters::codex_discovery::forget_lifetime(&cwd, owner2);
+}
+
+#[test]
+fn dropping_the_barrier_handle_disarms_the_parked_registration_and_clears_the_slot() {
+    // c-usagefu r15 item 8(c): the handle returned by arm owns the barrier.
+    // Dropping it (even while a parked registration still holds an Arc clone)
+    // must (1) release the parked registration and (2) clear the cwd slot via
+    // the Arc::ptr_eq check, so the NEXT registration proceeds without any
+    // explicit release. An older dropped handle must never clear a NEWER
+    // barrier's slot.
+    use crate::adapters::codex_discovery::PendingLaunchBarrierHandle as Barrier;
+    use crate::adapters::codex_discovery::{forget_lifetime, register_pending_launch};
+
+    let cwd = "/projects/r15-item8-barrier-drop";
+
+    // (1) Drop releases the parked registration.
+    let barrier = Barrier::arm_pre_lock(Path::new(cwd));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let builder = std::thread::Builder::new()
+        .name("r15-item8-parked".into())
+        .spawn(move || {
+            tx.send(register_pending_launch(Path::new(cwd), "r15-item8-b"))
+                .unwrap();
+        })
+        .unwrap();
+    barrier.wait_before_lock();
+    drop(barrier);
+    let pending = rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("dropping the handle releases the parked registration");
+    builder.join().unwrap();
+
+    // (2) The slot was cleared: a fresh registration completes with NO
+    // barrier armed and NO release call.
+    let (tx2, rx2) = std::sync::mpsc::channel();
+    let builder2 = std::thread::Builder::new()
+        .name("r15-item8-clear".into())
+        .spawn(move || {
+            tx2.send(register_pending_launch(Path::new(cwd), "r15-item8-c"))
+                .unwrap();
+        })
+        .unwrap();
+    rx2.recv_timeout(std::time::Duration::from_secs(3))
+        .expect("the slot is clear: nothing parks a later registration");
+    builder2.join().unwrap();
+    forget_lifetime(Path::new(cwd), "r15-item8-b");
+    forget_lifetime(Path::new(cwd), "r15-item8-c");
+    drop(pending);
+
+    // (3) A dropped OLDER handle never removes the NEWER barrier's slot.
+    let older = Barrier::arm_pre_lock(Path::new(cwd));
+    let newer = Barrier::arm_pre_lock(Path::new(cwd));
+    drop(older);
+    let (tx3, rx3) = std::sync::mpsc::channel();
+    let builder3 = std::thread::Builder::new()
+        .name("r15-item8-newer-park".into())
+        .spawn(move || {
+            tx3.send(register_pending_launch(Path::new(cwd), "r15-item8-d"))
+                .unwrap();
+        })
+        .unwrap();
+    newer.wait_before_lock();
+    assert!(
+        rx3.recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
+        "the newer barrier still parks after the older handle dropped"
+    );
+    drop(newer);
+    rx3.recv_timeout(std::time::Duration::from_secs(3))
+        .expect("dropping the newer handle releases the registration");
+    builder3.join().unwrap();
+    forget_lifetime(Path::new(cwd), "r15-item8-d");
 }

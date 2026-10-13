@@ -338,7 +338,7 @@ impl Supervisor {
     }
 
     /// Test-only: whether the registry currently holds an entry for `cwd`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-stub"))]
     fn has_pending_for(&self, cwd: &Path) -> bool {
         let want = crate::adapters::codex_discovery::canonical_path(cwd);
         self.registry
@@ -432,6 +432,28 @@ pub async fn shutdown_pending_terminations() {
     }
 }
 
+// -- Cross-crate observation seams (remuda-node integration tests) ----------
+//
+// Read-only access to census/supervisor state for tests that drive the REAL
+// DevNode shutdown wiring. They install no guards and substitute no stop
+// outcome — behaviour stays entirely production; these only observe it.
+/// Test-stub observation seam: whether `owner`'s census interval is live.
+#[cfg(any(test, feature = "test-stub"))]
+pub fn census_interval_is_live(cwd: &Path, owner: &str) -> bool {
+    crate::adapters::codex_discovery::census_lifetime_is_live(cwd, owner)
+}
+
+/// Test-stub observation seam: whether the pending registry holds an entry for `cwd`.
+#[cfg(any(test, feature = "test-stub"))]
+pub fn pending_entry_exists_for(cwd: &Path) -> bool {
+    global_supervisor().has_pending_for(cwd)
+}
+
+/// Test-stub hygiene seam: forget `owner`'s census intervals in `cwd`.
+#[cfg(any(test, feature = "test-stub"))]
+pub fn forget_census_for_test(cwd: &Path, owner: &str) {
+    crate::adapters::codex_discovery::forget_lifetime(cwd, owner);
+}
 // -- Test timing seams -------------------------------------------------------
 
 /// Maintenance sweep interval override (millis), zero means production. The
@@ -454,7 +476,11 @@ pub(crate) fn test_has_pending_for(cwd: &Path) -> bool {
     global_supervisor().has_pending_for(cwd)
 }
 
+/// Supervisor teardown observation seam; the node-level shutdown regression
+/// observes teardown through the real `DevNode::shutdown`, so this direct
+/// supervisor-state check is kept for focused debugging.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn test_global_is_shut() -> bool {
     GLOBAL_SUPERVISOR
         .lock()

@@ -609,23 +609,29 @@ impl BarrierStage {
 }
 
 /// Barrier parking [`register_pending_launch`]. Two independent stages:
-/// - the PRE-LOCK stage (arm with [`Self::arm_pre_lock`]) fires BEFORE the
-///   LAUNCH_REGISTRATION lock is taken and the boundary sampled;
-/// - the BETWEEN stage (arm with [`Self::arm`]) fires inside the lock between
-///   the lifetime insert and the window open (the r13 item 1 gap).
+/// - the PRE-LOCK stage (arm with [`PendingLaunchBarrierHandle::arm_pre_lock`])
+///   fires BEFORE the LAUNCH_REGISTRATION lock is taken and the boundary
+///   sampled;
+/// - the BETWEEN stage (arm with [`PendingLaunchBarrierHandle::arm`]) fires
+///   inside the lock between the lifetime insert and the window open (the
+///   r13 item 1 gap).
 ///
 /// Only registrations for the armed canonical cwd park (parallel tests share
-/// the process and the static slot). [`Self::disarm`] (Drop, or a newer arm)
-/// releases every parked registration without touching the global slot lock,
-/// so a clone dropped from a registration thread can never deadlock against a
-/// test thread holding the slot.
+/// the process and the static slot).
+///
+/// c-usagefu r15 item 8(c): the barrier is handed out as an owned
+/// [`PendingLaunchBarrierHandle`]. Dropping the CALLER's handle disarms the
+/// barrier and clears the per-cwd slot when it still holds THIS barrier
+/// ([`Arc::ptr_eq`]) — even while a parked registration thread still holds a
+/// clone — so a test scope ending always unblocks its registration and the
+/// next launch starts clean without an explicit disarm.
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) struct PendingLaunchBarrier {
     /// Only registrations for THIS canonical cwd park (parallel tests share
     /// the process and the static slot).
     cwd: PathBuf,
-    /// Set false by Drop or a newer arm; parked registrations then return.
+    /// Set false by handle Drop or a newer arm; parked registrations then
+    /// return.
     alive: std::sync::atomic::AtomicBool,
     /// Before LAUNCH_REGISTRATION is acquired (and before the boundary sample).
     before_lock: BarrierStage,
@@ -633,18 +639,68 @@ pub(crate) struct PendingLaunchBarrier {
     between: BarrierStage,
 }
 
+/// Owned handle returned by [`PendingLaunchBarrier`]'s arm constructors. Its
+/// Drop disarms the barrier and clears the slot; method calls deref straight
+/// to the barrier (c-usagefu r15 item 8c).
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) struct PendingLaunchBarrierHandle(std::sync::Arc<PendingLaunchBarrier>);
+
+#[cfg(test)]
+impl PendingLaunchBarrierHandle {
+    /// Arm the BETWEEN stage.
+    pub(crate) fn arm(cwd: &Path) -> Self {
+        PendingLaunchBarrier::arm(cwd)
+    }
+
+    /// Arm the PRE-LOCK stage.
+    pub(crate) fn arm_pre_lock(cwd: &Path) -> Self {
+        PendingLaunchBarrier::arm_pre_lock(cwd)
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for PendingLaunchBarrierHandle {
+    type Target = PendingLaunchBarrier;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for PendingLaunchBarrierHandle {
+    fn drop(&mut self) {
+        // Wake every parked registration (this barrier must never park
+        // anything once the caller is done with it) — this touches only the
+        // barrier's own cv mutexes, never the global slot lock.
+        self.0.disarm();
+        // Clear the slot ONLY when it still holds this exact barrier, so a
+        // newer arm for the same cwd is never accidentally removed. try_lock:
+        // a registration thread is blocked on a condition variable (its own
+        // cv mutex), never holding the slot mutex, so this cannot deadlock.
+        if let Ok(mut slot) = PENDING_LAUNCH_BARRIER.try_lock() {
+            let still_us = slot
+                .get(&self.0.cwd)
+                .is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.0));
+            if still_us {
+                slot.remove(&self.0.cwd);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 impl PendingLaunchBarrier {
     /// Arm the BETWEEN stage (r13 item 1): registration parks inside the lock
     /// after inserting its lifetime and before opening its window.
-    pub(crate) fn arm(cwd: &Path) -> std::sync::Arc<Self> {
-        Self::arm_stage(cwd, false, true)
+    pub(crate) fn arm(cwd: &Path) -> PendingLaunchBarrierHandle {
+        PendingLaunchBarrierHandle(Self::arm_stage(cwd, false, true))
     }
 
     /// Arm the PRE-LOCK stage (r14 item 2, Ruling L1): registration parks
     /// BEFORE taking LAUNCH_REGISTRATION and before sampling its boundary.
-    pub(crate) fn arm_pre_lock(cwd: &Path) -> std::sync::Arc<Self> {
-        Self::arm_stage(cwd, true, false)
+    pub(crate) fn arm_pre_lock(cwd: &Path) -> PendingLaunchBarrierHandle {
+        PendingLaunchBarrierHandle(Self::arm_stage(cwd, true, false))
     }
 
     fn arm_stage(cwd: &Path, pre_lock: bool, between: bool) -> std::sync::Arc<Self> {
@@ -705,27 +761,6 @@ impl PendingLaunchBarrier {
     /// Let the parked registration finish (its window opens immediately after).
     pub(crate) fn release(&self) {
         self.between.release();
-    }
-}
-
-#[cfg(test)]
-impl Drop for PendingLaunchBarrier {
-    fn drop(&mut self) {
-        // Wake every parked registration first (own cv mutexes only — never
-        // the global slot lock, which a registration thread may be taking).
-        self.disarm();
-        // Clear this cwd's entry only while it still points at THIS barrier.
-        // try_lock: a newer arm() has replaced us anyway, and blocking here
-        // could deadlock against a registration thread parking through the
-        // slot.
-        if let Ok(mut slot) = PENDING_LAUNCH_BARRIER.try_lock() {
-            let still_us = slot
-                .get(&self.cwd)
-                .is_some_and(|barrier| std::ptr::eq(std::sync::Arc::as_ptr(barrier), self));
-            if still_us {
-                slot.remove(&self.cwd);
-            }
-        }
     }
 }
 
@@ -1357,7 +1392,7 @@ pub(crate) fn prompt_candidate_matches(
 /// instance had left the cwd census entirely. Lets Ruling A1 regressions prove
 /// the rejection outlives the blocker WITHOUT depending on the interval
 /// retention policy (r11 item 1).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-stub"))]
 pub(crate) fn forget_lifetime(cwd: &Path, owner: &str) {
     let key = canonical(cwd);
     if let Some(by_instance) = INSTANCE_LIFETIMES
@@ -1384,7 +1419,7 @@ pub(crate) fn census_contains(cwd: &Path, owner: &str) -> bool {
 /// Test seam: whether `owner`'s lifetime in `cwd` is still LIVE (its interval
 /// has not been closed). A retained closed interval returns false (r11 item 3:
 /// the close must follow the process stop, never precede close beginning).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-stub"))]
 pub(crate) fn census_lifetime_is_live(cwd: &Path, owner: &str) -> bool {
     INSTANCE_LIFETIMES
         .lock()

@@ -2332,7 +2332,7 @@ it("GATE31 item 2: a logout/epoch rotation between the failed CAS and its retry 
   await storage.put(rec({ commandId: "cmd_g31_rot", instanceId: "ins_rot", state: "sent", issuerEpoch: "ep_before", issuerLifetime: seeded.lifetime }));
   // The FIRST retry CAS rejects; later ones would succeed.
   let casAttempts = 0;
-  storage.casProgressRecorded = vi.fn(async (id: string, e: string) => {
+  storage.casProgressRecorded = vi.fn(async (id: string) => {
     casAttempts += 1;
     if (casAttempts === 1) throw new Error("g31 epoch CAS first failure");
     return storage.map.get(id) ? true : false;

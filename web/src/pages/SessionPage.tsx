@@ -25,8 +25,7 @@ import { steerHeldControl } from "../features/composer/state";
 import { LaunchedByMark } from "../features/session/LaunchedBy";
 import { allModelPinMismatches } from "../features/session/modelEffective";
 import { RunDetails } from "../features/session/RunDetails";
-import { contextPercent } from "../features/session/effort";
-import { ptyYoloChipLabel } from "../lib/sessionOptions";
+import { claudeDefaultTier, contextPercent } from "../features/session/effort";
 import { Transcript, type TranscriptHandle } from "../features/session/Transcript";
 import { LiveStatusStrip } from "../features/session/live/LiveStatusStrip";
 import { useTurnDecision } from "../features/session/useTurnDecision";
@@ -49,6 +48,7 @@ import { apiRouteClause, apiRouteKind, routeDownMessage } from "../lib/apiRoute"
 import { projectCommandStatus } from "../lib/commandStatus";
 import { endReason, NODE_EPOCH_CHANGED } from "../lib/endReason";
 import { bindingChipText, transcriptBinding } from "../lib/transcriptBinding";
+import { ptyYoloChipLabel } from "../lib/sessionOptions";
 import type { ResumeMode } from "../lib/api";
 import { hubStore, type HubState } from "../lib/store";
 import { e2eSeamsEnabled } from "../lib/e2eSeams";
@@ -106,7 +106,8 @@ function sameValue(a: unknown, b: unknown): boolean {
  * emit that touches another session, the host/workspace lists, or re-fetches
  * an unchanged row selects an equal slice and the body does not re-render.
  */
-function selectSession(state: HubState, instanceId: string) {
+/** Selected slice for one session (c-effortread r10 item 8: exported for tests). */
+export function selectSession(state: HubState, instanceId: string) {
   const instance = state.instances.find((i) => i.id === instanceId);
   const kind = instance?.kind;
   return {
@@ -136,6 +137,23 @@ function selectSession(state: HubState, instanceId: string) {
     effort: hubStore.effortOf(instanceId, kind),
     effortEffective: hubStore.effortEffectiveOf(instanceId),
     effortPending: hubStore.effortPendingOf(instanceId),
+    // c-effortread r10 item 8: the composer's gate inputs come from the slice,
+    // not hubStore calls in the render — the version gate reads the HOST's
+    // pinned CLI (a host inventory refresh changes the host row, not this
+    // instance), and the refusal/withdrawal/default-index change on
+    // observations. Without them in the selected slice a refresh that finally
+    // supplies the CLI version left the switch disabled.
+    effortVersionGate:
+      kind === "claude" ? hubStore.effortVersionGate(instanceId) : undefined,
+    effortRefusal: hubStore.effortRefusalOf(instanceId),
+    effortReadbackWithdrawn: hubStore.effortReadbackWithdrawnOf(instanceId),
+    effortDefaultIndex:
+      kind === "claude"
+        ? (claudeDefaultTier(
+            hubStore.modelEffectiveOf(instanceId)?.id ?? (instance?.model ?? null),
+            hubStore.supplyCatalogRows(),
+          )?.index ?? null)
+        : null,
     usageRollup: hubStore.usageRollupOf(instanceId),
   };
 }
@@ -302,6 +320,11 @@ function SessionPageBody({
   useEffect(() => {
     if (instanceId && !isTtyLabFixtureId(instanceId)) void hubStore.follow(instanceId);
   }, [instanceId]);
+
+  // D-056 §6: per-model default + ultracode capability rows (best-effort).
+  useEffect(() => {
+    void hubStore.loadSupplyCatalog();
+  }, []);
 
   // c-composerpop e2e seam: inject a Hub-computed usage rollup as if a poll
   // had delivered it (fake-node sessions never report usage). Installed ONLY
@@ -961,27 +984,42 @@ function SessionPageBody({
           permissionMode={
             genericPty ? ptyYoloChipLabel(instance.kind) : hub.permissionMode
           }
-          launchPermissionMode={
-            genericPty ? undefined : hub.launchPermissionMode
-          }
-          permissionEffective={genericPty ? null : hub.permissionEffective}
-          permissionPending={genericPty ? null : hub.permissionPending}
+          // generic-PTY read-only chip: the Node yolo preset (bypass /
+          // always-approve / skip-permissions) is a danger state and is in no
+          // live table, so mark it explicitly (c-effortui r4 item 5(b)).
+          permissionDanger={genericPty}
+          launchPermissionMode={genericPty ? undefined : hubStore.launchPermissionModeOf(instance.id)}
+          permissionEffective={genericPty ? null : hubStore.permissionEffectiveOf(instance.id)}
+          permissionPending={genericPty ? null : hubStore.permissionPendingOf(instance.id)}
           kind={instance.kind}
           model={hub.model}
           launchModel={instance.model ?? null}
-          models={hub.models ?? undefined}
-          modelEffective={hub.modelEffective?.id ?? null}
-          modelPending={hub.modelPending}
-          modelSelectionPath={hub.modelEffective?.selectionPath ?? null}
-          modelCatalog={hub.modelCatalog}
+          models={hubStore.modelListOf(instance.id) ?? undefined}
+          modelEffective={hubStore.modelEffectiveOf(instance.id)?.id ?? null}
+          modelPending={hubStore.modelPendingOf(instance.id)}
+          modelSelectionPath={hubStore.modelEffectiveOf(instance.id)?.selectionPath ?? null}
+          modelCatalog={hubStore.modelCatalogOf(instance.id)}
           effort={hub.effort}
           effortEffective={hub.effortEffective}
+          effortReadbackWithdrawn={hub.effortReadbackWithdrawn}
           effortPending={hub.effortPending}
+          ultraGate={hub.effortVersionGate}
+          ultraBlocked={
+            instance.kind === "claude" && hub.effortRefusal
+              ? { reason: hub.effortRefusal.reason, model: hub.effortRefusal.modelId }
+              : null
+          }
+          effortDefaultIndex={
+            instance.kind === "claude" ? hub.effortDefaultIndex : undefined
+          }
           contextLabel={(() => {
             const pct = contextPercent(usage, instance.kind);
             return pct == null ? null : `${pct}%`;
           })()}
-          usageRollup={hub.usageRollup}
+          usageRollup={hubStore.usageRollupOf(instance.id)}
+          // Only the Claude PTY implements the live permission wheel today;
+          // a generic-pty and every non-Claude harness gets a read-only chip
+          // (its launch mode / the Node yolo preset), terminals none.
           onPermission={
             genericPty || instance.kind !== "claude"
               ? undefined
@@ -990,9 +1028,12 @@ function SessionPageBody({
                 }
           }
           effortDisabled={status === "exited" || instance.ownership === "observed-only"}
-          onEffort={(next) => {
-            void hubStore.setEffort(instance.id, next);
-          }}
+          // D-056 live configure is the two-axis wire ({name, ultracode});
+          // gateLiveEffort in the store applies the coupled xhigh linkage and
+          // the legacy/unknown fail-closed before the optimistic emit and the
+          // post (c-effortui r3 item 2).
+          onEffort={(next) => hubStore.setEffort(instance.id, next)}
+          onUltracode={(on) => hubStore.setUltracode(instance.id, on)}
           // The store owns the failure mouth: it reverts modelPending and
           // toasts the Hub/Node reason. Return the promise (never void it) so
           // a rejected configure is not an unhandled rejection and the

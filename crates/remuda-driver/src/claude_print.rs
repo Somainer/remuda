@@ -6924,6 +6924,49 @@ impl StdoutMapper {
     }
 }
 
+/// One slot in the slash → verdict FIFO (c-effortread r16 item 2).
+enum EffortSlashSlot {
+    /// A `/effort` switch attributed to an armed bridge generation; the slot
+    /// carries the IMMUTABLE request metadata (generation, id, requested
+    /// value) bound at its slash record, so a delayed verdict pairs with its
+    /// own request even after a newer one armed (c-effortread r11 item 1).
+    Owned(u64, crate::effort::EffortRequest),
+    /// A recognised switch slash that belongs to NO armed request: an older
+    /// pre-floor command (c-effortread r15 item 4) or a human-typed
+    /// `/effort`. The slot keeps the slash's PLACE in verdict order, so the
+    /// verdict that answers it — which can land AFTER a newer owned slash —
+    /// consumes this slot and never the owned request following it.
+    /// `is_switch` is false for non-switch slashes (`status`/`current`/
+    /// `auto`/an invalid word): their status/other verdicts prune only a
+    /// non-switch slot and can never cross an outstanding switch slot.
+    Unowned { is_switch: bool },
+}
+
+/// c-effortread r17 item 1: tri-state result of popping the verdict FIFO's
+/// front slot — the OWNED request this verdict answers, an UNOWNED place (an
+/// older pre-floor/human slash), or an EMPTY FIFO (a verdict whose slash
+/// predates this mapper, e.g. a terminal command).
+enum VerdictFront {
+    Owned(u64, crate::effort::EffortRequest),
+    Unowned,
+    Empty,
+}
+
+/// c-effortread r18 item 3 / r19 item 2 ruling B: the ONE edge the latest
+/// unowned accepted verdict WOULD have published, stashed while an armed
+/// switch is still outstanding. The edge is held with ITS OWN verdict
+/// record's deterministic event id and raw stdout, so when the armed switch
+/// ends (refusal/timeout) the deferred publish derives the SAME id the
+/// journal tailer derives for that record — the live mapper and durable
+/// replay converge on one event instead of the value being swallowed by edge
+/// dedup. Every suppressed acceptance OVERWRITES this slot, including one
+/// equal to the published baseline (a return to baseline).
+struct DeferredEffortEdge {
+    observed: remuda_protocol::ObservedEffort,
+    event_id: EventId,
+    raw: Option<String>,
+}
+
 /// Transcript-to-observations mapper for a live claude-pty session.
 pub struct TranscriptMapper {
     mapper: Mapper,
@@ -6936,8 +6979,27 @@ pub struct TranscriptMapper {
     effort: remuda_protocol::EffortTracker,
     /// Rendezvous for Remuda-initiated switches awaiting read-back.
     effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
-    /// Generation the tracker is currently armed with.
-    effort_generation: Option<u64>,
+    /// c-effortread r11 item 1 / r16 item 2: one FIFO slot per RECOGNISED
+    /// `/effort` switch slash, in transcript order. An owned slot carries the
+    /// IMMUTABLE request metadata (generation, id, requested value) bound at
+    /// its slash record; a pre-floor or human slash gets an unowned slot. Each
+    /// switch-family verdict pops the front slot, so a delayed old verdict
+    /// pairs with ITS OWN slash — never with a newer owned request B typed
+    /// while A's verdict was outstanding.
+    effort_armed: std::collections::VecDeque<EffortSlashSlot>,
+    /// c-effortread r18 item 3 / r19 item 2 ruling B: the ONE latest
+    /// suppressed unowned acceptance edge awaiting the armed switch's end.
+    /// Every suppressed acceptance overwrites it; any authoritative
+    /// effective-state publication or the end-of-switch publish clears it via
+    /// [`Self::invalidate_deferred_effort`].
+    deferred_effort_edge: Option<DeferredEffortEdge>,
+    /// c-effortread r12 item 1: test-only one-shot seam fired immediately
+    /// after a `/effort` slash takes its single pending snapshot. It lets a
+    /// unit test deterministically time the request out and arm a newer one
+    /// BEFORE the snapshot tuple is attributed. Never present in production
+    /// builds.
+    #[cfg(test)]
+    effort_slash_snapshot_hook: Option<Box<dyn FnOnce() + Send>>,
     /// §9.1 effective-model read-back state.
     model: remuda_protocol::ModelTracker,
     /// Rendezvous for Remuda-initiated `/model` switches.
@@ -6965,6 +7027,10 @@ impl TranscriptMapper {
         session_id: String,
         binary_version: String,
     ) -> Self {
+        // D-056: seed the effort version gate from the pinned binary; the
+        // transcript's own `version` records correct it as needed.
+        let mut effort = remuda_protocol::EffortTracker::new();
+        effort.seed_version(&binary_version);
         Self {
             mapper: Mapper {
                 stream: stream::StreamState::default(),
@@ -6989,9 +7055,12 @@ impl TranscriptMapper {
             group: records::Group::default(),
             seen_prompts: std::collections::HashSet::new(),
             seen_uuids: std::collections::HashSet::new(),
-            effort: remuda_protocol::EffortTracker::new(),
+            effort,
             effort_bridge: None,
-            effort_generation: None,
+            effort_armed: std::collections::VecDeque::new(),
+            deferred_effort_edge: None,
+            #[cfg(test)]
+            effort_slash_snapshot_hook: None,
             model: remuda_protocol::ModelTracker::new(),
             model_bridge: None,
             model_generation: None,
@@ -7026,6 +7095,151 @@ impl TranscriptMapper {
         }
         self.effort_bridge = Some(bridge);
         self
+    }
+
+    /// c-effortread r12 item 1: install the one-shot test seam fired right
+    /// after a `/effort` slash takes its pending snapshot (cfg(test) only).
+    #[cfg(test)]
+    pub(crate) fn set_effort_slash_snapshot_hook(&mut self, hook: Box<dyn FnOnce() + Send>) {
+        self.effort_slash_snapshot_hook = Some(hook);
+    }
+
+    /// c-effortread r8 item 5: snapshot the EffortTracker latch
+    /// (name, flag, semantics) and, per c-effortread r22 ruling S, the
+    /// channel that published the level, for re-seeding a replacement mapper
+    /// on re-promotion. None when no level has been observed.
+    pub(crate) fn effort_seed(
+        &self,
+    ) -> Option<(
+        remuda_protocol::EffortName,
+        Option<bool>,
+        remuda_protocol::EffortSemantics,
+        remuda_protocol::LevelSource,
+    )> {
+        let last = self.effort.last_observed()?;
+        Some((
+            last.name,
+            last.ultracode,
+            self.effort.semantics(),
+            self.effort.level_source(),
+        ))
+    }
+
+    /// c-effortread r8 item 5: seed a freshly built mapper's EffortTracker
+    /// with the last published observation of the previous (same pid/session)
+    /// hydrator, so a demote/re-promotion does not forget the latched
+    /// level/flag/semantics. Without it a decoupled build with ultracode on
+    /// emits `{high, ultracode: None}` on the next attachment-less assistant
+    /// record and the chip drops from "ultracode" to "high".
+    ///
+    /// c-effortread r22 item 2: the seeded level keeps its ORIGINAL
+    /// LevelSource, so a status-only level stays movable by a later status.
+    pub(crate) fn with_effort_seed(
+        mut self,
+        seed: (
+            remuda_protocol::EffortName,
+            Option<bool>,
+            remuda_protocol::EffortSemantics,
+            remuda_protocol::LevelSource,
+        ),
+    ) -> Self {
+        let (name, ultracode, semantics, level_source) = seed;
+        self.effort.seed_observed(
+            name,
+            ultracode,
+            remuda_protocol::EffortSource::Remuda,
+            semantics,
+            level_source,
+        );
+        self
+    }
+
+    /// Set whether the records about to be mapped are provenanced to THIS
+    /// process (D-056 (4)).
+    ///
+    /// The transcript pumps call this before each batch from the tail's
+    /// provenance: `true` for bytes at/after the verified resume boundary (or
+    /// any live-tail read), `false` for a resume tail displaced by a
+    /// shrink/replacement whose current-process provenance can no longer be
+    /// established — those records hydrate conversation but must never set
+    /// effort/ultracode or settle a fresh switch, so read-back stays unknown.
+    /// A live (non-resume) mapper is current by default.
+    pub(crate) fn set_effort_current_process(&mut self, current: bool) {
+        if current {
+            self.effort.mark_current_process();
+        } else {
+            self.effort.begin_history();
+        }
+    }
+
+    /// Drive the gate from a tail batch, returning an explicit
+    /// read-back-unavailable observation when a previously VERIFIED resume
+    /// becomes UNVERIFIABLE mid-run (item 5).
+    ///
+    /// `current` is this batch's provenance. When it flips to false the
+    /// tracker clears its projected effective state; if that clears a
+    /// previously published `{level, ultracode}`, the returned observation
+    /// carries that effective state cleared to `None` so the UI stops showing
+    /// a stale "effective" (it renders `?`) and no pending switch resolves
+    /// Applied. Callers emit the returned observation like any mapped edge.
+    pub(crate) fn apply_effort_provenance(
+        &mut self,
+        current: bool,
+    ) -> DriverResult<Vec<Observation>> {
+        if current {
+            self.set_effort_current_process(true);
+            return Ok(Vec::new());
+        }
+        self.set_effort_current_process(false);
+        // A switch armed for this process must not be settled by a record the
+        // tail can no longer attribute to it. Drop every armed generation
+        // WITHOUT resolving or rejecting: the bridge keeps waiting for its
+        // bounded timeout and degrades, never reporting Applied (item 5).
+        self.effort_armed.clear();
+        let Some(cleared) = self.effort.read_back_unavailable() else {
+            return Ok(Vec::new());
+        };
+        let requested = self
+            .effort_bridge
+            .as_ref()
+            .and_then(|bridge| bridge.requested())
+            .map(|request| remuda_protocol::EffortSelection {
+                name: request.name,
+                ultracode: request.ultracode,
+            });
+        // `cleared` only proves a projected state existed (the edge is
+        // emitted once). It is NOT republished: name and ultracode withdraw
+        // to None so the Hub nulls its projection and the UI renders `?`
+        // instead of keeping the stale level/flag.
+        let _ = cleared;
+        let obs = self.mapper.observation(
+            Completeness::Structured,
+            remuda_protocol::NativeRequestKey::None,
+            ObservationPayload::Effort(Box::new(EffortPayload {
+                requested,
+                request_id: None,
+                effective: EffortEffective {
+                    name: None,
+                    ultracode: None,
+                    // The provenance loss is not a level observation: source
+                    // unknown, so the UI cannot attribute it to a switch.
+                    source: remuda_protocol::EffortSource::Unknown,
+                    observed_at: now()?,
+                    readback_available: Some(false),
+                },
+                raw: None,
+            })),
+        )?;
+        Ok(vec![obs])
+    }
+
+    /// Whether the effort tracker is accepting current-process records (D-056
+    /// (4)). False for a resume tail that has not reached (or has lost) its
+    /// current-process boundary. Test-only: production pumps drive provenance
+    /// through [`Self::set_effort_current_process`].
+    #[cfg(any(test, feature = "test-stub"))]
+    pub(crate) fn is_current_process(&self) -> bool {
+        self.effort.is_current_process()
     }
 
     /// Attach the §9.1 model bridge so this mapper drives `/model` read-back
@@ -7107,6 +7321,21 @@ impl TranscriptMapper {
     /// Map one transcript line. Blank lines and undecodable JSON yield nothing:
     /// a partially written tail is normal while the file is being appended to.
     pub fn map_line(&mut self, line: &str) -> DriverResult<Vec<Observation>> {
+        self.map_line_at(line, None)
+    }
+
+    /// Map one transcript line with its VERIFIED byte position in the
+    /// transcript file (c-effortread r15 item 4, r16 item 1). The production
+    /// tail passes the position [`crate::claude_transcript::TailRead`] reports;
+    /// an armed effort switch is attributed only to a slash record starting at
+    /// or after the switch's pre-submit EOF (the switch's own record starts
+    /// exactly AT that file length), so a backlogged older slash (still
+    /// unread when the switch was armed) can never claim the newer request.
+    pub fn map_line_at(
+        &mut self,
+        line: &str,
+        position: Option<u64>,
+    ) -> DriverResult<Vec<Observation>> {
         let line = line.trim();
         if line.is_empty() {
             return Ok(Vec::new());
@@ -7114,7 +7343,7 @@ impl TranscriptMapper {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return Ok(Vec::new());
         };
-        self.map_record(value)
+        self.map_record_at(value, position)
     }
 
     /// Flush whatever assistant run is still buffered.
@@ -7131,6 +7360,10 @@ impl TranscriptMapper {
         let Some(record) = self.group.flush() else {
             return Ok(Vec::new());
         };
+        // c-effortread r9 item 5: emit ONLY conversation records here. The
+        // run's effort/model extras were already computed exactly once at
+        // map_record (native order); they must not be recomputed against
+        // tracker state a later slash may have advanced.
         self.emit_conversation(record)
     }
 
@@ -7166,6 +7399,12 @@ impl TranscriptMapper {
         if let Some(source) = value.get("sourceToolUseID").and_then(Value::as_str) {
             frame.insert("parent_tool_use_id".into(), Value::String(source.into()));
         }
+        // c-effortread r9 item 5: emit ONLY the conversation records the
+        // outbound mapper produces. Effort/model/permission side-effects are
+        // computed exactly once elsewhere — in map_record for an immediate
+        // record, or at group start (group_extras) for a buffered run — and are
+        // never recomputed here against tracker state that a later record may
+        // have advanced.
         let mut out = map_outbound(
             &mut self.mapper,
             &Outbound::from_value(Value::Object(frame)),
@@ -7187,6 +7426,16 @@ impl TranscriptMapper {
 
     /// Map one decoded transcript record.
     pub fn map_record(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
+        self.map_record_at(value, None)
+    }
+
+    /// Map one decoded transcript record with its verified transcript byte
+    /// position (see [`Self::map_line_at`]).
+    fn map_record_at(
+        &mut self,
+        value: Value,
+        position: Option<u64>,
+    ) -> DriverResult<Vec<Observation>> {
         // A sidechain record belongs to a sub-agent's own transcript view; the
         // main conversation is what the 结构 tab renders.
         if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
@@ -7197,18 +7446,32 @@ impl TranscriptMapper {
         {
             self.mapper.session_id = session.to_owned();
         }
+        // D-056: every transcript record names its Claude Code version; the
+        // effort gate (coupled vs decoupled ultracode) follows it. Version
+        // notes are not gated: a resumed mapper replays into the tracker only
+        // to learn the semantics before the first current-process record.
+        if let Some(version) = value.get("version").and_then(Value::as_str) {
+            self.effort.note_version(version);
+        }
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
         let mut extra = Vec::new();
         if kind == "assistant" {
+            // c-effortread r9 item 5: the read-back side-effects are computed
+            // ONCE here, in native record order — even while the conversation
+            // blocks buffer into the group. emit_conversation/flush_group emit
+            // only the conversation records and must never recompute these
+            // against tracker state a later record (e.g. a slash) advanced.
             extra = self.map_effort_assistant(&value)?;
             extra.extend(self.map_model_assistant(&value)?);
         } else if kind == "user" {
-            extra = self.note_effort_user(&value)?;
+            extra = self.note_effort_user(&value, position)?;
             extra.extend(self.note_model_user(&value)?);
             extra.extend(self.note_permission_user(&value)?);
         } else if kind == "system" {
             extra = self.note_model_system(&value)?;
         } else if kind == "attachment" {
+            // Top-level attachment records carry §9.1 ultra_effort_enter|exit
+            // (2.1.272+) in addition to queued_command lifecycle.
             extra = self.note_effort_attachment(&value)?;
         }
         let mut mapped = match kind {
@@ -7233,72 +7496,406 @@ impl TranscriptMapper {
     /// §9.1: the `/effort` command writes TWO user records — the slash markup
     /// and its `<local-command-stdout>` verdict. The slash record only arms
     /// attribution (on 2.1.272 it lands even for a dismissed dialog); the
-    /// verdict settles the level and resolves or rejects the switch bridge.
-    /// Returns an effort edge observation when the verdict changes the level.
-    fn note_effort_user(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
+    /// verdict settles the level/toggle and resolves or rejects the switch
+    /// bridge. Returns effort edge observations when the verdict changes the
+    /// effective level or flag.
+    fn note_effort_user(
+        &mut self,
+        value: &Value,
+        position: Option<u64>,
+    ) -> DriverResult<Vec<Observation>> {
+        // D-056 (4): a resumed session replaying pre-launch records must not
+        // arm or settle a current switch from a same-words slash/verdict pair.
+        if !self.effort.is_current_process() {
+            return Ok(Vec::new());
+        }
         let Some(message) = value.get("message") else {
             return Ok(Vec::new());
         };
         let text = records::record_text(message);
         if text.contains("<command-name>/effort</command-name>") {
-            let Some(word) = remuda_protocol::slash_effort_word(&text) else {
+            let Some(args) = remuda_protocol::slash_effort_args(&text) else {
                 return Ok(Vec::new());
             };
-            let from_remuda = self
+            // c-effortread r12 item 1: ONE bridge snapshot. The worker lives
+            // on another task and can time this request out and arm a newer
+            // one between any two lock acquisitions, so matching the slash
+            // arguments and attributing the armed tuple must both come from
+            // this single (generation, request) pair — otherwise B's tuple
+            // gets stored for A's slash and A's delayed verdict settles B.
+            // c-effortread r12 item 1: ONE bridge snapshot. The worker lives
+            // on another task and can time this request out and arm a newer
+            // one between any two lock acquisitions, so matching the slash
+            // arguments and attributing the armed tuple must both come from
+            // this single (generation, request) pair — otherwise B's tuple
+            // gets stored for A's slash and A's delayed verdict settles B.
+            let pending_snapshot = self
                 .effort_bridge
                 .as_ref()
-                .and_then(|bridge| bridge.pending())
-                .is_some_and(|request| request.command_word() == word);
-            if from_remuda
-                && let Some(bridge) = &self.effort_bridge
-                && let Some((generation, request)) = bridge.pending_with_gen()
-            {
-                self.effort_generation = Some(generation);
-                self.effort.arm_awaiting(request.observed_name());
+                .and_then(|bridge| bridge.pending_with_gen());
+            // Test-only interleaving seam: fire AFTER the snapshot is taken.
+            #[cfg(test)]
+            if let Some(hook) = self.effort_slash_snapshot_hook.take() {
+                hook();
             }
-            self.effort.note_slash(&word, from_remuda);
+            let from_remuda = pending_snapshot.as_ref().is_some_and(|pending| {
+                if pending.request.command_word() != args {
+                    return false;
+                }
+                // c-effortread r15 item 4 / r16 items 1/3: matching command
+                // content is not enough — the slash must also have SUBMISSION
+                // PROVENANCE. With a verified floor L (the file length captured
+                // immediately before submission) only a record starting at or
+                // after L can be this switch: the command's OWN record starts
+                // exactly at byte L (r16 item 1), while an older same-word
+                // slash the pump had not read yet starts BELOW L and is treated
+                // as a human/replaced command. When the carrier reports
+                // provenance UNAVAILABLE (stat failed / no bound transcript),
+                // NOTHING is attributed — the request ends through its own
+                // timeout/unconfirmed path rather than by word-only matching
+                // (r16 item 3). When either side lacks provenance (direct unit
+                // tests via the test-only `arm`) the word match alone governs.
+                pending.submit_floor.as_ref().is_none_or(|provenance| {
+                    use crate::effort::SubmissionProvenance;
+                    match provenance {
+                        SubmissionProvenance::Floor(floor) => {
+                            position.is_some_and(|record_pos| record_pos >= *floor)
+                        }
+                        SubmissionProvenance::Unavailable => false,
+                    }
+                })
+            });
+            // A slash read off an unverified/displaced batch cannot belong to
+            // this process: arm neither the generation nor the level await, so
+            // a verdict that follows provenance loss cannot settle the switch.
+            let mut owned: Option<(u64, crate::effort::EffortRequest)> = None;
+            if from_remuda
+                && let Some(pending) = pending_snapshot
+                && self.effort_armed.iter().all(|slot| {
+                    !matches!(slot, EffortSlashSlot::Owned(armed_gen, _) if *armed_gen == pending.generation)
+                })
+            {
+                let crate::effort::PendingSwitch {
+                    generation,
+                    request,
+                    submit_floor: _,
+                } = pending;
+                // c-effortread r11 item 1: bind the slash generation to ITS OWN
+                // immutable request (id, requested value, submission floor).
+                // Two commands can be outstanding (A timed out, B armed)
+                // before either verdict is read; the FIFO pairs each verdict
+                // with the slash that asked for it, so A's delayed verdict
+                // can never carry B's id.
+                if let Some(name) = request.awaits_level(self.effort.semantics()) {
+                    self.effort.arm_awaiting(name);
+                }
+                owned = Some((generation, request));
+            }
+            // c-effortread r16 item 2: note_slash also says whether the args
+            // are a SWITCH (false for `status`/`current`/`auto`/invalid words).
+            // Every recognised switch slash keeps a verdict-order slot: an
+            // owned slot when attributed to the armed request, otherwise an
+            // unowned slot (an older pre-floor command or a human /effort) so
+            // its delayed verdict consumes the unowned place, never a later
+            // owned request. Non-switch slashes get a non-switch slot: their
+            // status/other verdicts prune only those and can never cross an
+            // outstanding switch slot.
+            let is_switch = self.effort.note_slash(&args, from_remuda);
+            self.effort_armed.push_back(match owned.take() {
+                Some((generation, request)) => EffortSlashSlot::Owned(generation, request),
+                None => EffortSlashSlot::Unowned { is_switch },
+            });
             return Ok(Vec::new());
         }
         if text.contains("<local-command-stdout>") {
             let stdout = extract_local_stdout(&text);
-            let verdict = remuda_protocol::parse_effort_stdout(&stdout);
-            let from_remuda = self
-                .effort_bridge
-                .as_ref()
-                .and_then(|bridge| bridge.pending())
-                .is_some();
-            if matches!(verdict, remuda_protocol::EffortStdout::Accepted(_)) {
-                if let Some((observed, source)) = self.effort.note_stdout(&stdout, from_remuda) {
-                    if let Some(generation) = self.effort_generation.take()
-                        && let Some(bridge) = &self.effort_bridge
-                    {
-                        bridge.resolve(generation, observed);
-                    }
-                    return self.effort_observation(observed, source, Some(stdout));
-                }
-                // Non-edge accept: still resolve the switch (a switch to the
-                // level already in effect is accepted), carrying the flag.
-                if let Some(generation) = self.effort_generation.take()
-                    && let Some(bridge) = &self.effort_bridge
-                    && let remuda_protocol::EffortStdout::Accepted(observed) = verdict
-                {
-                    bridge.resolve(generation, observed);
-                }
-            } else if matches!(
-                verdict,
-                remuda_protocol::EffortStdout::Kept | remuda_protocol::EffortStdout::Invalid
-            ) && let Some(generation) = self.effort_generation.take()
-                && let Some(bridge) = &self.effort_bridge
-            {
-                let reason = if verdict == remuda_protocol::EffortStdout::Kept {
-                    "dialog-kept"
-                } else {
-                    "invalid-argument"
-                };
-                bridge.reject(generation, reason);
-            }
+            let verdict = remuda_protocol::parse_effort_stdout(&stdout, self.effort.semantics());
+            return self.settle_effort_stdout(value, stdout, verdict);
         }
         Ok(Vec::new())
+    }
+
+    /// Settle one parsed `/effort` verdict: accept/status edges carry the
+    /// deterministic per-record event ids (parity with the journal tailer),
+    /// and an armed bridge generation resolves or rejects with the stable
+    /// reason code. Status output never touches the bridge.
+    fn settle_effort_stdout(
+        &mut self,
+        value: &Value,
+        stdout: String,
+        verdict: remuda_protocol::EffortStdout,
+    ) -> DriverResult<Vec<Observation>> {
+        let mut observations = Vec::new();
+        match verdict {
+            remuda_protocol::EffortStdout::Accepted(parsed) => {
+                // c-effortread r11 item 1: this verdict answers the OLDEST
+                // outstanding slash (FIFO). When A's verdict is delayed past a
+                // newer armed B, the pair is still (gen A, request A): the
+                // bridge ignores the resolve for a stale generation and the
+                // observation is stamped with A's id/requested value, never
+                // B's. c-effortread r16 item 2: the front slot may be UNOWNED
+                // (an older pre-floor or human slash whose verdict landed
+                // here) — it consumes that place only, and a later owned
+                // request keeps waiting for ITS verdict. A verdict with no
+                // slot at all is a human/terminal command whose slash
+                // predates this mapper.
+                let front = self.pop_front_verdict_slot();
+                let paired = match &front {
+                    VerdictFront::Owned(generation, request) => {
+                        Some((*generation, request.clone()))
+                    }
+                    VerdictFront::Unowned | VerdictFront::Empty => None,
+                };
+                // c-effortread r17 item 1 / r18 item 1 (coordinator ruling):
+                // the verdict answers an UNOWNED place while ANY Remuda switch
+                // is still ARMED on the bridge — regardless of whether a later
+                // OWNED slot remains in this FIFO. The r17 guard fired only
+                // with an owned slot still queued, so two cases fell through
+                // and emitted an id-less projection that settled B via the
+                // store's value fallback: B's OWN slash stored Unowned after a
+                // failed floor stat (the failed-floor case), and an older
+                // pre-floor accept read BEFORE B's own slash acquired its owned
+                // slot. While the bridge has ANY pending switch, fold the
+                // transcript level/flag only: the edge is never labelled
+                // Remuda, NO settlement-eligible observation is emitted and
+                // the bridge's observed selection is NOT refreshed. B settles
+                // only from its own id-bearing verdict, or ends through its
+                // own bounded path. (r18 item 3 latches the folded state
+                // separately so its edge can be published once the bridge is
+                // idle.)
+                let armed_switch_pending = self
+                    .effort_bridge
+                    .as_ref()
+                    .is_some_and(|bridge| bridge.has_pending());
+                if matches!(front, VerdictFront::Unowned) && armed_switch_pending {
+                    // r18 item 3 / r19 item 2 ruling B: the folded state is
+                    // NOT published now, but the verdict's own edge is
+                    // stashed with its record event id. The stash is ONE
+                    // latest slot: EVERY suppressed accepted verdict
+                    // overwrites it — including one equal to the published
+                    // baseline (a return to baseline) — so it is handed back
+                    // even when it changes no published state. It is
+                    // published once the armed switch ends (if still current
+                    // and different), or dropped by the next authoritative
+                    // publication via invalidate_deferred_effort.
+                    if let Some(accept) = self.effort.note_unowned_stdout(&stdout) {
+                        let event_id = self.effort_event_id(
+                            value,
+                            accept.observed.name,
+                            remuda_protocol::EFFORT_STDOUT_NATIVE,
+                        );
+                        self.deferred_effort_edge = Some(DeferredEffortEdge {
+                            observed: accept.observed,
+                            event_id,
+                            raw: Some(stdout.clone()),
+                        });
+                    }
+                    return Ok(Vec::new());
+                }
+                let from_remuda = paired.is_some();
+                let edge = self.effort.note_stdout(&stdout, from_remuda);
+                // B's OWN verdict (or an idle-bridge human verdict) is the
+                // authority and publishes/supersedes anything a suppressed
+                // unowned acceptance had latched (r18 item 3 / r19 item 2
+                // ruling B): one shared invalidation of both slots.
+                self.invalidate_deferred_effort();
+                if let Some((generation, _)) = &paired
+                    && let Some(bridge) = &self.effort_bridge
+                {
+                    // A switch to the state already in effect is accepted too:
+                    // carry the post-latch observation even without an edge.
+                    let settled = edge
+                        .map(|(observed, _)| observed)
+                        .unwrap_or(self.effort.last_observed().unwrap_or(parsed));
+                    bridge.resolve(*generation, settled);
+                }
+                if let Some((observed, source)) = edge {
+                    observations = self.effort_observation(
+                        value,
+                        observed,
+                        source,
+                        Some(stdout),
+                        remuda_protocol::EFFORT_STDOUT_NATIVE,
+                        paired.as_ref(),
+                    )?;
+                } else if paired.is_some() {
+                    // c-effortread r11 item 2: an accepted verdict that changes
+                    // NOTHING (the switch targeted the state already in effect)
+                    // produces no tracker edge, but it IS request-specific
+                    // completion evidence for the armed command that typed it.
+                    // Emit the post-latch observation stamped with THAT request so
+                    // the web can settle the moved axes from the id; without it a
+                    // no-op switch would stay 切换中 until the pending max age.
+                    let observed = self.effort.last_observed().unwrap_or(parsed);
+                    observations = self.effort_observation(
+                        value,
+                        observed,
+                        EffortSource::Remuda,
+                        Some(stdout),
+                        remuda_protocol::EFFORT_STDOUT_NATIVE,
+                        paired.as_ref(),
+                    )?;
+                }
+            }
+            remuda_protocol::EffortStdout::Status(_) => {
+                // Observation only: it never resolves/rejects an armed switch.
+                // c-effortread r16 item 2: it answers the human's non-switch
+                // `/effort status` slash; retire THAT non-switch slot without
+                // crossing an outstanding switch slot.
+                self.prune_front_non_switch_slot();
+                let from_remuda = self
+                    .effort_bridge
+                    .as_ref()
+                    .and_then(|bridge| bridge.pending())
+                    .is_some();
+                // c-effortread r20 ruling B′: /effort status is an
+                // AUTHORITATIVE read-back. The tracker reconciled it through
+                // the shared path (latch + clear its deferred slot); drop
+                // THIS mapper's stashed edge in lockstep EVEN when the status
+                // emits no edge — a same-level status with no ultracode suffix
+                // is positive flag-OFF evidence and must not leave a
+                // suppressed {max, on} for B's later refusal to publish.
+                // Replayed pre-launch status reaches neither side.
+                let status_edge = self.effort.note_stdout(&stdout, from_remuda);
+                if self.effort.is_current_process() {
+                    self.invalidate_deferred_effort();
+                }
+                if let Some((observed, source)) = status_edge {
+                    observations = self.effort_observation(
+                        value,
+                        observed,
+                        source,
+                        Some(stdout),
+                        remuda_protocol::EFFORT_STATUS_NATIVE,
+                        None,
+                    )?;
+                }
+            }
+            remuda_protocol::EffortStdout::Kept
+            | remuda_protocol::EffortStdout::Invalid
+            | remuda_protocol::EffortStdout::WorkflowsDisabled
+            | remuda_protocol::EffortStdout::UnavailableForModel
+            | remuda_protocol::EffortStdout::EnvOverride => {
+                // Clears the awaiting attribution; refuses the armed switch
+                // (if any) with the verdict's stable reason code. The refusal
+                // pairs with its own slash generation, never a newer armed
+                // request's (r11 item 1). r16 item 2: an unowned front slot
+                // (pre-floor/human slash) is consumed here without touching a
+                // later owned request. r17 item 1 / r18 item 1: when such an
+                // unowned refusal lands while ANY switch is still armed on the
+                // bridge it folds NOTHING — not even when no owned FIFO slot
+                // remains (the failed-floor case, or the verdict read before
+                // B's slash acquired its owned slot): the armed request's
+                // attribution survives and it ends through its own bounded
+                // path, never from this id-less refusal.
+                let front = self.pop_front_verdict_slot();
+                let paired = match &front {
+                    VerdictFront::Owned(generation, request) => {
+                        Some((*generation, request.clone()))
+                    }
+                    VerdictFront::Unowned | VerdictFront::Empty => None,
+                };
+                let unowned_while_armed = matches!(front, VerdictFront::Unowned)
+                    && self
+                        .effort_bridge
+                        .as_ref()
+                        .is_some_and(|bridge| bridge.has_pending());
+                if !unowned_while_armed {
+                    self.effort.note_stdout(&stdout, paired.is_some());
+                }
+                if let Some((generation, _)) = paired
+                    && let Some(bridge) = &self.effort_bridge
+                    && let Some(reason) = verdict.reject_reason()
+                {
+                    bridge.reject(generation, reason);
+                }
+            }
+            remuda_protocol::EffortStdout::Other => {
+                // Unrecognised output (e.g. `/effort auto`): retire the
+                // non-switch slash slot that produced it, never a switch one.
+                self.prune_front_non_switch_slot();
+            }
+        }
+        // c-effortread r18 item 3 / r19 item 2 ruling B: once NO switch is
+        // armed on the bridge (an owned verdict resolved/rejected it above, B
+        // ended through its bounded path and this is a later verdict, or no
+        // bridge exists), publish the ONE stashed suppressed acceptance under
+        // ITS OWN verdict record's event id (live-vs-journal parity). It is
+        // published at most once and only when it still differs from the last
+        // published state; a return-to-baseline slot emits nothing. While a
+        // switch remains armed the stash stays held and the next authoritative
+        // read-back invalidates it.
+        let bridge_idle = self
+            .effort_bridge
+            .as_ref()
+            .is_none_or(|bridge| !bridge.has_pending());
+        if bridge_idle
+            && let Some(DeferredEffortEdge {
+                observed: stashed_observed,
+                event_id,
+                raw,
+            }) = self.deferred_effort_edge.take()
+            && let Some((observed, source)) = self.effort.publish_deferred(stashed_observed)
+        {
+            let mut emitted = self.effort_observation(
+                value,
+                observed,
+                source,
+                raw,
+                remuda_protocol::EFFORT_STDOUT_NATIVE,
+                None,
+            )?;
+            if let Some(first) = emitted.first_mut() {
+                first.event_id = event_id;
+            }
+            observations.append(&mut emitted);
+        }
+        Ok(observations)
+    }
+
+    /// c-effortread r19 item 2 ruling B / r20 ruling B′: the ONE shared
+    /// invalidation of the suppressed-acceptance slot. An AUTHORITATIVE
+    /// effective-state publication — an owned accept, an assistant read-back,
+    /// the effort clause of a `/model` verdict, an
+    /// `ultra_effort_enter|exit` attachment, or a `/effort status` read-back —
+    /// clears BOTH the tracker's deferred state and this mapper's stashed
+    /// edge, so a suppressed acceptance can never be published after it was
+    /// superseded. The end-of-switch deferred publish also drains through the
+    /// tracker side here (after taking the slot for emission).
+    fn invalidate_deferred_effort(&mut self) {
+        self.effort.clear_deferred();
+        self.deferred_effort_edge = None;
+    }
+
+    /// c-effortread r16 item 2 / r17 item 1: pop the front verdict-order slot.
+    /// A switch-family verdict always consumes the OLDEST outstanding slash
+    /// place (FIFO). The owned request is returned only when that place is
+    /// owned; an unowned place — an older pre-floor command or a human slash —
+    /// yields [`VerdictFront::Unowned`] and an empty FIFO
+    /// [`VerdictFront::Empty`], so the verdict takes the human/terminal path
+    /// and a later owned request keeps waiting for its own verdict.
+    fn pop_front_verdict_slot(&mut self) -> VerdictFront {
+        match self.effort_armed.pop_front() {
+            Some(EffortSlashSlot::Owned(generation, request)) => {
+                VerdictFront::Owned(generation, request)
+            }
+            Some(EffortSlashSlot::Unowned { .. }) => VerdictFront::Unowned,
+            None => VerdictFront::Empty,
+        }
+    }
+
+    /// c-effortread r16 item 2: remove the foremost outstanding NON-SWITCH
+    /// slash slot (a human `status`/`current`/`auto` command answered by a
+    /// status/other verdict). Switch slots and owned requests are never
+    /// crossed, so such a verdict cannot steal an outstanding switch verdict.
+    fn prune_front_non_switch_slot(&mut self) {
+        if let Some(index) = self
+            .effort_armed
+            .iter()
+            .position(|slot| matches!(slot, EffortSlashSlot::Unowned { is_switch: false }))
+        {
+            self.effort_armed.remove(index);
+        }
     }
 
     /// A `/plan` command switches mode natively; arm slash attribution so the
@@ -7315,54 +7912,110 @@ impl TranscriptMapper {
     }
 
     /// §9.1: 2.1.272 rides an `ultra_effort_enter|exit` attachment on the next
-    /// prompt; it corroborates the stdout verdict's ultracode flag.
+    /// prompt; on 2.1.289 a sparse enter is just a re-reminder while the toggle
+    /// stays on. It corroborates the verdict's ultracode flag.
     fn note_effort_attachment(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
-        match value.pointer("/attachment/type").and_then(Value::as_str) {
-            Some("ultra_effort_enter") => {
-                if let Some((observed, source)) = self.effort.note_ultra_attachment(true) {
-                    return self.effort_observation(observed, source, None);
-                }
+        if let Some(label @ ("ultra_effort_enter" | "ultra_effort_exit")) =
+            value.pointer("/attachment/type").and_then(Value::as_str)
+        {
+            let enters = label == "ultra_effort_enter";
+            let edge = self.effort.note_ultra_attachment(enters);
+            // r19 item 2 ruling B / r20 ruling B′: the attachment is an
+            // authoritative flag publication and clears BOTH deferred copies
+            // (the tracker reconciles for the current process — including a
+            // sparse repeat that emits no edge — and its edge is decided
+            // against the last PUBLISHED tuple, not the latched flag).
+            // Replayed pre-launch attachments are ignored by both sides.
+            if self.effort.is_current_process() {
+                self.invalidate_deferred_effort();
             }
-            Some("ultra_effort_exit") => {
-                if let Some((observed, source)) = self.effort.note_ultra_attachment(false) {
-                    return self.effort_observation(observed, source, None);
-                }
+            if let Some((observed, source)) = edge {
+                // The attachment type is the native-key label, exactly like
+                // the journal tailer, so both channels derive one event id.
+                return self.effort_observation(value, observed, source, None, label, None);
             }
-            _ => {}
         }
         Ok(Vec::new())
     }
 
-    /// Build the §9.1 effort observation for one edge.
+    /// Build the §9.1 effort observation for one edge. `native_label` selects
+    /// the deterministic event-id key (assistant message id vs
+    /// `/effort`-stdout/status/attachment record uuid) so the live mapper and
+    /// the journal tailer mint the same id for the same native edge.
+    ///
+    /// `paired` is the slash request THIS verdict answers (c-effortread r11
+    /// item 1): the echo carries THAT request's id and requested selection,
+    /// captured at its slash record — not the bridge's latest request. Non-
+    /// verdict edges (assistant records, attachments, model verdicts) pass
+    /// `None`, so they echo no request at all and settle only through the
+    /// read-back fallback.
     fn effort_observation(
         &mut self,
+        value: &Value,
         observed: remuda_protocol::ObservedEffort,
         source: remuda_protocol::EffortSource,
         raw: Option<String>,
+        native_label: &str,
+        paired: Option<&(u64, crate::effort::EffortRequest)>,
     ) -> DriverResult<Vec<Observation>> {
-        let requested = self
-            .effort_bridge
-            .as_ref()
-            .and_then(|bridge| bridge.requested())
-            .map(|request| remuda_protocol::EffortSelection {
-                name: request.name,
-                ultracode: request.ultracode,
-            });
+        let (requested, request_id) = paired
+            .map(|(_, request)| {
+                (
+                    Some(remuda_protocol::EffortSelection {
+                        name: request.name,
+                        ultracode: request.ultracode,
+                    }),
+                    request.request_id.clone(),
+                )
+            })
+            .unwrap_or((None, None));
         let payload = ObservationPayload::Effort(Box::new(EffortPayload {
             requested,
+            request_id,
             effective: EffortEffective {
-                name: observed.name,
+                name: Some(observed.name),
                 ultracode: observed.ultracode,
                 source,
                 observed_at: now()?,
+                readback_available: None,
             },
             raw,
         }));
-        Ok(vec![self.mapper.observation(
-            Completeness::Structured,
-            NativeRequestKey::None,
-            payload,
-        )?])
+        let mut obs =
+            self.mapper
+                .observation(Completeness::Structured, NativeRequestKey::None, payload)?;
+        obs.event_id = self.effort_event_id(value, observed.name, native_label);
+        // c-effortui r4 item 2: every settled effective edge (verdict or
+        // assistant record) refreshes the bridge's OBSERVED selection, so the
+        // next live configure classifies toggle-vs-tier-move against
+        // read-back — including after a terminal-typed /effort or a resume.
+        if let Some(bridge) = &self.effort_bridge {
+            bridge.note_observed(observed);
+        }
+        Ok(vec![obs])
+    }
+
+    /// Deterministic event id for one effort edge, matching the journal
+    /// tailer's key: the assistant message id for assistant edges, or
+    /// `<label>:<record uuid>` for verdict/attachment edges.
+    fn effort_event_id(
+        &self,
+        value: &Value,
+        name: remuda_protocol::EffortName,
+        native_label: &str,
+    ) -> EventId {
+        let scope = self.mapper.instance_id.as_id().as_str();
+        if native_label.is_empty() {
+            let native = value
+                .pointer("/message/id")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("uuid").and_then(Value::as_str))
+                .unwrap_or("");
+            remuda_protocol::effort_event_id(scope, native, name)
+        } else {
+            let native = value.get("uuid").and_then(Value::as_str).unwrap_or("");
+            remuda_protocol::effort_record_event_id(scope, native_label, native, name)
+        }
     }
 
     /// §9.1: read `effort` / `perTurnEffort` off an assistant record and emit
@@ -7372,14 +8025,35 @@ impl TranscriptMapper {
     fn map_effort_assistant(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
         let effort = value.get("effort").and_then(Value::as_str);
         let per_turn = value.get("perTurnEffort").and_then(Value::as_str);
+        // r19 item 2 ruling B: a CURRENT-process assistant record carrying a
+        // parseable level is an authoritative effective-state read-back and
+        // clears the suppressed-acceptance slot unconditionally — even a
+        // same-value record that produces no edge. Replayed pre-launch
+        // records (and a record with no level) reach neither observe_level
+        // nor this invalidation.
+        let level_read = self.effort.is_current_process()
+            && [effort, per_turn]
+                .into_iter()
+                .flatten()
+                .find(|raw| !raw.trim().is_empty())
+                .is_some_and(|raw| {
+                    remuda_protocol::EffortTracker::parse_level(raw, self.effort.semantics())
+                        .is_some()
+                });
         let Some((observed, source)) = self.effort.observe(effort, per_turn) else {
+            if level_read {
+                self.invalidate_deferred_effort();
+            }
             return Ok(Vec::new());
         };
+        if level_read {
+            self.invalidate_deferred_effort();
+        }
         let raw = effort
             .filter(|value| !value.is_empty())
             .or(per_turn.filter(|value| !value.is_empty()))
             .map(str::to_owned);
-        self.effort_observation(observed, source, raw)
+        self.effort_observation(value, observed, source, raw, "", None)
     }
 
     // ───────── §9.1 model read-back (same verdict pattern as effort) ─────────
@@ -7472,7 +8146,7 @@ impl TranscriptMapper {
             return Ok(Vec::new());
         }
         if text.contains("<local-command-stdout>") {
-            return self.settle_model_stdout(&extract_local_stdout(&text));
+            return self.settle_model_stdout(value, &extract_local_stdout(&text));
         }
         Ok(Vec::new())
     }
@@ -7507,13 +8181,17 @@ impl TranscriptMapper {
             return Ok(Vec::new());
         }
         if text.contains("<local-command-stdout>") {
-            return self.settle_model_stdout(&extract_local_stdout(text));
+            return self.settle_model_stdout(value, &extract_local_stdout(text));
         }
         Ok(Vec::new())
     }
 
     /// Shared verdict handling for `user` and `system` stdout records.
-    fn settle_model_stdout(&mut self, stdout: &str) -> DriverResult<Vec<Observation>> {
+    fn settle_model_stdout(
+        &mut self,
+        value: &Value,
+        stdout: &str,
+    ) -> DriverResult<Vec<Observation>> {
         let verdict = remuda_protocol::parse_model_stdout(stdout);
         let from_remuda = self.model_generation.is_some()
             || self
@@ -7522,16 +8200,48 @@ impl TranscriptMapper {
                 .and_then(|bridge| bridge.pending())
                 .is_some();
         match verdict {
-            remuda_protocol::ModelStdout::Accepted(observed) => {
+            remuda_protocol::ModelStdout::Accepted { model, effort } => {
+                let mut out = Vec::new();
+                // D-056 §4: a trailing ` with `<level>` effort` clause is an
+                // effort observation, attributed like the model switch. It
+                // never settles an effort bridge.
+                if let Some(name) = effort {
+                    let source = if from_remuda {
+                        EffortSource::Remuda
+                    } else {
+                        EffortSource::Slash
+                    };
+                    // r19 item 2 ruling B: the /model verdict's effort clause
+                    // is an authoritative effective-state publication and
+                    // clears the suppressed slot — even a same-value read-back
+                    // that emits no edge.
+                    let edge = self.effort.observe_level(name, source);
+                    self.invalidate_deferred_effort();
+                    if let Some((observed, source)) = edge {
+                        out.extend(self.effort_observation(
+                            value,
+                            observed,
+                            source,
+                            Some(stdout.to_owned()),
+                            remuda_protocol::EFFORT_MODEL_NATIVE,
+                            None,
+                        )?);
+                    }
+                }
                 let edge = self.model.note_stdout(stdout, from_remuda);
                 if let Some(generation) = self.model_generation.take()
                     && let Some(bridge) = &self.model_bridge
                 {
-                    bridge.resolve(generation, observed.clone());
+                    bridge.resolve(generation, model.clone());
                 }
                 if let Some((observed, source)) = edge {
-                    return self.model_observation(observed, source, Some(stdout.to_owned()));
+                    out.extend(self.model_observation(
+                        observed,
+                        source,
+                        Some(stdout.to_owned()),
+                    )?);
                 }
+                return Ok(out);
             }
             remuda_protocol::ModelStdout::Kept | remuda_protocol::ModelStdout::NotFound => {
                 self.model.note_stdout(stdout, from_remuda);

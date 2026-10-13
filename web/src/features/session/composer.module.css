@@ -200,6 +200,14 @@
   position: relative;
 }
 
+/* D-042 / c-effortui r3 item 7: a read-only chip for a yolo mode (codex
+   `never` / full access, a generic-pty server preset) must wear the danger
+   treatment too — hiding danger inside a menu is the loudest prohibition. */
+.chipDanger {
+  border-color: var(--danger);
+  color: var(--danger-strong);
+}
+
 /* UO-4 ownership: the desktop effort chip's top-tier modifier and its spark
    layers live HERE, immediately after the `.chip` base. In the old single
    session.module.css `.ember` followed `.chip`, so at equal specificity the
@@ -316,6 +324,21 @@
 
 .chipEffortMismatch {
   color: var(--warn);
+  font-size: 11px;
+  white-space: nowrap;
+  padding: 0 2px;
+}
+
+/* D-056: the orthogonal switch renders as an ember suffix on the level word;
+   an unobserved flag keeps the muted colour until the verdict lands. */
+.chipUltra {
+  color: var(--ember-ultra);
+  font-size: 11px;
+  white-space: nowrap;
+  padding: 0 2px;
+}
+.chipUltraMuted {
+  color: var(--mute);
   font-size: 11px;
   white-space: nowrap;
   padding: 0 2px;

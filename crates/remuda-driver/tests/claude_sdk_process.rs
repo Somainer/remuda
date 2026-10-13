@@ -12,8 +12,8 @@ use remuda_driver::{
 };
 use remuda_protocol::{
     ContentBlock, Digest, DispatchState, DriverInput, DriverKind, InputOrigin, InstanceSpec,
-    Knowledge, LifecyclePayload, Observation, ObservationPayload, PromptInput, PromptMode,
-    SourceChannel, TextBlock,
+    Knowledge, LifecyclePayload, LifecycleTopic, Observation, ObservationPayload, PromptInput,
+    PromptMode, SourceChannel, TextBlock,
 };
 use remuda_testing::{ScriptKind, ensure_workspace_bin, script_path};
 use std::collections::BTreeMap;
@@ -113,14 +113,42 @@ fn process_alive(pid: &str) -> bool {
     remuda_driver::shell_pty::lifecycle::group_alive(pid)
 }
 
+/// ma-sdk-state r14 item 2/4; r15 item 2: the ONE named bounded wait every
+/// pre-close fatal-signal death assertion goes through (the no-inline-sleep
+/// rule). `Alive` keeps polling; `Unknown` (unreadable `/proc`/`EPERM`, or a
+/// platform whose only probe cannot distinguish a zombie) also keeps polling
+/// rather than being mistaken for death.
+///
+/// r15 item 2 replaces the 25 ms `/proc` sleep-poll with a KERNEL EVENT: on
+/// Linux a `pidfd` becomes readable at the zombie transition (the watched
+/// child is the driver's, not the test's, so `waitpid` is unavailable), and
+/// on macOS the equivalent is a `kqueue` `EVFILT_PROC`/`NOTE_EXIT` — the
+/// waiter parks in the kernel for up to this named bound and never sleeps or
+/// spins. The bound is the terminator; the final classifier read still has to
+/// say Gone or Zombie.
+async fn wait_child_gone_or_zombie(pid: &str, timeout: Duration) {
+    let Ok(pid) = pid.parse::<i32>() else {
+        panic!("the launch ack carried a non-numeric pid: {pid:?}");
+    };
+    let confirmed = remuda_driver::shell_pty::lifecycle::wait_child_exit(pid, timeout).await;
+    assert!(
+        confirmed,
+        "the overflow SIGKILL delivered to the flooding child ({pid})"
+    );
+}
+
 fn prompt(text: &str) -> DriverInput {
+    prompt_id(text, "msg-1")
+}
+
+fn prompt_id(text: &str, native_client_message_id: &str) -> DriverInput {
     DriverInput::Prompt(Box::new(PromptInput {
         mode: PromptMode::NewTurn,
         blocks: vec![ContentBlock::Text(Box::new(TextBlock {
             text: text.into(),
         }))],
         origin: InputOrigin::Human,
-        native_client_message_id: "msg-1".into(),
+        native_client_message_id: native_client_message_id.into(),
     }))
 }
 
@@ -144,6 +172,127 @@ async fn collect_until(
         }
     }
     out
+}
+
+/// ACKNOWLEDGED fence drain (ma-sdk-state r10 item 2/4): collect until the
+/// ordered publication fence resolves — every job enqueued before it,
+/// INCLUDING a rollback-generated correction emitted at a cancelled ticket's
+/// position, has then been published into the channel — then drain the
+/// observations already buffered behind it. One overall timeout bounds the
+/// whole collect; there is no quiet-period polling, so a correction emitted
+/// late (or delayed at a barrier) cannot be silently missed.
+async fn drain_fence(
+    handle: &mut remuda_driver::RunHandle,
+    fence: tokio::sync::oneshot::Receiver<()>,
+    timeout: Duration,
+) -> Vec<Observation> {
+    let mut out = Vec::new();
+    let mut fence = fence;
+    let drain = async {
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut fence => {
+                    while let Some(obs) = handle.try_recv() {
+                        out.push(obs);
+                    }
+                    break;
+                }
+                maybe = handle.recv() => match maybe {
+                    Some(obs) => out.push(obs),
+                    None => break,
+                },
+            }
+        }
+    };
+    tokio::time::timeout(timeout, drain)
+        .await
+        .expect("publication fence drains within timeout");
+    out
+}
+
+/// Assert a bounded wait FAILED with tokio's elapsed timeout (r11 item 5
+/// bound proofs). `T` needs no Debug: only the error is displayed.
+fn assert_elapsed<T>(r: Result<T, tokio::time::error::Elapsed>, what: &str) {
+    match r {
+        Err(error) => assert!(
+            error.to_string().contains("elapsed"),
+            "{what} failed with a non-elapsed error: {error}"
+        ),
+        Ok(_) => panic!("{what} did not time out — the bound did not fire"),
+    }
+}
+
+/// ma-sdk-state r12 items 3/4: the ONE named bounded wait every spawned join
+/// (scheduling tests) and the spawned-join bound proof go through. The
+/// timeout lives HERE, not at any call site: remove it and a withheld
+/// completion hangs until the outer harness command timeout (the r12 item 4
+/// RED), with no local wrapper to terminate things sooner.
+async fn wait_bounded<F: std::future::Future>(
+    future: F,
+    timeout: Duration,
+    what: &str,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    // `what` names the awaited thing at every call site's expect/panic; keep it
+    // out of the body so the helper itself stays a thin timeout wrapper.
+    let _ = what;
+    tokio::time::timeout(timeout, future).await
+}
+
+/// Scheduling-site convenience: a spawned send/holder join under the shared
+/// named bound; the panic message names the awaited task `what`.
+async fn join_bounded<T: std::fmt::Debug + Send>(
+    task: tokio::task::JoinHandle<T>,
+    timeout: Duration,
+    what: &str,
+) -> T {
+    wait_bounded(task, timeout, what)
+        .await
+        .unwrap_or_else(|_| panic!("bounded test wait timed out: waiting for {what} to finish"))
+        .expect("the spawned task completed without panicking")
+}
+
+/// ma-sdk-state r12 item 4: recv until the events channel closes (None), in
+/// ONE overall named bound — a 5 s quiet period must never be read as EOF.
+/// Shared by the natural-EOF scheduling test and the recv-None bound proof;
+/// returns the collected tail on success or Elapsed when close is withheld.
+async fn drain_until_closed(
+    handle: &mut remuda_driver::RunHandle,
+    timeout: Duration,
+) -> Result<Vec<Observation>, tokio::time::error::Elapsed> {
+    let mut out = Vec::new();
+    let drain = async {
+        while let Some(obs) = handle.recv().await {
+            out.push(obs);
+        }
+        out
+    };
+    tokio::time::timeout(timeout, drain).await
+}
+
+/// ma-sdk-state r12 item 4: join a task that calls a NAMED bounded helper and
+/// require it to PANIC with the helper's own named timeout message
+/// (`name_fragment` must appear in the panic payload). There is deliberately
+/// NO local timeout around this join: the helper's internal bound is the
+/// terminator in GREEN; with that bound removed (RED) the join hangs until the
+/// outer harness command timeout, which is the required failure mode.
+async fn expect_named_timeout_panic<T: Send + std::fmt::Debug>(
+    task: tokio::task::JoinHandle<T>,
+    name_fragment: &str,
+) {
+    let panic = task
+        .await
+        .expect_err("the named bounded wait must panic when its release is withheld");
+    let payload = panic.into_panic();
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+        .unwrap_or("");
+    assert!(
+        message.contains(name_fragment),
+        "named bounded-wait panic expected to mention {name_fragment:?}, got: {message}"
+    );
 }
 
 fn lifecycle_status(obs: &Observation) -> Option<&str> {
@@ -173,6 +322,19 @@ fn turn_done_count(obs: &[Observation]) -> usize {
     obs.iter()
         .filter(|o| lifecycle_status(o) == Some("turn_done"))
         .count()
+}
+
+fn turn_started_count(obs: &[Observation]) -> usize {
+    obs.iter()
+        .filter(|o| lifecycle_named(o) == Some("turn_started"))
+        .count()
+}
+
+/// Index of the first observation matching `pred`.
+fn first_where(obs: &[Observation], pred: impl Fn(&Observation) -> bool) -> usize {
+    obs.iter()
+        .position(pred)
+        .unwrap_or_else(|| panic!("no match in {} observations", obs.len()))
 }
 
 /// Golden argv, read back from the child itself.
@@ -256,14 +418,24 @@ async fn one_turn_emits_the_observation_sequence_in_order() {
         assert_eq!(obs.source.channel, SourceChannel::Stdout);
     }
 
-    // Ordering: the session lifecycle from `system/init` precedes the assembled
-    // message, which precedes the turn's `result` and its usage.
+    // The session lifecycle from `system/init`, the `turn_started` emitted
+    // right after the user frame is written, the assembled assistant message,
+    // and the turn's settled `result` + usage are all present. The mpsc pump
+    // buffers observations, so delivery order between session/message and the
+    // post-write turn_started is not asserted; the causal relationship that
+    // matters for the working→idle projection is turn_started before result.
     let session_at = events
         .iter()
         .position(|o| {
             lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("started")
         })
         .expect("session started lifecycle");
+    let turn_started_at = events
+        .iter()
+        .position(|o| {
+            lifecycle_named(o) == Some("turn_started") && lifecycle_status(o) == Some("working")
+        })
+        .expect("turn_started/working after the user frame");
     let message_at = events
         .iter()
         .position(|o| matches!(o.body, ObservationPayload::Message(_)))
@@ -273,15 +445,102 @@ async fn one_turn_emits_the_observation_sequence_in_order() {
         .position(|o| lifecycle_status(o) == Some("turn_done"))
         .expect("turn_done");
     assert!(
-        session_at < message_at && message_at < result_at,
-        "out of order: session={session_at} message={message_at} result={result_at}"
+        session_at < result_at && message_at < result_at && turn_started_at < result_at,
+        "session/message/turn_started must all precede the result: session={session_at} \
+         start={turn_started_at} message={message_at} result={result_at}"
     );
+    // The turn_started event carries the native client message id so a later
+    // fold can join the command to the turn (D-057 ma-sdk-state).
+    use remuda_protocol::LifecyclePayload as LP;
+    let started = events
+        .iter()
+        .find(|o| lifecycle_named(o) == Some("turn_started"))
+        .expect("turn_started observation");
+    if let ObservationPayload::Lifecycle(lp) = &started.body
+        && let LP::Native(native) = lp.as_ref()
+    {
+        assert!(
+            native.related_ids.contains_key("nativeClientMessageId"),
+            "turn_started must carry the native client message id"
+        );
+    }
     // usage rides the terminal result (§2.5, `usage_from_result`).
     let usage_at = events
         .iter()
         .position(|o| matches!(o.body, ObservationPayload::Usage(_)))
         .expect("usage from result");
     assert!(usage_at > message_at, "usage must follow the message");
+
+    driver.close().await.expect("close");
+}
+
+/// A settled result `error` (an API error such as 429) maps to a
+/// `turn/result` lifecycle at status `error` with the native text on a
+/// `lastError` related id and severity info — turn-level, never process
+/// failure (D-057 OA6, ma-sdk-state).
+#[tokio::test]
+async fn an_error_result_carries_turn_level_last_error_at_info_severity() {
+    let body = r#"{"type":"assistant","message":{"id":"msg_err","type":"message","role":"assistant","model":"fake","content":[{"type":"text","text":"retry please"}]},"session_id":"__SESSION__","uuid":"aaaaaaaa-0000-4000-8000-aaaaaaaaaaa1"}
+{"type":"result","subtype":"success","is_error":true,"duration_ms":1,"num_turns":1,"result":"API Error: 429 try again","stop_reason":"end_turn","total_cost_usd":0,"usage":{"input_tokens":1,"output_tokens":1},"modelUsage":{},"permission_denials":[],"session_id":"__SESSION__","uuid":"aaaaaaaa-0000-4000-8000-aaaaaaaaaaa2","result_index":1,"queued_turn_count":0}
+{"turn":"end"}
+"#;
+    let script_path = std::env::temp_dir().join(format!(
+        "ma-sdk-state-error-{}-{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    tokio::fs::write(&script_path, body)
+        .await
+        .expect("write script");
+
+    let mut env = BTreeMap::new();
+    env.insert(
+        "FAKE_CLAUDE_SCRIPT".to_owned(),
+        script_path.to_string_lossy().into_owned(),
+    );
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+    driver.send(prompt("one")).await.expect("send");
+    let events = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        obs.iter()
+            .any(|o| lifecycle_named(o) == Some("result") && lifecycle_status(o) == Some("error"))
+    })
+    .await;
+
+    use remuda_protocol::{LifecyclePayload as LP, Severity};
+    let error_result = events
+        .iter()
+        .find(|o| lifecycle_named(o) == Some("result") && lifecycle_status(o) == Some("error"))
+        .expect("turn/result error");
+    let native = match &error_result.body {
+        ObservationPayload::Lifecycle(lp) => match lp.as_ref() {
+            LP::Native(native) => native,
+            other => panic!("expected native lifecycle, got {other:?}"),
+        },
+        other => panic!("expected lifecycle, got {other:?}"),
+    };
+    assert_eq!(native.topic, remuda_protocol::LifecycleTopic::Turn);
+    assert_eq!(
+        native.severity,
+        Severity::Info,
+        "a turn error is not an error-severity event"
+    );
+    assert_eq!(
+        native.related_ids.get("lastError").map(String::as_str),
+        Some("API Error: 429 try again"),
+        "native error text is carried for the additive turn-error marker"
+    );
+    assert_eq!(
+        native
+            .related_ids
+            .get("queuedTurnCount")
+            .map(String::as_str),
+        Some("0")
+    );
 
     driver.close().await.expect("close");
 }
@@ -676,6 +935,1472 @@ async fn close_returns_when_stdin_is_not_drained_and_the_writer_is_saturated() {
     );
 }
 
+/// r3 item 5 + ma-sdk-state r5 item 1: a blocked SEND cannot gate close, and
+/// the child's stdout must keep being DRAINED under bidirectional pipe
+/// pressure.
+///
+/// The fake stops reading stdin AND floods stdout forever. A prompt bigger
+/// than a pipe buffer blocks in the writer task. Pre-r3 `send` held the
+/// `live` (and turn-order) lock across that write, so a concurrent `close`
+/// could not start its ladder and the process hung. r5 parks the publication
+/// worker at the turn's in-queue reservation ticket while the write is
+/// blocked: the reader task keeps draining the child's stdout into the
+/// unbounded queue (so the OS pipe never fills and close is not gated), but
+/// frames behind the ticket are not EMITTED until the write resolves. Here we:
+///  1. start a large send and prove it is parked on the blocked pipe;
+///  2. prove emission is gated at the ticket while the reader still drains
+///     (no pipe deadlock);
+///  3. close concurrently — it must reach the ladder, reap the child within
+///     its bound, and release the parked send (with an error, not a success).
+#[tokio::test]
+async fn a_blocked_send_cannot_gate_close_and_emission_gates_at_the_ticket_without_deadlock() {
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_STOP_READING".into(), "1".into());
+    env.insert("FAKE_CLAUDE_STDOUT_FLOOD".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let mut handle = driver.start(spec).await.expect("start");
+
+    // 1. A large prompt parks on the blocked pipe (write never completes).
+    let big = "x".repeat(256 * 1024);
+    let mut send_fut = Box::pin(driver.send(prompt(&big)));
+    let parked = tokio::time::timeout(Duration::from_millis(800), &mut send_fut).await;
+    assert!(
+        parked.is_err(),
+        "the send must stay parked while the child does not drain stdin"
+    );
+
+    // 2. The flood (~one frame every 500us, i.e. thousands over the window if
+    // it flowed) must NOT be emitted while the worker holds the reservation
+    // ticket. Only the few frames enqueued ahead of the ticket can be
+    // delivered before the worker parks; a free-running drain would deliver
+    // orders of magnitude more. The reader still drains the child's stdout
+    // into the unbounded queue, so the OS pipe never fills (no close deadlock).
+    let mut emitted = 0usize;
+    let gate_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < gate_deadline {
+        if let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(100), handle.recv()).await {
+            emitted += 1;
+        }
+    }
+    assert!(
+        emitted < 100,
+        "frames behind the parked reservation must not be emitted; got {emitted} \
+         (a free-running 2 kHz flood delivers thousands over the window)"
+    );
+
+    // 3. close must start immediately (no `live` held by the blocked send),
+    // bound the unresponsive child away, and unblock the send.
+    let started = std::time::Instant::now();
+    let close_fut = tokio::time::timeout(Duration::from_secs(20), driver.close());
+    let (send_result, closed) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(20), &mut send_fut),
+        close_fut
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "close took {:?}: a blocked send gated the close ladder",
+        started.elapsed()
+    );
+    closed.expect("close timed out").expect("close ack");
+    let send_result = send_result.expect("the parked send never resolved after close");
+    assert!(
+        send_result.is_err(),
+        "a write the dead child never drained must surface an error, not success: {send_result:?}"
+    );
+}
+
+/// Related ids of the session terminal lifecycle, when it is the named event;
+/// used to read the ma-sdk-state r12 item 1 overflow diagnostic.
+fn session_terminal_related(
+    obs: &Observation,
+) -> Option<&std::collections::BTreeMap<String, String>> {
+    match &obs.body {
+        ObservationPayload::Lifecycle(payload) => match payload.as_ref() {
+            LifecyclePayload::Native(native)
+                if native.topic == LifecycleTopic::Session && native.native_name == "session" =>
+            {
+                Some(&native.related_ids)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// ma-sdk-state r12 item 1: the publication backlog is bounded by BOTH bytes
+/// and items. In the blocked-send fixture (the child stops reading stdin and
+/// floods stdout forever while a 256 KiB prompt is stuck in the writer) the
+/// old unbounded publication queue grew Node memory without limit. With small
+/// caps the bounded admission trips, the session is shut down with the
+/// `publication_backlog_overflow` terminal diagnostic (the process-end
+/// classifier's exact `session`/`failed` token), the parked send surfaces an
+/// error, and `close` still completes — while the measured backlog never
+/// crosses either cap and nothing is published after the terminal observation.
+#[tokio::test]
+async fn a_publication_backlog_overflow_shuts_the_session_down_bounded_with_a_diagnostic() {
+    const ITEM_CAP: usize = 32;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_STOP_READING".into(), "1".into());
+    env.insert("FAKE_CLAUDE_STDOUT_FLOOD".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    // Shrink the caps BEFORE launch: the flood (~one small frame/500 µs) trips
+    // the item cap in tens of milliseconds; 32 tiny frames stay far below the
+    // byte cap, so the ITEM limit is the one proven here.
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+
+    let barrier = driver.arm_write_commit_barrier();
+
+    // One oversized prompt parks on the pipe the child never drains: the
+    // publication worker holds its reservation ticket while flood frames
+    // accumulate behind it (the exact fixture the brief names).
+    let big = "x".repeat(256 * 1024);
+    let d = driver.clone();
+    let parked_send = tokio::spawn(async move { d.send(prompt(&big)).await });
+
+    // ACKNOWLEDGED overflow: the barrier note is set inside the shutdown
+    // routine after the terminal observation was delivered — no polling.
+    barrier
+        .wait_until_backlog_overflow(Duration::from_secs(10))
+        .await;
+
+    // The reserved terminal permit delivers the diagnostic even while the
+    // worker is parked; drain until it arrives (bounded overall, no quiet
+    // period).
+    let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+        seen.iter().any(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+    })
+    .await;
+    let terminal = all
+        .iter()
+        .find(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+        .expect("the session ends with the publication_backlog_overflow diagnostic");
+    assert_eq!(
+        lifecycle_named(terminal),
+        Some("session"),
+        "the overflow diagnostic is the session terminal lifecycle: {terminal:?}"
+    );
+    assert_eq!(
+        lifecycle_status(terminal),
+        Some("failed"),
+        "overflow shutdown ends the instance as Failed, not a clean exit: {terminal:?}"
+    );
+    let related = session_terminal_related(terminal).expect("related ids");
+    assert_eq!(
+        related.get("backlogItems").map(String::as_str),
+        Some(ITEM_CAP.to_string().as_str()),
+        "the diagnostic names the occupancy that tripped the cap: {related:?}"
+    );
+    assert_eq!(
+        related.get("backlogItemsLimit").map(String::as_str),
+        Some(ITEM_CAP.to_string().as_str()),
+        "the diagnostic names the configured item cap: {related:?}"
+    );
+    assert_eq!(
+        related.get("backlogBytesLimit").map(String::as_str),
+        Some(BYTE_CAP.to_string().as_str()),
+        "the diagnostic names the configured byte cap: {related:?}"
+    );
+    assert!(
+        related
+            .get("backlogBytes")
+            .and_then(|s| s.parse::<usize>().ok())
+            .is_some_and(|bytes| bytes <= BYTE_CAP),
+        "named byte occupancy is within the byte cap: {related:?}"
+    );
+
+    // BOUNDED MEMORY: neither high-water mark ever crossed its cap.
+    let snapshot = driver.publication_backlog_for_test();
+    assert!(snapshot.overflowed, "the driver reports the overflow once");
+    assert!(
+        snapshot.items_high <= ITEM_CAP,
+        "frame backlog crossed the item cap: {} > {ITEM_CAP}",
+        snapshot.items_high
+    );
+    assert!(
+        snapshot.bytes_high <= BYTE_CAP,
+        "frame backlog crossed the byte cap: {} > {BYTE_CAP}",
+        snapshot.bytes_high
+    );
+
+    // The diagnostic is terminal: close seals the channel and nothing trails
+    // it. The parked send unblocks with an error once the killed child's pipes
+    // close.
+    drop(barrier);
+    let send_result = join_bounded(
+        parked_send,
+        Duration::from_secs(10),
+        "the overflow-parked send",
+    )
+    .await;
+    assert!(
+        send_result.is_err(),
+        "a write the killed child never drained surfaces an error: {send_result:?}"
+    );
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(10),
+        "close after the overflow",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close after the overflow")
+    .expect("close ack");
+    let tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+    assert!(
+        tail.iter().all(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_none()
+        }),
+        "the overflow diagnostic is not emitted twice: {tail:?}"
+    );
+    assert!(
+        !tail.iter().any(|o| lifecycle_named(o) == Some("session")),
+        "no session lifecycle follows the overflow terminal observation: {tail:?}"
+    );
+}
+
+/// ma-sdk-state r13 item 2: a child that keeps READING prompts but emits no
+/// stdout cannot grow Reserve tickets (and outstanding turn-book entries)
+/// without bound when nobody drains the RunHandle. Each committed ticket emits
+/// one `turn_started`; once the 255 ordinary observation slots are full the
+/// publication worker parks in emit and every later ticket queues. Reservation
+/// admission is bounded by the same caps as frames: the (cap+1)th reserve is
+/// refused, the overflow shutdown fires, and the high-water marks never cross
+/// either cap.
+#[tokio::test]
+async fn a_silent_prompt_flood_is_bounded_by_reservation_admission() {
+    // Above 255 so the worker is provably parked in emit (the ordinary slots
+    // are all turn_starteds) before reservation charges reach the cap.
+    const ITEM_CAP: usize = 256;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_SILENT_PROMPTS".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+
+    // Armed for the overflow acknowledgement; open every gate immediately so
+    // arming alone does not park write commits (the barrier defaults to
+    // holding) — commits must flow for the tickets to accumulate.
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.release();
+
+    // Never drain the handle while the flood runs: the committed tickets emit
+    // turn_starteds that fill the ordinary slots, the worker parks in emit, and
+    // the tickets behind it stay charged. Sequential sends are enough — the
+    // write completes when the child reads the prompt, independent of the
+    // wedged worker.
+    let d = driver.clone();
+    let sender = tokio::spawn(async move {
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for n in 0..2000usize {
+            let id = format!("msg-silent-{n}");
+            match d.send(prompt_id("silent turn", &id)).await {
+                Ok(_) => accepted += 1,
+                Err(_) => {
+                    rejected += 1;
+                    break;
+                }
+            }
+        }
+        (accepted, rejected)
+    });
+
+    // ACKNOWLEDGED overflow: the note is set after the kill and the terminal
+    // delivery, so the refusal is the bounded one (not a closed-race).
+    barrier
+        .wait_until_backlog_overflow(Duration::from_secs(30))
+        .await;
+
+    let (accepted, rejected) = join_bounded(
+        sender,
+        Duration::from_secs(10),
+        "the silent-prompt flood sender",
+    )
+    .await;
+    assert!(
+        rejected >= 1,
+        "the prompt past the reserve cap is rejected: {accepted} accepted"
+    );
+    // 255 starts occupy the ordinary slots when the worker parks; the cap is
+    // reached by queued tickets behind that parked one.
+    assert!(
+        accepted >= ITEM_CAP,
+        "tickets accumulated to the reservation cap before the refusal: {accepted}"
+    );
+
+    // The reserved terminal permit delivers the diagnostic past the wedged
+    // ordinary channel.
+    let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+        seen.iter().any(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+    })
+    .await;
+    let terminal = all
+        .iter()
+        .find(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+        .expect("the session ends with the publication_backlog_overflow diagnostic");
+    assert_eq!(lifecycle_status(terminal), Some("failed"));
+    assert_eq!(lifecycle_named(terminal), Some("session"));
+    let snapshot = driver.publication_backlog_for_test();
+    assert!(snapshot.overflowed, "the driver reports the overflow once");
+    assert!(
+        snapshot.items_high <= ITEM_CAP,
+        "ticket backlog crossed the item cap: {} > {ITEM_CAP}",
+        snapshot.items_high
+    );
+    assert!(
+        snapshot.bytes_high <= BYTE_CAP,
+        "ticket backlog crossed the byte cap: {} > {BYTE_CAP}",
+        snapshot.bytes_high
+    );
+
+    drop(barrier);
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close after the reservation overflow",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close after the reservation overflow")
+    .expect("close ack");
+    let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+}
+
+/// ma-sdk-state r13 item 3 (revised r15 item 1): the overflow shutdown used to
+/// re-read the driver's live slot, so a held handle could delay (or a skipped
+/// `try_lock` permanently miss) the kill. The shutdown now signals the launch's
+/// CAPTURED pid/pgid directly, so the SIGKILL lands THROUGH a live lock the
+/// test keeps held for the whole proof.
+#[tokio::test]
+async fn an_overflow_kill_reaches_the_child_through_a_held_live_handle() {
+    const ITEM_CAP: usize = 32;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_STOP_READING".into(), "1".into());
+    env.insert("FAKE_CLAUDE_STDOUT_FLOOD".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+    let pid = handle
+        .ack()
+        .native_ids
+        .get("pid")
+        .expect("pid on the launch ack")
+        .clone();
+
+    let barrier = driver.arm_write_commit_barrier();
+
+    // Hold the live process handle BEFORE the flood trips and KEEP it through
+    // the kill: the launch-scoped shutdown must not need it.
+    let live_hold = driver
+        .bounded_hold_live_for_test(Duration::from_secs(5))
+        .await;
+
+    // ACKNOWLEDGED: the shutdown sealed admission and reached the kill step.
+    barrier
+        .wait_until_overflow_kill_waiting(Duration::from_secs(10))
+        .await;
+
+    // The SIGKILL lands while the handle is STILL held — the kill targets the
+    // captured pid, never the driver's live slot. Pre-close evidence goes
+    // through the named bounded, event-driven death waiter (r15 item 2).
+    wait_child_gone_or_zombie(&pid, Duration::from_secs(15)).await;
+    barrier
+        .wait_until_backlog_overflow(Duration::from_secs(10))
+        .await;
+
+    // The terminal diagnostic rides the reserved permit.
+    let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+        seen.iter().any(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+    })
+    .await;
+    assert!(all.iter().any(|o| {
+        session_terminal_related(o)
+            .and_then(|r| r.get("reason"))
+            .is_some_and(|reason| reason == "publication_backlog_overflow")
+    }));
+
+    drop(live_hold);
+    drop(barrier);
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close after the captured-pid overflow kill",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close after the overflow kill")
+    .expect("close ack");
+    assert!(
+        !process_alive(&pid),
+        "close reaps the SIGKILLed group the overflow kill already reached"
+    );
+    let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+}
+
+/// ma-sdk-state r14 item 2, accepted schedule (ma-sdk-state r15 item 6): on a
+/// MULTI-THREAD runtime the abort must genuinely land on the triggering send
+/// WHILE the overflow shutdown is in progress.
+///
+/// The current-thread version only ever aborted an already-finished flooder:
+/// the breaching send spawns the shutdown synchronously and immediately
+/// returns the refusal error, so the shutdown task ran only after the send
+/// ended. Here the trigger send PARKS at a post-spawn barrier gate while the
+/// shutdown parks (sealed) at its pre-kill gate; the test acknowledges both
+/// parked points, aborts the send, and asserts the join reports a
+/// cancellation. The detached, launch-scoped shutdown then still kills the
+/// captured child and publishes the terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_the_triggering_send_mid_overflow_shutdown_still_kills_and_publishes() {
+    const ITEM_CAP: usize = 256;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_SILENT_PROMPTS".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+    let pid = handle
+        .ack()
+        .native_ids
+        .get("pid")
+        .expect("pid on the launch ack")
+        .clone();
+
+    // Open write/commit gates; SHUT both the shutdown's pre-kill gate AND the
+    // triggering send's post-spawn refusal gate.
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.release();
+    barrier.hold_overflow_kill();
+    barrier.hold_overflow_refusal();
+
+    // Flood reservation tickets on a task on the OTHER worker.
+    let d = driver.clone();
+    let mut flooder = tokio::spawn(async move {
+        for n in 0..4_000usize {
+            let id = format!("msg-r15-6-{n}");
+            if d.send(prompt_id("silent turn", &id)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // The shutdown sealed admission and parked at its pre-kill gate — it is
+    // genuinely in progress.
+    barrier
+        .wait_until_overflow_kill_gate_parked(Duration::from_secs(20))
+        .await;
+    // The TRIGGER SEND spawned it and is now parked BEFORE returning its
+    // error — so aborting the flooder lands on a live, in-flight send rather
+    // than on a finished one.
+    barrier
+        .wait_until_overflow_refusal_parked(1, Duration::from_secs(20))
+        .await;
+
+    // Keep the kill target's live handle held through the abort, too: the
+    // launch-scoped kill must reach the captured pid without it (r15 item 1).
+    let live_hold = driver
+        .bounded_hold_live_for_test(Duration::from_secs(5))
+        .await;
+
+    // ABORT while both tasks are parked mid-shutdown. The join must report a
+    // real cancellation landing at the send's post-spawn await.
+    flooder.abort();
+    let join = wait_bounded(&mut flooder, Duration::from_secs(5), "the aborted flooder")
+        .await
+        .expect("the bounded join itself completed")
+        .expect_err("the flooder task was aborted, so its inner result is a JoinError");
+    assert!(
+        join.is_cancelled(),
+        "the abort landed on the in-flight triggering send: {join:?}"
+    );
+    assert!(
+        process_alive(&pid),
+        "the child stays alive while the shutdown parks at the pre-kill gate"
+    );
+
+    // Release the parked send (no task waits anymore) and then the shutdown:
+    // it reaches the captured pid THROUGH the still-held live handle.
+    barrier.release_overflow_refusal();
+    barrier.release_overflow_kill();
+    wait_child_gone_or_zombie(&pid, Duration::from_secs(15)).await;
+    drop(live_hold);
+
+    // The detached shutdown survived the genuine mid-flight abort: the
+    // terminal diagnostic is published after the kill.
+    barrier
+        .wait_until_backlog_overflow(Duration::from_secs(20))
+        .await;
+
+    let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+        seen.iter().any(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+    })
+    .await;
+    let terminal = all
+        .iter()
+        .find(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+        .expect("the genuinely-aborted triggering send still publishes the overflow terminal");
+    assert_eq!(lifecycle_status(terminal), Some("failed"));
+
+    drop(barrier);
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close after the mid-shutdown abort",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close after the mid-shutdown abort")
+    .expect("close ack");
+    let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+}
+
+/// ma-sdk-state r18 item 1 (RULING): the overflow ownership decision — latch
+/// swap, closed check, and registration of the tracked shutdown task — runs
+/// SYNCHRONOUSLY under the publication guard the reservation path already
+/// holds, with no await between detecting the overflow and the registration.
+///
+/// The pre-fix code dropped that guard and re-acquired it asynchronously in
+/// the spawn function; a cooperative-budget yield at the re-entry let an
+/// aborted send discard the whole overflow (latch unset, no tracked task, the
+/// live child kept running without the publication_backlog_overflow
+/// terminal). This regression aborts the triggering send at a gate parked at
+/// that EXACT yield point: under the fix the decision already completed (the
+/// registration ack fired, the send parks still HOLDING the gate), so the
+/// abort only drops the gate — the registered task seals, kills the captured
+/// child and emits the single overflow terminal. The r16 cancellation
+/// regression parks LATER (after the spawn returned) and therefore misses
+/// this window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_the_triggering_send_at_the_prespawn_point_keeps_the_overflow_registered() {
+    const ITEM_CAP: usize = 256;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_SILENT_PROMPTS".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+    let pid = handle
+        .ack()
+        .native_ids
+        .get("pid")
+        .expect("pid on the launch ack")
+        .clone();
+
+    // Open the write/commit gates; SHUT the overflow-spawn gate (the send
+    // parks there AFTER the synchronous decision, holding the admission
+    // gate) and the shutdown's pre-kill gate.
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.release();
+    barrier.hold_overflow_spawn();
+    barrier.hold_overflow_kill();
+
+    // Flood reservation tickets on a task on the OTHER worker.
+    let d = driver.clone();
+    let mut flooder = tokio::spawn(async move {
+        for n in 0..4_000usize {
+            let id = format!("msg-r18-1-{n}");
+            if d.send(prompt_id("silent turn", &id)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // The decision ran SYNCHRONOUSLY before the send reached the (relocated)
+    // park point: the latch is set and the shutdown task is tracked on the
+    // launch. Reverting the fix parks the send BEFORE deciding, so this
+    // acknowledgement times out with the overflow discarded.
+    barrier
+        .wait_until_overflow_registered(1, Duration::from_secs(20))
+        .await;
+    barrier
+        .wait_until_overflow_spawn_parked(1, Duration::from_secs(20))
+        .await;
+
+    // The registered task cannot seal while the parked send still holds the
+    // admission gate, so no kill has landed: the child stays alive.
+    assert!(
+        process_alive(&pid),
+        "the child is not killed while the parked triggering send holds the admission gate"
+    );
+
+    // ABORT the send at the old pre-spawn yield point. The cancellation lands
+    // on a genuinely in-flight send; dropping its future releases the gate,
+    // nothing else.
+    flooder.abort();
+    let join = wait_bounded(&mut flooder, Duration::from_secs(5), "the aborted flooder")
+        .await
+        .expect("the bounded join itself completed")
+        .expect_err("the flooder task was aborted, so its inner result is a JoinError");
+    assert!(
+        join.is_cancelled(),
+        "the abort landed on the in-flight triggering send: {join:?}"
+    );
+
+    // The tracked task survived the abort, sealed as the gate dropped, and is
+    // now parked at its pre-kill gate.
+    barrier
+        .wait_until_overflow_kill_gate_parked(Duration::from_secs(20))
+        .await;
+    assert!(
+        process_alive(&pid),
+        "the child stays alive while the tracked shutdown parks at its pre-kill gate"
+    );
+
+    // Release the task: it reaches the captured pid directly and publishes
+    // the overflow terminal.
+    barrier.release_overflow_spawn();
+    barrier.release_overflow_kill();
+    wait_child_gone_or_zombie(&pid, Duration::from_secs(15)).await;
+    barrier
+        .wait_until_backlog_overflow(Duration::from_secs(20))
+        .await;
+
+    let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+        seen.iter().any(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+    })
+    .await;
+    let terminals = all
+        .iter()
+        .filter(|o| {
+            lifecycle_named(o) == Some("session")
+                && matches!(lifecycle_status(o), Some("exited") | Some("failed"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "exactly one session terminal, the overflow one: {all:?}"
+    );
+    assert_eq!(lifecycle_status(terminals[0]), Some("failed"));
+
+    drop(barrier);
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close after the pre-spawn abort proof",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close")
+    .expect("close ack");
+    let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+}
+
+/// ma-sdk-state r15 item 1: the overflow shutdown is LAUNCH-SCOPED.
+///
+/// Park launch A's spawned overflow shutdown at its pre-kill gate, close A
+/// (close must finish the detached shutdown itself — bounded join then abort —
+/// before its kill ladder), start B, and only then release A's gate. A
+/// shutdown that merely detached and re-read the driver's live slot would now
+/// kill B's child; the launch-scoped shutdown signals A's captured pid only
+/// (and the parked task was aborted by close), so B stays alive and answers a
+/// real turn after the gate release.
+#[tokio::test]
+async fn a_parked_overflow_shutdown_cannot_kill_the_relaunched_child() {
+    const ITEM_CAP: usize = 256;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    // The silent fixture is FILE-GATED: present while A floods, removed before
+    // B starts, so the relaunched child answers turns normally.
+    let marker = std::env::temp_dir().join(format!("remuda-r15-1-silent-{}", std::process::id()));
+    std::fs::write(&marker, b"x").expect("create the silence marker");
+    let mut env = BTreeMap::new();
+    env.insert(
+        "FAKE_CLAUDE_SILENT_PROMPTS_FILE".into(),
+        marker.to_string_lossy().into_owned(),
+    );
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.release();
+    barrier.hold_overflow_kill();
+
+    // Launch A and flood reservations until A's overflow shutdown spawns and
+    // parks at the pre-kill gate.
+    let mut handle_a = wait_bounded(
+        driver.start(spec.clone()),
+        Duration::from_secs(10),
+        "start A",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for start A")
+    .expect("start A");
+    let d = driver.clone();
+    let flooder = tokio::spawn(async move {
+        for n in 0..4_000usize {
+            let id = format!("msg-r15-1-a-{n}");
+            if d.send(prompt_id("silent turn", &id)).await.is_err() {
+                break;
+            }
+        }
+    });
+    barrier
+        .wait_until_overflow_kill_gate_parked(Duration::from_secs(20))
+        .await;
+    join_bounded(
+        flooder,
+        Duration::from_secs(10),
+        "A's flood after the refusal",
+    )
+    .await;
+
+    // Close A with the shutdown STILL parked. close must finish the detached
+    // task (bounded join → abort at the gate → await its unwind) before it
+    // returns; the close ladder then kills and reaps A itself.
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close A with shutdown parked",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close A")
+    .expect("close A ack");
+    let a_tail = drain_until_closed(&mut handle_a, Duration::from_secs(5))
+        .await
+        .expect("RunHandle A reaches recv=None after close");
+    // The parked overflow never published; close covered A with an ordinary
+    // exit (no overflow terminal leaking from the aborted task).
+    assert!(
+        !a_tail.iter().any(|o| session_terminal_related(o)
+            .and_then(|r| r.get("reason"))
+            .is_some_and(|reason| reason == "publication_backlog_overflow")),
+        "close A aborts the parked shutdown before it publishes: {a_tail:?}"
+    );
+
+    // B starts on the same driver while A's gate is still shut.
+    std::fs::remove_file(&marker).expect("un-silence the relaunched fake");
+    let mut handle_b = wait_bounded(
+        driver.start(spec.clone()),
+        Duration::from_secs(10),
+        "start B",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for start B")
+    .expect("start B");
+    let pid_b = handle_b
+        .ack()
+        .native_ids
+        .get("pid")
+        .expect("pid on B's launch ack")
+        .clone();
+
+    // NOW release A's parked pre-kill gate. Nothing (in the fixed code: no
+    // task at all) may reach B.
+    barrier.release_overflow_kill();
+
+    // B is alive and usable: a full turn round-trip completes AFTER the gate
+    // release. The regression killed B's child from the stale live slot, so B
+    // never answered and its handle got an exit instead.
+    wait_bounded(
+        driver.send(prompt_id("hello after relaunch", "msg-r15-1-b")),
+        Duration::from_secs(10),
+        "B accepts the post-gate prompt",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for B's send")
+    .expect("B accepts the prompt");
+    let b_obs = collect_until(&mut handle_b, Duration::from_secs(15), |seen| {
+        turn_done_count(seen) >= 1
+    })
+    .await;
+    assert!(
+        turn_done_count(&b_obs) >= 1,
+        "B completes a real turn after A's gate release: {b_obs:?}"
+    );
+    assert!(
+        process_alive(&pid_b),
+        "B's child is still alive after A's shutdown gate released"
+    );
+
+    drop(barrier);
+    wait_bounded(driver.close(), Duration::from_secs(20), "close B")
+        .await
+        .expect("bounded test wait timed out: waiting for close B")
+        .expect("close B ack");
+    let _tail = drain_until_closed(&mut handle_b, Duration::from_secs(5))
+        .await
+        .expect("RunHandle B reaches recv=None after close");
+}
+
+/// ma-sdk-state r15 item 4: after a RESERVATION-triggered overflow pauses its
+/// shutdown (pre-kill gate shut), one more stdout frame arrives. Frame
+/// admission answers `Closed` (the overflow latch already tripped); the old
+/// reader treated that break as natural EOF and enqueued a StdoutEof, so the
+/// worker published an ordinary `exited` and suppressed the overflow
+/// terminal. The reader must now stop WITHOUT a StdoutEof and leave the
+/// terminal to the overflow task.
+#[tokio::test]
+async fn a_frame_after_a_paused_reservation_overflow_publishes_the_overflow_terminal_not_eof() {
+    const ITEM_CAP: usize = 256;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    let trigger =
+        std::env::temp_dir().join(format!("remuda-r15-4-spare-frame-{}", std::process::id()));
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_SILENT_PROMPTS".into(), "1".into());
+    env.insert(
+        "FAKE_CLAUDE_SPARE_FRAME_TRIGGER".into(),
+        trigger.to_string_lossy().into_owned(),
+    );
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.release();
+    barrier.hold_overflow_kill();
+
+    let d = driver.clone();
+    let flooder = tokio::spawn(async move {
+        for n in 0..4_000usize {
+            let id = format!("msg-r15-4-{n}");
+            if d.send(prompt_id("silent turn", &id)).await.is_err() {
+                break;
+            }
+        }
+    });
+    barrier
+        .wait_until_overflow_kill_gate_parked(Duration::from_secs(20))
+        .await;
+    join_bounded(
+        flooder,
+        Duration::from_secs(10),
+        "the flood after the refusal",
+    )
+    .await;
+
+    // The child emits ONE more frame while the overflow shutdown is paused.
+    // ACKNOWLEDGE the frame's Closed refusal and then the reader finishing:
+    // by that point the buggy reader had enqueued its false StdoutEof.
+    std::fs::write(&trigger, b"x").expect("trigger the spare frame");
+    barrier
+        .wait_until_closed_frame_refusals(1, Duration::from_secs(10))
+        .await;
+    barrier
+        .wait_until_reader_finished_after_refusal(Duration::from_secs(10))
+        .await;
+
+    // Drain everything the worker can reach up to an ordered fence, WITH the
+    // shutdown still paused (the consumer is draining: turn_starteds flow).
+    // No TERMINAL session lifecycle must be among these observations — the
+    // overflow terminal has not been emitted yet, and a false ordinary EOF
+    // must not have jumped the fence (the init-time session "started" is not
+    // terminal and is expected).
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
+    let drained = drain_fence(&mut handle, fence, Duration::from_secs(20)).await;
+    let early_terminals = drained
+        .iter()
+        .filter(|o| {
+            lifecycle_named(o) == Some("session")
+                && matches!(lifecycle_status(o), Some("exited") | Some("failed"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        early_terminals.is_empty(),
+        "no terminal session lifecycle before the overflow shutdown runs: {early_terminals:?}"
+    );
+
+    // Resume the paused shutdown: ITS terminal is the session terminal.
+    barrier.release_overflow_kill();
+    barrier
+        .wait_until_backlog_overflow(Duration::from_secs(10))
+        .await;
+    let terminal = {
+        let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+            seen.iter().any(|o| {
+                session_terminal_related(o)
+                    .and_then(|r| r.get("reason"))
+                    .is_some_and(|reason| reason == "publication_backlog_overflow")
+            })
+        })
+        .await;
+        let t = all
+            .iter()
+            .find(|o| {
+                session_terminal_related(o)
+                    .and_then(|r| r.get("reason"))
+                    .is_some_and(|reason| reason == "publication_backlog_overflow")
+            })
+            .expect("the overflow terminal is published after the paused shutdown");
+        assert_eq!(lifecycle_status(t), Some("failed"));
+        assert!(
+            !all.iter().any(|o| {
+                lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("exited")
+            }),
+            "the false StdoutEof did not emit an ordinary exited: {all:?}"
+        );
+        t.clone()
+    };
+    let _ = terminal;
+
+    drop(barrier);
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close after the paused-overflow false-EOF proof",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close")
+    .expect("close ack");
+    let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+}
+
+/// ma-sdk-state r16 item 1: a GENUINE receiver EOF — `driver.kill()` closing
+/// the child's stdout while a RESERVATION-triggered overflow shutdown is PAUSED
+/// at its pre-kill gate — must not publish an ordinary StdoutEof terminal. The
+/// overflow has already won terminal ownership under the admission
+/// synchronization, so ordinary EOF publication is suppressed and the resumed
+/// overflow task delivers the single terminal.
+#[tokio::test]
+async fn a_genuine_eof_while_the_overflow_shutdown_is_paused_leaves_it_the_one_terminal() {
+    const ITEM_CAP: usize = 256;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    // Silent prompts trip the RESERVATION backlog without producing a single
+    // stdout frame, so after the flood joins the reader's next observation is
+    // the genuine EOF itself — no Closed-refused frame in between.
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_SILENT_PROMPTS".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.release();
+    barrier.hold_overflow_kill();
+
+    let d = driver.clone();
+    let flooder = tokio::spawn(async move {
+        for n in 0..4_000usize {
+            let id = format!("msg-r16-1-{n}");
+            if d.send(prompt_id("silent turn", &id)).await.is_err() {
+                break;
+            }
+        }
+    });
+    barrier
+        .wait_until_overflow_kill_gate_parked(Duration::from_secs(20))
+        .await;
+    join_bounded(
+        flooder,
+        Duration::from_secs(10),
+        "the flood after the refusal",
+    )
+    .await;
+
+    // Kill the child genuinely WHILE the overflow gate is held: the reader sees
+    // a real recv()=None (not an admission refusal). ACKNOWLEDGE the EOF was
+    // suppressed under the admission critical section — the old reader
+    // enqueued the ordinary StdoutEof here.
+    wait_bounded(
+        driver.kill(),
+        Duration::from_secs(10),
+        "kill the fake child",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for kill")
+    .expect("kill acks");
+    // ACKNOWLEDGE which terminal owner the genuine EOF resolved to under the
+    // admission critical section. The fixed reader suppresses the ordinary
+    // StdoutEof (first arm); the pre-fix reader enqueued it (second arm) —
+    // racing the two NAMED bounded acknowledgements gives the RED its defect
+    // name at once instead of timing out on the missing suppression.
+    tokio::select! {
+        () = barrier.wait_until_eof_suppressed_after_overflow(Duration::from_secs(10)) => {}
+        () = barrier.wait_until_stdout_eof_queued(Duration::from_secs(10)) => {
+            panic!("the genuine EOF queued an ordinary StdoutEof while the paused overflow shutdown owns the terminal");
+        }
+    }
+
+    // Drain a fence with the shutdown still paused: no terminal session
+    // lifecycle may appear — the suppressed EOF enqueued nothing, and the
+    // overflow terminal is still parked behind its gate (the init-time
+    // session "started" is not terminal).
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
+    let drained = drain_fence(&mut handle, fence, Duration::from_secs(20)).await;
+    let early_terminals = drained
+        .iter()
+        .filter(|o| {
+            lifecycle_named(o) == Some("session")
+                && matches!(lifecycle_status(o), Some("exited") | Some("failed"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        early_terminals.is_empty(),
+        "the genuine EOF published no terminal before the overflow shutdown ran: {early_terminals:?}"
+    );
+
+    // Resume the paused shutdown: exactly one terminal — the overflow one.
+    barrier.release_overflow_kill();
+    barrier
+        .wait_until_backlog_overflow(Duration::from_secs(10))
+        .await;
+    let all = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+        seen.iter().any(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+    })
+    .await;
+    let terminals = all
+        .iter()
+        .filter(|o| {
+            lifecycle_named(o) == Some("session")
+                && matches!(lifecycle_status(o), Some("exited") | Some("failed"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "exactly one session terminal, the overflow one: {all:?}"
+    );
+    let terminal = terminals[0];
+    assert_eq!(lifecycle_status(terminal), Some("failed"));
+    assert!(
+        session_terminal_related(terminal)
+            .and_then(|r| r.get("reason"))
+            .is_some_and(|reason| reason == "publication_backlog_overflow")
+    );
+
+    drop(barrier);
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close after the paused-overflow genuine-EOF proof",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close")
+    .expect("close ack");
+    let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+}
+
+/// ma-sdk-state r17 item 1 race regression, re-sequenced in r18 item 2 and
+/// given a POSITIVE contention proof in ma-sdk-state r19 item 1.
+///
+/// The breaching RESERVATION decides ownership WHILE holding the publish
+/// admission gate (latch swap, closed check, task registration one
+/// synchronous section) and then parks at its relocated post-decision gate
+/// STILL HOLDING the gate. A genuine reader EOF must then BLOCK on the
+/// publication guard: this is proved with a NAMED bounded handshake at the
+/// reader's acquisition point — after the reader announces it reached the
+/// point, a non-awaiting `try_lock` must ANSWER `WouldBlock` and that positive
+/// contention report is awaited through a bounded wait (a timeout FAILS the
+/// proof; a merely descheduled reader reports nothing, so it can no longer
+/// satisfy the check the way the old 750 ms absence window allowed). Every
+/// other possible holder is gated while the proof runs — the spawned
+/// overflow shutdown is itself queued BEHIND the send, and no fence or close
+/// acquisition exists — so contention names the send as the holder. Only
+/// after that positive proof does the test release the send: the reader
+/// enters, loads the already-set latch and SUPPRESSES the ordinary
+/// StdoutEof, leaving the registered overflow shutdown to deliver the single
+/// publication_backlog_overflow terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_overflow_decided_under_the_admission_gate_suppresses_a_later_genuine_eof() {
+    const ITEM_CAP: usize = 256;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    // Silent prompts trip the RESERVATION backlog without producing a single
+    // stdout frame (same flood shape as the r16 item 1 proof).
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_SILENT_PROMPTS".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+
+    let barrier = driver.arm_write_commit_barrier();
+    // Open every default-shut write/worker gate (the flood needs the commit
+    // path), then shut the overflow-send gate (the send parks there AFTER its
+    // synchronous decision, holding the admission gate) and the EOF
+    // seal-decision gate.
+    barrier.release();
+    barrier.hold_overflow_spawn();
+    barrier.hold_eof_seal_decision();
+
+    let d = driver.clone();
+    let flooder = tokio::spawn(async move {
+        for n in 0..4_000usize {
+            let id = format!("msg-r18-2-race-{n}");
+            if d.send(prompt_id("silent turn", &id)).await.is_err() {
+                break;
+            }
+        }
+    });
+    // The send is parked at its post-decision gate. Under the fix the
+    // decision already ran while it held the admission gate; under the revert
+    // it parked only AFTER dropping the gate (no decision yet), which is
+    // exactly what the EOF handshake below distinguishes.
+    barrier
+        .wait_until_overflow_spawn_parked(1, Duration::from_secs(20))
+        .await;
+
+    // Genuine receiver EOF while the send is parked: the reader reaches its
+    // publish-guard acquisition.
+    wait_bounded(
+        driver.kill(),
+        Duration::from_secs(10),
+        "kill the fake child for a genuine reader EOF",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for kill")
+    .expect("kill acks");
+    barrier
+        .wait_until_eof_seal_lock_waits(1, Duration::from_secs(10))
+        .await;
+
+    // POSITIVE bounded handshake (r19 item 1): the reader reached the
+    // acquisition and its acquisition-point try_lock FOUND THE GATE HELD.
+    // That report can only come from a contended try_lock — a reader that has
+    // merely not been polled yet reports nothing, and with the decision guard
+    // reverted the reader's probe takes the free guard, so the wait times
+    // out and FAILS the proof with the defect named (it is never allowed to
+    // pass on a timeout). The spawned overflow shutdown is queued behind the
+    // send and no fence/close runs here, so the holder is the parked send.
+    barrier
+        .wait_until_eof_seal_lock_contended(1, Duration::from_secs(10))
+        .await;
+
+    // Only NOW release the send. It drops the admission gate and returns its
+    // refusal; the reader enters, loads the already-set latch and parks
+    // before deciding.
+    barrier.release_overflow_spawn();
+    barrier
+        .wait_until_eof_seal_entered(1, Duration::from_secs(10))
+        .await;
+    barrier
+        .wait_until_eof_seal_decision_parked(Duration::from_secs(10))
+        .await;
+    barrier.release_eof_seal_decision();
+
+    // The genuine EOF was suppressed in favour of the overflow terminal.
+    barrier
+        .wait_until_eof_suppressed_after_overflow(Duration::from_secs(10))
+        .await;
+    join_bounded(
+        flooder,
+        Duration::from_secs(10),
+        "the flood after the EOF suppression",
+    )
+    .await;
+
+    // The overflow terminal is the ONLY session terminal.
+    let head = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+        seen.iter().any(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+    })
+    .await;
+    let terminals = head
+        .iter()
+        .filter(|o| {
+            lifecycle_named(o) == Some("session")
+                && matches!(lifecycle_status(o), Some("exited") | Some("failed"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "exactly one session terminal, the overflow one: {head:?}"
+    );
+    assert_eq!(lifecycle_status(terminals[0]), Some("failed"));
+
+    // A publication fence proves no ordinary exited (or anything else
+    // terminal) follows the suppressed EOF.
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
+    let drained = drain_fence(&mut handle, fence, Duration::from_secs(20)).await;
+    assert!(
+        !drained.iter().any(|o| {
+            lifecycle_named(o) == Some("session") && matches!(lifecycle_status(o), Some("exited"))
+        }),
+        "no ordinary EOF terminal follows the overflow one: {drained:?}"
+    );
+
+    drop(barrier);
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close after the decided-under-gate/EOF suppression proof",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close")
+    .expect("close ack");
+    let _tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+}
+
+/// ma-sdk-state r13 item 4: when the overflow terminal is published with the
+/// worker blocked in emit against the FULL events channel, the terminal rides
+/// the reserved permit behind every queued observation and NOTHING follows it;
+/// the observations queued ahead of it are all preserved.
+#[tokio::test]
+async fn nothing_follows_the_overflow_terminal_when_the_consumer_channel_was_full() {
+    // Above the 255 ordinary slots: overflow trips from the FRAME backlog while
+    // the worker is parked emitting, the exact r13 item 4 shape.
+    const ITEM_CAP: usize = 512;
+    const BYTE_CAP: usize = 16 * 1024 * 1024;
+
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_STDOUT_FLOOD".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+
+    let barrier = driver.arm_write_commit_barrier();
+
+    // Do NOT drain: 255 ordinary observations fill the channel and the worker
+    // parks in emit. ACKNOWLEDGE the saturation through the named barrier hook
+    // (the worker records an emission parked at zero capacity) — no polling
+    // sleep (ma-sdk-state r14 item 1).
+    barrier
+        .wait_until_emit_waiting(1, Duration::from_secs(10))
+        .await;
+
+    // The frame backlog keeps growing behind the parked worker and trips the
+    // overflow shutdown; the terminal goes through the reserved permit.
+    barrier
+        .wait_until_backlog_overflow(Duration::from_secs(20))
+        .await;
+
+    // Drain up to and including the terminal. Freed slots here are exactly what
+    // the OLD in-flight ordinary send would have completed into after the
+    // terminal.
+    let head = collect_until(&mut handle, Duration::from_secs(10), |seen| {
+        seen.iter().any(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+    })
+    .await;
+    let terminal = head
+        .last()
+        .filter(|o| {
+            session_terminal_related(o)
+                .and_then(|r| r.get("reason"))
+                .is_some_and(|reason| reason == "publication_backlog_overflow")
+        })
+        .expect("the head drain ends ON the overflow terminal");
+    assert_eq!(lifecycle_status(terminal), Some("failed"));
+    // Every ordinary slot that was occupied at saturation is delivered ahead
+    // of the permit terminal: 255 observations + the terminal.
+    assert_eq!(
+        head.len(),
+        256,
+        "the queued observations are preserved and the terminal is last among them"
+    );
+
+    // Close and drain whatever remains: the tail must be empty — the cancelled
+    // in-flight ordinary send is never completed.
+    drop(barrier);
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close after the full-channel overflow",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close after the full-channel overflow")
+    .expect("close ack");
+    let tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the RunHandle reaches recv=None after close");
+    assert!(
+        tail.is_empty(),
+        "no observation follows the terminal through the full channel: {tail:?}"
+    );
+}
+
+/// ma-sdk-state r14 item 1 (directives (a)/(b)/(e)): closing while the
+/// publisher is mid-release of a frame charge and relaunching on the same
+/// driver must give launch B a FRESH budget. The aborted launch-A worker's
+/// permits release onto launch A's (dead) semaphores only — launch B's budget
+/// starts at zero and its one init-frame charge is the only occupancy it ever
+/// shows.
+#[tokio::test]
+async fn close_relaunch_with_the_publisher_mid_release_keeps_the_new_budget_clean() {
+    const ITEM_CAP: usize = 16;
+    const BYTE_CAP: usize = 256 * 1024;
+
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    driver.set_publication_backlog_limits_for_test(ITEM_CAP, BYTE_CAP);
+    let driver = std::sync::Arc::new(driver);
+
+    // Launch A with the pre-charge-release gate shut. The worker maps and
+    // emits the single init frame, then parks holding that frame's permits.
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.hold_charge_release();
+    let mut handle_a = wait_bounded(
+        driver.start(spec.clone()),
+        Duration::from_secs(10),
+        "start A",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for start A")
+    .expect("start A");
+    barrier
+        .wait_until_charge_release_parked(Duration::from_secs(10))
+        .await;
+    let id_a = driver.active_backlog_id_for_test();
+    let snap_a = driver.publication_backlog_for_test();
+    assert!(
+        snap_a.items >= 1,
+        "A's worker holds at least the init frame charge: {snap_a:?}"
+    );
+    assert!(snap_a.bytes > 0);
+
+    // Close with the worker still parked: the bounded join times out, the
+    // worker is aborted AND JOINED (directive (e)); its charge drops onto the
+    // dying launch-A budget. close still returns inside its bound.
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close A with the publisher parked mid-release",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close A")
+    .expect("close A ack");
+    drain_until_closed(&mut handle_a, Duration::from_secs(5))
+        .await
+        .expect("RunHandle A reaches recv=None after close");
+
+    // Relaunch B with the same gate shut: B's worker parks holding B's own
+    // init-frame charge.
+    barrier.hold_charge_release();
+    let mut handle_b = wait_bounded(
+        driver.start(spec.clone()),
+        Duration::from_secs(10),
+        "start B",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for start B")
+    .expect("start B");
+    barrier
+        .wait_until_charge_release_parked(Duration::from_secs(10))
+        .await;
+    let id_b = driver.active_backlog_id_for_test();
+    assert_ne!(id_a, id_b, "relaunch built a fresh per-launch budget");
+    let snap_b = driver.publication_backlog_for_test();
+    assert_eq!(
+        snap_b.items, snap_a.items,
+        "B shows exactly its own startup charges — launch A leaked none: \
+         A={snap_a:?} B={snap_b:?}"
+    );
+    assert_eq!(
+        snap_b.bytes, snap_a.bytes,
+        "B's byte occupancy is just its own startup frames: A={snap_a:?} B={snap_b:?}"
+    );
+    assert_eq!(snap_b.limit_items, ITEM_CAP);
+    assert_eq!(snap_b.limit_bytes, BYTE_CAP);
+    assert!(!snap_b.overflowed);
+
+    // Let B finish and close it cleanly.
+    drop(barrier);
+    wait_bounded(driver.close(), Duration::from_secs(20), "close B")
+        .await
+        .expect("bounded test wait timed out: waiting for close B")
+        .expect("close B ack");
+    drain_until_closed(&mut handle_b, Duration::from_secs(5))
+        .await
+        .expect("RunHandle B reaches recv=None after close");
+}
+
 /// Item 4: a reader from a previous launch must never emit into the next one.
 ///
 /// `close` joins or aborts the reader before it returns, and `start` re-arms
@@ -710,4 +2435,2055 @@ async fn relaunch_after_close_emits_one_exited_per_launch() {
              a reader from a prior launch leaked into this channel"
         );
     }
+}
+
+// The deterministic write-window barrier test
+// (`a_result_queued_during_the_write_window_starts_then_results`, below)
+// replaces the old live-only version of this assertion: it forces the exact
+// start-before-result ordering, including the result arriving while the
+// prompt write is still in flight.
+
+/// D-057 OA6 r2 item 3: `send` resolves only after the user line is WRITTEN,
+/// and propagates the write failure once the child's stdin is gone (closed
+/// pipe / broken pipe) instead of reporting `transport_written` for a prompt
+/// that never reached the process.
+#[tokio::test]
+async fn a_send_after_the_child_stdin_closed_is_an_error_not_written() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Drain the first turn so the child is up and reading.
+    driver.send(prompt("one")).await.expect("first send ok");
+    let _ = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        turn_done_count(obs) >= 1
+    })
+    .await;
+
+    // Close the child's stdin and reap the process; the writer channel then
+    // rejects the next write.
+    driver.close().await.expect("close");
+
+    let result = driver.send(prompt("after close")).await;
+    assert!(
+        result.is_err(),
+        "a prompt after stdin closed must propagate the write failure, got {result:?}"
+    );
+}
+
+/// ma-sdk-state r4 item 1 (barrier): the write has acked and the send task is
+/// parked BEFORE it commits the reservation/enqueues turn_started, while the
+/// child's result is already mapped and queued in the publication worker. The
+/// reserved turn's start must still be published before ITS result.
+#[tokio::test]
+async fn a_result_queued_during_the_write_window_starts_then_results() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = driver.arm_write_commit_barrier();
+    let send_task = tokio::spawn(async move {
+        let result = driver.send(prompt("race prompt")).await;
+        (driver, result)
+    });
+
+    // Provably occupy the race window: write acked, result queued in the
+    // worker, turn_started not yet enqueued.
+    barrier
+        .wait_until_result_parked(Duration::from_secs(5))
+        .await;
+    barrier.release();
+
+    let (driver, result) = send_task.await.expect("send task");
+    result.expect("the write acked, so the send resolves Ok");
+
+    let all = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        turn_started_count(obs) >= 1 && turn_done_count(obs) >= 1
+    })
+    .await;
+    assert_eq!(
+        turn_started_count(&all),
+        1,
+        "exactly one turn_started even under the forced race: {all:?}"
+    );
+    let start = first_where(&all, |o| lifecycle_named(o) == Some("turn_started"));
+    let done = first_where(&all, |o| lifecycle_status(o) == Some("turn_done"));
+    assert!(
+        start < done,
+        "turn_started ({start}) must precede its own result ({done})"
+    );
+
+    driver.close().await.expect("close");
+}
+
+/// ma-sdk-state r4 item 3 (OA6): the fake child closes its OWN stdin fd after
+/// the handshake and keeps running with stdout open. The acknowledged write
+/// must surface as an error, but the process is still alive:
+/// * `send` returns `Err`, never `transport_written`;
+/// * the reservation produced ZERO turn_started observations;
+/// * the child process survives (parent-death reaper notwithstanding) and
+///   `process_gone()` stays false — the Node must not terminalize on this.
+#[tokio::test]
+async fn a_live_child_that_closed_its_stdin_errors_the_send_without_any_turn_start() {
+    let closed_marker = std::env::temp_dir().join(format!(
+        "remuda-r10-close-stdin-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (_tmp, driver, spec) = driver_with_env(
+        ScriptKind::Ok,
+        BTreeMap::from([
+            ("FAKE_CLAUDE_CLOSE_STDIN".into(), "1".into()),
+            (
+                "FAKE_CLAUDE_STDIN_CLOSED_FILE".into(),
+                closed_marker.to_string_lossy().into_owned(),
+            ),
+        ]),
+    );
+    let mut handle = driver.start(spec).await.expect("start");
+    let pid = handle
+        .ack()
+        .native_ids
+        .get("pid")
+        .expect("pid on the launch ack")
+        .clone();
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // No post-start sleep (r10 item 5): the fake closes fd 0 and fsyncs this
+    // marker BEFORE it emits the initialize success, so start() returning
+    // already implies the read end is shut.
+    assert!(
+        closed_marker.is_file(),
+        "start() returning implies the child closed stdin and wrote its marker"
+    );
+    assert!(
+        process_alive(&pid),
+        "the child parked alive with stdin closed"
+    );
+
+    let result = driver.send(prompt("into a closed stdin")).await;
+    assert!(
+        result.is_err(),
+        "the write against the child-closed stdin must error, got {result:?}"
+    );
+    assert!(
+        !driver.process_gone().await,
+        "a closed stdin on a live child is not process loss"
+    );
+
+    // Drain for a grace period: the failed reservation must not have leaked a
+    // turn_started, and the live child sends no stdout exit either.
+    let mut leaked = Vec::new();
+    while let Ok(Some(obs)) = tokio::time::timeout(Duration::from_millis(300), handle.recv()).await
+    {
+        leaked.push(obs);
+    }
+    for obs in &leaked {
+        assert_ne!(
+            lifecycle_named(obs),
+            Some("turn_started"),
+            "a failed write emits no turn_started: {obs:?}"
+        );
+        assert!(
+            !(lifecycle_named(obs) == Some("session") && lifecycle_status(obs) == Some("exited")),
+            "a live child emits no exit while its stdin is closed: {obs:?}"
+        );
+    }
+    assert!(
+        process_alive(&pid),
+        "the child is still running after the failed write"
+    );
+
+    driver.close().await.expect("close");
+    assert!(
+        !process_alive(&pid),
+        "close still reaps the live child through the ladder"
+    );
+}
+
+/// ma-sdk-state r4 item 4: when the child floods stdout and nobody drains
+/// the event channel, `close` aborts the blocked publication worker — yet
+/// the terminal session-exit must still be delivered on a reserved channel
+/// slot, and it must be exactly ONE, ordered after every buffered frame and
+/// before stream EOF. Without the reserved permit the exit was dropped when
+/// the worker was aborted (events sender taken), so a later drain saw
+/// buffered frames then EOF with no exit.
+#[tokio::test]
+async fn close_under_output_pressure_still_delivers_exactly_one_terminal_exit() {
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_STDOUT_FLOOD".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+
+    // Do NOT drain handle at all. Acknowledge the worker parking on the full
+    // 255-slot observation channel through the named barrier hook — no
+    // sleep-poll for channel capacity (ma-sdk-state r14).
+    let barrier = driver.arm_write_commit_barrier();
+    barrier
+        .wait_until_emit_waiting(1, Duration::from_secs(10))
+        .await;
+
+    // Close under pressure: it aborts the blocked worker and reaps the child
+    // through its bounded ladder, and must not hang.
+    let started = std::time::Instant::now();
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(20),
+        "close under output pressure",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close under output pressure")
+    .expect("close ack");
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "close took {:?} under output pressure",
+        started.elapsed()
+    );
+
+    // Now drain everything until EOF.
+    let mut terminal = Vec::new();
+    while let Some(obs) = handle.recv().await {
+        if lifecycle_named(&obs) == Some("session") && lifecycle_status(&obs) == Some("exited") {
+            terminal.push(obs);
+        }
+    }
+    assert_eq!(
+        terminal.len(),
+        1,
+        "exactly one terminal session/exited event survives the saturated \
+         channel + aborted worker"
+    );
+}
+
+/// ma-sdk-state r4 item 5(c): a host permission response must ride the SAME
+/// FIFO stdin queue as prompts. It used to go through the inbound bridge
+/// (pub_in_tx -> a forward task -> writer_tx), so a prompt enqueued
+/// afterwards could be written first. Record the child's actual stdin order
+/// and prove the `control_response` precedes the following `user` frame.
+#[tokio::test]
+async fn a_permission_response_is_written_before_a_later_prompt_on_one_fifo() {
+    let order = std::env::temp_dir().join(format!(
+        "sdk-fifo-{}.txt",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (_tmp, driver, spec) = driver_with_env(
+        ScriptKind::Approval,
+        BTreeMap::from([(
+            "FAKE_CLAUDE_STDIN_FILE".into(),
+            order.to_string_lossy().into_owned(),
+        )]),
+    );
+    let mut handle = driver.start(spec).await.expect("start");
+    driver.send(prompt("touch")).await.expect("send");
+    let events = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        obs.iter()
+            .any(|o| matches!(o.body, ObservationPayload::InteractionRequested(_)))
+    })
+    .await;
+
+    let interaction = events
+        .iter()
+        .find_map(|o| match &o.body {
+            ObservationPayload::InteractionRequested(payload) => Some(payload.interaction.clone()),
+            _ => None,
+        })
+        .expect("approval interaction");
+
+    // Respond to the approval, then enqueue ANOTHER prompt. Both now go
+    // through the single ProcessWriter FIFO.
+    driver
+        .respond_interaction(
+            interaction.meta.id.clone(),
+            remuda_protocol::InteractionAnswer::Approval(Box::new(
+                remuda_protocol::ApprovalAnswer {
+                    option_id: "allow".into(),
+                    input_digest: {
+                        use remuda_protocol::InteractionRequest;
+                        match interaction.request.clone() {
+                            InteractionRequest::Approval(req) => req.input_digest,
+                            _ => dummy_digest(),
+                        }
+                    },
+                },
+            )),
+        )
+        .await
+        .expect("respond");
+    // Distinct client id so the second prompt is not deduped.
+    let mut second = prompt("after approval");
+    if let DriverInput::Prompt(p) = &mut second {
+        p.native_client_message_id = "msg-2".into();
+    }
+    driver.send(second).await.expect("second send");
+
+    // Wait for the writer to flush and the fake to read both frames. Poll
+    // until both markers appear (the first `user` is only recorded when the
+    // fake plays the turn; the control_response marker is recorded inside
+    // the fake's wait loop).
+    let text = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let text = std::fs::read_to_string(&order).unwrap_or_default();
+            let lines = text.lines().collect::<Vec<_>>();
+            if lines.contains(&"control_response")
+                && lines.iter().filter(|l| **l == "user").count() >= 2
+            {
+                break text;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("both frames never recorded");
+    let markers: Vec<String> = text.lines().map(str::to_owned).collect();
+    let response_at = markers.iter().position(|l| l == "control_response");
+    let user_at = markers.iter().rposition(|l| l == "user");
+    assert!(
+        response_at < user_at,
+        "permission response must precede the later prompt on the wire: {markers:?}"
+    );
+
+    driver.close().await.expect("close");
+}
+
+// NOTE ma-sdk-state r5 item 6 (5a): the former r4 5a test here ran the two
+// prompts SEQUENTIALLY (A fully drained before B), so it never armed the
+// item-1 barrier and could not observe a buffered result. Its per-turn
+// attribution claim now lives in the node barrier suite, which forces A's
+// result to be buffered while B is published and folds the stream through
+// engine_turn_activity AND the Hub derive:
+// `buffered_turn_a_result_keeps_the_row_working_until_turn_b_settles` in
+// crates/remuda-node/tests/sdk_turn_publication_barrier.rs. Plain sequential
+// two-turn coverage remains in `the_sdk_child_survives_a_second_prompt`.
+/// ma-sdk-state r5 item 1 (replaces the old hand-mapped
+/// `an_older_buffered_result_cannot_settle_a_newer_outstanding_input`): drive
+/// two turns through the REAL publication task with turn A's ticket parked
+/// while B is registered, so B's book is open before the worker maps A's
+/// buffered result. Two invariants are checked on the published stream:
+/// (1) ORDER — start_A < result_A < start_B < result_B, so no result ever
+/// precedes its own turn_started (the in-queue ticket makes this structural);
+/// (2) ATTRIBUTION — A's result is mapped while turn B is outstanding, so it
+/// carries no settledRootTurn and cannot settle the root; only B's result
+/// settles. The raw turn lifecycle still goes working → turn_done → working →
+/// turn_done, and the child survives.
+#[tokio::test]
+async fn an_older_buffered_result_cannot_settle_a_newer_outstanding_input_through_the_publication_task()
+ {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Arm the per-driver barrier BEFORE moving the driver into the send task.
+    let barrier = driver.arm_write_commit_barrier();
+    // One task owns the driver: send A (which commits while the worker is held
+    // at its ticket) then send B, whose book is opened before the worker maps
+    // A's buffered result.
+    let send_both = tokio::spawn(async move {
+        driver.send(prompt_id("first", "msg-a")).await?;
+        driver.send(prompt_id("second", "msg-b")).await?;
+        Ok::<ClaudeSdkDriver, DriverError>(driver)
+    });
+    // Wait until the worker holds turn A's ticket, the write has acked, AND
+    // turn A's RESULT frame is queued behind the ticket. Waiting for the result
+    // specifically (not just any frame) is what makes the strict cross-turn
+    // order deterministic rather than scheduler luck (r6 item 3): A's result is
+    // in the queue BEFORE B even begins.
+    barrier
+        .wait_until_result_parked(Duration::from_secs(5))
+        .await;
+    // Release the SEND only: A commits, the worker publishes start_A then
+    // stays parked at the ticket (worker gate still shut). A's result is
+    // already queued, so it precedes B's start.
+    barrier.release_send();
+    // Wait until B's reservation is enqueued — B's book is now open, in the
+    // queue behind A's buffered result.
+    barrier
+        .wait_until_reserves_enqueued(2, Duration::from_secs(5))
+        .await;
+    // Now let the worker map. It maps A's result with turn B outstanding.
+    barrier.resume_worker();
+    let send_both = send_both.await.expect("send task");
+    let driver = send_both.as_ref().expect("both prompt writes ack");
+
+    // Drain BOTH turns in one pass — no draining between the two sends, so this
+    // is the unfiltered publication order.
+    let all = collect_until(&mut handle, Duration::from_secs(8), |obs| {
+        let starts = obs
+            .iter()
+            .filter(|o| lifecycle_named(o) == Some("turn_started"))
+            .count();
+        starts >= 2 && turn_done_count(obs) >= 2
+    })
+    .await;
+
+    let positions = |name: &str| {
+        all.iter()
+            .enumerate()
+            .filter_map(|(i, o)| (lifecycle_named(o) == Some(name)).then_some(i))
+            .collect::<Vec<_>>()
+    };
+    let starts = positions("turn_started");
+    let results = positions("result");
+    assert_eq!(starts.len(), 2, "two turn_started: {all:?}");
+    assert_eq!(results.len(), 2, "two results: {all:?}");
+    // The invariant: each turn's start precedes its OWN result, and the older
+    // turn's result is fully published BEFORE the newer turn starts.
+    assert!(
+        starts[0] < results[0] && results[0] < starts[1] && starts[1] < results[1],
+        "expected start_A < result_A < start_B < result_B, got starts={starts:?} results={results:?}"
+    );
+
+    // Per-turn attribution (the claim the old hand-mapped test made): A's
+    // result is mapped while B's turn is already open, so it must NOT carry
+    // settledRootTurn — it cannot settle the root a newer turn owns. Only B's
+    // result, with no turn outstanding behind it, settles.
+    let settles_at = |pos: usize| {
+        matches!(&all[pos].body,
+            ObservationPayload::Lifecycle(p) if matches!(p.as_ref(),
+                LifecyclePayload::Native(n) if n.native_name == "result"
+                    && n.related_ids.get("settledRootTurn").map(String::as_str) == Some("true")))
+    };
+    assert!(
+        !settles_at(results[0]),
+        "the older buffered result A must not settle while turn B is outstanding"
+    );
+    assert!(
+        settles_at(results[1]),
+        "the last outstanding turn B's result settles the root"
+    );
+
+    // Raw turn lifecycle still runs working → turn_done → working → turn_done:
+    // A's end-of-turn result is published (turn_done) without idling the root,
+    // and B re-enters working at its own start. (The Node engine keeps the row
+    // working through A because A's result lacks settledRootTurn, and derives
+    // idle only from B's settling result.)
+    let mut edges: Vec<&str> = Vec::new();
+    for status in all.iter().filter_map(lifecycle_status) {
+        if edges.last() != Some(&status) && matches!(status, "working" | "turn_done") {
+            edges.push(status);
+        }
+    }
+    assert_eq!(
+        edges,
+        vec!["working", "turn_done", "working", "turn_done"],
+        "per-turn working/turn_done edges: {edges:?}"
+    );
+
+    let pid = handle.ack().native_ids.get("pid").cloned().expect("pid");
+    assert!(process_alive(&pid), "the sdk child survives both turns");
+    driver.close().await.expect("close");
+}
+
+/// ma-sdk-state r5 item 4: once the sdk child has really exited (the reader
+/// emitted its terminal lifecycle), `process_gone` through the `Driver` trait
+/// must report true. Before forwarding, `ClaudeSdkDriver` fell back to the
+/// trait default (always false), so the inner claude-print evidence was
+/// unreachable and a failed write to a dead child was misread as a control
+/// error.
+#[tokio::test]
+async fn process_gone_is_true_through_the_driver_trait_after_the_child_exits() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let mut handle = driver.start(spec).await.expect("start");
+    let as_driver: &dyn Driver = &driver;
+    assert!(
+        !as_driver.process_gone().await,
+        "a freshly launched live child is not gone"
+    );
+    driver.send(prompt("hi")).await.expect("send");
+    let _ = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        turn_done_count(obs) >= 1
+    })
+    .await;
+
+    driver.close().await.expect("close");
+    // Drain the terminal exit so the reader flips exit_emitted.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_exit = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), handle.recv()).await {
+            Ok(Some(obs)) => {
+                if lifecycle_named(&obs) == Some("session")
+                    && lifecycle_status(&obs) == Some("exited")
+                {
+                    saw_exit = true;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(saw_exit, "the child emitted one session exited lifecycle");
+    assert!(
+        as_driver.process_gone().await,
+        "process_gone must forward the inner driver's end evidence"
+    );
+}
+
+/// ma-sdk-state r6 item 1: a prompt whose staged image cannot be read returns
+/// Err from content resolution BEFORE any turn book/ticket exists. The next
+/// normal prompt must still publish turn_started and its result — the failed
+/// (or here, never-opened) reservation must neither park the publication
+/// worker nor leave an empty outstanding turn that blocks the later settle.
+#[tokio::test]
+async fn a_missing_image_send_errors_and_the_next_turn_still_starts_and_results() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let id = remuda_protocol::Id::new("obj").expect("object id");
+    let missing_image = DriverInput::Prompt(Box::new(PromptInput {
+        mode: PromptMode::NewTurn,
+        blocks: vec![
+            ContentBlock::Image(Box::new(remuda_protocol::MediaBlock {
+                object_id: id.clone(),
+                media_type: "image/png".into(),
+                name: Some("shot.png".into()),
+                anchor: None,
+                size: None,
+            })),
+            ContentBlock::Resource(Box::new(remuda_protocol::ResourceBlock {
+                uri: "file:///nonexistent/r6-missing-shot.png".into(),
+                media_type: Knowledge::Known {
+                    value: "image/png".into(),
+                },
+                object_id: Some(id),
+            })),
+            ContentBlock::Text(Box::new(TextBlock {
+                text: "describe the missing image".into(),
+            })),
+        ],
+        origin: InputOrigin::Human,
+        native_client_message_id: "msg-r6-missing".into(),
+    }));
+    let failed = driver.send(missing_image).await;
+    assert!(
+        failed.is_err(),
+        "an unreadable staged image must fail the send: {failed:?}"
+    );
+
+    // The very next prompt goes through the full publication pipeline.
+    driver
+        .send(prompt("after the failed image"))
+        .await
+        .expect("the next prompt must still send after a content-resolution failure");
+    let obs = collect_until(&mut handle, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .any(|o| lifecycle_named(o) == Some("turn_started"))
+            && turn_done_count(seen) >= 1
+    })
+    .await;
+    assert!(
+        obs.iter()
+            .any(|o| lifecycle_named(o) == Some("turn_started")),
+        "turn_started is still published after the failed image send"
+    );
+    assert_eq!(
+        turn_started_count(&obs),
+        1,
+        "the failed image send leaked no turn_started"
+    );
+    assert!(turn_done_count(&obs) >= 1, "the result is still published");
+
+    driver.close().await.expect("close");
+}
+
+/// ma-sdk-state r6 item 4: when the terminal exit observation build errors,
+/// the reserved channel permit (taken BEFORE the build) must be released so the
+/// RunHandle still reaches clean EOF after close. Pre-fix the permit stayed
+/// parked in Inner.exit_permit and recv() blocked forever.
+#[tokio::test]
+async fn a_failing_exit_observation_build_still_closes_the_run_handle_to_eof() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Arm the fault seam: emit_exit's observation build fails after taking the
+    // terminal permit.
+    driver.force_exit_build_to_fail();
+
+    driver
+        .close()
+        .await
+        .expect("close still acks despite the exit-build fault");
+
+    // Drain every buffered observation; the stream must TERMINATE (None) rather
+    // than hang with the permit still parked. Pre-fix this loop never reaches
+    // EOF. The forced fault suppresses the terminal `exited` observation itself.
+    let drain = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut count = 0usize;
+        while let Some(_obs) = handle.recv().await {
+            count += 1;
+        }
+        count
+    })
+    .await;
+    assert!(
+        drain.is_ok(),
+        "RunHandle must reach EOF after close even when the exit build errors: {drain:?}"
+    );
+}
+
+/// ma-sdk-state r6 item 5 (live): turn A completes normally, then the child
+/// closes its stdin after that turn and parks alive; turn B's write therefore
+/// fails on the LIVE child. The ordered cancel must roll B's empty book back
+/// without emitting a B turn_started, leave the child alive (not process loss),
+/// and close cleanly.
+#[tokio::test]
+async fn a_successful_turn_then_a_failed_live_write_rolls_back_without_a_b_start() {
+    let closed_marker = std::env::temp_dir().join(format!(
+        "remuda-r9-afterturn-closed-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut env = BTreeMap::new();
+    env.insert(
+        "FAKE_CLAUDE_CLOSE_STDIN_AFTER_TURNS".to_owned(),
+        "1".to_owned(),
+    );
+    env.insert(
+        "FAKE_CLAUDE_STDIN_CLOSED_FILE".to_owned(),
+        closed_marker.to_string_lossy().into_owned(),
+    );
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::TwoTurn, env);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Turn A completes (the child answers turn 1, then closes its stdin).
+    driver
+        .send(prompt_id("first", "msg-r5-live-a"))
+        .await
+        .expect("A sends");
+    let _a = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        turn_done_count(obs) >= 1
+    })
+    .await;
+
+    // Acknowledge the child closed stdin after turn A (bounded, no sleep).
+    await_marker(&closed_marker).await;
+
+    // Turn B's write fails on the live child. B's prompt is large enough to
+    // exceed the 64 KiB pipe buffer, so with no reader it cannot be absorbed
+    // and the write fails for real (a small write could still be buffered once
+    // even after the read end closed).
+    let big_b = "y".repeat(256 * 1024);
+    let b = driver.send(prompt_id(&big_b, "msg-r5-live-b")).await;
+    assert!(b.is_err(), "B's write must fail on the closed stdin: {b:?}");
+    assert!(
+        !driver.process_gone().await,
+        "the child is still alive after the failed write"
+    );
+
+    // No second turn_started leaked, and close still reaches EOF.
+    let mut starts_after = 0usize;
+    while let Ok(Some(obs)) = tokio::time::timeout(Duration::from_millis(300), handle.recv()).await
+    {
+        if lifecycle_named(&obs) == Some("turn_started") {
+            starts_after += 1;
+        }
+    }
+    assert_eq!(starts_after, 0, "the failed B send leaked no turn_started");
+
+    driver.close().await.expect("close");
+}
+
+/// Await a fake-child marker file under an overall timeout (barrier, no fixed
+/// sleep); returns once the file exists.
+async fn await_marker(path: &std::path::Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if path.exists() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for marker {path:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// ma-sdk-state r7/r8/r9 item 3: a failed write must not leak the driver's
+/// Inner (the old ReservationGuard::fail used std::mem::forget). After the
+/// failed write and close, a Weak to Inner upgrades to None.
+///
+/// Uses a REAL write failure on a live child: the fake closes its stdin read
+/// end and writes a post-closure marker before it parks (r9 item 5), so the
+/// test waits for that ACKNOWLEDGED closure (bounded, no sleep) and then the
+/// first prompt write deterministically fails — no driver-injected fault.
+#[tokio::test]
+async fn a_failed_write_and_close_release_the_driver_inner() {
+    let closed_marker = std::env::temp_dir().join(format!(
+        "remuda-r9-stdin-closed-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_CLOSE_STDIN".into(), "1".into());
+    env.insert(
+        "FAKE_CLAUDE_STDIN_CLOSED_FILE".into(),
+        closed_marker.to_string_lossy().into_owned(),
+    );
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+    // Acknowledge the child has closed stdin before we attempt the write.
+    await_marker(&closed_marker).await;
+    let weak = driver.weak_inner();
+    assert!(
+        weak.upgrade().is_some(),
+        "Inner is alive while the driver is"
+    );
+
+    // The first real prompt write fails against the acknowledged closed stdin.
+    let failed = driver.send(prompt("never written")).await;
+    assert!(
+        failed.is_err(),
+        "write against acknowledged-closed stdin must fail: {failed:?}"
+    );
+
+    driver.close().await.expect("close");
+    drop(handle);
+    drop(driver);
+
+    assert!(
+        weak.upgrade().is_none(),
+        "failed write + close leaked the driver Inner (forgotten ReservationGuard)"
+    );
+}
+
+/// ma-sdk-state r8 item 3: A's result is mapped DEFERRED while B's pre-opened
+/// book is open; the live child closed its stdin after turn A so B's REAL write
+/// fails (EPIPE) — not a driver-injected fault. The rollback publishes exactly
+/// ONE ordered correction (settledRootTurn=true, deferredSettle=true); the whole
+/// drained sequence shows no B start and no extra ordinary settlement.
+#[tokio::test]
+async fn a_deferred_result_emits_exactly_one_ordered_settlement_when_b_real_write_fails() {
+    let mut env = BTreeMap::new();
+    // Answer turn A, then close stdin and park ALIVE: B's subsequent real write
+    // hits a closed read end (a genuine write failure on a live child),
+    // synchronized to after A was fully handled.
+    env.insert("FAKE_CLAUDE_CLOSE_STDIN_AFTER_TURNS".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::TwoTurn, env);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = driver.arm_write_commit_barrier();
+    // A (#1) runs through the pre-accept gate; B (#2) parks pre-accept.
+    barrier.park_from_write(2);
+
+    // One task owns A then B on the shared driver (write_seq FIFO). It drives
+    // both sends; the test gates their publication/write progress.
+    let d = driver.clone();
+    let sends = tokio::spawn(async move {
+        d.send(prompt_id("first", "msg-a")).await?;
+        // B blocks at the pre-accept gate until the test releases it (after A's
+        // result is mapped with B's book open). A LARGE prompt exceeds the 64KiB
+        // pipe buffer, so once the child closed its stdin read end the write
+        // cannot be buffered and fails for real (EPIPE/broken pipe) rather than
+        // silently landing in the pipe.
+        let big = "z".repeat(256 * 1024);
+        d.send(prompt_id(&big, "msg-b")).await
+    });
+
+    // A commits; the worker parks at A's ticket after publishing start_A, and
+    // A's result is already queued behind the ticket.
+    barrier
+        .wait_until_result_parked(Duration::from_secs(5))
+        .await;
+    barrier.release_send();
+    // B reserves (pre-accept park keeps it short of the writer), opening its
+    // book while the worker holds at A's ticket.
+    barrier
+        .wait_until_reserves_enqueued(2, Duration::from_secs(5))
+        .await;
+    // Resume the worker so A's result maps against the open B book (deferred),
+    // and wait for that mapping explicitly before releasing B — no sleep.
+    barrier.resume_worker();
+    barrier
+        .wait_until_results_mapped(1, Duration::from_secs(5))
+        .await;
+
+    // A is deferred; stdin is closed. Release B's pre-accept gate: its REAL
+    // write fails (EPIPE), so the ordered rollback emits the one correction.
+    barrier.release_write_ack();
+    let b_result = join_bounded(sends, Duration::from_secs(5), "the chained A/B sends").await;
+    assert!(
+        b_result.is_err(),
+        "B's real write fails on the closed stdin"
+    );
+
+    // ACKNOWLEDGED PUBLICATION FENCE (r9 item 4; r10 item 4): enqueue AFTER B's
+    // rollback and drain in one overall timeout. The fence resolves only once
+    // every earlier job — INCLUDING the deferred-settle correction emitted at
+    // B's cancelled ticket position — is published, so counting ALL starts and
+    // settledRootTurn observations in the drained sequence needs no quiet
+    // period and a delayed correction cannot slip past.
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
+    let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
+
+    assert_eq!(
+        turn_started_count(&all),
+        1,
+        "only A starts; B's failed real write emits no turn_started: {all:?}"
+    );
+    let settled: Vec<Option<&str>> = all.iter().filter_map(settled_marker).collect();
+    assert_eq!(
+        settled,
+        vec![Some("true")],
+        "exactly one settledRootTurn=true observation, marked deferredSettle"
+    );
+
+    drop(barrier);
+    let _ = driver.close().await;
+}
+
+/// ma-sdk-state r9 item 1: A's result is mapped DEFERRED while B is reserved
+/// and parked PRE-accept (its prompt not yet accepted by the writer). Aborting
+/// B there must roll B back AND still publish A's saved settle through the
+/// ordered path — exactly one settledRootTurn=true (deferredSettle=true), no B
+/// start. (Pre-fix the pre-accept Drop discarded the released observation.)
+#[tokio::test]
+async fn cancelling_a_pre_accept_b_publishes_a_deferred_a_settle() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = driver.arm_write_commit_barrier();
+    // A (#1) runs through; B (#2) parks PRE-accept.
+    barrier.park_from_write(2);
+
+    let d = driver.clone();
+    let send_a = tokio::spawn(async move { d.send(prompt_id("first", "msg-a")).await });
+    barrier
+        .wait_until_result_parked(Duration::from_secs(5))
+        .await;
+    barrier.release_send();
+    join_bounded(send_a, Duration::from_secs(5), "send_a")
+        .await
+        .expect("A acked");
+
+    // B reserves, then parks pre-accept (writer has not accepted it).
+    let db = driver.clone();
+    let send_b = tokio::spawn(async move { db.send(prompt_id("second", "msg-b")).await });
+    barrier
+        .wait_until_reserves_enqueued(2, Duration::from_secs(5))
+        .await;
+    // Map A's result against B's open book (deferred), wait for that mapping.
+    barrier.resume_worker();
+    barrier
+        .wait_until_results_mapped(1, Duration::from_secs(5))
+        .await;
+
+    // Abort B BEFORE the writer accepts its prompt. Its cancelled ticket is
+    // rolled back at its queue position, releasing A's deferred settle.
+    send_b.abort();
+    barrier.release_write_ack();
+
+    // ACKNOWLEDGED FENCE DRAIN (r10 item 4): the fence sits behind B's
+    // cancelled ticket, so it resolves only after the rollback-generated
+    // correction is published. One overall timeout, no quiet period; count ALL
+    // starts and settlements in the complete sequence.
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
+    let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
+
+    assert_eq!(
+        turn_started_count(&all),
+        1,
+        "only A starts; cancelled pre-accept B emits no start: {all:?}"
+    );
+    let settled: Vec<Option<&str>> = all.iter().filter_map(settled_marker).collect();
+    assert_eq!(
+        settled,
+        vec![Some("true")],
+        "B's cancellation still publishes A's deferred settle, exactly once"
+    );
+
+    drop(barrier);
+    let _ = driver.close().await;
+}
+
+/// ma-sdk-state r9 item 2 / r10 item 3: B reserves and SUSPENDS pre-accept
+/// (holding write_seq); C is already waiting on write_seq behind it. Abort B:
+/// B's book entry must be removed at its cancelled ticket's FIFO position
+/// BEFORE C's frames map, so C's real result settles C itself —
+/// result_settles_root never pops a phantom B for C's turn and attribution
+/// stays correct from then on.
+///
+/// r10 item 3 makes the failing schedule ACKNOWLEDGED rather than hoped for:
+/// (1) the test waits until C is parked on write_seq behind B BEFORE B is
+/// aborted; (2) a third holder X queues behind C and does not release write_seq
+/// until C's result has actually been MAPPED. Under the OLD cleanup (a detached
+/// Drop task re-acquiring write_seq) that task can only run AFTER C's result
+/// maps — deterministically reproducing the phantom pop instead of winning the
+/// race — while the fixed worker-side rollback runs at B's ticket position and
+/// needs no write_seq at all.
+#[tokio::test]
+async fn aborting_a_suspended_b_does_not_let_c_result_pop_a_phantom_b() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Park write #1 (B) pre-accept. (The turn naming: B is the suspended one;
+    // the prior turn A has already completed, so B begins a fresh reservation.)
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.park_from_write(1);
+
+    // B starts and parks pre-accept, holding write_seq with an open book.
+    let db = driver.clone();
+    let send_b = tokio::spawn(async move { db.send(prompt_id("suspended-b", "msg-b")).await });
+    barrier
+        .wait_until_write_parked(Duration::from_secs(5))
+        .await;
+    barrier
+        .wait_until_reserves_enqueued(1, Duration::from_secs(5))
+        .await;
+
+    // C queues behind B for write_seq; ACKNOWLEDGE C is actually parked there
+    // before B is aborted (count 2: B and C both reached the lock await).
+    let dc = driver.clone();
+    let send_c = tokio::spawn(async move { dc.send(prompt_id("first", "msg-c")).await });
+    barrier
+        .wait_until_write_seq_waits(2, Duration::from_secs(5))
+        .await;
+
+    // X queues behind C. It acquires write_seq only after C's prepare releases
+    // it and HOLDS it until C's result is mapped — so a detached cleanup that
+    // re-acquires write_seq (the old Drop path) provably runs only after C's
+    // result has been mapped against the stale book. The fixed rollback runs on
+    // the worker and never waits on X.
+    let dx = driver.clone();
+    let seq_holder = tokio::spawn(async move {
+        let hold = dx
+            .bounded_hold_write_seq_for_test(Duration::from_secs(5))
+            .await;
+        dx.test_wait_results_mapped(1, Duration::from_secs(5)).await;
+        drop(hold);
+    });
+
+    // r11 item 4(b): ACKNOWLEDGE X has actually queued for write_seq (behind C)
+    // BEFORE B is aborted — count 3 (B, C, X all reached the lock await). This
+    // is what puts the old detached cleanup behind X; without it the abort only
+    // hoped X was in line.
+    barrier
+        .wait_until_write_seq_waits(3, Duration::from_secs(5))
+        .await;
+
+    // Abort B: write_seq transfers C -> X -> (old detached cleanup). Open ALL
+    // worker/send gates so C's frames map up to its result: B's reservation is
+    // consumed at its ticket position (fixed arm) before C maps; the old no-op
+    // arm leaves B in the book for C's result to pop as a phantom.
+    send_b.abort();
+    barrier.release();
+
+    // Bounded joins: C completes and X releases (both acknowledge the schedule
+    // actually played out).
+    join_bounded(send_c, Duration::from_secs(5), "send_c")
+        .await
+        .expect("C sends after B aborted");
+    join_bounded(seq_holder, Duration::from_secs(5), "the write_seq holder").await;
+
+    // C's single turn starts and settles as C (index 0, settledRootTurn) — its
+    // result did not pop a phantom B leaving C outstanding.
+    let obs = collect_until(&mut handle, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .any(|o| lifecycle_named(o) == Some("turn_started"))
+            && turn_done_count(seen) >= 1
+    })
+    .await;
+    assert_eq!(
+        turn_started_count(&obs),
+        1,
+        "B never started; only C did: {obs:?}"
+    );
+    let result = obs.iter().find_map(result_attrs).expect("C result");
+    assert_eq!(
+        result,
+        ("0", true),
+        "C's result settles C (no phantom B pop)"
+    );
+
+    drop(barrier);
+    let _ = driver.close().await;
+}
+
+/// ma-sdk-state r10 item 1: with the publish mutex held, B parks on it (BEFORE
+/// opening its book entry now) and is aborted there. No reservation may be
+/// left without a ticket owning it: A's result (mapped while B is parked)
+/// settles A, and a later C completes and settles C itself. Pre-fix, B opened
+/// the book before parking; the abort left a phantom entry, A's settle was
+/// deferred forever, and C's result popped the phantom so C stayed
+/// outstanding.
+#[tokio::test]
+async fn aborting_while_parked_on_the_publish_mutex_leaves_no_phantom_reservation() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = driver.arm_write_commit_barrier();
+
+    // A writes; the send task parks post-ack, the worker parks at A's ticket,
+    // A's result is queued behind it.
+    let da = driver.clone();
+    let send_a = tokio::spawn(async move { da.send(prompt_id("first", "msg-a")).await });
+    barrier
+        .wait_until_result_parked(Duration::from_secs(5))
+        .await;
+    barrier.release_send();
+    join_bounded(send_a, Duration::from_secs(5), "send_a")
+        .await
+        .expect("A acked");
+
+    // Hold the publish mutex (a concurrent fence/close does the same), then
+    // send B. Under the fix B parks on the mutex BEFORE its book entry opens.
+    // r11 item 4(d): the acquisition itself is bounded with a named failure.
+    let publish_hold = driver
+        .bounded_hold_publish_mutex_for_test(Duration::from_secs(5))
+        .await;
+    let db = driver.clone();
+    let send_b = tokio::spawn(async move { db.send(prompt_id("second", "msg-b")).await });
+    barrier
+        .wait_until_publish_lock_waits(2, Duration::from_secs(5))
+        .await;
+
+    // Map A's result WHILE B is parked: with no phantom B book outstanding, A
+    // settles its root turn ordinarily (result index 0, settledRootTurn).
+    barrier.resume_worker();
+    barrier
+        .wait_until_results_mapped(1, Duration::from_secs(5))
+        .await;
+
+    // Abort B parked on the mutex, then release the mutex. B opened nothing and
+    // enqueued no ticket, so no cleanup is owed and write_seq is free again.
+    send_b.abort();
+    drop(publish_hold);
+
+    // C completes normally; its result (second user frame the child sees)
+    // settles C itself at result index 1.
+    let dc = driver.clone();
+    wait_bounded(
+        dc.send(prompt_id("second", "msg-c")),
+        Duration::from_secs(5),
+        "the post-abort C send",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for the post-abort C send")
+    .expect("C sends after B aborted");
+    // The send ack means WRITTEN, not answered: acknowledge C's result is
+    // mapped before fencing so the fence cannot overtake C's live frames.
+    barrier
+        .wait_until_results_mapped(2, Duration::from_secs(5))
+        .await;
+
+    // Count ALL starts/settlements through one acknowledged fence drain.
+    // r11 item 4(d): bound the fence acquisition (it takes the publish mutex)
+    // separately from the drain.
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
+    let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
+
+    assert_eq!(
+        turn_started_count(&all),
+        2,
+        "only A and C start; the aborted B emits no start: {all:?}"
+    );
+    let results: Vec<(&str, bool)> = all.iter().filter_map(result_attrs).collect();
+    assert_eq!(
+        results,
+        vec![("0", true), ("1", true)],
+        "A settles while B parks pre-book, and C settles C (no phantom B pop): {all:?}"
+    );
+    let corrections: Vec<Option<&str>> = all
+        .iter()
+        .filter_map(settled_marker)
+        .filter(|marker| *marker == Some("true"))
+        .collect();
+    assert!(
+        corrections.is_empty(),
+        "no deferred correction is owed when B never opened a book: {all:?}"
+    );
+
+    drop(barrier);
+    let _ = driver.close().await;
+}
+
+/// ma-sdk-state r10 item 2: A's result is mapped DEFERRED behind B's reserved
+/// turn; B is cancelled pre-accept while C reserves CONCURRENTLY. A's
+/// settlement must be emitted at B's cancelled TICKET POSITION — ahead of C's
+/// turn_started (and never after the child's StdoutEof). Pre-fix the
+/// correction was appended to the publication queue tail, so C's start (and a
+/// queued StdoutEof) could overtake it.
+#[tokio::test]
+async fn cancelling_b_emits_a_settlement_at_its_ticket_position_before_c_starts() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = driver.arm_write_commit_barrier();
+    // A (#1) runs the pre-ack gate; B (#2) parks pre-accept.
+    barrier.park_from_write(2);
+    // Hold the worker at B's cancelled ticket (before the rollback) so C can
+    // enqueue its ticket BEHIND B before the correction is emitted.
+    barrier.hold_cancelled_rollback();
+
+    let da = driver.clone();
+    let send_a = tokio::spawn(async move { da.send(prompt_id("first", "msg-a")).await });
+    barrier
+        .wait_until_result_parked(Duration::from_secs(5))
+        .await;
+    barrier.release_send();
+    join_bounded(send_a, Duration::from_secs(5), "send_a")
+        .await
+        .expect("A acked");
+
+    // B reserves and parks pre-accept (writer never accepts its prompt).
+    let db = driver.clone();
+    let send_b = tokio::spawn(async move { db.send(prompt_id("second", "msg-b")).await });
+    barrier
+        .wait_until_reserves_enqueued(2, Duration::from_secs(5))
+        .await;
+
+    // Map A's result against B's open book -> deferred; acknowledge the map.
+    barrier.resume_worker();
+    barrier
+        .wait_until_results_mapped(1, Duration::from_secs(5))
+        .await;
+
+    // Cancel B; the worker reaches the cancelled ticket and parks at the
+    // r10-item-2 gate just before the ordered rollback.
+    send_b.abort();
+    barrier
+        .wait_until_cancelled_ticket_reached(Duration::from_secs(5))
+        .await;
+
+    // C reserves CONCURRENTLY: its ticket is enqueued BEHIND B's cancelled
+    // ticket while the rollback is held at the gate (count 3: A, B, C).
+    let dc = driver.clone();
+    let send_c = tokio::spawn(async move { dc.send(prompt_id("second", "msg-c")).await });
+    barrier
+        .wait_until_reserves_enqueued(3, Duration::from_secs(5))
+        .await;
+    // C parked at the pre-ack gate; open it so C writes and the fake answers
+    // turn 2 while the worker is STILL parked at B's cancelled ticket.
+    barrier.release_write_ack();
+    join_bounded(send_c, Duration::from_secs(5), "send_c")
+        .await
+        .expect("C writes and commits after B cancelled");
+    // r11 item 4(a): ACKNOWLEDGE C's result frame is ENQUEUED (reader side,
+    // count 2: A then C) before provoking the natural EOF — the EOF must queue
+    // behind result_C, not overtake it.
+    barrier
+        .wait_until_results_enqueued(2, Duration::from_secs(5))
+        .await;
+
+    // r11 item 4(a): provoke a NATURAL stdout EOF while the rollback is still
+    // pending at B's cancelled ticket. SIGKILL closes the child's stdout; the
+    // reader seals admission and queues StdoutEof behind result_C. ACKNOWLEDGE
+    // the EOF is queued before the rollback is released, so the queue is
+    // provably [B ticket(parked), C ticket, result_C, StdoutEof].
+    driver.kill().await.expect("kill the fake child");
+    barrier
+        .wait_until_stdout_eof_queued(Duration::from_secs(5))
+        .await;
+
+    // Release the rollback with the EOF already queued: the fixed code emits
+    // A's correction at B's position — before C's start, result_C and the
+    // terminal exited — then drains to the EOF.
+    barrier.release_cancelled_ticket();
+
+    // r11 item 4(d): bound the fence acquisition (it takes the publish mutex)
+    // separately from the acknowledged drain.
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
+    let mut all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
+
+    assert_eq!(
+        turn_started_count(&all),
+        2,
+        "A and C start; cancelled B emits no start: {all:?}"
+    );
+    let corrections: Vec<usize> = all
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| match settled_marker(o) {
+            Some(Some("true")) => Some(i),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        corrections.len(),
+        1,
+        "exactly one deferred correction (A's released settle): {all:?}"
+    );
+    let correction = corrections[0];
+    // Two starts in publication order: A then C. C's start is the second.
+    let mut starts = all
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| (lifecycle_named(o) == Some("turn_started")).then_some(i));
+    let _start_a = starts.next().expect("start_A");
+    let start_c = starts.next().expect("start_C");
+    assert!(
+        correction < start_c,
+        "A's settlement is emitted at B's ticket position, BEFORE C's start \
+         (correction={correction}, start_c={start_c}): {all:?}"
+    );
+    // The natural EOF was interleaved with the pending rollback: its exited
+    // observation is already in the fence-drained sequence.
+    let exited = first_where(&all, |o| {
+        lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("exited")
+    });
+    assert!(
+        correction < exited,
+        "A's correction precedes the natural session exit: {all:?}"
+    );
+
+    // r11 item 4(c); r12 items 3/4: close seals the events channel; the SAME
+    // shared `drain_until_closed` the bound proof withholds collects the tail
+    // to recv None inside ONE overall named bound — a quiet period is never
+    // mistaken for EOF.
+    drop(barrier);
+    let _ = driver.close().await;
+    let tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("events channel reaches recv=None after natural EOF and close");
+    all.extend(tail);
+
+    // Re-locate exited in the completed sequence and demand it be the LAST
+    // observation: nothing — no correction, no result — follows the terminal
+    // state (a tail-appended correction would land here).
+    let exited = first_where(&all, |o| {
+        lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("exited")
+    });
+    assert_eq!(
+        exited + 1,
+        all.len(),
+        "nothing is published after the natural exited observation: {all:?}"
+    );
+}
+
+/// ma-sdk-state r11 item 1: A commits, B commits (still active), A's result is
+/// mapped DEFERRED behind B; a NEWER turn C then reserves and its write fails.
+/// C is newer than the outstanding blocker B, so its cancellation must NOT
+/// release A's deferred settle — no settledRootTurn may be emitted while B is
+/// mid-turn (Node/Hub would otherwise read the session idle mid-turn). B's own
+/// result settles the root ordinarily. Pre-fix, C's cancel released the
+/// deferral purely because one existed, emitting a bogus correction.
+///
+/// r12 item 2: the schedule is now ACKNOWLEDGED end to end rather than raced.
+/// `prepare_prompt_write` releases `write_seq` at writer-enqueue acceptance,
+/// before the detached write ack, so releasing B also lets C proceed and B's
+/// result could race C's reservation — the old test could pass with the bug
+/// (B's ordinary settle cleared the deferral before C's rollback ran) or fail
+/// correct code. The controlled order here is: B COMMITted before A's result
+/// is released to the mapper; the reader WITHHOLDS B's result frame until C's
+/// cancelled ticket is fully rolled back AT ITS TICKET POSITION; only then is
+/// B's result released, so the rollback provably runs with B still active and
+/// A's settle still deferred.
+#[tokio::test]
+async fn cancelling_a_newer_c_while_older_b_is_active_does_not_release_a_deferred_settle() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // A (#1) runs the pre-ack gate; B (#2) and C (#3) park pre-accept.
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.park_from_write(2);
+
+    let da = driver.clone();
+    let send_a = tokio::spawn(async move { da.send(prompt_id("first", "msg-a")).await });
+    barrier
+        .wait_until_result_parked(Duration::from_secs(5))
+        .await;
+    barrier.release_send();
+    join_bounded(send_a, Duration::from_secs(5), "send_a")
+        .await
+        .expect("A acked");
+    // A committed: the worker emitted start_A and is parked after it with the
+    // worker gate STILL shut — result_A (queued ahead of B's ticket) is not
+    // mapped yet.
+
+    // B reserves; acknowledge its ticket before anything else moves.
+    let db = driver.clone();
+    let send_b = tokio::spawn(async move { db.send(prompt_id("second", "msg-b")).await });
+    barrier
+        .wait_until_reserves_enqueued(2, Duration::from_secs(5))
+        .await;
+
+    // C queues behind B on write_seq; its write will take the forced fault.
+    // ACKNOWLEDGE C is actually parked on write_seq behind B (count 2: B holds
+    // it, C waits) before B is released.
+    driver.force_write_failure_from(3);
+    let dc = driver.clone();
+    let send_c = tokio::spawn(async move { dc.send(prompt_id("never-written-c", "msg-c")).await });
+    barrier
+        .wait_until_write_seq_waits(2, Duration::from_secs(5))
+        .await;
+
+    // WITHHOLD B's result frame from the publication queue BEFORE B writes, so
+    // it cannot race C's ticket (the r12 item 2 defect).
+    barrier.hold_result_enqueue();
+
+    // Open the pre-ack gate: B proceeds to its writer, enqueues (releasing
+    // write_seq at acceptance), its detached task COMMITs; C enqueues its
+    // ticket (count 3) and takes the forced fault before the writer accepts.
+    // The worker gate is still shut, so neither result_A nor any ticket moves
+    // while this plays out.
+    barrier.release_write_ack();
+    barrier
+        .wait_until_reserves_enqueued(3, Duration::from_secs(5))
+        .await;
+    let b = join_bounded(send_b, Duration::from_secs(5), "send_b").await;
+    assert!(b.is_ok(), "B writes and commits: {b:?}");
+    let c = join_bounded(send_c, Duration::from_secs(5), "send_c").await;
+    assert!(c.is_err(), "C's forced-fault write fails: {c:?}");
+    // B is now COMMITTED (mid-turn) before A's result is released.
+
+    // Release the worker: it maps result_A (deferred behind B), emits start_B
+    // at B's ticket, then reaches C's cancelled ticket.
+    barrier.resume_worker();
+    barrier
+        .wait_until_results_mapped(1, Duration::from_secs(5))
+        .await;
+    // C's cancelled ticket is fully rolled back AT ITS POSITION while B is
+    // still active and result_B is withheld from the queue.
+    barrier
+        .wait_until_cancelled_rollbacks_done(1, Duration::from_secs(5))
+        .await;
+    // Acknowledge the reader really is holding result_B at the shut gate —
+    // not merely that no result happened to arrive yet.
+    barrier
+        .wait_until_result_enqueue_parked(Duration::from_secs(5))
+        .await;
+
+    // NOW release B's result: it maps and settles B's own root ordinarily.
+    barrier.release_result_enqueue();
+    barrier
+        .wait_until_results_mapped(2, Duration::from_secs(5))
+        .await;
+
+    // ACKNOWLEDGED FENCE: every job up to the withheld-then-released result is
+    // published, so the complete observation order is asserted, not sampled.
+    // The fence enqueue itself goes through the shared named bounded wait
+    // (r12 item 3).
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
+    let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
+
+    assert_eq!(
+        turn_started_count(&all),
+        2,
+        "A and B start; the failed C emits no start: {all:?}"
+    );
+    let results: Vec<(&str, bool)> = all.iter().filter_map(result_attrs).collect();
+    assert_eq!(
+        results,
+        vec![("0", false), ("1", true)],
+        "A's result is deferred (no settledRootTurn) and B's OWN result settles \
+         the root — C's cancel emits no idle while B is active: {all:?}"
+    );
+    let corrections: Vec<Option<&str>> = all
+        .iter()
+        .filter_map(settled_marker)
+        // B's own ordinary settle carries settledRootTurn=true but NO
+        // deferredSettle marker; only the correction carries "true".
+        .filter(|marker| *marker == Some("true"))
+        .collect();
+    assert!(
+        corrections.is_empty(),
+        "no deferred-settle correction is released by a newer C: {all:?}"
+    );
+
+    drop(barrier);
+    let _ = driver.close().await;
+}
+
+/// ma-sdk-state r11 item 2: natural stdout EOF seals reservation admission.
+/// The worker is held after start_A with result_A still queued; the one-turn
+/// fake then exits ON ITS OWN (FAKE_CLAUDE_EXIT_WHEN_SCRIPT_DONE), so the
+/// reader seals admission and queues StdoutEof behind result_A. A send B
+/// attempted only AFTER that EOF is acknowledged must be REFUSED at admission
+/// (no book entry, no ticket behind the terminal job), and when the worker
+/// drains, `exited` is the LAST observation — no deferred correction after it.
+/// Pre-fix, B booked and queued its ticket behind EOF, its dead-child write
+/// failed, A's result was deferred, and the rollback correction was emitted
+/// AFTER exited.
+#[tokio::test]
+async fn natural_stdout_eof_seals_reservation_admission_and_emits_nothing_after_exit() {
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_EXIT_WHEN_SCRIPT_DONE".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let driver = std::sync::Arc::new(driver);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = driver.arm_write_commit_barrier();
+
+    // A: send parks post-ack, the worker parks at A's ticket, result_A queued.
+    let da = driver.clone();
+    let send_a = tokio::spawn(async move { da.send(prompt("only turn")).await });
+    barrier
+        .wait_until_result_parked(Duration::from_secs(5))
+        .await;
+    barrier.release_send();
+    // A commits: start_A is published and the worker parks post-start (worker
+    // gate shut by default) BEFORE mapping result_A.
+    join_bounded(send_a, Duration::from_secs(5), "send_a")
+        .await
+        .expect("A acked");
+
+    // The one-turn fake finishes its script and exits naturally: the reader
+    // seals admission and queues StdoutEof BEHIND result_A. ACKNOWLEDGE the
+    // sealed EOF before attempting B, so B deterministically loses the race
+    // (this is not a timing hope: sealing completes under the publish mutex
+    // before the barrier note is set).
+    barrier
+        .wait_until_stdout_eof_queued(Duration::from_secs(5))
+        .await;
+
+    let b = wait_bounded(
+        driver.send(prompt("late b")),
+        Duration::from_secs(5),
+        "late B admission",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for late B admission to resolve");
+    assert!(
+        matches!(&b, Err(DriverError::ControlUnavailable)),
+        "B loses the race to the EOF seal and is refused: {b:?}"
+    );
+
+    // An acknowledged fence queued after the EOF: the worker maps result_A,
+    // emits exited, then signals. Open the worker gate first (drop the
+    // barrier), then drain in one overall timeout.
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
+    drop(barrier);
+    let all = drain_fence(&mut handle, fence, Duration::from_secs(5)).await;
+
+    let exited = first_where(&all, |o| {
+        lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("exited")
+    });
+    assert_eq!(
+        exited + 1,
+        all.len(),
+        "nothing is published after the terminal exited observation: {all:?}"
+    );
+    let results: Vec<(&str, bool)> = all.iter().filter_map(result_attrs).collect();
+    assert_eq!(
+        results,
+        vec![("0", true)],
+        "A settles ordinarily — B never opened a book: {all:?}"
+    );
+    let corrections = all
+        .iter()
+        .filter_map(settled_marker)
+        .filter(|marker| *marker == Some("true"))
+        .count();
+    assert_eq!(
+        corrections, 0,
+        "no deferred-settle correction is emitted, before or after exit"
+    );
+
+    let _ = driver.close().await;
+}
+
+/// ma-sdk-state r11 item 3: fail_without_ticket used to mark the guard
+/// resolved BEFORE awaiting its rollback, so a caller aborted while parked on
+/// the mapper lock left the just-opened reservation orphaned. Resolved is now
+/// set only after the rollback completes: Drop stays armed across the await
+/// and hands the rollback to a cancellation-independent detached task.
+#[tokio::test]
+async fn aborting_during_fail_without_ticket_rollback_does_not_orphan_the_reservation() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let driver = std::sync::Arc::new(driver);
+    let handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = driver.arm_write_commit_barrier();
+    // Park B before its rollback, and force its Reserve ticket send to fail
+    // (publisher stays open; the live child is untouched).
+    barrier.hold_rollback_without_ticket();
+    driver.force_reserve_send_failure_for_test();
+
+    let db = driver.clone();
+    let send_b = tokio::spawn(async move { db.send(prompt("orphan check")).await });
+    barrier
+        .wait_until_rollback_parked(Duration::from_secs(5))
+        .await;
+
+    // Hold the mapper, then release B INTO the rollback: it parks on the
+    // mapper-lock wait. ACKNOWLEDGE that exact wait before aborting B.
+    let mapper_hold = driver
+        .bounded_hold_mapper_for_test(Duration::from_secs(5))
+        .await;
+    barrier.release_rollback_without_ticket();
+    barrier
+        .wait_until_rollback_lock_waits(1, Duration::from_secs(5))
+        .await;
+
+    // Cancel B WHILE it waits on the mapper lock. The fixed guard is still
+    // unresolved, so its Drop detaches the rollback instead of no-opping.
+    send_b.abort();
+    drop(mapper_hold);
+
+    // The cancellation-independent cleanup finishes the rollback: after the
+    // fence, no outstanding turn remains (the old code leaked B forever).
+    barrier
+        .wait_until_rollbacks_done(1, Duration::from_secs(5))
+        .await;
+    assert!(
+        driver
+            .bounded_outstanding_turn_seqs_for_test(Duration::from_secs(5))
+            .await
+            .is_empty(),
+        "the aborted caller's reservation is rolled back, not orphaned"
+    );
+
+    drop(barrier);
+    drop(handle);
+    let _ = driver.close().await;
+}
+
+/// deferredSettle marker (None = ordinary settlement, Some("true") = deferred
+/// correction); returns None for non-settled results. Use this to count ALL
+/// settledRootTurn observations and inspect the deferred flag.
+fn settled_marker(o: &Observation) -> Option<Option<&str>> {
+    match &o.body {
+        ObservationPayload::Lifecycle(p) => match p.as_ref() {
+            LifecyclePayload::Native(n)
+                if n.native_name == "result"
+                    && n.related_ids.get("settledRootTurn").map(String::as_str) == Some("true") =>
+            {
+                Some(n.related_ids.get("deferredSettle").map(String::as_str))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// ma-sdk-state r8 item 1 (a): aborting the caller BEFORE the writer accepts
+/// UserWrite (parked pre-accept) must never write the prompt — no `user` frame
+/// reaches the child, no turn_started is emitted, and the reservation is rolled
+/// back so a following turn starts and settles normally.
+#[tokio::test]
+async fn aborting_before_the_writer_accepts_never_writes_the_prompt() {
+    let stdin_file = std::env::temp_dir().join(format!(
+        "remuda-r8-preaccept-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut env = BTreeMap::new();
+    env.insert(
+        "FAKE_CLAUDE_STDIN_FILE".into(),
+        stdin_file.to_string_lossy().into_owned(),
+    );
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let mut handle = driver.start(spec).await.expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Park write #1 at the pre-accept gate (after Reserve, before UserWrite).
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.park_from_write(1);
+    let mut first = Box::pin(driver.send(prompt_id("aborted-before-accept", "msg-cancel")));
+    tokio::select! {
+        _ = barrier.wait_until_write_parked(Duration::from_secs(5)) => {}
+        r = &mut first => panic!("first send should park pre-accept, got {r:?}"),
+    }
+    // Caller gives up BEFORE the writer accepted the command.
+    drop(first);
+    // Opening the gate must not resurrect the cancelled write.
+    barrier.release_write_ack();
+    barrier.release_send();
+    drop(barrier);
+
+    // A second, normal prompt must run: proves the cancelled reservation was
+    // rolled back cleanly (one start, one settle) and the first never wrote.
+    wait_bounded(
+        driver.send(prompt_id("the real prompt", "msg-real")),
+        Duration::from_secs(5),
+        "the post-abort follow-up send",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for the follow-up send")
+    .expect("the follow-up send succeeds");
+    let obs = collect_until(&mut handle, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .any(|o| lifecycle_named(o) == Some("turn_started"))
+            && turn_done_count(seen) >= 1
+    })
+    .await;
+    assert_eq!(
+        turn_started_count(&obs),
+        1,
+        "the aborted prompt emitted no turn_started; only the real turn did"
+    );
+    assert!(turn_done_count(&obs) >= 1, "the real turn settles");
+
+    // Wait (bounded) until the child has recorded the real prompt's user frame
+    // on its stdin marker — the aborted prompt's frame never reached it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let user_frames = loop {
+        let recorded = std::fs::read_to_string(&stdin_file).unwrap_or_default();
+        let count = recorded.lines().filter(|l| l.trim() == "user").count();
+        if count == 1 {
+            break count;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected exactly 1 recorded user frame"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(
+        user_frames, 1,
+        "exactly one user frame (the real prompt) reached the child; aborted one was cancelled"
+    );
+
+    driver.close().await.expect("close");
+}
+
+/// Result-index/settled attributes of a lifecycle observation, in emission
+/// order.
+fn result_attrs(o: &Observation) -> Option<(&str, bool)> {
+    match &o.body {
+        ObservationPayload::Lifecycle(p) => match p.as_ref() {
+            LifecyclePayload::Native(n) if n.native_name == "result" => Some((
+                n.related_ids
+                    .get("resultIndex")
+                    .map(String::as_str)
+                    .unwrap_or("?"),
+                n.related_ids.get("settledRootTurn").map(String::as_str) == Some("true"),
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+/// ma-sdk-state r9 item 3: abort the caller INSIDE THE REAL WRITER window —
+/// the single writer task has accepted UserWrite off its FIFO and is parked
+/// between the write and the ack (the wire `WriteGate`, not a driver-side
+/// observer). The accepted write must still run on caller drop: turn A is
+/// announced BEFORE its result and settles; a later B keeps attribution
+/// (resultIndex 0 then 1).
+#[tokio::test]
+async fn aborting_inside_the_real_writer_window_keeps_the_accepted_turn_ordered_and_settled() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::TwoTurn);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Close the writer's in-window gate: the writer parks INSIDE UserWrite
+    // handling (after FIFO accept, before write_line/ack).
+    let gate = driver.bounded_write_window(Duration::from_secs(5)).await;
+    gate.close();
+
+    let mut send_a = Box::pin(driver.send(prompt_id("first", "msg-a")));
+    let parked = async {
+        gate.wait_until_parked_bounded(Duration::from_secs(5)).await;
+    };
+    tokio::select! {
+        _ = parked => {}
+        r = &mut send_a => panic!("A should park inside the writer window, got {r:?}"),
+    }
+    // Caller aborts while the writer holds the accepted command.
+    drop(send_a);
+    // Reopen: the writer completes the write/ack even though the caller is gone.
+    gate.open();
+
+    // A completes and settles despite the dropped caller.
+    let a = collect_until(&mut handle, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .any(|o| lifecycle_named(o) == Some("turn_started"))
+            && turn_done_count(seen) >= 1
+    })
+    .await;
+    let a_start = a
+        .iter()
+        .position(|o| lifecycle_named(o) == Some("turn_started"))
+        .expect("start_A");
+    let a_result = a
+        .iter()
+        .position(|o| result_attrs(o).is_some())
+        .expect("result_A");
+    assert!(a_start < a_result, "start_A precedes result_A");
+    assert_eq!(
+        result_attrs(&a[a_result]),
+        Some(("0", true)),
+        "A settles, index 0"
+    );
+
+    // A normal follow-up turn B.
+    wait_bounded(
+        driver.send(prompt_id("second", "msg-b")),
+        Duration::from_secs(5),
+        "the follow-up B send",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for the follow-up B send")
+    .expect("B sends");
+    let b = collect_until(&mut handle, Duration::from_secs(5), |seen| {
+        turn_done_count(seen) >= 1
+    })
+    .await;
+    let b_start = b
+        .iter()
+        .position(|o| lifecycle_named(o) == Some("turn_started"))
+        .expect("start_B");
+    let b_result = b
+        .iter()
+        .position(|o| result_attrs(o).is_some())
+        .expect("result_B");
+    assert!(b_start < b_result, "start_B precedes result_B");
+    assert_eq!(
+        result_attrs(&b[b_result]),
+        Some(("1", true)),
+        "B settles, index 1"
+    );
+
+    wait_bounded(driver.close(), Duration::from_secs(10), "close")
+        .await
+        .expect("bounded test wait timed out: waiting for close")
+        .expect("close");
+}
+
+/// ma-sdk-state r11 item 5 / r12 item 4 — bound proof, class SPAWNED-TASK JOIN.
+///
+/// A send parked forever at the pre-accept gate is awaited through the SAME
+/// named `wait_bounded` helper every scheduling join uses. With the release
+/// withheld it fails Elapsed FAST at the helper's bound; releasing the gate
+/// then lets the SAME send complete cleanly, and close reaps the child. The
+/// RED switch is the bound inside `wait_bounded` only: removed, this test
+/// hangs until the outer harness command timeout.
+#[tokio::test]
+async fn bound_proof_a_parked_send_join_fails_fast_at_the_named_bound_then_completes_on_release() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let driver = std::sync::Arc::new(driver);
+    let handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Gate shut from write #1: the send parks pre-accept and stays parked.
+    // Run the send in a task relaying its result over a oneshot: the receiver
+    // is awaitable by reference, so the SAME send can be bounded once while
+    // withheld and awaited again after the release.
+    let barrier = driver.arm_write_commit_barrier();
+    barrier.park_from_write(1);
+    let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+    let d = driver.clone();
+    tokio::spawn(async move {
+        let _ = result_tx.send(d.send(prompt("parked then released")).await);
+    });
+    barrier
+        .wait_until_write_parked(Duration::from_secs(5))
+        .await;
+
+    // WITHHOLD: the shared named bound fires.
+    let elapsed = wait_bounded(
+        &mut result_rx,
+        Duration::from_millis(300),
+        "the parked send",
+    )
+    .await;
+    assert_elapsed(elapsed, "the parked send join");
+
+    // RELEASE: the same send completes successfully (the fake answers turn 1).
+    drop(barrier);
+    let result = wait_bounded(&mut result_rx, Duration::from_secs(5), "the parked send")
+        .await
+        .expect("bounded test wait timed out: waiting for the released send to finish")
+        .expect("the send task relayed its result");
+    assert!(
+        result.is_ok(),
+        "the released parked send completes: {result:?}"
+    );
+
+    drop(handle);
+    let _ = wait_bounded(
+        driver.close(),
+        Duration::from_secs(10),
+        "close after the parked-send proof",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close after the parked-send proof");
+}
+
+/// ma-sdk-state r11 item 5 / r12 item 4 — bound proof, class BARRIER WAIT.
+///
+/// The barrier count helpers carry their own named internal deadline — there
+/// is no test-local timeout here, so a withheld count must panic with the
+/// helper's named message; with that deadline removed the helper loops
+/// forever and the OUTER harness command timeout is the terminator (the RED).
+/// Releasing the withheld condition (a reservation actually enqueuing) then
+/// makes the same helper return.
+#[tokio::test]
+async fn bound_proof_a_barrier_count_wait_fails_at_its_named_deadline_then_returns_on_release() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let driver = std::sync::Arc::new(driver);
+    let handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let barrier = std::sync::Arc::new(driver.arm_write_commit_barrier());
+    // WITHHOLD: nothing has reserved yet, so a wait for count 1 must panic AT
+    // its internal 300 ms deadline. No local timeout wraps this join.
+    let waiter_barrier = barrier.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_barrier
+            .wait_until_reserves_enqueued(1, Duration::from_millis(300))
+            .await;
+    });
+    expect_named_timeout_panic(waiter, "timed out waiting for 1 reservations").await;
+
+    // RELEASE: open every barrier gate (the send's post-ack hold, the worker
+    // gate, …) while keeping the barrier handle for the acknowledged count; one
+    // normal send then enqueues its Reserve ticket and completes.
+    barrier.release();
+    let d = driver.clone();
+    let send = tokio::spawn(async move { d.send(prompt("the releasing turn")).await });
+    barrier
+        .wait_until_reserves_enqueued(1, Duration::from_secs(5))
+        .await;
+    join_bounded(send, Duration::from_secs(5), "the releasing send")
+        .await
+        .expect("the releasing send is acked");
+
+    drop(barrier);
+    drop(handle);
+    let _ = wait_bounded(
+        driver.close(),
+        Duration::from_secs(10),
+        "close after the barrier-count proof",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close after the barrier-count proof");
+}
+
+/// ma-sdk-state r11 item 5 / r12 item 4 — bound proof, class WRITER GATE WAIT.
+///
+/// The scheduling tests and this proof use the SAME wire helper
+/// `wait_until_parked_bounded`. With the gate closed and no write issued the
+/// helper panics at its named bound; once a real write arrives (release
+/// condition) the same helper returns and the write completes on `open`.
+#[tokio::test]
+async fn bound_proof_the_writer_gate_park_wait_fails_named_then_returns_when_a_write_arrives() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let driver = std::sync::Arc::new(driver);
+    let handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    let gate = driver.bounded_write_window(Duration::from_secs(5)).await;
+    gate.close();
+
+    // WITHHOLD: no write is issued, so the bounded gate wait panics named.
+    let waiter_gate = gate.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_gate
+            .wait_until_parked_bounded(Duration::from_millis(300))
+            .await;
+    });
+    expect_named_timeout_panic(waiter, "waiting for the writer to park in its window").await;
+
+    // RELEASE the condition: a send reaches the closed gate; the SAME bounded
+    // helper now returns (acknowledged), then opening the gate completes it.
+    let d = driver.clone();
+    let send = tokio::spawn(async move { d.send(prompt("gated write")).await });
+    gate.wait_until_parked_bounded(Duration::from_secs(5)).await;
+    gate.open();
+    join_bounded(send, Duration::from_secs(5), "the gated send")
+        .await
+        .expect("the gated send completes after the gate opens");
+
+    drop(handle);
+    let _ = wait_bounded(
+        driver.close(),
+        Duration::from_secs(10),
+        "close after the writer gate proof",
+    )
+    .await;
+}
+
+/// ma-sdk-state r11 item 5 / r12 item 4 — bound proof, class MUTEX/FENCE
+/// ACQUISITION. A parked holder withholds the publish mutex: BOTH named
+/// helpers the scheduling tests use (bounded mutex hold, bounded fence
+/// enqueue) panic at their named bounds. The holder released, both helpers
+/// then acquire/enqueue and complete (the fence drains and signals).
+#[tokio::test]
+async fn bound_proof_contended_mutex_and_fence_acquisitions_fail_named_then_complete_on_release() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let driver = std::sync::Arc::new(driver);
+    let handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // Holder acquires the publish mutex and parks until the test releases it;
+    // acknowledge acquisition. An explicit release (not abort) makes the
+    // guard-drop-and-handover deterministic: the holder task is awaited to
+    // completion before the release half reacquires.
+    let (acq_tx, acq_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let d = driver.clone();
+    let holder = tokio::spawn(async move {
+        let _hold = d
+            .bounded_hold_publish_mutex_for_test(Duration::from_secs(5))
+            .await;
+        acq_tx.send(()).expect("acknowledge holder acquired");
+        let _ = release_rx.await;
+    });
+    acq_rx.await.expect("holder acquisition acknowledged");
+
+    // WITHHOLD: the shared helpers panic at their named 300 ms bounds.
+    let d = driver.clone();
+    let hold_waiter = tokio::spawn(async move {
+        let _hold = d
+            .bounded_hold_publish_mutex_for_test(Duration::from_millis(300))
+            .await;
+    });
+    expect_named_timeout_panic(hold_waiter, "acquiring the publication mutex hold").await;
+    let d = std::sync::Arc::clone(&driver);
+    let fence_waiter = tokio::spawn(async move {
+        let _rx = d
+            .bounded_publication_fence(Duration::from_millis(300))
+            .await;
+    });
+    expect_named_timeout_panic(
+        fence_waiter,
+        "enqueuing a publication fence (publish mutex)",
+    )
+    .await;
+
+    // RELEASE: let the holder drop its guard and wait for the holder task to
+    // finish so the handover is acknowledged, not hoped for.
+    release_tx.send(()).expect("release the holder");
+    wait_bounded(holder, Duration::from_secs(5), "the mutex holder task")
+        .await
+        .expect("bounded test wait timed out: waiting for the holder task to finish")
+        .expect("the holder task exits after release");
+    // Both shared helpers now complete — the mutex hold acquires (then drops),
+    // and a freshly enqueued fence drains and signals through the live worker.
+    {
+        let _hold = driver
+            .bounded_hold_publish_mutex_for_test(Duration::from_secs(5))
+            .await;
+    }
+    let fence = driver
+        .bounded_publication_fence(Duration::from_secs(5))
+        .await;
+    wait_bounded(fence, Duration::from_secs(5), "the released fence signal")
+        .await
+        .expect("the released publication fence signals after the holder drops")
+        .expect("the released fence signals");
+
+    drop(handle);
+    let _ = wait_bounded(
+        driver.close(),
+        Duration::from_secs(10),
+        "close after the mutex/fence proof",
+    )
+    .await;
+}
+
+/// ma-sdk-state r11 item 5 / r12 item 4 — bound proof, class OVERALL
+/// recv-NONE DRAIN (r11 item 4c). The one-turn fake exits naturally (so
+/// `exited` arrives), but close is WITHHELD: recv never returns None and the
+/// shared `drain_until_closed` helper fails Elapsed at its ONE overall bound.
+/// Closing (the release) then lets the same drain complete — a quiet-period
+/// loop would instead have returned silently and read "no tail" as EOF.
+#[tokio::test]
+async fn bound_proof_the_recv_none_drain_fails_named_then_completes_after_close() {
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_EXIT_WHEN_SCRIPT_DONE".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let mut handle = wait_bounded(driver.start(spec), Duration::from_secs(10), "start")
+        .await
+        .expect("bounded test wait timed out: waiting for start")
+        .expect("start");
+    assert_eq!(handle.ack().dispatch, DispatchState::TransportWritten);
+
+    // One ordinary prompt: the one-turn fake answers and then exits naturally.
+    wait_bounded(
+        driver.send(prompt("the only turn")),
+        Duration::from_secs(5),
+        "the only prompt",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for the only prompt")
+    .expect("the prompt is written");
+
+    // The natural exited observation arrives (its own acknowledged wait).
+    let before = collect_until(&mut handle, Duration::from_secs(5), |seen| {
+        seen.iter()
+            .any(|o| lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("exited"))
+    })
+    .await;
+    assert!(before.iter().any(|o| {
+        lifecycle_named(o) == Some("session") && lifecycle_status(o) == Some("exited")
+    }));
+
+    // WITHHOLD close: the shared drain must fail at its overall 300 ms bound.
+    let drained = drain_until_closed(&mut handle, Duration::from_millis(300)).await;
+    assert_elapsed(
+        drained.map(|_| ()),
+        "the recv-None drain with close withheld",
+    );
+
+    // RELEASE: close seals the channel; the same drain completes.
+    wait_bounded(
+        driver.close(),
+        Duration::from_secs(10),
+        "close for the recv-None proof",
+    )
+    .await
+    .expect("bounded test wait timed out: waiting for close for the recv-None proof")
+    .expect("close");
+    let tail = drain_until_closed(&mut handle, Duration::from_secs(5))
+        .await
+        .expect("the recv-None drain completes after close");
+    assert!(
+        tail.iter()
+            .all(|o| !(lifecycle_named(o) == Some("session")
+                && lifecycle_status(o) == Some("exited"))),
+        "close seals without a duplicate terminal exit: {tail:?}"
+    );
 }

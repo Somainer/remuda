@@ -10,13 +10,12 @@ use futures::FutureExt;
 use remuda_protocol::{
     Acceptance, AcceptanceScope, Activity, ActorRef, ActorType, AgentKind, ClaudeRef, Command,
     CommandAuthority, CommandId, CommandOperation, CommandOrigin, CommandResult, CommandState,
-    CommandTarget, Completeness, Connectivity, Digest as WireDigest, DispatchState, DriverKind,
+    CommandTarget, Completeness, Connectivity, Digest as WireDigest, DispatchState,
     EntityLifecycle, EntityMeta, ExpectedState, Host, HostId, HostState, HostTransport,
     HostTransportMode, Id, Instance, InstanceId, InstanceLifecycle, JournalEvent, Knowledge,
     LifecycleEntity, LifecyclePayload, MessagePhase, MessageRole, NativeRef, NodeReceipt,
     ObservationPayload, Ownership, Page, PathStyle, Platform, ProcessRef, ResolutionState,
-    Settlement, SettlementOutcome, SourceChannel, U64, Workspace, WorkspaceId, WorkspaceState,
-    WritePolicy,
+    Settlement, SettlementOutcome, U64, Workspace, WorkspaceId, WorkspaceState, WritePolicy,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -456,6 +455,7 @@ impl DevNode {
                     finish_instance_operation(
                         self.inner.store.as_ref(),
                         instance_id,
+                        driver.kind(),
                         &DriverRequest::Close,
                     )?;
                 }
@@ -1831,10 +1831,15 @@ async fn pump_one_observation(
     // only for a kind with a file-tail adapter (codex/grok); the
     // registry is the single lookup rather than another per-kind branch.
     //
-    // c-cardsettle r5 item 4: finally, a ROOT result/StopFailure turn
-    // failure frees the composer (idle) regardless of channel — print/SDK
-    // events arrive on Stdout/Transcript, which neither the Hook nor the
-    // File fold sees.
+    // Finally, the print/sdk engine's own turn events (ma-sdk-state r3):
+    // turn/turn_started sets working; a settled turn/result idles exactly
+    // like a successful turn end even when the result is a turn failure
+    // (c-cardsettle r5 item 4) — never failing the instance. The
+    // cardsettle r5-item-4 fallback (an UNSETTLED root result/error still
+    // frees the composer) must run AFTER the explicit engine decision: the
+    // merge with ma-sdk-state had dropped it, which let a mapper-bypassed
+    // failed result stick the root at working (the Hub derive keeps both
+    // arms; Node and Hub must agree).
     let activity = hook_activity
         .or_else(|| match store.get_instance(instance_id) {
             Ok(instance) if crate::adapter_registry::has_file_adapter(instance.kind) => {
@@ -1842,6 +1847,7 @@ async fn pump_one_observation(
             }
             _ => None,
         })
+        .or_else(|| crate::signal::engine_turn_activity(&observation))
         .or_else(|| root_turn_failure_activity(&observation));
     if let Some(activity) = activity
         && let Err(error) = store.set_instance_state(
@@ -2331,7 +2337,7 @@ async fn execute_queued(
                 )?;
                 interactions.ingest(&observation).await?;
             }
-            finish_instance_operation(store.as_ref(), instance_id, &queued.request)?;
+            finish_instance_operation(store.as_ref(), instance_id, driver.kind(), &queued.request)?;
             settle_command(
                 &mut command,
                 SettlementOutcome::Completed,
@@ -2405,6 +2411,7 @@ fn notify_carrier(
 fn finish_instance_operation(
     store: &dyn LocalStore,
     instance_id: &InstanceId,
+    kind: remuda_protocol::DriverKind,
     request: &DriverRequest,
 ) -> Result<(), NodeError> {
     match request {
@@ -2428,13 +2435,22 @@ fn finish_instance_operation(
         | DriverRequest::Cancel
         | DriverRequest::SendKeys { .. }
         | DriverRequest::Configure { .. } => {
-            store.set_instance_state(
-                instance_id,
-                None,
-                Some(Knowledge::Known {
-                    value: Activity::Idle,
-                }),
-            )?;
+            // ma-sdk-state r4 item 2: on the structured print/sdk carriers a
+            // transport acknowledgement is not turn evidence. The
+            // turn_started observation sets working and the SETTLED result (or
+            // process end) idles; stamping idle here overwrote a working that
+            // the pump applied from turn_started, and any successful control
+            // during a turn did the same. PTY carriers have no native turn
+            // lifecycle, so the ack stays their idle signal.
+            if !crate::signal::structured_engine_turn_carrier(kind) {
+                store.set_instance_state(
+                    instance_id,
+                    None,
+                    Some(Knowledge::Known {
+                        value: Activity::Idle,
+                    }),
+                )?;
+            }
         }
         DriverRequest::RespondInteraction { .. } => {}
     }
@@ -2818,6 +2834,13 @@ fn record_native_exit(store: &dyn LocalStore, instance_id: &InstanceId, exit: &N
 /// `process_end` evidence is terminal. Subagent scope, configure and
 /// diagnostic topics return None (own scope). Mirrors the Hub's
 /// `root_turn_failed` derivation so Node local state and the Hub agree.
+///
+/// Runs in the observation pump AFTER
+/// `signal::engine_turn_activity`: that fold handles turn_started and the
+/// explicit `settledRootTurn` decision, while this is the r5-item-4 fallback
+/// for an UNSETTLED result/error (older journals and mapper-bypassed tests).
+/// In the live mapper output a root error already carries the settled flag,
+/// so the two arms agree on the real stream.
 fn root_turn_failure_activity(observation: &remuda_protocol::Observation) -> Option<Activity> {
     let ObservationPayload::Lifecycle(payload) = &observation.body else {
         return None;
@@ -2834,8 +2857,8 @@ fn root_turn_failure_activity(observation: &remuda_protocol::Observation) -> Opt
     // foreground session, so this channel-agnostic fallback must NOT invent
     // attribution for it. Print/SDK children own the Stdout/Transcript
     // channels outright — those are exactly the events this exists for.
-    if observation.source.channel == SourceChannel::Hook
-        && observation.source.driver_kind == DriverKind::ShellPty
+    if observation.source.channel == remuda_protocol::SourceChannel::Hook
+        && observation.source.driver_kind == remuda_protocol::DriverKind::ShellPty
     {
         return None;
     }
@@ -2843,8 +2866,23 @@ fn root_turn_failure_activity(observation: &remuda_protocol::Observation) -> Opt
         .related_ids
         .get("outcome")
         .is_some_and(|outcome| outcome.eq_ignore_ascii_case("failed"));
+    // ma-sdk-state r5 item 2: `affects_completion` is the one-shot PRINT
+    // process-completion heuristic the mapper derives from the process-global
+    // result_index (index>0 && queued==0). That index is meaningless on the
+    // long-lived sdk child — an is_error result with index 1 while a workflow
+    // is open would otherwise idle here — and it is redundant for print too:
+    // claude-sdk/claude-print results always carry the explicit
+    // `settledRootTurn` decision, which `engine_turn_activity` handles before
+    // this fallback. So honor the index heuristic only for OTHER sources
+    // (legacy journals / mapper-bypassed shapes).
+    let index_heuristic_source = !matches!(
+        observation.source.driver_kind,
+        remuda_protocol::DriverKind::ClaudeSdk | remuda_protocol::DriverKind::ClaudePrint
+    );
     let result_error = native.native_name == "result"
-        && matches!(&native.status, remuda_protocol::Knowledge::Known { value } if value == "error");
+        && matches!(&native.status, remuda_protocol::Knowledge::Known { value } if value == "error")
+        && native.affects_completion
+        && index_heuristic_source;
     let stop_failure = native.native_name == "StopFailure" && outcome_failed;
     (result_error || stop_failure).then_some(Activity::Idle)
 }
@@ -3681,12 +3719,18 @@ mod tests {
 
         // 3b) A failed first TURN (the print mapper's exact result-error
         // frame on stdout): composer idles but the process stays alive — it
-        // must accept the next prompt rather than being marked ended.
+        // must accept the next prompt rather than being marked ended. The
+        // final result carries the explicit settledRootTurn decision (r5 item
+        // 2: the index heuristic alone no longer idles print/sdk).
         tx.send(native_lifecycle_full(
             remuda_protocol::LifecycleTopic::Turn,
             "result",
             "sess-1",
-            &[("resultIndex", "1"), ("numTurns", "1")],
+            &[
+                ("resultIndex", "1"),
+                ("numTurns", "1"),
+                ("settledRootTurn", "true"),
+            ],
             remuda_protocol::Severity::Error,
             true,
             "error",
@@ -3831,14 +3875,20 @@ mod tests {
         assert!(native_exit(&obs).is_none());
     }
 
-    /// c-cardsettle r5 item 4: the channel-agnostic root turn-failure edge
-    /// frees the composer for print/SDK Runtime/Stdout channels, but does NOT
-    /// attribute an UNBOUND shell-pty hook (the promoted-hook fold verifies
-    /// ownership itself); subagent/configure stay own-scope.
+    /// c-cardsettle r5 item 4 / ma-sdk-state r5 item 2: the channel-agnostic
+    /// root turn-failure edge frees the composer, but for claude-print/sdk a
+    /// result error must be attributed ONLY by the explicit settledRootTurn
+    /// decision (engine_turn_activity), never by the process-global index
+    /// heuristic. An UNSETTLED print/sdk result error therefore returns None
+    /// here; the index heuristic still idles OTHER (legacy) sources, and an
+    /// unbound shell-pty hook as well as subagent/configure stay own-scope.
     #[test]
     fn root_turn_failure_activity_is_scoped_like_the_hub_projection() {
         use remuda_protocol::{DriverKind, SourceChannel};
-        // Root result error on the print/SDK (Runtime) channel → idle.
+        // A print/SDK result error carrying ONLY the index heuristic (no
+        // settledRootTurn — e.g. an is_error result with index 1 while a
+        // workflow is open) must NOT idle: those carriers always settle via the
+        // explicit flag, which engine_turn_activity handles.
         let runtime_result = native_lifecycle_full(
             remuda_protocol::LifecycleTopic::Turn,
             "result",
@@ -3848,8 +3898,22 @@ mod tests {
             true,
             "error",
         );
+        assert_eq!(root_turn_failure_activity(&runtime_result), None);
+
+        // The SAME observation from a legacy/non-structured source still idles
+        // through the index heuristic (older journals / other carriers).
+        let mut legacy_result = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "result",
+            "sess-1",
+            &[("resultIndex", "1"), ("numTurns", "1")],
+            remuda_protocol::Severity::Error,
+            true,
+            "error",
+        );
+        legacy_result.source.driver_kind = DriverKind::ClaudePty;
         assert_eq!(
-            root_turn_failure_activity(&runtime_result),
+            root_turn_failure_activity(&legacy_result),
             Some(Activity::Idle)
         );
 
@@ -3905,6 +3969,55 @@ mod tests {
             "turn_done",
         );
         assert_eq!(root_turn_failure_activity(&turn_done), None);
+    }
+
+    /// ma-sdk-state r5 item 2: on the long-lived sdk child an is_error result
+    /// can carry the process-global result_index 1 (and the print-derived
+    /// affects_completion) WHILE A WORKFLOW IS STILL OPEN. The mapper therefore
+    /// omits settledRootTurn. Neither the engine fold nor the failure fallback
+    /// may idle the turn — the row must stay working until the workflow's own
+    /// terminal notification settles it.
+    #[test]
+    fn an_sdk_result_error_while_a_workflow_is_open_never_idles() {
+        use remuda_protocol::DriverKind;
+        // index 1 + no queued field is exactly what made the print heuristic
+        // stamp affects_completion=true; the open workflow is represented by
+        // the absence of settledRootTurn.
+        let mut open_workflow_error = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "result",
+            "sess-1",
+            &[("resultIndex", "1")],
+            remuda_protocol::Severity::Error,
+            true,
+            "error",
+        );
+        open_workflow_error.source.driver_kind = DriverKind::ClaudeSdk;
+        assert_eq!(
+            crate::signal::engine_turn_activity(&open_workflow_error),
+            None,
+            "the engine fold idles only on settledRootTurn"
+        );
+        assert_eq!(
+            root_turn_failure_activity(&open_workflow_error),
+            None,
+            "the index heuristic must not idle an open-workflow sdk result"
+        );
+
+        // Once the workflow closes, the real mapper settles the turn and the
+        // same result carries the flag → idle.
+        let mut settled_error = open_workflow_error.clone();
+        if let remuda_protocol::ObservationPayload::Lifecycle(payload) = &mut settled_error.body
+            && let remuda_protocol::LifecyclePayload::Native(native) = payload.as_mut()
+        {
+            native
+                .related_ids
+                .insert("settledRootTurn".to_owned(), "true".to_owned());
+        }
+        assert_eq!(
+            crate::signal::engine_turn_activity(&settled_error),
+            Some(Activity::Idle)
+        );
     }
 
     /// c-cardsettle r3 item 8: any hook/turn/session observation carrying a
@@ -4356,14 +4469,21 @@ mod tests {
             row.lifecycle
         );
 
-        // r4 item 2: a failed turn (topic=turn result error, even the final
-        // result) does NOT end a LIVE child — the child accepts another
-        // prompt and cards stay pending until a real topic=session exit.
+        // r4 item 2 / r5 item 2: a failed turn (topic=turn result error, even
+        // the final result) does NOT end a LIVE child — the child accepts
+        // another prompt and cards stay pending until a real topic=session
+        // exit. The FINAL print result settles via the explicit settledRootTurn
+        // decision (NOT the process-global index heuristic), so the observation
+        // carries the flag the real mapper emits.
         tx.send(native_lifecycle_full(
             remuda_protocol::LifecycleTopic::Turn,
             "result",
             "not-applicable",
-            &[("resultIndex", "1"), ("outcome", "failed")],
+            &[
+                ("resultIndex", "1"),
+                ("outcome", "failed"),
+                ("settledRootTurn", "true"),
+            ],
             remuda_protocol::Severity::Error,
             true,
             "error",
@@ -4414,6 +4534,171 @@ mod tests {
 
         drop(tx);
         pump.await.unwrap();
+    }
+
+    /// ma-sdk-state r4 item 2: on a structured print/sdk carrier a command's
+    /// TRANSPORT acknowledgement is not turn evidence. The command completion
+    /// is held until the turn_started observation has already applied
+    /// working; the ack must leave the working state alone, and only the
+    /// settled result idles. A PTY carrier keeps the old ack-idles behaviour.
+    #[tokio::test]
+    async fn structured_carrier_command_ack_keeps_turn_working_until_result() {
+        use remuda_protocol::{Activity, DriverKind, InputOrigin, PromptMode};
+
+        async fn wait_activity(
+            store: &Arc<dyn LocalStore>,
+            id: &InstanceId,
+            want: Activity,
+        ) -> Instance {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let row = store.get_instance(id).unwrap();
+                if let remuda_protocol::Knowledge::Known { value } = &row.activity
+                    && *value == want
+                {
+                    return row;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("activity never reached {want:?}: {row:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        let send = DriverRequest::Send {
+            prompt: "do the thing".to_owned(),
+            attachments: Vec::new(),
+            origin: InputOrigin::Human,
+            mode: PromptMode::NewTurn,
+        };
+
+        // ── Structured sdk carrier ──────────────────────────────────────────
+        let store: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
+        let instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ClaudeSdk,
+        )
+        .unwrap();
+        let id = instance.meta.id.clone();
+        store.insert_instance(instance).unwrap();
+        let interactions = InteractionRuntime::spawn(Arc::clone(&store)).unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let pump = spawn_observation_pump(
+            Arc::clone(&store),
+            interactions,
+            id.clone(),
+            rx,
+            Arc::new(FakeDriver::default()),
+            Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
+        );
+
+        // Hold the command completion until the start observation is applied.
+        let mut started = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "turn_started",
+            "sess-item2",
+            &[("nativeClientMessageId", "msg-item2")],
+            remuda_protocol::Severity::Info,
+            false,
+            "working",
+        );
+        started.source.driver_kind = DriverKind::ClaudeSdk;
+        tx.send(started).await.unwrap();
+        wait_activity(&store, &id, Activity::Working).await;
+
+        // The write ack lands AFTER the start: the Send ack must not idle.
+        finish_instance_operation(store.as_ref(), &id, DriverKind::ClaudeSdk, &send).unwrap();
+        let row = store.get_instance(&id).unwrap();
+        assert_eq!(
+            row.activity,
+            remuda_protocol::Knowledge::Known {
+                value: Activity::Working
+            },
+            "the send ack must not overwrite the turn_started working state"
+        );
+        // Any other successful control ack during the turn is just as inert.
+        finish_instance_operation(
+            store.as_ref(),
+            &id,
+            DriverKind::ClaudeSdk,
+            &DriverRequest::Cancel,
+        )
+        .unwrap();
+        finish_instance_operation(
+            store.as_ref(),
+            &id,
+            DriverKind::ClaudeSdk,
+            &DriverRequest::Configure {
+                model: Some("haiku".to_owned()),
+                effort: None,
+                effort_index: None,
+                permission_mode: None,
+            },
+        )
+        .unwrap();
+        let row = store.get_instance(&id).unwrap();
+        assert_eq!(
+            row.activity,
+            remuda_protocol::Knowledge::Known {
+                value: Activity::Working
+            },
+            "cancel/configure acks keep the native turn state"
+        );
+
+        // Only the settled result ends the turn.
+        let mut result = native_lifecycle_full(
+            remuda_protocol::LifecycleTopic::Turn,
+            "result",
+            "sess-item2",
+            &[
+                ("resultIndex", "0"),
+                ("queuedTurnCount", "0"),
+                ("settledRootTurn", "true"),
+            ],
+            remuda_protocol::Severity::Info,
+            false,
+            "turn_done",
+        );
+        result.source.driver_kind = DriverKind::ClaudeSdk;
+        tx.send(result).await.unwrap();
+        let row = wait_activity(&store, &id, Activity::Idle).await;
+        assert_eq!(
+            row.lifecycle,
+            InstanceLifecycle::Ready,
+            "a turn result idles without ending the sdk process"
+        );
+        drop(tx);
+        pump.await.unwrap();
+
+        // ── PTY carrier keeps the ack-idles behaviour ───────────────────────
+        let pty: Arc<dyn LocalStore> = Arc::new(MemoryStore::new(64));
+        let pty_instance = fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ShellPty,
+        )
+        .unwrap();
+        let pty_id = pty_instance.meta.id.clone();
+        pty.insert_instance(pty_instance).unwrap();
+        pty.set_instance_state(
+            &pty_id,
+            None,
+            Some(remuda_protocol::Knowledge::Known {
+                value: Activity::Working,
+            }),
+        )
+        .unwrap();
+        finish_instance_operation(pty.as_ref(), &pty_id, DriverKind::ShellPty, &send).unwrap();
+        assert_eq!(
+            pty.get_instance(&pty_id).unwrap().activity,
+            remuda_protocol::Knowledge::Known {
+                value: Activity::Idle
+            },
+            "a PTY carrier has no native turn lifecycle: its ack still idles"
+        );
     }
 
     /// c-cardsettle r7 item 5 (was r5 item 3, strengthened): the owner's
@@ -5860,6 +6145,11 @@ mod tests {
 mod api_relay_launch_test {
     use super::*;
     use crate::{FakeDriver, MemoryStore};
+    // Test-only DriverKind references left without the top-level import after
+    // the ma-sdk-state origin/main merge (24a8bbdd): production code now
+    // qualifies DriverKind in full, while every other cfg(test) site imports
+    // it locally; this sibling test module needs it at its top.
+    use remuda_protocol::DriverKind;
 
     fn node() -> DevNode {
         let config = crate::DevServerConfig::loopback(0)

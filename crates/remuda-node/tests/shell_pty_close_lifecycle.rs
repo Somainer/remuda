@@ -2069,22 +2069,38 @@ async fn retire_bound_releases_a_parked_finalise_and_completes() {
         .expect("exit");
 
     // Resume WITHOUT releasing the finish gate: retirement hits its bound and
-    // must release the parked finalise itself.
-    let started = Instant::now();
-    let resume = tokio::time::timeout(
-        Duration::from_secs(10),
-        driver.start_resumed(
-            spec_for(&workspace, DriverKind::ShellPty),
-            SESSION_ID.into(),
-        ),
-    )
-    .await
-    .expect("resume hung")
-    .expect("resume ok");
-    let elapsed = started.elapsed();
+    // must release the parked finalise itself. Spawn run 2 first (its spawn is
+    // excluded from the measurement); start the retirement clock only once the
+    // predecessor finalise has parked (c-ctxusage r22 item 5).
+    let mut resume = tokio::spawn({
+        let driver = driver.clone();
+        async move {
+            driver
+                .start_resumed(
+                    spec_for(&workspace, DriverKind::ShellPty),
+                    SESSION_ID.into(),
+                )
+                .await
+        }
+    });
     assert!(
-        elapsed < Duration::from_millis(2000),
-        "retirement completed within its bound: {elapsed:?}"
+        faults.wait_finish_entered(),
+        "the predecessor finalise never parked"
+    );
+    // The poller ACK (run 2 spawned) and the finish park are both in by now;
+    // from here `resume` is waiting ONLY on predecessor retirement.
+    let retirement_started = Instant::now();
+    let resume_result = tokio::time::timeout(Duration::from_secs(10), &mut resume)
+        .await
+        .expect("retirement/resume hung");
+    let retirement_elapsed = retirement_started.elapsed();
+    let _resume = resume_result
+        .expect("resume task panicked")
+        .expect("resume ok");
+    assert!(
+        retirement_elapsed < Duration::from_millis(2000),
+        "retirement released the parked finalise within its 500 ms bound: \
+         {retirement_elapsed:?} (measurement excludes run-2 spawn)"
     );
     // The hard item-4 signal: the test never called release(), so the ONLY
     // thing that opened the blocking gate is retirement releasing the parked
@@ -2098,7 +2114,6 @@ async fn retire_bound_releases_a_parked_finalise_and_completes() {
 
     // Clean up the resumed run; the released predecessor is already retired.
     faults.release();
-    drop(resume);
     tokio::time::timeout(Duration::from_secs(25), driver.close())
         .await
         .expect("close hung")

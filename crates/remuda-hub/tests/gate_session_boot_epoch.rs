@@ -289,3 +289,112 @@ async fn session_identities_never_repeat_across_a_real_hub_restart() {
     b.shutdown();
     hub2.shutdown().await;
 }
+
+/// Open the hub DB read-write directly (only while no Hub is running).
+fn rw_conn(dir: &std::path::Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(dir.join("hub.sqlite")).unwrap()
+}
+
+/// r15 item 6 (R5): a missing or regressed `gate_session_boot_epoch` row in a
+/// database that still RETAINES gate carrier sessions makes the Hub REFUSE to
+/// start — it must not silently reset the epoch to 1 (which would mint ids the
+/// retained sessions already used).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_or_regressed_epoch_with_retained_sessions_refuses_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("hub");
+    let addr = free_port().await;
+    let mut config = HubConfig::for_test(data_dir.clone());
+    config.listen = addr;
+    let hub = spawn(config.clone()).await.expect("first hub boots");
+    let dev_token = hub.mint_device_token("h").await.unwrap();
+    drop(dev_token);
+    hub.shutdown().await;
+
+    // First-boot DB: epoch 1 persisted, no gate jobs yet.
+    {
+        let conn = read_only_conn(&data_dir);
+        assert_eq!(kv_i64(&conn, "gate_session_boot_epoch"), 1);
+    }
+
+    // Simulate a partially restored/cloned data dir: a retained Landing
+    // carrier session from epoch 5, but the epoch allocation row is MISSING.
+    {
+        let mut conn = rw_conn(&data_dir);
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO gate_jobs
+                (id, project_id, state, doc_json, queued_at, created_at,
+                 updated_at, revision, landing_at, dispatch_session)
+             VALUES ('gjb_retained', 'prj_ghost', 'landing', '{}',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z', 1,
+                     '2026-01-01T00:00:00Z', ?1)",
+            [5i64 << 32 | 7],
+        )
+        .unwrap();
+        tx.execute(
+            "DELETE FROM hub_kv WHERE key = 'gate_session_boot_epoch'",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    // The Hub must fail to start.
+    let missing = spawn(HubConfig::for_test(data_dir.clone())).await;
+    let error = match missing {
+        Ok(hub) => panic!(
+            "a missing epoch with retained sessions must refuse boot: boot={}",
+            hub.boot_epoch_value()
+        ),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        error.contains("boot epoch"),
+        "the failure must surface the boot-epoch problem: {error}"
+    );
+
+    // Regressed row (smaller than the retained epoch): same refusal.
+    {
+        let conn = rw_conn(&data_dir);
+        conn.execute(
+            "INSERT INTO hub_kv(key, value) VALUES ('gate_session_boot_epoch', 2)
+             ON CONFLICT(key) DO UPDATE SET value = 2",
+            [],
+        )
+        .unwrap();
+    }
+    let regressed = spawn(HubConfig::for_test(data_dir.clone())).await;
+    let error = match regressed {
+        Ok(hub) => panic!(
+            "a regressed epoch must refuse boot: boot={}",
+            hub.boot_epoch_value()
+        ),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        error.contains("regressed") || error.contains("older than a retained"),
+        "the failure must name the regression: {error}"
+    );
+
+    // A healthy epoch row (>= the retained epoch) boots normally and allocates
+    // the next monotonic value.
+    {
+        let conn = rw_conn(&data_dir);
+        conn.execute(
+            "UPDATE hub_kv SET value = 5 WHERE key = 'gate_session_boot_epoch'",
+            [],
+        )
+        .unwrap();
+    }
+    let healthy = spawn(HubConfig::for_test(data_dir.clone()))
+        .await
+        .expect("an epoch at least as new as the retained data boots");
+    assert_eq!(
+        healthy.boot_epoch_value(),
+        6,
+        "the next monotonic epoch is 6"
+    );
+    healthy.shutdown().await;
+}

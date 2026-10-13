@@ -100,6 +100,12 @@ pub enum StoreError {
     /// the authenticating device row no longer exists. Maps to 409 `fenced`.
     #[error("fenced")]
     Fenced,
+    /// r15 item 6: the persisted gate carrier boot epoch is missing or older
+    /// than a session identity retained in the database (a cloned/partially
+    /// restored/rolled-back data dir). The Hub refuses to mint session ids
+    /// rather than risk repeating one.
+    #[error("gate session boot epoch regressed: {0}")]
+    GateEpochRegressed(String),
     /// An injected test fault (`test-faults` feature only).
     #[cfg(any(test, feature = "test-faults"))]
     #[error("injected store fault: {0}")]

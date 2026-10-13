@@ -488,6 +488,13 @@ impl RunningHub {
         self.store.as_ref()
     }
 
+    /// Test helper: the boot epoch this Hub process allocated.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn boot_epoch_value(&self) -> u64 {
+        self.state.nodes.boot_epoch()
+    }
+
     /// Test helper: insert an online host row directly (no WS enroll).
     #[doc(hidden)]
     pub async fn test_insert_host(&self, host_id: &str) -> anyhow::Result<()> {
@@ -1347,7 +1354,9 @@ async fn spawn_inner(
         config: Arc::new(config.clone()),
         store: store.clone(),
         secrets: Arc::new(secrets),
-        nodes: crate::transport::ConnectedNodes::boot(&store).await,
+        nodes: crate::transport::ConnectedNodes::boot(&store)
+            .await
+            .map_err(|err| anyhow::anyhow!("gate carrier boot epoch: {err}"))?,
         bus: Bus::with_capacity(config.follow_buffer_events),
         settlement_bus: {
             // Settlements are rare control notices; a small capacity is plenty

@@ -120,30 +120,70 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 impl Store {
-    /// r14 R3: atomically allocate this Hub process's boot epoch, monotonic
-    /// across restarts on the same data dir. The first boot reads/inserts 1;
-    /// every later boot takes `max(stored, 1) + 1`, so a downgraded/cloned
-    /// data dir can never roll the counter back and mint a session id a previous
-    /// Hub process already handed out.
+    /// r14 R3 / r15 item 6: allocate this Hub process's boot epoch (the high 32
+    /// bits of every gate carrier session identity) in ONE immediate
+    /// transaction that both validates against retained sessions and claims the
+    /// next value, so a crash or a partial restore can never roll the counter
+    /// back.
+    ///
+    /// Fail closed: before allocating, the persisted value is checked against
+    /// every RETAINED carrier session (the `dispatch_session` columns of gate
+    /// jobs that survive this restart):
+    /// * no kv row AND no retained epochs → first boot, allocate epoch 1;
+    /// * a kv row present and >= the maximum retained epoch → allocate kv + 1;
+    /// * a kv row missing WITH retained sessions, or a kv SMALLER than a
+    ///   retained epoch (a cloned/partially restored/rolled-back database) →
+    ///   [`StoreError::GateEpochRegressed`]: minting here could repeat a live
+    ///   session identity, so the Hub refuses to mint (and fails to start).
     pub(crate) async fn next_gate_session_boot_epoch(
         &self,
     ) -> Result<u64, crate::store::StoreError> {
         self.run_named("next_gate_session_boot_epoch", |conn| {
-            let current: Option<i64> = conn
+            let tx = crate::store::immediate_tx(conn)?;
+            // Highest epoch embedded in any retained carrier session.
+            let retained: Option<i64> = tx
+                .query_row("SELECT MAX(dispatch_session) FROM gate_jobs", [], |row| {
+                    row.get(0)
+                })
+                .optional()?
+                .flatten();
+            let retained_epoch = retained
+                .map(|session| i64::try_from(session).unwrap_or(0) >> 32)
+                .unwrap_or(0)
+                .max(0) as u64;
+            // Current persisted allocation epoch, if any.
+            let current: Option<i64> = tx
                 .query_row(
                     "SELECT value FROM hub_kv WHERE key = 'gate_session_boot_epoch'",
                     [],
                     |row| row.get(0),
                 )
                 .optional()?;
-            // Rust computes the successor from the stored (locked read in
-            // SQLite's single writer) value; the UPSERT just claims it.
-            let next = current.unwrap_or(0).max(0) as u64 + 1;
-            conn.execute(
+            let next = match current {
+                None if retained_epoch == 0 => 1,
+                None => {
+                    return Err(crate::store::StoreError::GateEpochRegressed(format!(
+                        "retained gate carrier sessions require boot epoch >= {retained_epoch} but \
+                         no gate_session_boot_epoch row exists; refusing to mint session ids"
+                    )));
+                }
+                Some(value) => {
+                    let stored = value.max(0) as u64;
+                    if stored < retained_epoch {
+                        return Err(crate::store::StoreError::GateEpochRegressed(format!(
+                            "gate_session_boot_epoch={stored} is older than a retained carrier \
+                             session epoch {retained_epoch}; refusing to mint session ids"
+                        )));
+                    }
+                    stored.max(retained_epoch).saturating_add(1)
+                }
+            };
+            tx.execute(
                 "INSERT INTO hub_kv(key, value) VALUES ('gate_session_boot_epoch', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![next as i64],
+                params![i64::try_from(next).unwrap_or(i64::MAX)],
             )?;
+            tx.commit()?;
             Ok(next)
         })
         .await

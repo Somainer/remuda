@@ -498,23 +498,23 @@ impl ConnectedNodes {
     /// Boot identity: allocate the next persisted boot epoch (monotonic across
     /// Hub restarts on the same data dir) and start this process's per-boot
     /// session counter at zero.
-    pub(crate) async fn boot(store: &crate::store::Store) -> Self {
-        let boot_epoch = store
-            .next_gate_session_boot_epoch()
-            .await
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "could not persist the gate session boot epoch; using 1");
-                1
-            });
+    ///
+    /// r15 item 6 — fail closed: a missing/regressed epoch or a DB allocation
+    /// failure returns an error so the Hub refuses to start instead of minting
+    /// possibly-repeated session ids with a silently reset epoch.
+    pub(crate) async fn boot(
+        store: &crate::store::Store,
+    ) -> Result<Self, crate::store::StoreError> {
+        let boot_epoch = store.next_gate_session_boot_epoch().await?;
         tracing::info!(boot_epoch, "gate carrier session boot epoch allocated");
-        Self {
+        Ok(Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             authority: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(any(test, feature = "test-faults"))]
             authority_contention: Arc::new(Mutex::new(HashMap::new())),
             boot_epoch,
             next_session: Arc::new(AtomicU32::new(0)),
-        }
+        })
     }
 
     /// This Hub process's boot epoch (high 32 bits of every session id).

@@ -477,6 +477,11 @@ pub struct ShellPtyDriver {
     /// hydrator finalise instead of aborting mid-pump.
     poller_shutdown: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     poller_finalised: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// Serializes overlapping `close()` calls (c-usagefu r18 item 1): the first
+    /// close owns the whole teardown; a concurrent close waits for it and then
+    /// finds no state. Held across the ladder (seconds), never across a
+    /// blocking std guard.
+    close_lock: Mutex<()>,
     /// Exit waiter (§5.5), stopped on close.
     waiter: Mutex<Option<JoinHandle<()>>>,
     /// Process table behind detection; a fixture in tests.
@@ -571,6 +576,7 @@ impl ShellPtyDriver {
             poller: Mutex::new(None),
             poller_shutdown: Mutex::new(None),
             poller_finalised: Mutex::new(None),
+            close_lock: Mutex::new(()),
             waiter: Mutex::new(None),
             table,
             fallbacks: crate::hook_answer::FallbackLedger::new(),
@@ -2397,6 +2403,64 @@ fn provider_source_lifecycle(
     )))
 }
 
+/// c-usagefu r18 item 1 deterministic test gate for overlapping closes. With
+/// the permit held, the winning close parks immediately AFTER claiming
+/// teardown ownership and the observation sender and BEFORE the
+/// poller/ladder teardown. Free permit (production and normal tests) is a
+/// pass-through.
+/// Set by a close AFTER it claimed teardown ownership + sender; it then waits
+/// on [`TEST_CLOSE_OWNERSHIP_PARK`] for the test to release it.
+#[cfg(test)]
+static TEST_CLOSE_OWNERSHIP_PARKED: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+    std::sync::LazyLock::new(|| std::sync::atomic::AtomicBool::new(false));
+/// Whether a test has armed the gate. Disarmed by default, so every close in
+/// normal tests and other test binaries passes the seam without touching it.
+#[cfg(test)]
+static TEST_CLOSE_OWNERSHIP_ARMED: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+    std::sync::LazyLock::new(|| std::sync::atomic::AtomicBool::new(false));
+/// Latch used while armed: false parks the winning close until the test opens
+/// it; a late second close after the release (value already true) passes.
+#[cfg(test)]
+static TEST_CLOSE_OWNERSHIP_PARK: std::sync::LazyLock<tokio::sync::watch::Sender<bool>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(true).0);
+
+#[cfg(test)]
+async fn park_after_close_ownership_claim() {
+    if !TEST_CLOSE_OWNERSHIP_ARMED.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let mut rx = TEST_CLOSE_OWNERSHIP_PARK.subscribe();
+    TEST_CLOSE_OWNERSHIP_PARKED.store(true, std::sync::atomic::Ordering::SeqCst);
+    if *rx.borrow() {
+        return;
+    }
+    let _ = rx.changed().await;
+}
+
+#[cfg(not(test))]
+async fn park_after_close_ownership_claim() {}
+
+/// Test seam: arm the gate (clear the arrival flag, close the latch).
+#[cfg(test)]
+pub(crate) fn test_reset_close_ownership_park() {
+    TEST_CLOSE_OWNERSHIP_PARKED.store(false, std::sync::atomic::Ordering::SeqCst);
+    TEST_CLOSE_OWNERSHIP_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+    TEST_CLOSE_OWNERSHIP_PARK.send_replace(false);
+}
+
+/// Test seam: the winning close has reached the gate (ownership + sender
+/// claimed) and is waiting for release.
+#[cfg(test)]
+pub(crate) fn test_close_ownership_park_winner_arrived() -> bool {
+    TEST_CLOSE_OWNERSHIP_PARKED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Test seam: open the latch so every parked (or later-arriving) close passes.
+#[cfg(test)]
+pub(crate) fn test_release_close_ownership_park() {
+    TEST_CLOSE_OWNERSHIP_PARK.send_replace(true);
+}
+
 /// c-usagefu r17 Ruling W0: the operator-facing Diagnostic/Warning emitted
 /// once when a close's stop ladder cannot confirm the process group is gone.
 /// Its census intervals then stay open for the rest of the Node lifetime, so
@@ -3126,6 +3190,14 @@ impl Driver for ShellPtyDriver {
     /// not, that is journaled as `stop-incomplete`; §5.3 step 4 forbids
     /// reporting `exited` over a process tree that is still there.
     async fn close(&self) -> DriverResult<DriverAck> {
+        // c-usagefu r18 item 1: serialize overlapping closes. The winner runs
+        // the whole teardown; a concurrent close waits here and then leaves
+        // immediately (its teardown ownership claim finds nothing). Without
+        // this, one close could take the observation sender and be descheduled
+        // while a second close won the teardown ownership below — the loser of
+        // the ownership race would then hold the only sender and the winner's
+        // stop-incomplete operator warning could never be emitted.
+        let _close_guard = self.close_lock.lock().await;
         // §9.1: stop the effort switch before the PTY it types into goes away.
         self.effort_queue.lock().await.close();
         if let Some(worker) = self.effort_worker.lock().await.take() {
@@ -3140,16 +3212,6 @@ impl Driver for ShellPtyDriver {
         if let Some(worker) = self.permission_worker.lock().await.take() {
             worker.abort();
         }
-        // c-usagefu r17 W0: the stop-incomplete operator warning is emitted
-        // only AFTER the ladder verdict is known, so keep a sender clone (and
-        // the stamp ctx) before the run channel is torn down.
-        let close_events = {
-            let mut slot = self.events_tx.lock().await;
-            let clone = slot.clone();
-            *slot = None;
-            clone
-        };
-        let close_ctx = self.promote_ctx.lock().await.clone();
         // c-ctxusage r4 item 2: cooperative poller shutdown. Signal closure
         // first, then give the poller one window to read the final append and
         // publish its last turn via `finish()` (an assistant record with usage
@@ -3229,9 +3291,27 @@ impl Driver for ShellPtyDriver {
         self.interrupt_pid.store(0, Ordering::SeqCst);
         // Drop any transcript claim so a respawn starts a fresh epoch.
         self.bindings.demobilize();
-        let Some(state) = self.inner.lock().await.take() else {
-            return Ok(DriverAck::not_dispatched());
+        // Claim teardown ownership AND the run's observation channel in ONE
+        // critical section (c-usagefu r18 item 1). The sender is needed only
+        // after the ladder (the stop-incomplete warning), but taking it here
+        // with the inner state guarantees the close that owns the teardown is
+        // also the only close that ever held the sender — a concurrent closer
+        // is already parked on `close_lock`, so the winner cannot end up
+        // senderless. A second close after completion finds no state and leaves.
+        let close_events;
+        let close_ctx;
+        let claimed = {
+            let Some(state) = self.inner.lock().await.take() else {
+                return Ok(DriverAck::not_dispatched());
+            };
+            close_events = self.events_tx.lock().await.take();
+            close_ctx = self.promote_ctx.lock().await.clone();
+            state
         };
+        let state = claimed;
+        // c-usagefu r18 item 1 test gate (no-op in production): park with
+        // teardown ownership and the sender already claimed.
+        park_after_close_ownership_claim().await;
         // Set before the ladder runs so the exit waiter reads this exit as the
         // ladder working rather than as an unexplained crash.
         state.closed.store(true, Ordering::SeqCst);
@@ -6336,6 +6416,135 @@ mod tests {
             crate::adapters::codex_discovery::forget_lifetime(&cwd, owner);
         }
         crate::adapters::codex_discovery::forget_lifetime(&cwd, next_owner);
+    }
+
+    /// Collect every observation of one body type from the receiver (drains
+    /// without blocking).
+    fn drain_observations<T>(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+        mut select: impl FnMut(&remuda_protocol::ObservationPayload) -> Option<T>,
+    ) -> Vec<T> {
+        let mut out = Vec::new();
+        while let Ok(observation) = events.try_recv() {
+            if let Some(value) = select(&observation.body) {
+                out.push(value);
+            }
+        }
+        out
+    }
+
+    fn stop_incomplete_warnings(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+    ) -> Vec<remuda_protocol::NativeLifecycle> {
+        drain_observations(events, |body| match body {
+            remuda_protocol::ObservationPayload::Lifecycle(payload) => match &**payload {
+                remuda_protocol::LifecyclePayload::Native(native)
+                    if native.topic == remuda_protocol::LifecycleTopic::Diagnostic
+                        && native.severity == remuda_protocol::Severity::Warning
+                        && native.native_name == "stop-incomplete" =>
+                {
+                    Some((**native).clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn overlapping_closes_winner_emits_the_single_stop_incomplete_warning() {
+        // c-usagefu r18 item 1: two overlapping close() calls on one driver.
+        // The close that wins teardown ownership must also be the one holding
+        // the observation sender; otherwise — as before — close A takes the
+        // sender and parks in the poller-finalise wait, close B wins the
+        // teardown, runs the incomplete stop and has NO sender: the operator
+        // warning is silently lost. The close lock serializes the two, so
+        // exactly one warning is ever emitted, by the winner.
+        use std::os::unix::process::CommandExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+
+        // External survivor named by the forced verdict.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let survivor_pid = i32::try_from(child.id()).unwrap();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        let args = Arc::new(std::sync::Mutex::new("claude".to_owned()));
+        let driver = Arc::new(r7_login_driver(&cwd, &dir.path().join("home"), args));
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        // Let the promotion poller reach its select before arming the gate.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        *driver.test_stop_outcome.lock().unwrap() = Some(lifecycle::StopOutcome {
+            rung: lifecycle::StopRung::Kill,
+            group_gone: false,
+            pgid: Some(survivor_pid),
+            survivors: vec![survivor_pid],
+        });
+        // The owner guard a codex launch registers (the table here is a
+        // promoted claude login; the guard is what makes the warning fire).
+        *driver.codex_lifetime.lock().await =
+            Some(crate::adapters::codex_discovery::begin_lifetime(
+                &cwd,
+                "r18-item1-owner",
+                Some(time::OffsetDateTime::now_utc()),
+            ));
+
+        // Arm the deterministic gate: the winning close parks immediately
+        // after claiming teardown ownership and the sender, so B's overlap is
+        // driven while the teardown is still in flight.
+        test_reset_close_ownership_park();
+
+        let driver_a = Arc::clone(&driver);
+        let driver_b = Arc::clone(&driver);
+        let closer_a = tokio::spawn(async move { Driver::close(&*driver_a).await });
+
+        // Wait until A has claimed ownership and the sender.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !test_close_ownership_park_winner_arrived() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "A parks at the ownership gate"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            driver.events_tx.lock().await.is_none(),
+            "A has taken the observation sender before B starts"
+        );
+
+        // B starts while A is parked. Under the fix it waits on close_lock;
+        // without the fix it overtakes through the poller teardown, wins the
+        // (later) ownership claim and has NO sender.
+        let closer_b = tokio::spawn(async move { Driver::close(&*driver_b).await });
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // Release A; both closes then settle (A completes the teardown; B
+        // finds no state).
+        test_release_close_ownership_park();
+        closer_a.await.unwrap().unwrap();
+        closer_b.await.unwrap().unwrap();
+
+        let warnings = stop_incomplete_warnings(&mut events);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one stop-incomplete warning is emitted, by the winning close"
+        );
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(survivor_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards();
     }
 
     ///

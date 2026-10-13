@@ -2238,10 +2238,14 @@ class HubStore {
    *  - a journal message settling the row as accepted/done
    *    (live onEvents and catch-up settleFromJournal).
    *
-   * Gate 27 item 1 rule — AT MOST ONCE per command: a second observation of
-   * the same command id in any order is a no-op, so failures/backoff earned
-   * on the instance AFTER the first acceptance are not wiped by a late
-   * duplicate.
+   * Gate 27 final rules:
+   *  - AT MOST ONCE per command: a second observation of the same command id
+   *    in any order is a no-op, so failures/backoff earned on the instance
+   *    AFTER the first acceptance are not wiped by a late duplicate;
+   *  - ISSUING OUTBOX ONLY: the command must have been issued (enqueued or
+   *    claimed for delivery) by the still-current outbox; a stale journal
+   *    catch-up from a logout/reinit previous epoch never touches the
+   *    replacement's books, even though its done patch still retires the row.
    *
    * Rejected, failed, held or never-resolving observations never call this.
    */
@@ -2252,6 +2256,7 @@ class HubStore {
   ): void {
     const box = origin ?? this.outbox;
     if (this.pageIsUnloading || !box || this.outbox !== box) return;
+    if (!box.hasIssued(commandId)) return;
     if (!box.noteAcceptedOnce(commandId)) return;
     box.noteDeliveryProgress(instanceId);
     void box.deliveryEpilogue().catch(() => undefined);
@@ -2387,6 +2392,11 @@ class HubStore {
     // and continue the flush with B (gate 10 item 7).
     if (claimed.state === "done") return false;
     if (claimed.lease?.owner !== box.ownerId) return "claim-aborted";
+    // THIS outbox is issuing the command's delivery (a durable row restored
+    // from a previous epoch becomes issued by the epoch that really claims and
+    // POSTs it): its later acceptance observations may record progress
+    // (c-reconnfu gate 27 item 2).
+    box.markIssued(commandId);
     this.syncBubbleFromOutbox(commandId);
     // Gate 15 item 2: this document owns the live claim for the duration of the
     // POST — suppress expiry recovery for our own inflight row on refresh.

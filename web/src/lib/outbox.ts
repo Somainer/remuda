@@ -710,6 +710,16 @@ export class Outbox {
    */
   private deliveryExhausted = new Set<Id>();
   /**
+   * Commands THIS outbox instance (one auth epoch / page lifetime) ISSUED —
+   * enqueued itself or claimed for a real delivery attempt. An acceptance
+   * observation (POST, command-status GET, journal settle) is allowed to
+   * record delivery progress ONLY for one of these: a stale journal catch-up
+   * batch arriving after logout/reinit carries commands issued by the
+   * PREVIOUS outbox and must never touch the replacement's books
+   * (c-reconnfu gate 27 item 2). Bounded like {@link acceptedCommands}.
+   */
+  private issuedCommands = new Set<Id>();
+  /**
    * Commands whose Hub ACCEPTANCE has already recorded progress on THIS outbox
    * (c-reconnfu gate 27 item 1): progress per command is recorded AT MOST
    * ONCE. A second observation of the same command id in any order (the POST
@@ -1023,6 +1033,9 @@ export class Outbox {
   ): Promise<OutboxRecord> {
     const full: OutboxRecord = { attempts: 0, state: "pending", ...rec };
     await this.storage.put(full);
+    // THIS outbox issued the command: only its acceptance observations may
+    // later record progress (c-reconnfu gate 27 item 2).
+    this.markIssued(full.commandId);
     this.cache.set(full.commandId, full);
     this.emit();
     this.reconcileAfterCommittedWrite();
@@ -1180,9 +1193,10 @@ export class Outbox {
     this.readRecoveryExhausted = false;
     this.deliveryFailures.clear();
     this.deliveryExhausted.clear();
-    // The per-command acceptance book belongs to the same envelope: a genuine
-    // teardown (or a pagehide that is later undone) resets it with the failure
-    // state it gates (c-reconnfu gate 27 item 1).
+    // The per-command acceptance/issuance books belong to the same envelope: a
+    // genuine teardown (or a pagehide that is later undone) resets them with
+    // the failure state they gate (c-reconnfu gate 27).
+    this.issuedCommands.clear();
     this.acceptedCommands.clear();
     this.deliveryPasses.clear();
     this.deliverySuppressed.clear();
@@ -1207,6 +1221,24 @@ export class Outbox {
   /** Test visibility: kind of an armed wake. */
   leaseWakeKind(commandId: Id): "lease" | "deliver" | undefined {
     return this.leaseWakeups.get(commandId)?.kind;
+  }
+
+  /**
+   * Record that THIS outbox issued a command (its own enqueue, or a durable
+   * row it claimed and is about to deliver). Bounded.
+   */
+  markIssued(commandId: Id) {
+    this.capTracking(this.issuedCommands);
+    this.issuedCommands.add(commandId);
+  }
+
+  /**
+   * Whether the command was issued by THIS outbox (gate 27 item 2): an
+   * acceptance observation for a command issued before a logout/reinit never
+   * records progress on the replacement outbox.
+   */
+  hasIssued(commandId: Id): boolean {
+    return this.issuedCommands.has(commandId);
   }
 
   /**

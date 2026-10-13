@@ -529,9 +529,14 @@ mod r15_tests {
     use crate::adapters::codex_discovery::{
         begin_lifetime, census_lifetime_is_live, forget_lifetime,
     };
+    use crate::shell_pty::lifecycle::ProcessIdentity;
     #[cfg(target_os = "linux")]
     use crate::shell_pty::lifecycle::process_start_ticks;
-    use crate::shell_pty::lifecycle::{ProcessIdentity, process_identity_alive};
+    // Every use of process_identity_alive in this module is a Linux-only test
+    // (start-time identity is Linux-only); an ungated import is unused on
+    // macOS and fails -D warnings (c-usagefu r16 item 1).
+    #[cfg(target_os = "linux")]
+    use crate::shell_pty::lifecycle::process_identity_alive;
     use std::path::Path;
     use time::OffsetDateTime;
 

@@ -1173,14 +1173,9 @@ pub(crate) fn process_running(pid: i32) -> bool {
 }
 
 /// Non-Linux unix: no `/proc` start time; the signal-0/`ps` disposition is the
-/// evidence, with Unknown kept alive (Ruling F).
-#[cfg(all(unix, not(target_os = "linux")))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ProcessIdentity {
-    pub(crate) pid: i32,
-    pub(crate) start_ticks: Option<u64>,
-}
-
+/// evidence, with Unknown kept alive (Ruling F). The struct itself is the
+/// single `#[cfg(unix)]` definition above (c-usagefu r16 item 1: the two
+/// overlapping unix definitions made macOS fail to compile).
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn process_identity_alive(identity: ProcessIdentity) -> bool {
     let _ = identity.start_ticks;

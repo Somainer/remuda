@@ -912,12 +912,36 @@ impl GateRegistry {
                 let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGKILL));
                 wait_until_group_gone(pgid, Duration::from_millis(500));
             }
-            if !land_group_exists(pgid) {
-                certify_dead_and_remove_fence(&dir, &job_id, pgid);
+            if land_group_exists(pgid) {
+                // ESRCH still not proven (e.g. EPERM, or a zombie under a
+                // subreaper): the record stays and the startup fence proves it
+                // later. Unknown never releases the proof.
+                return;
             }
-            // ESRCH still not proven (e.g. EPERM, or a zombie under a
-            // subreaper): the record stays and the startup fence proves it
-            // later. Unknown never releases the proof.
+            // Certify only the EXACT on-disk snapshot for this pgid. A missing
+            // or changed fence (a newer attempt re-fenced the job) is never
+            // certified from this run's stale pgid observation (r17 item 1).
+            let fence_path = land_fence_path(&dir, &job_id);
+            let text = match std::fs::read_to_string(&fence_path) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) => {
+                    tracing::warn!(%error, job_id, "settling the land group could not read its fence");
+                    return;
+                }
+            };
+            let Ok(record) = serde_json::from_str::<Value>(&text) else {
+                tracing::warn!(job_id, "settling the land group found an unreadable fence; keeping it");
+                return;
+            };
+            match certify_dead_and_remove_fence(&dir, &record, pgid) {
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    job_id,
+                    "certifying the settled land group failed; keeping the fence"
+                ),
+            }
         })
         .await;
     }
@@ -3506,37 +3530,106 @@ fn write_land_fence(
     Ok(())
 }
 
+/// Prefix of a durable live land-group fence ledger (`land-<slug>.json`).
+/// Death certificates use a different `dead-` prefix so the startup fence
+/// never treats a certificate as an actionable fence (r17 item 1).
 #[cfg(unix)]
-fn remove_land_fence(dir: &std::path::Path, job_id: &str) {
-    let _ = std::fs::remove_file(land_fence_path(dir, job_id));
+const LAND_FENCE_FILE_PREFIX: &str = "land-";
+
+/// True only for a live-fence ledger file name (`land-<slug>.json`), never a
+/// `dead-<slug>.json` certificate or a temp file.
+#[cfg(unix)]
+fn is_land_fence_file_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.starts_with(LAND_FENCE_FILE_PREFIX) && name.ends_with(".json")
+}
+
+/// Whether two fence/cert records describe the EXACT same granted attempt:
+/// job, generation, process group, and durable leader identity. Used to refuse
+/// certifying a LIVE REPLACEMENT group from a stale observation (r17 item 1).
+#[cfg(unix)]
+fn land_fence_snapshot_matches(a: &Value, b: &Value) -> bool {
+    if a.get("jobId").and_then(Value::as_str) != b.get("jobId").and_then(Value::as_str)
+        || a.get("generation").and_then(Value::as_u64)
+            != b.get("generation").and_then(Value::as_u64)
+        || a.get("pgid").and_then(Value::as_i64) != b.get("pgid").and_then(Value::as_i64)
+    {
+        return false;
+    }
+    match (
+        LeaderIdentity::from_record(a),
+        LeaderIdentity::from_record(b),
+    ) {
+        (Some(identity_a), Some(identity_b)) => identity_a == identity_b,
+        _ => false,
+    }
 }
 
 /// Authoritative group death has been observed (killpg ESRCH on the recorded
-/// pgid): persist the death certificate FROM the fence record's provenance, and
-/// only then remove the fence. Any missing/unreadable/malformed record or cert
-/// write failure KEEPS the fence (Unknown never silently loses its proof).
+/// pgid): persist the death certificate FROM THE OBSERVED FENCE SNAPSHOT, and
+/// only then remove the fence (r16 item 2; r17 item 1 hardening).
+///
+/// Returns `Ok(true)` when the cert was written and the fence removed, and
+/// `Ok(false)` when the observation must NOT certify (the fence is gone or no
+/// longer matches the observed snapshot — a LIVE REPLACEMENT group re-fenced
+/// the same job slug). Any other I/O failure propagates as `Err` so the caller
+/// keeps the fence (Unknown never silently loses its proof). The fence is
+/// re-read and compared to the observed snapshot immediately before writing; a
+/// stale observation (e.g. a leftover death certificate for a recycled pgid)
+/// can never certify a different, live group.
 #[cfg(unix)]
-fn certify_dead_and_remove_fence(dir: &std::path::Path, job_id: &str, pgid: i32) {
-    let Ok(text) = std::fs::read_to_string(land_fence_path(dir, job_id)) else {
-        // No record to certify from (or unreadable): keep whatever is on disk;
-        // a missing fence with no certificate is Unknown to later probes.
-        return;
+fn certify_dead_and_remove_fence(
+    dir: &std::path::Path,
+    observed: &Value,
+    observed_pgid: i32,
+) -> std::io::Result<bool> {
+    let Some(job_id) = observed.get("jobId").and_then(Value::as_str) else {
+        return Ok(false);
     };
-    let Ok(record) = serde_json::from_str::<Value>(&text) else {
+    // The observation must be a complete live-fence snapshot, never a
+    // certificate or a record missing provenance.
+    if observed.get("pgid").and_then(Value::as_i64) != Some(i64::from(observed_pgid))
+        || observed.get("generation").and_then(Value::as_u64).is_none()
+        || LeaderIdentity::from_record(observed).is_none()
+        || observed.get("diedAt").is_some()
+        || observed.get("cause").is_some()
+    {
+        return Ok(false);
+    }
+    let fence_path = land_fence_path(dir, job_id);
+    let current_text = match std::fs::read_to_string(&fence_path) {
+        Ok(text) => text,
+        // The fence is already gone: never manufacture a certificate from a
+        // stale in-memory observation (another path owns the current state).
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let current: Value = serde_json::from_str(&current_text)
+        .map_err(|_| std::io::Error::other("land fence record is unreadable at certification"))?;
+    if !land_fence_snapshot_matches(&current, observed) {
         tracing::warn!(
             job_id,
-            "land group verified dead but its fence record is unreadable; keeping it (Unknown)"
+            observed_pgid,
+            "land fence changed since the death observation; refusing to certify a possible live \
+             replacement group"
         );
-        return;
-    };
-    if write_land_group_dead_cert(dir, &record, pgid).is_ok() {
-        remove_land_fence(dir, job_id);
-    } else {
-        tracing::warn!(
-            job_id,
-            "land group verified dead but the death certificate could not be written; keeping the \
-             fence record"
-        );
+        return Ok(false);
+    }
+    write_land_group_dead_cert(dir, observed, observed_pgid)?;
+    match std::fs::remove_file(&fence_path) {
+        Ok(()) => Ok(true),
+        // A concurrent same-process removal after our re-read: the cert
+        // attests the exact snapshot that is now gone, which is consistent.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => {
+            // The fence still exists and the unlink failed: roll the
+            // certificate back so the fence remains the single, conservative
+            // proof (fence presence reads as MayPush), then surface the error.
+            let _ = std::fs::remove_file(land_dead_cert_path(dir, job_id));
+            Err(error)
+        }
     }
 }
 
@@ -3602,7 +3695,12 @@ fn fence_orphaned_land_groups(dir: &std::path::Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+        // r17 item 1: scan ONLY live-fence ledgers (`land-*.json`). A leftover
+        // `dead-*.json` certificate must never be read as an actionable fence:
+        // its pgid may have been reused by a LIVE replacement group, and acting
+        // on it could certify that replacement dead. Certs are consumed only
+        // via read_land_group_dead_cert by the read-only probe.
+        if !is_land_fence_file_name(&entry.file_name()) {
             continue;
         }
         // Read/parse/field failures all mean the record cannot be acted on:
@@ -3614,6 +3712,11 @@ fn fence_orphaned_land_groups(dir: &std::path::Path) {
         let Ok(record) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
+        // Defense in depth: never act on a certificate even if one was
+        // mis-named with the fence prefix.
+        if record.get("diedAt").is_some() || record.get("cause").is_some() {
+            continue;
+        }
         let Some(pgid) = record["pgid"]
             .as_i64()
             .and_then(|value| i32::try_from(value).ok())
@@ -3623,16 +3726,24 @@ fn fence_orphaned_land_groups(dir: &std::path::Path) {
         let Some(recorded_identity) = LeaderIdentity::from_record(&record) else {
             continue;
         };
+        let Some(_job) = record.get("jobId").and_then(Value::as_str) else {
+            continue;
+        };
         match kill(Pid::from_raw(pgid), None) {
             Ok(()) => {
                 // A live process holds the leader pid. Signal ONLY on a
                 // positive identity match.
                 match sample_leader_identity(pgid) {
                     Some(current) if current == recorded_identity => {
-                        if terminate_and_verify_group(pgid, LAND_GROUP_TERM_GRACE)
-                            && let Some(job) = record.get("jobId").and_then(Value::as_str)
-                        {
-                            certify_dead_and_remove_fence(dir, job, pgid);
+                        if terminate_and_verify_group(pgid, LAND_GROUP_TERM_GRACE) {
+                            match certify_dead_and_remove_fence(dir, &record, pgid) {
+                                Ok(true) | Ok(false) => {}
+                                Err(error) => tracing::warn!(
+                                    %error,
+                                    pgid,
+                                    "certifying the terminated land group failed; keeping the fence"
+                                ),
+                            }
                         }
                         // Still not provably gone: keep for the next boot.
                     }
@@ -3657,10 +3768,15 @@ fn fence_orphaned_land_groups(dir: &std::path::Path) {
                 // group can no longer be positively distinguished from a
                 // same-session process that joined it: only an authoritative
                 // group ESRCH settles it; anything else keeps the record.
-                if !land_group_exists(pgid)
-                    && let Some(job) = record.get("jobId").and_then(Value::as_str)
-                {
-                    certify_dead_and_remove_fence(dir, job, pgid);
+                if !land_group_exists(pgid) {
+                    match certify_dead_and_remove_fence(dir, &record, pgid) {
+                        Ok(true) | Ok(false) => {}
+                        Err(error) => tracing::warn!(
+                            %error,
+                            pgid,
+                            "certifying the dead land group failed; keeping the fence"
+                        ),
+                    }
                 }
             }
             Err(error) => {
@@ -5791,6 +5907,99 @@ Running 8 tests across 2 projects
             pgid,
             Duration::from_millis(200)
         ));
+    }
+
+    /// r17 item 1: a leftover death certificate for a DEAD attempt-1 group must
+    /// never be treated as an actionable fence. Here a LIVE replacement group
+    /// now holds the same job slug (a different pgid, and a fence identity that
+    /// does not match the live process so it is correctly NOT signalled). The
+    /// old scan read every `*.json` (including the cert): the dead cert's ESRCH
+    /// made it certify-from and DELETE the live replacement fence.
+    #[test]
+    fn a_stale_certificate_for_a_dead_group_never_certifies_a_live_replacement() {
+        let _seq = proc_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let job = "gjb_replacement";
+
+        // A guaranteed-gone pgid for the stale attempt-1 certificate.
+        let dead = spawn_grouped("sh", &["-c", "exit 0"]);
+        let dead_pgid = dead.id() as i32;
+        reap(dead);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while super::land_group_exists(dead_pgid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!super::land_group_exists(dead_pgid));
+
+        // A LIVE replacement group holding the same job slug.
+        let mut live = spawn_grouped("sleep", &["300"]);
+        let live_pgid = live.id() as i32;
+        // Its fence records a FOREIGN identity (a fence the live process does
+        // not own), so a correct startup fence refuses to signal it.
+        super::write_land_fence(dir, job, 2, live_pgid, &super::LeaderIdentity::StartTick(1))
+            .unwrap();
+        // The leftover attempt-1 certificate for the DEAD pgid.
+        let stale = {
+            let mut v = serde_json::json!({
+                "jobId": job,
+                "generation": 1,
+                "pgid": dead_pgid,
+            });
+            super::LeaderIdentity::StartTick(2).write(&mut v);
+            v
+        };
+        super::write_land_group_dead_cert(dir, &stale, dead_pgid).unwrap();
+
+        super::fence_orphaned_land_groups(dir);
+
+        // The live replacement group survived and its fence was retained.
+        assert!(
+            super::land_group_exists(live_pgid),
+            "the live replacement group must not be signalled"
+        );
+        assert!(
+            super::land_fence_path(dir, job).exists(),
+            "the live replacement fence must not be unlinked"
+        );
+        // No certificate was derived for the replacement snapshot.
+        let cert = super::read_land_group_dead_cert(dir, job).expect("cert still present");
+        assert_eq!(cert["pgid"], json!(dead_pgid), "{cert}");
+        assert_eq!(cert["generation"], json!(1), "{cert}");
+
+        let _ = live.kill();
+        reap(live);
+    }
+
+    /// r17 item 1: `certify_dead_and_remove_fence` refuses when the fence on
+    /// disk is no longer the observed snapshot — it never certifies a different
+    /// (replacement) attempt from a stale observation.
+    #[test]
+    fn certify_refuses_when_the_on_disk_fence_is_a_different_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let job = "gjb_snapshot";
+        // On disk: attempt 2 at pgid 4242.
+        super::write_land_fence(dir, job, 2, 4242, &super::LeaderIdentity::StartTick(22)).unwrap();
+        // Observed (stale): attempt 1 at a different pgid/identity.
+        let observed = {
+            let mut v = serde_json::json!({"jobId": job, "generation": 1, "pgid": 4141});
+            super::LeaderIdentity::StartTick(11).write(&mut v);
+            v
+        };
+        let certified = super::certify_dead_and_remove_fence(dir, &observed, 4141).unwrap();
+        assert!(
+            !certified,
+            "a mismatched on-disk snapshot must not be certified"
+        );
+        assert!(
+            super::land_fence_path(dir, job).exists(),
+            "the current fence stays"
+        );
+        assert!(
+            super::read_land_group_dead_cert(dir, job).is_none(),
+            "no certificate may be written for the wrong snapshot"
+        );
     }
 
     #[test]

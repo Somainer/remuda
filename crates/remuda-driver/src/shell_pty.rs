@@ -1723,19 +1723,18 @@ impl ShellPtyDriver {
                 // Live descendants OUTSIDE the signalled group escaped it
                 // (e.g. a setsid daemonising child): the tree is not fully
                 // gone, so name them as stop-incomplete survivors the
-                // termination watcher/registry probes by pid.
-                let escaped: Vec<i32> = tree_snapshot
-                    .iter()
-                    .filter(|proc_info| {
-                        proc_info.pid != pgid
-                            && proc_info.pgrp != pgid
-                            && lifecycle::process_running(proc_info.pid)
-                    })
-                    .map(|proc_info| proc_info.pid)
-                    .collect();
+                // termination watcher/registry probes by (pid, start time).
+                //
+                // c-usagefu r15 item 6: rescan the snapshot members' CURRENT
+                // groups, not just their snapshot pgrp. A descendant that
+                // calls setsid(2) DURING the grace (a SIGHUP handler
+                // daemonising the signal-holding process) had its snapshot
+                // group INSIDE the signalled group; only the rescan sees it
+                // escape and keeps the interval open while it can still write.
+                let escaped = lifecycle::rescan_escaped_snapshot_members(&tree_snapshot, pgid);
                 if !escaped.is_empty() {
                     outcome.group_gone = false;
-                    outcome.survivors = escaped;
+                    outcome.survivors = escaped.into_iter().map(|identity| identity.pid).collect();
                 }
             }
             outcome
@@ -5791,8 +5790,186 @@ mod tests {
         crate::adapters::codex_discovery::forget_lifetime(&cwd, owner);
     }
 
-    /// A driver whose PTY runs an inert process, carrying `kind` as its
-    /// session.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_descendant_that_calls_setsid_during_the_sighup_grace_is_named_stop_incomplete() {
+        // c-usagefu r15 item 6: a descendant that calls setsid(2) on ITSELF
+        // DURING the stop grace (here a SIGHUP handler daemonising the
+        // signal-holding python process) had the SAME pgrp in the pre-signal
+        // snapshot, so the r14 post-ladder filter (snapshot pgrp != signalled
+        // pgrp) missed it and closed the census interval while the survivor
+        // kept running. The post-ladder rescan reads each snapshot member's
+        // CURRENT group and names the escaped survivor.
+        use crate::adapters::FileSignalAdapter as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _term_lock = crate::termination::termination_test_lock();
+        lifecycle::set_test_watch_bound(Some(std::time::Duration::from_millis(400)));
+        crate::termination::set_test_maintenance_interval(None);
+        crate::termination::shutdown_pending_terminations().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        // The agent child: ignores SIGINT (so it survives rung 1), and on
+        // SIGHUP calls setsid(2) ON ITSELF and then keeps running. The
+        // subsequent SIGKILL goes to the OLD group, which the process left.
+        let script = dir.path().join("fake-codex-r15item6.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+case "$1" in --version|version) echo 'codex 0.154.0'; exit 0;; esac
+python3 -c '
+import os,signal,time
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+def hup(*a):
+    os.setsid()
+    while True: time.sleep(100)
+signal.signal(signal.SIGHUP, hup)
+time.sleep(120)'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let instance_id = InstanceId::new();
+        let instance_dir = dir.path().join(instance_id.as_id().as_str());
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.kind = AgentKind::Codex;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+        spec.model_id = Some("gpt-5.4".into());
+
+        let mut options = ShellPtyOptions::agent(
+            dir.path().to_path_buf(),
+            AgentKind::Codex,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::OpenaiResponses,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["gpt-5.4".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: instance_dir.join("launch"),
+                native_home: dir.path().join("codex-native-home"),
+                binary: Some(script.clone()),
+                origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: true,
+                settings_overlay: None,
+            },
+        );
+        options.instance_id = Some(instance_id.clone());
+        options.hooks = Some(HookConfig {
+            instance_dir: instance_dir.clone(),
+            relay_binary: PathBuf::from("/bin/true"),
+            tui: crate::launch::TuiMode::Default,
+        });
+
+        let driver = ShellPtyDriver::new(options);
+        let mut run = driver.start(spec.clone()).await.expect("real codex spawn");
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), run.recv()).await;
+        let cwd: PathBuf = spec.cwd.clone().into();
+        let owner = instance_id.as_id().as_str();
+        let root_pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+
+        // Pre-signal: identify the descendant python member. At this point it
+        // is still IN the signalled group — the exact shape the r14 filter
+        // could not see after its mid-grace setsid.
+        let member_pid = {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let tree = lifecycle::snapshot_process_tree(root_pgid);
+                if let Some(proc_info) = tree.iter().find(|proc_info| {
+                    proc_info.pid != root_pgid
+                        && proc_info.pgrp == root_pgid
+                        && lifecycle::process_running(proc_info.pid)
+                }) {
+                    break proc_info.pid;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the in-group python descendant appears before the stop"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        };
+
+        // The REAL stop ladder: SIGINT ignored, SIGHUP makes the python setsid
+        // itself, SIGKILL clears only the old group.
+        Driver::close(&driver).await.unwrap();
+
+        // The survivor is STILL the same pid, now in its own group.
+        assert!(
+            lifecycle::process_running(member_pid),
+            "the setsid-on-SIGHUP descendant survives the ladder"
+        );
+        let current_group = {
+            let stat = std::fs::read_to_string(format!("/proc/{member_pid}/stat")).unwrap();
+            let after = stat
+                .rsplit_once(')')
+                .map(|(_, rest)| rest.trim_start())
+                .unwrap();
+            lifecycle::parse_proc_parent_group(after).unwrap().1
+        };
+        assert_ne!(
+            current_group, root_pgid,
+            "the survivor changed groups during the grace"
+        );
+
+        // The production-registered interval stayed live and transferred to
+        // the bounded watcher's registry.
+        for _ in 0..10 {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+                "the mid-grace escape keeps the production interval live"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        let transfer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !crate::termination::test_has_pending_for(&cwd) {
+            assert!(tokio::time::Instant::now() < transfer_deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Confirmed exit closes the interval only via a registry recheck.
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(member_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+            "the exit alone never closes; only a recheck does"
+        );
+        let recheck_home = tempfile::tempdir().unwrap();
+        let mut rechecker = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+            home: recheck_home.path().to_path_buf(),
+            cwd: cwd.clone(),
+            pid: None,
+            launched_at: Some(time::OffsetDateTime::now_utc()),
+            resume_session_id: None,
+        })
+        .with_instance_key(Some("r15-item6-rechecker".to_owned()));
+        assert!(rechecker.poll().unwrap().is_empty());
+        assert!(
+            !crate::termination::test_has_pending_for(&cwd),
+            "the discovery recheck resolves the entry"
+        );
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+            "confirmed exit of the mid-grace survivor closes the interval"
+        );
+        drop(rechecker);
+
+        lifecycle::set_test_watch_bound(None);
+        crate::termination::set_test_maintenance_interval(None);
+        crate::termination::shutdown_pending_terminations().await;
+        crate::adapters::codex_discovery::forget_lifetime(&cwd, owner);
+    }
+
     ///
     /// Promoted rather than launched: §1.0 makes the two the same session to
     /// everything below the spawn, and the promoted shape needs no materializer

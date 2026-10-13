@@ -1312,6 +1312,64 @@ pub(crate) fn parse_proc_parent_group(after_comm: &str) -> Option<(i32, i32)> {
     Some((ppid, pgrp))
 }
 
+/// After the stop ladder, rescan the pre-signal snapshot members and return
+/// the identities of those STILL LIVE whose CURRENT process group is no longer
+/// the signalled group (c-usagefu r15 item 6).
+///
+/// The pre-signal snapshot alone misses a descendant that calls `setsid(2)`
+/// DURING the grace (e.g. a SIGHUP handler that daemonises the signal-holding
+/// process): its snapshot pgrp still MATCHES the signalled group. Reading each
+/// snapshot member's CURRENT stat catches both forms — a pre-signal escape and
+/// a mid-ladder group change. An unreadable/absent stat is simply skipped
+/// here; the conservative stop-incomplete decision is made from the members
+/// that were observed.
+#[cfg(target_os = "linux")]
+pub(crate) fn rescan_escaped_snapshot_members(
+    tree: &[TreeProc],
+    signalled_pgid: i32,
+) -> Vec<ProcessIdentity> {
+    use std::collections::HashMap;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    // One /proc pass: pid -> (state, pgrp) for every process.
+    let mut groups: HashMap<i32, (String, i32)> = HashMap::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start()) else {
+            continue;
+        };
+        let mut fields = after_comm.split_whitespace();
+        let Some(state) = fields.next() else {
+            continue;
+        };
+        let _ppid = fields.next();
+        let Some(pgrp) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
+            continue;
+        };
+        groups.insert(pid, (state.to_owned(), pgrp));
+    }
+    tree.iter()
+        .filter(|member| member.pid != signalled_pgid)
+        .filter_map(|member| {
+            let (state, current_pgrp) = groups.get(&member.pid)?;
+            if state_is_dead(state) || *current_pgrp == signalled_pgid {
+                return None;
+            }
+            Some(survivor_identity(member.pid))
+        })
+        .collect()
+}
+
 /// Pids in `pgid` that are still running (not zombies), for a
 /// `stop-incomplete` diagnostic.
 ///

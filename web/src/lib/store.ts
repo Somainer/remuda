@@ -1955,9 +1955,10 @@ class HubStore {
             if (id) {
               attempted.add(id);
               deliveredNew = true;
-              // A real POST of one of this instance's rows clears its bounded
-              // delivery-failure backoff (gate 20 item 4).
-              box.noteDeliveryProgress(instanceId);
+              // Progress (clearing the per-instance backoff/exhaustion) is
+              // recorded at the shared POST boundary inside
+              // deliverOutboxRecord's finally — the same boundary the direct
+              // steer routes cross (c-reconnfu gate 23 item 3).
             }
           } catch {
             // The instance lock request itself rejected (deadlock/
@@ -2403,6 +2404,16 @@ class HubStore {
       }
     } finally {
       box.endActiveDelivery(commandId);
+      // c-reconnfu gate 23 item 3 (exhaustion ruling): the shared POST
+      // boundary. A delivery that won its claim and ran its POST — whether
+      // entered by the guarded flush, a timer handoff, OR a direct live steer
+      // route — proves the instance's lock/storage path works and records
+      // progress, clearing the per-instance delivery-failure backoff and the
+      // surfaced exhaustion latch. This used to be recorded only in the flush
+      // loop, so a successful direct steer after exhaustion did not clear it
+      // and the steer epilogue left the instance's other pending rows
+      // uncoved.
+      box.noteDeliveryProgress(current0.instanceId);
     }
     this.syncBubbleFromOutbox(commandId);
     if (!box.pendingFor(current0.instanceId).length) this.clearOutboxRetry(current0.instanceId);

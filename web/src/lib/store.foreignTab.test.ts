@@ -3651,3 +3651,124 @@ it("GATE22 item 6: a flush queued across logout/reinit releases its tokens and e
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE23 item 3: a successful DIRECT STEER records progress at the shared POST boundary, clears the instance's exhaustion and lets the real timer deliver the earlier pending row", async () => {
+  // Exhaustion is per instance and total, and ANY successful delivery for the
+  // instance — flush, timer OR direct steer — records progress at the shared
+  // POST boundary and clears it. P is enqueued while offline and the Web Lock
+  // is down: the real timer wakes spend the bounded budget (persistent lock
+  // rejections, reads succeed) and the instance surfaces exhausted with no
+  // armed wake. The locks then recover and a live steer S is POSTed through
+  // the DIRECT route (no flush pass): pre-fix only the guarded flush recorded
+  // progress, so the latch stayed, the steer epilogue armed nothing for P and
+  // it stranded; post-fix the shared boundary clears the latch, the steer
+  // epilogue re-arms P's one deliver wake and A's REAL timer delivers P — no
+  // manual flush anywhere.
+  vi.useFakeTimers();
+  vi.setSystemTime(950_000);
+  const I = "ins_g23_i3";
+  const originalNavigator = globalThis.navigator;
+  const good = fifoWebLocks().locks;
+  const bad = {
+    query: async () => ({ held: [] as Array<{ name: string }> }),
+    request: () => Promise.reject(new Error("g23 i3 locks down")),
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let locks: { query: () => Promise<unknown>; request: (...args: any[]) => Promise<unknown> } = bad;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: {
+      get locks() {
+        return locks;
+      },
+    },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g23_i3");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_iid: string, _p: string, _x?: unknown, _m?: unknown, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: {
+          commandId,
+          id: commandId,
+          state: "accepted",
+          revision: "1",
+          dispatch: "native-acknowledged",
+          resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    const boxOf = () =>
+      (
+        hubStore as unknown as {
+          outbox: {
+            isDeliveryExhausted: (i: string) => boolean;
+            pendingLeaseWakeups: () => string[];
+          } | null;
+        }
+      ).outbox;
+    const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+
+    // 1) Offline + locks down: enqueue P through the real send. No flush runs
+    //    while offline; the enqueue epilogue arms the one deliver wake.
+    hubStore.setConnectionStateForTest("offline");
+    locks = bad;
+    expect(await hubStore.send(I, "gate23 3 P")).toBe(true);
+    await pump(200);
+    const pId = storedRows().find((r) => r.prompt === "gate23 3 P")!.commandId;
+    expect(send).not.toHaveBeenCalled();
+
+    // 2) The real timer wakes spend the bounded budget: lock requests reject
+    //    while reads succeed — exhaustion surfaced, every wake cancelled.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(true);
+    expect(boxOf()!.pendingLeaseWakeups()).toEqual([]);
+    expect(send).not.toHaveBeenCalled();
+    expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("pending");
+
+    // 3) Locks recover and the link is live: POST the steer S through the
+    //    DIRECT route (no guarded flush pass).
+    locks = good;
+    hubStore.setConnectionStateForTest("live");
+    const accepted = await hubStore.send(I, "gate23 3 S", [], [], "steer");
+    expect(accepted).toBe(true);
+    await pump(500);
+    expect(send).toHaveBeenCalledTimes(1);
+    const sId = send.mock.calls[0]?.[4] as string;
+    expect(storedRows().find((r) => r.commandId === sId)?.state).toBe("sent");
+
+    // 4) The successful steer cleared the instance's exhaustion at the shared
+    //    POST boundary; the steer epilogue re-armed P and the REAL timer now
+    //    delivers it automatically — no manual flush.
+    for (let i = 0; i < 400 && send.mock.calls.length < 2; i += 1) {
+      await vi.advanceTimersByTimeAsync(10);
+      await Promise.resolve();
+    }
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls.map((c) => c[4])).toEqual([sId, pId]);
+    expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("sent");
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(false);
+    expect(boxOf()!.pendingLeaseWakeups()).toEqual([]);
+
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

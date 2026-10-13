@@ -21,7 +21,7 @@ use remuda_driver::{
     BinarySource, ClaudePtyDriver, ClaudePtyOptions, Delegation, Driver, DriverError, DriverKind,
     LaunchOrigin, ProviderHealth, ProviderKind, ProviderProfile, pin_binary,
 };
-use remuda_protocol::{InstanceSpec, ObservationPayload};
+use remuda_protocol::{InstanceSpec, InteractionAnswer, NativeRef, ObservationPayload};
 use remuda_testing::{
     FakeHerdrOptions, FakeHerdrServer, ShortTempDir, ensure_workspace_bin, install_executable,
 };
@@ -153,6 +153,70 @@ async fn a_forced_close_after_a_server_restart_refuses_the_reused_foreign_pane()
     assert!(
         matches!(close, Err(DriverError::ForeignHerdrResource(_))),
         "the forced close must refuse the reused foreign pane, got {close:?}"
+    );
+
+    // c-ctxusage r25 item 1: a FAILED close leaves controls DISABLED even
+    // though the pane id was reused by a foreign boot. Every control path must
+    // refuse locally without dispatching ANYTHING to that foreign pane:
+    // send(), respond_interaction(), and attach() all return ControlUnavailable.
+    let send_err = driver
+        .send(remuda_protocol::DriverInput::Prompt(Box::new(
+            remuda_protocol::PromptInput {
+                mode: remuda_protocol::PromptMode::NewTurn,
+                blocks: vec![remuda_protocol::ContentBlock::Text(Box::new(
+                    remuda_protocol::TextBlock {
+                        text: "echo OWNED-BY-STRANGER".into(),
+                    },
+                ))],
+                origin: remuda_protocol::InputOrigin::Human,
+                native_client_message_id: "foreign-pane-guard".into(),
+            },
+        )))
+        .await;
+    assert!(
+        matches!(send_err, Err(DriverError::ControlUnavailable)),
+        "send after a failed close must not reach the foreign pane, got {send_err:?}"
+    );
+    let answer_err = driver
+        .respond_interaction(
+            remuda_protocol::InteractionId::new(),
+            InteractionAnswer::Question(Box::new(remuda_protocol::QuestionAnswer {
+                answers: std::collections::BTreeMap::from([(
+                    "q-1".into(),
+                    remuda_protocol::QuestionFieldAnswer {
+                        option_ids: Vec::new(),
+                        text: Some("yes".into()),
+                    },
+                )]),
+            })),
+        )
+        .await;
+    assert!(
+        matches!(answer_err, Err(DriverError::ControlUnavailable)),
+        "respond_interaction after a failed close is refused, got {answer_err:?}"
+    );
+    let attach_err = driver
+        .attach(NativeRef {
+            host_id: remuda_protocol::HostId::new(),
+            native_store_id: remuda_protocol::Id::new("obj").unwrap(),
+            kind: remuda_protocol::AgentKind::Claude,
+            session_id: remuda_protocol::Knowledge::Known {
+                value: "fixture-session".into(),
+            },
+            transcript: remuda_protocol::Knowledge::NotApplicable,
+            signal_tier: None,
+            capabilities: Vec::new(),
+            codex: None,
+            acp: None,
+            claude: None,
+            claude_bg: None,
+            agy: None,
+            herdr: None,
+        })
+        .await;
+    assert!(
+        matches!(attach_err, Err(DriverError::ControlUnavailable)),
+        "attach after a failed close is refused, got {attach_err:?}"
     );
 
     // Positive proof the foreign pane, workspace and live agent survived the

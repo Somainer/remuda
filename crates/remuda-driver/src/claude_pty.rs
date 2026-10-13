@@ -204,15 +204,16 @@ struct PtyLive {
     /// Controls are disabled (coordination tasks retired) once close starts.
     /// The driver-level `closed` flag mirrors this for callers that hold no
     /// live lock (c-ctxusage r24 item 3).
-    #[allow(dead_code)]
+    /// Controls (send/keys/attach/tty bridge/…) are disabled once close begins.
+    /// Set BEFORE the carrier close runs and kept set if that close fails, so
+    /// a pane id the carrier reuses while we are between attempts can never
+    /// receive a follow-up control dispatch (c-ctxusage r25 item 1).
     controls_disabled: bool,
     /// Every close phase finished successfully exactly once (carrier closed,
     /// terminal emission sent, launch cleanup done and live state retired).
     /// A retry whose first `resources.close()` failed runs the remaining
     /// phases; a retry after completion is a clean no-op.
-    #[allow(dead_code)]
     close_complete: bool,
-    closed: bool,
 }
 
 /// Native Claude TUI hosted in a Herdr pane.
@@ -224,6 +225,11 @@ pub struct ClaudePtyDriver {
     /// Last successfully materialized spec; `resume` re-materializes from this.
     last_spec: Mutex<Option<InstanceSpec>>,
     closed: AtomicBool,
+    /// Serializes the WHOLE close (c-ctxusage r25 item 2): carrier close,
+    /// launch cleanup, terminal emission and live-state retirement. One owner
+    /// runs the phases once; a concurrent/second caller waits and observes the
+    /// completion (a no-op) instead of duplicating the terminal work.
+    close_lock: Mutex<()>,
     seq: Arc<AtomicU64>,
 }
 
@@ -237,6 +243,7 @@ impl ClaudePtyDriver {
             last_recipe: Mutex::new(None),
             last_spec: Mutex::new(None),
             closed: AtomicBool::new(false),
+            close_lock: Mutex::new(()),
             seq: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -278,7 +285,7 @@ impl ClaudePtyDriver {
     pub async fn open_observer(&self) -> DriverResult<TerminalObserver> {
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
-        if live.closed {
+        if live.controls_disabled {
             return Err(DriverError::ControlUnavailable);
         }
         TerminalObserver::open(&live.client, &live.pane_id, 80, 24)
@@ -743,7 +750,6 @@ impl ClaudePtyDriver {
             alt_screen: Arc::new(AtomicBool::new(false)),
             controls_disabled: false,
             close_complete: false,
-            closed: false,
         });
 
         info!(
@@ -772,7 +778,7 @@ impl ClaudePtyDriver {
         let (pane_id, session_id, queue, ready, io, request) = {
             let inner = self.inner.lock().await;
             let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
-            if live.closed {
+            if live.controls_disabled {
                 return Err(DriverError::ControlUnavailable);
             }
             require_session_start(live)?;
@@ -877,7 +883,7 @@ impl ClaudePtyDriver {
         let (pane_id, session_id, queue, ready, io) = {
             let inner = self.inner.lock().await;
             let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
-            if live.closed {
+            if live.controls_disabled {
                 return Err(DriverError::ControlUnavailable);
             }
             require_session_start(live)?;
@@ -939,7 +945,7 @@ impl ClaudePtyDriver {
         let (pane_id, session_id, queue, ready, io) = {
             let inner = self.inner.lock().await;
             let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
-            if live.closed {
+            if live.controls_disabled {
                 return Err(DriverError::ControlUnavailable);
             }
             require_session_start(live)?;
@@ -1031,7 +1037,7 @@ impl Driver for ClaudePtyDriver {
         let inner = self.inner.lock().await;
         let live = inner
             .as_ref()
-            .filter(|live| !live.closed)
+            .filter(|live| !live.controls_disabled)
             .ok_or(DriverError::ControlUnavailable)?;
         require_session_start(live)?;
         // SessionStart proves the native session is real, so no later screen
@@ -1044,7 +1050,7 @@ impl Driver for ClaudePtyDriver {
     async fn attach(&self, native_ref: NativeRef) -> DriverResult<DriverAck> {
         let mut inner = self.inner.lock().await;
         let live = inner.as_mut().ok_or(DriverError::NativeSessionNotFound)?;
-        if live.closed {
+        if live.controls_disabled {
             return Err(DriverError::ControlUnavailable);
         }
         match &native_ref.session_id {
@@ -1133,7 +1139,7 @@ impl Driver for ClaudePtyDriver {
         let text = prompt_text(&input)?;
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
-        if live.closed {
+        if live.controls_disabled {
             return Err(DriverError::ControlUnavailable);
         }
         require_session_start(live)?;
@@ -1159,7 +1165,7 @@ impl Driver for ClaudePtyDriver {
             .lock()
             .await
             .as_ref()
-            .filter(|live| !live.closed)
+            .filter(|live| !live.controls_disabled)
             .map(|live| Arc::clone(&live.interactions))
             .ok_or(DriverError::ControlUnavailable)?;
         interactions.send_keys(keys).await
@@ -1168,7 +1174,7 @@ impl Driver for ClaudePtyDriver {
     async fn tty_bridge(&self) -> Option<crate::tty::TtyBridge> {
         let inner = self.inner.lock().await;
         let live = inner.as_ref()?;
-        if live.closed {
+        if live.controls_disabled {
             return None;
         }
         Some(crate::tty::TtyBridge::Herdr {
@@ -1183,7 +1189,8 @@ impl Driver for ClaudePtyDriver {
         // pane's mode has no trustworthy observation.
         let inner = self.inner.lock().await;
         let live = inner.as_ref()?;
-        (live.tty_task.is_some() && !live.closed).then(|| live.alt_screen.load(Ordering::SeqCst))
+        (live.tty_task.is_some() && !live.controls_disabled)
+            .then(|| live.alt_screen.load(Ordering::SeqCst))
     }
 
     async fn cancel(&self) -> DriverResult<DriverAck> {
@@ -1200,24 +1207,28 @@ impl Driver for ClaudePtyDriver {
             .lock()
             .await
             .as_ref()
-            .filter(|live| !live.closed)
+            .filter(|live| !live.controls_disabled)
             .map(|live| Arc::clone(&live.interactions))
             .ok_or(DriverError::ControlUnavailable)?;
         interactions.respond(id, answer).await
     }
 
     async fn close(&self) -> DriverResult<DriverAck> {
-        // c-ctxusage r24 item 3: `closed` only disables controls; it is NOT
-        // proof the destructive phases finished. Serialize close on the inner
-        // lock, and run the teardown sequence exactly once. If
-        // `resources.close()` fails on the first attempt the live state is kept
-        // (with controls disabled); a later successful retry runs the terminal
-        // emission, launch cleanup and inner retirement instead of returning
-        // early and skipping them forever.
+        // c-ctxusage r25 items 1+2:
+        //  - `closed` (controls_disabled) gates EVERY control and is set the
+        //    moment close BEGINS, so a failed close against a pane the carrier
+        //    later reuses can never dispatch a follow-up send/attach to a
+        //    foreign pane;
+        //  - the whole close is serialized by `close_lock`: one owner runs the
+        //    carrier close, launch cleanup, terminal emission and state
+        //    retirement exactly once. A concurrent caller waits, sees
+        //    completion, and returns a no-op. A close whose carrier phase
+        //    failed keeps controls disabled but leaves completion unset, so a
+        //    LATER (not concurrent) retry finishes the terminal phases.
         self.closed.store(true, Ordering::SeqCst);
+        let _phase = self.close_lock.lock().await;
         let mut inner = self.inner.lock().await;
         let Some(live) = inner.as_mut() else {
-            // No live state at all: still attempt carrier close idempotently.
             drop(inner);
             self.resources.close().await?;
             return Ok(DriverAck::not_dispatched());
@@ -1226,9 +1237,9 @@ impl Driver for ClaudePtyDriver {
             // A previous close finished every phase; this is a clean no-op.
             return Ok(DriverAck::not_dispatched());
         }
-        // First pass (or a retry after a failed first pass): disable the
-        // coordination tasks exactly once. The flag makes a second pass skip
-        // straight to the carrier/terminal phases.
+        // Disable the coordination tasks exactly once. The flag stays set after
+        // a failure: every control gate reads it and stays closed while a retry
+        // is pending.
         if !live.controls_disabled {
             live.controls_disabled = true;
             live.interaction_task.abort();
@@ -1262,8 +1273,9 @@ impl Driver for ClaudePtyDriver {
         let ctx = live.ctx.clone();
         let recipe = live.recipe.clone();
         drop(inner);
-        // Destructive carrier close; on failure keep the live state so a retry
-        // completes the terminal phases below.
+        // Destructive carrier close; on failure keep the live state (controls
+        // stay disabled) so a later retry completes the terminal phases below.
+        // The held close_lock means no concurrent close reaches here.
         self.resources.close().await?;
         // S5: the pane is closed, so the launch overlays can go.
         crate::recipe::report_launch_cleanup(&recipe, "claude-pty");

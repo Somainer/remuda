@@ -87,7 +87,9 @@ pub(crate) struct FaultState {
     /// unlike the one-shot `promoter_started` bool this counts run 1 AND the
     /// resumed run 2, so a test can prove run 2's poller spawned while the
     /// predecessor was still parked in finalise.
+    #[cfg(feature = "test-faults")]
     promoter_starts: Mutex<u64>,
+    #[cfg(feature = "test-faults")]
     promoter_starts_cv: Condvar,
     skip_cooperative_finalise: AtomicBool,
     /// Overrides the driver's bounded cooperative-close wait so an abort test
@@ -195,7 +197,9 @@ impl FaultState {
             flusher_idle_cv: Condvar::new(),
             promoter_started: Mutex::new(false),
             promoter_started_cv: Condvar::new(),
+            #[cfg(feature = "test-faults")]
             promoter_starts: Mutex::new(0),
+            #[cfg(feature = "test-faults")]
             promoter_starts_cv: Condvar::new(),
             skip_cooperative_finalise: AtomicBool::new(false),
             close_timeout_ms: AtomicU64::new(0),
@@ -522,16 +526,22 @@ impl FaultState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         self.promoter_started_cv.notify_all();
-        let mut starts = self
-            .promoter_starts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *starts += 1;
-        self.promoter_starts_cv.notify_all();
+        // Per-run spawn count (c-ctxusage r20 item 2): test-faults builds only.
+        #[cfg(feature = "test-faults")]
+        {
+            let mut starts = self
+                .promoter_starts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *starts += 1;
+            self.promoter_starts_cv.notify_all();
+        }
     }
 
     /// Bounded wait for `n` promotion poller spawns (c-ctxusage r20 item 2);
-    /// called from the driver (which holds `Arc<FaultState>`).
+    /// called from the driver (which holds `Arc<FaultState>`). Compiled only
+    /// with `test-faults` (c-ctxusage r21 item 2).
+    #[cfg(feature = "test-faults")]
     pub(crate) fn wait_promoter_starts_state(&self, n: u64, timeout: Duration) -> bool {
         let guard = self
             .promoter_starts

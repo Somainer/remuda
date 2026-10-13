@@ -2275,8 +2275,10 @@ impl ShellPtyDriver {
         // Test-only hard barrier (c-ctxusage r20 item 2): do not retire the
         // predecessor until the new run's poller task is actually live
         // (two poller spawns: predecessor + run 2). In production the spawn
-        // handle already implies the task is registered; this ack wait exists
-        // only when faults are injected.
+        // handle already implies the task is registered. Compiled ONLY with
+        // the test-faults feature — zero cost in release (c-ctxusage r21
+        // item 2).
+        #[cfg(feature = "test-faults")]
         if self
             .test_faults
             .lock()

@@ -7084,3 +7084,77 @@ vi.spyOn(api, "login").mockRejectedValue(new HE(503, "busy", "host busy"));
     }
   }
 });
+
+it("GATE36 item 3: a failed login finalizer is invalidated by logout — no box is created, no POST, pending C survives (not rejected)", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_230_000);
+  const I = "ins_g36_3";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 3_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  const rows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g36_3");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await hubStore.follow(I);
+    // Pending durable C, kept from auto-delivery by going offline.
+    hubStore.setConnectionStateForTest("live");
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    hubStore.setConnectionStateForTest("offline");
+    const obx = (hubStore as unknown as { outbox: { enqueue: (r: unknown) => Promise<unknown> } }).outbox;
+    await obx.enqueue({ commandId: "cmd_g36_3_c", clientRequestId: "local_g36_3_c", instanceId: I, prompt: "g36 3 C", createdAt: 1 });
+    await pump(200);
+    expect(send).not.toHaveBeenCalled();
+
+    // Login A starts and its body parks.
+    let rejectA: ((e: unknown) => void) | null = null;
+    vi.spyOn(api, "login").mockImplementation(
+      () => new Promise((_resolve, reject) => { rejectA = reject; }),
+    );
+    const h = hubStore as unknown as {
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      logout: () => void;
+      outbox: unknown;
+      authTransitionOpenForTest: boolean;
+    };
+    const loginP = h.login("bootstrap", "a", "devA");
+    await pump(300);
+    expect(h.authTransitionOpenForTest).toBe(true);
+
+    // Logout completes WHILE A's credential request is in flight. It bumps the
+    // auth generation but leaves the transition seq alone.
+    h.logout();
+    await pump(200);
+    expect(h.outbox).toBeNull();
+
+    // A's request then rejects. Its stale finalizer must NOT create a box or
+    // deliver anything under the new logged-out generation.
+    const { HubHttpError: HE } = await import("./httpError");
+    rejectA!(new HE(503, "busy", "host busy"));
+    await expect(loginP).rejects.toThrow(/busy/);
+    await pump(4_000);
+
+    expect(h.outbox).toBeNull();
+    expect(send).not.toHaveBeenCalled();
+    const c = rows().find((r) => r.commandId === "cmd_g36_3_c")!;
+    expect(c.state).toBe("pending");
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

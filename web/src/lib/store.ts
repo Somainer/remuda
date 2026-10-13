@@ -1293,6 +1293,12 @@ class HubStore {
       // This transition now owns the identity change: dispose the current box
       // and bump the auth generation (seq already advanced).
       this.applyAuthIdentityChange();
+      // Gate 36 item 3: capture the auth generation THIS transition owns at
+      // ACQUISITION. A non-transition identity change (logout, bootstrap 401,
+      // peer-tab session removal) bumps the generation while a queued/in-flight
+      // credential request is still open, WITHOUT advancing transitionSeq;
+      // that generation must invalidate this transition's recovery finalizer.
+      const myGen = this.authGen;
       this.authTransition = new Promise<void>((resolve) => {
         this.resolveAuthTransition = resolve;
       });
@@ -1304,14 +1310,15 @@ class HubStore {
         thrown = err;
       } finally {
         // Release the blocker. Run current-generation initialization in the
-        // finalizer (gate 35 item 1) only if NO newer transition acquired —
-        // the newer one owns the chain and initialization then.
+        // finalizer (gate 35 item 1) only while this transition still owns
+        // BOTH the sequence and the generation it acquired — a queued newer
+        // transition OR a logout/401/peer change invalidates it.
         const resolve = this.resolveAuthTransition;
         this.resolveAuthTransition = null;
         this.authTransition = null;
         resolve?.();
-        const superseded = this.transitionSeq !== mySeq;
-        if (!superseded) void this.ensureOutbox().catch(() => undefined);
+        const stillOwns = this.transitionSeq === mySeq && this.authGen === myGen;
+        if (stillOwns) void this.ensureOutbox().catch(() => undefined);
         if (thrown !== undefined) throw thrown;
       }
       return { result: result!, superseded: this.transitionSeq !== mySeq };

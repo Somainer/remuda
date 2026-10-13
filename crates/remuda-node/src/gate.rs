@@ -3953,7 +3953,14 @@ fn write_land_fence(
     let path = land_fence_path(dir, job_id);
     // A new granted attempt supersedes any death certificate for the same job
     // (e.g. a requeue): the old cert must never attest death for THIS attempt.
-    let _ = std::fs::remove_file(land_dead_cert_path(dir, job_id));
+    // r18 item 9: propagate every removal error except NotFound — a permission
+    // /IO failure must not be silently ignored (which would leave a stale cert
+    // able to certify the new attempt).
+    if let Err(error) = std::fs::remove_file(land_dead_cert_path(dir, job_id))
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error);
+    }
     let temporary = dir.join(format!(".land-{pgid}-{}.tmp", std::process::id()));
     std::fs::write(&temporary, serde_json::to_vec(&record).unwrap_or_default())?;
     std::fs::rename(&temporary, &path)?;
@@ -6428,7 +6435,36 @@ Running 8 tests across 2 projects
 
     /// r17 item 1: `certify_dead_and_remove_fence` refuses when the fence on
     /// disk is no longer the observed snapshot — it never certifies a different
-    /// (replacement) attempt from a stale observation.
+    /// r18 item 9: an error removing the PREVIOUS death certificate other than
+    /// NotFound (here the cert path is a non-empty directory → IsADirectory)
+    /// must propagate; the new fence is not written (no silent stale cert).
+    #[test]
+    fn write_fence_propagates_a_non_notfound_old_cert_removal_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let job = "gjb_certunlink";
+        let cert = super::land_dead_cert_path(dir, job);
+        // The cert path is a non-empty DIRECTORY: remove_file fails with
+        // IsADirectory/EISDIR, not NotFound.
+        std::fs::create_dir_all(cert.join("inside")).unwrap();
+        let error =
+            super::write_land_fence(dir, job, 1, 1234, &super::LeaderIdentity::StartTick(7))
+                .expect_err("a non-NotFound cert removal error must propagate");
+        assert_ne!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "the induced failure is a directory, not a missing file: {error}"
+        );
+        // The new fence was NOT written, so the grant failure is honest rather
+        // than leaving the stale directory cert in place behind a new fence.
+        assert!(
+            !super::land_fence_path(dir, job).exists(),
+            "the fence must not be written when the old cert cannot be removed"
+        );
+    }
+
+    /// A refused/changed snapshot: a later fence for a DIFFERENT
+    /// (replacement) attempt must never be certified from a stale observation.
     #[test]
     fn certify_refuses_when_the_on_disk_fence_is_a_different_snapshot() {
         let tmp = tempfile::TempDir::new().unwrap();

@@ -842,3 +842,125 @@ fi
         "the drained land stderr must be retained in the failure reason: {error}"
     );
 }
+
+/// r15 item 1 (R5): the merge CLI's structured `uncertain` verdict (a failed
+/// push whose recovery fetch/ancestry read also failed — exit 4) must survive
+/// the Node's nonzero-exit handling as `uncertain`, never collapse to
+/// `failed`. The Hub treats that as "keep Landing; reconcile against the
+/// remote"; the Node must not guess.
+#[tokio::test]
+async fn a_nonzero_land_exit_carrying_uncertain_keeps_the_unknown_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin.git");
+    Command::new("git")
+        .args(["init", "--bare", "-b", "main"])
+        .arg(&origin)
+        .status()
+        .unwrap();
+    let seed = dir.path().join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    git(&seed, &["init", "-b", "main"]);
+    git(&seed, &["config", "user.email", "t@example.com"]);
+    git(&seed, &["config", "user.name", "T"]);
+    std::fs::write(seed.join("f.txt"), "base\n").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-q", "-m", "init"]);
+    git(&seed, &["checkout", "-q", "-b", "wt/land/uncertain"]);
+    std::fs::write(seed.join("f.txt"), "task\n").unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-q", "-m", "task"]);
+    git(
+        &seed,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(
+        &seed,
+        &["push", "-q", "origin", "main", "wt/land/uncertain"],
+    );
+
+    let lane = dir.path().join("lane");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            lane.to_str().unwrap(),
+        ],
+    );
+    git(&lane, &["config", "user.email", "t@example.com"]);
+    git(&lane, &["config", "user.name", "T"]);
+    git(&lane, &["fetch", "-q", "origin"]);
+    let target = dir.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+
+    let bin = dir.path().join("fake-land-uncertain.sh");
+    let script = r#"#!/bin/bash
+set -eu
+branch=""; onto="main"; mode=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --onto) onto="$2"; shift 2;;
+    --land) mode=land; shift;;
+    --gate) mode=gate; shift;;
+    --no-push) shift;;
+    --repo|--target-dir) shift 2;;
+    --*) shift;;
+    merge) shift;;
+    *) if [ -z "$branch" ]; then branch="$1"; fi; shift;;
+  esac
+done
+git fetch -q origin
+if [ "$mode" = "gate" ]; then
+  git checkout -qB "$onto" "origin/$onto"
+  base=$(git rev-parse "$onto"); head=$(git rev-parse "origin/$branch")
+  git merge -q --no-ff "origin/$branch" -m "merge $branch"
+  printf '{"exitCode":0,"status":"verified","base":"%s","head":"%s","merged":"%s"}\n' "$base" "$head" "$(git rev-parse HEAD)"
+else
+  # r15 R5: push failed AND the recovery read failed — the real merge CLI
+  # exits 4 with the structured "uncertain" verdict.
+  printf '{"exitCode":4,"status":"uncertain","error":"push failed and the recovery fetch failed; the remote may already contain the merge"}\n'
+  exit 4
+fi
+"#;
+    std::fs::write(&bin, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let node = DevNode::new(&DevServerConfig::loopback(0)).unwrap();
+    node.gate_test_set_authorizer(std::sync::Arc::new(GrantAll))
+        .await;
+
+    let params = json!({
+        "jobId": "gjb_land_uncertain", "laneId": "lane1",
+        "repoPath": lane.to_string_lossy(),
+        "targetDir": target.to_string_lossy(),
+        "branch": "wt/land/uncertain", "baseBranch": "main",
+        "mode": "land", "web": "never", "push": true, "generation": 1,
+        "binary": bin.to_string_lossy(),
+    });
+    let reply = tokio::time::timeout(
+        Duration::from_secs(30),
+        node.dispatch_gate_rpc("gate.run", &params),
+    )
+    .await
+    .expect("gate.run hung")
+    .expect("gate.run errored");
+
+    assert_eq!(
+        reply["status"],
+        json!("uncertain"),
+        "a structured uncertain land verdict must stay uncertain, never failed: {reply}"
+    );
+    assert!(
+        reply["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("reconciles against the remote"),
+        "the reason must point at remote reconciliation: {reply}"
+    );
+    // Origin main never moved by this stand-in (it does not push at all).
+    let origin_main = git(&origin, &["rev-parse", "main"]);
+    let init_commit = git(&seed, &["rev-parse", "main"]);
+    assert_eq!(origin_main, init_commit, "nothing was pushed");
+}

@@ -239,6 +239,14 @@ enum MergeStop {
     CasLost,
     #[error("main moved from {0} to {1} since verification; re-verify onto {1}")]
     BaseMoved(String, String),
+    /// r15 R5: the push's server-side outcome cannot be ESTABLISHED. The push
+    /// returned a failure, but the recovery fetch/ancestry read needed to prove
+    /// the ref absent (or present) itself failed, so the merge may already have
+    /// landed. Never a `failed` verdict: the consumer (the Node land path) keeps
+    /// its Landing occupancy and the Hub reconciles the exact merge against the
+    /// remote. The carried text records what could and could not be established.
+    #[error("land push outcome unknown: {0}")]
+    PushUncertain(String),
 }
 
 pub(crate) fn run(args: MergeArgs) -> Result<i32> {
@@ -326,6 +334,13 @@ pub(crate) fn run(args: MergeArgs) -> Result<i32> {
 
 /// Shared synchronous operation; MCP runs this on a blocking worker.
 pub(crate) fn execute(args: MergeArgs) -> MergeReport {
+    // r15 R5 child-start barrier: when the Node spawned this process as a
+    // granted LAND child, it blocks here on the inherited pipe fd until the
+    // Node has persisted the durable land-group fence and writes one release
+    // byte. EOF/error before the byte means the parent could not fence the
+    // granted push — exit BEFORE acquiring locks or touching git, so an
+    // unfenced child can never push.
+    await_start_barrier();
     // Concurrency guard: one merge/queue per repository (+ one per gate
     // target directory). Contention is a structured exit-3 report, available
     // to both the CLI and the MCP entry points.
@@ -384,7 +399,12 @@ pub(crate) fn execute(args: MergeArgs) -> MergeReport {
     // A failed gate leaves a persisted report too, naming the merge and base
     // that failed, for inspection and for the queue to read the verdict. The
     // merge never lands, so drop its reachability pin.
-    if args.onto.is_some() && report.exit_code != 0 {
+    //
+    // r15 R5: an UNCERTAIN push outcome is not a failure — the exact merge may
+    // already be on the remote — so keep its reachability pin like a
+    // cancel-after-verify; dropping it could garbage-collect a merge the remote
+    // accepted while the acknowledgement was lost.
+    if args.onto.is_some() && report.exit_code != 0 && report.status != "uncertain" {
         persist_report(&args, &report);
         if let (Some(repo), Some(reference), Some(base)) = (
             report.repo_root.as_ref(),
@@ -411,6 +431,51 @@ pub(crate) fn execute(args: MergeArgs) -> MergeReport {
     }
     report
 }
+
+/// Block on the Node's granted-land child-start barrier when present (env
+/// `REMUDA_START_BARRIER_FD` names the fd carrying the release byte — the
+/// granted land child's stdin, fd 0): the Node writes one byte only after the
+/// granted land group's durable fence record exists. EOF (the parent dropped
+/// the write end because fencing failed) or a read error exits the process
+/// before any git operation, so nothing can be pushed by an unfenced child
+/// (r15 R5). After the release, /dev/null is dup2'd over the fd so later
+/// gate/git children inherit a neutral stdin rather than the drained pipe.
+#[cfg(unix)]
+fn await_start_barrier() {
+    use std::os::fd::{AsRawFd, RawFd};
+    let Some(fd) = std::env::var("REMUDA_START_BARRIER_FD")
+        .ok()
+        .and_then(|raw| raw.parse::<RawFd>().ok())
+    else {
+        return;
+    };
+    let mut byte = [0u8; 1];
+    loop {
+        match nix::unistd::read(fd, &mut byte) {
+            Ok(0) => {
+                eprintln!(
+                    "remuda merge: start barrier closed before release; the land fence was not \
+                     persisted — refusing to run"
+                );
+                std::process::exit(4);
+            }
+            Ok(_) => break,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => {
+                eprintln!("remuda merge: start barrier read failed ({error}); refusing to run");
+                std::process::exit(4);
+            }
+        }
+    }
+    // Replace the drained barrier fd (the land child's stdin) with /dev/null so
+    // gate/git descendants never inherit the pipe.
+    if let Ok(null) = std::fs::File::open("/dev/null") {
+        let _ = nix::unistd::dup2(null.as_raw_fd(), fd);
+    }
+}
+
+#[cfg(not(unix))]
+fn await_start_barrier() {}
 
 /// Acquire the concurrency-guard locks before running a merge/queue.
 fn acquire_locks(args: &MergeArgs) -> Result<lock::MergeLocks> {
@@ -468,6 +533,13 @@ fn apply_stop(report: &mut MergeReport, error: anyhow::Error) {
             report.exit_code = 2;
             report.status = "base_moved".into();
             report.current_main = Some(current.clone());
+        }
+        Some(MergeStop::PushUncertain(_)) => {
+            // r15 R5: exit 4 / status "uncertain" — not a failure verdict. The
+            // granted merge MAY be on the remote; the Node keeps the Landing
+            // row and the Hub establishes the truth against the remote.
+            report.exit_code = 4;
+            report.status = "uncertain".into();
         }
         None => {
             report.exit_code = 1;
@@ -834,15 +906,22 @@ fn execute_inner(
 /// `git push origin <merged>:refs/heads/main`. A successful push needs no
 /// lease because the merge is a strict descendant of `expected`.
 ///
-/// r14 R4: a failed push is NOT a verdict. Before reporting anything, fetch
-/// and resolve the situation against the REMOTE state:
+/// r14 R4 + r15 R5: a failed push is NOT a verdict. Recover the situation
+/// against the REMOTE state, and every recovery READ is itself classified as
+/// Established or Unknown:
 /// * the exact granted merge is present on remote main (a lost
 ///   acknowledgement — the ref update landed server-side but the client got an
 ///   error: a failing post-receive hook, a killed connection) → this LANDED;
 ///   never a failure and never a base-moved requeue;
-/// * the merge is absent but remote main moved to a descendant of `expected`
-///   (an origin-only base move) → `MergeStop::BaseMoved`;
-/// * anything else keeps the real push error.
+/// * the merge is established ABSENT (a fresh fetch + ancestry succeeded) and
+///   remote main moved to a descendant of `expected` (an origin-only base
+///   move) → `MergeStop::BaseMoved`;
+/// * the merge is established absent AND remote main is still `expected` → the
+///   real push rejection (e.g. a hook refused, the ref never moved);
+/// * ANY recovery read fails (fetch error, ancestry/ref resolution error) →
+///   `MergeStop::PushUncertain`: the ref may have moved server-side, so the
+///   outcome is Unknown and must be reconciled against the remote, never
+///   reported failed.
 fn push_main_cas(repo: &Path, merged: &str, expected: &str) -> Result<()> {
     let output = git_output(
         repo,
@@ -855,18 +934,55 @@ fn push_main_cas(repo: &Path, merged: &str, expected: &str) -> Result<()> {
     // before reporting anything (r14 R4): the acknowledgement may be lost
     // while the ref update committed server-side.
     let remote = "refs/remotes/origin/main";
-    git(repo, &["fetch", "-q", "origin"])?;
-    if remote_has_commit(repo, remote, merged)? {
-        // The exact granted merge IS on remote main: the push landed, only the
-        // acknowledgement failed. Treat as success — never failed/base-moved.
-        return Ok(());
+    if let Err(error) = git(repo, &["fetch", "-q", "origin"]) {
+        // r15 R5: without the recovery fetch neither presence nor absence is
+        // established — the push may have landed. Unknown, never failed.
+        return Err(MergeStop::PushUncertain(format!(
+            "push failed and the recovery fetch failed ({error:#}); the remote may already \
+             contain the merge"
+        ))
+        .into());
     }
-    let remote_tip = resolve(repo, remote)?;
-    if remote_tip != expected && is_ancestor(repo, expected, &remote_tip)? {
+    match remote_has_commit(repo, remote, merged) {
+        Ok(true) => {
+            // The exact granted merge IS on remote main: the push landed, only
+            // the acknowledgement failed. Treat as success — never
+            // failed/base-moved.
+            return Ok(());
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return Err(MergeStop::PushUncertain(format!(
+                "push failed and the remote ancestry could not be established ({error:#}); the \
+                 remote may already contain the merge"
+            ))
+            .into());
+        }
+    }
+    let remote_tip = match resolve(repo, remote) {
+        Ok(tip) => tip,
+        Err(error) => {
+            return Err(MergeStop::PushUncertain(format!(
+                "push failed and the remote tip could not be resolved ({error:#}); the remote may \
+                 already contain the merge"
+            ))
+            .into());
+        }
+    };
+    if remote_tip != expected
+        && is_ancestor(repo, expected, &remote_tip).map_err(|error| {
+            MergeStop::PushUncertain(format!(
+                "push failed and remote ancestry could not be classified ({error:#})"
+            ))
+        })?
+    {
         // Origin-only base move: the merge is absent but main advanced from our
         // base to another commit — the real CAS loss the caller requeues on.
         return Err(MergeStop::BaseMoved(expected.to_owned(), remote_tip).into());
     }
+    // Recovery established: the merge is absent and the remote base did not
+    // advance past ours. The rejection itself (hook refusal, etc.) is the
+    // established failure — the ref provably never moved.
     successful(&output)
 }
 
@@ -1008,18 +1124,32 @@ fn execute_land(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
     })?;
     report.main_updated = true;
     report.status = "landed".into();
-    // The merge is main now and reachable on its own; drop the pin.
-    let _ = git(
-        &repo,
-        &[
-            "update-ref",
-            "-d",
-            &reports::verified_ref(&reference, &base),
-        ],
-    );
-    if !args.no_push {
+    if args.no_push {
+        // Nothing remote to wait for: the merge is main locally and reachable
+        // on its own; drop the pin.
+        let _ = git(
+            &repo,
+            &[
+                "update-ref",
+                "-d",
+                &reports::verified_ref(&reference, &base),
+            ],
+        );
+    } else {
+        // r15 R5: drop the reachability pin ONLY once the push outcome is
+        // established. A PushUncertain (lost ack + unreadable recovery) leaves
+        // the pin in place so a merge the remote may already contain is never
+        // garbage-collected before the Hub reconciles it.
         record(report, "push", || push_main_cas(&repo, &merged, &base))?;
         report.pushed = true;
+        let _ = git(
+            &repo,
+            &[
+                "update-ref",
+                "-d",
+                &reports::verified_ref(&reference, &base),
+            ],
+        );
     }
     Ok(())
 }

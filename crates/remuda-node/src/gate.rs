@@ -762,39 +762,42 @@ impl GateRegistry {
         Duration::from_secs(DEFAULT_LAND_TIMEOUT_SECS)
     }
 
-    /// Durably record the granted land child's process group right after it
-    /// spawns, so a Node crash leaves the next boot a fence it can kill and
-    /// verify before serving (r14 R1).
+    /// Durably record the granted land child's process group while the child is
+    /// still stopped before exec (the child-start barrier, r15 R5). A missing
+    /// leader identity or any write failure propagates so the caller refuses to
+    /// release (SIGCONT) the land child until the fence is durable.
     #[cfg(unix)]
-    fn record_land_group(&self, job_id: &str, generation: u32, pgid: i32) {
-        write_land_fence(&self.land_fence_dir, job_id, generation, pgid);
+    fn record_land_group(&self, job_id: &str, generation: u32, pgid: i32) -> std::io::Result<()> {
+        let identity = sample_leader_identity(pgid).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "could not read the land leader's start-time identity",
+            )
+        })?;
+        write_land_fence(&self.land_fence_dir, job_id, generation, pgid, &identity)
     }
 
     /// The land leader has already been reaped by the caller. Finish off any
-    /// surviving group member with SIGKILL, verify the whole group is ESRCH, and
-    /// only then remove the durable fence record.
+    /// surviving group member with SIGKILL, verify the whole group is ESRCH (the
+    /// kernel's authoritative answer — never a `/proc` enumeration, r15 R5),
+    /// and only then remove the durable fence record.
     #[cfg(unix)]
     async fn settle_land_group(&self, job_id: &str, pgid: i32) {
         let dir = self.land_fence_dir.clone();
         let job_id = job_id.to_owned();
         let _ = tokio::task::spawn_blocking(move || {
-            // The graceful TERM pass (if one was owed) already ran; any member
-            // still here after the leader was reaped gets KILL, then verify
-            // ESRCH/only-zombies before releasing the fence record.
-            if !land_group_cleared(pgid) {
+            if land_group_exists(pgid) {
                 use nix::sys::signal::{Signal, killpg};
                 use nix::unistd::Pid;
                 let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGKILL));
-                let deadline = Instant::now() + Duration::from_millis(500);
-                while Instant::now() < deadline && !land_group_cleared(pgid) {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
+                wait_until_group_gone(pgid, Duration::from_millis(500));
             }
-            if land_group_cleared(pgid) {
+            if !land_group_exists(pgid) {
                 remove_land_fence(&dir, &job_id);
             }
-            // If ESRCH still cannot be proven (an unreaped zombie under a
-            // subreaper) the record stays: the startup fence proves it later.
+            // ESRCH still not proven (e.g. EPERM, or a zombie under a
+            // subreaper): the record stays and the startup fence proves it
+            // later. Unknown never releases the proof.
         })
         .await;
     }
@@ -1134,9 +1137,6 @@ impl DevNode {
             if land_pgid.is_none()
                 && let Some(run) = table.runs.get(&request.job_id)
             {
-                // The grant never got to spawn its land child (or the row was
-                // settled while the verify group was the live one): release its
-                // cancel flag so a verify-phase child stands down too.
                 run.cancel.send(true).ok();
             }
             table.record_cancel(&request.job_id, request.generation);
@@ -1809,17 +1809,31 @@ impl DevNode {
             }
             let land_child_env = gate_run_child_env(request, &host_env_snapshot());
             let mut land_command = Command::new(&binary);
+            #[cfg(unix)]
+            let land_start_barrier: Option<LandStartBarrier> = {
+                let mut barrier = match LandStartBarrier::new() {
+                    Ok(barrier) => barrier,
+                    Err(error) => LandStartBarrier::failed(error),
+                };
+                let ready = matches!(barrier, LandStartBarrier::Ready { .. });
+                land_command.stdin(barrier.take_child_stdin());
+                if ready {
+                    land_command.env(REMUDA_START_BARRIER_FD, "0");
+                }
+                Some(barrier)
+            };
             land_command
                 .args(&land_args)
                 .current_dir(&repo)
                 .env_clear()
                 .envs(&land_child_env)
-                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(false);
             #[cfg(unix)]
             land_command.process_group(0);
+            #[cfg(not(unix))]
+            let land_start_barrier: Option<()> = None;
             let mut land_child = match land_command.spawn() {
                 Ok(child) => child,
                 Err(error) => {
@@ -1836,15 +1850,36 @@ impl DevNode {
             #[cfg(unix)]
             let land_pgid = land_child.id().and_then(|pid| i32::try_from(pid).ok());
             #[cfg(unix)]
-            if let Some(pgid) = land_pgid {
-                // r14 R1: expose the live land group to read-only probes and
-                // durably fence it BEFORE the child can push, so a Node crash
-                // cannot leave an unattestable orphaned pusher.
+            if let Some(pgid) = land_pgid
+                && let Some(barrier) = land_start_barrier
+            {
                 *live
                     .land_pgid
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner()) = Some(pgid);
-                registry.record_land_group(&request.job_id, request.generation, pgid);
+                // The child is blocked on the barrier before user logic runs.
+                // Persist the fence BEFORE releasing it. On any barrier/fence
+                // failure drop the write end (EOF) and KILL the held child — an
+                // ESTABLISHED pre-push failure (it ran no git), never an
+                // unfenced orphan pusher (r15 R5).
+                if let Err(error) = barrier.release_after(|| {
+                    registry.record_land_group(&request.job_id, request.generation, pgid)
+                }) {
+                    use nix::sys::signal::{Signal, killpg};
+                    use nix::unistd::Pid;
+                    let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGKILL));
+                    let _ = land_child.wait().await;
+                    result.status = "failed".into();
+                    result.error = Some(format!(
+                        "could not durably record the granted land group before releasing the land \
+                         child ({error}); the child was held before start and killed, so nothing was \
+                         pushed"
+                    ));
+                    result.reason =
+                        Some("land fence persistence failed before child start; not pushed".into());
+                    attach_failure_evidence(&mut result, &trace, request.keep_logs);
+                    return finalize(result);
+                }
             }
             let land_stdout = land_child.stdout.take();
             // r13 item 6: drain stderr CONCURRENTLY for the life of the child
@@ -1961,6 +1996,24 @@ impl DevNode {
                             result.current_main_sha = string_field(&land_report, "currentMain");
                             result.error = string_field(&land_report, "error");
                             result.reason = None;
+                        }
+                        // r15 R5: the merge CLI could not establish the push's
+                        // outcome (a failed push whose recovery fetch/ancestry
+                        // read also failed). NEVER "failed": the ref may already
+                        // have moved; keep the Landing and let Hub reconciliation
+                        // establish the exact granted merge against the remote.
+                        Some("uncertain") => {
+                            result.status = "uncertain".into();
+                            result.reason = Some(
+                                "land push outcome unknown; the Hub reconciles against the remote"
+                                    .into(),
+                            );
+                            result.error = string_field(&land_report, "error").or_else(|| {
+                                Some(
+                                    "land push outcome could not be established against the remote"
+                                        .into(),
+                                )
+                            });
                         }
                         _ => {
                             result.status = "failed".into();
@@ -2669,14 +2722,183 @@ fn land_fence_path(dir: &std::path::Path, job_id: &str) -> std::path::PathBuf {
     dir.join(format!("land-{slug}.json"))
 }
 
-/// Leader's start time in clock ticks (`/proc/<pid>/stat` field 22, index 19
-/// after the comm field). Pairs with the pid to defeat pid reuse.
+/// Env var telling the granted land child to read its one start-release byte
+/// from the given fd (its stdin, fd 0 — modern Rust's spawn fd hygiene closes
+/// ambient fds, so the pipe read end is passed as the registered stdin). The
+/// `remuda merge` CLI blocks on it before running (crates/remuda/src/cmd/
+/// merge.rs); the Node writes the byte only once the durable fence record
+/// exists (r15 R5 child-start barrier).
 #[cfg(unix)]
-fn proc_start_tick(pid: i32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = stat.rsplit_once(')').map(|(_, rest)| rest)?;
-    let fields: Vec<&str> = after_comm.split_whitespace().collect();
-    fields.get(19).and_then(|value| value.parse().ok())
+const REMUDA_START_BARRIER_FD: &str = "REMUDA_START_BARRIER_FD";
+
+/// One-shot child-start barrier backed by a pipe whose READ end is handed to
+/// the land child as its stdin (std's spawn fd hygiene makes ambient fd
+/// inheritance unreliable, so the read end is passed through the registered
+/// stdio slot — always fd 0 in the child). The merge CLI blocks reading one
+/// byte until the parent either releases it (fence durable) or drops the write
+/// end (fencing failed → EOF → the CLI exits before touching git).
+#[cfg(unix)]
+enum LandStartBarrier {
+    Ready {
+        write: std::os::fd::OwnedFd,
+        child_stdin: Option<std::process::Stdio>,
+    },
+    Failed(String),
+}
+
+#[cfg(unix)]
+impl LandStartBarrier {
+    fn new() -> std::io::Result<Self> {
+        use std::fs::File;
+        let (read, write) = nix::unistd::pipe()?;
+        // nix hands back CLOEXEC fds; std registers the read end explicitly as
+        // the child's stdin (fd 0), so no ambient-fd inheritance is relied on.
+        let read_file = File::from(read);
+        Ok(Self::Ready {
+            write,
+            child_stdin: Some(std::process::Stdio::from(read_file)),
+        })
+    }
+
+    fn failed(error: std::io::Error) -> Self {
+        Self::Failed(error.to_string())
+    }
+
+    /// Take the child stdio for the spawn (consumed once).
+    fn take_child_stdin(&mut self) -> std::process::Stdio {
+        match self {
+            Self::Ready { child_stdin, .. } => {
+                child_stdin.take().unwrap_or(std::process::Stdio::null())
+            }
+            Self::Failed(_) => std::process::Stdio::null(),
+        }
+    }
+
+    /// Persist via `fence`, then release the waiting child with one byte. On
+    /// any error the write end drops when self is consumed: the child's read
+    /// returns EOF and the CLI exits without running.
+    fn release_after<F>(self, fence: F) -> std::io::Result<()>
+    where
+        F: FnOnce() -> std::io::Result<()>,
+    {
+        match self {
+            Self::Failed(error) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("start barrier unavailable: {error}"),
+            )),
+            Self::Ready { write, .. } => {
+                fence()?;
+                nix::unistd::write(&write, &[1u8; 1])?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Durable leader identity sampled when the land child spawns and re-checked
+/// at every later boot. A signal is authorized ONLY by an equal identity at
+/// the same pid (r15 R5).
+#[cfg(unix)]
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum LeaderIdentity {
+    /// Linux clock ticks since boot (`/proc/<pid>/stat` field 22).
+    StartTick(u64),
+    /// Portable fallback on platforms without `/proc` (macOS): the `ps
+    /// -o lstart=` start timestamp text, compared verbatim on the same host.
+    StartedAt(String),
+}
+
+#[cfg(unix)]
+impl LeaderIdentity {
+    /// Read the identity recorded in a durable fence record. Absent/malformed
+    /// is Unknown to the caller, never a match or a mismatch.
+    fn from_record(value: &Value) -> Option<Self> {
+        if let Some(tick) = value.get("startTick").and_then(Value::as_u64) {
+            return Some(LeaderIdentity::StartTick(tick));
+        }
+        value
+            .get("startTime")
+            .and_then(Value::as_str)
+            .map(|text| LeaderIdentity::StartedAt(text.to_owned()))
+    }
+
+    /// Write the identity into the fence JSON.
+    fn write(&self, record: &mut Value) {
+        match self {
+            LeaderIdentity::StartTick(tick) => record["startTick"] = json!(*tick),
+            LeaderIdentity::StartedAt(text) => record["startTime"] = json!(text),
+        }
+    }
+}
+
+/// Sample the leader's start-time identity. Returns `None` whenever it cannot
+/// be read (missing `/proc`, `ps` unavailable/failed, unparseable output) —
+/// `None` means Unknown: the callers never treat it as a match (no signal) or a
+/// mismatch (r15 R5).
+#[cfg(unix)]
+fn sample_leader_identity(pid: i32) -> Option<LeaderIdentity> {
+    #[cfg(target_os = "linux")]
+    {
+        // /proc/<pid>/stat: field 22 (index 19 after the comm field) is the
+        // start time in clock ticks. Pairs with the pid to defeat pid reuse.
+        let stat = std::fs::read_to_string(proc_root().join(format!("{pid}/stat"))).ok()?;
+        let after_comm = stat.rsplit_once(')').map(|(_, rest)| rest)?;
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        fields
+            .get(19)
+            .and_then(|value| value.parse().ok())
+            .map(LeaderIdentity::StartTick)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Portable process start time: `ps -o lstart= -p <pid>` prints one
+        // canonical timestamp line; the same host sampled both values, so a
+        // byte comparison is an identity check without assuming /proc.
+        let output = std::process::Command::new("ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (!text.is_empty()).then_some(LeaderIdentity::StartedAt(text))
+    }
+}
+
+/// Root of the process-info filesystem (Linux `/proc`). Overridable under
+/// test-faults to simulate a platform where it is missing/unreadable (macOS),
+/// which every consumer must treat as Unknown — never as an empty enumeration.
+/// An RwLock makes an override globally exclusive: a read on any OTHER thread
+/// blocks until the override drops, so parallel tests that spawn real children
+/// never see a ghost `/proc`.
+#[cfg(all(unix, any(test, feature = "test-faults")))]
+fn proc_root() -> std::path::PathBuf {
+    if let Some(local) = PROC_OVERRIDE_LOCAL.with(|cell| cell.take()) {
+        PROC_OVERRIDE_LOCAL.with(|cell| cell.set(Some(local.clone())));
+        return local;
+    }
+    PROC_ROOT_RW
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("/proc"))
+}
+
+#[cfg(all(unix, not(any(test, feature = "test-faults"))))]
+fn proc_root() -> std::path::PathBuf {
+    std::path::PathBuf::from("/proc")
+}
+
+#[cfg(all(unix, any(test, feature = "test-faults")))]
+static PROC_ROOT_RW: std::sync::RwLock<Option<std::path::PathBuf>> = std::sync::RwLock::new(None);
+
+/// Reentrant per-thread view of the [`PROC_ROOT_RW`] override, so a thread
+/// holding the write lock still reads its own override without deadlocking.
+#[cfg(all(unix, any(test, feature = "test-faults")))]
+thread_local! {
+    static PROC_OVERRIDE_LOCAL: std::cell::Cell<Option<std::path::PathBuf>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// True iff a process group with `pgid` still exists (signal 0 probe). EPERM
@@ -2693,25 +2915,31 @@ fn land_group_exists(pgid: i32) -> bool {
     }
 }
 
+/// Persist the granted land group fence. Every failure (missing identity,
+/// directory/temp/rename error) propagates: the caller has the land child
+/// stopped before exec and refuses to release it until this record is durable
+/// (child-start barrier, r15 R5). A missing record can never be silently
+/// skipped into an unfenced, possibly-orphaned pusher.
 #[cfg(unix)]
-fn write_land_fence(dir: &std::path::Path, job_id: &str, generation: u32, pgid: i32) {
-    let Some(start_tick) = proc_start_tick(pgid) else {
-        return;
-    };
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    let record = serde_json::json!({
+fn write_land_fence(
+    dir: &std::path::Path,
+    job_id: &str,
+    generation: u32,
+    pgid: i32,
+    identity: &LeaderIdentity,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let mut record = serde_json::json!({
         "jobId": job_id,
         "generation": generation,
         "pgid": pgid,
-        "startTick": start_tick,
     });
+    identity.write(&mut record);
     let path = land_fence_path(dir, job_id);
     let temporary = dir.join(format!(".land-{pgid}-{}.tmp", std::process::id()));
-    if std::fs::write(&temporary, serde_json::to_vec(&record).unwrap_or_default()).is_ok() {
-        let _ = std::fs::rename(&temporary, &path);
-    }
+    std::fs::write(&temporary, serde_json::to_vec(&record).unwrap_or_default())?;
+    std::fs::rename(&temporary, &path)?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2719,55 +2947,63 @@ fn remove_land_fence(dir: &std::path::Path, job_id: &str) {
     let _ = std::fs::remove_file(land_fence_path(dir, job_id));
 }
 
-/// True when no LIVE member of `pgid` remains. The kernel's killpg probe
-/// returning ESRCH proves it outright; if the group still exists (killpg
-/// succeeds) but every member the /proc scan can see is a ZOMBIE, the group is
-/// effectively dead too — the zombies are on their way to being reaped and can
-/// never run another instruction or push.
+/// Boundedly poll until the kernel reports the group gone (`killpg(pgid,0)`
+/// == ESRCH) or the budget elapses. No /proc enumeration participates: only
+/// the kernel's authoritative answer can prove death (r15 R5).
 #[cfg(unix)]
-fn land_group_cleared(pgid: i32) -> bool {
-    if !land_group_exists(pgid) {
-        return true;
+fn wait_until_group_gone(pgid: i32, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if !land_group_exists(pgid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
-    alive_pids_in_group(pgid).is_empty()
 }
 
-/// SIGTERM a whole land group, boundedly wait for it to empty, then SIGKILL the
-/// WHOLE group with killpg (never an enumeration that could miss a member) and
-/// verify the group is cleared (ESRCH or only unreaped zombies left). Returns
-/// false only when a LIVE member survives the kill grace (the fence record is
-/// then kept for the next boot's fence).
+/// SIGTERM a whole land group, boundedly wait for the GROUP ITSELF to disappear
+/// (killpg ESRCH), then ALWAYS SIGKILL the WHOLE group with killpg (never an
+/// enumeration that could miss a member and never an early return on an empty
+/// scan), and verify the group is gone by ESRCH again. Returns false only when
+/// the kernel still cannot report ESRCH at the deadline (the fence record is
+/// kept for the next boot's fence). A missing `/proc` or a transient empty
+/// enumeration can never skip the KILL — no enumeration is consulted at all
+/// (r14 item 4, r15 R5).
 #[cfg(unix)]
 fn terminate_and_verify_group(pgid: i32, term_grace: Duration) -> bool {
     use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
     let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGTERM));
-    let term_deadline = Instant::now() + term_grace;
-    while Instant::now() < term_deadline {
-        if land_group_cleared(pgid) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    // Still occupied at the deadline: unconditionally KILL the whole group.
+    wait_until_group_gone(pgid, term_grace);
+    // Still occupied or merely UNPROVEN at the deadline: unconditionally KILL
+    // the whole group. This is never skipped — even when the TERM-wait poll
+    // already saw ESRCH, the extra KILL is harmless (ESRCH) and costs nothing
+    // compared with missing a member one /proc read away.
     let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGKILL));
-    let kill_deadline = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < kill_deadline {
-        if land_group_cleared(pgid) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    land_group_cleared(pgid)
+    wait_until_group_gone(pgid, Duration::from_millis(500));
+    // Authoritative death claim only.
+    !land_group_exists(pgid)
 }
 
-/// r14 R1 startup fence: every leftover record names a granted land group the
-/// PREVIOUS Node process may have orphaned mid-push. The pid+start-tick record
-/// guards pid reuse (a reused pid is never signalled); a still-present group is
-/// terminated and verified gone before its record — and the proof it provides —
-/// is removed.
+/// r14 R1 / r15 R5 startup fence: every leftover record names a granted land
+/// group the PREVIOUS Node process may have orphaned mid-push. Every decision
+/// is Established or Unknown:
+/// * record unreadable/unparseable/missing fields/missing identity → Unknown,
+///   KEEP the record (never delete the only proof, never signal);
+/// * leader pid ALIVE with the SAME durable start identity → positively ours;
+///   terminate the whole group (TERM → bounded wait → KILL → ESRCH) and remove
+///   the record only once death is authoritative;
+/// * leader pid alive with a DIFFERENT identity (pid reused by a stranger) →
+///   no signal; group ownership can no longer be positively established → KEEP
+///   the record (the Landing stays outcome-unknown and the remote resolves it);
+/// * leader pid ESRCH and the group ESRCH → established dead → remove;
+/// * leader pid ESRCH but the group still exists (orphaned members, no leader)
+///   → Unknown without the leader identity → no signal, KEEP the record;
+/// * `kill(pid, 0)` EPERM/other → Unknown → keep, never signal.
 #[cfg(unix)]
 fn fence_orphaned_land_groups(dir: &std::path::Path) {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -2776,39 +3012,66 @@ fn fence_orphaned_land_groups(dir: &std::path::Path) {
         if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
             continue;
         }
+        // Read/parse/field failures all mean the record cannot be acted on:
+        // KEEP it. Deleting an unparseable record used to destroy the only
+        // proof that a group might push (r15 R5 fail-open).
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
         let Ok(record) = serde_json::from_str::<Value>(&text) else {
-            let _ = std::fs::remove_file(&path);
             continue;
         };
         let Some(pgid) = record["pgid"]
             .as_i64()
             .and_then(|value| i32::try_from(value).ok())
         else {
-            let _ = std::fs::remove_file(&path);
             continue;
         };
-        let Some(start_tick) = record["startTick"].as_u64() else {
-            let _ = std::fs::remove_file(&path);
+        let Some(recorded_identity) = LeaderIdentity::from_record(&record) else {
             continue;
         };
-        // Pid reuse: if that pid now belongs to a process that started later,
-        // our leader (and its group) is dead; do not signal the stranger.
-        if let Some(current) = proc_start_tick(pgid)
-            && current != start_tick
-        {
-            let _ = std::fs::remove_file(&path);
-            continue;
+        match kill(Pid::from_raw(pgid), None) {
+            Ok(()) => {
+                // A live process holds the leader pid. Signal ONLY on a
+                // positive identity match.
+                match sample_leader_identity(pgid) {
+                    Some(current) if current == recorded_identity => {
+                        if terminate_and_verify_group(pgid, LAND_GROUP_TERM_GRACE) {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                        // Still not provably gone: keep for the next boot.
+                    }
+                    Some(_) => {
+                        tracing::warn!(
+                            pgid,
+                            "land fence leader pid was reused by an unrelated process; refusing \
+                             to signal the group and keeping the fence record"
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            pgid,
+                            "land fence leader is alive but its identity cannot be read; refusing \
+                             to signal the group and keeping the fence record"
+                        );
+                    }
+                }
+            }
+            Err(nix::errno::Errno::ESRCH) => {
+                // No process at the leader pid. With no leader, a still-present
+                // group can no longer be positively distinguished from a
+                // same-session process that joined it: only an authoritative
+                // group ESRCH settles it; anything else keeps the record.
+                if !land_group_exists(pgid) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            Err(error) => {
+                // EPERM (a process owned by another uid) or any other probe
+                // failure: Unknown ownership — no signal, keep.
+                tracing::warn!(%error, pgid, "land fence leader probe failed; keeping record");
+            }
         }
-        // Same leader, or leader already reaped: decide on the GROUP. A group
-        // still occupying this pgid is ours (pgids are not reused while a
-        // member exists).
-        if !land_group_exists(pgid) || terminate_and_verify_group(pgid, LAND_GROUP_TERM_GRACE) {
-            let _ = std::fs::remove_file(&path);
-        }
-        // Still not provably gone: keep the record; the next boot retries.
     }
 }
 
@@ -2819,11 +3082,13 @@ fn fence_orphaned_land_groups(dir: &std::path::Path) {
 const LAND_GROUP_TERM_GRACE: Duration = Duration::from_millis(750);
 
 /// Pids currently alive (non-zombie) whose process group is `pgid` (Linux
-/// /proc enumeration). An empty Vec means none running; on a platform without
-/// /proc it returns empty ("cannot tell").
-#[cfg(unix)]
+/// `/proc` enumeration). TEST/DIAGNOSTIC ONLY: it is never consulted to prove
+/// death or to skip a signal — production termination claims death only on the
+/// kernel's authoritative `killpg(pgid, 0)` ESRCH, so an empty scan (or a
+/// platform without `/proc`) can never be read as "cleared" (r15 R5).
+#[cfg(all(unix, any(test, feature = "test-faults")))]
 pub(crate) fn alive_pids_in_group(pgid: i32) -> Vec<i32> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+    let Ok(entries) = std::fs::read_dir(proc_root()) else {
         return Vec::new();
     };
     let mut pids = Vec::new();
@@ -2837,7 +3102,7 @@ pub(crate) fn alive_pids_in_group(pgid: i32) -> Vec<i32> {
         // /proc/<pid>/stat: after the comm field '(…)', field 1 is state and
         // field 3 is the process group. comm may contain spaces/parens, so
         // split from the last ')'.
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        let Ok(stat) = std::fs::read_to_string(proc_root().join(format!("{pid}/stat"))) else {
             continue;
         };
         let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
@@ -3872,6 +4137,7 @@ JSON
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
+
     #[test]
     fn port_pair_and_path_helpers() {
         let (listen, web) = super::port_pair(Some("58480-58489")).unwrap();
@@ -4257,5 +4523,397 @@ Running 8 tests across 2 projects
         assert_eq!(test.seen_lines, 4);
         // The banner line belongs to no step, but stays in the global ring.
         assert!(!trace.by_step.contains_key("Rust tests"));
+    }
+
+    // ── r15 R5 land fence / termination tests ──────────────────────────────
+    use std::os::unix::process::CommandExt as StdUnixCommandExt;
+
+    /// Serializes tests that read (or override) the `/proc` root: the override
+    /// is process-global, so identity/enumeration tests take this one lock.
+    static PROC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn proc_lock() -> std::sync::MutexGuard<'static, ()> {
+        PROC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// While held, process-info reads see a root that does not exist — the
+    /// macOS/no-`/proc` condition every consumer must treat as Unknown. The
+    /// write lock blocks proc reads on every other thread; the thread-local
+    /// keeps this thread's own reads reentrant (no self-deadlock).
+    struct MissingProc {
+        _write: std::sync::RwLockWriteGuard<'static, Option<std::path::PathBuf>>,
+    }
+    impl MissingProc {
+        fn set() -> Self {
+            let mut write = PROC_ROOT_RW
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let ghost = std::env::temp_dir().join(format!(
+                "r15-missing-proc-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            assert!(!ghost.exists());
+            *write = Some(ghost.clone());
+            super::PROC_OVERRIDE_LOCAL.with(|cell| cell.set(Some(ghost)));
+            Self { _write: write }
+        }
+    }
+    impl Drop for MissingProc {
+        fn drop(&mut self) {
+            super::PROC_OVERRIDE_LOCAL.with(|cell| cell.set(None));
+            *self._write = None;
+        }
+    }
+
+    /// Spawn `program` in its OWN new process group (pgid == child pid); the
+    /// caller reaps the leader. Safe-only (std's process_group, no pre_exec).
+    fn spawn_grouped(program: &str, args: &[&str]) -> std::process::Child {
+        let mut command = std::process::Command::new(program);
+        command
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        command.spawn().expect("spawn grouped child")
+    }
+
+    /// Bounded: reap the leader so killpg can reach ESRCH.
+    fn reap(mut child: std::process::Child) {
+        let _ = child.wait();
+    }
+
+    /// Spawn a group whose leader ignores SIGTERM and SURVIVES the whole TERM
+    /// grace (a tight loop; each `sleep` child is disposable). The leader
+    /// writes `ready` to `marker` only AFTER installing the trap, so the test
+    /// never sends TERM during the race window before exec/handler setup (in
+    /// which a default-disposition process would die instantly).
+    fn spawn_term_ignoring_group(marker: &std::path::Path) -> std::process::Child {
+        let child = spawn_grouped(
+            "sh",
+            &[
+                "-c",
+                &format!(
+                    "trap '' TERM; echo ready > '{}'; while true; do sleep 1; done",
+                    marker.display()
+                ),
+            ],
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(marker.exists(), "TERM-ignoring leader never became ready");
+        child
+    }
+
+    #[test]
+    fn terminate_always_kills_a_term_ignoring_group_and_proves_esrch() {
+        let _seq = proc_lock();
+        // sh ignores SIGTERM (trap '') and holds the group open through the
+        // whole TERM grace; only the unconditional KILL can clear it, and the
+        // death claim is the kernel ESRCH (never an enumeration).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut child = spawn_term_ignoring_group(&tmp.path().join("ready1"));
+        let pgid = child.id() as i32;
+        assert!(super::land_group_exists(pgid), "group never came up");
+        // Fence in a thread while the test reaps the killed leader (a zombie
+        // leader keeps killpg returning success until reaped).
+        let verdict = std::thread::scope(|scope| {
+            let handle = scope
+                .spawn(move || super::terminate_and_verify_group(pgid, Duration::from_millis(150)));
+            // Bounded: wait for the child to die, then reap it.
+            let kill_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if std::time::Instant::now() >= kill_deadline => {
+                        panic!("TERM-ignoring group was not KILLed")
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                    Err(_) => break,
+                }
+            }
+            reap(child);
+            handle.join().unwrap()
+        });
+        assert!(verdict, "group must be provably ESRCH after the KILL");
+        assert!(!super::land_group_exists(pgid), "group survived");
+    }
+
+    #[test]
+    fn termination_kills_even_when_process_enumeration_is_unavailable() {
+        // The macOS condition: /proc is absent, so the diagnostic enumeration
+        // answers empty. A SIGTERM-ignoring member is nevertheless alive and
+        // would keep pushing. Termination must wait the bounded grace, ALWAYS
+        // KILL the whole group, and claim death only on ESRCH — an empty
+        // enumeration must never skip the KILL or report "cleared".
+        let _missing = MissingProc::set();
+        // Sanity: the seam really does hide process info.
+        assert!(super::alive_pids_in_group(1).is_empty());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut child = spawn_term_ignoring_group(&tmp.path().join("ready2"));
+        let pgid = child.id() as i32;
+        assert!(super::land_group_exists(pgid));
+        let verdict = std::thread::scope(|scope| {
+            let started = std::time::Instant::now();
+            let handle = scope
+                .spawn(move || super::terminate_and_verify_group(pgid, Duration::from_millis(300)));
+            let kill_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if std::time::Instant::now() >= kill_deadline => {
+                        panic!("TERM-ignoring group was not KILLed without /proc")
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                    Err(_) => break,
+                }
+            }
+            reap(child);
+            let verdict = handle.join().unwrap();
+            // The leader must die at the KILL (after the full TERM grace), not
+            // be reported "cleared" by an empty enumeration ten ms in.
+            assert!(
+                started.elapsed() >= Duration::from_millis(280),
+                "the KILL must wait for the whole TERM grace, not skip it"
+            );
+            verdict
+        });
+        assert!(
+            verdict,
+            "death must be proven by ESRCH, not by an empty scan"
+        );
+        assert!(!super::land_group_exists(pgid));
+    }
+
+    #[test]
+    fn startup_fence_with_unreadable_identity_holds_and_does_not_signal() {
+        // /proc is absent (the read fails): the leader pid is live but its
+        // identity is Unknown. The startup fence must NOT signal the group and
+        // must KEEP the record — previously a missing identity fell through to
+        // a killpg on the pgid, which could kill an unrelated reused group.
+        let _missing = MissingProc::set();
+        let mut stranger = spawn_grouped("sleep", &["30"]);
+        let pgid = stranger.id() as i32;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !super::land_group_exists(pgid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(super::land_group_exists(pgid));
+        assert!(super::sample_leader_identity(pgid).is_none());
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = super::land_fence_path(dir.path(), "ghost");
+        std::fs::write(
+            &path,
+            serde_json::json!({"jobId":"ghost","generation":1,"pgid":pgid,"startTick":42})
+                .to_string(),
+        )
+        .unwrap();
+        super::fence_orphaned_land_groups(dir.path());
+        assert!(
+            stranger.try_wait().unwrap().is_none(),
+            "a group with unknown identity must never be signalled"
+        );
+        assert!(path.exists(), "the record must be kept on unknown identity");
+        let _ = stranger.kill();
+        reap(stranger);
+    }
+
+    #[test]
+    fn startup_fence_keeps_unreadable_or_identityless_records() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fence = dir.path();
+        std::fs::write(fence.join("land-bad.json"), b"{not json").unwrap();
+        std::fs::write(
+            fence.join("land-noid.json"),
+            serde_json::json!({"jobId":"j","generation":1,"pgid":12345}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            fence.join("land-nopgid.json"),
+            serde_json::json!({"jobId":"j","generation":1,"startTick":7}).to_string(),
+        )
+        .unwrap();
+        super::fence_orphaned_land_groups(fence);
+        // Unknown evidence: every record is KEPT, none deleted.
+        for name in ["land-bad.json", "land-noid.json", "land-nopgid.json"] {
+            assert!(
+                fence.join(name).is_file(),
+                "{name} must be kept on unknown evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_fence_never_signals_a_reused_leader_and_keeps_the_record() {
+        let _seq = proc_lock();
+        // A live process at the leader pid whose start identity DIFFERS from
+        // the record: pid was reused by a stranger. No signal, record kept.
+        let mut stranger = spawn_grouped("sleep", &["30"]);
+        let pgid = stranger.id() as i32;
+        let dir = tempfile::TempDir::new().unwrap();
+        let fence = dir.path();
+        let recorded = match super::sample_leader_identity(pgid) {
+            Some(super::LeaderIdentity::StartTick(tick)) => tick.saturating_add(1_000_000),
+            other => panic!("expected a start tick, got {other:?}"),
+        };
+        std::fs::write(
+            super::land_fence_path(fence, "job-x"),
+            serde_json::json!({
+                "jobId": "job-x",
+                "generation": 1,
+                "pgid": pgid,
+                "startTick": recorded,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        super::fence_orphaned_land_groups(fence);
+        // The stranger is still alive...
+        assert!(
+            stranger.try_wait().unwrap().is_none(),
+            "the reused-pid stranger must not have been signalled"
+        );
+        // ...and the record was kept (unknown ownership, Landing held).
+        assert!(super::land_fence_path(fence, "job-x").is_file());
+        let _ = stranger.kill();
+        reap(stranger);
+    }
+
+    #[test]
+    fn startup_fence_removes_the_record_only_when_death_is_esrch() {
+        let _seq = proc_lock();
+        // Established dead: leader killed+reaped and the group gone.
+        let mut child = spawn_grouped("sleep", &["1"]);
+        let pgid = child.id() as i32;
+        let identity = super::sample_leader_identity(pgid).expect("identity");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = super::land_fence_path(dir.path(), "dead");
+        let mut record = serde_json::json!({"jobId":"dead","generation":1,"pgid":pgid});
+        identity.write(&mut record);
+        std::fs::write(&path, record.to_string()).unwrap();
+        let _ = child.kill();
+        reap(child);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while super::land_group_exists(pgid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!super::land_group_exists(pgid));
+        super::fence_orphaned_land_groups(dir.path());
+        assert!(!path.exists(), "ESRCH must release the record");
+    }
+
+    #[test]
+    fn startup_fence_holds_when_the_leader_is_gone_but_members_survive() {
+        let _seq = proc_lock();
+        // Leader exits (kills itself) while a descendant keeps the pgid: with
+        // no leader identity to match, ownership is Unknown — no signal, the
+        // orphan survives, the record stays.
+        let child = spawn_grouped(
+            "sh",
+            &["-c", "sleep 30 & kill -9 $$; wait 2>/dev/null || true"],
+        );
+        let pgid = child.id() as i32;
+        // Capture the leader identity before it exits.
+        let identity = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Some(value) = super::sample_leader_identity(pgid) {
+                    break value;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("never sampled the leader");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        reap(child);
+        // The orphan keeps the group present.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut present = false;
+        while std::time::Instant::now() < deadline {
+            if super::land_group_exists(pgid) {
+                present = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(present, "the orphaned member should hold the pgid");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = super::land_fence_path(dir.path(), "orphan");
+        let mut record = serde_json::json!({"jobId":"orphan","generation":1,"pgid":pgid});
+        identity.write(&mut record);
+        std::fs::write(&path, record.to_string()).unwrap();
+        super::fence_orphaned_land_groups(dir.path());
+        assert!(path.exists(), "no leader identity => record kept");
+        assert!(
+            super::land_group_exists(pgid),
+            "the orphan must not have been signalled"
+        );
+        // Cleanup: the established-same-leader path isn't available, so the
+        // test itself clears the group now (it owns it).
+        assert!(super::terminate_and_verify_group(
+            pgid,
+            Duration::from_millis(200)
+        ));
+    }
+
+    #[test]
+    fn record_land_group_fails_when_the_fence_dir_cannot_be_written() {
+        let _seq = proc_lock();
+        // A FILE where the fence directory must live: create_dir_all fails, so
+        // the grant refuses to persist — the caller must then fail the land
+        // rather than release an unfenced child.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocked = tmp.path().join("gate-land");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let registry = GateRegistry::new(blocked);
+        let error = registry
+            .record_land_group("job-fail", 1, std::process::id() as i32)
+            .expect_err("fence persistence must fail");
+        assert!(
+            error.to_string().contains("entity") || error.raw_os_error().is_some(),
+            "expected an io error, got {error}"
+        );
+    }
+
+    #[test]
+    fn start_barrier_delivers_the_release_byte_only_after_the_fence() {
+        // A real child receives the read end as its STDIN and blocks on
+        // `head -c 1`; it exits 0 once release_after writes the byte.
+        let mut barrier = super::LandStartBarrier::new().expect("barrier");
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "head -c 1"])
+            .stdin(barrier.take_child_stdin())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn barrier waiter");
+        // Give the child a moment to park in read(2).
+        std::thread::sleep(Duration::from_millis(50));
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("child must block before the release byte: {status}");
+        }
+        barrier
+            .release_after(|| Ok(()))
+            .expect("fence write and release");
+        let status = child.wait().expect("reap barrier waiter");
+        assert!(status.success(), "released child exits 0");
+    }
+
+    #[test]
+    fn start_barrier_failed_variant_refuses_release() {
+        let barrier =
+            super::LandStartBarrier::failed(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
+        let error = barrier.release_after(|| Ok(())).expect_err("no release");
+        assert!(error.to_string().contains("start barrier unavailable"));
     }
 }

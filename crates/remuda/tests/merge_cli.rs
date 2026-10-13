@@ -1322,6 +1322,233 @@ exit 1
     let _ = base;
 }
 
+/// Write the r14-R5 lost-ack pre-receive hook: applies the incoming ref
+/// server-side, then rejects the push so the client sees a failure while the
+/// remote already contains the merge. Returns nothing; the hook lives at
+/// `$origin/hooks/pre-receive`.
+fn install_lost_ack_hook(origin: &Path) {
+    let real_git: PathBuf = {
+        let path = std::env::var_os("PATH").expect("PATH");
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("git"))
+            .find(|candidate| candidate.is_file())
+            .expect("real git on PATH")
+    };
+    let hook_dir = origin.join("hooks");
+    fs::create_dir_all(&hook_dir).unwrap();
+    let hook = hook_dir.join("pre-receive");
+    fs::write(
+        &hook,
+        format!(
+            r#"#!/bin/sh
+read old new dst
+find "$GIT_QUARANTINE_PATH" -type f -not -path "*/pack/*" 2>/dev/null | while IFS= read -r f; do
+  rel="${{f#$GIT_QUARANTINE_PATH/}}"
+  mkdir -p "$GIT_DIR/objects/$(dirname "$rel")"
+  cp -f "$f" "$GIT_DIR/objects/$rel"
+done
+env -i HOME="$HOME" PATH="{path_dir}" \
+  "{real_git}" --git-dir="$GIT_DIR" update-ref "$dst" "$new" "$old"
+echo "simulated post-update acknowledgement loss" >&2
+exit 1
+"#,
+            path_dir = std::env::var("PATH").unwrap_or_default(),
+            real_git = real_git.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Write a `git` wrapper on a throwaway PATH dir that delegates every call to
+/// the real git EXCEPT the named recovery read, which it makes fail. Used to
+/// prove r15 R5: a failed recovery read after a rejected push is `uncertain`,
+/// never `gate_failed`.
+///
+/// `fail`: "fetch" fails `git fetch -q origin`; "merge-base" fails the ancestry
+/// read.
+fn install_failing_git_wrapper(parent: &Path, fail: &str) -> PathBuf {
+    let real_git: PathBuf = {
+        let path = std::env::var_os("PATH").expect("PATH");
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("git"))
+            .find(|candidate| candidate.is_file())
+            .expect("real git on PATH")
+    };
+    let wrapper_dir = parent.join("wrapper-bin");
+    fs::create_dir_all(&wrapper_dir).unwrap();
+    let wrapper = wrapper_dir.join("git");
+    fs::write(
+        &wrapper,
+        format!(
+            r#"#!/bin/sh
+if [ "{fail}" = "fetch" ] && [ "$1" = "fetch" ]; then
+  echo "wrapper: simulated fetch failure" >&2
+  exit 1
+fi
+if [ "{fail}" = "merge-base" ] && [ "$1" = "merge-base" ]; then
+  echo "wrapper: simulated merge-base failure" >&2
+  exit 2
+fi
+exec "{real_git}" "$@"
+"#,
+            fail = fail,
+            real_git = real_git.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    wrapper_dir
+}
+
+/// r15 item 1 (R5): the push landed server-side but the client saw a failure
+/// AND the recovery `git fetch` also fails. The outcome cannot be established
+/// — the CLI must report `uncertain` (exit 4), never `gate_failed` (exit 1),
+/// keep the reachability pin, and surface what could not be established. The
+/// exact merge IS on remote main (the hook moved it).
+#[test]
+fn a_lost_ack_with_a_failed_recovery_fetch_is_uncertain_never_failed() {
+    let repo = Repo::new();
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+    let base = repo.base.clone();
+
+    install_lost_ack_hook(&repo.origin);
+    let wrapper_dir = install_failing_git_wrapper(repo.root.parent().unwrap(), "fetch");
+    let wrapped_path = format!(
+        "{}:{}",
+        wrapper_dir.display(),
+        std::env::var("PATH").unwrap()
+    );
+
+    let (output, report) = repo.merge(
+        &["--land", "--onto", "main", "--report", &merged],
+        &[("PATH", wrapped_path.as_str())],
+    );
+    assert_exit(&output, &report, 4);
+    assert_eq!(
+        report["status"], "uncertain",
+        "a failed recovery fetch must be uncertain, not failed: {report}"
+    );
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("recovery fetch failed"),
+        "the error must name the failed recovery read: {report}"
+    );
+    // The merge actually landed despite the uncertainty — remote main is the
+    // exact granted merge (the hook applied it).
+    assert_eq!(
+        repo.remote_main(),
+        merged,
+        "the lost-ack push landed remotely"
+    );
+    // The reachability pin is KEPT (uncertain is not a failure; the merge may
+    // be on the remote and must not be garbage-collected).
+    let pin_ref = format!("refs/remuda/merge/topic/{base}");
+    let pin_check = git_command(&repo.root)
+        .args(["rev-parse", "--verify", &pin_ref])
+        .output()
+        .unwrap();
+    assert!(
+        pin_check.status.success(),
+        "uncertain land must keep the merge reachability pin {pin_ref}: {}",
+        String::from_utf8_lossy(&pin_check.stderr)
+    );
+}
+
+/// r15 item 1 (R5): the push landed server-side but the client saw a failure;
+/// the recovery fetch SUCCEEDS but the ancestry read (`merge-base
+/// --is-ancestor`) fails. Presence/absence cannot be established → uncertain,
+/// never a failed/base-moved verdict.
+#[test]
+fn a_lost_ack_with_a_failed_ancestry_read_is_uncertain() {
+    let repo = Repo::new();
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+
+    install_lost_ack_hook(&repo.origin);
+    let wrapper_dir = install_failing_git_wrapper(repo.root.parent().unwrap(), "merge-base");
+    let wrapped_path = format!(
+        "{}:{}",
+        wrapper_dir.display(),
+        std::env::var("PATH").unwrap()
+    );
+
+    let (output, report) = repo.merge(
+        &["--land", "--onto", "main", "--report", &merged],
+        &[("PATH", wrapped_path.as_str())],
+    );
+    assert_exit(&output, &report, 4);
+    assert_eq!(
+        report["status"], "uncertain",
+        "a failed ancestry read must be uncertain: {report}"
+    );
+    assert_eq!(
+        repo.remote_main(),
+        merged,
+        "the lost-ack push landed remotely"
+    );
+}
+
+/// r15 item 1 (R5) companion: a recovery that ESTABLISHES absence (fetch works,
+/// the merge is not on the remote, remote main is still the expected base) is a
+/// genuine push rejection — `gate_failed` (exit 1), not uncertain. Unknown is
+/// only for reads that cannot establish a fact.
+#[test]
+fn an_established_rejection_with_remote_unchanged_is_failed_not_uncertain() {
+    let repo = Repo::new();
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+    let base = repo.base.clone();
+
+    // A pre-receive hook that refuses WITHOUT moving the ref: the remote stays
+    // at the expected base, so absence is established and the rejection is real.
+    let hook_dir = repo.origin.join("hooks");
+    fs::create_dir_all(&hook_dir).unwrap();
+    let hook = hook_dir.join("pre-receive");
+    fs::write(&hook, "#!/bin/sh\necho \"policy: rejected\" >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (output, report) = repo.merge(&["--land", "--onto", "main", "--report", &merged], &[]);
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    assert_eq!(report["status"], "gate_failed", "{report}");
+    // Remote provably unchanged at the expected base.
+    assert_eq!(repo.remote_main(), base, "remote never moved");
+}
+
+/// r15 item 1 (R5): a granted land child whose start barrier is not released
+/// (an unreadable/closed fd) exits BEFORE touching git — it must never run a
+/// push as an unfenced child. The CLI exits 4 without a report.
+#[test]
+fn a_land_child_refuses_to_run_without_a_released_start_barrier() {
+    let repo = Repo::new();
+    // fd 99 is not open in the child: read(2) fails EBADF → immediate refusal.
+    let output = repo
+        .command()
+        .args(["merge", "topic", "--json", "--gate", "--onto", "main"])
+        .env("REMUDA_START_BARRIER_FD", "99")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "barrier read failure must exit 4: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("start barrier"),
+        "the refusal must name the start barrier: {stderr}"
+    );
+    // Nothing ran: no merge commit, remote unchanged.
+    assert_eq!(repo.remote_main(), repo.base);
+}
+
 /// r14 item 6: local main moving between verification and the land is a
 /// structured `base_moved(expected, current)` (exit 2), not an ordinary
 /// `gate_failed` (exit 1). The pinned report is loaded first; the land CAS then

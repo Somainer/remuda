@@ -103,3 +103,40 @@ it("logout rotates the anon epoch even while storage cannot persist it (no cache
   setItem.mockRestore();
   vi.resetModules();
 });
+
+it("GATE31 item 3: another tab's logout tombstone/rotation drops this page's cached anon epoch — it never republishes the deleted id", async () => {
+  clearSession();
+  localStorage.clear();
+  vi.resetModules();
+  const mod = await import("./session");
+  const KEY = "runtime.outbox-auth-epoch";
+  const e1 = mod.readAuthEpoch();
+  expect(localStorage.getItem(KEY)).toBe(e1);
+
+  // A SECOND document logs out: it writes the empty tombstone and the browser
+  // delivers a storage event to this page.
+  localStorage.setItem(KEY, "");
+  window.dispatchEvent(new StorageEvent("storage", { key: KEY, newValue: "", oldValue: e1 }));
+  // Read-before-use sees the tombstone: fresh epoch, old id not republished.
+  const e2 = mod.readAuthEpoch();
+  expect(e2).toBeTruthy();
+  expect(e2).not.toBe(e1);
+  expect(localStorage.getItem(KEY)).toBe(e2);
+
+  // The other document then establishes its OWN new epoch (rotation while
+  // live); the storage event syncs this page's cache, and a read returns the
+  // remote id rather than re-writing the local one.
+  const e3 = `epoch_remote_${Math.random().toString(36).slice(2)}`;
+  localStorage.setItem(KEY, e3);
+  window.dispatchEvent(new StorageEvent("storage", { key: KEY, newValue: e3, oldValue: e2 }));
+  expect(mod.readAuthEpoch()).toBe(e3);
+  expect(localStorage.getItem(KEY)).toBe(e3);
+
+  // A second logout tombstone rotates again and is never republished.
+  localStorage.setItem(KEY, "");
+  window.dispatchEvent(new StorageEvent("storage", { key: KEY, newValue: "", oldValue: e3 }));
+  const e4 = mod.readAuthEpoch();
+  expect(e4).not.toBe(e3);
+  expect(localStorage.getItem(KEY)).toBe(e4);
+  vi.resetModules();
+});

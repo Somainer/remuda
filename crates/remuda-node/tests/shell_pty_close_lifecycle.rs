@@ -1023,3 +1023,200 @@ async fn a_returned_poller_does_not_block_a_promoted_close() {
              and completes once the group is gone",
         );
 }
+
+/// c-ctxusage r17 item 3 (direct): a handoff oneshot that is CANCELED (its
+/// sender is dropped without sending, as a concurrent close re-arming the
+/// barrier would do) is not an acknowledgement. The close must stay
+/// retryable and signal nothing; a later close with a fresh barrier
+/// completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_canceled_close_barrier_is_retryable_not_acknowledged() {
+    use remuda_driver::test_faults::TranscriptFaults;
+    use std::io::Write;
+
+    let (_dir, workspace, transcript, driver) = p1_promoted_layout();
+    let driver = std::sync::Arc::new(driver);
+    let faults = TranscriptFaults::new();
+    driver.set_test_faults(faults.clone());
+
+    let handle = driver
+        .start(spec_for(&workspace, DriverKind::ShellPty))
+        .await
+        .expect("start");
+    let mut events_rx = handle.into_events();
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
+    let drainer = tokio::spawn(async move {
+        while let Some(observation) = events_rx.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+                && native.native_name == "transcript_bound"
+                && let Some(tx) = bound_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(20), bound_rx)
+        .await
+        .expect("the seeded replay never bound")
+        .expect("bound oneshot closed without firing");
+
+    // Park the next normal tick in its blocking collect, then start a close
+    // that waits on the handoff barrier.
+    faults.arm_pump_gate();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .expect("open transcript for append");
+    file.write_all(filler("cancel", 9002).as_bytes())
+        .expect("append fresh record");
+    file.sync_all().expect("sync append");
+    drop(file);
+    assert!(
+        faults.wait_pump_entered(),
+        "the post-bind normal-tick collect never parked"
+    );
+    let close = tokio::spawn({
+        let driver = driver.clone();
+        async move { driver.close().await }
+    });
+    assert!(
+        faults.wait_close_barrier_waiting_for(Duration::from_secs(15)),
+        "close never parked at the poller handoff barrier"
+    );
+
+    // Drop the barrier sender without an ack (the concurrent-close shape),
+    // then release the parked poll. The Canceled must surface as a retryable
+    // error, never as "acknowledged".
+    assert!(
+        driver.test_cancel_close_barrier().await,
+        "no handoff sender was installed"
+    );
+    faults.release();
+    let first = tokio::time::timeout(Duration::from_secs(15), close)
+        .await
+        .expect("the first close hung past its bound")
+        .expect("the close task panicked");
+    assert!(
+        matches!(first, Err(remuda_driver::DriverError::WriterStillLive(_))),
+        "a Canceled handoff is not an ack; close stays retryable, got {first:?}"
+    );
+
+    // A fresh close arms a new barrier the live poller observes and completes.
+    tokio::time::timeout(Duration::from_secs(20), driver.close())
+        .await
+        .expect("the retried close hung past its bound")
+        .expect("the retried close completes with a fresh handoff barrier");
+
+    driver.abort_event_workers_for_test().await;
+    tokio::time::timeout(Duration::from_secs(30), drainer)
+        .await
+        .expect("event channel never closed")
+        .expect("event drainer panicked");
+}
+
+/// c-ctxusage r17 item 3 (serialization): two closes started while a normal
+/// poll is parked must not arm two handoff barriers on the same drain — the
+/// second arm would cancel the first close's oneshot and both stop ladders
+/// would race the writer. The second close queues behind the first; after
+/// the pump releases both complete and the writer's termination usage is
+/// delivered exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_promoted_closes_share_one_handoff_and_stop_once() {
+    use remuda_driver::test_faults::TranscriptFaults;
+    use std::io::Write;
+
+    let (_dir, workspace, transcript, driver) = p1_promoted_layout();
+    let driver = std::sync::Arc::new(driver);
+    let faults = TranscriptFaults::new();
+    // Keep a timed-out handoff short if the teardown race parks the second
+    // close on a barrier the retiring poller can no longer ack.
+    faults.arm_close_barrier_timeout(Duration::from_millis(1200));
+    driver.set_test_faults(faults.clone());
+
+    let handle = driver
+        .start(spec_for(&workspace, DriverKind::ShellPty))
+        .await
+        .expect("start");
+    let mut events_rx = handle.into_events();
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
+    let term_count = Arc::new(AtomicUsize::new(0));
+    let drainer_count = Arc::clone(&term_count);
+    let drainer = tokio::spawn(async move {
+        while let Some(observation) = events_rx.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+                && native.native_name == "transcript_bound"
+                && let Some(tx) = bound_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+            if let ObservationPayload::Usage(payload) = &observation.body
+                && payload.scope_id == TERMINATION_MSG_ID
+            {
+                drainer_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(20), bound_rx)
+        .await
+        .expect("the seeded replay never bound")
+        .expect("bound oneshot closed without firing");
+
+    faults.arm_pump_gate();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .expect("open transcript for append");
+    file.write_all(filler("concurrent", 9003).as_bytes())
+        .expect("append fresh record");
+    file.sync_all().expect("sync append");
+    drop(file);
+    assert!(
+        faults.wait_pump_entered(),
+        "the post-bind normal-tick collect never parked"
+    );
+
+    let first = tokio::spawn({
+        let driver = driver.clone();
+        async move { driver.close().await }
+    });
+    assert!(
+        faults.wait_close_barrier_waiting_for(Duration::from_secs(15)),
+        "the first close never parked at the handoff barrier"
+    );
+    let second = tokio::spawn({
+        let driver = driver.clone();
+        async move { driver.close().await }
+    });
+
+    // While the first handoff is unresolved the second close must be queued
+    // behind it: no second barrier arm (the old code armed immediately,
+    // canceling the first close's oneshot).
+    assert!(
+        !faults.wait_close_barrier_arms(2, Duration::from_millis(800)),
+        "a concurrent close armed a second handoff barrier"
+    );
+
+    faults.release();
+    for (name, task) in [("first", first), ("second", second)] {
+        tokio::time::timeout(Duration::from_secs(40), task)
+            .await
+            .unwrap_or_else(|_| panic!("the {name} close timed out"))
+            .unwrap_or_else(|e| panic!("the {name} close task panicked: {e:?}"))
+            .unwrap_or_else(|e| panic!("the {name} close failed: {e:?}"));
+    }
+
+    driver.abort_event_workers_for_test().await;
+    tokio::time::timeout(Duration::from_secs(30), drainer)
+        .await
+        .expect("event channel never closed")
+        .expect("event drainer panicked");
+    assert_eq!(
+        term_count.load(Ordering::SeqCst),
+        1,
+        "the writer was stopped once: a single termination usage across both closes"
+    );
+}

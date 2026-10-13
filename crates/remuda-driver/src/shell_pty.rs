@@ -471,6 +471,13 @@ pub struct ShellPtyDriver {
     bindings: promotion::BindingHandle,
     /// Promotion poller, stopped on close.
     poller: Mutex<Option<JoinHandle<()>>>,
+    /// One close owner for the whole close (c-ctxusage r17 item 3): an
+    /// overlapping close queues here instead of interleaving a second close
+    /// body — two bodies used to arm two LiveDrain handoff barriers, the
+    /// second arm cancelling the first close's oneshot, which was wrongly
+    /// treated as an acknowledgement so two stop ladders raced the writer.
+    /// The guard drops on every early `?`, so a failed close stays retryable.
+    close_phase: tokio::sync::Mutex<()>,
     /// Cooperative-shutdown signal for the promotion poller and the channel its
     /// `finish()` completes on (c-ctxusage r5 item 6): close waits for the last
     /// hydrator finalise instead of aborting mid-pump.
@@ -585,6 +592,20 @@ impl ShellPtyDriver {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = drain;
     }
 
+    /// Test-only: drop the close handoff sender the current drain holds
+    /// WITHOUT firing it, so the waiting close receives a Canceled — exactly
+    /// what a concurrent close re-arming the barrier used to produce. Canceled
+    /// is not an ack: the close must stay retryable (c-ctxusage r17 item 3).
+    #[cfg(feature = "test-faults")]
+    pub async fn test_cancel_close_barrier(&self) -> bool {
+        let drain = self
+            .live_drain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        drain.cancel_close_barrier().await
+    }
+
     /// Test-only: whether the spawned promotion poller task has already
     /// RETURNED while its slot is still occupied (its observation receiver
     /// was dropped, so events closed and the loop exited). `None` means no
@@ -667,6 +688,7 @@ impl ShellPtyDriver {
             status: Arc::new(std::sync::Mutex::new(None)),
             bindings: promotion::BindingHandle::empty(),
             poller: Mutex::new(None),
+            close_phase: tokio::sync::Mutex::new(()),
             poller_shutdown: Mutex::new(None),
             poller_finalised: Mutex::new(None),
             live_drain: std::sync::Mutex::new(promotion::LiveDrain::new()),
@@ -1699,7 +1721,20 @@ impl ShellPtyDriver {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        // Concurrent closes are serialized by close()'s close_phase guard, so
+        // no other close can re-arm this drain barrier while this one is in
+        // flight: a re-arm used to drop this wait's oneshot sender and the
+        // resulting Canceled was wrongly read as an ack (c-ctxusage r17
+        // item 3).
         let close_barrier = drain.arm_close().await;
+        if let Some(faults) = self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+        {
+            faults.note_close_barrier_armed();
+        }
         // The handoff barrier exists to serialize with an IN-FLIGHT poll. The
         // slot being occupied only means a poller was SPAWNED; the task may
         // already have RETURNED — its observation receiver was dropped, so
@@ -1739,51 +1774,65 @@ impl ShellPtyDriver {
                 .as_deref()
                 .and_then(crate::test_faults::FaultState::close_barrier_timeout)
                 .unwrap_or(PROMOTER_CLOSE_BARRIER);
-            if tokio::time::timeout(barrier_bound, close_barrier)
-                .await
-                .is_err()
-            {
-                // The poller never reached the closing branch. Two cases:
-                //
-                // 1. A blocking collect is genuinely parked (in production a
-                //    stalled collect; in tests the injected pump gate). Close
-                //    must still complete: run the writer stop ladder below,
-                //    and let the poller teardown abort the parked task with
-                //    its FinaliseGuard rescue — the collected frames cannot
-                //    demote/finalise from inside a parked collect.
-                //
-                // 2. The poller is observing a DIFFERENT drain (the
-                //    start_resumed foreign-drain defect): nothing is parked,
-                //    so keep the close retryable rather than racing a live
-                //    normal poll.
-                let parked_pump = self
-                    .test_faults
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .as_deref()
-                    .is_some_and(crate::test_faults::FaultState::pump_gate_holds);
-                // A task that finished while close waited (its event receiver
-                // closed mid-barrier) has no in-flight poll either; its
-                // handoff is satisfied and the writer must be signalled.
-                let poller_finished = self
-                    .poller
-                    .lock()
-                    .await
-                    .as_ref()
-                    .is_some_and(tokio::task::JoinHandle::is_finished);
-                if !parked_pump && !poller_finished {
+            match tokio::time::timeout(barrier_bound, close_barrier).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_canceled)) => {
+                    // The sender was dropped WITHOUT sending. With closes
+                    // serialized this can only be a drain replacement (a
+                    // resumed/foreign drain) or a test fault, never an ack:
+                    // signal nothing and stay retryable, and the next close
+                    // arms a fresh barrier (c-ctxusage r17 item 3).
                     tracing::warn!(
-                        "promoted close barrier was not acknowledged; close stays retryable"
+                        "promoted close handoff barrier was canceled without an \
+                         acknowledgement; close stays retryable"
                     );
                     return Err(DriverError::WriterStillLive(
-                        "the poller never acknowledged the close handoff barrier".into(),
+                        "the close handoff barrier was canceled without an acknowledgement".into(),
                     ));
                 }
-                tracing::warn!(
-                    "promoted close barrier timed out against a parked blocking collect \
-                     or a poller that exited mid-barrier; proceeding to the stop ladder \
-                     (and the poller abort-rescue path when it is still parked)"
-                );
+                Err(_elapsed) => {
+                    // The poller never reached the closing branch. Two cases:
+                    //
+                    // 1. A blocking collect is genuinely parked (in production a
+                    //    stalled collect; in tests the injected pump gate). Close
+                    //    must still complete: run the writer stop ladder below,
+                    //    and let the poller teardown abort the parked task with
+                    //    its FinaliseGuard rescue — the collected frames cannot
+                    //    demote/finalise from inside a parked collect.
+                    //
+                    // 2. The poller is observing a DIFFERENT drain (the
+                    //    start_resumed foreign-drain defect): nothing is parked,
+                    //    so keep the close retryable rather than racing a live
+                    //    normal poll.
+                    let parked_pump = self
+                        .test_faults
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .as_deref()
+                        .is_some_and(crate::test_faults::FaultState::pump_gate_holds);
+                    // A task that finished while close waited (its event receiver
+                    // closed mid-barrier) has no in-flight poll either; its
+                    // handoff is satisfied and the writer must be signalled.
+                    let poller_finished = self
+                        .poller
+                        .lock()
+                        .await
+                        .as_ref()
+                        .is_some_and(tokio::task::JoinHandle::is_finished);
+                    if !parked_pump && !poller_finished {
+                        tracing::warn!(
+                            "promoted close barrier was not acknowledged; close stays retryable"
+                        );
+                        return Err(DriverError::WriterStillLive(
+                            "the poller never acknowledged the close handoff barrier".into(),
+                        ));
+                    }
+                    tracing::warn!(
+                        "promoted close barrier timed out against a parked blocking collect \
+                         or a poller that exited mid-barrier; proceeding to the stop ladder \
+                         (and the poller abort-rescue path when it is still parked)"
+                    );
+                }
             }
         }
         let outcome = self.stop_tree(&state, true).await;
@@ -3040,6 +3089,17 @@ impl Driver for ShellPtyDriver {
     /// not, that is journaled as `stop-incomplete`; §5.3 step 4 forbids
     /// reporting `exited` over a process tree that is still there.
     async fn close(&self) -> DriverResult<DriverAck> {
+        // c-ctxusage r17 item 3: one close owner for the WHOLE close, matching
+        // claude_pty's close_phase. An overlapping close (a purge racing the
+        // queued instance.close) used to interleave two close bodies: the
+        // second re-armed the LiveDrain handoff barrier, dropping the first
+        // close's oneshot sender, and the resulting Canceled was read as an
+        // ack — so two stop ladders raced the same native writer. The queued
+        // close settles here after the owner finishes, finding the teardown
+        // already done (all phases are take-based/idempotent). The guard drops
+        // on the retryable `?` early return below, so a failed close stays
+        // resumable rather than blocking every later attempt.
+        let _close_guard = self.close_phase.lock().await;
         // Is a promoted native agent live in the foreground? The native writer
         // must be verified gone BEFORE anything is torn down.
         //

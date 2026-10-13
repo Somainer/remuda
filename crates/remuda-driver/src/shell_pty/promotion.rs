@@ -814,6 +814,14 @@ impl LiveDrain {
         self.closing.load(Ordering::SeqCst)
     }
 
+    /// Test-only: drop the installed handoff sender WITHOUT firing it — the
+    /// Canceled a concurrent close re-arming the barrier would produce
+    /// (c-ctxusage r17 item 3). Returns whether a sender was installed.
+    #[cfg(feature = "test-faults")]
+    pub(super) async fn cancel_close_barrier(&self) -> bool {
+        self.close_barrier.lock().await.take().is_some()
+    }
+
     /// Poller side of the handoff barrier: fire once per arm when it enters
     /// the non-terminal closing branch, BEFORE the tail collect, so close only
     /// runs the stop ladder once no normal poll (sample/demote/finalise) is in

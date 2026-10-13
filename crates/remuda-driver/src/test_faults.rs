@@ -134,6 +134,12 @@ pub(crate) struct FaultState {
     /// c-ctxusage r16 item 6).
     close_barrier_waiting: Mutex<bool>,
     close_barrier_waiting_cv: Condvar,
+    /// Number of times a promoted close ARMED the poller handoff barrier.
+    /// Concurrent closes are serialized on the poller slot, so a second
+    /// close must not arm until the first handoff is resolved (c-ctxusage
+    /// r17 item 3).
+    close_barrier_arms: Mutex<u64>,
+    close_barrier_arms_cv: Condvar,
 }
 
 /// A parked phase must never wait forever on a test that forgot to release:
@@ -185,6 +191,8 @@ impl FaultState {
             promoted_stop_incomplete_attempts: AtomicU64::new(0),
             close_barrier_waiting: Mutex::new(false),
             close_barrier_waiting_cv: Condvar::new(),
+            close_barrier_arms: Mutex::new(0),
+            close_barrier_arms_cv: Condvar::new(),
         })
     }
 
@@ -434,6 +442,19 @@ impl FaultState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *waiting = true;
         self.close_barrier_waiting_cv.notify_all();
+    }
+
+    /// Note one promoted close arming the poller handoff barrier. The
+    /// serialization test waits on this counter to prove a concurrent close
+    /// does not arm a second barrier while the first handoff is unresolved
+    /// (c-ctxusage r17 item 3).
+    pub(crate) fn note_close_barrier_armed(&self) {
+        let mut arms = self
+            .close_barrier_arms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *arms += 1;
+        self.close_barrier_arms_cv.notify_all();
     }
 
     /// Acknowledge that the streaming flusher exited. A test holding a
@@ -752,6 +773,23 @@ impl TranscriptFaults {
             &self.inner.close_barrier_waiting_cv,
             timeout,
         )
+    }
+
+    /// Whether `n` promoted closes armed the handoff barrier within
+    /// `timeout` (c-ctxusage r17 item 3): a concurrent close serialized
+    /// behind the first must not arm until the first handoff resolves.
+    pub fn wait_close_barrier_arms(&self, n: u64, timeout: Duration) -> bool {
+        let guard = self
+            .inner
+            .close_barrier_arms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (guard, _) = self
+            .inner
+            .close_barrier_arms_cv
+            .wait_timeout_while(guard, timeout, |arms| *arms < n)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard >= n
     }
 
     /// Block until the streaming flusher acknowledges it drained and parked

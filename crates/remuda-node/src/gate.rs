@@ -658,6 +658,20 @@ fn canceled_before_run(registry: &GateRegistry, job_id: &str, generation: u32) -
     result
 }
 
+/// r16 item 1 test-only fault for granted-land fence persistence. The fence
+/// closure signals `entered`, parks on the `release` condvar (the spawned land
+/// child is blocked on its start barrier the whole time), and then fails or
+/// succeeds.
+#[cfg(any(test, feature = "test-faults"))]
+pub struct LandFenceFault {
+    /// Signalled once the persistence closure has entered.
+    pub(crate) entered: Arc<tokio::sync::Notify>,
+    /// Set the bool and notify to release the parked persistence.
+    pub(crate) release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    /// Make the persistence FAIL after the hold releases.
+    pub(crate) fail: bool,
+}
+
 /// Lane locks, running jobs and the per-Node event uplink.
 pub(crate) struct GateRegistry {
     /// laneId → one slot; a held slot rejects a second run (`lane-busy`).
@@ -684,6 +698,15 @@ pub(crate) struct GateRegistry {
     /// authority decision still runs through the real Hub.
     #[cfg(any(test, feature = "test-faults"))]
     merge_bin: Mutex<Option<std::path::PathBuf>>,
+    /// r16 item 1 test-only: the NEXT granted-land fence persistence parks
+    /// (the spawned land child blocked on its start barrier) until the fault is
+    /// released, then fails or succeeds. One-shot.
+    #[cfg(any(test, feature = "test-faults"))]
+    land_fence_fault: std::sync::Mutex<Option<LandFenceFault>>,
+    /// r16 item 1 test-only: force the land child's start-barrier setup to fail
+    /// so the "refuse to spawn, report uncertain" arm can be exercised.
+    #[cfg(any(test, feature = "test-faults"))]
+    force_barrier_fault: std::sync::Mutex<bool>,
     /// Durable ledger directory for granted LAND process groups (r14 R1). One
     /// record per granted land, written right after the land child spawns and
     /// removed only once the whole group is verified gone. A leftover record
@@ -720,6 +743,10 @@ impl GateRegistry {
             land_timeout: Mutex::new(None),
             #[cfg(any(test, feature = "test-faults"))]
             merge_bin: Mutex::new(None),
+            #[cfg(any(test, feature = "test-faults"))]
+            land_fence_fault: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "test-faults"))]
+            force_barrier_fault: std::sync::Mutex::new(false),
             land_fence_dir,
             events,
         })
@@ -773,10 +800,98 @@ impl GateRegistry {
     /// release (SIGCONT) the land child until the fence is durable.
     #[cfg(unix)]
     fn record_land_group(&self, job_id: &str, generation: u32, pgid: i32) -> std::io::Result<()> {
+        // r16 item 1: the injected hold/fail runs while the spawned child is
+        // parked on its start barrier, before the real fence write.
+        #[cfg(any(test, feature = "test-faults"))]
+        self.run_land_fence_fault()?;
         let identity = sample_leader_identity(pgid).ok_or_else(|| {
             std::io::Error::other("could not read the land leader's start-time identity")
         })?;
         write_land_fence(&self.land_fence_dir, job_id, generation, pgid, &identity)
+    }
+
+    /// r16 item 1 test-only: arm the one-shot land-fence persistence hold/fail.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn set_land_fence_fault(&self, fault: LandFenceFault) {
+        *self
+            .land_fence_fault
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(fault);
+    }
+
+    /// r16 item 1 test-only: force the land start-barrier setup to fail.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn set_force_barrier_fault(&self, on: bool) {
+        *self
+            .force_barrier_fault
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = on;
+    }
+
+    #[cfg(any(test, feature = "test-faults"))]
+    fn barrier_setup_fault(&self) -> bool {
+        *self
+            .force_barrier_fault
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Build the land child's one-shot start barrier (or a Failed variant the
+    /// caller refuses to spawn on).
+    #[cfg(unix)]
+    fn make_land_start_barrier(&self) -> LandStartBarrier {
+        #[cfg(any(test, feature = "test-faults"))]
+        if self.barrier_setup_fault() {
+            return LandStartBarrier::failed(std::io::Error::other(
+                "injected land start-barrier setup failure",
+            ));
+        }
+        match LandStartBarrier::new() {
+            Ok(barrier) => barrier,
+            Err(error) => LandStartBarrier::failed(error),
+        }
+    }
+
+    /// Run the one-shot fence-persistence fault: signal `entered`, park until
+    /// `release`, then fail or pass. Sync-only (the fence closure runs inline
+    /// on the async worker), so the latch is a condvar, not an async wait.
+    #[cfg(any(test, feature = "test-faults"))]
+    fn run_land_fence_fault(&self) -> std::io::Result<()> {
+        let Some(fault) = self
+            .land_fence_fault
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        else {
+            return Ok(());
+        };
+        fault.entered.notify_one();
+        let mut guard = fault
+            .release
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while !*guard {
+            let (next, wait) = fault
+                .release
+                .1
+                .wait_timeout(guard, Duration::from_secs(30))
+                .unwrap_or_else(|poison| poison.into_inner());
+            guard = next;
+            if wait.timed_out() {
+                return Err(std::io::Error::other(
+                    "test land-fence persistence hold was never released",
+                ));
+            }
+        }
+        drop(guard);
+        if fault.fail {
+            Err(std::io::Error::other(
+                "injected land fence persistence failure",
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// The land leader has already been reaped by the caller. Finish off any
@@ -1099,6 +1214,22 @@ impl DevNode {
     #[cfg(any(test, feature = "test-faults"))]
     pub async fn gate_test_set_merge_bin(&self, bin: std::path::PathBuf) {
         self.gate_registry().set_merge_bin(bin).await;
+    }
+
+    /// Test-only (r16 item 1): arm the one-shot granted-land fence
+    /// persistence hold/failure while the spawned child sits on its barrier.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_set_land_fence_fault(&self, fault: LandFenceFault) {
+        self.gate_registry().set_land_fence_fault(fault);
+    }
+
+    /// Test-only (r16 item 1): force the granted-land start-barrier setup to
+    /// fail so the node refuses to spawn the land child and reports uncertain.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_set_force_barrier_fault(&self, on: bool) {
+        self.gate_registry().set_force_barrier_fault(on);
     }
 
     /// Dispatch one Hub→Node gate RPC by method name.
@@ -1856,21 +1987,13 @@ impl DevNode {
             if !request.push {
                 land_args.push("--no-push".into());
             }
+            // r16 item 1: assemble the COMPLETE child environment BEFORE the
+            // start barrier is wired. The barrier env used to be set first and
+            // `.env_clear()` below wiped it, so the land CLI never saw
+            // REMUDA_START_BARRIER_FD, ran unblocked, and the "durable fence
+            // before exec" guarantee was fictional.
             let land_child_env = gate_run_child_env(request, &host_env_snapshot());
             let mut land_command = Command::new(&binary);
-            #[cfg(unix)]
-            let land_start_barrier: Option<LandStartBarrier> = {
-                let mut barrier = match LandStartBarrier::new() {
-                    Ok(barrier) => barrier,
-                    Err(error) => LandStartBarrier::failed(error),
-                };
-                let ready = matches!(barrier, LandStartBarrier::Ready { .. });
-                land_command.stdin(barrier.take_child_stdin());
-                if ready {
-                    land_command.env(REMUDA_START_BARRIER_FD, "0");
-                }
-                Some(barrier)
-            };
             land_command
                 .args(&land_args)
                 .current_dir(&repo)
@@ -1881,15 +2004,58 @@ impl DevNode {
                 .kill_on_drop(false);
             #[cfg(unix)]
             land_command.process_group(0);
+            // r16 item 1: the barrier is configured ONLY after the environment
+            // is final. If the barrier cannot be made Ready there is NO SAFE
+            // CHILD TO SPAWN: refuse to start it at all and report UNCERTAIN
+            // (the grant is held; the Hub reconciles the exact merge against
+            // the remote). The old code spawned anyway with no barrier env —
+            // an unblocked pusher — and then reported a definite "failed".
+            #[cfg(unix)]
+            let land_start_barrier: Option<LandStartBarrier> = {
+                match registry.make_land_start_barrier() {
+                    mut ready @ LandStartBarrier::Ready { .. } => {
+                        land_command.stdin(ready.take_child_stdin());
+                        land_command.env(REMUDA_START_BARRIER_FD, "0");
+                        Some(ready)
+                    }
+                    LandStartBarrier::Failed(error) => {
+                        land_command.stdin(Stdio::null());
+                        tracing::error!(
+                            %error,
+                            "land child-start barrier unavailable; refusing to spawn the land child"
+                        );
+                        None
+                    }
+                }
+            };
             #[cfg(not(unix))]
             let land_start_barrier: Option<()> = None;
-            let mut land_child = match land_command.spawn() {
-                Ok(child) => child,
-                Err(error) => {
-                    result.status = "failed".into();
-                    result.error = Some(format!("spawn land child: {error}"));
-                    attach_failure_evidence(&mut result, &trace, request.keep_logs);
-                    return finalize(result);
+            #[cfg(unix)]
+            let barrier_ready = land_start_barrier.is_some();
+            #[cfg(not(unix))]
+            let barrier_ready = true;
+            let mut land_child = if !barrier_ready {
+                result.status = "uncertain".into();
+                result.error = Some(
+                    "the land child-start barrier could not be created; the granted land child was \
+                     NOT started (nothing pushed); the Hub reconciles the granted merge against the \
+                     remote"
+                        .into(),
+                );
+                result.reason = Some(
+                    "land child-start barrier unavailable; child not spawned; push outcome uncertain"
+                        .into(),
+                );
+                return finalize(result);
+            } else {
+                match land_command.spawn() {
+                    Ok(child) => child,
+                    Err(error) => {
+                        result.status = "failed".into();
+                        result.error = Some(format!("spawn land child: {error}"));
+                        attach_failure_evidence(&mut result, &trace, request.keep_logs);
+                        return finalize(result);
+                    }
                 }
             };
             // Record the land child's OWN process group so a timeout can kill
@@ -1908,9 +2074,10 @@ impl DevNode {
                     .unwrap_or_else(|poison| poison.into_inner()) = Some(pgid);
                 // The child is blocked on the barrier before user logic runs.
                 // Persist the fence BEFORE releasing it. On any barrier/fence
-                // failure drop the write end (EOF) and KILL the held child — an
-                // ESTABLISHED pre-push failure (it ran no git), never an
-                // unfenced orphan pusher (r15 R5).
+                // failure drop the write end (EOF) and KILL the held child — it
+                // ran no git. r16 item 1 / R5: the verdict is UNCERTAIN, never
+                // a definite "failed": the grant is already held by the Hub,
+                // which reconciles the exact granted merge against the remote.
                 if let Err(error) = barrier.release_after(|| {
                     registry.record_land_group(&request.job_id, request.generation, pgid)
                 }) {
@@ -1918,14 +2085,17 @@ impl DevNode {
                     use nix::unistd::Pid;
                     let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGKILL));
                     let _ = land_child.wait().await;
-                    result.status = "failed".into();
+                    result.status = "uncertain".into();
                     result.error = Some(format!(
                         "could not durably record the granted land group before releasing the land \
                          child ({error}); the child was held before start and killed, so nothing was \
-                         pushed"
+                         pushed; the Hub reconciles against the remote"
                     ));
-                    result.reason =
-                        Some("land fence persistence failed before child start; not pushed".into());
+                    result.reason = Some(
+                        "land fence persistence failed before child start; not pushed; outcome \
+                         uncertain"
+                            .into(),
+                    );
                     attach_failure_evidence(&mut result, &trace, request.keep_logs);
                     return finalize(result);
                 }
@@ -4058,6 +4228,192 @@ fi
                 .any(|line| line.contains("--land") && line.contains("--no-push")),
             "the land child must push: {argv}"
         );
+    }
+
+    /// The fake CLI speaks the production child-start barrier protocol: the
+    /// verify child must NOT see the barrier variable; the LAND child must see
+    /// REMUDA_START_BARRIER_FD=0, block on one stdin byte before any git work,
+    /// and exit 4 on EOF (the real `remuda merge` does exactly this).
+    const BARRIER_LAND_SCRIPT: &str = r#"
+dir=$(dirname "$0")
+echo "$*" >> "$dir/args.txt"
+base=$(git rev-parse main 2>/dev/null || echo "1111111111111111111111111111111111111111")
+head=$(git rev-parse wt/fake/task 2>/dev/null || echo "$base")
+if ! printf '%s\n' "$*" | grep -q -- '--land'; then
+  if [ "${REMUDA_START_BARRIER_FD+x}" = x ]; then
+    echo "verify child must not carry the start-barrier var" >&2
+    exit 97
+  fi
+  echo "{\"exitCode\":0,\"status\":\"verified\",\"base\":\"$base\",\"head\":\"$head\",\"merged\":\"$head\",\"steps\":[]}"
+  exit 0
+fi
+if [ "${REMUDA_START_BARRIER_FD-}" != "0" ]; then
+  echo "land child lost REMUDA_START_BARRIER_FD after env_clear" >&2
+  exit 98
+fi
+head -c 1 >/dev/null || { echo "start barrier closed before release" >&2; exit 4; }
+echo released > "$dir/released.marker"
+echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\":\"$head\",\"steps\":[]}"
+"#;
+
+    /// Read main from the fixture's REAL bare origin.
+    fn origin_main(fixture: &Fixture) -> String {
+        let origin = fixture._bare.path().join("origin.git");
+        String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["--git-dir", origin.to_str().unwrap(), "rev-parse", "main"])
+                .output()
+                .expect("read origin main")
+                .stdout,
+        )
+        .trim()
+        .to_owned()
+    }
+
+    /// r16 item 1: through the PRODUCTION spawn builder, the granted land
+    /// child survives env_clear with its start-barrier variable, parks on the
+    /// barrier while the durable fence write is LATCHED, and when that
+    /// persistence FAILS it is killed (never released) and the run reports
+    /// UNCERTAIN — never a definite failure — and nothing pushed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn land_fence_persistence_failure_holds_child_and_reports_uncertain() {
+        let fixture = fixture(BARRIER_LAND_SCRIPT);
+        let base_main = origin_main(&fixture);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        fixture
+            .node
+            .gate_registry()
+            .set_land_fence_fault(LandFenceFault {
+                entered: entered.clone(),
+                release: release.clone(),
+                fail: true,
+            });
+        let mut p = params(&fixture, "land");
+        p.push = false;
+        let node = fixture.node.clone();
+        let run = tokio::spawn(async move { node.run_gate_typed(p).await });
+        // The fence-persistence closure has ENTERED: the land child spawned
+        // and is parked behind its barrier (the release byte is unsent).
+        tokio::time::timeout(Duration::from_secs(15), entered.notified())
+            .await
+            .expect("the latched fence persistence was entered");
+        let argv_path = fixture.bin.parent().unwrap().join("args.txt");
+        // The child records argv immediately before parking on the barrier;
+        // wait for that line (the persistence latch fires as soon as the
+        // parent spawned, which can beat the child's first instruction).
+        let argv = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let text = std::fs::read_to_string(&argv_path).unwrap_or_default();
+                if text.lines().any(|line| line.contains("--land")) {
+                    break text;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the land child never recorded its argv: {text}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        assert!(
+            argv.lines().any(|line| line.contains("--land")),
+            "the land child spawned through the production builder: {argv}"
+        );
+        assert!(
+            !fixture
+                .bin
+                .parent()
+                .unwrap()
+                .join("released.marker")
+                .exists(),
+            "the child must not pass the barrier while the fence is unpersisted"
+        );
+        assert_eq!(
+            origin_main(&fixture),
+            base_main,
+            "nothing pushed while held"
+        );
+        // Release the latch as a PERSISTENCE FAILURE.
+        {
+            let (lock, cvar) = &*release;
+            let mut done = lock.lock().unwrap();
+            *done = true;
+            cvar.notify_one();
+        }
+        let result = tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("the run finished")
+            .expect("the run task joined")
+            .expect("run_gate returned");
+        assert_eq!(
+            result.status, "uncertain",
+            "a fence persistence failure with the child held is Unknown, never failed: {result:?}"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|text| text.contains("durably record")),
+            "the error names the fence persistence failure: {:?}",
+            result.error
+        );
+        assert!(
+            !fixture
+                .bin
+                .parent()
+                .unwrap()
+                .join("released.marker")
+                .exists(),
+            "the child must never be released after the fence failed"
+        );
+        assert_eq!(
+            origin_main(&fixture),
+            base_main,
+            "a fenced-off child never pushes"
+        );
+    }
+
+    /// r16 item 1: when the start barrier itself cannot be set up, the land
+    /// child is NOT SPAWNED AT ALL and the run reports UNCERTAIN (the Hub
+    /// reconciles the held grant), instead of spawning an unblocked pusher and
+    /// reporting a definite failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_start_barrier_setup_failure_refuses_to_spawn_and_reports_uncertain() {
+        let fixture = fixture(BARRIER_LAND_SCRIPT);
+        let base_main = origin_main(&fixture);
+        fixture.node.gate_registry().set_force_barrier_fault(true);
+        let mut p = params(&fixture, "land");
+        p.push = false;
+        let result = fixture.node.run_gate_typed(p).await.unwrap();
+        assert_eq!(
+            result.status, "uncertain",
+            "an uncreatable barrier means no spawn + Unknown: {result:?}"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|text| text.contains("NOT started")),
+            "the error states the child was not started: {:?}",
+            result.error
+        );
+        let argv = std::fs::read_to_string(fixture.bin.parent().unwrap().join("args.txt"))
+            .unwrap_or_default();
+        assert!(
+            !argv.lines().any(|line| line.contains("--land")),
+            "the land child must never spawn without a barrier: {argv}"
+        );
+        assert!(
+            !fixture
+                .bin
+                .parent()
+                .unwrap()
+                .join("released.marker")
+                .exists(),
+            "no land phase may run"
+        );
+        assert_eq!(origin_main(&fixture), base_main, "nothing was pushed");
     }
 
     /// A `pushFrom: home` land must stay a verify on the lane. Passing --land

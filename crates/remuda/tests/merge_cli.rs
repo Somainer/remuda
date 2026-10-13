@@ -1549,6 +1549,73 @@ fn a_land_child_refuses_to_run_without_a_released_start_barrier() {
     assert_eq!(repo.remote_main(), repo.base);
 }
 
+/// r16 item 1: with the REAL land CLI against a pinned verified report, the
+/// granted land child BLOCKS on the stdin release byte before any lock or git
+/// operation while the parent holds the pipe, and on EOF (the parent could not
+/// persist the fence) exits 4 without moving local main. This is the half the
+/// Node's production spawn builder relies on.
+#[test]
+fn a_released_barrier_gates_the_real_land_and_eof_aborts_before_main_moves() {
+    let repo = Repo::new();
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+    let main_before = repo.main();
+
+    let mut child = repo
+        .command()
+        .args([
+            "merge",
+            "topic",
+            "--land",
+            "--onto",
+            "main",
+            "--json",
+            "--report",
+            &merged,
+            "--no-push",
+        ])
+        .env("REMUDA_START_BARRIER_FD", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Bounded observation: the child stays ALIVE and main stays put the whole
+    // time the release byte is withheld — the barrier is ahead of locks/git.
+    let deadline = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < deadline {
+        match child.try_wait().unwrap() {
+            Some(status) => panic!("the land child must block on the barrier, exited {status}"),
+            None => assert_eq!(
+                repo.main(),
+                main_before,
+                "main moved while the barrier byte was withheld"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // EOF: the fence never became durable; the CLI must refuse without running.
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "barrier EOF on a granted land must exit 4: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("start barrier closed before release"),
+        "the refusal must name the closed barrier: {stderr}"
+    );
+    assert_eq!(
+        repo.main(),
+        main_before,
+        "an EOF-aborted land must never move local main"
+    );
+}
+
 /// r14 item 6: local main moving between verification and the land is a
 /// structured `base_moved(expected, current)` (exit 2), not an ordinary
 /// `gate_failed` (exit 1). The pinned report is loaded first; the land CAS then

@@ -13,7 +13,7 @@ workspace = true
 [features]
 default = []
 # In-process FakeDriver for Node/Web loopback. Not installed in release images.
-test-stub = []
+test-stub = ["remuda-claude-wire/test-stub"]
 # Deterministic close/abort fault injection for integration tests. Never
 # enabled by release binaries; dev-dependencies only.
 test-faults = []
@@ -47,8 +47,17 @@ zeroize = "1.9"
 # reach everything the session started, and `std` can only signal a direct
 # child. Unix-only, matching the `tcgetpgrp` identity path this pairs with;
 # `remuda-node` already depends on the same version for its access probe.
+# The "event" feature supplies the safe kqueue wrapper for the r15 item-2
+# child-exit wait on macOS; "pthread" supplies the safe thread-directed
+# `pthread_kill` for the r16 item-2 EINTR regression.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.28", features = ["process", "signal"] }
+nix = { version = "0.28", features = ["process", "signal", "event", "pthread"] }
+
+# r15 item 2: the event-driven child-exit wait parks on pidfd/poll (safe
+# wrappers; the workspace forbids `unsafe`, and nix 0.28 has no pidfd
+# binding). Linux devboxes only — the macOS arm uses nix's kqueue above.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["process", "event"] }
 
 [dev-dependencies]
 # Enable the test-only surface (`StdoutMapper`) for this crate's own
@@ -57,3 +66,9 @@ remuda-driver = { path = ".", features = ["test-stub"] }
 remuda-testing.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# r16 item 2: install a SAFE empty SIGUSR1 handler for the EINTR regression
+# (the workspace forbids `unsafe`, so nix's unsafe `sigaction` is off-limits;
+# ppoll(2) returns EINTR even with the registry's SA_RESTART). Unix only.
+[target.'cfg(unix)'.dev-dependencies]
+signal-hook = "0.3"

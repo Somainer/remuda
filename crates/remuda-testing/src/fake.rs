@@ -57,6 +57,33 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
     // 64-slot writer channel, which is what made `close_stdin` itself able to
     // hang — a behaviour the close ladder has to bound.
     let stop_reading = std::env::var("FAKE_CLAUDE_STOP_READING").is_ok_and(|value| value == "1");
+    // `FAKE_CLAUDE_CLOSE_STDIN=1`: after the handshake, CLOSE our stdin fd and
+    // keep running with stdout open. The parent's next write then fails
+    // BrokenPipe while the process is still alive — unlike shutdown/EOF, which
+    // the driver itself initiates and maps to ControlUnavailable. This is the
+    // only way to exercise "the write itself errored" deterministically.
+    let close_stdin = std::env::var("FAKE_CLAUDE_CLOSE_STDIN").is_ok_and(|value| value == "1");
+    // `FAKE_CLAUDE_CLOSE_STDIN_AFTER_TURNS=<n>`: behave normally (answer turns)
+    // for the first n POST-handshake inbound frames, then close stdin and park
+    // alive. Turn n therefore completes normally while the NEXT prompt's write
+    // fails on the still-live child — the live-child write-failure after a
+    // successful earlier turn (ma-sdk-state r6 item 5).
+    let close_stdin_after_turns = std::env::var("FAKE_CLAUDE_CLOSE_STDIN_AFTER_TURNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    // `FAKE_CLAUDE_STDOUT_FLOOD=1`: after the handshake, never read stdin again
+    // and keep emitting frames on stdout forever. Bidirectional pipe pressure:
+    // the parent must keep draining stdout while a write is blocked on the
+    // full stdin pipe, otherwise close deadlocks.
+    let stdout_flood = std::env::var("FAKE_CLAUDE_STDOUT_FLOOD").is_ok_and(|value| value == "1");
+    // `FAKE_CLAUDE_STDIN_FILE=<path>`: append one marker per inbound frame in
+    // read order, so a test can assert the exact FIFO order the child saw
+    // (control-then-prompt, interrupt-then-prompt, …).
+    let stdin_file = std::env::var("FAKE_CLAUDE_STDIN_FILE").ok();
+    // r9 item 5: when set, write this marker file AFTER closing stdin (both the
+    // handshake-close and after-turn-close modes), so a test can await the
+    // closure deterministically before issuing the write that must fail.
+    let stdin_closed_file = std::env::var("FAKE_CLAUDE_STDIN_CLOSED_FILE").ok();
     if std::env::args()
         .skip(1)
         .any(|arg| arg == "--version" || arg == "-V")
@@ -89,6 +116,15 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
     // kill and is reaped only by the group signal.
     #[cfg(unix)]
     let _grandchild = spawn_group_grandchild();
+    // `FAKE_CLAUDE_SPARE_FRAME_TRIGGER=<path>` (ma-sdk-state r15 item 4):
+    // arm a background watcher that, once the trigger file appears (always
+    // after the handshake in practice — tests create it post-overflow),
+    // emits exactly ONE assistant frame on stdout. Lets a test make the child
+    // speak again after a reservation-triggered overflow has paused its
+    // shutdown.
+    if let Ok(path) = std::env::var("FAKE_CLAUDE_SPARE_FRAME_TRIGGER") {
+        spawn_spare_frame_trigger(path);
+    }
     let session_id = flags
         .session_id
         .clone()
@@ -108,6 +144,8 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
     session.emit_init()?;
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
+    // Count post-handshake inbound frames for CLOSE_STDIN_AFTER_TURNS.
+    let mut post_handshake_frames = 0usize;
     while let Some(line) = lines.next() {
         let line = line?;
         let trimmed = line.trim();
@@ -115,7 +153,71 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
             continue;
         }
         let incoming: Value = serde_json::from_str(trimmed)?;
-        session.handle_incoming(incoming, &mut lines)?;
+        if let Some(path) = &stdin_file {
+            record_stdin_marker(path, &incoming);
+        }
+        let was_initialized = session.saw_initialize;
+        // A late frame: the handshake response the caller must emit AFTER its
+        // post-frame hooks (CLOSE_STDIN closes fd 0 + writes the marker BEFORE
+        // the driver-visible success, so start() returning implies the read
+        // end is already shut — r10 item 5).
+        let late = session.handle_incoming(incoming, &mut lines)?;
+        // ma-sdk-state r6 item 5: after the Nth POST-handshake frame is fully
+        // handled (so its turn completed and its frames were emitted), close
+        // stdin and park alive — the NEXT prompt's write fails while this child
+        // stays up.
+        if was_initialized {
+            post_handshake_frames += 1;
+        }
+        if close_stdin_after_turns == Some(post_handshake_frames) && was_initialized {
+            #[cfg(unix)]
+            {
+                let _ = nix::unistd::close(0);
+            }
+            if let Some(path) = &stdin_closed_file {
+                let _ = std::fs::write(path, b"closed");
+            }
+            if let Some(frame) = late {
+                emit(&frame)?;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(300));
+            // Parked; the parent-death watch reaps us. Don't fall through to
+            // the ordinary late-frame emit (the frame was just emitted).
+            continue;
+        }
+        // ma-sdk-state r4 item 3 / r10 item 5: FAKE_CLAUDE_CLOSE_STDIN closes
+        // the read end on the SAME iteration that completes the handshake — the
+        // first prompt must never be consumed, so its write fails while the
+        // child parks alive. Closing on a later iteration would let the first
+        // send through (it is the frame that triggers this loop body).
+        //
+        // fd 0 is closed and the marker file written BEFORE the initialize
+        // success frame is emitted: the parent's start() returns only after it
+        // reads that success, so start() returning already implies the read end
+        // is shut (the test needs no post-start sleep).
+        if close_stdin && !was_initialized && session.saw_initialize {
+            #[cfg(unix)]
+            {
+                // The read end is closed on THIS iteration: the first prompt
+                // frame is never consumed, so its write fails while the child
+                // parks alive. `std::io::stdin()` only borrows fd 0, so close
+                // the fd outright.
+                let _ = nix::unistd::close(0);
+            }
+            if let Some(path) = &stdin_closed_file {
+                let _ = std::fs::write(path, b"closed");
+            }
+            if let Some(frame) = late {
+                emit(&frame)?;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(300));
+            // Parked; the parent-death watch reaps us. The frame was emitted
+            // after the fd was closed; do not emit it again below.
+            continue;
+        }
+        if let Some(frame) = late {
+            emit(&frame)?;
+        }
         // c-cardsettle r8 item 1: a test can ask the child to leave on its OWN
         // once the scripted conversation is exhausted — WITHOUT stdin EOF and
         // WITHOUT an `instance.close` (whose explicit-close entity ends the
@@ -129,10 +231,21 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
         {
             return Ok(0);
         }
-        // Handshake done; from here the child never drains stdin. The parent
-        // stdin watch is suppressed for this knob (see parent_watch); the
-        // getppid() poll still reaps us when the test really goes away.
-        if stop_reading && session.saw_initialize {
+        if session.saw_initialize && (close_stdin || stdout_flood || stop_reading) {
+            // All three knobs park here with the process alive and stdout open;
+            // the parent-death watch reaps us when the test goes away.
+            #[cfg(unix)]
+            if close_stdin {
+                // Drop our read end of the stdin pipe. `std::io::stdin()` only
+                // borrows fd 0, so dropping the lock would leave the pipe's
+                // read end open; close the fd outright (nix is a safe wrapper,
+                // and unsafe is forbidden workspace-wide).
+                let _ = nix::unistd::close(0);
+            }
+            if stdout_flood {
+                flood_stdout();
+            }
+            // Handshake done; from here the child never drains stdin.
             std::thread::sleep(std::time::Duration::from_secs(300));
         }
     }
@@ -191,28 +304,54 @@ impl Session {
         Ok(())
     }
 
+    /// Handle one inbound frame. Returns `Some(frame)` when a response must be
+    /// emitted AFTER the caller's post-frame hooks: the initialize success in
+    /// FAKE_CLAUDE_CLOSE_STDIN mode, where fd 0 and the closure marker have to
+    /// be in place BEFORE the driver-visible handshake response (r10 item 5).
     fn handle_incoming(
         &mut self,
         incoming: Value,
         lines: &mut impl Iterator<Item = io::Result<String>>,
-    ) -> Result<(), FakeClaudeError> {
+    ) -> Result<Option<Value>, FakeClaudeError> {
         let ty = incoming.get("type").and_then(Value::as_str).unwrap_or("");
         match ty {
-            "keep_alive" | "control_cancel_request" => Ok(()),
+            "keep_alive" | "control_cancel_request" => Ok(None),
             "control_request" => self.handle_control_request(&incoming),
-            "control_response" => Ok(()),
+            "control_response" => Ok(None),
             "user" => {
-                if self.flags.replay_user_messages {
+                // ma-sdk-state r13 item 2 fixture: keep DRAINING prompts (the
+                // write completes and its commit lands) but emit NOTHING back,
+                // not even the inbound-user echo — one queued turn_started per
+                // prompt accumulates behind a wedged publication worker and
+                // only reservation admission can bound it.
+                //
+                // r15 item 1 adds a FILE-GATED spelling: silence holds only
+                // while the marker file exists, so a relaunched child on the
+                // same driver goes back to answering turns once a test removes
+                // the marker (A overflows silently; B must stay usable).
+                let silent = self.saw_initialize
+                    && (std::env::var("FAKE_CLAUDE_SILENT_PROMPTS").is_ok_and(|v| v == "1")
+                        || std::env::var("FAKE_CLAUDE_SILENT_PROMPTS_FILE")
+                            .as_deref()
+                            .is_ok_and(|path| std::path::Path::new(path).exists()));
+                if !silent && self.flags.replay_user_messages {
                     emit(&incoming)?;
                 }
                 self.append_transcript(&incoming)?;
-                self.play_turn(lines)
+                if silent {
+                    return Ok(None);
+                }
+                self.play_turn(lines)?;
+                Ok(None)
             }
-            _ => Ok(()),
+            _ => Ok(None),
         }
     }
 
-    fn handle_control_request(&mut self, incoming: &Value) -> Result<(), FakeClaudeError> {
+    fn handle_control_request(
+        &mut self,
+        incoming: &Value,
+    ) -> Result<Option<Value>, FakeClaudeError> {
         let request_id = incoming
             .get("request_id")
             .and_then(Value::as_str)
@@ -227,20 +366,21 @@ impl Session {
                 self.interrupted = true;
                 emit(&interrupt_ack(&request_id))?;
                 self.emit_interrupt_result()?;
-                Ok(())
+                Ok(None)
             }
             "initialize" => {
                 self.saw_initialize = true;
-                emit(&initialize_success(&request_id))?;
-                Ok(())
+                // Returned late: in CLOSE_STDIN mode the caller closes fd 0
+                // (and writes the marker) before this frame is emitted.
+                Ok(Some(initialize_success(&request_id)))
             }
             "set_permission_mode" | "set_model" => {
                 emit(&control_success(&request_id, json!({})))?;
-                Ok(())
+                Ok(None)
             }
             _ => {
                 emit(&control_success(&request_id, json!({})))?;
-                Ok(())
+                Ok(None)
             }
         }
     }
@@ -310,6 +450,9 @@ impl Session {
             match ty {
                 "keep_alive" | "control_cancel_request" => continue,
                 "control_request" => {
+                    if let Ok(path) = std::env::var("FAKE_CLAUDE_STDIN_FILE") {
+                        record_stdin_marker(&path, &incoming);
+                    }
                     let subtype = incoming
                         .pointer("/request/subtype")
                         .and_then(Value::as_str)
@@ -323,9 +466,19 @@ impl Session {
                         emit(&interrupt_ack(id))?;
                         return Ok(incoming);
                     }
-                    self.handle_control_request(&incoming)?;
+                    if let Some(late) = self.handle_control_request(&incoming)? {
+                        // Nested inside a control-response wait: no outer late
+                        // frame handling here, emit it directly.
+                        emit(&late)?;
+                    }
                 }
                 "control_response" => {
+                    // The response bypasses the main loop's marker; record it
+                    // here too so FIFO order tests see it (ma-sdk-state r4
+                    // item 5c).
+                    if let Ok(path) = std::env::var("FAKE_CLAUDE_STDIN_FILE") {
+                        record_stdin_marker(&path, &incoming);
+                    }
                     let echoed = incoming
                         .pointer("/response/request_id")
                         .and_then(Value::as_str)
@@ -402,6 +555,84 @@ fn emit(value: &Value) -> Result<(), FakeClaudeError> {
     writeln!(out, "{}", serde_json::to_string(value)?)?;
     out.flush()?;
     Ok(())
+}
+
+/// Append one FIFO marker describing an inbound frame to `path` (best effort):
+/// `user`, `control_response`, or `control_request:<subtype>` (e.g.
+/// `control_request:interrupt`). Lets a test assert the exact wire order the
+/// child read, which is the order the single writer queue must preserve.
+fn record_stdin_marker(path: &str, incoming: &Value) {
+    let marker = match incoming.get("type").and_then(Value::as_str) {
+        Some("control_request") => incoming
+            .pointer("/request/subtype")
+            .and_then(Value::as_str)
+            .map(|subtype| format!("control_request:{subtype}"))
+            .unwrap_or_else(|| "control_request".into()),
+        Some(other) => other.to_owned(),
+        None => "unknown".to_owned(),
+    };
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{marker}");
+        let _ = file.sync_all();
+    }
+}
+
+/// Wait for a trigger file and emit ONE assistant frame (r15 item 4 fixture).
+///
+/// Fixture-side polling is bounded by a 60 s deadline; this runs in the fake
+/// peer process, not in a test task. A single `writeln!` under the stdout lock
+/// delivers the frame in one write.
+fn spawn_spare_frame_trigger(path: String) {
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            if std::path::Path::new(&path).exists() {
+                let frame = json!({
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg_r15_4_spare",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "text", "text": "spare frame after the overflow" }]
+                    }
+                });
+                let mut stdout = io::stdout().lock();
+                let _ = writeln!(stdout, "{frame}");
+                let _ = stdout.flush();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+}
+
+/// Emit valid stream-json frames forever without touching stdin again. The
+/// loop backpressures naturally on the stdout pipe if the parent ever stops
+/// draining — which is exactly the deadlock the bidirectional-pressure test
+/// must prove cannot happen while a stdin write is blocked.
+fn flood_stdout() -> ! {
+    let mut stdout = io::stdout().lock();
+    let mut n: u64 = 0;
+    loop {
+        let _ = writeln!(stdout, "{}", json!({ "type": "keep_alive" }));
+        // A UNIQUE message id per frame: a repeated id with the same block is
+        // deduped/coalesced by the driver's stream assembler, which would make
+        // this flood look like one observation instead of continuous stdout
+        // pressure.
+        let frame = json!({
+            "type": "assistant",
+            "message": {
+                "id": format!("msg_flood_{n}"),
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": format!("flood {n}") }]
+            }
+        });
+        let _ = writeln!(stdout, "{frame}");
+        let _ = stdout.flush();
+        n = n.wrapping_add(1);
+        std::thread::sleep(std::time::Duration::from_micros(500));
+    }
 }
 
 fn initialize_success(request_id: &str) -> Value {

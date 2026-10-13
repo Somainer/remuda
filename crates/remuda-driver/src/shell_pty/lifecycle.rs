@@ -1045,17 +1045,25 @@ pub(crate) fn termination_watch_bound() -> Duration {
     TERMINATION_WATCH_BOUND
 }
 
-/// Whether a stop-incomplete survivor identity is still running: the signalled
-/// process GROUP still has a live member OR one of the explicitly named
-/// survivor identities is live. c-usagefu r15 item 5 (COORDINATOR RULING F):
-/// a named survivor is a (pid, start time) identity — a reused pid with a
-/// different start time means the ORIGINAL process exited, and an unreadable
-/// process state is Unknown (kept), never death.
+/// Whether a stop-incomplete survivor identity is still running. c-usagefu r15
+/// item 5 (COORDINATOR RULING F): a named survivor is a (pid, start time)
+/// identity — a reused pid with a different start time means the ORIGINAL
+/// process exited, and an unreadable process state is Unknown (kept), never
+/// death.
 ///
 /// c-usagefu r16 item 2 (Ruling F'): when the pre-signal SNAPSHOT itself could
 /// not be read (`observation_unknown`) no descendant identity was ever
 /// captured, so neither the group signal nor the survivor probes can speak for
 /// the tree: Unknown, always kept.
+///
+/// c-usagefu r16 item 4: surviving membership is decided ONLY from the
+/// captured identities — never from the signalled group NUMBER. After the
+/// original group exits the kernel can reuse its pgid for an unrelated
+/// session; a matching live number used to keep the interval live forever (and
+/// block same-cwd discovery) even when every captured process was gone. `pgid`
+/// is retained on the identity for diagnostics, but it cannot keep an entry
+/// alive. With no captured identity and no Unknown observation the entry is
+/// gone.
 pub(crate) fn termination_identity_alive(
     pgid: Option<i32>,
     survivors: &[ProcessIdentity],
@@ -1064,10 +1072,9 @@ pub(crate) fn termination_identity_alive(
     if observation_unknown {
         return true;
     }
-    let group_alive = pgid
-        .filter(|pgid| *pgid > 0)
-        .is_some_and(group_has_live_member);
-    group_alive || survivors.iter().copied().any(process_identity_alive)
+    // Deliberately ignored for the liveness decision (see above).
+    let _ = pgid;
+    survivors.iter().copied().any(process_identity_alive)
 }
 
 /// One process the stop ladder could not confirm dead, identified per Ruling F

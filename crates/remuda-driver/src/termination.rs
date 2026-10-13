@@ -644,6 +644,101 @@ mod r15_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn a_live_reused_group_number_never_keeps_an_entry_with_dead_identities() {
+        // c-usagefu r16 item 4: surviving membership is decided from the
+        // CAPTURED identities, never from a matching group number. After the
+        // signalled group exits the kernel reuses its pgid for an unrelated
+        // session; the OLD `group_alive ||` arm saw that live number and kept
+        // the interval alive forever (blocking same-cwd discovery) even though
+        // every captured process was already gone. This drives the production
+        // `Some(pgid)` shape: the child is its OWN group leader (pgid == pid)
+        // and genuinely live, while the captured identity carries a STALE
+        // start-time baseline — a reused pid whose original process exited.
+        use std::os::unix::process::CommandExt as _;
+
+        let _lock = termination_test_lock();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            // setpgid(0,0): the child leads a live group whose NUMBER is its pid.
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = i32::try_from(child.id()).unwrap();
+        let real = process_start_ticks(pgid).expect("the live group leader has a start time");
+        let stale = real.wrapping_add(10_000);
+
+        assert!(
+            crate::shell_pty::lifecycle::group_has_live_member(pgid),
+            "the production Some(pgid) names a genuinely LIVE group"
+        );
+
+        // The live group number must NOT override the identity decision: a
+        // start-time mismatch means the captured process exited even though the
+        // number is live again; the matching baseline stays alive.
+        assert!(
+            !termination_identity_alive(
+                Some(pgid),
+                &[ProcessIdentity {
+                    pid: pgid,
+                    start_ticks: Some(stale),
+                }],
+                false,
+            ),
+            "a live reused group number never keeps an entry with a dead identity"
+        );
+        assert!(
+            termination_identity_alive(
+                Some(pgid),
+                &[ProcessIdentity {
+                    pid: pgid,
+                    start_ticks: Some(real),
+                }],
+                false,
+            ),
+            "the matching captured identity stays alive despite the group-number rule"
+        );
+
+        // End-to-end through the registry with the production Some(pgid):
+        // stale identity + live group -> resolved (interval closes); real
+        // baseline + live group -> kept.
+        let dir_gone = tempfile::tempdir().unwrap();
+        let dir_live = tempfile::tempdir().unwrap();
+        let supervisor = fresh();
+        let make_entry = |dir: &Path, owner: &'static str, ticks: u64| PendingEntry {
+            guards: vec![guard_for(dir, owner)],
+            identity: TerminationIdentity {
+                pgid: Some(pgid),
+                survivors: vec![ProcessIdentity {
+                    pid: pgid,
+                    start_ticks: Some(ticks),
+                }],
+                observation_unknown: false,
+            },
+            cwd: Some(crate::adapters::codex_discovery::canonical_path(dir)),
+        };
+        supervisor.test_push(make_entry(dir_gone.path(), "r16-pgid-gone", stale));
+        supervisor.test_push(make_entry(dir_live.path(), "r16-pgid-live", real));
+        supervisor.recheck(None, MAINTENANCE_RECHECK_CAP);
+        assert!(
+            !census_lifetime_is_live(dir_gone.path(), "r16-pgid-gone"),
+            "the stale entry closes on identity even with a live Some(pgid)"
+        );
+        assert!(
+            census_lifetime_is_live(dir_live.path(), "r16-pgid-live"),
+            "the matching identity keeps its interval"
+        );
+        assert!(
+            !supervisor.has_pending_for(dir_gone.path()),
+            "the stale entry is removed from the registry, not held by the group number"
+        );
+
+        forget_lifetime(dir_live.path(), "r16-pgid-live");
+        child.kill().unwrap();
+        let _ = child.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn an_unreadable_proc_state_is_unknown_and_keeps_the_entry() {
         // c-usagefu r15 item 5 (Ruling F): with /proc reads failing, even
         // against a LIVE pid the registry must not close — Unknown stays.

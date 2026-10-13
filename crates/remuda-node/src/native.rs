@@ -446,6 +446,7 @@ impl DriverFactory for NativeClaudeFactory {
                 // c-usagefu (d): stamp the codex/grok file-tail adapter
                 // observations with the real Hub-issued instance id.
                 options.instance_id = Some(launch.instance.meta.id.clone());
+                options.node_epoch = self.epoch.clone();
                 Arc::new(GenericPtyDriver::new(options))
             }
             DriverKind::ShellPty => {

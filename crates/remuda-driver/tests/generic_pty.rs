@@ -118,6 +118,7 @@ async fn fake_herdr_codex_start_send_wait_read_stop() {
         line_matcher: Some("^DONE ".into()),
         instance_id: None,
         file_adapter_home: None,
+        node_epoch: None,
     });
 
     let mut requested = spec(&cwd, AgentKind::Codex);
@@ -236,6 +237,7 @@ async fn fake_herdr_start_failure_emits_error_lifecycle() {
         line_matcher: None,
         instance_id: None,
         file_adapter_home: None,
+        node_epoch: None,
     });
 
     let spec = spec(&cwd, AgentKind::Grok);
@@ -313,6 +315,7 @@ async fn fake_herdr_slow_start_emits_ready_lifecycle() {
         line_matcher: None,
         instance_id: None,
         file_adapter_home: None,
+        node_epoch: None,
     });
 
     let started_at = tokio::time::Instant::now();
@@ -388,6 +391,7 @@ async fn fake_herdr_send_before_start_defers_without_blocking_control() {
         line_matcher: Some("^DONE".into()),
         instance_id: None,
         file_adapter_home: None,
+        node_epoch: None,
     }));
     fs::create_dir_all(tmp.path().join("home")).unwrap();
 
@@ -441,6 +445,7 @@ async fn fake_herdr_journals_bounded_screen_snapshot() {
         line_matcher: Some("^DONE".into()),
         instance_id: None,
         file_adapter_home: None,
+        node_epoch: None,
     });
 
     let mut handle = driver
@@ -620,6 +625,7 @@ async fn generic_pty_grok_spawns_file_adapter_and_emits_usage() {
         line_matcher: Some("^DONE".into()),
         instance_id: Some(instance.clone()),
         file_adapter_home: Some(real_home),
+        node_epoch: None,
     };
     // OpenAI-shaped test profile; the grok usage counters are priced
     // independently, this only satisfies launch materialization.

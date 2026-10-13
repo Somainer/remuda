@@ -1198,6 +1198,10 @@ impl ShellPtyDriver {
                 let (guard, boundary) = crate::adapters::codex_discovery::register_confirmed_launch(
                     std::path::Path::new(cwd),
                     hook_ctx.instance_id.as_id().as_str(),
+                    self.options
+                        .node_epoch
+                        .as_ref()
+                        .map(crate::adapters::codex_discovery::NodeEpoch::id),
                 );
                 (Some(guard), boundary)
             } else {
@@ -1593,6 +1597,10 @@ impl ShellPtyDriver {
                 Arc::clone(&self.interrupt_pid),
                 Arc::clone(&self.interrupt_screen_markers),
                 Arc::clone(&self.promoted_codex_lifetimes),
+                self.options
+                    .node_epoch
+                    .as_ref()
+                    .map(crate::adapters::codex_discovery::NodeEpoch::id),
                 tx.clone(),
                 Arc::clone(&self.seq),
                 Some(Arc::clone(&effort_bridge)),
@@ -6303,17 +6311,26 @@ mod tests {
         let mut events = driver.spawn().await.expect("spawns").into_events();
 
         // The driver-owned (native launch) cohort AND a promoted (unknown
-        // boundary) cohort, exactly as production registers them.
+        // boundary) cohort, exactly as production registers them. c-usagefu r18
+        // item 3: they carry this test's Node epoch so the epoch-scoped
+        // shutdown seam below retires them.
+        let epoch = crate::adapters::codex_discovery::NodeEpoch::mint();
         let native_owner = "r17-w0-native";
         let promoted_owner = "r17-w0-promoted";
         *driver.codex_lifetime.lock().await =
-            Some(crate::adapters::codex_discovery::begin_lifetime(
+            Some(crate::adapters::codex_discovery::begin_lifetime_for_epoch(
                 &cwd,
                 native_owner,
                 Some(time::OffsetDateTime::now_utc()),
+                Some(epoch.id()),
             ));
         driver.promoted_codex_lifetimes.lock().unwrap().push(
-            crate::adapters::codex_discovery::begin_lifetime(&cwd, promoted_owner, None),
+            crate::adapters::codex_discovery::begin_lifetime_for_epoch(
+                &cwd,
+                promoted_owner,
+                None,
+                Some(epoch.id()),
+            ),
         );
 
         // Force the stop-incomplete verdict AFTER the real ladder, naming the
@@ -6448,15 +6465,16 @@ mod tests {
         }
         drop(next);
 
-        // Node shutdown (the exact seam DevNode::shutdown calls): the retained
-        // guards drop WITHOUT a recorded close — intervals stay live.
-        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
+        // Node shutdown (the exact seam DevNode::shutdown calls, c-usagefu r18
+        // item 3): the retained guards drop WITHOUT a recorded close and their
+        // still-open census SEGMENTS are retired (removed, not closed), so a
+        // fresh Node epoch can attribute in this cwd again.
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(Some(&epoch));
         for owner in [native_owner, promoted_owner] {
             assert!(
-                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
-                "{owner}: Node shutdown drops the guard without recording a close"
+                !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+                "{owner}: this Node's shutdown retires its block without recording a close"
             );
-            crate::adapters::codex_discovery::forget_lifetime(&cwd, owner);
         }
         crate::adapters::codex_discovery::forget_lifetime(&cwd, next_owner);
     }
@@ -6529,10 +6547,15 @@ mod tests {
             survivors: vec![survivor_pid],
         });
         *driver.codex_lifetime.lock().await =
-            Some(crate::adapters::codex_discovery::begin_lifetime(
+            Some(crate::adapters::codex_discovery::begin_lifetime_for_epoch(
                 &cwd,
                 "r18-item2-owner",
                 Some(time::OffsetDateTime::now_utc()),
+                driver
+                    .options
+                    .node_epoch
+                    .as_ref()
+                    .map(crate::adapters::codex_discovery::NodeEpoch::id),
             ));
         Driver::close(&driver).await.unwrap();
 

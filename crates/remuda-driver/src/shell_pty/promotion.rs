@@ -852,6 +852,9 @@ pub(super) fn spawn(
     // confirms termination, so the lifetime is owned by the session rather
     // than by the poller or foreground detection.
     promoted_lifetimes: Arc<std::sync::Mutex<Vec<crate::adapters::codex_discovery::LifetimeGuard>>>,
+    // Census epoch of the Node that owns promoted intervals this poller
+    // registers (c-usagefu r18 item 3).
+    node_epoch: Option<u64>,
     events: mpsc::Sender<Observation>,
     seq: Arc<AtomicU64>,
     effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
@@ -1028,10 +1031,11 @@ pub(super) fn spawn(
                 .and_then(|f| (f.kind == AgentKind::Codex).then_some(f.pid));
             if next_codex_pid != census_pid {
                 if let Some(pid) = next_codex_pid {
-                    let guard = crate::adapters::codex_discovery::begin_lifetime(
+                    let guard = crate::adapters::codex_discovery::begin_lifetime_for_epoch(
                         &ctx.cwd,
                         &format!("promoted-codex-{pid}"),
                         None,
+                        node_epoch,
                     );
                     promoted_lifetimes
                         .lock()

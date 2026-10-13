@@ -1678,7 +1678,7 @@ fn a_pending_launch_window_survives_another_window_releasing_before_adapter_buil
     // critical section (r14 L1); pin it to t2 for this deterministic timeline.
     crate::adapters::codex_discovery::set_test_launch_boundary(Path::new(cwd), t2);
     let b_pending =
-        crate::adapters::codex_discovery::register_pending_launch(Path::new(cwd), INST_B);
+        crate::adapters::codex_discovery::register_pending_launch(Path::new(cwd), INST_B, None);
     let t_boundary = b_pending.launched_at;
     let b_lifetime = b_pending.lifetime;
     let b_window = b_pending.window;
@@ -1846,8 +1846,11 @@ fn a_window_releasing_inside_a_pending_launch_registration_cannot_prune_its_inte
     let builder = std::thread::Builder::new()
         .name("r13-item1-pending-launch".into())
         .spawn(move || {
-            let pending =
-                crate::adapters::codex_discovery::register_pending_launch(Path::new(cwd), INST_B);
+            let pending = crate::adapters::codex_discovery::register_pending_launch(
+                Path::new(cwd),
+                INST_B,
+                None,
+            );
             tx.send(pending).unwrap();
         })
         .unwrap();
@@ -1971,7 +1974,7 @@ fn a_launch_blocked_before_the_lock_samples_its_boundary_after_a_close_and_refus
     // (the same path a hook-shadowed codex spawn takes), never a hand-built
     // guard — its boundary is whatever the production path samples.
     let (c_guard, _c_boundary) =
-        crate::adapters::codex_discovery::register_confirmed_launch(Path::new(cwd), INST_C);
+        crate::adapters::codex_discovery::register_confirmed_launch(Path::new(cwd), INST_C, None);
 
     // B registers on another thread and parks before the lock.
     let barrier = PendingLaunchBarrier::arm_pre_lock(Path::new(cwd));
@@ -1979,8 +1982,11 @@ fn a_launch_blocked_before_the_lock_samples_its_boundary_after_a_close_and_refus
     let builder = std::thread::Builder::new()
         .name("r14-item2-pending-launch".into())
         .spawn(move || {
-            let pending =
-                crate::adapters::codex_discovery::register_pending_launch(Path::new(cwd), INST_B);
+            let pending = crate::adapters::codex_discovery::register_pending_launch(
+                Path::new(cwd),
+                INST_B,
+                None,
+            );
             tx.send(pending).unwrap();
         })
         .unwrap();
@@ -2064,8 +2070,11 @@ fn arming_a_second_barrier_disarms_the_first_and_releases_its_parked_registratio
     let builder = std::thread::Builder::new()
         .name("r14-item6-old-registration".into())
         .spawn(move || {
-            let pending =
-                crate::adapters::codex_discovery::register_pending_launch(Path::new(cwd), INST_B);
+            let pending = crate::adapters::codex_discovery::register_pending_launch(
+                Path::new(cwd),
+                INST_B,
+                None,
+            );
             tx.send(pending).unwrap();
         })
         .unwrap();
@@ -2103,8 +2112,11 @@ fn dropping_a_replaced_barrier_never_clears_the_currently_armed_barrier() {
     let builder = std::thread::Builder::new()
         .name("r14-item6-parked-registration".into())
         .spawn(move || {
-            let pending =
-                crate::adapters::codex_discovery::register_pending_launch(Path::new(cwd), INST_B);
+            let pending = crate::adapters::codex_discovery::register_pending_launch(
+                Path::new(cwd),
+                INST_B,
+                None,
+            );
             tx.send(pending).unwrap();
         })
         .unwrap();
@@ -3596,8 +3608,11 @@ fn a_confirmed_launch_samples_its_boundary_inside_the_registration_lock() {
     let builder = std::thread::Builder::new()
         .name("r15-item4-confirmed-launch".into())
         .spawn(move || {
-            let registration =
-                crate::adapters::codex_discovery::register_confirmed_launch(Path::new(cwd), owner);
+            let registration = crate::adapters::codex_discovery::register_confirmed_launch(
+                Path::new(cwd),
+                owner,
+                None,
+            );
             tx.send(registration).unwrap();
         })
         .unwrap();
@@ -3824,7 +3839,7 @@ fn dropping_the_barrier_handle_disarms_the_parked_registration_and_clears_the_sl
     let builder = std::thread::Builder::new()
         .name("r15-item8-parked".into())
         .spawn(move || {
-            tx.send(register_pending_launch(Path::new(cwd), "r15-item8-b"))
+            tx.send(register_pending_launch(Path::new(cwd), "r15-item8-b", None))
                 .unwrap();
         })
         .unwrap();
@@ -3841,7 +3856,7 @@ fn dropping_the_barrier_handle_disarms_the_parked_registration_and_clears_the_sl
     let builder2 = std::thread::Builder::new()
         .name("r15-item8-clear".into())
         .spawn(move || {
-            tx2.send(register_pending_launch(Path::new(cwd), "r15-item8-c"))
+            tx2.send(register_pending_launch(Path::new(cwd), "r15-item8-c", None))
                 .unwrap();
         })
         .unwrap();
@@ -3860,7 +3875,7 @@ fn dropping_the_barrier_handle_disarms_the_parked_registration_and_clears_the_sl
     let builder3 = std::thread::Builder::new()
         .name("r15-item8-newer-park".into())
         .spawn(move || {
-            tx3.send(register_pending_launch(Path::new(cwd), "r15-item8-d"))
+            tx3.send(register_pending_launch(Path::new(cwd), "r15-item8-d", None))
                 .unwrap();
         })
         .unwrap();

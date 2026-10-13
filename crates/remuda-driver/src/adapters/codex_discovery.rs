@@ -73,6 +73,13 @@ impl NodeEpoch {
         }
     }
 
+    /// Monotonic per-process id used to scope retained census guards (used by
+    /// the per-epoch retention added in c-usagefu r18 item 3).
+    #[allow(dead_code)]
+    pub(crate) fn id(&self) -> u64 {
+        self.inner.id
+    }
+
     /// Signal this Node is shutting down BEFORE its instances are closed, so
     /// an incomplete stop during the close loop needs no operator observation
     /// (c-usagefu r18 Ruling W0').
@@ -216,6 +223,10 @@ struct InstanceLifetime {
     /// session is never marked closed by its previous spawn (c-usagefu r10
     /// item 1; r11 item 4).
     epoch: u64,
+    /// Census epoch of the Node that registered this segment, so a shutdown
+    /// can retire exactly its own intervals (c-usagefu r18 item 3). `None`
+    /// for segments begun outside a composed Node (direct test calls).
+    node_epoch: Option<u64>,
 }
 
 /// Every interval one owner has had in a cwd, in registration order
@@ -283,6 +294,8 @@ struct LifetimeGuardInner {
     /// Registration cohort this guard belongs to. A close is recorded only if
     /// it is still the current cohort (resume bumps the epoch).
     epoch: u64,
+    /// Census epoch of the Node that owns this guard (c-usagefu r18 item 3).
+    node_epoch: Option<u64>,
     /// Set once the interval has been closed, so an explicit close followed by
     /// owner Drop cannot move the recorded close time later.
     closed: std::sync::atomic::AtomicBool,
@@ -304,6 +317,22 @@ impl LifetimeGuard {
     /// Canonical cwd this guard's interval belongs to.
     pub(crate) fn cwd(&self) -> &Path {
         &self.inner.key
+    }
+
+    /// Owner key of this guard's interval.
+    pub(crate) fn owner(&self) -> &str {
+        &self.inner.owner
+    }
+
+    /// Per-owner cohort id this guard closes.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.inner.epoch
+    }
+
+    /// Census epoch of the Node that owns this guard, when it was built by a
+    /// composed Node.
+    pub(crate) fn node_epoch(&self) -> Option<u64> {
+        self.inner.node_epoch
     }
 
     /// Witness clone: shares the cohort but its Drop never closes the interval
@@ -407,8 +436,8 @@ impl Drop for LifetimeGuard {
 /// close) and drops its guards; another still-live Node's epoch is untouched.
 /// Guards whose driver carried no epoch (constructed outside a composed Node)
 /// live in the `None` detached bucket and are dropped unclosed as before.
-static UNCONFIRMED_GUARDS: LazyLock<Mutex<Vec<LifetimeGuard>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+static UNCONFIRMED_GUARDS: LazyLock<Mutex<HashMap<Option<u64>, Vec<LifetimeGuard>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Retain the owner census guards of one stop-incomplete teardown for the
 /// rest of its Node's lifetime (Ruling W0). Drop-close is suppressed on
@@ -419,12 +448,15 @@ pub(crate) fn retain_unconfirmed_guards(guards: Vec<LifetimeGuard>) {
     if guards.is_empty() {
         return;
     }
+    let node_epoch = guards.first().and_then(LifetimeGuard::node_epoch);
     for guard in &guards {
         guard.suppress_drop_close();
     }
     UNCONFIRMED_GUARDS
         .lock()
         .expect("unconfirmed codex census guards")
+        .entry(node_epoch)
+        .or_default()
         .extend(guards);
 }
 
@@ -439,17 +471,47 @@ pub(crate) fn retain_unconfirmed_guards(guards: Vec<LifetimeGuard>) {
 /// built outside a composed Node) are left strictly alone. Synchronous: the
 /// guards own no tasks.
 pub fn shutdown_unconfirmed_guards(epoch: Option<&NodeEpoch>) {
-    // c-usagefu r18 item 2 intermediate: the epoch's shutdown flag is what
-    // suppresses the operator warning on shutdown closes. Per-epoch census
-    // scoping/retirement lands in item 3; here every retained guard drops
-    // without recording a close (r17 W0 semantics).
-    let _ = epoch;
-    let guards = std::mem::take(
-        &mut *UNCONFIRMED_GUARDS
-            .lock()
-            .expect("unconfirmed codex census guards"),
-    );
+    let epoch_id = epoch.map(NodeEpoch::id);
+    let guards = UNCONFIRMED_GUARDS
+        .lock()
+        .expect("unconfirmed codex census guards")
+        .remove(&epoch_id)
+        .unwrap_or_default();
+    let locations: Vec<(PathBuf, String, u64)> = guards
+        .iter()
+        .map(|guard| {
+            (
+                guard.cwd().to_path_buf(),
+                guard.owner().to_owned(),
+                guard.epoch(),
+            )
+        })
+        .collect();
+    // Drop the suppressed guards first; they record no closure.
     drop(guards);
+    // Then forget their (still live) segments so the census no longer blocks
+    // the next Node epoch in those cwds. This is a RETIREMENT, not a close.
+    if !locations.is_empty() {
+        let mut map = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
+        for (key, owner, cohort) in locations {
+            if let Some(by_instance) = map.get_mut(&key) {
+                if let Some(segments) = by_instance.get_mut(&owner) {
+                    segments.segments.retain(|segment| {
+                        // Defense in depth: remove only segments this Node
+                        // actually registered (a same-owner segment a newer
+                        // Node already appended must survive).
+                        !(segment.epoch == cohort && segment.node_epoch == epoch_id)
+                    });
+                }
+                if by_instance
+                    .get(&owner)
+                    .is_some_and(|segments| segments.segments.is_empty())
+                {
+                    by_instance.remove(&owner);
+                }
+            }
+        }
+    }
 }
 
 /// Register instance `owner` as launching in `cwd` at the agent.start boundary
@@ -473,6 +535,17 @@ pub(crate) fn begin_lifetime(
     owner: &str,
     launched_at: Option<OffsetDateTime>,
 ) -> LifetimeGuard {
+    begin_lifetime_for_epoch(cwd, owner, launched_at, None)
+}
+
+/// Production variant scoped to the owning Node's census epoch
+/// (c-usagefu r18 item 3).
+pub(crate) fn begin_lifetime_for_epoch(
+    cwd: &Path,
+    owner: &str,
+    launched_at: Option<OffsetDateTime>,
+    node_epoch: Option<u64>,
+) -> LifetimeGuard {
     let key = canonical(cwd);
     let epoch = {
         let mut map = INSTANCE_LIFETIMES.lock().expect("codex instance lifetimes");
@@ -494,6 +567,7 @@ pub(crate) fn begin_lifetime(
             launched_at,
             closed_at: None,
             epoch,
+            node_epoch,
         });
         epoch
     };
@@ -502,6 +576,7 @@ pub(crate) fn begin_lifetime(
             key,
             owner: owner.to_owned(),
             epoch,
+            node_epoch,
             closed: std::sync::atomic::AtomicBool::new(false),
             drop_closes: std::sync::atomic::AtomicBool::new(true),
             #[cfg(test)]
@@ -552,7 +627,11 @@ pub(crate) struct PendingCodexLaunch {
 /// taking the lock could predate a close that completed while this launch was
 /// queued for the lock, letting the launch bind a rollout created in that
 /// window over a since-closed interval the prune had just discarded.
-pub(crate) fn register_pending_launch(cwd: &Path, owner: &str) -> PendingCodexLaunch {
+pub(crate) fn register_pending_launch(
+    cwd: &Path,
+    owner: &str,
+    node_epoch: Option<u64>,
+) -> PendingCodexLaunch {
     // Test barrier (cfg(test)): parks BEFORE the coordination lock is taken,
     // so a regression can delay the boundary sample until a rollout was
     // written and closed and the last window released while this launch was
@@ -566,7 +645,7 @@ pub(crate) fn register_pending_launch(cwd: &Path, owner: &str) -> PendingCodexLa
     let launched_at = take_test_launch_boundary(cwd).unwrap_or_else(OffsetDateTime::now_utc);
     #[cfg(not(test))]
     let launched_at = OffsetDateTime::now_utc();
-    let lifetime = begin_lifetime(cwd, owner, Some(launched_at));
+    let lifetime = begin_lifetime_for_epoch(cwd, owner, Some(launched_at), node_epoch);
     // Test barrier (cfg(test)): parks BETWEEN the lifetime insert and the
     // window open WHILE HOLDING the coordination lock, so a barrier-controlled
     // regression can drive another window's release into exactly this gap. In
@@ -596,6 +675,7 @@ pub(crate) fn register_pending_launch(cwd: &Path, owner: &str) -> PendingCodexLa
 pub(crate) fn register_confirmed_launch(
     cwd: &Path,
     owner: &str,
+    node_epoch: Option<u64>,
 ) -> (LifetimeGuard, OffsetDateTime) {
     #[cfg(test)]
     pending_launch_pre_lock_barrier(cwd);
@@ -604,7 +684,7 @@ pub(crate) fn register_confirmed_launch(
     let launched_at = take_test_launch_boundary(cwd).unwrap_or_else(OffsetDateTime::now_utc);
     #[cfg(not(test))]
     let launched_at = OffsetDateTime::now_utc();
-    let lifetime = begin_lifetime(cwd, owner, Some(launched_at));
+    let lifetime = begin_lifetime_for_epoch(cwd, owner, Some(launched_at), node_epoch);
     (lifetime, launched_at)
 }
 

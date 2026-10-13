@@ -103,6 +103,9 @@ pub struct GenericPtyOptions {
     /// because the workspace forbids process-env mutation; it must name a home
     /// the operator's harness actually writes to.
     pub file_adapter_home: Option<PathBuf>,
+    /// Census epoch of the Node that built this driver (c-usagefu r18 item 3);
+    /// None outside a composed Node.
+    pub node_epoch: Option<crate::adapters::codex_discovery::NodeEpoch>,
 }
 
 impl GenericPtyOptions {
@@ -130,6 +133,7 @@ impl GenericPtyOptions {
             line_matcher: Some("^DONE".into()),
             instance_id: None,
             file_adapter_home: None,
+            node_epoch: None,
         }
     }
 }
@@ -422,6 +426,10 @@ impl GenericPtyDriver {
             let pending = crate::adapters::codex_discovery::register_pending_launch(
                 std::path::Path::new(&recipe.cwd),
                 &instance_key,
+                self.options
+                    .node_epoch
+                    .as_ref()
+                    .map(crate::adapters::codex_discovery::NodeEpoch::id),
             );
             launched_at = pending.launched_at;
             lifetime = Some(pending.lifetime);

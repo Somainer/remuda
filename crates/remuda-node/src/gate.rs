@@ -2226,69 +2226,54 @@ impl DevNode {
                     result.merge_sha = string_field(&land_report, "merged").or(result.merge_sha);
                 }
                 Ok(Some(output)) => {
-                    // A nonzero land exit can still carry a structured verdict:
-                    // `merge --land` exits nonzero when the compare-and-swap
-                    // lost (base moved under the lease). Parse stdout even on
-                    // failure so base-moved keeps its requeue verdict (and the
-                    // currentMain sha) instead of becoming a generic failure
-                    // and losing the bounded reverify/requeue path (r12 item 7).
-                    let land_report: Value =
-                        serde_json::from_slice(&output.stdout).unwrap_or_else(|_| json!({}));
-                    match land_report.get("status").and_then(Value::as_str) {
-                        Some("base_moved") | Some("base-moved") => {
+                    // r16 item 4 (R5): the child was RELEASED, so its push may
+                    // have reached the remote. Only a RECOGNIZED structured
+                    // verdict may settle the Landing; a crash (signal), a
+                    // missing/malformed/unparseable report, or an unrecognized
+                    // status is UNCERTAIN — the Hub reconciles against origin —
+                    // never a definite failure.
+                    let drained_stderr = captured_stderr
+                        .lock()
+                        .map(|lines| lines.join("\n"))
+                        .unwrap_or_default();
+                    match classify_released_land_outcome(&output, &drained_stderr) {
+                        ReleasedLandOutcome::Landed(land_report) => {
+                            result.status = "landed".into();
+                            result.current_main_sha = string_field(&land_report, "currentMain");
+                            result.merge_sha =
+                                string_field(&land_report, "merged").or(result.merge_sha);
+                        }
+                        ReleasedLandOutcome::BaseMoved(land_report) => {
+                            // `merge --land` exits nonzero when the
+                            // compare-and-swap lost (base moved under the
+                            // lease): keep the requeue verdict and currentMain.
                             result.status = "base-moved".into();
                             result.current_main_sha = string_field(&land_report, "currentMain");
                             result.error = string_field(&land_report, "error");
                             result.reason = None;
                         }
-                        // r15 R5: the merge CLI could not establish the push's
-                        // outcome (a failed push whose recovery fetch/ancestry
-                        // read also failed). NEVER "failed": the ref may already
-                        // have moved; keep the Landing and let Hub reconciliation
-                        // establish the exact granted merge against the remote.
-                        Some("uncertain") => {
+                        ReleasedLandOutcome::Uncertain { error, reason } => {
                             result.status = "uncertain".into();
-                            result.reason = Some(
-                                "land push outcome unknown; the Hub reconciles against the remote"
-                                    .into(),
-                            );
-                            result.error = string_field(&land_report, "error").or_else(|| {
-                                Some(
-                                    "land push outcome could not be established against the remote"
-                                        .into(),
-                                )
-                            });
+                            result.error = Some(error);
+                            result.reason = Some(reason);
                         }
-                        _ => {
+                        ReleasedLandOutcome::Failed(error) => {
                             result.status = "failed".into();
-                            // Prefer the child's own stderr; fall back to the
-                            // lines the concurrent pump drained (r14 item 9) —
-                            // the Output's stderr is empty because that handle
-                            // was consumed by the pump.
-                            let drained_stderr = captured_stderr
-                                .lock()
-                                .map(|lines| lines.join("\n"))
-                                .unwrap_or_default();
-                            let stderr_text = {
-                                let direct =
-                                    String::from_utf8_lossy(&output.stderr).trim().to_owned();
-                                if direct.is_empty() {
-                                    drained_stderr
-                                } else {
-                                    direct
-                                }
-                            };
-                            result.error = Some(format!(
-                                "land failed after grant (exit {:?}): {}",
-                                output.status.code(),
-                                stderr_text.trim()
-                            ));
+                            result.error = Some(error);
                         }
                     }
                 }
                 Ok(None) => {
-                    result.status = "failed".into();
-                    result.error = Some("land child produced no result".into());
+                    // r16 item 4: no wait status at all after the release is
+                    // not an established failure: the push may have landed.
+                    result.status = "uncertain".into();
+                    result.error = Some(
+                        "the released land child ended without any result; the push may have \
+                         reached the remote; the Hub reconciles against the exact granted merge"
+                            .into(),
+                    );
+                    result.reason =
+                        Some("land child produced no result; push outcome uncertain".into());
                 }
             }
             // The child has exited (or been killed on timeout); let the stderr
@@ -2355,6 +2340,99 @@ impl DevNode {
             exit_code: output.status.code().unwrap_or(-1),
             output: captured,
         })
+    }
+}
+
+/// What a RELEASED granted-land child's exit established (r16 item 4, R5).
+enum ReleasedLandOutcome {
+    Landed(Value),
+    BaseMoved(Value),
+    Uncertain {
+        error: String,
+        reason: String,
+    },
+    /// Only the merge CLI's recognized, structured failure verdict.
+    Failed(String),
+}
+
+/// Combine the child's own stderr (empty under the concurrent pump) with the
+/// pump-drained lines for a verdict message.
+fn combine_land_stderr(output: &std::process::Output, drained: &str) -> String {
+    let direct = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let text = if direct.is_empty() {
+        drained.trim().to_owned()
+    } else {
+        direct
+    };
+    text.chars().take(2000).collect()
+}
+
+/// Classify a granted-land child that already ran (its start barrier was
+/// released, so its push MAY have reached the remote). Every outcome is
+/// Established or Unknown (r16 item 4, R5):
+/// * exit 0 → `Landed` (the CLI only exits 0 after the push is acknowledged);
+/// * a recognized structured verdict → `BaseMoved` (CAS loss, nothing pushed),
+///   `Uncertain` (the CLI itself could not establish the push), or `Failed`
+///   ONLY for `gate_failed` at exit 1 — a pre-push rejection or a
+///   recovery-ESTABLISHED remote rejection, both proving the exact merge did
+///   not land;
+/// * death by signal (no exit code), missing/malformed stdout JSON, or an
+///   unrecognized status → `Uncertain`, never Failed: the child may have
+///   pushed and crashed before reporting, so the Hub must reconcile.
+fn classify_released_land_outcome(
+    output: &std::process::Output,
+    drained_stderr: &str,
+) -> ReleasedLandOutcome {
+    if output.status.success() {
+        let report = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| json!({}));
+        return ReleasedLandOutcome::Landed(report);
+    }
+    let stderr_text = combine_land_stderr(output, drained_stderr);
+    // Killed by a signal (no exit code) AFTER release: crash-only, Unknown.
+    let Some(exit_code) = output.status.code() else {
+        return ReleasedLandOutcome::Uncertain {
+            error: format!(
+                "the land child was killed by a signal after it was released; the push may have \
+                 reached the remote (stderr: {stderr_text})"
+            ),
+            reason: "land child killed by a signal; push outcome uncertain".into(),
+        };
+    };
+    // Missing or malformed JSON: no recognized verdict, Unknown.
+    let Ok(report) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return ReleasedLandOutcome::Uncertain {
+            error: format!(
+                "the land child exited {exit_code} without a parseable result after it was \
+                 released; the push may have reached the remote (stderr: {stderr_text})"
+            ),
+            reason: "land child returned no readable verdict; push outcome uncertain".into(),
+        };
+    };
+    match report.get("status").and_then(Value::as_str) {
+        Some("base_moved") | Some("base-moved") => ReleasedLandOutcome::BaseMoved(report),
+        Some("uncertain") => ReleasedLandOutcome::Uncertain {
+            error: string_field(&report, "error").unwrap_or_else(|| {
+                "land push outcome could not be established against the remote".into()
+            }),
+            reason: "land push outcome unknown; the Hub reconciles against the remote".into(),
+        },
+        // The merge CLI's one recognized failure verdict (exit 1): it only
+        // reaches this status for a pre-push error (nothing pushed) or after
+        // recovery established the exact merge absent with the remote base
+        // unchanged (a genuine rejection).
+        Some("gate_failed") if exit_code == 1 => ReleasedLandOutcome::Failed(format!(
+            "land failed after grant (exit 1): {}",
+            string_field(&report, "error")
+                .unwrap_or_else(|| stderr_text.clone())
+                .trim()
+        )),
+        other => ReleasedLandOutcome::Uncertain {
+            error: format!(
+                "the land child exited {exit_code} with an unrecognized verdict {other:?}; the \
+                 push may have reached the remote (stderr: {stderr_text})"
+            ),
+            reason: "land child verdict unrecognized; push outcome uncertain".into(),
+        },
     }
 }
 
@@ -5862,6 +5940,121 @@ Running 8 tests across 2 projects
             .unwrap();
         assert_eq!(reply["status"], json!("absent"), "{reply}");
         assert!(reply["baseSha"].is_string(), "{reply}");
+    }
+
+    /// r16 item 4: classify the RELEASED land child's exit as
+    /// Established-or-Unknown.
+    #[cfg(unix)]
+    #[test]
+    fn released_land_outcome_recognizes_failure_but_not_crash_or_garbage() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{ExitStatus, Output};
+        fn output_from(raw: i32, stdout: &str, stderr: &str) -> Output {
+            Output {
+                status: ExitStatus::from_raw(raw),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: stderr.as_bytes().to_vec(),
+            }
+        }
+        let gate_failed = r#"{"exitCode":1,"status":"gate_failed","error":"hook refused"}"#;
+
+        // exit 0 → landed, even with an empty body.
+        assert!(matches!(
+            super::classify_released_land_outcome(&output_from(0, "{}", ""), ""),
+            super::ReleasedLandOutcome::Landed(_)
+        ));
+        // The one recognized structured failure (exit 1 + gate_failed).
+        assert!(matches!(
+            super::classify_released_land_outcome(&output_from(1 << 8, gate_failed, ""), ""),
+            super::ReleasedLandOutcome::Failed(message) if message.contains("hook refused")
+        ));
+        // base_moved keeps its recognized verdict.
+        assert!(matches!(
+            super::classify_released_land_outcome(
+                &output_from(2 << 8, r#"{"status":"base_moved","currentMain":"abc"}"#, ""),
+                ""
+            ),
+            super::ReleasedLandOutcome::BaseMoved(_)
+        ));
+        // The CLI's own uncertainty stays uncertain.
+        assert!(matches!(
+            super::classify_released_land_outcome(
+                &output_from(4 << 8, r#"{"status":"uncertain"}"#, ""),
+                ""
+            ),
+            super::ReleasedLandOutcome::Uncertain { .. }
+        ));
+        // Missing JSON, malformed JSON, an empty object and an unrecognized
+        // status are all Unknown — never Failed.
+        for stdout in [
+            "",
+            "not json",
+            "{}",
+            r#"{"status":"conflict"}"#,
+            r#"{"status":"wat"}"#,
+        ] {
+            assert!(
+                matches!(
+                    super::classify_released_land_outcome(
+                        &output_from(1 << 8, stdout, "some stderr"),
+                        ""
+                    ),
+                    super::ReleasedLandOutcome::Uncertain { .. }
+                ),
+                "stdout {stdout:?} must be Unknown"
+            );
+        }
+        // gate_failed on a NON-1 exit is not the recognized failure.
+        assert!(matches!(
+            super::classify_released_land_outcome(&output_from(2 << 8, gate_failed, ""), ""),
+            super::ReleasedLandOutcome::Uncertain { .. }
+        ));
+        // Killed by SIGKILL/SIGSEGV after release with no exit code: crash-only
+        // is Unknown even if a well-formed gate_failed happened to be printed.
+        for signal in [9, 11] {
+            assert!(
+                matches!(
+                    super::classify_released_land_outcome(
+                        &output_from(signal, gate_failed, ""),
+                        ""
+                    ),
+                    super::ReleasedLandOutcome::Uncertain { .. }
+                ),
+                "signal {signal} must be Unknown"
+            );
+        }
+    }
+
+    /// r16 item 4 end-to-end through the production builder: a granted land
+    /// child that is RELEASED and then dies on a signal without a JSON verdict
+    /// reports UNCERTAIN — it may have pushed — never Failed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_released_land_child_killed_by_a_signal_is_uncertain_never_failed() {
+        let script = r#"
+base=$(git rev-parse main 2>/dev/null || echo "1111111111111111111111111111111111111111")
+head=$(git rev-parse wt/fake/task 2>/dev/null || echo "$base")
+if ! printf '%s\n' "$*" | grep -q -- '--land'; then
+  echo "{\"exitCode\":0,\"status\":\"verified\",\"base\":\"$base\",\"head\":\"$head\",\"merged\":\"$head\",\"steps\":[]}"
+  exit 0
+fi
+head -c 1 >/dev/null || exit 4
+echo 'pushed then crashed?' >&2
+kill -9 $$
+"#;
+        let fixture = fixture(script);
+        let mut p = params(&fixture, "land");
+        p.push = false;
+        let result = fixture.node.run_gate_typed(p).await.unwrap();
+        assert_eq!(
+            result.status, "uncertain",
+            "a signal death after the barrier release is Unknown: {result:?}"
+        );
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("signal"),
+            "the error names the signal death: {:?}",
+            result.error
+        );
     }
 
     fn fixture_lane_main(fixture: &Fixture) -> String {

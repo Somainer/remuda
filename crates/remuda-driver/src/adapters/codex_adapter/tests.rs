@@ -1824,8 +1824,6 @@ fn a_window_releasing_inside_a_pending_launch_registration_cannot_prune_its_inte
         "C's closed interval is retained while A's window is open"
     );
 
-    // Arm the barrier, then run B's registration on another thread. The
-    // boundary is sampled inside registration (r14 L1); pin it to t_b.
     crate::adapters::codex_discovery::set_test_launch_boundary(Path::new(cwd), t_b);
     let barrier = PendingLaunchBarrier::arm(Path::new(cwd));
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1838,7 +1836,6 @@ fn a_window_releasing_inside_a_pending_launch_registration_cannot_prune_its_inte
         })
         .unwrap();
 
-    // B has inserted its lifetime but has not opened its window yet.
     barrier.wait_to_enter();
     assert!(
         crate::adapters::codex_discovery::census_contains(Path::new(cwd), INST_B),
@@ -1849,11 +1846,19 @@ fn a_window_releasing_inside_a_pending_launch_registration_cannot_prune_its_inte
     // prunes C (B has no window yet, so A looks like the last window); with
     // the atomic registration the release blocks until B's window is open and
     // then only decrements the count 2 -> 1.
+    //
+    // c-usagefu r14 item 6: prove deterministically that the releaser is
+    // queued on LAUNCH_REGISTRATION BEFORE B is allowed to proceed — a fixed
+    // sleep could release B before the releaser even reached the lock.
+    let release_blocked =
+        crate::adapters::codex_discovery::release_blocked_receiver(Path::new(cwd));
     let releaser = std::thread::Builder::new()
         .name("r13-item1-release".into())
         .spawn(move || drop(a))
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    release_blocked
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the releaser is blocked on LAUNCH_REGISTRATION before B is released");
 
     barrier.release();
     let b_pending = rx.recv().unwrap();
@@ -2023,6 +2028,80 @@ fn a_launch_blocked_before_the_lock_samples_its_boundary_after_a_close_and_refus
         b_pending.launched_at > fc_started,
         "the returned boundary is the in-lock sample after FC's creation"
     );
+}
+
+#[test]
+fn arming_a_second_barrier_disarms_the_first_and_releases_its_parked_registration() {
+    // c-usagefu r14 item 6: arm disarms a PREVIOUS barrier first. A
+    // registration parked on the old barrier must be released by the new arm
+    // itself, without anyone calling the old barrier's release(). A stale arm
+    // that merely overwrote the slot left the thread parked forever.
+    use crate::adapters::codex_discovery::PendingLaunchBarrier;
+
+    let cwd = "/projects/r14-item6-disarm";
+    let (tx, rx) = std::sync::mpsc::channel();
+    let first = PendingLaunchBarrier::arm_pre_lock(Path::new(cwd));
+    let builder = std::thread::Builder::new()
+        .name("r14-item6-old-registration".into())
+        .spawn(move || {
+            let pending =
+                crate::adapters::codex_discovery::register_pending_launch(Path::new(cwd), INST_B);
+            tx.send(pending).unwrap();
+        })
+        .unwrap();
+    first.wait_before_lock();
+
+    // A newer arm for the SAME cwd disarms `first`; its parked registration
+    // runs to completion on its own (the new barrier has the between stage
+    // disabled).
+    let second = PendingLaunchBarrier::arm_pre_lock(Path::new(cwd));
+    let pending = rx
+        .recv_timeout(std::time::Duration::from_millis(2000))
+        .expect("arming a newer barrier releases a registration parked on the old one");
+    builder.join().unwrap();
+    drop(pending);
+    drop(second);
+    drop(first);
+}
+
+#[test]
+fn dropping_a_replaced_barrier_never_clears_the_currently_armed_barrier() {
+    // c-usagefu r14 item 6: Drop clears the static slot ONLY while it still
+    // holds THIS barrier (Arc identity). After a second arm replaced the
+    // first, dropping the first Arc must leave the new barrier armed — a
+    // later registration parks on it. Unconditional clearing made a later
+    // test's registration sail past an armed barrier.
+    use crate::adapters::codex_discovery::PendingLaunchBarrier;
+
+    let cwd = "/projects/r14-item6-ptr-eq";
+    let first = PendingLaunchBarrier::arm_pre_lock(Path::new(cwd));
+    let second = PendingLaunchBarrier::arm_pre_lock(Path::new(cwd));
+    // `first` is no longer the armed barrier; its Drop must not clear `second`.
+    drop(first);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let builder = std::thread::Builder::new()
+        .name("r14-item6-parked-registration".into())
+        .spawn(move || {
+            let pending =
+                crate::adapters::codex_discovery::register_pending_launch(Path::new(cwd), INST_B);
+            tx.send(pending).unwrap();
+        })
+        .unwrap();
+    // No blocking wait: with the entry intact the registration parks (nothing
+    // is sent); if the replaced barrier's Drop cleared the current barrier the
+    // registration sails through and this receipt succeeds.
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(500))
+            .is_err(),
+        "the registration stays parked on the still-armed second barrier"
+    );
+    second.release_pre_lock();
+    let pending = rx
+        .recv_timeout(std::time::Duration::from_millis(2000))
+        .unwrap();
+    builder.join().unwrap();
+    drop(pending);
 }
 
 #[test]

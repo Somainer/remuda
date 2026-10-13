@@ -147,10 +147,7 @@ impl Store {
                 })
                 .optional()?
                 .flatten();
-            let retained_epoch = retained
-                .map(|session| i64::try_from(session).unwrap_or(0) >> 32)
-                .unwrap_or(0)
-                .max(0) as u64;
+            let retained_epoch = retained.map(|session| (session >> 32) as u64).unwrap_or(0);
             // Current persisted allocation epoch, if any.
             let current: Option<i64> = tx
                 .query_row(
@@ -3589,8 +3586,10 @@ impl Store {
         digest: String,
         created_by: &str,
         auth: LogAuth,
+        // r15 item 3: the authenticated host the evidence arrived on.
         host: Option<&str>,
     ) -> Result<Option<String>, crate::store::StoreError> {
+        #![allow(clippy::too_many_arguments)]
         let project_id = project_id.to_owned();
         let job_id = job_id.to_owned();
         let created_by = created_by.to_owned();

@@ -774,10 +774,7 @@ impl GateRegistry {
     #[cfg(unix)]
     fn record_land_group(&self, job_id: &str, generation: u32, pgid: i32) -> std::io::Result<()> {
         let identity = sample_leader_identity(pgid).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "could not read the land leader's start-time identity",
-            )
+            std::io::Error::other("could not read the land leader's start-time identity")
         })?;
         write_land_fence(&self.land_fence_dir, job_id, generation, pgid, &identity)
     }
@@ -2834,10 +2831,9 @@ impl LandStartBarrier {
         F: FnOnce() -> std::io::Result<()>,
     {
         match self {
-            Self::Failed(error) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("start barrier unavailable: {error}"),
-            )),
+            Self::Failed(error) => Err(std::io::Error::other(format!(
+                "start barrier unavailable: {error}"
+            ))),
             Self::Ready { write, .. } => {
                 fence()?;
                 nix::unistd::write(&write, &[1u8; 1])?;
@@ -2945,8 +2941,8 @@ fn proc_root() -> std::path::PathBuf {
 #[cfg(all(unix, any(test, feature = "test-faults")))]
 static PROC_ROOT_RW: std::sync::RwLock<Option<std::path::PathBuf>> = std::sync::RwLock::new(None);
 
-/// Reentrant per-thread view of the [`PROC_ROOT_RW`] override, so a thread
-/// holding the write lock still reads its own override without deadlocking.
+// Reentrant per-thread view of the PROC_ROOT_RW override, so a thread
+// holding the write lock still reads its own override without deadlocking.
 #[cfg(all(unix, any(test, feature = "test-faults")))]
 thread_local! {
     static PROC_OVERRIDE_LOCAL: std::cell::Cell<Option<std::path::PathBuf>> =
@@ -5091,8 +5087,7 @@ Running 8 tests across 2 projects
 
     #[test]
     fn start_barrier_failed_variant_refuses_release() {
-        let barrier =
-            super::LandStartBarrier::failed(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
+        let barrier = super::LandStartBarrier::failed(std::io::Error::other("boom"));
         let error = barrier.release_after(|| Ok(())).expect_err("no release");
         assert!(error.to_string().contains("start barrier unavailable"));
     }

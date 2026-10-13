@@ -805,6 +805,7 @@ impl RunningHub {
     /// the verdict generation no longer matches the row's attempt). Drives the
     /// real writer, not a test copy (r12 item 8).
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn test_insert_gate_log(
         &self,
         project_id: &str,

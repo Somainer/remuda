@@ -1705,9 +1705,14 @@ impl ShellPtyDriver {
         // group kill and — once the leader is dead — reparents to init, so a
         // post-signal ppid scan could no longer find it. The snapshot makes
         // such an escaped survivor discoverable after the group is gone.
+        //
+        // Ruling F' (c-usagefu r16 item 2): a process table that cannot be
+        // read is Unknown, NOT an empty tree. The Unknown marker is carried
+        // into the outcome and the termination identity, and the interval is
+        // never closed on it.
         #[cfg(target_os = "linux")]
         let tree_snapshot = lifecycle::snapshot_process_tree(pgid);
-        let outcome = lifecycle::stop_group(
+        let mut outcome = lifecycle::stop_group(
             pgid,
             move || {
                 drop(writer.take());
@@ -1717,28 +1722,54 @@ impl ShellPtyDriver {
         )
         .await?;
         #[cfg(target_os = "linux")]
-        let outcome = {
-            let mut outcome = outcome;
-            if outcome.group_gone {
-                // Live descendants OUTSIDE the signalled group escaped it
-                // (e.g. a setsid daemonising child): the tree is not fully
-                // gone, so name them as stop-incomplete survivors the
-                // termination watcher/registry probes by (pid, start time).
-                //
-                // c-usagefu r15 item 6: rescan the snapshot members' CURRENT
-                // groups, not just their snapshot pgrp. A descendant that
-                // calls setsid(2) DURING the grace (a SIGHUP handler
-                // daemonising the signal-holding process) had its snapshot
-                // group INSIDE the signalled group; only the rescan sees it
-                // escape and keeps the interval open while it can still write.
-                let escaped = lifecycle::rescan_escaped_snapshot_members(&tree_snapshot, pgid);
-                if !escaped.is_empty() {
+        {
+            use lifecycle::ProcessTableObservation;
+            match tree_snapshot {
+                ProcessTableObservation::Unknown => {
+                    // The pre-signal table could not be read: no descendant
+                    // identity was ever captured. Stop-incomplete and Unknown
+                    // for the life of this Node — the interval is never closed
+                    // on this observation (Ruling F', c-usagefu r16 item 2).
                     outcome.group_gone = false;
-                    outcome.survivors = escaped.into_iter().map(|identity| identity.pid).collect();
+                    outcome.observation_unknown = true;
+                    outcome.survivors.clear();
+                }
+                ProcessTableObservation::Established(tree) => {
+                    if outcome.group_gone {
+                        // Live descendants OUTSIDE the signalled group escaped
+                        // it (e.g. a setsid daemonising child): name them as
+                        // stop-incomplete survivors the termination
+                        // watcher/registry probes by (pid, start time).
+                        //
+                        // c-usagefu r15 item 6: rescan the snapshot members'
+                        // CURRENT groups, not just their snapshot pgrp.
+                        //
+                        // c-usagefu r16 item 2 (F'): a rescan table that
+                        // cannot be read is Unknown — retain EVERY captured
+                        // non-leader identity rather than dropping the lot as
+                        // "no survivor"; only a later confirmed probe discards
+                        // one.
+                        match lifecycle::rescan_escaped_snapshot_members(&tree, pgid) {
+                            ProcessTableObservation::Unknown => {
+                                outcome.group_gone = false;
+                                outcome.survivors = tree
+                                    .iter()
+                                    .filter(|member| member.pid != pgid)
+                                    .map(|member| member.pid)
+                                    .collect();
+                            }
+                            ProcessTableObservation::Established(escaped) => {
+                                if !escaped.is_empty() {
+                                    outcome.group_gone = false;
+                                    outcome.survivors =
+                                        escaped.iter().map(|identity| identity.pid).collect();
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            outcome
-        };
+        }
         // The leader can be classified dead while the kernel has not made it
         // reapable yet: on macOS a SIGKILLed session leader sits in `E`
         // (exiting) before it becomes a zombie. `stop_group` correctly reports
@@ -3027,9 +3058,13 @@ impl Driver for ShellPtyDriver {
             }
         }
         if !group_gone && !unconfirmed.is_empty() {
-            let (pgid, survivor_pids) = match &outcome {
-                Ok(outcome) => (outcome.pgid, outcome.survivors.clone()),
-                Err(_) => (Some(state.pgid.load(Ordering::SeqCst)), Vec::new()),
+            let (pgid, survivor_pids, observation_unknown) = match &outcome {
+                Ok(outcome) => (
+                    outcome.pgid,
+                    outcome.survivors.clone(),
+                    outcome.observation_unknown,
+                ),
+                Err(_) => (Some(state.pgid.load(Ordering::SeqCst)), Vec::new(), false),
             };
             // r15 item 5 (Ruling F): each named survivor is a (pid, start
             // time) identity captured NOW; a later reused pid with a different
@@ -3044,7 +3079,11 @@ impl Driver for ShellPtyDriver {
             // pending-termination registry instead of being abandoned.
             crate::termination::watch_pending_termination(
                 unconfirmed,
-                crate::termination::TerminationIdentity { pgid, survivors },
+                crate::termination::TerminationIdentity {
+                    pgid,
+                    survivors,
+                    observation_unknown,
+                },
             );
         }
         Ok(DriverAck::not_dispatched())
@@ -5215,6 +5254,7 @@ mod tests {
             group_gone: false,
             pgid: Some(survivor_pid),
             survivors: vec![survivor_pid],
+            observation_unknown: false,
         });
         Driver::close(&driver).await.unwrap();
 
@@ -5379,6 +5419,7 @@ mod tests {
             group_gone: false,
             pgid: Some(survivor_pid),
             survivors: vec![survivor_pid],
+            observation_unknown: false,
         });
         Driver::close(&driver).await.unwrap();
 
@@ -5580,7 +5621,12 @@ mod tests {
         let escaped_pid = {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
-                let tree = lifecycle::snapshot_process_tree(root_pgid);
+                let tree = match lifecycle::snapshot_process_tree(root_pgid) {
+                    lifecycle::ProcessTableObservation::Established(tree) => tree,
+                    lifecycle::ProcessTableObservation::Unknown => {
+                        panic!("/proc is readable in this test")
+                    }
+                };
                 if let Some(proc_info) = tree.iter().find(|proc_info| {
                     proc_info.pid != root_pgid
                         && proc_info.pgrp != root_pgid
@@ -5784,7 +5830,12 @@ time.sleep(120)'
         let member_pid = {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
-                let tree = lifecycle::snapshot_process_tree(root_pgid);
+                let tree = match lifecycle::snapshot_process_tree(root_pgid) {
+                    lifecycle::ProcessTableObservation::Established(tree) => tree,
+                    lifecycle::ProcessTableObservation::Unknown => {
+                        panic!("/proc is readable in this test")
+                    }
+                };
                 if let Some(proc_info) = tree.iter().find(|proc_info| {
                     proc_info.pid != root_pgid
                         && proc_info.pgrp == root_pgid
@@ -5874,8 +5925,278 @@ time.sleep(120)'
         crate::adapters::codex_discovery::forget_lifetime(&cwd, owner);
     }
 
-    ///
-    /// Promoted rather than launched: §1.0 makes the two the same session to
+    /// Launch a REAL codex-target driver whose agent child ignores SIGINT and
+    /// `setsid(2)`s ITSELF on SIGHUP, then runs forever: the exact process that
+    /// escapes the SIGKILL group kill mid-ladder. Returns the owned tempdir,
+    /// driver, census cwd/owner and the signalled group id. Production spawn
+    /// path only — nothing hand-installed (c-usagefu r16 items 2/3).
+    #[cfg(target_os = "linux")]
+    async fn spawn_sighup_setsid_fixture()
+    -> (tempfile::TempDir, ShellPtyDriver, PathBuf, String, i32) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-codex-r16items23.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+case "$1" in --version|version) echo 'codex 0.154.0'; exit 0;; esac
+python3 -c '
+import os,signal,time
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+def hup(*a):
+    os.setsid()
+    while True: time.sleep(100)
+signal.signal(signal.SIGHUP, hup)
+time.sleep(120)'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let instance_id = InstanceId::new();
+        let instance_dir = dir.path().join(instance_id.as_id().as_str());
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.kind = AgentKind::Codex;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+        spec.model_id = Some("gpt-5.4".into());
+
+        let mut options = ShellPtyOptions::agent(
+            dir.path().to_path_buf(),
+            AgentKind::Codex,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::OpenaiResponses,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["gpt-5.4".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: instance_dir.join("launch"),
+                native_home: dir.path().join("codex-native-home"),
+                binary: Some(script.clone()),
+                origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: true,
+                settings_overlay: None,
+            },
+        );
+        options.instance_id = Some(instance_id.clone());
+        options.hooks = Some(HookConfig {
+            instance_dir: instance_dir.clone(),
+            relay_binary: PathBuf::from("/bin/true"),
+            tui: crate::launch::TuiMode::Default,
+        });
+
+        let driver = ShellPtyDriver::new(options);
+        let mut run = driver.start(spec.clone()).await.expect("real codex spawn");
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), run.recv()).await;
+        let cwd: PathBuf = spec.cwd.clone().into();
+        let owner = instance_id.as_id().as_str().to_owned();
+        let root_pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        (dir, driver, cwd, owner, root_pgid)
+    }
+
+    /// Find the in-group python descendant of `root_pgid` through the
+    /// production snapshot BEFORE the ladder (it is still in the signalled
+    /// group at that point).
+    #[cfg(target_os = "linux")]
+    async fn fixture_in_group_member(root_pgid: i32) -> i32 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let tree = match lifecycle::snapshot_process_tree(root_pgid) {
+                lifecycle::ProcessTableObservation::Established(tree) => tree,
+                lifecycle::ProcessTableObservation::Unknown => {
+                    panic!("/proc is readable before the failure seam is armed")
+                }
+            };
+            if let Some(proc_info) = tree.iter().find(|proc_info| {
+                proc_info.pid != root_pgid
+                    && proc_info.pgrp == root_pgid
+                    && lifecycle::process_running(proc_info.pid)
+            }) {
+                return proc_info.pid;
+            }
+            assert!(deadline > tokio::time::Instant::now(), "member appears");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_unreadable_process_table_is_unknown_and_never_closes_the_interval() {
+        use crate::adapters::FileSignalAdapter as _;
+        // c-usagefu r16 item 2 (Ruling F'): when the pre-signal snapshot cannot
+        // read the process table, the OLD code took it for an empty tree and
+        // the failed post-ladder rescan for "no survivors", so a live escaped
+        // descendant produced a clean group_gone and the census interval
+        // CLOSED while the process could still write. An unreadable table is
+        // Unknown: the interval stays open and the registry entry is kept even
+        // AFTER the survivor dies and /proc is readable again — this Node
+        // captured no identity, so nothing it later observes may close it.
+        let _term_lock = crate::termination::termination_test_lock();
+        lifecycle::set_test_watch_bound(Some(std::time::Duration::from_millis(400)));
+        crate::termination::set_test_maintenance_interval(None);
+        crate::termination::shutdown_pending_terminations().await;
+        // The scan-failure seam is keyed by pgid; a prior panic could have
+        // left it armed. Tests serialize on the termination lock; reset here.
+        lifecycle::set_test_proc_scan_failure(None);
+
+        let (_dir, driver, cwd, owner, root_pgid) = spawn_sighup_setsid_fixture().await;
+        let member_pid = fixture_in_group_member(root_pgid).await;
+
+        // The /proc DIRECTORY scan for THIS group fails (snapshot and rescan)
+        // from here; the ladder's own group scan and per-pid probes read single
+        // stat files and are deliberately unaffected, so the REAL ladder still
+        // runs and still kills the old group. Other driver closes in the test
+        // process use a different pgid and read the real table.
+        lifecycle::set_test_proc_scan_failure(Some(root_pgid));
+        Driver::close(&driver).await.unwrap();
+        assert!(
+            lifecycle::process_running(member_pid),
+            "the setsid-on-SIGHUP descendant really escaped the ladder"
+        );
+
+        for _ in 0..10 {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+                "an unreadable snapshot never closes the interval"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        let transfer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !crate::termination::test_has_pending_for(&cwd) {
+            assert!(tokio::time::Instant::now() < transfer_deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // The survivor dies and the table becomes readable again: the entry
+        // still cannot close — no identity was ever captured (Ruling F').
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(member_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        lifecycle::set_test_proc_scan_failure(None);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let recheck_home = tempfile::tempdir().unwrap();
+        let mut rechecker = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+            home: recheck_home.path().to_path_buf(),
+            cwd: cwd.clone(),
+            pid: None,
+            launched_at: Some(time::OffsetDateTime::now_utc()),
+            resume_session_id: None,
+        })
+        .with_instance_key(Some("r16-item2-unknown-rechecker".to_owned()));
+        assert!(rechecker.poll().unwrap().is_empty());
+        assert!(
+            crate::termination::test_has_pending_for(&cwd),
+            "Unknown is never proven gone: the entry is kept for Node reconciliation"
+        );
+        assert!(
+            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "the interval stays live with no captured identity"
+        );
+        drop(rechecker);
+
+        lifecycle::set_test_watch_bound(None);
+        crate::termination::set_test_maintenance_interval(None);
+        crate::termination::shutdown_pending_terminations().await;
+        crate::adapters::codex_discovery::forget_lifetime(&cwd, &owner);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_failed_post_ladder_rescan_retains_captured_identities_until_confirmed_death() {
+        use crate::adapters::FileSignalAdapter as _;
+        // c-usagefu r16 item 2/3: a READABLE pre-signal snapshot followed by an
+        // UNREADABLE post-ladder rescan. OLD code dropped the whole rescan
+        // result and, with the ladder reporting its group gone, closed the
+        // interval while the escaped survivor lived. F' retains every captured
+        // snapshot member as an Unknown-strength identity; a later per-pid
+        // probe that CONFIRMS death (ESRCH) then closes it through the normal
+        // registry recheck — retained, never silently dropped.
+        let _term_lock = crate::termination::termination_test_lock();
+        lifecycle::set_test_watch_bound(Some(std::time::Duration::from_millis(400)));
+        crate::termination::set_test_maintenance_interval(None);
+        crate::termination::shutdown_pending_terminations().await;
+        // The scan-failure seam is keyed by pgid; a prior panic could have
+        // left it armed. Tests serialize on the termination lock; reset here.
+        lifecycle::set_test_proc_scan_failure(None);
+
+        let (_dir, driver, cwd, owner, root_pgid) = spawn_sighup_setsid_fixture().await;
+        let member_pid = fixture_in_group_member(root_pgid).await;
+
+        // The snapshot is taken synchronously when the ladder starts; the
+        // ladder then waits ~2 s per rung (the child ignores SIGINT) and the
+        // rescan runs only after it (~4.5 s in). Arm the scan failure 500 ms
+        // in: AFTER the snapshot, well BEFORE the rescan. It is scoped to THIS
+        // group, so concurrent driver closes in the test process read the real
+        // table.
+        let failure_thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            lifecycle::set_test_proc_scan_failure(Some(root_pgid));
+        });
+
+        Driver::close(&driver).await.unwrap();
+        failure_thread.join().unwrap();
+        assert!(
+            lifecycle::process_running(member_pid),
+            "the descendant escaped the ladder into its own group"
+        );
+
+        for _ in 0..10 {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+                "the failed rescan keeps the captured identity and the interval"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        let transfer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !crate::termination::test_has_pending_for(&cwd) {
+            assert!(tokio::time::Instant::now() < transfer_deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Per-pid probes use /proc/<pid>/stat directly and are not failed by
+        // the scan seam; restore it anyway, then confirm death through the
+        // production discovery recheck.
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(member_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        lifecycle::set_test_proc_scan_failure(None);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let recheck_home = tempfile::tempdir().unwrap();
+        let mut rechecker = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+            home: recheck_home.path().to_path_buf(),
+            cwd: cwd.clone(),
+            pid: None,
+            launched_at: Some(time::OffsetDateTime::now_utc()),
+            resume_session_id: None,
+        })
+        .with_instance_key(Some("r16-item2-retained-rechecker".to_owned()));
+        assert!(rechecker.poll().unwrap().is_empty());
+        assert!(
+            !crate::termination::test_has_pending_for(&cwd),
+            "the retained identity is confirmed gone and resolved"
+        );
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "confirmed ESRCH closes the interval the failed rescan kept open"
+        );
+        drop(rechecker);
+
+        lifecycle::set_test_watch_bound(None);
+        crate::termination::set_test_maintenance_interval(None);
+        crate::termination::shutdown_pending_terminations().await;
+        crate::adapters::codex_discovery::forget_lifetime(&cwd, &owner);
+    }
+
     /// everything below the spawn, and the promoted shape needs no materializer
     /// inputs. What is being tested is the gate, which reads `session_kind` —
     /// satisfied by either.

@@ -82,6 +82,14 @@ pub struct StopOutcome {
     pub pgid: Option<i32>,
     /// Survivor pids on a `stop-incomplete`, for the diagnostic.
     pub survivors: Vec<i32>,
+    /// Ruling F' (c-usagefu r16 item 2): the pre-signal process-tree SNAPSHOT
+    /// itself could not be read, so no descendant identity was ever captured.
+    /// `true` forces `group_gone = false`; the pending-termination entry can
+    /// never be proven gone by this Node (Unknown never closes) and is
+    /// reconciled by the next Node process. A failed post-ladder RESCAN with a
+    /// captured tree does NOT set this — its members are retained as
+    /// Unknown-strength identities and later confirmed probes may close them.
+    pub observation_unknown: bool,
 }
 
 impl StopOutcome {
@@ -93,6 +101,7 @@ impl StopOutcome {
             group_gone: true,
             pgid: None,
             survivors: Vec::new(),
+            observation_unknown: false,
         }
     }
 }
@@ -958,6 +967,7 @@ where
                 group_gone: true,
                 pgid: Some(pgid),
                 survivors: Vec::new(),
+                observation_unknown: false,
             });
         }
 
@@ -970,6 +980,7 @@ where
                 group_gone: true,
                 pgid: Some(pgid),
                 survivors: Vec::new(),
+                observation_unknown: false,
             });
         }
 
@@ -986,6 +997,7 @@ where
             } else {
                 live_survivors(pgid)
             },
+            observation_unknown: false,
         })
     }
 }
@@ -1039,7 +1051,19 @@ pub(crate) fn termination_watch_bound() -> Duration {
 /// a named survivor is a (pid, start time) identity — a reused pid with a
 /// different start time means the ORIGINAL process exited, and an unreadable
 /// process state is Unknown (kept), never death.
-pub(crate) fn termination_identity_alive(pgid: Option<i32>, survivors: &[ProcessIdentity]) -> bool {
+///
+/// c-usagefu r16 item 2 (Ruling F'): when the pre-signal SNAPSHOT itself could
+/// not be read (`observation_unknown`) no descendant identity was ever
+/// captured, so neither the group signal nor the survivor probes can speak for
+/// the tree: Unknown, always kept.
+pub(crate) fn termination_identity_alive(
+    pgid: Option<i32>,
+    survivors: &[ProcessIdentity],
+    observation_unknown: bool,
+) -> bool {
+    if observation_unknown {
+        return true;
+    }
     let group_alive = pgid
         .filter(|pgid| *pgid > 0)
         .is_some_and(group_has_live_member);
@@ -1141,6 +1165,35 @@ fn read_proc_stat(pid: i32) -> std::io::Result<String> {
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
 }
 
+/// Test seam: make the `/proc` DIRECTORY scan (the pre-signal snapshot and the
+/// post-ladder rescan) for ONE signalled group fail as a permission error, so
+/// Ruling F's unreadable-table branch is exercised deterministically WITHOUT
+/// also failing the ladder's own group scan, the per-pid identity probes, or —
+/// crucially — a bystander driver's close running in the same parallel test
+/// process. The seam is keyed to the test's own pgid: `Some(pgid)` arms the
+/// fault for that group, `None` restores real reads (c-usagefu r16 item 2).
+#[cfg(all(test, target_os = "linux"))]
+static TEST_PROC_SCAN_FAILURE_PGID: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-1);
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn set_test_proc_scan_failure(armed_for_pgid: Option<i32>) {
+    TEST_PROC_SCAN_FAILURE_PGID.store(
+        armed_for_pgid.map(i64::from).unwrap_or(-1),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn test_proc_scan_fails_for(pgid: i32) -> bool {
+    TEST_PROC_SCAN_FAILURE_PGID.load(std::sync::atomic::Ordering::SeqCst) == i64::from(pgid)
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_dir() -> std::io::Result<std::fs::ReadDir> {
+    std::fs::read_dir("/proc")
+}
+
 /// Parse the state letter and the starttime field (22nd stat field, the 20th
 /// after `comm`) from a `/proc/<pid>/stat` tail.
 #[cfg(target_os = "linux")]
@@ -1221,17 +1274,41 @@ pub(crate) fn process_identity_alive(_identity: ProcessIdentity) -> bool {
     false
 }
 
-/// One process captured in the pre-signal tree snapshot: its pid and process
-/// group (a setsid descendant has a group of its own). Linux-only: both the
-/// snapshot and the post-ladder rescan read `/proc`.
+/// One process captured in the pre-signal tree snapshot: its pid, process
+/// group (a setsid descendant has a group of its own), and its `/proc` start
+/// time captured BEFORE the ladder. Linux-only: both the snapshot and the
+/// post-ladder rescan read `/proc`.
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct TreeProc {
     pub(crate) pid: i32,
     /// The post-ladder rescan reads each member's CURRENT group; this
     /// snapshot group is retained for the tree tests' pre-signal assertions.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) pgrp: i32,
+    /// Start-time baseline captured in the SAME pre-signal pass. If the member
+    /// vanishes during the ladder and its pid is later reused, a mismatch
+    /// against this baseline proves the captured process exited (Ruling F').
+    pub(crate) start_ticks: Option<u64>,
+}
+
+/// What a `/proc` process-table read established for the pre-signal snapshot
+/// and the post-ladder rescan (COORDINATOR RULING F', c-usagefu r16 item 2).
+///
+/// Every process observation is either Established or Unknown: a table that
+/// cannot be read (ENOENT aside, resource exhaustion, permissions) is
+/// **Unknown** — it must never be read as "no survivors", never close an
+/// interval, and never drop a captured identity. Callers retain every captured
+/// identity; only a later confirmed death (or a Linux start-time mismatch)
+/// discards one.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProcessTableObservation<T> {
+    /// The table was read and every relevant row accounted for; `T` is the
+    /// established result.
+    Established(T),
+    /// The table itself could not be read. The caller fails closed.
+    Unknown,
 }
 
 /// Snapshot the descendant process tree of `root_pid` BEFORE the stop ladder
@@ -1245,10 +1322,20 @@ pub(crate) struct TreeProc {
 ///
 /// Transitive closure over `ppid` edges read in one `/proc` pass. The root
 /// itself is included.
+///
+/// Returns [`ProcessTableObservation::Unknown`] when the process table itself
+/// cannot be opened (Ruling F'): the caller has NO captured descendant and the
+/// stop decision must fail closed rather than treating an unreadable table as
+/// an empty tree.
 #[cfg(target_os = "linux")]
-pub(crate) fn snapshot_process_tree(root_pid: i32) -> Vec<TreeProc> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
+pub(crate) fn snapshot_process_tree(root_pid: i32) -> ProcessTableObservation<Vec<TreeProc>> {
+    // Test seam: a per-pgid injected unreadable table (c-usagefu r16 item 2).
+    #[cfg(test)]
+    if test_proc_scan_fails_for(root_pid) {
+        return ProcessTableObservation::Unknown;
+    }
+    let Ok(entries) = read_proc_dir() else {
+        return ProcessTableObservation::Unknown;
     };
     let mut rows: Vec<TreeProc> = Vec::new();
     let mut parents: Vec<(i32, i32)> = Vec::new();
@@ -1266,8 +1353,12 @@ pub(crate) fn snapshot_process_tree(root_pid: i32) -> Vec<TreeProc> {
         let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start()) else {
             continue;
         };
-        if let Some((ppid, pgrp)) = parse_proc_parent_group(after_comm) {
-            rows.push(TreeProc { pid, pgrp });
+        if let Some((ppid, pgrp, start_ticks)) = parse_proc_parent_group_start(after_comm) {
+            rows.push(TreeProc {
+                pid,
+                pgrp,
+                start_ticks,
+            });
             parents.push((pid, ppid));
         }
     }
@@ -1275,6 +1366,7 @@ pub(crate) fn snapshot_process_tree(root_pid: i32) -> Vec<TreeProc> {
     let mut descendants = vec![TreeProc {
         pid: root_pid,
         pgrp: root_pid,
+        start_ticks: None,
     }];
     let mut frontier = vec![root_pid];
     while let Some(parent) = frontier.pop() {
@@ -1288,18 +1380,28 @@ pub(crate) fn snapshot_process_tree(root_pid: i32) -> Vec<TreeProc> {
             }
         }
     }
-    descendants
+    ProcessTableObservation::Established(descendants)
 }
 
 /// Parse the `state ppid pgrp` fields of a `/proc/<pid>/stat` tail, returning
-/// `(ppid, pgrp)`.
-#[cfg(target_os = "linux")]
+/// `(ppid, pgrp)`. Used by the tree tests' current-group assertions.
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn parse_proc_parent_group(after_comm: &str) -> Option<(i32, i32)> {
+    parse_proc_parent_group_start(after_comm).map(|(ppid, pgrp, _)| (ppid, pgrp))
+}
+
+/// Parse a `/proc/<pid>/stat` tail into `(ppid, pgrp, starttime)`; starttime is
+/// stat field 22 (clock ticks since boot), the Ruling F' start-time baseline.
+#[cfg(target_os = "linux")]
+pub(crate) fn parse_proc_parent_group_start(after_comm: &str) -> Option<(i32, i32, Option<u64>)> {
     let mut fields = after_comm.split_whitespace();
     let _state = fields.next()?;
     let ppid: i32 = fields.next()?.parse().ok()?;
     let pgrp: i32 = fields.next()?.parse().ok()?;
-    Some((ppid, pgrp))
+    // After state/ppid/pgrp the next field is session(2); starttime is tail
+    // index 18 (stat field 22), i.e. nth(16) from here.
+    let start_ticks = fields.nth(16).and_then(|value| value.parse().ok());
+    Some((ppid, pgrp, start_ticks))
 }
 
 /// After the stop ladder, rescan the pre-signal snapshot members and return
@@ -1310,17 +1412,29 @@ pub(crate) fn parse_proc_parent_group(after_comm: &str) -> Option<(i32, i32)> {
 /// DURING the grace (e.g. a SIGHUP handler that daemonises the signal-holding
 /// process): its snapshot pgrp still MATCHES the signalled group. Reading each
 /// snapshot member's CURRENT stat catches both forms — a pre-signal escape and
-/// a mid-ladder group change. An unreadable/absent stat is simply skipped
-/// here; the conservative stop-incomplete decision is made from the members
-/// that were observed.
+/// a mid-ladder group change.
+///
+/// COORDINATOR RULING F' (c-usagefu r16 item 2): Unknown is never "no
+/// survivor". If the process table itself cannot be opened this returns
+/// [`ProcessTableObservation::Unknown`] and the caller retains EVERY captured
+/// identity. A member the table does not show (its stat is unreadable or the
+/// row is absent) is retained as an Unknown-strength identity — a later
+/// `kill(pid, 0) == ESRCH` is the only thing that proves it gone (hidden
+/// `/proc` can otherwise hide a live pid). Only a confirmed dead state drops a
+/// member here.
 #[cfg(target_os = "linux")]
 pub(crate) fn rescan_escaped_snapshot_members(
     tree: &[TreeProc],
     signalled_pgid: i32,
-) -> Vec<ProcessIdentity> {
+) -> ProcessTableObservation<Vec<ProcessIdentity>> {
     use std::collections::HashMap;
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
+    // Test seam: a per-pgid injected unreadable table (c-usagefu r16 item 2).
+    #[cfg(test)]
+    if test_proc_scan_fails_for(signalled_pgid) {
+        return ProcessTableObservation::Unknown;
+    }
+    let Ok(entries) = read_proc_dir() else {
+        return ProcessTableObservation::Unknown;
     };
     // One /proc pass: pid -> (state, pgrp) for every process.
     let mut groups: HashMap<i32, (String, i32)> = HashMap::new();
@@ -1348,16 +1462,42 @@ pub(crate) fn rescan_escaped_snapshot_members(
         };
         groups.insert(pid, (state.to_owned(), pgrp));
     }
-    tree.iter()
-        .filter(|member| member.pid != signalled_pgid)
-        .filter_map(|member| {
-            let (state, current_pgrp) = groups.get(&member.pid)?;
-            if state_is_dead(state) || *current_pgrp == signalled_pgid {
-                return None;
-            }
-            Some(survivor_identity(member.pid))
-        })
-        .collect()
+    ProcessTableObservation::Established(
+        tree.iter()
+            .filter(|member| member.pid != signalled_pgid)
+            .filter_map(|member| {
+                // The identity carries the start-time baseline captured in the
+                // pre-signal pass, never a fresh read: a reused pid must be
+                // recognised by a start-time mismatch, not re-baselined into a
+                // false survivor (Ruling F').
+                let identity = ProcessIdentity {
+                    pid: member.pid,
+                    start_ticks: member.start_ticks,
+                };
+                match groups.get(&member.pid) {
+                    // Established dead: the only direct observation that
+                    // discards a captured member at this point.
+                    Some((state, _)) if state_is_dead(state) => None,
+                    // Established alive and OUTSIDE the signalled group: it
+                    // escaped the group kill; the snapshot baseline proves the
+                    // row is still the captured process.
+                    Some((state, current_pgrp)) if *current_pgrp != signalled_pgid => {
+                        debug_assert!(!state_is_dead(state));
+                        Some(identity)
+                    }
+                    // Established alive still inside the signalled group.
+                    Some(_) => None,
+                    // The table opened but this member's row is absent or
+                    // unreadable. Discard ONLY on confirmed death: a vanished
+                    // pid that gives ESRCH, or a reused pid whose start time
+                    // differs from the snapshot baseline. Anything less — a
+                    // hidden `/proc`, EPERM — retains the identity and the
+                    // watcher probes it again later (Ruling F').
+                    None => process_identity_alive(identity).then_some(identity),
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Pids in `pgid` that are still running (not zombies), for a

@@ -50,6 +50,11 @@ use crate::shell_pty::lifecycle::{
 pub(crate) struct TerminationIdentity {
     pub(crate) pgid: Option<i32>,
     pub(crate) survivors: Vec<ProcessIdentity>,
+    /// Ruling F' (c-usagefu r16 item 2): the pre-signal process-tree snapshot
+    /// could not be read, so no descendant identity exists. Unknown can never
+    /// be proven gone — every probe reports alive; the entry leaves only via
+    /// conservative eviction or Node shutdown, and the next Node reconciles.
+    pub(crate) observation_unknown: bool,
 }
 
 /// One stop-incomplete teardown whose intervals have no confirmed close yet.
@@ -134,7 +139,11 @@ impl Supervisor {
             let bound = termination_watch_bound();
             let start = tokio::time::Instant::now();
             loop {
-                if !termination_identity_alive(entry.identity.pgid, &entry.identity.survivors) {
+                if !termination_identity_alive(
+                    entry.identity.pgid,
+                    &entry.identity.survivors,
+                    entry.identity.observation_unknown,
+                ) {
                     close_guards(&entry.guards);
                     return;
                 }
@@ -146,7 +155,11 @@ impl Supervisor {
             // Bound expired while the survivor is still there: one last probe
             // (it may have exited in the final tick), then hand guards and
             // identity to the Node-owned pending-termination registry.
-            if !termination_identity_alive(entry.identity.pgid, &entry.identity.survivors) {
+            if !termination_identity_alive(
+                entry.identity.pgid,
+                &entry.identity.survivors,
+                entry.identity.observation_unknown,
+            ) {
                 close_guards(&entry.guards);
                 return;
             }
@@ -282,7 +295,11 @@ impl Supervisor {
                     continue;
                 }
                 probed += 1;
-                if termination_identity_alive(entry.identity.pgid, &entry.identity.survivors) {
+                if termination_identity_alive(
+                    entry.identity.pgid,
+                    &entry.identity.survivors,
+                    entry.identity.observation_unknown,
+                ) {
                     registry.push_back(entry);
                 } else {
                     // Confirmed gone: take the guards and drop the entry. The
@@ -556,6 +573,7 @@ mod r15_tests {
             identity: TerminationIdentity {
                 pgid: None,
                 survivors,
+                observation_unknown: false,
             },
             cwd: Some(crate::adapters::codex_discovery::canonical_path(dir)),
         }

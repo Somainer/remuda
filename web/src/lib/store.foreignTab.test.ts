@@ -2,6 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { ConnectionMachine } from "./connection";
 import { REST_PROBE_MS } from "./connection";
 import { CLAIM_WAKE_MAX_FAILURES, OUTBOX_LS_KEY, type OutboxRecord } from "./outbox";
+import { readAuthEpoch } from "./session";
 
 const INSTANCE = "ins_foreign_tab";
 const JOURNAL = "obj_foreign_tab_journal";
@@ -4895,18 +4896,19 @@ it("GATE27 item 1: a second acceptance observation of the SAME command is a no-o
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
-
-it("GATE27 item 2: a stale journal catch-up from the previous outbox retires the old row but never clears the replacement outbox's exhaustion", async () => {
-  // Logout/reinit creates a NEW outbox on the same durable backend. The old
-  // epoch's follow subscription later delivers a journal batch carrying the
-  // OLD command's accepted settle. Pre-gate-27 the live settle path recorded
-  // progress on the CURRENT outbox and wiped a freshly exhausted instance;
-  // post-fix the observation retires the durable row (journal evidence always
-  // applies) but the new outbox never issued that command, so its books are
-  // untouched and its pending row stays stranded until its own acceptance.
+it("GATE27 item 2: an OLD-epoch acceptance arriving only AFTER logout/reinit (the command was issued but never accepted) never credits the new epoch", async () => {
+  // codex gate-29 refinement: epoch A ISSUES C (its claim commits, stamping
+  // the issuer) but C is never accepted — the POST hangs inflight. Logout/
+  // reinit creates epoch B, which exhausts its own instance on P while C's
+  // live same-owner lease keeps B from claiming it. The stale epoch-A
+  // subscription delivers C's accepted journal settle ONLY THEN. The durable
+  // CAS compares C's issuer (A) with the current epoch (B): the row retires
+  // to done (journal evidence always applies) but progressRecorded never
+  // flips, B's exhaustion/backoff are untouched and P stays stranded.
   vi.useFakeTimers();
   vi.setSystemTime(1_010_000);
   const I = "ins_g27_i2";
+  const oldI = "ins_g27_i2_old";
   const originalNavigator = globalThis.navigator;
   const good = fifoWebLocks().locks;
   const bad = {
@@ -4925,9 +4927,12 @@ it("GATE27 item 2: a stale journal catch-up from the previous outbox retires the
   const pump = async (n = 2_000) => {
     for (let i = 0; i < n; i += 1) await Promise.resolve();
   };
+  const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+  const rowOf = (id: string) => storedRows().find((r) => r.commandId === id);
   try {
-    // Epoch A: follow (capture its subscription), send the old command C.
-    sessionStorage.setItem("remuda-outbox-owner", "owner_g27_i2_a");
+    // Epoch A: follow (capture subscription); C's POST parks forever so the
+    // command is claimed (issuer = A) but never accepted before logout.
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g27_i2");
     const { api: apiA, hubStore: a } = await fresh();
     vi.spyOn(apiA, "eventsRead").mockResolvedValue({
       events: [],
@@ -4936,43 +4941,56 @@ it("GATE27 item 2: a stale journal catch-up from the previous outbox retires the
       reachedAfterSeq: true,
     });
     vi.spyOn(apiA, "screenRead").mockResolvedValue({ lines: [] });
-    vi.spyOn(apiA, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(apiA, "instanceGet").mockImplementation(
+      (async (id: string) => ({ id, journalId: JOURNAL })) as Api["instanceGet"],
+    );
+    vi.spyOn(apiA, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "1", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    });
     vi.spyOn(apiA, "eventsSubscribe").mockResolvedValue(
       { ...g26Subscription(), subscriptionId: "sub_g27_i2_a" } as never,
     );
-    const sendA = vi.spyOn(apiA, "instanceSend").mockImplementation(
-      (async (_iid: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
-        relatedCommandIds: [],
-        command: {
-          commandId, id: commandId, state: "accepted", revision: "1",
-          dispatch: "native-acknowledged", resolution: "clear",
-        },
-      })) as unknown as Api["instanceSend"],
+    const sendA = vi.spyOn(apiA, "instanceSend");
+    sendA.mockImplementation(
+      (() => new Promise(() => { /* C's POST never resolves: issued, not accepted */ })) as Api["instanceSend"],
     );
     await bootLive(apiA, a);
     await (a as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
-    await a.follow(I);
+    await a.follow(oldI);
     const subscribeA = vi.mocked(apiA.eventsSubscribe);
     for (let i = 0; i < 2_000 && !subscribeA.mock.calls[0]?.[2]; i += 1) await Promise.resolve();
     const onBatchA = subscribeA.mock.calls[0]?.[2] as (b: G26Batch) => void;
-    await a.send(I, "g27 2 C");
-    await pump(500);
-    const cId = sendA.mock.calls[0]?.[4] as string;
-    const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
-    expect(storedRows().find((r) => r.commandId === cId)?.state).toBe("sent");
 
-    // Logout: epoch A ends. Reinit a brand-new outbox B.
+    // Online ordinary send: the claim commits and the POST then hangs.
+    a.setConnectionStateForTest("live");
+    await a.send(oldI, "g27 2 C");
+    await pump(2_000);
+    const cId = sendA.mock.calls[0]?.[4] as string;
+    expect(sendA).toHaveBeenCalledTimes(1);
+    expect(rowOf(cId)?.state).toBe("inflight");
+    const epochA = rowOf(cId)?.issuerEpoch;
+    expect(epochA).toBeTruthy();
+    expect(rowOf(cId)?.progressRecorded).toBeFalsy();
+
+    // Logout BEFORE any acceptance; epoch rotates and the hung POST dies with
+    // the disposed outbox. Reinit epoch B.
     a.logout();
     const reopened = await (
       a as unknown as { ensureOutbox: () => Promise<boolean> }
     ).ensureOutbox();
     expect(reopened).toBe(true);
-    // Settle the new epoch's boot flush completely (its epilogue read must not
-    // coalesce P's later enqueue epilogue onto a pre-P snapshot) while locks
-    // are still up — the only durable row is C, already sent.
+    const epochB = readAuthEpoch();
+    expect(epochB).not.toBe(epochA);
+    // B's boot flush cannot touch C: its lease is still a LIVE same-owner
+    // lease (TTL 30 s), so the claim stops at claim-aborted.
     locks = good;
     a.setConnectionStateForTest("live");
     await (a as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await pump(1_000);
+    expect(rowOf(cId)?.state).toBe("inflight");
+    expect(rowOf(cId)?.issuerEpoch).toBe(epochA);
+    expect(sendA).toHaveBeenCalledTimes(1);
     const boxOfB = () =>
       (
         a as unknown as {
@@ -4983,22 +5001,17 @@ it("GATE27 item 2: a stale journal catch-up from the previous outbox retires the
         }
       ).outbox;
 
-    // B has its own fresh wake wiring but no deliveries yet. With locks down,
-    // B enqueues P and its real timer wakes exhaust the NEW instance.
+    // B exhausts its OWN instance on P with the locks down.
     locks = bad;
     a.setConnectionStateForTest("offline");
     expect(await a.send(I, "g27 2 P")).toBe(true);
     await pump(200);
     const pId = storedRows().find((r) => r.prompt === "g27 2 P")!.commandId;
-    await pump(200);
     await vi.advanceTimersByTimeAsync(120_000);
     expect(boxOfB()!.isDeliveryExhausted(I)).toBe(true);
     expect(boxOfB()!.pendingLeaseWakeups()).toEqual([]);
-    expect(sendA.mock.calls.map((c) => c[4])).toEqual([cId]);
 
-    // The STALE epoch-A subscription delivers C's accepted journal settle.
-    // B never issued C: the durable row retires to done, but B's exhaustion
-    // and P's cover are untouched.
+    // The stale epoch-A subscription settles C accepted/done AFTER reinit.
     onBatchA({
       subscriptionId: "sub_g27_i2_a",
       journalId: JOURNAL,
@@ -5009,13 +5022,16 @@ it("GATE27 item 2: a stale journal catch-up from the previous outbox retires the
     });
     await pump(2_000);
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(storedRows().find((r) => r.commandId === cId)?.state).toBe("done");
+
+    // Journal evidence retires C to durable done, but C is NOT credited to
+    // epoch B: the flag never flips (issuer A ≠ epoch B) and B's books stand.
+    expect(rowOf(cId)?.state).toBe("done");
+    expect(rowOf(cId)?.issuerEpoch).toBe(epochA);
+    expect(rowOf(cId)?.progressRecorded).toBeFalsy();
     expect(boxOfB()!.isDeliveryExhausted(I)).toBe(true);
     expect(boxOfB()!.pendingLeaseWakeups()).toEqual([]);
-    expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("pending");
-    // No new POST: C was posted once in epoch A, P is still stranded.
-    expect(sendA.mock.calls.map((c) => c[4])).toEqual([cId]);
-
+    expect(rowOf(pId)?.state).toBe("pending");
+    expect(sendA).toHaveBeenCalledTimes(1);
     a.logout();
   } finally {
     vi.useRealTimers();

@@ -384,6 +384,43 @@ function HarnessAvoid({
   );
 }
 
+// Panel > flex-column scroll wrapper > a nested scroll REGION (the effort
+// popover: popover > [data-popover-scroll] > slider card > effort-list body).
+function HarnessNestedRegion({
+  open,
+  avoid,
+  onAnchor,
+}: {
+  open: boolean;
+  avoid: { current: HTMLElement };
+  onAnchor: (anchor: AnchoredStyle) => void;
+}) {
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const anchor = useAnchoredPopover(triggerRef, panelRef, open, {
+    preferUp: true,
+    avoidElements: [avoid],
+  });
+  onAnchor(anchor);
+  return (
+    <div>
+      <button ref={triggerRef} data-testid="trigger" style={{ position: "fixed" }}>
+        open
+      </button>
+      {open ? (
+        <div ref={panelRef} data-testid="panel" data-placement={anchor.placement} style={anchor.style}>
+          <div data-popover-scroll="1" data-testid="panel-body">
+            <div className="list-head">head</div>
+            <div data-popover-scroll-region="1" data-testid="panel-region">
+              tall catalog
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 describe("useAnchoredPopover measured positioning", () => {
   const panelSize = { width: 300, height: 190 };
   const triggerRect = {
@@ -617,6 +654,111 @@ describe("useAnchoredPopover measured positioning", () => {
     // extent: placement does NOT flip to up.
     expect(placements[placements.length - 1]).toBe("down");
     expect(new Set(placements).size).toBe(1);
+  });
+
+  it("reads content extent from a nested scroll region so a flex-column wrapper clamping never oscillates", async () => {
+    // The effort popover is popover > flex-column [data-popover-scroll]
+    // wrapper > slider card > effort-list (the real scrollport). Once the
+    // 60vh/strip max-height clamps the card, the overflow lives entirely in
+    // the nested region: the wrapper's OWN scrollHeight equals its clamped
+    // clientHeight. naturalHeightOf must add the region's hidden overflow
+    // back, otherwise `need` collapses to the clamp and the placement math
+    // oscillates between the card-cleared strip cap (need = content, blocked)
+    // and the plain above-room cap (need = clamp, "fits") every observer
+    // cycle, resizing the panel.
+    //
+    // Review geometry: viewport 900, trigger 857/887, approval bottom 721 →
+    // exactly 120px of cleared strip (usable). Below has no room
+    // (900 - 887 - 8 - 8 = -3), so the panel stays up and caps to 120.
+    const avoid = { current: document.createElement("div") };
+    Object.defineProperty(avoid.current, "getBoundingClientRect", {
+      configurable: true,
+      value: () => new DOMRect(100, 621, 1000, 100), // bottom = 721
+    });
+    const triggerRect857 = {
+      x: 590, y: 857, top: 857, bottom: 887, left: 590, right: 699, width: 109, height: 30,
+      toJSON: () => ({}),
+    } as unknown as DOMRect;
+    Object.defineProperty(window, "innerWidth", { value: 1440, configurable: true });
+    Object.defineProperty(window, "innerHeight", { value: 900, configurable: true });
+    // Natural content: 2920px (20px head inside the wrapper + 2900px list).
+    const CONTENT = 2920;
+    const REGION_CONTENT = 2900;
+    const HEAD = CONTENT - REGION_CONTENT;
+    let clamped = false;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      if (this.dataset.testid === "trigger") return triggerRect857;
+      if (this.dataset.testid === "panel") {
+        const h = clamped ? 120 : CONTENT;
+        return {
+          x: 0, y: 0, right: 300, bottom: h, width: 300, height: h, toJSON: () => ({}),
+        } as DOMRect;
+      }
+      return new DOMRect();
+    });
+    Object.defineProperty(HTMLElement.prototype, "offsetHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        if (this.dataset.testid === "panel") return clamped ? 120 : CONTENT;
+        if (this.dataset.testid === "panel-body") return clamped ? 120 : CONTENT;
+        return 0;
+      },
+    });
+    // The flex wrapper never overflows itself (the nested region absorbs it),
+    // so its scrollHeight tracks its clamped offsetHeight.
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        if (this.dataset.testid === "panel-body") return clamped ? 120 : CONTENT;
+        if (this.dataset.testid === "panel-region") return REGION_CONTENT;
+        return 0;
+      },
+    });
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        if (this.dataset.testid === "panel-region") return clamped ? 120 - HEAD : REGION_CONTENT;
+        return 0;
+      },
+    });
+    const observerInstances: { flush: () => void }[] = [];
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(cb: () => void) {
+          observerInstances.push({ flush: cb });
+        }
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    const anchors: AnchoredStyle[] = [];
+    render(<HarnessNestedRegion avoid={avoid} open onAnchor={(a) => anchors.push(a)} />);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    // First measure: need is the full content (2920) > the 120 strip, blocked
+    // up, no room below → stays up capped exactly to the cleared strip.
+    expect(anchors[anchors.length - 1].placement).toBe("up");
+    expect(anchors[anchors.length - 1].style.maxHeight).toBe(120);
+
+    // The browser applies the 120px clamp; fire repeated panel resize cycles.
+    clamped = true;
+    for (let i = 0; i < 5; i++) {
+      observerInstances.forEach((o) => o.flush());
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const last = anchors[anchors.length - 1];
+    expect(last.placement).toBe("up");
+    // need MUST NOT collapse to the clamped 120 (which would "fit" and jump to
+    // the plain above-room 540 cap); every post-clamp measure keeps 120.
+    expect(last.style.maxHeight).toBe(120);
+    const postClamp = anchors.filter((_, i) => i > 0);
+    expect(new Set(postClamp.map((a) => a.placement))).toEqual(new Set(["up"]));
+    expect(new Set(postClamp.map((a) => a.style.maxHeight))).toEqual(new Set([120]));
+    const tops = new Set(postClamp.map((a) => a.style.top));
+    expect(tops.size, "panel top must not oscillate between caps").toBe(1);
   });
 });
 

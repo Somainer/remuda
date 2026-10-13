@@ -239,12 +239,25 @@ export function useAnchoredPopover(
   // instead reconstruct the natural panel height as the inner content extent
   // plus the panel's fixed chrome (head/footer/border), which the clamp
   // shrinks by exactly the same amount it shrinks the inner offsetHeight.
+  //
+  // When the wrapper is itself a flex COLUMN (so a nested card with its OWN
+  // `[data-popover-scroll-region]` scrollport sits inside it), the clamp is
+  // absorbed by the nested region: the wrapper's scrollHeight then equals
+  // its clamped clientHeight and under-reports the content. Add the nested
+  // region's hidden overflow back so `need` stays the true content height
+  // and the popover settles once on the strip cap instead of oscillating
+  // between the strip and the plain above-room cap.
+  //
   // When there is no inner scroll wrapper (the short slider card, which is
   // never content-clamped) the panel's own offsetHeight is used.
   const naturalHeightOf = (panel: HTMLElement): number => {
     const inner = panel.querySelector<HTMLElement>("[data-popover-scroll='1']");
     if (inner) {
       const chrome = panel.offsetHeight - inner.offsetHeight;
+      const region = inner.querySelector<HTMLElement>("[data-popover-scroll-region='1']");
+      if (region) {
+        return inner.scrollHeight + (region.scrollHeight - region.clientHeight) + chrome;
+      }
       return inner.scrollHeight + chrome;
     }
     return panel.offsetHeight;

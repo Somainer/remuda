@@ -485,6 +485,11 @@ export function EffortSlider({
           ref={listBodyRef}
           className={css.effortListBody}
           data-testid={tid("list")}
+          // The real scrollport INSIDE the popover's flex-column scroll
+          // wrapper: it absorbs a tall catalog's overflow, so AnchoredPopover
+          // must read the content extent from THIS region (scrollHeight -
+          // clientHeight) rather than the already-clamped wrapper.
+          data-popover-scroll-region="1"
           role="listbox"
           aria-label={`${stopLabel}，展开档位与模型`}
           onKeyDown={onListKeyDown}

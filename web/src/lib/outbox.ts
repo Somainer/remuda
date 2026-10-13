@@ -1410,9 +1410,18 @@ export class Outbox {
 
   private bumpAcceptedRetry(commandId: Id, failures: number) {
     const next = failures + 1;
+    const pending = this.pendingAcceptances.get(commandId);
+    if (!pending) return;
+    // PERSIST the increased count on the pending entry (c-reconnfu gate 31
+    // item 1): without writing it back, every scheduled attempt re-reads the
+    // initial count and `next` stays below the cap forever — a persistently
+    // failing CAS would retry indefinitely.
+    pending.failures = next;
     if (next >= CLAIM_WAKE_MAX_FAILURES) {
+      // Cap reached: stop scheduling. Nothing new is surfaced — the delivery
+      // is already accepted and the durable flag retry simply gives up; a
+      // later fresh observation (journal/GET/flush) attempts the CAS again.
       this.clearPendingAcceptance(commandId);
-      this.onReadRecoveryExhausted?.();
       return;
     }
     this.scheduleAcceptedRetry(commandId, next);

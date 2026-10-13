@@ -2291,3 +2291,35 @@ it("GATE30 item 3: two different commands fail their acceptance CAS back to back
     vi.useRealTimers();
   }
 });
+
+it("GATE31 item 1: a persistently failing acceptance CAS retries exactly CLAIM_WAKE_MAX_FAILURES-1 times after the immediate failure, then stops forever", async () => {
+  // Seeded under REAL timers (MemStorage commits on a 1 ms chain timer).
+  const storage = new MemStorage();
+  const seeded = await Outbox.load(storage, "owner_g31_cap");
+  await storage.put(rec({ commandId: "cmd_g31_cap", instanceId: "ins_cap", state: "sent", issuerEpoch: "ep", issuerLifetime: seeded.lifetime }));
+  // Every CAS storage write rejects (persistent backend failure).
+  storage.casProgressRecorded = vi.fn(async () => {
+    throw new Error("g31 cap CAS always fails");
+  });
+  vi.useFakeTimers();
+  try {
+    // The store's immediate CAS already failed once; the outbox gets the
+    // observation pending and starts the bounded retry chain.
+    seeded.retryAcceptedProgress("ins_cap", "cmd_g31_cap", "ep", seeded.lifetime);
+    // Drive well past the longest bounded backoff (cap is 12).
+    await vi.advanceTimersByTimeAsync(120_000);
+    await Promise.resolve();
+    await Promise.resolve();
+    // Immediate failure counted as attempt 1 → the outbox may make exactly
+    // cap-1 further attempts (2..cap), then must stop.
+    expect(storage.casProgressRecorded).toHaveBeenCalledTimes(CLAIM_WAKE_MAX_FAILURES - 1);
+    const callsAtCap = vi.mocked(storage.casProgressRecorded).mock.calls.length;
+    // No further attempts, ever, after the cap.
+    await vi.advanceTimersByTimeAsync(300_000);
+    await Promise.resolve();
+    expect(vi.mocked(storage.casProgressRecorded).mock.calls).toHaveLength(callsAtCap);
+    seeded.dispose();
+  } finally {
+    vi.useRealTimers();
+  }
+});

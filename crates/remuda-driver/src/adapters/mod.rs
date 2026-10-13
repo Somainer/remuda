@@ -21,7 +21,7 @@
 //! [grok-signals-1](../../../docs/design/evidence/grok-signals-1.md).
 
 pub mod codex_adapter;
-pub(crate) mod codex_discovery;
+pub mod codex_discovery;
 pub(crate) mod codex_ownership;
 pub mod grok_adapter;
 pub mod grok_live;

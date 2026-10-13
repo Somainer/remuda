@@ -533,13 +533,13 @@ impl DevNode {
                 Err(error) => failure = Some(node_error(error)),
             }
         }
-        // c-usagefu r14 item 3 (Ruling W1): every instance is closed above, so
-        // own the driver side for the last time — cancel and AWAIT the
-        // stop-incomplete termination watchers and the maintenance sweep, and
-        // drop the pending-termination registry. Guards drop WITHOUT a recorded
-        // close: an unconfirmed survivor must leave its interval live for the
-        // next Node process rather than be closed speculatively.
-        remuda_driver::termination::shutdown_pending_terminations().await;
+        // c-usagefu r17 Ruling W0: every instance is closed above, so own the
+        // driver side for the last time — drop the census guards retained for
+        // stop-incomplete teardowns. The guards drop WITHOUT a recorded close:
+        // an unconfirmed survivor leaves its interval live for the next Node
+        // process rather than being closed speculatively. There are no watcher
+        // tasks to await (the r13–r16 watcher/registry machinery was removed).
+        remuda_driver::shutdown_unconfirmed_guards();
         // Includes partial launches which never yielded a driver handle.
         for resource in self.inner.store.pty_resources()? {
             match resource.close().await {

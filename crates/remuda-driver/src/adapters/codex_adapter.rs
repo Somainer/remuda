@@ -351,12 +351,6 @@ impl CodexAdapter {
     ///    predates us, so the name-index recency guess remains the last
     ///    resort, exactly as before.
     fn discover(&mut self) -> DriverResult<bool> {
-        // c-usagefu r14 item 3 (Ruling W1): a codex discovery is one of the
-        // bounded recheck points for the Node's pending-termination registry.
-        // A stop-incomplete survivor that has since been confirmed gone closes
-        // its census intervals HERE, so this launch's census decision sees the
-        // interval closed instead of live. No-op while nothing is pending.
-        crate::termination::recheck_for_discovery(&self.home.cwd);
         // A prior poll proved ambiguity: never rescan and never reverse.
         if self.discovery_gave_up {
             return Ok(false);

@@ -41,7 +41,6 @@ mod recipe;
 mod screenlive;
 mod secrets;
 pub mod shell_pty;
-pub mod termination;
 pub mod tty;
 pub mod usage;
 
@@ -52,6 +51,9 @@ mod fake;
 #[cfg(any(test, feature = "test-stub"))]
 pub mod test_support;
 
+/// Node shutdown seam: drop codex census guards retained by stop-incomplete
+/// teardowns WITHOUT recording closures (c-usagefu r17 Ruling W0).
+pub use adapters::codex_discovery::shutdown_unconfirmed_guards;
 pub use attachment::{PromptAttachment, attachments_of, text_with_path_mentions};
 pub use binary::{
     BinaryOverrideGuard, BinaryPin, default_command, hash_file, pin_binary, resolve_binary,

@@ -1746,13 +1746,13 @@ fn a_pending_launch_window_survives_another_window_releasing_before_adapter_buil
 }
 
 #[test]
-fn a_termination_watcher_guard_dropped_without_a_confirmed_exit_stays_live() {
-    // c-usagefu r13 item 3: a guard handed to the bounded termination watcher
-    // is closed ONLY by the explicit confirmed-exit close. When the watcher is
-    // aborted (Node shutdown) or its bound expires, dropping the owner guard
-    // must NOT record a close — a false close is worse than an interval that
-    // stays live until the Node restarts. An explicit close before the drop is
-    // still recorded exactly once.
+fn a_retained_stop_incomplete_guard_dropped_without_a_confirmed_exit_stays_live() {
+    // c-usagefu r17 Ruling W0: a guard retained for a stop-incomplete teardown
+    // is closed ONLY by an explicit confirmed-exit close. When Node shutdown
+    // drains the retention bag, dropping the owner guard must NOT record a
+    // close — a false close is worse than an interval that stays live until
+    // the Node restarts. An explicit close before the drop is still recorded
+    // exactly once.
     use crate::adapters::codex_discovery::LifetimeGuardClock as _;
 
     let cwd = "/projects/r13-item3-drop";

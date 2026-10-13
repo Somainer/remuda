@@ -130,11 +130,6 @@ fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Cross-module cwd canonicalization (r14 W1 pending-termination registry).
-pub(crate) fn canonical_path(path: &Path) -> PathBuf {
-    canonical(path)
-}
-
 // ---------------------------------------------------------------------------
 // Instance LIFETIMES (c-usagefu r9 item 1; r11 Ruling A2)
 // ---------------------------------------------------------------------------
@@ -230,12 +225,11 @@ struct LifetimeGuardInner {
     /// owner Drop cannot move the recorded close time later.
     closed: std::sync::atomic::AtomicBool,
     /// Whether owner Drop may record a close. True for a normally-held owner;
-    /// set false when the owner guard is handed to the bounded termination
-    /// watcher (c-usagefu r13 item 3): a teardown that never CONFIRMED the
-    /// process exit (the watcher is aborted on Node shutdown, or its bound
-    /// expires with a survivor still alive) must drop the guard WITHOUT
-    /// recording a false close. An explicit [`LifetimeGuard::close_interval`]
-    /// after confirmed exit bypasses this flag.
+    /// set false when the owner guard is retained for a stop-incomplete
+    /// teardown (c-usagefu r17 Ruling W0): a teardown that never CONFIRMED the
+    /// process group gone must drop the guard WITHOUT recording a false close.
+    /// An explicit [`LifetimeGuard::close_interval`] after confirmed exit
+    /// bypasses this flag.
     drop_closes: std::sync::atomic::AtomicBool,
     /// Test clock: when set, the close is recorded at this time instead of
     /// wall-clock now, so regressions can place launches/closes on a
@@ -245,8 +239,7 @@ struct LifetimeGuardInner {
 }
 
 impl LifetimeGuard {
-    /// Canonical cwd this guard's interval belongs to (r14 W1: scopes the
-    /// pending-termination registry recheck).
+    /// Canonical cwd this guard's interval belongs to.
     pub(crate) fn cwd(&self) -> &Path {
         &self.inner.key
     }
@@ -269,11 +262,10 @@ impl LifetimeGuard {
         self.record_close();
     }
 
-    /// Transfer this owner guard to the bounded termination watcher used on a
-    /// stop-incomplete teardown (c-usagefu r13 item 3): owner Drop must then
-    /// never record a close the process never confirmed — task abort on Node
-    /// shutdown and the watcher's bounded expiry both drop the guard without
-    /// closing. [`Self::close_interval`] stays effective for the
+    /// Transfer this owner guard to stop-incomplete retention (c-usagefu r17
+    /// Ruling W0): owner Drop must then never record a close the stop ladder
+    /// did not confirm — draining the bag on Node shutdown drops the guard
+    /// without closing. [`Self::close_interval`] stays effective for the
     /// confirmed-exit path.
     pub(crate) fn suppress_drop_close(&self) {
         self.inner
@@ -322,9 +314,10 @@ impl Drop for LifetimeGuard {
     fn drop(&mut self) {
         // Safety net only: a normal teardown already called close_interval()
         // after the stop ladder (the AtomicBool then makes this a no-op). A
-        // witness drop never closes, and a guard the termination watcher owns
-        // closes ONLY via an explicit confirmed-exit close_interval (r13 item
-        // 3): its drop after abort/expiry records nothing.
+        // witness drop never closes, and a guard retained for a stop-incomplete
+        // teardown (c-usagefu r17 Ruling W0) closes ONLY via an explicit
+        // confirmed-exit close_interval: its drop on Node shutdown records
+        // nothing.
         if self
             .inner
             .drop_closes
@@ -333,6 +326,53 @@ impl Drop for LifetimeGuard {
             self.record_close();
         }
     }
+}
+
+/// c-usagefu r17 COORDINATOR RULING W0 — census owner guards of
+/// stop-incomplete teardowns.
+///
+/// When a close's stop ladder cannot CONFIRM the process group is gone, its
+/// codex census intervals must stay OPEN for the rest of this Node's
+/// lifetime: same-cwd prompt-only discovery then keeps refusing exactly as
+/// while the agent was live, and a survivor that exits later (or a pid the
+/// kernel reused) can never produce a false close on this Node. Deliberately
+/// there is NO watcher, NO periodic sweep and NO process-identity tracking —
+/// this is only a bag of suppressed owner guards. On Node shutdown
+/// [`shutdown_unconfirmed_guards`] drains and drops them; because
+/// [`LifetimeGuard::suppress_drop_close`] was set when they entered, that drop
+/// records no closure. The next Node process reconciles the census afresh.
+static UNCONFIRMED_GUARDS: LazyLock<Mutex<Vec<LifetimeGuard>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Retain the owner census guards of one stop-incomplete teardown for the
+/// rest of this Node's lifetime (Ruling W0). Drop-close is suppressed on
+/// every guard before it enters the bag; an explicit confirmed-exit close
+/// stays impossible here because the close path already classified the group
+/// as not gone.
+pub(crate) fn retain_unconfirmed_guards(guards: Vec<LifetimeGuard>) {
+    if guards.is_empty() {
+        return;
+    }
+    for guard in &guards {
+        guard.suppress_drop_close();
+    }
+    UNCONFIRMED_GUARDS
+        .lock()
+        .expect("unconfirmed codex census guards")
+        .extend(guards);
+}
+
+/// Node shutdown seam (called from `DevNode::shutdown`): drop every retained
+/// stop-incomplete census guard WITHOUT recording a close (Ruling W0). The
+/// intervals stay live in the census for the next Node process to reconcile.
+/// Synchronous and instant: the guards own no tasks.
+pub fn shutdown_unconfirmed_guards() {
+    let guards = std::mem::take(
+        &mut *UNCONFIRMED_GUARDS
+            .lock()
+            .expect("unconfirmed codex census guards"),
+    );
+    drop(guards);
 }
 
 /// Register instance `owner` as launching in `cwd` at the agent.start boundary
@@ -1477,7 +1517,7 @@ pub(crate) fn prompt_candidate_matches(
 /// the rejection outlives the blocker WITHOUT depending on the interval
 /// retention policy (r11 item 1).
 #[cfg(any(test, feature = "test-stub"))]
-pub(crate) fn forget_lifetime(cwd: &Path, owner: &str) {
+pub fn forget_lifetime(cwd: &Path, owner: &str) {
     let key = canonical(cwd);
     if let Some(by_instance) = INSTANCE_LIFETIMES
         .lock()
@@ -1504,7 +1544,7 @@ pub(crate) fn census_contains(cwd: &Path, owner: &str) -> bool {
 /// has not been closed). A retained closed interval returns false (r11 item 3:
 /// the close must follow the process stop, never precede close beginning).
 #[cfg(any(test, feature = "test-stub"))]
-pub(crate) fn census_lifetime_is_live(cwd: &Path, owner: &str) -> bool {
+pub fn census_lifetime_is_live(cwd: &Path, owner: &str) -> bool {
     INSTANCE_LIFETIMES
         .lock()
         .expect("codex instance lifetimes")

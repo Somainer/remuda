@@ -501,8 +501,9 @@ pub struct ShellPtyDriver {
     /// DRIVER/SESSION rather than by the poller or foreground detection. The
     /// poller only pushes; a demotion never closes. The driver drains the vec
     /// in close() and closes every interval only after the stop ladder
-    /// confirms the process group terminated (or forgets them on a
-    /// stop-incomplete survivor so the safety-net Drop cannot lie).
+    /// confirms the process group terminated (or retains them with Drop-close
+    /// suppressed for the Node's lifetime on a stop-incomplete verdict,
+    /// c-usagefu r17 Ruling W0).
     promoted_codex_lifetimes:
         Arc<std::sync::Mutex<Vec<crate::adapters::codex_discovery::LifetimeGuard>>>,
     /// Recipe from the last start, reused by [`Driver::close`] to journal what
@@ -538,9 +539,10 @@ pub struct ShellPtyDriver {
     interrupt_pid: Arc<AtomicI32>,
     interrupt_screen_markers: Arc<std::sync::Mutex<promotion::InterruptBaseline>>,
     seq: Arc<AtomicU64>,
-    /// c-usagefu r13 item 3 test seam: when set, close() substitutes this
-    /// ladder outcome (a stop-incomplete with a survivor process identity the
-    /// regression controls) for the real one after the ladder has run.
+    /// c-usagefu r17 W0 test seam: when set, close() substitutes this ladder
+    /// outcome (a stop-incomplete naming a survivor the regression controls)
+    /// for the real one AFTER the real ladder has run — its signals and group
+    /// scan are never skipped.
     #[cfg(test)]
     test_stop_outcome: std::sync::Mutex<Option<StopOutcome>>,
 }
@@ -1864,19 +1866,7 @@ impl ShellPtyDriver {
                 }
             }
         };
-        // c-usagefu r14 item 4: snapshot the leader's WHOLE descendant tree
-        // BEFORE signalling. A descendant that called setsid escapes the
-        // group kill and — once the leader is dead — reparents to init, so a
-        // post-signal ppid scan could no longer find it. The snapshot makes
-        // such an escaped survivor discoverable after the group is gone.
-        //
-        // Ruling F' (c-usagefu r16 item 2): a process table that cannot be
-        // read is Unknown, NOT an empty tree. The Unknown marker is carried
-        // into the outcome and the termination identity, and the interval is
-        // never closed on it.
-        #[cfg(target_os = "linux")]
-        let tree_snapshot = lifecycle::snapshot_process_tree(pgid);
-        let mut outcome = lifecycle::stop_group(
+        let outcome = lifecycle::stop_group(
             pgid,
             move || {
                 drop(writer.take());
@@ -1886,74 +1876,21 @@ impl ShellPtyDriver {
         )
         .await?;
         // Test seam: override ONLY the ladder verdict (simulating a member the
-        // ladder could not kill), consumed BEFORE the real snapshot-rescan so
-        // an escaped descendant is still found and unioned below. The real
-        // signals, snapshot and rescan all run; nothing substitutes them.
+        // ladder could not kill). The real signals and group scan all run;
+        // nothing substitutes them.
         #[cfg(test)]
-        if let Some(forced) = self
-            .test_stop_outcome
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            outcome = forced;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            use lifecycle::ProcessTableObservation;
-            match tree_snapshot {
-                ProcessTableObservation::Unknown => {
-                    // The pre-signal table could not be read: no descendant
-                    // identity was ever captured. Stop-incomplete and Unknown
-                    // for the life of this Node — the interval is never closed
-                    // on this observation (Ruling F', c-usagefu r16 item 2).
-                    outcome.group_gone = false;
-                    outcome.observation_unknown = true;
-                    outcome.survivors.clear();
-                }
-                ProcessTableObservation::Established(tree) => {
-                    // c-usagefu r16 item 3: the rescan runs after EVERY ladder
-                    // — whether the signalled group was proved gone OR the
-                    // ladder was incomplete — and its findings are UNIONED with
-                    // the ladder's named survivors. A setsid descendant escaped
-                    // the group kill precisely by leaving the group, so an
-                    // incomplete/inconclusive group result can never speak for
-                    // it: a missing rescan used to leave such a survivor
-                    // unnamed and the interval closed while it could still
-                    // write.
-                    //
-                    // Start from the ladder's named survivors and add distinct
-                    // rescan members (r15 item 6 uses each member's CURRENT
-                    // group, catching a mid-grace setsid too).
-                    let mut unioned: Vec<i32> = outcome.survivors.clone();
-                    let mut rescan_unknown = false;
-                    match lifecycle::rescan_escaped_snapshot_members(&tree, pgid) {
-                        ProcessTableObservation::Unknown => {
-                            // r16 item 2 (F'): retain EVERY captured non-leader
-                            // member as an Unknown-strength identity; only a
-                            // later confirmed probe discards one.
-                            rescan_unknown = true;
-                            for member in tree.iter().filter(|member| member.pid != pgid) {
-                                if !unioned.contains(&member.pid) {
-                                    unioned.push(member.pid);
-                                }
-                            }
-                        }
-                        ProcessTableObservation::Established(escaped) => {
-                            for identity in escaped {
-                                if !unioned.contains(&identity.pid) {
-                                    unioned.push(identity.pid);
-                                }
-                            }
-                        }
-                    }
-                    if rescan_unknown || !unioned.is_empty() {
-                        outcome.group_gone = false;
-                        outcome.survivors = unioned;
-                    }
-                }
+        let outcome = {
+            let mut outcome = outcome;
+            if let Some(forced) = self
+                .test_stop_outcome
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                outcome = forced;
             }
-        }
+            outcome
+        };
         // The leader can be classified dead while the kernel has not made it
         // reapable yet: on macOS a SIGKILLed session leader sits in `E`
         // (exiting) before it becomes a zombie. `stop_group` correctly reports
@@ -2458,6 +2395,42 @@ fn provider_source_lifecycle(
             affects_completion: false,
         })),
     )))
+}
+
+/// c-usagefu r17 Ruling W0: the operator-facing Diagnostic/Warning emitted
+/// once when a close's stop ladder cannot confirm the process group is gone.
+/// Its census intervals then stay open for the rest of the Node lifetime, so
+/// new sessions in that directory are not auto-attributed until the restart;
+/// this observation is the operator's only signal why. It names both the
+/// instance and the directory.
+pub(crate) fn stop_incomplete_warning_message() -> &'static str {
+    "stop incomplete — new sessions in this directory will not be auto-attributed until the Node \
+     restarts"
+}
+
+fn stop_incomplete_warning_payload(
+    instance: &str,
+    cwd: &str,
+) -> remuda_protocol::ObservationPayload {
+    let mut related = std::collections::BTreeMap::new();
+    related.insert("instance".to_owned(), instance.to_owned());
+    related.insert("cwd".to_owned(), cwd.to_owned());
+    remuda_protocol::ObservationPayload::Lifecycle(Box::new(
+        remuda_protocol::LifecyclePayload::Native(Box::new(remuda_protocol::NativeLifecycle {
+            topic: remuda_protocol::LifecycleTopic::Diagnostic,
+            native_name: "stop-incomplete".to_owned(),
+            native_id: remuda_protocol::Knowledge::Known {
+                value: instance.to_owned(),
+            },
+            status: remuda_protocol::Knowledge::Known {
+                value: stop_incomplete_warning_message().to_owned(),
+            },
+            related_ids: related,
+            data_ref: None,
+            severity: remuda_protocol::Severity::Warning,
+            affects_completion: false,
+        })),
+    ))
 }
 
 /// Write the standalone settings overlay (hooks-off path) when no hook
@@ -3167,7 +3140,16 @@ impl Driver for ShellPtyDriver {
         if let Some(worker) = self.permission_worker.lock().await.take() {
             worker.abort();
         }
-        self.events_tx.lock().await.take();
+        // c-usagefu r17 W0: the stop-incomplete operator warning is emitted
+        // only AFTER the ladder verdict is known, so keep a sender clone (and
+        // the stamp ctx) before the run channel is torn down.
+        let close_events = {
+            let mut slot = self.events_tx.lock().await;
+            let clone = slot.clone();
+            *slot = None;
+            clone
+        };
+        let close_ctx = self.promote_ctx.lock().await.clone();
         // c-ctxusage r4 item 2: cooperative poller shutdown. Signal closure
         // first, then give the poller one window to read the final append and
         // publish its last turn via `finish()` (an assistant record with usage
@@ -3284,12 +3266,18 @@ impl Driver for ShellPtyDriver {
         // actually stopped — a record the agent writes while this teardown was
         // in flight must find a live census. This covers BOTH the
         // driver-launched cohort and every promoted-codex interval the poller
-        // handed the session (r12 item 1: a demotion never closes one). When
-        // the group is NOT gone (stop-incomplete: a survivor outlived SIGKILL)
-        // the guards are handed to a BOUNDED termination watcher that closes
-        // them only after the survivor identity is confirmed gone (r13 item 3);
-        // r12 mem::forget-ed them instead, which blocked same-cwd discovery for
-        // the rest of the Node lifetime.
+        // handed the session (r12 item 1: a demotion never closes one).
+        //
+        // c-usagefu r17 COORDINATOR RULING W0 (replaces the r13–r16 watcher /
+        // registry / process-identity machinery): when the ladder CANNOT
+        // confirm the group is gone, the owner guards are suppressed and
+        // retained for the rest of this Node's lifetime — the intervals stay
+        // OPEN and same-cwd prompt-only discovery keeps refusing, exactly as
+        // while the agent was live. Nothing probes the survivor or closes the
+        // intervals later on this Node; Node shutdown drops the guards without
+        // recording a close. The one operator-visible consequence is the
+        // lifecycle/Warning below. A confirmed group exit closes every interval
+        // here, exactly as before.
         let mut unconfirmed = Vec::new();
         if let Some(lifetime) = self.codex_lifetime.lock().await.take() {
             if group_gone {
@@ -3312,33 +3300,44 @@ impl Driver for ShellPtyDriver {
             }
         }
         if !group_gone && !unconfirmed.is_empty() {
-            let (pgid, survivor_pids, observation_unknown) = match &outcome {
-                Ok(outcome) => (
-                    outcome.pgid,
-                    outcome.survivors.clone(),
-                    outcome.observation_unknown,
-                ),
-                Err(_) => (Some(state.pgid.load(Ordering::SeqCst)), Vec::new(), false),
-            };
-            // r15 item 5 (Ruling F): each named survivor is a (pid, start
-            // time) identity captured NOW; a later reused pid with a different
-            // start time reads as the original having exited. An unreadable
-            // stat yields no baseline, which only ever fails conservative.
-            let survivors = survivor_pids
-                .into_iter()
-                .map(lifecycle::survivor_identity)
-                .collect::<Vec<_>>();
-            // r14 W1: the bounded per-close watcher owns the guards, and on
-            // bound expiry they move — identity included — to the Node-owned
-            // pending-termination registry instead of being abandoned.
-            crate::termination::watch_pending_termination(
-                unconfirmed,
-                crate::termination::TerminationIdentity {
-                    pgid,
-                    survivors,
-                    observation_unknown,
-                },
+            let cwd = unconfirmed
+                .first()
+                .map(|guard| guard.cwd().display().to_string())
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            let instance = close_ctx
+                .as_ref()
+                .map(|ctx| ctx.instance_id.as_id().to_string())
+                .or_else(|| {
+                    self.options
+                        .instance_id
+                        .as_ref()
+                        .map(|id| id.as_id().to_string())
+                })
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            tracing::warn!(
+                instance = %instance,
+                cwd = %cwd,
+                "stop-incomplete: the census interval stays open until the Node restarts"
             );
+            crate::adapters::codex_discovery::retain_unconfirmed_guards(unconfirmed);
+            // Surface the condition to the operator exactly once (close runs
+            // once per instance): a Diagnostic/Warning lifecycle naming the
+            // instance and cwd. Best-effort — the run channel may already be
+            // gone during teardown; the retained intervals are what enforce
+            // the conservative behaviour, not this emission.
+            if let (Some(events), Some(ctx)) = (close_events.as_ref(), close_ctx.as_ref())
+                && let Err(error) = promotion::emit_payload(
+                    events,
+                    &self.seq,
+                    ctx,
+                    remuda_protocol::SourceChannel::Runtime,
+                    remuda_protocol::Completeness::Structured,
+                    stop_incomplete_warning_payload(&instance, &cwd),
+                )
+                .await
+            {
+                tracing::debug!(%error, "stop-incomplete warning not journaled");
+            }
         }
         Ok(DriverAck::not_dispatched())
     }
@@ -6140,31 +6139,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stop_incomplete_interval_closes_when_the_survivor_exits_and_a_later_launch_discovers()
-     {
-        // c-usagefu r13 item 3: on stop-incomplete r12 mem::forget-ed the codex
-        // census guards, abandoning the native AND promoted intervals forever:
-        // the survivor usually dies seconds after the SIGKILL ladder gave up,
-        // but same-cwd prompt-only discovery stayed blocked until the Node
-        // restarted. The guards now go to a BOUNDED termination watcher that
-        // closes each interval only after the survivor process identity is
-        // confirmed gone; afterwards an ordinary later same-cwd launch is the
-        // sole live instance and discovers normally.
+    async fn a_stop_incomplete_teardown_keeps_the_census_open_for_the_node_lifetime() {
+        // c-usagefu r17 COORDINATOR RULING W0 (replaces the r13–r16 watcher /
+        // registry / process-identity machinery): when the stop ladder cannot
+        // CONFIRM the group is gone, the codex census intervals stay OPEN for
+        // the rest of this Node's lifetime — no watcher, no registry, no
+        // survivor probing. The operator is told exactly once through a
+        // lifecycle/Warning naming the instance and cwd, a later same-cwd
+        // prompt-only discovery keeps REFUSING even after the survivor exits,
+        // and Node shutdown drops the retained guards without recording a
+        // close.
         use crate::adapters::FileSignalAdapter as _;
         use std::os::unix::process::CommandExt as _;
 
-        // The global termination supervisor and the watch-bound seam are
-        // process-global; serialize every test that drives a stop-incomplete.
-        let _term_lock = crate::termination::termination_test_lock();
-        lifecycle::set_test_watch_bound(None);
-        crate::termination::set_test_maintenance_interval(None);
-
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_path_buf();
+        let canonical_cwd = std::fs::canonicalize(&cwd).unwrap().display().to_string();
 
         // The survivor: a REAL process in its OWN group, the identity a
-        // stop-incomplete outcome would name. It keeps running through close()
-        // (the watcher never signals it); the test kills it afterwards.
+        // stop-incomplete verdict names. The forced verdict only substitutes
+        // the ladder's conclusion; the real ladder still runs. The test kills
+        // the survivor after close.
         let mut child = std::process::Command::new("/bin/sh")
             .args(["-c", "exec sleep 60"])
             .process_group(0)
@@ -6182,12 +6177,12 @@ mod tests {
         let mut options = ShellPtyOptions::login(cwd.clone());
         options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
         let driver = ShellPtyDriver::new(options);
-        let _run = driver.spawn().await.expect("spawns");
+        let mut events = driver.spawn().await.expect("spawns").into_events();
 
         // The driver-owned (native launch) cohort AND a promoted (unknown
         // boundary) cohort, exactly as production registers them.
-        let native_owner = "r13-item3-native";
-        let promoted_owner = "r13-item3-promoted";
+        let native_owner = "r17-w0-native";
+        let promoted_owner = "r17-w0-promoted";
         *driver.codex_lifetime.lock().await =
             Some(crate::adapters::codex_discovery::begin_lifetime(
                 &cwd,
@@ -6198,64 +6193,92 @@ mod tests {
             crate::adapters::codex_discovery::begin_lifetime(&cwd, promoted_owner, None),
         );
 
-        // Force the stop-incomplete outcome AFTER the real ladder runs, naming
-        // the external survivor group (whose process is genuinely still live).
+        // Force the stop-incomplete verdict AFTER the real ladder, naming the
+        // genuinely live external survivor.
         *driver.test_stop_outcome.lock().unwrap() = Some(lifecycle::StopOutcome {
             rung: lifecycle::StopRung::Kill,
             group_gone: false,
             pgid: Some(survivor_pid),
             survivors: vec![survivor_pid],
-            observation_unknown: false,
         });
         Driver::close(&driver).await.unwrap();
 
-        // The survivor outlives the ladder: both intervals must stay LIVE under
-        // the watcher (the r12 mem::forget would have abandoned — also live
-        // forever; the distinction is what happens after the survivor exits).
-        for _ in 0..20 {
+        // The operator warning: exactly one Diagnostic/Warning lifecycle,
+        // naming the instance and the cwd and carrying the W0 message.
+        let mut stop_warnings = Vec::new();
+        while let Ok(observation) = events.try_recv() {
+            if let remuda_protocol::ObservationPayload::Lifecycle(payload) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = &**payload
+                && native.topic == remuda_protocol::LifecycleTopic::Diagnostic
+                && native.severity == remuda_protocol::Severity::Warning
+                && native.native_name == "stop-incomplete"
+            {
+                stop_warnings.push(native.clone());
+            }
+        }
+        assert_eq!(
+            stop_warnings.len(),
+            1,
+            "the stop-incomplete warning is emitted exactly once"
+        );
+        let warning = &stop_warnings[0];
+        let instance = warning
+            .related_ids
+            .get("instance")
+            .expect("names the instance");
+        assert!(!instance.is_empty(), "the named instance is not empty");
+        assert_eq!(
+            warning.related_ids.get("cwd").map(String::as_str),
+            Some(canonical_cwd.as_str()),
+            "the warning names the census cwd"
+        );
+        assert_eq!(
+            warning.native_id,
+            remuda_protocol::Knowledge::Known {
+                value: instance.clone()
+            },
+            "the native id is the named instance"
+        );
+        assert_eq!(
+            warning.status,
+            remuda_protocol::Knowledge::Known {
+                value: super::stop_incomplete_warning_message().to_owned()
+            }
+        );
+
+        // Both intervals are LIVE immediately after the incomplete close.
+        for owner in [native_owner, promoted_owner] {
             assert!(
-                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, native_owner),
-                "native interval stays live while the survivor is still running"
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+                "{owner}: the interval stays live after a stop-incomplete close"
             );
-            assert!(
-                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, promoted_owner),
-                "promoted interval stays live while the survivor is still running"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
 
-        // The survivor exits — kernel reaps it via the waiter thread; its
-        // /proc state goes Z then vanishes. The watcher polls at 250 ms.
+        // The survivor exits later — nothing is watching, so both intervals
+        // stay LIVE.
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(survivor_pid),
             Some(nix::sys::signal::Signal::SIGKILL),
         )
         .unwrap();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let native_closed =
-                !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, native_owner);
-            let promoted_closed =
-                !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, promoted_owner);
-            if native_closed && promoted_closed {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the watcher must close both intervals once the survivor exit is confirmed"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lifecycle::group_has_live_member(survivor_pid) {
+            assert!(tokio::time::Instant::now() < deadline, "the survivor exits");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        assert!(
-            crate::adapters::codex_discovery::census_contains(&cwd, native_owner),
-            "the closed native interval is retained until the last window prunes"
-        );
+        for owner in [native_owner, promoted_owner] {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+                "{owner}: a survivor exit after close never closes the interval (W0)"
+            );
+        }
 
-        // A LATER, same-cwd launch: its floor is after the confirmed close, so
-        // the retained closed intervals cannot overlap [launch, creation].
+        // A LATER same-cwd, prompt-only launch is refused through the REAL
+        // discovery path and the rejection sticks (Ruling A1): the live
+        // intervals overlap its whole decision window.
         let next_home = tempfile::tempdir().unwrap();
-        let floor = time::OffsetDateTime::now_utc() + time::Duration::milliseconds(500);
-        let next_owner = "r13-item3-next";
+        let floor = time::OffsetDateTime::now_utc();
+        let next_owner = "r17-w0-competitor";
         let mut next = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
             home: next_home.path().to_path_buf(),
             cwd: cwd.clone(),
@@ -6264,9 +6287,9 @@ mod tests {
             resume_session_id: None,
         })
         .with_instance_key(Some(next_owner.to_owned()));
-        let prompt = "r13 item 3 later launch prompt";
+        let prompt = "r17 W0 later launch prompt";
         crate::adapters::codex_discovery::record_input(&cwd, next_owner, prompt);
-        let started = floor + time::Duration::seconds(1);
+        let started = floor;
         let date_dir = format!(
             "{:04}/{:02}/{:02}",
             started.year(),
@@ -6279,1059 +6302,40 @@ mod tests {
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
         std::fs::write(
-            month_dir.join("rollout-r13item3.jsonl"),
+            month_dir.join("rollout-r17w0.jsonl"),
             format!(
-                "{{\"timestamp\":\"{started_rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"r13item3\",\"session_id\":\"r13item3\",\"cwd\":\"{}\",\"timestamp\":\"{started_rfc}\"}}}}\n\
+                "{{\"timestamp\":\"{started_rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"r17w0\",\"session_id\":\"r17w0\",\"cwd\":\"{}\",\"timestamp\":\"{started_rfc}\"}}}}\n\
                  {{\"timestamp\":\"{started_rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
                 cwd.display()
             ),
         )
         .unwrap();
-
-        // Wait until the floor is in the past, then run the REAL discovery
-        // (the public poll entry point runs discover).
-        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-        let observed = next.poll().unwrap();
-        assert!(
-            next.binding().is_some(),
-            "the later same-cwd launch is sole-live and discovers its rollout; \
-             emitted {observed:?}"
-        );
-
-        // Its window was the cwd's last: dropping it prunes the watcher-closed
-        // intervals (ordinary retention rules apply once closed).
-        drop(next);
-        let prune_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            let pruned = !crate::adapters::codex_discovery::census_contains(&cwd, native_owner)
-                && !crate::adapters::codex_discovery::census_contains(&cwd, promoted_owner);
-            if pruned {
-                break;
-            }
-            assert!(tokio::time::Instant::now() < prune_deadline);
+        for attempt in 0..2 {
+            let observed = next.poll().unwrap();
+            assert!(
+                observed.is_empty(),
+                "same-cwd prompt-only discovery refuses while a stop-incomplete interval is live \
+                 (attempt {attempt})"
+            );
+            assert!(
+                next.binding().is_none(),
+                "no bind after refusal (attempt {attempt})"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        lifecycle::set_test_watch_bound(None);
-        crate::termination::set_test_maintenance_interval(None);
-        crate::termination::shutdown_pending_terminations().await;
-    }
-
-    #[tokio::test]
-    async fn a_survivor_outliving_the_watch_bound_closes_via_registry_recheck_then_a_later_launch_discovers()
-     {
-        // c-usagefu r14 item 3 (Ruling W1), regression 1: per-close polling
-        // stays BOUNDED. A survivor that outlives the bound moves, guards and
-        // process identity together, into the Node-owned pending-termination
-        // registry rather than being dropped (r13) — r13's drop left the
-        // intervals live for the rest of the Node lifetime. A later codex
-        // discovery in the same cwd rechecks the registry and closes the
-        // intervals on confirmed exit; a launch whose floor is AFTER that
-        // close is then sole-live and discovers.
-        use crate::adapters::FileSignalAdapter as _;
-        use std::os::unix::process::CommandExt as _;
-
-        let _term_lock = crate::termination::termination_test_lock();
-        lifecycle::set_test_watch_bound(Some(std::time::Duration::from_millis(400)));
-        crate::termination::set_test_maintenance_interval(None);
-        // A fresh supervisor for this timeline (a prior test reset it).
-        crate::termination::shutdown_pending_terminations().await;
-
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().to_path_buf();
-
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "exec sleep 60"])
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let survivor_pid = i32::try_from(child.id()).unwrap();
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
-
-        let mut options = ShellPtyOptions::login(cwd.clone());
-        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
-        let driver = ShellPtyDriver::new(options);
-        let _run = driver.spawn().await.expect("spawns");
-
-        let native_owner = "r14-item3a-native";
-        let promoted_owner = "r14-item3a-promoted";
-        *driver.codex_lifetime.lock().await =
-            Some(crate::adapters::codex_discovery::begin_lifetime(
-                &cwd,
-                native_owner,
-                Some(time::OffsetDateTime::now_utc()),
-            ));
-        driver.promoted_codex_lifetimes.lock().unwrap().push(
-            crate::adapters::codex_discovery::begin_lifetime(&cwd, promoted_owner, None),
-        );
-        *driver.test_stop_outcome.lock().unwrap() = Some(lifecycle::StopOutcome {
-            rung: lifecycle::StopRung::Kill,
-            group_gone: false,
-            pgid: Some(survivor_pid),
-            survivors: vec![survivor_pid],
-            observation_unknown: false,
-        });
-        Driver::close(&driver).await.unwrap();
-
-        // The survivor outlives the per-close bound; both intervals stay live
-        // while the watcher polls and after it transfers the entry.
-        for _ in 0..8 {
-            assert!(
-                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, native_owner),
-                "native interval stays live while the registry-bound survivor runs"
-            );
-            assert!(
-                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, promoted_owner),
-                "promoted interval stays live while the registry-bound survivor runs"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        let transfer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !crate::termination::test_has_pending_for(&cwd) {
-            assert!(tokio::time::Instant::now() < transfer_deadline);
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-
-        // The survivor exits after the registry transfer.
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(survivor_pid),
-            Some(nix::sys::signal::Signal::SIGKILL),
-        )
-        .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        assert!(
-            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, native_owner),
-            "nothing closes the interval on its own after the bound — only a recheck does"
-        );
-
-        // A later discovery in the same cwd performs the BOUNDED registry
-        // recheck: confirmed exit closes both intervals. This launch has no
-        // rollout yet and binds nothing; the close is what it contributes.
-        let recheck_home = tempfile::tempdir().unwrap();
-        let mut rechecker = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
-            home: recheck_home.path().to_path_buf(),
-            cwd: cwd.clone(),
-            pid: None,
-            launched_at: Some(time::OffsetDateTime::now_utc()),
-            resume_session_id: None,
-        })
-        .with_instance_key(Some("r14-item3a-rechecker".to_owned()));
-        // poll() runs the production discover() (and therefore the registry
-        // recheck at its top); there is no rollout for the rechecker yet.
-        assert!(rechecker.poll().unwrap().is_empty());
-        assert!(
-            !crate::termination::test_has_pending_for(&cwd),
-            "the confirmed-gone entry is removed on the discovery recheck"
-        );
-        assert!(
-            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, native_owner),
-            "the discovery recheck closes the native interval on confirmed exit"
-        );
-        assert!(
-            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, promoted_owner),
-            "the discovery recheck closes the promoted interval on confirmed exit"
-        );
-        drop(rechecker);
-
-        // A LATER same-cwd launch — its floor is after the confirmed close —
-        // is sole-live and discovers its rollout through the REAL path.
-        let next_home = tempfile::tempdir().unwrap();
-        let floor = time::OffsetDateTime::now_utc() + time::Duration::milliseconds(500);
-        let next_owner = "r14-item3a-next";
-        let mut next = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
-            home: next_home.path().to_path_buf(),
-            cwd: cwd.clone(),
-            pid: None,
-            launched_at: Some(floor),
-            resume_session_id: None,
-        })
-        .with_instance_key(Some(next_owner.to_owned()));
-        let prompt = "r14 item 3a later launch prompt";
-        crate::adapters::codex_discovery::record_input(&cwd, next_owner, prompt);
-        let started = floor + time::Duration::seconds(1);
-        let date_dir = format!(
-            "{:04}/{:02}/{:02}",
-            started.year(),
-            u8::from(started.month()),
-            started.day()
-        );
-        let month_dir = next_home.path().join("sessions").join(date_dir);
-        std::fs::create_dir_all(&month_dir).unwrap();
-        let started_rfc = started
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap();
-        std::fs::write(
-            month_dir.join("rollout-r14item3a.jsonl"),
-            format!(
-                "{{\"timestamp\":\"{started_rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"r14item3a\",\"session_id\":\"r14item3a\",\"cwd\":\"{}\",\"timestamp\":\"{started_rfc}\"}}}}\n\
-                 {{\"timestamp\":\"{started_rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
-                cwd.display()
-            ),
-        )
-        .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-        let observed = next.poll().unwrap();
-        assert!(
-            next.binding().is_some(),
-            "the later launch discovers once the registry recheck closed the intervals; \
-             emitted {observed:?}"
-        );
         drop(next);
 
-        lifecycle::set_test_watch_bound(None);
-        crate::termination::set_test_maintenance_interval(None);
-        crate::termination::shutdown_pending_terminations().await;
-    }
-
-    #[cfg(target_os = "linux")] // snapshot_process_tree is Linux-only (c-usagefu r15 item 7)
-    #[tokio::test]
-    async fn a_real_setsid_descendant_is_named_stop_incomplete_through_the_production_ladder() {
-        // c-usagefu r14 item 4: rebuilds the item-3 regression through
-        // PRODUCTION registration and ownership acquisition — no hand-installed
-        // lifetime guards, no substituted stop outcome. A real codex-target
-        // launch (whose census cohort the spawn path registers itself) runs a
-        // child script that forks `setsid sleep`; that descendant calls
-        // setsid(2), so it escapes the process-group kill. The pre-signal tree
-        // snapshot in stop_tree must name it and make the REAL ladder report
-        // stop-incomplete; the guards move to the bounded watcher and the Node
-        // registry; a discovery recheck closes after confirmed exit and a later
-        // same-cwd launch discovers.
-        use crate::adapters::FileSignalAdapter as _;
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let _term_lock = crate::termination::termination_test_lock();
-        lifecycle::set_test_watch_bound(Some(std::time::Duration::from_millis(400)));
-        crate::termination::set_test_maintenance_interval(None);
-        crate::termination::shutdown_pending_terminations().await;
-
-        let dir = tempfile::tempdir().unwrap();
-        // The agent child: ignores the codex argv, forks a setsid survivor
-        // (its own session and process group), and waits on it so the leader
-        // stays live through the launch and into the stop ladder.
-        let script = dir.path().join("fake-codex.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\ncase \"$1\" in --version|version) echo 'codex 0.154.0'; exit 0;; esac\n\
-             setsid sleep 77 &\nwait\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let instance_id = InstanceId::new();
-        let instance_dir = dir.path().join(instance_id.as_id().as_str());
-        let mut spec: InstanceSpec =
-            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
-        spec.driver = DriverKind::ShellPty;
-        spec.kind = AgentKind::Codex;
-        spec.cwd = dir.path().to_string_lossy().into_owned();
-        spec.model_id = Some("gpt-5.4".into());
-
-        let mut options = ShellPtyOptions::agent(
-            dir.path().to_path_buf(),
-            AgentKind::Codex,
-            AgentLaunch {
-                profile: Box::new(crate::profile::ProviderProfile {
-                    id: spec.provider_profile.id.clone(),
-                    kind: ProviderKind::OpenaiResponses,
-                    base_url: String::new(),
-                    delegation: Delegation::None,
-                    secret_ref: None,
-                    models: vec!["gpt-5.4".into()],
-                    health: crate::profile::ProviderHealth::Healthy,
-                }),
-                launch_dir: instance_dir.join("launch"),
-                native_home: dir.path().join("codex-native-home"),
-                binary: Some(script.clone()),
-                origin: crate::materializer::LaunchOrigin::Human,
-                native_home_managed: true,
-                settings_overlay: None,
-            },
-        );
-        options.instance_id = Some(instance_id.clone());
-        options.hooks = Some(HookConfig {
-            instance_dir: instance_dir.clone(),
-            relay_binary: PathBuf::from("/bin/true"),
-            tui: crate::launch::TuiMode::Default,
-        });
-
-        let driver = ShellPtyDriver::new(options);
-        let mut run = driver.start(spec.clone()).await.expect("real codex spawn");
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), run.recv()).await;
-        let cwd: PathBuf = spec.cwd.clone().into();
-        let owner = instance_id.as_id().as_str();
-
-        // The production spawn path registered the native cohort itself.
-        assert!(
-            driver.codex_lifetime.lock().await.is_some(),
-            "the codex spawn path owns the census guard — nothing hand-installed"
-        );
-
-        // Locate the REAL setsid descendant through the production snapshot.
-        let root_pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
-        let escaped_pid = {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                let tree = match lifecycle::snapshot_process_tree(root_pgid) {
-                    lifecycle::ProcessTableObservation::Established(tree) => tree,
-                    lifecycle::ProcessTableObservation::Unknown => {
-                        panic!("/proc is readable in this test")
-                    }
-                };
-                if let Some(proc_info) = tree.iter().find(|proc_info| {
-                    proc_info.pid != root_pgid
-                        && proc_info.pgrp != root_pgid
-                        && lifecycle::process_running(proc_info.pid)
-                }) {
-                    break proc_info.pid;
-                }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "the setsid descendant appears"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        };
-
-        // The REAL stop ladder — no test_stop_outcome. The group dies; the
-        // pre-signal snapshot makes the escaped sleep a stop-incomplete
-        // survivor and the production guard goes to the bounded watcher.
-        Driver::close(&driver).await.unwrap();
-        for _ in 0..10 {
+        // Node shutdown (the exact seam DevNode::shutdown calls): the retained
+        // guards drop WITHOUT a recorded close — intervals stay live.
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards();
+        for owner in [native_owner, promoted_owner] {
             assert!(
                 crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
-                "the real setsid survivor keeps the production-registered interval live"
+                "{owner}: Node shutdown drops the guard without recording a close"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            crate::adapters::codex_discovery::forget_lifetime(&cwd, owner);
         }
-        let transfer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !crate::termination::test_has_pending_for(&cwd) {
-            assert!(tokio::time::Instant::now() < transfer_deadline);
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-
-        // Confirmed exit: a real discovery recheck closes the interval.
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(escaped_pid),
-            Some(nix::sys::signal::Signal::SIGKILL),
-        )
-        .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        assert!(
-            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
-            "only a registry recheck closes it, not the exit alone"
-        );
-        let recheck_home = tempfile::tempdir().unwrap();
-        let mut rechecker = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
-            home: recheck_home.path().to_path_buf(),
-            cwd: cwd.clone(),
-            pid: None,
-            launched_at: Some(time::OffsetDateTime::now_utc()),
-            resume_session_id: None,
-        })
-        .with_instance_key(Some("r14-item4-rechecker".to_owned()));
-        assert!(rechecker.poll().unwrap().is_empty());
-        assert!(
-            !crate::termination::test_has_pending_for(&cwd),
-            "the discovery recheck resolves the entry"
-        );
-        assert!(
-            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
-            "confirmed exit closes the production cohort's interval"
-        );
-        drop(rechecker);
-
-        // A later same-cwd launch is then sole-live and discovers.
-        let next_home = tempfile::tempdir().unwrap();
-        let floor = time::OffsetDateTime::now_utc() + time::Duration::milliseconds(500);
-        let next_owner = "r14-item4-next";
-        let mut next = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
-            home: next_home.path().to_path_buf(),
-            cwd: cwd.clone(),
-            pid: None,
-            launched_at: Some(floor),
-            resume_session_id: None,
-        })
-        .with_instance_key(Some(next_owner.to_owned()));
-        let prompt = "r14 item 4 later launch prompt";
-        crate::adapters::codex_discovery::record_input(&cwd, next_owner, prompt);
-        let started = floor + time::Duration::seconds(1);
-        let date_dir = format!(
-            "{:04}/{:02}/{:02}",
-            started.year(),
-            u8::from(started.month()),
-            started.day()
-        );
-        let month_dir = next_home.path().join("sessions").join(date_dir);
-        std::fs::create_dir_all(&month_dir).unwrap();
-        let started_rfc = started
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap();
-        std::fs::write(
-            month_dir.join("rollout-r14item4.jsonl"),
-            format!(
-                "{{\"timestamp\":\"{started_rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"r14item4\",\"session_id\":\"r14item4\",\"cwd\":\"{}\",\"timestamp\":\"{started_rfc}\"}}}}\n\
-                 {{\"timestamp\":\"{started_rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
-                cwd.display()
-            ),
-        )
-        .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-        let observed = next.poll().unwrap();
-        assert!(
-            next.binding().is_some(),
-            "the later same-cwd launch discovers after the natural stop-incomplete settled; \
-             emitted {observed:?}"
-        );
-        drop(next);
-
-        lifecycle::set_test_watch_bound(None);
-        crate::termination::set_test_maintenance_interval(None);
-        crate::termination::shutdown_pending_terminations().await;
-        crate::adapters::codex_discovery::forget_lifetime(&cwd, owner);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_descendant_that_calls_setsid_during_the_sighup_grace_is_named_stop_incomplete() {
-        // c-usagefu r15 item 6: a descendant that calls setsid(2) on ITSELF
-        // DURING the stop grace (here a SIGHUP handler daemonising the
-        // signal-holding python process) had the SAME pgrp in the pre-signal
-        // snapshot, so the r14 post-ladder filter (snapshot pgrp != signalled
-        // pgrp) missed it and closed the census interval while the survivor
-        // kept running. The post-ladder rescan reads each snapshot member's
-        // CURRENT group and names the escaped survivor.
-        use crate::adapters::FileSignalAdapter as _;
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let _term_lock = crate::termination::termination_test_lock();
-        lifecycle::set_test_watch_bound(Some(std::time::Duration::from_millis(400)));
-        crate::termination::set_test_maintenance_interval(None);
-        crate::termination::shutdown_pending_terminations().await;
-
-        let dir = tempfile::tempdir().unwrap();
-        // The agent child: ignores SIGINT (so it survives rung 1), and on
-        // SIGHUP calls setsid(2) ON ITSELF and then keeps running. The
-        // subsequent SIGKILL goes to the OLD group, which the process left.
-        let script = dir.path().join("fake-codex-r15item6.sh");
-        std::fs::write(
-            &script,
-            r#"#!/bin/sh
-case "$1" in --version|version) echo 'codex 0.154.0'; exit 0;; esac
-python3 -c '
-import os,signal,time
-signal.signal(signal.SIGINT, signal.SIG_IGN)
-def hup(*a):
-    os.setsid()
-    while True: time.sleep(100)
-signal.signal(signal.SIGHUP, hup)
-time.sleep(120)'
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let instance_id = InstanceId::new();
-        let instance_dir = dir.path().join(instance_id.as_id().as_str());
-        let mut spec: InstanceSpec =
-            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
-        spec.driver = DriverKind::ShellPty;
-        spec.kind = AgentKind::Codex;
-        spec.cwd = dir.path().to_string_lossy().into_owned();
-        spec.model_id = Some("gpt-5.4".into());
-
-        let mut options = ShellPtyOptions::agent(
-            dir.path().to_path_buf(),
-            AgentKind::Codex,
-            AgentLaunch {
-                profile: Box::new(crate::profile::ProviderProfile {
-                    id: spec.provider_profile.id.clone(),
-                    kind: ProviderKind::OpenaiResponses,
-                    base_url: String::new(),
-                    delegation: Delegation::None,
-                    secret_ref: None,
-                    models: vec!["gpt-5.4".into()],
-                    health: crate::profile::ProviderHealth::Healthy,
-                }),
-                launch_dir: instance_dir.join("launch"),
-                native_home: dir.path().join("codex-native-home"),
-                binary: Some(script.clone()),
-                origin: crate::materializer::LaunchOrigin::Human,
-                native_home_managed: true,
-                settings_overlay: None,
-            },
-        );
-        options.instance_id = Some(instance_id.clone());
-        options.hooks = Some(HookConfig {
-            instance_dir: instance_dir.clone(),
-            relay_binary: PathBuf::from("/bin/true"),
-            tui: crate::launch::TuiMode::Default,
-        });
-
-        let driver = ShellPtyDriver::new(options);
-        let mut run = driver.start(spec.clone()).await.expect("real codex spawn");
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), run.recv()).await;
-        let cwd: PathBuf = spec.cwd.clone().into();
-        let owner = instance_id.as_id().as_str();
-        let root_pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
-
-        // Pre-signal: identify the descendant python member. At this point it
-        // is still IN the signalled group — the exact shape the r14 filter
-        // could not see after its mid-grace setsid.
-        let member_pid = {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                let tree = match lifecycle::snapshot_process_tree(root_pgid) {
-                    lifecycle::ProcessTableObservation::Established(tree) => tree,
-                    lifecycle::ProcessTableObservation::Unknown => {
-                        panic!("/proc is readable in this test")
-                    }
-                };
-                if let Some(proc_info) = tree.iter().find(|proc_info| {
-                    proc_info.pid != root_pgid
-                        && proc_info.pgrp == root_pgid
-                        && lifecycle::process_running(proc_info.pid)
-                }) {
-                    break proc_info.pid;
-                }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "the in-group python descendant appears before the stop"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        };
-
-        // The REAL stop ladder: SIGINT ignored, SIGHUP makes the python setsid
-        // itself, SIGKILL clears only the old group.
-        Driver::close(&driver).await.unwrap();
-
-        // The survivor is STILL the same pid, now in its own group.
-        assert!(
-            lifecycle::process_running(member_pid),
-            "the setsid-on-SIGHUP descendant survives the ladder"
-        );
-        let current_group = {
-            let stat = std::fs::read_to_string(format!("/proc/{member_pid}/stat")).unwrap();
-            let after = stat
-                .rsplit_once(')')
-                .map(|(_, rest)| rest.trim_start())
-                .unwrap();
-            lifecycle::parse_proc_parent_group(after).unwrap().1
-        };
-        assert_ne!(
-            current_group, root_pgid,
-            "the survivor changed groups during the grace"
-        );
-
-        // The production-registered interval stayed live and transferred to
-        // the bounded watcher's registry.
-        for _ in 0..10 {
-            assert!(
-                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
-                "the mid-grace escape keeps the production interval live"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        }
-        let transfer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !crate::termination::test_has_pending_for(&cwd) {
-            assert!(tokio::time::Instant::now() < transfer_deadline);
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-
-        // Confirmed exit closes the interval only via a registry recheck.
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(member_pid),
-            Some(nix::sys::signal::Signal::SIGKILL),
-        )
-        .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        assert!(
-            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
-            "the exit alone never closes; only a recheck does"
-        );
-        let recheck_home = tempfile::tempdir().unwrap();
-        let mut rechecker = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
-            home: recheck_home.path().to_path_buf(),
-            cwd: cwd.clone(),
-            pid: None,
-            launched_at: Some(time::OffsetDateTime::now_utc()),
-            resume_session_id: None,
-        })
-        .with_instance_key(Some("r15-item6-rechecker".to_owned()));
-        assert!(rechecker.poll().unwrap().is_empty());
-        assert!(
-            !crate::termination::test_has_pending_for(&cwd),
-            "the discovery recheck resolves the entry"
-        );
-        assert!(
-            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
-            "confirmed exit of the mid-grace survivor closes the interval"
-        );
-        drop(rechecker);
-
-        lifecycle::set_test_watch_bound(None);
-        crate::termination::set_test_maintenance_interval(None);
-        crate::termination::shutdown_pending_terminations().await;
-        crate::adapters::codex_discovery::forget_lifetime(&cwd, owner);
-    }
-
-    /// Launch a REAL codex-target driver whose agent child ignores SIGINT and
-    /// `setsid(2)`s ITSELF on SIGHUP, then runs forever: the exact process that
-    /// escapes the SIGKILL group kill mid-ladder. Returns the owned tempdir,
-    /// driver, census cwd/owner and the signalled group id. Production spawn
-    /// path only — nothing hand-installed (c-usagefu r16 items 2/3).
-    #[cfg(target_os = "linux")]
-    async fn spawn_sighup_setsid_fixture()
-    -> (tempfile::TempDir, ShellPtyDriver, PathBuf, String, i32) {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("fake-codex-r16items23.sh");
-        std::fs::write(
-            &script,
-            r#"#!/bin/sh
-case "$1" in --version|version) echo 'codex 0.154.0'; exit 0;; esac
-python3 -c '
-import os,signal,time
-signal.signal(signal.SIGINT, signal.SIG_IGN)
-def hup(*a):
-    os.setsid()
-    while True: time.sleep(100)
-signal.signal(signal.SIGHUP, hup)
-time.sleep(120)'
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let instance_id = InstanceId::new();
-        let instance_dir = dir.path().join(instance_id.as_id().as_str());
-        let mut spec: InstanceSpec =
-            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
-        spec.driver = DriverKind::ShellPty;
-        spec.kind = AgentKind::Codex;
-        spec.cwd = dir.path().to_string_lossy().into_owned();
-        spec.model_id = Some("gpt-5.4".into());
-
-        let mut options = ShellPtyOptions::agent(
-            dir.path().to_path_buf(),
-            AgentKind::Codex,
-            AgentLaunch {
-                profile: Box::new(crate::profile::ProviderProfile {
-                    id: spec.provider_profile.id.clone(),
-                    kind: ProviderKind::OpenaiResponses,
-                    base_url: String::new(),
-                    delegation: Delegation::None,
-                    secret_ref: None,
-                    models: vec!["gpt-5.4".into()],
-                    health: crate::profile::ProviderHealth::Healthy,
-                }),
-                launch_dir: instance_dir.join("launch"),
-                native_home: dir.path().join("codex-native-home"),
-                binary: Some(script.clone()),
-                origin: crate::materializer::LaunchOrigin::Human,
-                native_home_managed: true,
-                settings_overlay: None,
-            },
-        );
-        options.instance_id = Some(instance_id.clone());
-        options.hooks = Some(HookConfig {
-            instance_dir: instance_dir.clone(),
-            relay_binary: PathBuf::from("/bin/true"),
-            tui: crate::launch::TuiMode::Default,
-        });
-
-        let driver = ShellPtyDriver::new(options);
-        let mut run = driver.start(spec.clone()).await.expect("real codex spawn");
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), run.recv()).await;
-        let cwd: PathBuf = spec.cwd.clone().into();
-        let owner = instance_id.as_id().as_str().to_owned();
-        let root_pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
-        (dir, driver, cwd, owner, root_pgid)
-    }
-
-    /// Find the in-group python descendant of `root_pgid` through the
-    /// production snapshot BEFORE the ladder (it is still in the signalled
-    /// group at that point).
-    #[cfg(target_os = "linux")]
-    async fn fixture_in_group_member(root_pgid: i32) -> i32 {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let tree = match lifecycle::snapshot_process_tree(root_pgid) {
-                lifecycle::ProcessTableObservation::Established(tree) => tree,
-                lifecycle::ProcessTableObservation::Unknown => {
-                    panic!("/proc is readable before the failure seam is armed")
-                }
-            };
-            if let Some(proc_info) = tree.iter().find(|proc_info| {
-                proc_info.pid != root_pgid
-                    && proc_info.pgrp == root_pgid
-                    && lifecycle::process_running(proc_info.pid)
-            }) {
-                return proc_info.pid;
-            }
-            assert!(deadline > tokio::time::Instant::now(), "member appears");
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn an_unreadable_process_table_is_unknown_and_never_closes_the_interval() {
-        use crate::adapters::FileSignalAdapter as _;
-        // c-usagefu r16 item 2 (Ruling F'): when the pre-signal snapshot cannot
-        // read the process table, the OLD code took it for an empty tree and
-        // the failed post-ladder rescan for "no survivors", so a live escaped
-        // descendant produced a clean group_gone and the census interval
-        // CLOSED while the process could still write. An unreadable table is
-        // Unknown: the interval stays open and the registry entry is kept even
-        // AFTER the survivor dies and /proc is readable again — this Node
-        // captured no identity, so nothing it later observes may close it.
-        let _term_lock = crate::termination::termination_test_lock();
-        lifecycle::set_test_watch_bound(Some(std::time::Duration::from_millis(400)));
-        crate::termination::set_test_maintenance_interval(None);
-        crate::termination::shutdown_pending_terminations().await;
-        // The scan-failure seam is keyed by pgid; a prior panic could have
-        // left it armed. Tests serialize on the termination lock; reset here.
-        lifecycle::set_test_proc_scan_failure(None);
-
-        let (_dir, driver, cwd, owner, root_pgid) = spawn_sighup_setsid_fixture().await;
-        let member_pid = fixture_in_group_member(root_pgid).await;
-
-        // The /proc DIRECTORY scan for THIS group fails (snapshot and rescan)
-        // from here; the ladder's own group scan and per-pid probes read single
-        // stat files and are deliberately unaffected, so the REAL ladder still
-        // runs and still kills the old group. Other driver closes in the test
-        // process use a different pgid and read the real table.
-        lifecycle::set_test_proc_scan_failure(Some(root_pgid));
-        Driver::close(&driver).await.unwrap();
-        assert!(
-            lifecycle::process_running(member_pid),
-            "the setsid-on-SIGHUP descendant really escaped the ladder"
-        );
-
-        for _ in 0..10 {
-            assert!(
-                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
-                "an unreadable snapshot never closes the interval"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        }
-        let transfer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !crate::termination::test_has_pending_for(&cwd) {
-            assert!(tokio::time::Instant::now() < transfer_deadline);
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-
-        // The survivor dies and the table becomes readable again: the entry
-        // still cannot close — no identity was ever captured (Ruling F').
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(member_pid),
-            Some(nix::sys::signal::Signal::SIGKILL),
-        )
-        .unwrap();
-        lifecycle::set_test_proc_scan_failure(None);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let recheck_home = tempfile::tempdir().unwrap();
-        let mut rechecker = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
-            home: recheck_home.path().to_path_buf(),
-            cwd: cwd.clone(),
-            pid: None,
-            launched_at: Some(time::OffsetDateTime::now_utc()),
-            resume_session_id: None,
-        })
-        .with_instance_key(Some("r16-item2-unknown-rechecker".to_owned()));
-        assert!(rechecker.poll().unwrap().is_empty());
-        assert!(
-            crate::termination::test_has_pending_for(&cwd),
-            "Unknown is never proven gone: the entry is kept for Node reconciliation"
-        );
-        assert!(
-            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
-            "the interval stays live with no captured identity"
-        );
-        drop(rechecker);
-
-        lifecycle::set_test_watch_bound(None);
-        crate::termination::set_test_maintenance_interval(None);
-        crate::termination::shutdown_pending_terminations().await;
-        crate::adapters::codex_discovery::forget_lifetime(&cwd, &owner);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_failed_post_ladder_rescan_retains_captured_identities_until_confirmed_death() {
-        use crate::adapters::FileSignalAdapter as _;
-        // c-usagefu r16 item 2/3: a READABLE pre-signal snapshot followed by an
-        // UNREADABLE post-ladder rescan. OLD code dropped the whole rescan
-        // result and, with the ladder reporting its group gone, closed the
-        // interval while the escaped survivor lived. F' retains every captured
-        // snapshot member as an Unknown-strength identity; a later per-pid
-        // probe that CONFIRMS death (ESRCH) then closes it through the normal
-        // registry recheck — retained, never silently dropped.
-        let _term_lock = crate::termination::termination_test_lock();
-        lifecycle::set_test_watch_bound(Some(std::time::Duration::from_millis(400)));
-        crate::termination::set_test_maintenance_interval(None);
-        crate::termination::shutdown_pending_terminations().await;
-        // The scan-failure seam is keyed by pgid; a prior panic could have
-        // left it armed. Tests serialize on the termination lock; reset here.
-        lifecycle::set_test_proc_scan_failure(None);
-
-        let (_dir, driver, cwd, owner, root_pgid) = spawn_sighup_setsid_fixture().await;
-        let member_pid = fixture_in_group_member(root_pgid).await;
-
-        // The snapshot is taken synchronously when the ladder starts; the
-        // ladder then waits ~2 s per rung (the child ignores SIGINT) and the
-        // rescan runs only after it (~4.5 s in). Arm the scan failure 500 ms
-        // in: AFTER the snapshot, well BEFORE the rescan. It is scoped to THIS
-        // group, so concurrent driver closes in the test process read the real
-        // table.
-        let failure_thread = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            lifecycle::set_test_proc_scan_failure(Some(root_pgid));
-        });
-
-        Driver::close(&driver).await.unwrap();
-        failure_thread.join().unwrap();
-        assert!(
-            lifecycle::process_running(member_pid),
-            "the descendant escaped the ladder into its own group"
-        );
-
-        for _ in 0..10 {
-            assert!(
-                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
-                "the failed rescan keeps the captured identity and the interval"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        }
-        let transfer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !crate::termination::test_has_pending_for(&cwd) {
-            assert!(tokio::time::Instant::now() < transfer_deadline);
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-
-        // Per-pid probes use /proc/<pid>/stat directly and are not failed by
-        // the scan seam; restore it anyway, then confirm death through the
-        // production discovery recheck.
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(member_pid),
-            Some(nix::sys::signal::Signal::SIGKILL),
-        )
-        .unwrap();
-        lifecycle::set_test_proc_scan_failure(None);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let recheck_home = tempfile::tempdir().unwrap();
-        let mut rechecker = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
-            home: recheck_home.path().to_path_buf(),
-            cwd: cwd.clone(),
-            pid: None,
-            launched_at: Some(time::OffsetDateTime::now_utc()),
-            resume_session_id: None,
-        })
-        .with_instance_key(Some("r16-item2-retained-rechecker".to_owned()));
-        assert!(rechecker.poll().unwrap().is_empty());
-        assert!(
-            !crate::termination::test_has_pending_for(&cwd),
-            "the retained identity is confirmed gone and resolved"
-        );
-        assert!(
-            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
-            "confirmed ESRCH closes the interval the failed rescan kept open"
-        );
-        drop(rechecker);
-
-        lifecycle::set_test_watch_bound(None);
-        crate::termination::set_test_maintenance_interval(None);
-        crate::termination::shutdown_pending_terminations().await;
-        crate::adapters::codex_discovery::forget_lifetime(&cwd, &owner);
-    }
-
-    /// Launch a REAL codex-target driver whose agent child daemonises a
-    /// `setsid sleep` descendant at LAUNCH (pre-signal escape: its own session
-    /// and group before the ladder ever signals), then `wait`s. Production
-    /// spawn path only (c-usagefu r16 item 3).
-    #[cfg(target_os = "linux")]
-    async fn spawn_preescaped_setsid_fixture()
-    -> (tempfile::TempDir, ShellPtyDriver, PathBuf, String, i32) {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("fake-codex-r16item3.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\ncase \"$1\" in --version|version) echo 'codex 0.154.0'; exit 0;; esac\n\
-             setsid sleep 78 &\nwait\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let instance_id = InstanceId::new();
-        let instance_dir = dir.path().join(instance_id.as_id().as_str());
-        let mut spec: InstanceSpec =
-            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
-        spec.driver = DriverKind::ShellPty;
-        spec.kind = AgentKind::Codex;
-        spec.cwd = dir.path().to_string_lossy().into_owned();
-        spec.model_id = Some("gpt-5.4".into());
-
-        let mut options = ShellPtyOptions::agent(
-            dir.path().to_path_buf(),
-            AgentKind::Codex,
-            AgentLaunch {
-                profile: Box::new(crate::profile::ProviderProfile {
-                    id: spec.provider_profile.id.clone(),
-                    kind: ProviderKind::OpenaiResponses,
-                    base_url: String::new(),
-                    delegation: Delegation::None,
-                    secret_ref: None,
-                    models: vec!["gpt-5.4".into()],
-                    health: crate::profile::ProviderHealth::Healthy,
-                }),
-                launch_dir: instance_dir.join("launch"),
-                native_home: dir.path().join("codex-native-home"),
-                binary: Some(script.clone()),
-                origin: crate::materializer::LaunchOrigin::Human,
-                native_home_managed: true,
-                settings_overlay: None,
-            },
-        );
-        options.instance_id = Some(instance_id.clone());
-        options.hooks = Some(HookConfig {
-            instance_dir: instance_dir.clone(),
-            relay_binary: PathBuf::from("/bin/true"),
-            tui: crate::launch::TuiMode::Default,
-        });
-
-        let driver = ShellPtyDriver::new(options);
-        let mut run = driver.start(spec.clone()).await.expect("real codex spawn");
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), run.recv()).await;
-        let cwd: PathBuf = spec.cwd.clone().into();
-        let owner = instance_id.as_id().as_str().to_owned();
-        let root_pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
-        (dir, driver, cwd, owner, root_pgid)
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn an_incomplete_ladder_still_rescans_and_unions_the_escaped_descendant() {
-        // c-usagefu r16 item 3: the OLD post-ladder rescan ran only when the
-        // ladder reported the signalled group GONE. A ladder that was
-        // INCOMPLETE skipped it entirely, so a setsid descendant that had
-        // escaped the group kill was never named: the empty survivor set (plus
-        // a now-dead group number) let the census interval CLOSE while the
-        // escaped process lived. The rescan now runs after EVERY ladder and is
-        // unioned with the ladder's named survivors regardless of the group
-        // result.
-        //
-        // The ladder verdict is forced incomplete with NO named survivor to
-        // stand in for an un-killable in-group member that cannot be produced
-        // hermetically; the real signals, the pre-signal snapshot, the rescan
-        // and the escaped identity are all production, and the census cohort is
-        // the real launch-registered one.
-        use crate::adapters::FileSignalAdapter as _;
-
-        let _term_lock = crate::termination::termination_test_lock();
-        lifecycle::set_test_watch_bound(Some(std::time::Duration::from_millis(400)));
-        crate::termination::set_test_maintenance_interval(None);
-        crate::termination::shutdown_pending_terminations().await;
-
-        let (_dir, driver, cwd, owner, root_pgid) = spawn_preescaped_setsid_fixture().await;
-        assert!(
-            driver.codex_lifetime.lock().await.is_some(),
-            "the codex spawn path owns the census guard — nothing hand-installed"
-        );
-
-        // The REAL pre-signal escaped descendant (own group from launch).
-        let escaped_pid = {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                let tree = match lifecycle::snapshot_process_tree(root_pgid) {
-                    lifecycle::ProcessTableObservation::Established(tree) => tree,
-                    lifecycle::ProcessTableObservation::Unknown => {
-                        panic!("/proc is readable in this test")
-                    }
-                };
-                if let Some(proc_info) = tree.iter().find(|proc_info| {
-                    proc_info.pid != root_pgid
-                        && proc_info.pgrp != root_pgid
-                        && lifecycle::process_running(proc_info.pid)
-                }) {
-                    break proc_info.pid;
-                }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "the setsid descendant appears"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        };
-
-        // Force ONLY the ladder verdict: incomplete, with no named survivor.
-        // The real ladder still runs and kills the signalled group; the real
-        // rescan is what must now discover the escapee.
-        *driver.test_stop_outcome.lock().unwrap() = Some(lifecycle::StopOutcome {
-            rung: lifecycle::StopRung::Kill,
-            group_gone: false,
-            pgid: Some(root_pgid),
-            survivors: Vec::new(),
-            observation_unknown: false,
-        });
-        Driver::close(&driver).await.unwrap();
-
-        assert!(
-            lifecycle::process_running(escaped_pid),
-            "the pre-escaped setsid descendant is genuinely alive"
-        );
-        for _ in 0..10 {
-            assert!(
-                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
-                "an incomplete ladder still rescans; the escaped descendant keeps the interval live"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        }
-        let transfer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !crate::termination::test_has_pending_for(&cwd) {
-            assert!(tokio::time::Instant::now() < transfer_deadline);
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-
-        // Confirmed exit closes the unioned identity only via a recheck.
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(escaped_pid),
-            Some(nix::sys::signal::Signal::SIGKILL),
-        )
-        .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        assert!(
-            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
-            "the exit alone never closes; only a recheck does"
-        );
-        let recheck_home = tempfile::tempdir().unwrap();
-        let mut rechecker = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
-            home: recheck_home.path().to_path_buf(),
-            cwd: cwd.clone(),
-            pid: None,
-            launched_at: Some(time::OffsetDateTime::now_utc()),
-            resume_session_id: None,
-        })
-        .with_instance_key(Some("r16-item3-rechecker".to_owned()));
-        assert!(rechecker.poll().unwrap().is_empty());
-        assert!(
-            !crate::termination::test_has_pending_for(&cwd),
-            "the unioned escapee identity is resolved on confirmed exit"
-        );
-        assert!(
-            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
-            "confirmed death of the unioned escapee closes the interval"
-        );
-        drop(rechecker);
-
-        lifecycle::set_test_watch_bound(None);
-        crate::termination::set_test_maintenance_interval(None);
-        crate::termination::shutdown_pending_terminations().await;
-        crate::adapters::codex_discovery::forget_lifetime(&cwd, &owner);
+        crate::adapters::codex_discovery::forget_lifetime(&cwd, next_owner);
     }
 
     ///

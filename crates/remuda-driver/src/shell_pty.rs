@@ -1332,9 +1332,16 @@ impl ShellPtyDriver {
         if let Some(guard) = native_lifetime {
             *self.codex_lifetime.lock().await = Some(guard);
         }
-        if let Some(handle) =
-            self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd, adapter_lifetime)?
-        {
+        if let Some(handle) = self.spawn_adapters(
+            &hooks,
+            &recipe,
+            &hook_ctx,
+            &tx,
+            pgid,
+            cwd,
+            adapter_lifetime,
+            launch_floor,
+        )? {
             *self.adapters.lock().await = Some(handle);
         }
         if self.options.promote {
@@ -1454,6 +1461,11 @@ impl ShellPtyDriver {
         pid: Option<i32>,
         cwd: &str,
         lifetime: Option<crate::adapters::codex_discovery::LifetimeGuard>,
+        // c-usagefu r14 item 5: the agent.start boundary the census lifetime
+        // was registered at (the resume time for a continued run). The tail
+        // adapter uses it as its discovery floor, so a gap rollout created
+        // before the resume is refused by the real discovery path.
+        launch_floor: time::OffsetDateTime,
     ) -> DriverResult<Option<crate::adapters::supervisor::AdapterHandle>> {
         let Some(hooks) = hooks else {
             return Ok(None);
@@ -1468,9 +1480,11 @@ impl ShellPtyDriver {
             home: shadow.home.clone(),
             cwd: PathBuf::from(cwd),
             pid: pid.filter(|pid| *pid > 0).map(|pid| pid as u32),
-            // Hook-confirmed shadow-home launch: discovery is proven by the
-            // hook channel (tier 1), so it needs no launch floor.
-            launched_at: None,
+            // Discovery floor for a shadow-home launch: a SessionStart hook
+            // still wins (tier 1), but without one the REAL cwd/floor/prompt
+            // path decides instead of the newest session_index guess — the
+            // floor is what refuses a pre-resume gap rollout (r14 item 5).
+            launched_at: Some(launch_floor),
         };
         let stamp = crate::adapters::supervisor::stamp_ctx(
             ctx.instance_id.clone(),
@@ -2599,6 +2613,22 @@ impl Driver for ShellPtyDriver {
         // half a second per prompt.
         state.await_quiescence().await;
         state.write_bytes(&submit).await?;
+        // c-usagefu r14 item 5: record the dispatched prompt for the codex
+        // file adapter the same way generic-pty does. A shadow-home codex
+        // launch's discovery is then provable through the REAL resume floor
+        // plus prompt evidence (the hook channel only confirms a session the
+        // codex child reports; without dispatched prompt evidence the adapter
+        // had to guess the newest session_index entry). Codex only and keyed
+        // by the stable instance id, so close/resume keeps the evidence.
+        if self.session_kind() == Some(AgentKind::Codex)
+            && let Some(instance_id) = &self.options.instance_id
+        {
+            crate::adapters::codex_discovery::record_input(
+                &self.options.cwd,
+                instance_id.as_id().as_str(),
+                &text,
+            );
+        }
         Ok(DriverAck::transport_written())
     }
 

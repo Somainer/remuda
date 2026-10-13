@@ -243,6 +243,7 @@ impl HookSession {
     /// reading `/proc/<pid>/environ` is restricted by ptrace policy.
     #[cfg(test)]
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn test_hook_credential(&self) -> Option<String> {
         self.shims.env.get("REMUDA_HOOK_CREDENTIAL").cloned()
     }

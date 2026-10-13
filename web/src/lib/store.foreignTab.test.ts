@@ -7158,3 +7158,195 @@ it("GATE36 item 3: a failed login finalizer is invalidated by logout — no box 
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE36 item 4 (password): from a logged-out store, login A succeeds and queued login B fails — A's session still gets the authenticated UI, connection, and pending delivery", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_240_000);
+  const I = "ins_g36_4";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 4_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  const rows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g36_4");
+    // Start LOGGED OUT: no bootstrap has run.
+    localStorage.removeItem("runtime.device-session");
+    localStorage.setItem("runtime.logged-out", "1");
+    const { api, hubStore } = await fresh();
+    const h0 = hubStore as unknown as { state: { authed: boolean } };
+    expect(h0.state.authed).toBe(false);
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+    });
+
+    // Pending durable work left over from before the logins.
+    const preStorage = new (await import("./outbox")).LocalStorageOutboxStorage();
+    await preStorage.put({
+      commandId: "cmd_g36_4_c", clientRequestId: "local_g36_4_c",
+      instanceId: I, prompt: "g36 4 C", createdAt: 1, attempts: 0, state: "pending",
+    });
+
+    const h = hubStore as unknown as {
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      outbox: { lifetime: string } | null;
+      connection: unknown;
+      state: { authed: boolean; connection: string };
+    };
+    let releaseA: () => void = () => undefined;
+    const { HubHttpError: HE } = await import("./httpError");
+    vi.spyOn(api, "login")
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        releaseA = () => resolve({ deviceId: "devA_g36_4", token: "tokA", name: "A" });
+      }))
+      .mockImplementationOnce(() => Promise.reject(new HE(503, "busy", "host busy")));
+
+    const loginA = h.login("bootstrap", "a", "devA");
+    await pump(300); // A acquired, body parked
+    const loginB = h.login("bootstrap", "b", "devB");
+    await pump(300); // B queued behind A
+
+    releaseA();
+    await loginA;
+    await expect(loginB).rejects.toThrow(/busy/);
+    await pump(8_000);
+
+    // A's valid session is the final identity: authenticated UI + connection
+    // came up, and the pre-existing pending row was delivered automatically.
+    expect(h.state.authed).toBe(true);
+    expect(h.connection).not.toBeNull();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBe("cmd_g36_4_c");
+    expect(rows().find((r) => r.commandId === "cmd_g36_4_c")?.state).toBe("sent");
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE36 item 4 (passkey): from a logged-out store, passkey login A succeeds and queued passkey login B fails — A's session still gets the authenticated UI, connection, and pending delivery", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_245_000);
+  const I = "ins_g36_4p";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: {
+      locks: fifoWebLocks().locks,
+      credentials: {
+        get: () =>
+          Promise.resolve({
+            id: "cred_g36_4p",
+            type: "public-key",
+            rawId: new ArrayBuffer(1),
+            response: {
+              authenticatorData: new ArrayBuffer(1),
+              clientDataJSON: new ArrayBuffer(1),
+              signature: new ArrayBuffer(1),
+              userHandle: new ArrayBuffer(1),
+            },
+          }),
+      },
+    },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  vi.stubGlobal("PublicKeyCredential", class { static isUserVerifyingPlatformAuthenticatorAvailable() { return Promise.resolve(true); } });
+  const pump = async (n = 4_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  const rows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g36_4p");
+    localStorage.removeItem("runtime.device-session");
+    localStorage.setItem("runtime.logged-out", "1");
+    const { api, hubStore } = await fresh();
+    expect((hubStore as unknown as { state: { authed: boolean } }).state.authed).toBe(false);
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+    });
+    vi.spyOn(api, "passkeyLoginStart").mockResolvedValue({
+      challengeId: "chal_g36_4p",
+      options: { publicKey: { challenge: "Y2hhbA", allowCredentials: [] } } as never,
+    });
+
+    const preStorage = new (await import("./outbox")).LocalStorageOutboxStorage();
+    await preStorage.put({
+      commandId: "cmd_g36_4p_c", clientRequestId: "local_g36_4p_c",
+      instanceId: I, prompt: "g36 4p C", createdAt: 1, attempts: 0, state: "pending",
+    });
+
+    const h = hubStore as unknown as {
+      passkeyLogin: (m: "required", d?: string) => Promise<unknown>;
+      connection: unknown;
+      state: { authed: boolean; connection: string };
+    };
+    let releaseA: () => void = () => undefined;
+    const { HubHttpError: HE } = await import("./httpError");
+    vi.spyOn(api, "passkeyLoginFinish")
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        releaseA = () => resolve({ deviceId: "devA_g36_4p", token: "tokA", name: "A" });
+      }))
+      .mockImplementationOnce(() => Promise.reject(new HE(503, "busy", "host busy")));
+
+    const loginA = h.passkeyLogin("required", "devA");
+    await pump(300); // A acquired, body parked
+    const loginB = h.passkeyLogin("required", "devB");
+    await pump(300); // B queued behind A
+
+    releaseA();
+    await loginA;
+    await expect(loginB).rejects.toThrow(/busy/);
+    await pump(8_000);
+
+    expect(h.state.authed).toBe(true);
+    expect(h.connection).not.toBeNull();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBe("cmd_g36_4p_c");
+    expect(rows().find((r) => r.commandId === "cmd_g36_4p_c")?.state).toBe("sent");
+  } finally {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

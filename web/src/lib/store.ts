@@ -1191,6 +1191,24 @@ class HubStore {
    */
   private transitionSeq = 0;
   /**
+   * Monotonic id assigned SYNCHRONOUSLY when a credential transition is issued
+   * (before chain acquisition), so two transitions issued back-to-back before
+   * either acquires still get distinct ids (c-reconnfu gate 36 item 4). Chain
+   * acquisition order equals issuance order; the id doubles as
+   * {@link transitionSeq} at acquisition.
+   */
+  private transitionIssuedSeq = 0;
+  /**
+   * Pending-bootstrap obligation on the serialized transition chain
+   * (c-reconnfu gate 36 item 4). A successful login whose own bootstrap is
+   * skipped because a newer transition was issued sets this; the FINAL owner
+   * of the chain discharges it when it settles — including on FAILURE, when an
+   * earlier transition's valid session is on disk and would otherwise never
+   * reach the authenticated UI/connection (a failed queued login exits before
+   * bootstrap).
+   */
+  private authBootstrapOwed = false;
+  /**
    * DELIVERY TOKEN (c-reconnfu gate 35). Captured ONCE at the start of every
    * send / lock turn / fallback and never re-read inside a delivery. The
    * synchronous validator {@link tokenLive} confirms the continuation is still
@@ -1272,24 +1290,35 @@ class HubStore {
    * initialization in that finalizer (when this transition still owns it).
    */
   /**
-   * Run a serialized credential transition. Resolves with
-   * `{ result, superseded }` — superseded is true when a NEWER transition
-   * acquired before this one finished (its caller must skip its own post-login
-   * bootstrap: the newer transition owns initialization and would deadlock if
-   * the older caller waited on the newer body).
+   * Run a serialized credential transition. Always RESOLVES (never throws)
+   * with a discriminated outcome so the PUBLIC caller can settle the chain's
+   * bootstrap obligation on BOTH success and failure (c-reconnfu gate 36
+   * item 4):
+   *  - `{ ok: true, result, superseded }` — the credential request succeeded.
+   *  - `{ ok: false, error, superseded }` — it rejected; the caller rethrows
+   *    `error` after dealing with any obligation.
+   * `superseded` is true when a NEWER transition was issued before this one
+   * finished: this caller must defer to the final owner of the chain rather
+   * than run its own post-login bootstrap.
    */
   private async runAuthTransition<T>(
     issue: () => Promise<T>,
-  ): Promise<{ result: T; superseded: boolean }> {
-    // Capture the sequence this transition will own; increment only AFTER
-    // acquiring the chain (queued transitions must not supersede the current
-    // one before the current body settles).
-    const mySeq = this.transitionSeq + 1;
+  ): Promise<{ superseded: boolean; ok: true; result: T } | { superseded: boolean; ok: false; error: unknown }> {
+    // Monotonic ISSUANCE order, assigned synchronously at call time: two
+    // transitions issued back-to-back before either acquires still get
+    // distinct ids, so the earlier one can tell at settle time that a newer
+    // transition was issued and hand the chain's obligations to it
+    // (c-reconnfu gate 36 item 4).
+    const myIssuedSeq = ++this.transitionIssuedSeq;
+    // Chain acquisition order equals issuance order (the chain serializes in
+    // call order), so the issued id is also this transition's ownership seq.
     // Link onto the chain and publish the tail BEFORE awaiting so the next
     // caller queues behind this run.
-    const run = async (prev: Promise<void>): Promise<{ result: T; superseded: boolean }> => {
+    const run = async (
+      prev: Promise<void>,
+    ): Promise<{ superseded: boolean; ok: true; result: T } | { superseded: boolean; ok: false; error: unknown }> => {
       await prev;
-      this.transitionSeq = mySeq;
+      this.transitionSeq = myIssuedSeq;
       // This transition now owns the identity change: dispose the current box
       // and bump the auth generation (seq already advanced).
       this.applyAuthIdentityChange();
@@ -1303,11 +1332,13 @@ class HubStore {
         this.resolveAuthTransition = resolve;
       });
       let result: T;
-      let thrown: unknown;
+      let error: unknown;
+      let failed = false;
       try {
         result = await issue();
       } catch (err) {
-        thrown = err;
+        failed = true;
+        error = err;
       } finally {
         // Release the blocker. Run current-generation initialization in the
         // finalizer (gate 35 item 1) only while this transition still owns
@@ -1317,11 +1348,16 @@ class HubStore {
         this.resolveAuthTransition = null;
         this.authTransition = null;
         resolve?.();
-        const stillOwns = this.transitionSeq === mySeq && this.authGen === myGen;
+        const stillOwns = this.transitionSeq === myIssuedSeq && this.authGen === myGen;
         if (stillOwns) void this.ensureOutbox().catch(() => undefined);
-        if (thrown !== undefined) throw thrown;
       }
-      return { result: result!, superseded: this.transitionSeq !== mySeq };
+      // A NEWER transition was issued before this one settled (whether or not
+      // it has acquired yet): this caller must not run the post-login
+      // bootstrap — the final owner's continuation owns the chain's bootstrap
+      // obligation (gate 36 item 4).
+      const superseded = this.transitionIssuedSeq !== myIssuedSeq;
+      if (failed) return { ok: false, error, superseded };
+      return { ok: true, result: result!, superseded };
     };
     // Snapshot the previous chain SYNCHRONOUSLY and publish the new tail
     // before run's body microtask executes — so run awaits the PREVIOUS chain,
@@ -1335,6 +1371,40 @@ class HubStore {
     return resultPromise;
   }
 
+
+  /**
+   * Settle the serialized chain's bootstrap obligation from a credential
+   * transition's PUBLIC continuation (c-reconnfu gate 36 item 4) — the only
+   * place a successful transition's session has just been written.
+   *  - successful FINAL owner: discharge any pending obligation and bootstrap
+   *    now;
+   *  - successful SUPERSEDED transition: transfer the obligation to the
+   *    chain's final owner instead of bootstrapping under it;
+   *  - FAILED final owner: when a predecessor's valid session is on disk and
+   *    still unbootstrapped, bootstrap THAT session (a queued login failing
+   *    after an earlier one succeeded must not leave the app logged out);
+   *  - failed superseded transition: nothing — the newer owner is responsible.
+   * Logout/401/peer changes leave no session, so the obligation naturally does
+   * not discharge there.
+   */
+  private settleAuthBootstrap(outcome:
+    | { ok: true; result: DeviceSession; superseded: boolean }
+    | { ok: false; error: unknown; superseded: boolean },
+  ): void {
+    if (outcome.ok) {
+      if (outcome.superseded) {
+        this.authBootstrapOwed = true;
+        return;
+      }
+      this.authBootstrapOwed = false;
+      void this.bootstrap().catch(() => undefined);
+      return;
+    }
+    if (!outcome.superseded && this.authBootstrapOwed && readSession()) {
+      this.authBootstrapOwed = false;
+      void this.bootstrap().catch(() => undefined);
+    }
+  }
 
   /**
    * Dispose the current Outbox INSTANCE for an auth-identity change.
@@ -4163,18 +4233,21 @@ class HubStore {
   async login(kind: "bootstrap" | "pair", secret: string, deviceName: string) {
     // Fence A: dispose + block init BEFORE the credential request (the new
     // cookie lands in response headers); write the session only after the body
-    // resolves, then bootstrap. A body failure still releases the blocker.
-    const { result: session, superseded } = await this.runAuthTransition(() =>
+    // resolves. A body failure still releases the blocker and the chain's
+    // final owner settles any pending bootstrap obligation (gate 36 item 4).
+    const outcome = await this.runAuthTransition(() =>
       kind === "pair"
         ? api.pairRedeem(secret, deviceName)
         : api.login(secret, deviceName),
     );
-    writeSession(session, { mock: api.mock });
+    if (!outcome.ok) {
+      this.settleAuthBootstrap(outcome);
+      throw outcome.error;
+    }
+    writeSession(outcome.result, { mock: api.mock });
     // bootstrap marks the session authenticated after cookie-backed reads finish.
     this.emit({ session: readSession(), error: null });
-    // A newer overlapping login acquired (or opened in the microtask gap):
-    // it owns bootstrap — waiting on its still-open body would deadlock.
-    if (!superseded && !this.authTransition) await this.bootstrap();
+    this.settleAuthBootstrap(outcome);
   }
 
   /** Whether the browser exposes WebAuthn on this origin. */
@@ -4203,12 +4276,16 @@ class HubStore {
     const envelope = await api.passkeyLoginStart(mediation === "conditional" ? "conditional" : undefined);
     const options = envelope.options as ServerRequestOptions;
     const assertion = await getPasskey(options, mediation, signal);
-    const { result: session, superseded } = await this.runAuthTransition(() =>
+    const outcome = await this.runAuthTransition(() =>
       api.passkeyLoginFinish(envelope.challengeId, assertion, deviceName),
     );
-    writeSession(session, { mock: api.mock });
+    if (!outcome.ok) {
+      this.settleAuthBootstrap(outcome);
+      throw outcome.error;
+    }
+    writeSession(outcome.result, { mock: api.mock });
     this.emit({ session: readSession(), error: null });
-    if (!superseded && !this.authTransition) await this.bootstrap();
+    this.settleAuthBootstrap(outcome);
     return { assertion, challengeId: envelope.challengeId };
   }
 
@@ -4335,6 +4412,7 @@ class HubStore {
     // identity-change helper — bumps authGen and disposes the outbox (and any
     // in-flight initializer) BEFORE the logged-out identity can be used; the
     // next bootstrap loads a fresh Outbox with a new lifetime.
+    this.authBootstrapOwed = false;
     this.applyAuthIdentityChange();
     if (this.unloadClearTimer) {
       clearTimeout(this.unloadClearTimer);

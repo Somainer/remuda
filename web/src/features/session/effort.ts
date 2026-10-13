@@ -640,6 +640,41 @@ export function shortModel(model: string | undefined): string {
   return tail;
 }
 
+/** Final segments that all name the provider's automatic model choice. */
+const AUTOMATIC_MODEL_TAILS = new Set(["auto", "auto_model"]);
+/** Explicit legacy passthrough ids for the automatic choice (no slash tail
+ *  ambiguity). */
+const AUTOMATIC_MODEL_EXPLICIT = new Set(["passthrough/auto", "passthrough/auto_model"]);
+
+/**
+ * Whether a FULL model id names the provider's automatic selection. This is
+ * the ONE cross-id equivalence the picker collapses: `passthrough/auto`,
+ * `e2e/auto`, `…/auto_model` all pick "automatic" (the driver resolves the
+ * concrete model at launch). Nothing else is aliased — `vendor-a/shared`
+ * and `vendor-b/shared` are distinct models matched by full id.
+ */
+export function isAutomaticModelId(id: string | null | undefined): boolean {
+  const raw = (id ?? "").trim();
+  if (!raw) return false;
+  if (AUTOMATIC_MODEL_EXPLICIT.has(raw)) return true;
+  return AUTOMATIC_MODEL_TAILS.has(raw.split("/").pop() ?? "");
+}
+
+/** Full-id identity with ONLY the known automatic-model fallback equivalence
+ *  collapsed. Selection and pending matching use this, never the short label
+ *  (which would merge distinct models sharing a final segment). */
+export function sameModelId(a: string | null | undefined, b: string | null | undefined): boolean {
+  const x = (a ?? "").trim();
+  const y = (b ?? "").trim();
+  return x === y || (isAutomaticModelId(x) && isAutomaticModelId(y));
+}
+
+/** A DOM-safe, full-id-derived testid suffix for rows whose short label
+ *  collides with another row (the plain short testid stays the norm). */
+export function fullModelTestId(id: string): string {
+  return id.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase();
+}
+
 export const DEFAULT_MODELS: Record<string, string[]> = {
   claude: ["opus", "sonnet", "haiku", "passthrough/auto"],
   codex: ["gpt-5", "o3", "passthrough/auto"],

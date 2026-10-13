@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { EffortSlider } from "./EffortSlider";
@@ -251,5 +251,99 @@ describe("EffortSlider tier/model list", () => {
     expect(row.getAttribute("title")).toContain("会话已退出");
     await user.click(row);
     expect(onModel).not.toHaveBeenCalled();
+  });
+
+  it("keeps distinct full ids that share a final segment as separate, fully-labelled rows", async () => {
+    // c-effortui2 r26 item 2: the driver matches models by FULL id;
+    // vendor-a/shared and vendor-b/shared are two real models and must not be
+    // merged by their short label.
+    const user = userEvent.setup();
+    const onModel = vi.fn();
+    mount({
+      kind: "claude",
+      index: 2,
+      model: "vendor-b/shared",
+      modelEffective: "vendor-b/shared",
+      models: ["vendor-a/shared", "vendor-b/shared"],
+      onModel,
+    });
+    await user.click(screen.getByTestId("effort-open-list"));
+    // Two distinct rows, keyed/labelled by full id, with full-id testids.
+    const rowA = screen.getByTestId("model-option-vendor-a-shared");
+    const rowB = screen.getByTestId("model-option-vendor-b-shared");
+    expect(rowA).toBeInTheDocument();
+    expect(rowB).toBeInTheDocument();
+    expect(rowA.textContent).toContain("vendor-a/shared");
+    expect(rowB.textContent).toContain("vendor-b/shared");
+    expect(screen.queryAllByTestId("model-option-shared")).toHaveLength(0);
+    // Only the running model is selected.
+    expect(rowA).toHaveAttribute("data-selected", "0");
+    expect(rowB).toHaveAttribute("data-selected", "1");
+    // Clicking posts the FULL id the driver matches, not the shared tail.
+    await user.click(rowA);
+    expect(onModel).toHaveBeenCalledWith("vendor-a/shared");
+  });
+
+  it("collapses only the known automatic-model ids onto one auto row", async () => {
+    // The gateway's e2e/auto and the launch passthrough/auto are the same
+    // AUTOMATIC choice; they collapse to one row (the catalog id survives).
+    const user = userEvent.setup();
+    const onModel = vi.fn();
+    mount({
+      kind: "claude",
+      index: 2,
+      model: "passthrough/auto",
+      modelEffective: "e2e/auto",
+      models: ["e2e/auto", "e2e/fast"],
+      onModel,
+    });
+    await user.click(screen.getByTestId("effort-open-list"));
+    // One auto row (short label, full-id title), not two.
+    expect(screen.getAllByText("auto")).toHaveLength(1);
+    const autoRow = screen.getByTestId("model-option-auto");
+    expect(autoRow).toHaveAttribute("data-selected", "1");
+    expect(autoRow.getAttribute("title")).toBe("e2e/auto");
+    // auto_model is the same automatic stop too (fresh mount).
+    cleanup();
+    const onModel2 = vi.fn();
+    const remount = render(
+      <EffortSlider
+        kind="claude"
+        index={2}
+        onChange={vi.fn()}
+        model="passthrough/auto_model"
+        modelEffective="passthrough/auto_model"
+        models={["passthrough/auto", "passthrough/auto_model"]}
+        onModel={onModel2}
+      />,
+    );
+    await user.click(remount.getByTestId("effort-open-list"));
+    expect(remount.getByTestId("model-option-auto")).toHaveAttribute("data-selected", "1");
+    expect(remount.queryAllByTestId("model-option-auto")).toHaveLength(1);
+  });
+
+  it("appends a read-back running model that the catalog does not list", async () => {
+    // c-effortui2 r26 item 3: a running id absent from the discovery catalog
+    // must stay a clickable row (dedupe([...models, current]) full-id
+    // semantics); without it the current selection dropped out of the list.
+    const user = userEvent.setup();
+    const onModel = vi.fn();
+    mount({
+      kind: "claude",
+      index: 2,
+      model: "e2e/typed-77",
+      modelEffective: "e2e/typed-77",
+      models: ["e2e/auto", "e2e/fast", "e2e/plain", "claude-e2e-only"],
+      onModel,
+    });
+    await user.click(screen.getByTestId("effort-open-list"));
+    const running = screen.getByTestId("model-option-typed-77");
+    expect(running).toBeInTheDocument();
+    expect(running).toHaveAttribute("data-selected", "1");
+    // Catalog rows still present and in order before the appended id.
+    const buttons = screen
+      .getAllByRole("button")
+      .map((b) => b.getAttribute("data-testid"));
+    expect(buttons.indexOf("model-option-plain")).toBeLessThan(buttons.indexOf("model-option-typed-77"));
   });
 });

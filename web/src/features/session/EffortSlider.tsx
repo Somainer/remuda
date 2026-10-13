@@ -6,8 +6,10 @@ import {
   effortLook,
   effortRatio,
   effortStops,
+  fullModelTestId,
   keyboardEffortIndex,
   modelsFor,
+  sameModelId,
   shortModel,
   ULTRACODE_COUPLED_DESC,
   ULTRACODE_SWITCH_DESC,
@@ -18,21 +20,6 @@ import {
 } from "./effort";
 import type { ModelCatalogView, ModelSelectionPath } from "./modelEffective";
 import css from "./effort.module.css";
-
-/** Order-preserving de-dup on the SHORT label the radio rows render by: full
- *  ids that shorten to the same stop are one row (the gateway's `e2e/auto`
- *  and the current `passthrough/auto` launch id are the same "auto" picker
- *  stop). The fuller id wins by first occurrence — the catalog lists before
- *  the fallback current. */
-function dedupeModels(ids: string[]): string[] {
-  const out: string[] = [];
-  for (const id of ids) {
-    if (id && !out.some((existing) => shortModel(existing) === shortModel(id))) {
-      out.push(id);
-    }
-  }
-  return out;
-}
 
 /**
  * The effort slider with the D-056 orthogonal Ultracode switch.
@@ -260,17 +247,35 @@ export function EffortSlider({
     return null;
   })();
 
+  // The switchable model rows, ordered catalog-first with the read-back id
+  // appended. Identity is the FULL id (the driver matches verbatim): distinct
+  // ids that share a final segment (vendor-a/shared vs vendor-b/shared) stay
+  // distinct rows; the ONLY collapsed equivalence is the automatic-model
+  // fallback (e2e/auto ≡ passthrough/auto via sameModelId). With no discovered
+  // catalog, offer the built-in aliases plus the running id the same way.
   const modelList = useMemo(() => {
-    if (!currentModel) return [];
-    // An explicit catalog list is used as-is (deduped); with no list, offer
-    // the harness's built-in aliases plus the running id.
-    const base = models && models.length ? models : modelsFor(kind, [currentModelId]);
-    // Dedup on the short label the rows render by, so e.g. the gateway's
-    // e2e/auto and the current passthrough/auto launch id don't produce two
-    // "auto" radio rows (full ids differ but they are the same picker stop).
-    return dedupeModels(base);
-  }, [currentModelId, currentModel, kind, models]);
-  const modelPendingShort = modelPending ? shortModel(modelPending.id) : null;
+    if (!currentModelId) return [];
+    const source = models && models.length ? models : modelsFor(kind, []);
+    const out: string[] = [];
+    for (const id of [...source, currentModelId]) {
+      if (id && !out.some((existing) => sameModelId(existing, id))) out.push(id);
+    }
+    return out;
+  }, [currentModelId, kind, models]);
+  // Full ids whose SHORT label collides with another row: those rows render
+  // and key/testid by the full id so the two models stay distinguishable and
+  // clickable; normal rows keep the short testid the hub e2e drives.
+  const collidingShorts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const id of modelList) {
+      const short = shortModel(id);
+      counts.set(short, (counts.get(short) ?? 0) + 1);
+    }
+    return new Set([...counts].filter(([, n]) => n > 1).map(([short]) => short));
+  }, [modelList]);
+  const modelTestId = (id: string) =>
+    collidingShorts.has(shortModel(id)) ? `model-option-${fullModelTestId(id)}` : `model-option-${shortModel(id)}`;
+  const modelPendingId = modelPending?.id ?? null;
 
   // ── Slider track (pill) ───────────────────────────────────────────────
   const ratio = effortRatio(shown, Math.max(1, stops.length));
@@ -530,8 +535,12 @@ export function EffortSlider({
               <div className={css.effortListTitle}>模型</div>
               {modelList.map((id) => {
                 const short = shortModel(id);
-                const selected = currentModel === short;
-                const pending = modelPendingShort === short;
+                const collision = collidingShorts.has(short);
+                // Identity is the FULL id: a colliding label (…/shared vs
+                // …/shared) still selects exactly the right model, and so does
+                // pending — never the short label.
+                const selected = sameModelId(currentModelId, id);
+                const pending = modelPendingId != null && sameModelId(modelPendingId, id);
                 const pathTag =
                   selected && modelSelectionPath
                     ? modelSelectionPath === "typed"
@@ -543,7 +552,8 @@ export function EffortSlider({
                     key={id}
                     type="button"
                     className={`${css.effortRow} ${selected ? css.effortOn : ""}`}
-                    data-testid={`model-option-${short}`}
+                    data-testid={modelTestId(id)}
+                    data-model-full-id={id}
                     data-selected={selected ? "1" : "0"}
                     data-model-pending={pending ? (modelPending?.queued ? "queued" : "switching") : "0"}
                     data-model-path={selected ? (modelSelectionPath ?? "") : ""}
@@ -556,7 +566,9 @@ export function EffortSlider({
                     }}
                   >
                     <span className={`${css.radio} ${selected ? css.radioOn : ""}`} />
-                    <span className={css.effortName}>{short}</span>
+                    {/* Colliding labels show the full id so two distinct
+                        models sharing a final segment stay distinguishable. */}
+                    <span className={css.effortName}>{collision ? id : short}</span>
                     {pathTag ? (
                       <span className={css.effortPathTag} data-testid="model-option-path">
                         {pathTag}

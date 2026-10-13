@@ -1,7 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import type { ConnectionMachine } from "./connection";
 import { REST_PROBE_MS } from "./connection";
-import { OUTBOX_LS_KEY, type OutboxRecord } from "./outbox";
+import { CLAIM_WAKE_MAX_FAILURES, OUTBOX_LS_KEY, type OutboxRecord } from "./outbox";
 
 const INSTANCE = "ins_foreign_tab";
 const JOURNAL = "obj_foreign_tab_journal";
@@ -3837,6 +3837,127 @@ it("GATE24 item 1: a REJECTED direct steer leaves exhaustion latched and arms no
     // Far past every deadline: the rejected steer never re-POSTs.
     await vi.advanceTimersByTimeAsync(120_000);
     expect(send.mock.calls.map((c) => c[4])).toEqual([rjId, okId, pId]);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE24 item 2 (rebuilds gate-23 item-2): a real HubStore with two real enqueues and the REAL onClaimWake — persistent timer-path lock rejections while reads succeed stop at the cap with no wakes and no further requests", async () => {
+  // Rebuilt per gate-24 RULES: the gate-23 version hand-seeded both records
+  // with store.put(rec(...)) and replaced onClaimWake with a vi.fn. Here
+  // everything runs through the real HubStore: both rows are created by real
+  // offline send() enqueues, the store's real registered onClaimWake drives
+  // its real guarded flush, and the ONLY fault is injected at
+  // navigator.locks.request (persistent rejection) — durable reads keep
+  // succeeding. The store boots and settles its empty boot flush with locks
+  // UP; the failing lock backend is installed only afterwards, so every
+  // counted request is a real timer-path delivery attempt. At the shared
+  // per-instance cap the central reconciliation cancels every wake, the
+  // instance is exhausted, no guarded flush ever POSTs and no further lock
+  // request is ever issued.
+  vi.useFakeTimers();
+  vi.setSystemTime(970_000);
+  const I = "ins_g24_i2";
+  const originalNavigator = globalThis.navigator;
+  const good = fifoWebLocks().locks;
+  let requestCount = 0;
+  const bad = {
+    query: async () => ({ held: [] as Array<{ name: string }> }),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    request: vi.fn((): Promise<any> => {
+      requestCount += 1;
+      return Promise.reject(new Error("g24 i2 locks down"));
+    }),
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let locks: { query: () => Promise<unknown>; request: (...args: any[]) => Promise<unknown> } = good;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: {
+      get locks() {
+        return locks;
+      },
+    },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g24_i2");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_iid: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: {
+          commandId,
+          id: commandId,
+          state: "accepted",
+          revision: "1",
+          dispatch: "native-acknowledged",
+          resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    // Settle the empty boot flush while locks are UP — it must not count.
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    const boxOf = () =>
+      (
+        hubStore as unknown as {
+          outbox: {
+            onClaimWake: (() => void) | null;
+            isDeliveryExhausted: (i: string) => boolean;
+            pendingLeaseWakeups: () => string[];
+          } | null;
+        }
+      ).outbox;
+    // The store's REAL wake handoff is registered (never replaced).
+    expect(typeof boxOf()!.onClaimWake).toBe("function");
+    expect(requestCount).toBe(0);
+
+    // Locks go DOWN; two rows really enqueued while offline — no flush, only
+    // the registered deliver wakes.
+    hubStore.setConnectionStateForTest("offline");
+    locks = bad;
+    expect(await hubStore.send(I, "g24 2 P1")).toBe(true);
+    expect(await hubStore.send(I, "g24 2 P2")).toBe(true);
+    const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    await pump(300);
+    const id1 = storedRows().find((r) => r.prompt === "g24 2 P1")!.commandId;
+    const id2 = storedRows().find((r) => r.prompt === "g24 2 P2")!.commandId;
+    expect(boxOf()!.pendingLeaseWakeups().sort()).toEqual([id1, id2].sort());
+    expect(send).not.toHaveBeenCalled();
+
+    // The real timer wakes spend the SHARED per-instance budget: lock
+    // requests reject while every read succeeds.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(requestCount).toBe(CLAIM_WAKE_MAX_FAILURES);
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(true);
+    expect(boxOf()!.pendingLeaseWakeups()).toEqual([]);
+    expect(send).not.toHaveBeenCalled();
+    expect(storedRows().find((r) => r.commandId === id1)?.state).toBe("pending");
+    expect(storedRows().find((r) => r.commandId === id2)?.state).toBe("pending");
+
+    // Long after every bounded delay: quiescence — no further requests, no
+    // re-armed wake, no POST.
+    const requestsAtQuiesce = requestCount;
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(requestCount).toBe(requestsAtQuiesce);
+    expect(boxOf()!.pendingLeaseWakeups()).toEqual([]);
+    expect(send).not.toHaveBeenCalled();
+
     hubStore.logout();
   } finally {
     vi.useRealTimers();

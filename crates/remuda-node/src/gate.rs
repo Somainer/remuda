@@ -177,6 +177,11 @@ const PLAYWRIGHT_BLOCK_MAX: usize = 100;
 
 /// One live gate run: cancel flag and the process group(s) to kill.
 struct LiveRun {
+    /// The dispatch generation THIS run executes. A delayed gate.cancel /
+    /// gate.abortLanding for a different generation must never signal this
+    /// run's groups (r15 item 2): the comparison happens under the registry
+    /// lock with the live row in hand.
+    generation: u32,
     cancel: watch::Sender<bool>,
     /// Verify child process group.
     pgid: std::sync::Mutex<Option<i32>>,
@@ -904,6 +909,21 @@ impl GateRegistry {
             .map(|record| record.generation)
     }
 
+    /// Test-only: the live run's dispatch generation and whether its stand-down
+    /// flag has been set. Lets a regression latch on the PRODUCTION cancel/abort
+    /// decision itself (a stale-generation RPC must leave `canceled=false`)
+    /// instead of watching a process over a time window (r15 item 2).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_live_run_state(&self, job_id: &str) -> Option<(u32, bool)> {
+        self.runs.lock().await.runs.get(job_id).map(|run| {
+            (
+                run.generation,
+                *run.cancel.borrow(),
+            )
+        })
+    }
+
     /// Test-only: drop all local canceled records, simulating a Node process
     /// restart that begins with an empty registry.
     #[doc(hidden)]
@@ -1029,6 +1049,13 @@ impl DevNode {
             .await
     }
 
+    /// Test-only: live run generation and stand-down flag (r15 item 2).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_live_run_state(&self, job_id: &str) -> Option<(u32, bool)> {
+        self.gate_registry().gate_test_live_run_state(job_id).await
+    }
+
     /// Test-only: install a Hub-authority hook directly (drives the pre-run
     /// gate.authorize check without a live carrier).
     #[doc(hidden)]
@@ -1129,16 +1156,32 @@ impl DevNode {
         let registry = self.gate_registry();
         let target = {
             let mut table = registry.runs.lock().await;
-            let land_pgid = table.runs.get(&request.job_id).and_then(|run| {
-                *run.land_pgid
+            // r15 item 2: a delayed abort for an OLDER generation must not
+            // touch the NEWER attempt that reused the job slot. Decide against
+            // the LIVE row's generation UNDER THIS LOCK, and only carry the
+            // pgid out when the generations are equal. A newer live run is
+            // left entirely alone (its land child keeps pushing under its own
+            // grant); the tombstone is still recorded so the stale RPC stands
+            // down.
+            let run = table.runs.get(&request.job_id);
+            let same_generation = run.is_some_and(|run| run.generation == request.generation);
+            let land_pgid = if same_generation {
+                let run = run.expect("same_generation implies a run");
+                let land_pgid = *run
+                    .land_pgid
                     .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-            });
-            if land_pgid.is_none()
-                && let Some(run) = table.runs.get(&request.job_id)
-            {
-                run.cancel.send(true).ok();
-            }
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if land_pgid.is_none() {
+                    // The grant never got to spawn its land child (or the row
+                    // was settled while the verify group was the live one):
+                    // release its cancel flag so a verify-phase child stands
+                    // down too.
+                    run.cancel.send(true).ok();
+                }
+                land_pgid
+            } else {
+                None
+            };
             table.record_cancel(&request.job_id, request.generation);
             land_pgid
         };
@@ -1169,9 +1212,18 @@ impl DevNode {
         let mut table = registry.runs.lock().await;
         let mut group_to_kill: Option<i32> = None;
         if let Some(run) = table.runs.get(&request.job_id) {
-            run.cancel.send(true).ok();
-            if let Some(pgid) = *run.pgid.lock().unwrap_or_else(|poison| poison.into_inner()) {
-                group_to_kill = Some(pgid);
+            // r15 item 2: only the live run that belongs to EXACTLY this
+            // dispatch generation may be signalled. A cancel frame delayed
+            // past a re-dispatch (the job slot reused by a newer attempt)
+            // records its tombstone below but must not kill the newer
+            // attempt's verify group — the newer run is authorized on its own
+            // generation and the stale cancel has no authority over it.
+            if run.generation == request.generation {
+                run.cancel.send(true).ok();
+                if let Some(pgid) = *run.pgid.lock().unwrap_or_else(|poison| poison.into_inner())
+                {
+                    group_to_kill = Some(pgid);
+                }
             }
         }
         // Record the canceled generation whether or not the run is registered
@@ -1350,6 +1402,7 @@ impl DevNode {
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let live = Arc::new(LiveRun {
+            generation: request.generation,
             cancel: cancel_tx,
             pgid: std::sync::Mutex::new(None),
             land_pgid: std::sync::Mutex::new(None),
@@ -4137,6 +4190,137 @@ JSON
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_generation_cancel_never_signals_the_newer_live_attempt() {
+        // r15 item 2: the job slot is reused by attempt 2. A delayed
+        // gate.cancel frame naming attempt 1 must record its tombstone but
+        // neither set attempt 2's stand-down flag nor signal its group. The
+        // matching-generation cancel (2) then does.
+        let fixture = fixture("sleep 30\necho '{\"exitCode\":0,\"status\":\"verified\"}'");
+        let node = fixture.node.clone();
+        let mut p = params(&fixture, "verify");
+        p.generation = 2;
+        let job_id = p.job_id.clone();
+        let running = tokio::spawn(async move { node.run_gate_typed(p).await });
+        // Bounded latch: the live gen-2 run is registered with a group.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((generation, canceled)) = fixture
+                .node
+                .gate_test_live_run_state(&job_id)
+                .await
+            {
+                assert_eq!(generation, 2);
+                assert!(!canceled);
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("gen-2 run never registered");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The delayed cancel for the OLDER attempt 1.
+        fixture
+            .node
+            .cancel_gate(&serde_json::json!({ "jobId": job_id, "generation": 1 }))
+            .await
+            .unwrap();
+        let state = fixture
+            .node
+            .gate_test_live_run_state(&job_id)
+            .await
+            .expect("gen-2 run still live");
+        assert_eq!(
+            state,
+            (2, false),
+            "a stale generation 1 cancel must not stand down the gen-2 run"
+        );
+        // The stale tombstone is recorded (a genuinely late gen-1 frame still
+        // refuses), without killing the gen-2 group.
+        assert_eq!(
+            fixture.node.gate_test_canceled_generation(&job_id).await,
+            Some(1)
+        );
+        // The CURRENT generation's cancel works as usual.
+        fixture
+            .node
+            .cancel_gate(&serde_json::json!({ "jobId": job_id, "generation": 2 }))
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the matching cancel reaps the run")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, "canceled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_generation_abort_never_signals_the_newer_live_attempt() {
+        // r15 item 2: a delayed gate.abortLanding naming the settled attempt 1
+        // must not stand down or kill the group of a newer attempt 2 that
+        // reclaimed the job slot.
+        let fixture = fixture("sleep 30\necho '{\"exitCode\":0,\"status\":\"verified\"}'");
+        let node = fixture.node.clone();
+        let mut p = params(&fixture, "verify");
+        p.generation = 3;
+        let job_id = p.job_id.clone();
+        let running = tokio::spawn(async move { node.run_gate_typed(p).await });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if fixture
+                .node
+                .gate_test_live_run_state(&job_id)
+                .await
+                .is_some_and(|(generation, canceled)| generation == 3 && !canceled)
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("gen-3 run never registered");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Delayed abort for attempt 2 (older than the live attempt 3).
+        fixture
+            .node
+            .abort_gate_landing(&serde_json::json!({
+                "jobId": job_id,
+                "generation": 2,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .node
+                .gate_test_live_run_state(&job_id)
+                .await
+                .expect("gen-3 run still live"),
+            (3, false),
+            "a stale abort must not stand down or signal the newer attempt"
+        );
+        // Matching generation aborts DO stand the run down (its verify phase,
+        // since this fake never reaches a granted land).
+        fixture
+            .node
+            .abort_gate_landing(&serde_json::json!({
+                "jobId": job_id,
+                "generation": 3,
+            }))
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the matching abort reaps the run")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.status,
+            "canceled",
+            "the same-generation abort must terminate the live run: {:?}",
+            result.status
+        );
+    }
 
     #[test]
     fn port_pair_and_path_helpers() {

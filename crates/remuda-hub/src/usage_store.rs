@@ -274,6 +274,12 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // Rows this branch wrote already carry it and are untouched; when no
     // journal table exists (unit fixtures) the guard makes this a no-op.
     backfill_scope_ids_from_journal(conn)?;
+    // c-usagefu r16 item 8: recover the OTHER projection fields the legacy
+    // insert path dropped for usage recorded WHILE a migration stayed rolled
+    // back (native turn id, native time/source, context window, metric
+    // revision) — from the durable journal, BEFORE the duplicate reconciliation
+    // and consolidation and BEFORE the completion marker is set.
+    reconstruct_fallback_projection_from_journal(conn)?;
     // Now the columns exist on both a fresh CREATE and an upgraded DB.
     //
     // Dedupe indexes are scope-specific (c-ctxusage r4 item 3):
@@ -343,6 +349,119 @@ fn backfill_scope_ids_from_journal(conn: &Connection) -> rusqlite::Result<()> {
                  AND json_extract(j2.payload_json, '$.kind') = 'usage'
                  AND json_extract(j2.payload_json, '$.payload.scopeId') IS NOT NULL
            )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Recover the projection fields origin/main's — and the rolled-back
+/// migration-window's — insert path did NOT persist, from the durable journal
+/// (c-usagefu r16 item 8).
+///
+/// While a usage migration stayed rolled back, [`insert_legacy_row`] recorded
+/// every usage event (codex Turn AND the new Message/Session frames) with only
+/// the fourteen legacy columns: the additive columns the migration adds were
+/// absent at write time and default to NULL/`'ingest'`/revision 1 afterward.
+/// The scope-id backfill above only recovered `scope_id`; without the native
+/// turn id the rollup's `COUNT(DISTINCT turn_id)` dropped every fallback
+/// Message call, and the `'ingest'` source excluded them from the native TPM
+/// windows and the eligible-flow relation — so fallback-period usage vanished
+/// from totals, rates and attribution.
+///
+/// This re-projects the missing fields from the matching journal row
+/// `(instance_id, seq)` the same way [`project_usage_event`] reads the live
+/// event, filling ONLY missing/authoritative-default values (never overwriting
+/// a value a native projection already supplied), and runs BEFORE
+/// [`reconcile_duplicate_turn_keys`] / [`consolidate_message_duplicates`] and
+/// before the completion marker, so the consolidation COALESCE actually has
+/// native siblings to merge. Idempotent: every assignment is COALESCE/guarded,
+/// and the step only ever runs before the one-time marker is set.
+fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::Result<()> {
+    // Same existence gate as the scope-id backfill (unit fixtures have no
+    // journal table).
+    let journal_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'journal'",
+        [],
+        |row| row.get(0),
+    )?;
+    if journal_exists == 0 {
+        return Ok(());
+    }
+    // The correlated subqueries return NULL unless a valid kind='usage'
+    // journal row carries the field; bare U64 scalars arrive as decimal
+    // strings and are CAST to integers (guarded > 0 so garbage never zeroes a
+    // stored positive value).
+    conn.execute(
+        "UPDATE usage_events
+         SET turn_id = COALESCE(turn_id, (
+                 SELECT json_extract(j.payload_json, '$.source.nativeTurnId.value')
+                 FROM journal j
+                 WHERE j.instance_id = usage_events.instance_id
+                   AND j.seq = usage_events.seq
+                   AND json_valid(j.payload_json)
+                   AND json_extract(j.payload_json, '$.kind') = 'usage'
+                   AND json_extract(j.payload_json, '$.source.nativeTurnId.value') IS NOT NULL
+             )),
+             native_context_window = COALESCE(native_context_window, (
+                 SELECT CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER)
+                 FROM journal j
+                 WHERE j.instance_id = usage_events.instance_id
+                   AND j.seq = usage_events.seq
+                   AND json_valid(j.payload_json)
+                   AND json_extract(j.payload_json, '$.kind') = 'usage'
+                   AND CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER) > 0
+             )),
+             metric_revision = CASE
+                 WHEN CAST((
+                     SELECT json_extract(j.payload_json, '$.payload.metricRevision')
+                     FROM journal j
+                     WHERE j.instance_id = usage_events.instance_id
+                       AND j.seq = usage_events.seq
+                       AND json_valid(j.payload_json)
+                       AND json_extract(j.payload_json, '$.kind') = 'usage'
+                 ) AS INTEGER) > 0
+                 THEN CAST((
+                     SELECT json_extract(j2.payload_json, '$.payload.metricRevision')
+                     FROM journal j2
+                     WHERE j2.instance_id = usage_events.instance_id
+                       AND j2.seq = usage_events.seq
+                       AND json_valid(j2.payload_json)
+                       AND json_extract(j2.payload_json, '$.kind') = 'usage'
+                 ) AS INTEGER)
+                 ELSE metric_revision
+             END,
+             observed_at = CASE
+                 WHEN observed_at_source = 'native' THEN observed_at
+                 ELSE COALESCE((
+                     SELECT json_extract(j.payload_json, '$.nativeAt.value')
+                     FROM journal j
+                     WHERE j.instance_id = usage_events.instance_id
+                       AND j.seq = usage_events.seq
+                       AND json_valid(j.payload_json)
+                       AND json_extract(j.payload_json, '$.kind') = 'usage'
+                       AND json_extract(j.payload_json, '$.nativeAt.value') IS NOT NULL
+                 ), observed_at)
+             END,
+             observed_at_source = CASE
+                 WHEN observed_at_source = 'native' THEN 'native'
+                 WHEN EXISTS (
+                     SELECT 1 FROM journal j
+                     WHERE j.instance_id = usage_events.instance_id
+                       AND j.seq = usage_events.seq
+                       AND json_valid(j.payload_json)
+                       AND json_extract(j.payload_json, '$.kind') = 'usage'
+                       AND json_extract(j.payload_json, '$.nativeAt.value') IS NOT NULL
+                 ) THEN 'native'
+                 ELSE observed_at_source
+             END
+         WHERE EXISTS (
+             SELECT 1 FROM journal j
+             WHERE j.instance_id = usage_events.instance_id
+               AND j.seq = usage_events.seq
+               AND json_valid(j.payload_json)
+               AND json_extract(j.payload_json, '$.kind') = 'usage'
+         )",
         [],
     )?;
     Ok(())
@@ -4537,6 +4656,250 @@ mod tests {
             2,
             "the two recorded legacy NULL-scope turns fold again after recovery"
         );
+    }
+
+    /// A codex Message/Session usage frame carrying full attribution, exactly as
+    /// the durable journal retains it; its projected row is written through the
+    /// LEGACY insert while the migration is rolled back (14 columns only).
+    #[allow(clippy::too_many_arguments)]
+    fn fallback_journal_record(
+        seq: i64,
+        scope: &str,
+        scope_id: &str,
+        native_turn: Option<&str>,
+        revision: i64,
+        input: i64,
+        output: i64,
+        native_at: &str,
+    ) -> JournalRecord {
+        let total = input + output;
+        let mut event = json!({
+            "kind": "usage",
+            "nativeAt": { "state": "known", "value": native_at },
+            "payload": {
+                "scope": scope,
+                "scopeId": scope_id,
+                "mode": "snapshot",
+                "metricRevision": revision.to_string(),
+                "contextWindow": "200000",
+                "totalTokens": { "state": "known", "value": total.to_string() },
+                "inputTokens": { "state": "known", "value": input.to_string() },
+                "outputTokens": { "state": "known", "value": output.to_string() },
+                "cacheReadTokens": { "state": "unknown", "reason": "x", "evidenceEventIds": [] },
+                "cacheWriteTokens": { "state": "unknown", "reason": "x", "evidenceEventIds": [] },
+                "cost": { "state": "known",
+                          "value": { "amount": "0.05", "currency": "USD" } },
+                "accounting": "estimated"
+            }
+        });
+        if let Some(turn) = native_turn {
+            event["source"] = json!({ "nativeTurnId": { "state": "known", "value": turn } });
+        }
+        JournalRecord {
+            instance_id: "ins_r16item8".into(),
+            seq,
+            event_id: format!("je8-{seq}"),
+            event,
+            observed_at: "2026-10-13T00:00:09.000Z".into(),
+        }
+    }
+
+    #[test]
+    fn a_later_migration_reconstructs_fallback_period_codex_message_and_session_usage() {
+        // c-usagefu r16 item 8: usage recorded WHILE the migration stayed rolled
+        // back went through the 14-column legacy insert, so codex Message/Session
+        // frames lost turn_id / native time / context window / revision even
+        // though the durable journal retained them. A later successful migration
+        // reconstructs those fields BEFORE consolidation so the call and its
+        // attribution/tokens fold exactly once.
+        let conn = Connection::open_in_memory().unwrap();
+        create_main_shaped_usage_tables(&conn);
+        let at = "2026-10-13T00:00:00.000Z";
+
+        // (1) An origin/main-era Turn (seq 1), with its journal scopeId.
+        let one = UsageEventRow {
+            instance_id: "ins_r16item8".into(),
+            seq: 1,
+            profile_id: None,
+            model: Some("gpt-5.4".into()),
+            scope: "turn".into(),
+            scope_id: Some("ta".into()),
+            turn_id: None,
+            mode: "snapshot".into(),
+            total_tokens: Some(100),
+            input_tokens: Some(60),
+            output_tokens: Some(40),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: Some("0.01".into()),
+            accounting: "estimated".into(),
+            observed_at: at.into(),
+            observed_at_source: "ingest".into(),
+            native_context_window: None,
+            metric_revision: 1,
+        };
+        insert_main_turn_with_journal(&conn, "ins_r16item8", 1, "ta", &one, at);
+
+        // (2) Force the migration to fail/roll back, then record fallback usage.
+        conn.execute_batch("CREATE TABLE remuda_test_force_usage_migration_failure (x);")
+            .unwrap();
+        assert!(migrate(&conn).is_err());
+        assert!(
+            !crate::store::column_exists(&conn, "usage_events", "turn_id").unwrap(),
+            "the additive projection column never committed during fallback"
+        );
+
+        // A fallback codex Message (seq 2): a DIFFERENT call, full attribution.
+        let msg = fallback_journal_record(
+            2,
+            "message",
+            "mb-call",
+            Some("nt-mb"),
+            2,
+            70,
+            30,
+            "2026-10-13T00:00:05.000Z",
+        );
+        conn.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                msg.instance_id,
+                msg.seq,
+                msg.event_id,
+                msg.event.to_string(),
+                msg.observed_at
+            ],
+        )
+        .unwrap();
+        assert!(
+            insert(&conn, &msg),
+            "the message lands on the legacy insert"
+        );
+
+        // A fallback cumulative Session growth point (seq 3).
+        let sess = fallback_journal_record(
+            3,
+            "session",
+            "sess-1",
+            None,
+            1,
+            200,
+            100,
+            "2026-10-13T00:00:06.000Z",
+        );
+        conn.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                sess.instance_id,
+                sess.seq,
+                sess.event_id,
+                sess.event.to_string(),
+                sess.observed_at
+            ],
+        )
+        .unwrap();
+        assert!(
+            insert(&conn, &sess),
+            "the session point lands on the legacy insert"
+        );
+
+        // (3) Migration recovers and completes.
+        conn.execute_batch("DROP TABLE remuda_test_force_usage_migration_failure;")
+            .unwrap();
+        migrate(&conn).unwrap();
+
+        // The Message row is fully reconstructed from the journal.
+        let (turn_id, source, revision, window) = conn
+            .query_row(
+                "SELECT turn_id, observed_at_source, metric_revision, native_context_window
+                 FROM usage_events WHERE instance_id='ins_r16item8' AND seq=2",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            turn_id.as_deref(),
+            Some("nt-mb"),
+            "native turn id recovered"
+        );
+        assert_eq!(source, "native", "native observation time/source recovered");
+        assert_eq!(revision, 2, "metric revision recovered");
+        assert_eq!(window, Some(200_000), "native context window recovered");
+        assert_eq!(
+            conn.query_row(
+                "SELECT observed_at FROM usage_events WHERE seq=2",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+            "2026-10-13T00:00:05.000Z",
+            "the native call time, not the ingest time, drives rate windows"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT observed_at_source FROM usage_events WHERE seq=3",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+            "native",
+            "the fallback session growth point is native-time stamped"
+        );
+
+        // Totals + attribution: the old Turn (100) and the fallback Message
+        // (100) are two distinct calls, each counted once.
+        let agg = aggregate_instance(&conn, "ins_r16item8").unwrap();
+        assert!(!agg.unavailable);
+        assert_eq!(
+            agg.total_tokens, 200,
+            "fallback Message usage is not omitted"
+        );
+        assert_eq!(agg.input_tokens, 130, "60 (turn) + 70 (message)");
+        assert_eq!(agg.output_tokens, 70, "40 (turn) + 30 (message)");
+        assert!(
+            (agg.cost_usd - 0.06).abs() < 1e-9,
+            "0.01 turn + 0.05 message attribution survives recovery"
+        );
+
+        // Rollup: both calls fold (distinct unmatched-Turn scope id + the
+        // Message's native turn id), no double count; the native window resolves.
+        let req = RollupRequest {
+            instance_id: "ins_r16item8",
+            kind: "codex",
+            spec_model: Some("gpt-5.4"),
+            effective_model: None,
+            profile_id: None,
+        };
+        let rollup = rollup_instance(&conn, &req).unwrap().unwrap();
+        assert_eq!(
+            rollup.turns, 2,
+            "old turn and fallback message each count once"
+        );
+        assert_eq!(
+            rollup.context_window_tokens,
+            Some(200_000),
+            "the fallback message's native window resolves the context chip"
+        );
+
+        // Rate windows see the native-time Message; the old ingest-time Turn is
+        // not native, so a threshold after it keeps only the message's flow.
+        let (flow_in, flow_out) =
+            sum_turn_tokens_since(&conn, "ins_r16item8", "2026-10-13T00:00:04.000Z").unwrap();
+        assert_eq!(
+            flow_in,
+            Some(70),
+            "native fallback message enters the TPM window"
+        );
+        assert_eq!(flow_out, Some(30));
     }
 
     #[test]

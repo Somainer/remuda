@@ -417,15 +417,17 @@ impl EintrWaitProbe {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
-    // Read accessors are used by the Linux x86_64 real-syscall test and by
-    // the r19 item 2 scripted-clock anchor-identity test (all unix targets);
-    // on every other (test or test-stub) build the probe only records.
+    // Read accessors: deadline_anchor is read by both the all-unix r19 item 2
+    // scripted-clock anchor-identity test and the Linux x86_64 real-syscall
+    // test, so it compiles on every unix test build; eintr_retries is read
+    // ONLY by the Linux x86_64 real-syscall test and must carry that gate or
+    // macOS clippy reports it never used (ma-sdk-state r20).
     #[cfg(all(test, unix))]
     fn deadline_anchor(&self) -> Option<std::time::Instant> {
         *self.deadline_anchor.lock().expect("eintr probe anchor")
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, unix, target_os = "linux", target_arch = "x86_64"))]
     fn eintr_retries(&self) -> usize {
         self.eintr_retries
             .load(std::sync::atomic::Ordering::Acquire)

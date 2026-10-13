@@ -398,3 +398,69 @@ async fn a_missing_or_regressed_epoch_with_retained_sessions_refuses_boot() {
     );
     healthy.shutdown().await;
 }
+
+/// r16 item 9: a boot epoch at or above 2^32 would shift out of the high 32
+/// bits of a packed session id and ALIAS lower-epoch sessions. Both an epoch
+/// row already at the limit and one whose NEXT allocation would reach it must
+/// refuse to boot rather than wrap. The row is left untouched by the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_epoch_at_or_above_the_32bit_field_refuses_to_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("hub");
+    let hub = spawn(HubConfig::for_test(data_dir.clone()))
+        .await
+        .expect("first hub boots");
+    hub.shutdown().await;
+
+    for bad in [1u64 << 32, (1u64 << 32) - 1] {
+        {
+            let conn = rw_conn(&data_dir);
+            conn.execute(
+                "INSERT INTO hub_kv(key, value) VALUES ('gate_session_boot_epoch', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = ?1",
+                [i64::try_from(bad).unwrap()],
+            )
+            .unwrap();
+        }
+        let refused = spawn(HubConfig::for_test(data_dir.clone())).await;
+        match refused {
+            Ok(hub) => panic!(
+                "epoch row {bad} must refuse boot instead of aliasing session ids: boot={}",
+                hub.boot_epoch_value()
+            ),
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("2^32") || message.contains("session-id"),
+                    "the refusal must name the 2^32 session-id limit: {message}"
+                );
+            }
+        }
+        // The refused allocation did not advance the row.
+        let conn = read_only_conn(&data_dir);
+        assert_eq!(
+            kv_i64(&conn, "gate_session_boot_epoch"),
+            i64::try_from(bad).unwrap(),
+            "a refused boot must not rewrite the epoch row"
+        );
+    }
+
+    // One step below the last-allowed row boots and allocates exactly 2^32 - 1.
+    {
+        let conn = rw_conn(&data_dir);
+        conn.execute(
+            "UPDATE hub_kv SET value = ?1 WHERE key = 'gate_session_boot_epoch'",
+            [(1u64 << 32) - 2],
+        )
+        .unwrap();
+    }
+    let last_ok = spawn(HubConfig::for_test(data_dir.clone()))
+        .await
+        .expect("the last under-limit epoch still boots");
+    assert_eq!(
+        last_ok.boot_epoch_value(),
+        (1u64 << 32) - 1,
+        "the final valid epoch is allocated"
+    );
+    last_ok.shutdown().await;
+}

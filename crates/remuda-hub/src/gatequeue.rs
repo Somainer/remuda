@@ -184,6 +184,17 @@ impl Store {
                 .optional()?
                 .flatten();
             let retained_epoch = retained.map(|session| (session >> 32) as u64).unwrap_or(0);
+            // r16 item 9: the epoch is the high 32 bits of every session id, so
+            // an epoch at or above 2^32 shifts out of the field and mints ids
+            // that alias low-epoch sessions. A negative retained session (a
+            // tampered/aliased row whose high bit is set) sign-extends into a
+            // huge epoch here and is refused too.
+            if retained_epoch >= MAX_GATE_SESSION_BOOT_EPOCH {
+                return Err(crate::store::StoreError::GateEpochRegressed(format!(
+                    "a retained gate carrier session embeds boot epoch {retained_epoch}, outside \
+                     the 32-bit session-id field; refusing to mint session ids"
+                )));
+            }
             // Current persisted allocation epoch, if any.
             let current: Option<i64> = tx
                 .query_row(
@@ -208,13 +219,28 @@ impl Store {
                              session epoch {retained_epoch}; refusing to mint session ids"
                         )));
                     }
-                    stored.max(retained_epoch).saturating_add(1)
+                    // r16 item 9: never allocate an epoch that would overflow
+                    // the 32-bit field and alias session ids — fail closed.
+                    if stored >= MAX_GATE_SESSION_BOOT_EPOCH {
+                        return Err(crate::store::StoreError::GateEpochRegressed(format!(
+                            "gate_session_boot_epoch={stored} is at or above the 2^32 session-id \
+                             limit; refusing to mint session ids"
+                        )));
+                    }
+                    let next = stored.max(retained_epoch).saturating_add(1);
+                    if next >= MAX_GATE_SESSION_BOOT_EPOCH {
+                        return Err(crate::store::StoreError::GateEpochRegressed(format!(
+                            "the next gate session boot epoch would be {next}, at or above the \
+                             2^32 session-id limit; refusing to mint aliasing session ids"
+                        )));
+                    }
+                    next
                 }
             };
             tx.execute(
                 "INSERT INTO hub_kv(key, value) VALUES ('gate_session_boot_epoch', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![i64::try_from(next).unwrap_or(i64::MAX)],
+                params![i64::try_from(next).expect("bounded below 2^32 by the checks above")],
             )?;
             tx.commit()?;
             Ok(next)
@@ -222,6 +248,11 @@ impl Store {
         .await
     }
 }
+
+/// r16 item 9: exclusive upper bound for a gate carrier boot epoch — the epoch
+/// is the high 32 bits of a packed session id, so an epoch `>= 2^32` shifts
+/// out of the field and aliases lower-epoch session ids.
+const MAX_GATE_SESSION_BOOT_EPOCH: u64 = 1 << 32;
 
 /// Routes for the project gate queue.
 pub fn routes() -> Router<AppState> {

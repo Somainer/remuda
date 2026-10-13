@@ -1260,6 +1260,11 @@ pub enum ControlSuccessPayload {
 }
 
 /// Stdout (C→H) frame.
+///
+/// Its manual `Serialize` (see below) also drives the driver's bounded
+/// publication backlog accounting (ma-sdk-state r12 item 1): a queued frame is
+/// charged its serialized JSON byte size as a lower bound on its parsed heap
+/// footprint.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum Outbound {

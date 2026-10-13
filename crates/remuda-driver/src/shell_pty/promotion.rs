@@ -2723,6 +2723,10 @@ async fn emit_mapped(
     mapped: Observation,
 ) -> DriverResult<()> {
     let event_id = mapped.event_id;
+    // c-ctxusage r24 item 1: preserve the mapper-stamped native time so live
+    // promoted TUI usage stays native-timed (TPM / lastTurnAt); rebuilding the
+    // observation resets it to Unknown and reclassifies the row as ingest.
+    let native_at = mapped.native_at;
     let mut observation = build(
         ctx,
         seq.fetch_add(1, Ordering::SeqCst) + 1,
@@ -2731,6 +2735,7 @@ async fn emit_mapped(
         mapped.body,
     )?;
     observation.event_id = event_id;
+    observation.native_at = native_at;
     events
         .send(observation)
         .await
@@ -2790,6 +2795,49 @@ mod tests {
     use super::*;
     use remuda_protocol::{QuestionAnswer, QuestionFieldAnswer};
     use std::io::Write;
+
+    /// c-ctxusage r24 item 1: the promoted TUI pump's `emit_mapped` rebuilds
+    /// run identity but must preserve the mapper-stamped native time so live
+    /// usage projects as native-timed (TPM / lastTurnAt).
+    #[tokio::test]
+    async fn emit_mapped_preserves_native_time() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let ctx = ctx_in(dir.path());
+        let (events, mut rx) = mpsc::channel(4);
+        let seq = Arc::new(AtomicU64::new(0));
+        let at = "2026-10-13T10:00:00.000Z";
+        let mut mapped = build(
+            &ctx,
+            99,
+            SourceChannel::Transcript,
+            Completeness::Structured,
+            ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+                NativeLifecycle {
+                    topic: LifecycleTopic::Session,
+                    native_name: "x".into(),
+                    native_id: Knowledge::NotApplicable,
+                    status: Knowledge::NotApplicable,
+                    related_ids: BTreeMap::new(),
+                    data_ref: None,
+                    severity: Severity::Info,
+                    affects_completion: false,
+                },
+            )))),
+        )
+        .expect("builds");
+        mapped.native_at = Knowledge::Known {
+            value: Timestamp::try_from(at.to_string()).unwrap(),
+        };
+        let expected = match &mapped.native_at {
+            Knowledge::Known { value } => value.clone(),
+            _ => panic!("set"),
+        };
+        emit_mapped(&events, &seq, &ctx, SourceChannel::Transcript, mapped)
+            .await
+            .expect("emits");
+        let out = rx.recv().await.expect("one observation");
+        assert_eq!(out.native_at, Knowledge::Known { value: expected });
+    }
 
     fn ctx_in(dir: &Path) -> PromoteCtx {
         PromoteCtx {

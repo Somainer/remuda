@@ -1755,8 +1755,15 @@ async fn emit_mapped_obs(
 ) -> DriverResult<()> {
     let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
     let event_id = mapped.event_id;
+    // c-ctxusage r24 item 1: the mapper stamped `native_at` from the record's
+    // own timestamp (historical transcript) or the live receipt time (live
+    // print/sdk result). Rebuilding the observation via `build_observation`
+    // resets it to Unknown, which would make the Hub treat live TUI usage as
+    // ingest-timed and exclude it from TPM / native lastTurnAt. Preserve it.
+    let native_at = mapped.native_at;
     let mut observation = build_observation(ctx, n, channel, mapped.completeness, mapped.body)?;
     observation.event_id = event_id;
+    observation.native_at = native_at;
     tx.send(observation)
         .await
         .map_err(|_| DriverError::ControlUnavailable)?;
@@ -2566,6 +2573,57 @@ pub(crate) async fn emit_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// c-ctxusage r24 item 1: the TUI pump's `emit_mapped_obs` rebuilds the
+    /// observation with run identity but must PRESERVE the mapper-stamped
+    /// native time, or live TUI usage projects as ingest-timed and drops out
+    /// of TPM/native lastTurnAt.
+    #[tokio::test]
+    async fn emit_mapped_obs_preserves_native_time() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ctx = ObsCtx {
+            driver: DriverKind::ClaudePty,
+            instance_id: InstanceId::new(),
+            host_id: HostId::new(),
+            journal_id: remuda_protocol::Id::new("obj").unwrap(),
+            run_id: RunId::new(),
+            session_id: "s".into(),
+            pin_version: "2.1.289".into(),
+        };
+        let at = "2026-10-13T10:00:00.000Z";
+        let mut mapped = build_observation(
+            &ctx,
+            1,
+            SourceChannel::Transcript,
+            Completeness::Structured,
+            ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+                NativeLifecycle {
+                    topic: LifecycleTopic::Session,
+                    native_name: "x".into(),
+                    native_id: Knowledge::NotApplicable,
+                    status: Knowledge::NotApplicable,
+                    related_ids: std::collections::BTreeMap::new(),
+                    data_ref: None,
+                    severity: Severity::Info,
+                    affects_completion: false,
+                },
+            )))),
+        )
+        .unwrap();
+        mapped.native_at = Knowledge::Known {
+            value: Timestamp::try_from(at.to_string()).unwrap(),
+        };
+        let expected = match &mapped.native_at {
+            Knowledge::Known { value } => value.clone(),
+            _ => panic!("set"),
+        };
+        emit_mapped_obs(&tx, &seq, &ctx, SourceChannel::Transcript, mapped)
+            .await
+            .expect("emits");
+        let out = rx.recv().await.expect("one observation");
+        assert_eq!(out.native_at, Knowledge::Known { value: expected });
+    }
 
     /// D-027: a PTY driver cannot inline bytes, so an attachment has to reach
     /// the agent as an absolute path it can open with its own Read tool.

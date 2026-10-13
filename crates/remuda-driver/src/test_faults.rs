@@ -610,6 +610,25 @@ impl FaultState {
         let _ = self.normal_gate_tx.send(true);
     }
 
+    /// Open the shared blocking-phase gate so a parked finalise/collect can
+    /// finish (c-ctxusage r21 item 4): retirement that hits its bounded wait
+    /// releases the parked phase instead of abandoning a parked OS thread.
+    #[cfg(feature = "test-faults")]
+    pub(crate) fn open_blocking_gate(&self) {
+        if let Ok(mut open) = self.gate_open.lock() {
+            *open = true;
+        }
+        self.gate_cv.notify_all();
+    }
+
+    /// Whether the blocking-phase gate has been opened (a parked finalise was
+    /// released) rather than abandoned (c-ctxusage r21 item 4 test seam).
+    #[cfg(feature = "test-faults")]
+    #[must_use]
+    pub(crate) fn blocking_gate_is_open_state(&self) -> bool {
+        self.gate_open.lock().map(|open| *open).unwrap_or(false)
+    }
+
     /// The injected bounded-pending capacity override, if a test armed one.
     pub(crate) fn pending_capacity(&self) -> Option<usize> {
         match self.pending_capacity.load(Ordering::SeqCst) {
@@ -997,6 +1016,13 @@ impl TranscriptFaults {
             .normal_parked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether retirement opened (released) a parked blocking phase rather
+    /// than abandoning it (c-ctxusage r21 item 4).
+    #[must_use]
+    pub fn blocking_gate_is_open(&self) -> bool {
+        self.inner.blocking_gate_is_open_state()
     }
 
     /// Block until at least `n` promotion polls have bound a transcript

@@ -1847,8 +1847,38 @@ impl ShellPtyDriver {
                     .is_ok()
             };
             if !finished {
-                poller.abort();
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut poller).await;
+                // c-ctxusage r21 item 4: the poller may be parked in an
+                // injected finalise/collect gate. A bound that simply abandons
+                // it leaves a parked blocking thread behind. Release the gate
+                // first (test-only), then give the task a short bounded grace
+                // to actually complete; abort only if it is genuinely wedged.
+                #[cfg(feature = "test-faults")]
+                if let Some(faults) = self
+                    .test_faults
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_deref()
+                {
+                    faults.open_blocking_gate();
+                }
+                let released = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    if let Some(finalised) = finalised.as_mut() {
+                        tokio::pin!(finalised);
+                        tokio::select! {
+                            _ = finalised => {}
+                            _ = &mut poller => {}
+                        }
+                    } else {
+                        let _ = (&mut poller).await;
+                    }
+                })
+                .await
+                .is_ok();
+                if !released {
+                    poller.abort();
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), &mut poller).await;
+                }
             }
         }
         if let Some(mut waiter) = self.waiter.lock().await.take() {

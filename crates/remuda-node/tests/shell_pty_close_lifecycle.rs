@@ -1982,3 +1982,105 @@ async fn a_failed_resume_spawn_leaves_the_predecessor_run_intact() {
         "the post-failed-resume append was delivered by the live predecessor poller"
     );
 }
+
+/// c-ctxusage r21 item 4: when predecessor retirement reaches its bounded
+/// wait while the predecessor finalise is parked in the injected finish gate,
+/// retirement must RELEASE that gate so the finalise (and the poller)
+/// completes inside the bound — not abandon a parked blocking thread behind an
+/// abort that cannot cancel a spawn_blocking closure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retire_bound_releases_a_parked_finalise_and_completes() {
+    use remuda_driver::test_faults::TranscriptFaults;
+    let (_dir, workspace, _transcript, events_path, driver) = p1_promoted_layout_tagged();
+    let driver = std::sync::Arc::new(driver);
+    let faults = TranscriptFaults::new();
+    faults.arm_finish_gate();
+    // 500 ms retire bound: the fix releases the parked gate at the bound, so
+    // retirement finishes shortly after; the revert path aborts and then waits
+    // the full 2 s post-abort join timeout (it cannot cancel a parked
+    // spawn_blocking), ~2.5 s total.
+    faults.arm_close_timeout(Duration::from_millis(500));
+    driver.set_test_faults(faults.clone());
+
+    let handle = driver
+        .start(spec_for(&workspace, DriverKind::ShellPty))
+        .await
+        .expect("start");
+    let mut events_rx = handle.into_events();
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    let exit_tx = std::sync::Mutex::new(Some(exit_tx));
+    let drainer = tokio::spawn(async move {
+        while let Some(observation) = events_rx.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+            {
+                if native.native_name == "transcript_bound"
+                    && let Some(tx) = bound_tx.lock().unwrap().take()
+                {
+                    let _ = tx.send(());
+                }
+                if native.native_name == "native_exit"
+                    && let Some(tx) = exit_tx.lock().unwrap().take()
+                {
+                    let _ = tx.send(());
+                }
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(20), bound_rx)
+        .await
+        .expect("run 1 never bound")
+        .expect("bound");
+    let pid1 = last_session_pid(&events_path);
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", &pid1.to_string()])
+            .status()
+            .expect("spawn kill")
+            .success()
+    );
+    tokio::time::timeout(Duration::from_secs(20), exit_rx)
+        .await
+        .expect("native_exit never observed")
+        .expect("exit");
+
+    // Resume WITHOUT releasing the finish gate: retirement hits its bound and
+    // must release the parked finalise itself.
+    let started = Instant::now();
+    let resume = tokio::time::timeout(
+        Duration::from_secs(10),
+        driver.start_resumed(
+            spec_for(&workspace, DriverKind::ShellPty),
+            SESSION_ID.into(),
+        ),
+    )
+    .await
+    .expect("resume hung")
+    .expect("resume ok");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(2000),
+        "retirement completed within its bound: {elapsed:?}"
+    );
+    // The hard item-4 signal: the test never called release(), so the ONLY
+    // thing that opened the blocking gate is retirement releasing the parked
+    // finalise at its bound. The revert abandons the parked thread and leaves
+    // the gate shut.
+    assert!(
+        faults.blocking_gate_is_open(),
+        "retirement at its bound must RELEASE the parked finalise (gate open), \
+         not abandon the parked blocking thread (gate still shut)"
+    );
+
+    // Clean up the resumed run; the released predecessor is already retired.
+    faults.release();
+    drop(resume);
+    tokio::time::timeout(Duration::from_secs(25), driver.close())
+        .await
+        .expect("close hung")
+        .expect("close ok");
+    driver.abort_event_workers_for_test().await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), drainer).await;
+}

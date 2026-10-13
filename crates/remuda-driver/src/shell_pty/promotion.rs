@@ -1098,6 +1098,36 @@ pub(super) fn spawn(
                     continue;
                 }
             }
+            // c-ctxusage r22 item 3 test-only: a sample-entry hold parked just
+            // before sampling. The normal-sample gate sits ABOVE this, so when
+            // the gate holds the poller it never reaches sampling and never
+            // enters this hold; if the gate were placed below sampling the
+            // poller would enter here instead. Close/drain/shutdown still
+            // release it.
+            #[cfg(feature = "test-faults")]
+            if let Some(faults) = faults.as_ref()
+                && faults.sample_hold_is_armed()
+            {
+                faults.note_sample_hold_entered();
+                let mut hold = faults.sample_hold_receiver();
+                tokio::select! {
+                    biased;
+                    result = shutdown.changed() => match result {
+                        Ok(()) => closing = *shutdown.borrow_and_update(),
+                        Err(_closed) => break,
+                    },
+                    _ = live_drain.notify.notified() => {
+                        drain_notified = true;
+                    }
+                    _ = hold.wait_for(|open| *open) => {}
+                }
+                if closing || state.closed.load(Ordering::SeqCst) || events.is_closed() {
+                    break;
+                }
+                if live_drain.is_closing() {
+                    continue;
+                }
+            }
             let Sample { rows, mut found } = sample(&state, table.as_ref(), alias.as_ref()).await;
             // Detection can still be late: `ps` has not caught the exec yet,
             // or the agent runs under a name neither the table nor the alias

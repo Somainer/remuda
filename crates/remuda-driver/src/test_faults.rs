@@ -104,6 +104,18 @@ pub(crate) struct FaultState {
     normal_parked: Mutex<u64>,
     #[cfg(feature = "test-faults")]
     normal_parked_cv: Condvar,
+    /// Sample-entry hold (c-ctxusage r22 item 3): when armed, a NORMAL sample
+    /// blocks the moment it begins sampling (after the normal-sample gate, so a
+    /// correctly-placed gate parks first and never reaches this). Lets a test
+    /// prove the gate stops the sample itself, not just the next tick.
+    #[cfg(feature = "test-faults")]
+    sample_hold_armed: AtomicBool,
+    #[cfg(feature = "test-faults")]
+    sample_hold_tx: tokio::sync::watch::Sender<bool>,
+    #[cfg(feature = "test-faults")]
+    sample_hold_entered: Mutex<bool>,
+    #[cfg(feature = "test-faults")]
+    sample_hold_entered_cv: Condvar,
     skip_cooperative_finalise: AtomicBool,
     /// Overrides the driver's bounded cooperative-close wait so an abort test
     /// crosses the bound deterministically without the production 15 s / 2 s
@@ -222,6 +234,14 @@ impl FaultState {
             normal_parked: Mutex::new(0),
             #[cfg(feature = "test-faults")]
             normal_parked_cv: Condvar::new(),
+            #[cfg(feature = "test-faults")]
+            sample_hold_armed: AtomicBool::new(false),
+            #[cfg(feature = "test-faults")]
+            sample_hold_tx: tokio::sync::watch::channel(false).0,
+            #[cfg(feature = "test-faults")]
+            sample_hold_entered: Mutex::new(false),
+            #[cfg(feature = "test-faults")]
+            sample_hold_entered_cv: Condvar::new(),
             skip_cooperative_finalise: AtomicBool::new(false),
             close_timeout_ms: AtomicU64::new(0),
             pending_capacity: AtomicU64::new(0),
@@ -608,6 +628,37 @@ impl FaultState {
     pub(crate) fn release_normal_samples_state(&self) {
         self.normal_gate_armed.store(false, Ordering::SeqCst);
         let _ = self.normal_gate_tx.send(true);
+    }
+
+    /// Receiver on the sample-entry hold gate (c-ctxusage r22 item 3).
+    #[cfg(feature = "test-faults")]
+    pub(crate) fn sample_hold_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.sample_hold_tx.subscribe()
+    }
+
+    /// Whether a normal sample may START: false while the sample-entry hold is
+    /// armed (c-ctxusage r22 item 3).
+    #[cfg(feature = "test-faults")]
+    pub(crate) fn sample_hold_is_armed(&self) -> bool {
+        self.sample_hold_armed.load(Ordering::SeqCst)
+    }
+
+    /// Acknowledge a normal sample entered (reached the start of sampling) and
+    /// is parked on the entry hold (c-ctxusage r22 item 3).
+    #[cfg(feature = "test-faults")]
+    pub(crate) fn note_sample_hold_entered(&self) {
+        *self
+            .sample_hold_entered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.sample_hold_entered_cv.notify_all();
+    }
+
+    /// Release any sample-entry hold and disarm it (c-ctxusage r22 item 3).
+    #[cfg(feature = "test-faults")]
+    pub(crate) fn release_sample_hold_state(&self) {
+        self.sample_hold_armed.store(false, Ordering::SeqCst);
+        let _ = self.sample_hold_tx.send(true);
     }
 
     /// Open the shared blocking-phase gate so a parked finalise/collect can
@@ -1014,6 +1065,45 @@ impl TranscriptFaults {
         *self
             .inner
             .normal_parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hold a normal sample at the very start of sampling (c-ctxusage r22
+    /// item 3): a probe that the normal-sample gate stops sampling itself.
+    pub fn arm_sample_hold(&self) {
+        if *self.inner.sample_hold_tx.borrow() {
+            let _ = self.inner.sample_hold_tx.send(false);
+        }
+        *self
+            .inner
+            .sample_hold_entered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        self.inner.sample_hold_armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Release the sample-entry hold (c-ctxusage r22 item 3).
+    pub fn release_sample_hold(&self) {
+        self.inner.release_sample_hold_state();
+    }
+
+    /// Block until a normal sample reaches the entry hold, bounded
+    /// (c-ctxusage r22 item 3).
+    pub fn wait_sample_hold_entered(&self, timeout: Duration) -> bool {
+        Self::wait_true(
+            &self.inner.sample_hold_entered,
+            &self.inner.sample_hold_entered_cv,
+            timeout,
+        )
+    }
+
+    /// Whether a normal sample entered the entry hold (c-ctxusage r22 item 3).
+    #[must_use]
+    pub fn sample_hold_entered(&self) -> bool {
+        *self
+            .inner
+            .sample_hold_entered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }

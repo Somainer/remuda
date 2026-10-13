@@ -1696,9 +1696,26 @@ async fn retirement_after_run2_binds_does_not_clear_run2_promotion() {
         "run 1 established a binding claim"
     );
 
-    // Freeze normal samples BEFORE the death: the post-death demote tick (and
-    // run 2's first tick) park here instead of racing the finalise.
+    // Freeze normal samples and WAIT for run 1 to park BEFORE the death
+    // (c-ctxusage r22 item 3): the park acknowledgement proves no normal
+    // sample is in flight, so an in-flight post-arm sample can never demote
+    // run 1 after the gate engaged. Run 2's first tick parks here too.
     faults.arm_normal_sample_gate();
+    // Safety probe (c-ctxusage r22 item 3): a hold at the very start of
+    // sampling. The gate parks ABOVE sampling, so while armed the poller must
+    // park at the gate and never reach the sample hold.
+    faults.arm_sample_hold();
+    assert!(
+        faults.wait_normal_samples_parked(1, Duration::from_secs(20)),
+        "run 1 never reached the normal-sample gate before the kill"
+    );
+    let parked_before_resume = faults.normal_sample_park_count();
+    assert!(
+        !faults.sample_hold_entered(),
+        "a normal sample STARTED while the gate was armed: the gate must stop \
+         the sample itself, so no sample can demote after arming"
+    );
+
     let pid1 = last_session_pid(&events_path);
     assert!(
         std::process::Command::new("kill")
@@ -1712,14 +1729,18 @@ async fn retirement_after_run2_binds_does_not_clear_run2_promotion() {
         .await
         .expect("the natural native_exit was never observed")
         .expect("exit oneshot closed without firing");
-    // The predecessor's post-death normal sample is held.
-    assert!(
-        faults.wait_normal_samples_parked(1, Duration::from_secs(20)),
-        "run 1's post-death normal sample never parked"
+    // The gate held the only normal sample in flight; no extra park from a
+    // post-death demote sample happens before resume.
+    assert_eq!(
+        faults.normal_sample_park_count(),
+        parked_before_resume,
+        "a post-arm sample ran while run 1 died — the gate did not hold the in-flight sample"
     );
-    let parked_before_resume = faults.normal_sample_park_count();
 
     // ---- resume ---------------------------------------------------------
+    // Run 2 must sample normally once the normal gate is released later; the
+    // entry hold was only a pre-kill probe — drop it now.
+    faults.release_sample_hold();
     let mut resume = tokio::spawn({
         let driver = driver.clone();
         async move {
@@ -1740,7 +1761,8 @@ async fn retirement_after_run2_binds_does_not_clear_run2_promotion() {
     assert_eq!(
         faults.promoter_start_count(),
         2,
-        "at the park both poller tasks exist (spawn-before-retire); reverting          the order leaves exactly one here"
+        "at the park both poller tasks exist (spawn-before-retire); reverting the \
+         order leaves exactly one here"
     );
     assert!(
         faults.wait_normal_samples_parked(parked_before_resume + 1, Duration::from_secs(20)),

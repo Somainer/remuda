@@ -503,9 +503,9 @@ mod r15_tests {
     use crate::adapters::codex_discovery::{
         begin_lifetime, census_lifetime_is_live, forget_lifetime,
     };
-    use crate::shell_pty::lifecycle::{
-        ProcessIdentity, process_identity_alive, process_start_ticks,
-    };
+    #[cfg(target_os = "linux")]
+    use crate::shell_pty::lifecycle::process_start_ticks;
+    use crate::shell_pty::lifecycle::{ProcessIdentity, process_identity_alive};
     use std::path::Path;
     use time::OffsetDateTime;
 
@@ -764,7 +764,11 @@ mod r15_tests {
             let dir = root.path().join(format!("e-{i:02}"));
             std::fs::create_dir_all(&dir).unwrap();
             let owner = Box::leak(format!("r15-cap-{i:02}").into_boxed_str());
-            supervisor.test_push(entry(&dir, owner, vec![ProcessIdentity { pid: 999_999 }]));
+            supervisor.test_push(entry(
+                &dir,
+                owner,
+                vec![crate::shell_pty::lifecycle::survivor_identity(999_999)],
+            ));
         }
         assert_eq!(supervisor.pending_count(), MAX_PENDING_ENTRIES);
     }

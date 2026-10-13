@@ -5589,6 +5589,7 @@ mod tests {
         crate::adapters::codex_discovery::forget_lifetime(&cwd, promoted_owner);
     }
 
+    #[cfg(target_os = "linux")] // snapshot_process_tree is Linux-only (c-usagefu r15 item 7)
     #[tokio::test]
     async fn a_real_setsid_descendant_is_named_stop_incomplete_through_the_production_ladder() {
         // c-usagefu r14 item 4: rebuilds the item-3 regression through

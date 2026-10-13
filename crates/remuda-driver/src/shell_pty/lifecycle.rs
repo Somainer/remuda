@@ -1160,25 +1160,16 @@ fn parse_proc_state_start(after_comm: &str) -> Option<(&str, u64)> {
 /// `kill(pid, 0)` returns success for a zombie, which must not keep a census
 /// interval live; read the `/proc` state letter first (zombie/exiting states
 /// are dead — [`state_is_dead`]), and treat an unreadable state as Unknown
-/// (Ruling F): it stays alive rather than being guessed dead.
+/// (Ruling F): it stays alive rather than being guessed dead. The production
+/// stop path probes identities through [`process_identity_alive`]; this
+/// convenience is used by the Linux-only tree tests.
+#[cfg(all(test, target_os = "linux"))]
 #[must_use]
 pub(crate) fn process_running(pid: i32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        process_identity_alive(ProcessIdentity {
-            pid,
-            start_ticks: None,
-        })
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        process_alive(pid)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
+    process_identity_alive(ProcessIdentity {
+        pid,
+        start_ticks: None,
+    })
 }
 
 /// Non-Linux unix: no `/proc` start time; the signal-0/`ps` disposition is the
@@ -1236,11 +1227,15 @@ pub(crate) fn process_identity_alive(_identity: ProcessIdentity) -> bool {
 }
 
 /// One process captured in the pre-signal tree snapshot: its pid and process
-/// group (a setsid descendant has a group of its own).
-#[cfg(unix)]
+/// group (a setsid descendant has a group of its own). Linux-only: both the
+/// snapshot and the post-ladder rescan read `/proc`.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 pub(crate) struct TreeProc {
     pub(crate) pid: i32,
+    /// The post-ladder rescan reads each member's CURRENT group; this
+    /// snapshot group is retained for the tree tests' pre-signal assertions.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) pgrp: i32,
 }
 
@@ -1303,7 +1298,7 @@ pub(crate) fn snapshot_process_tree(root_pid: i32) -> Vec<TreeProc> {
 
 /// Parse the `state ppid pgrp` fields of a `/proc/<pid>/stat` tail, returning
 /// `(ppid, pgrp)`.
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn parse_proc_parent_group(after_comm: &str) -> Option<(i32, i32)> {
     let mut fields = after_comm.split_whitespace();
     let _state = fields.next()?;

@@ -3876,3 +3876,60 @@ fn dropping_the_barrier_handle_disarms_the_parked_registration_and_clears_the_sl
     builder3.join().unwrap();
     forget_lifetime(Path::new(cwd), "r15-item8-d");
 }
+
+#[test]
+fn dropping_the_barrier_handle_clears_the_slot_even_while_the_lock_is_contended() {
+    // c-usagefu r16 item 10: the slot removal must take the slot lock AFTER
+    // disarming with a BLOCKING lock. The old try_lock skipped removal while
+    // another thread transiently held the map mutex, leaking the stale barrier
+    // into the next launch. Hold the map from a second thread, run the handle's
+    // Drop concurrently, then release — the slot must be absent afterwards.
+    use crate::adapters::codex_discovery::PendingLaunchBarrierHandle as Barrier;
+    use crate::adapters::codex_discovery::{
+        lock_pending_launch_slot_for_test, pending_launch_barrier_slot_absent,
+    };
+
+    let cwd = "/projects/r16-item10-slot-contention";
+    let barrier = Barrier::arm_pre_lock(Path::new(cwd));
+    assert!(
+        !pending_launch_barrier_slot_absent(Path::new(cwd)),
+        "arming installs the barrier slot"
+    );
+
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::Builder::new()
+        .name("r16-item10-slot-holder".into())
+        .spawn(move || {
+            let _guard = lock_pending_launch_slot_for_test();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+        .unwrap();
+    locked_rx
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("the holder acquired the slot lock");
+
+    // Drop runs on its own thread: it disarms first, then BLOCKS on the slot
+    // lock until the holder releases.
+    let dropper = std::thread::Builder::new()
+        .name("r16-item10-dropper".into())
+        .spawn(move || drop(barrier))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        !dropper.is_finished(),
+        "the dropping handle is waiting for the contended slot lock"
+    );
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    dropper
+        .join()
+        .expect("the drop completes once the slot lock is free");
+
+    assert!(
+        pending_launch_barrier_slot_absent(Path::new(cwd)),
+        "the slot is actually removed despite the lock being contended during Drop"
+    );
+}

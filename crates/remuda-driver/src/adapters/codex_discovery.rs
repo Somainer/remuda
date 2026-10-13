@@ -535,6 +535,35 @@ static PENDING_LAUNCH_BARRIER: std::sync::LazyLock<
     std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<PendingLaunchBarrier>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
+/// Test-only held guard over the global barrier slot map (c-usagefu r16
+/// item 10): lets a contention regression block another thread from taking the
+/// slot lock.
+#[cfg(test)]
+pub(crate) struct PendingSlotGuard(
+    /// Held only for its Drop (mutex release); never read.
+    #[allow(dead_code)]
+    std::sync::MutexGuard<'static, HashMap<PathBuf, std::sync::Arc<PendingLaunchBarrier>>>,
+);
+
+#[cfg(test)]
+pub(crate) fn lock_pending_launch_slot_for_test() -> PendingSlotGuard {
+    PendingSlotGuard(
+        PENDING_LAUNCH_BARRIER
+            .lock()
+            .expect("pending launch barrier"),
+    )
+}
+
+/// Test-only: whether the per-cwd barrier slot is currently empty.
+#[cfg(test)]
+pub(crate) fn pending_launch_barrier_slot_absent(cwd: &Path) -> bool {
+    PENDING_LAUNCH_BARRIER
+        .lock()
+        .expect("pending launch barrier")
+        .get(&canonical(cwd))
+        .is_none()
+}
+
 /// One parked point of [`register_pending_launch`]. A disabled stage passes
 /// straight through; an armed one marks arrival and blocks until released OR
 /// the barrier is disarmed/dropped.
@@ -676,21 +705,28 @@ impl std::ops::Deref for PendingLaunchBarrierHandle {
 #[cfg(test)]
 impl Drop for PendingLaunchBarrierHandle {
     fn drop(&mut self) {
-        // Wake every parked registration (this barrier must never park
+        // Wake every parked registration FIRST (this barrier must never park
         // anything once the caller is done with it) — this touches only the
         // barrier's own cv mutexes, never the global slot lock.
         self.0.disarm();
         // Clear the slot ONLY when it still holds this exact barrier, so a
-        // newer arm for the same cwd is never accidentally removed. try_lock:
-        // a registration thread is blocked on a condition variable (its own
-        // cv mutex), never holding the slot mutex, so this cannot deadlock.
-        if let Ok(mut slot) = PENDING_LAUNCH_BARRIER.try_lock() {
-            let still_us = slot
-                .get(&self.0.cwd)
-                .is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.0));
-            if still_us {
-                slot.remove(&self.0.cwd);
-            }
+        // newer arm for the same cwd is never accidentally removed. Take the
+        // slot lock AFTER disarming and with a BLOCKING lock (c-usagefu r16
+        // item 10), so the slot is guaranteed absent on return even under
+        // contention. This cannot deadlock: a parked registration holds the
+        // slot lock only long enough to clone the barrier Arc — it parks on
+        // the stage's own cv mutex with the slot lock released — and disarming
+        // above already released any parked thread. The old try_lock skipped
+        // removal while another thread transiently held the mutex, leaking the
+        // stale barrier into the next launch.
+        let mut slot = PENDING_LAUNCH_BARRIER
+            .lock()
+            .expect("pending launch barrier");
+        let still_us = slot
+            .get(&self.0.cwd)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.0));
+        if still_us {
+            slot.remove(&self.0.cwd);
         }
     }
 }

@@ -18,10 +18,12 @@ import {
   buildHomeGroups,
   buildHomeRows,
   homeError,
+  homeTurnError,
   homeRowsSignature,
   readHomeOrder,
   writeHomeOrder,
 } from "./homeRows";
+import { mapInstance } from "../../lib/api";
 
 /**
  * Fixtures: the mock's first instance is a connected claude-print session
@@ -217,20 +219,67 @@ describe("buildHomeGroups body text", () => {
     expect(row.bodyDetail).toBeNull();
   });
 
-  it("falls back to the latest native severity=error lifecycle event when lastError is absent", () => {
+  it("falls back to the latest non-turn severity=error lifecycle event when lastError is absent", () => {
     const instance = session("ins-event-error", { lifecycle: "running", activity: known("idle") });
     const events = [
       {
         kind: "lifecycle",
         payload: {
           type: "native",
-          nativeName: "turn_error",
+          topic: "session",
+          nativeName: "native_exit_error",
           severity: "error",
           status: { state: "known", value: "Upstream 500" },
         },
       },
     ] as unknown as Observation[];
     expect(homeError(instance, events)).toBe("Upstream 500");
+  });
+
+  it("(OA6) shows lastTurnError on a live row as a non-failure and ignores turn-result lastError as a process error", () => {
+    // A settled turn error: the durable marker carries the text; the row is
+    // idle/running and must NOT read as a process failure (bodyIsError false).
+    const groups = build(
+      named([
+        session("ins-turn-error", {
+          lifecycle: "running",
+          activity: known("idle"),
+          lastTurnError: { at: "2026-10-06T00:00:00Z", text: "API Error: 429" },
+        }),
+      ]),
+    );
+    const row = groups[0].rows[0];
+    expect(row.status).toBe("idle");
+    expect(row.body).toBe("API Error: 429");
+    expect(row.bodyIsError, "a retryable turn error is not a red process failure").toBe(false);
+
+    // A severity-info topic=turn result with a lastError related id is NOT a
+    // process error in the homeError fallback.
+    const instance = session("ins-turn-info", { lifecycle: "running", activity: known("idle") });
+    const events = [
+      {
+        kind: "lifecycle",
+        payload: {
+          type: "native",
+          topic: "turn",
+          nativeName: "result",
+          severity: "info",
+          status: { state: "known", value: "error" },
+          relatedIds: { lastError: "API Error: 429 turn", settledRootTurn: "true" },
+        },
+      },
+    ] as unknown as Observation[];
+    expect(homeError(instance, events)).toBeNull();
+    // And it must not outlive the marker once the next turn clears it.
+    const cleared = build(
+      named([
+        session("ins-turn-cleared", {
+          lifecycle: "running",
+          activity: known("working"),
+        }),
+      ]),
+    );
+    expect(cleared[0].rows[0].bodyIsError).toBe(false);
   });
 
   it("keeps 状态待确认 for disconnected/unknown rows even when an error text exists", () => {
@@ -249,6 +298,78 @@ describe("buildHomeGroups body text", () => {
       expect(body).toBe("状态待确认 · 不推断成功或结束");
       expect(body).not.toMatch(/运行中|API Error/);
     }
+  });
+
+  it("(r9 item 6) consumes the Hub's real settled-error and next-turn-cleared goldens (contract)", async () => {
+    // Two goldens produced by the Hub store contract test
+    // (crates/remuda-hub/tests/turn_error_contract.rs) through the production
+    // append/fold path: (1) the InstanceRecord after a settled turn API error,
+    // (2) the SAME record after the next turn start clears the marker. Parsed
+    // as the WIRE InstanceRecord schema and mapped via mapInstance, so breaking
+    // Hub persistence, the clearing branch, serialization, or the mapping fails
+    // here.
+    const erroredRaw = (await import("./__fixtures__/last-turn-error-instance.json", {
+      with: { type: "json" },
+    })) as unknown as Parameters<typeof mapInstance>[0];
+    const clearedRaw = (await import("./__fixtures__/last-turn-error-cleared-instance.json", {
+      with: { type: "json" },
+    })) as unknown as Parameters<typeof mapInstance>[0];
+
+    // 1) Settled error: marker survives the wire→UI mapping and surfaces as a
+    // non-red idle status.
+    const errored = mapInstance(erroredRaw);
+    expect(errored.lastTurnError?.text).toBe("API Error: 429 no eligible upstream");
+    const erroredRow = build(named([errored]))[0].rows[0];
+    expect(erroredRow.status).toBe("idle");
+    expect(erroredRow.body).toBe("API Error: 429 no eligible upstream");
+    expect(erroredRow.bodyIsError, "durable turn error on a live process is not red").toBe(false);
+
+    // 2) Next turn start (real Hub clearing branch): the golden carries NO
+    // marker and is back to working, so no turn-error body.
+    const cleared = mapInstance(clearedRaw);
+    expect(homeTurnError(cleared)).toBeNull();
+    const clearedRow = build(named([cleared]))[0].rows[0];
+    expect(clearedRow.status).toBe("working");
+    expect(clearedRow.bodyIsError).toBe(false);
+  });
+
+  it("(r3 item 8) unknown connectivity wins over a durable lastTurnError: disconnect and reconcile", () => {
+    // An instance that carries a settled turn error disconnects: the row must
+    // show the unknown-connectivity sentence, not the turn error text.
+    const disconnected = session("ins-turn-disconnected", {
+      lifecycle: "running",
+      connectivity: "disconnected",
+      activity: known("idle"),
+      lastTurnError: { at: "2026-10-06T00:00:00Z", text: "API Error: 429" },
+    });
+    // The reconnect reconcile state projects to the same unknown status.
+    // During reconcile connectivity is "reconciling" (projectStatus unknown).
+    const reconciling = session("ins-turn-reconciling", {
+      lifecycle: "reconciling",
+      connectivity: "reconciling",
+      activity: known("idle"),
+      lastTurnError: { at: "2026-10-06T00:00:00Z", text: "API Error: 500" },
+    });
+    const groups = build(named([disconnected, reconciling]));
+    for (const row of groups[0].rows) {
+      expect(row.status).toBe("unknown");
+      expect(row.body).toBe("状态待确认 · 不推断成功或结束");
+      expect(row.body).not.toContain("API Error");
+      expect(row.bodyIsError).toBe(false);
+    }
+
+    // After reconnect reconciles (connected again), the marker shows again.
+    const reconnected = build(
+      named([
+        session("ins-turn-reconciling", {
+          lifecycle: "running",
+          connectivity: "connected",
+          activity: known("idle"),
+          lastTurnError: { at: "2026-10-06T00:00:00Z", text: "API Error: 500" },
+        }),
+      ]),
+    );
+    expect(reconnected[0].rows[0].body).toBe("API Error: 500");
   });
 
   it("advertises 恢复 only on exited rows whose resume capability is supported", () => {

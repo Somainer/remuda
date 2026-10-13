@@ -123,6 +123,13 @@ impl RunHandle {
         self.events.recv().await
     }
 
+    /// Take the next observation if one is already buffered, without waiting.
+    /// Returns `None` when the buffer is empty OR the stream has closed (the
+    /// two are indistinguishable by design; callers that care use [`recv`]).
+    pub fn try_recv(&mut self) -> Option<Observation> {
+        self.events.try_recv().ok()
+    }
+
     /// Take the raw receiver.
     pub fn into_events(self) -> mpsc::Receiver<Observation> {
         self.events

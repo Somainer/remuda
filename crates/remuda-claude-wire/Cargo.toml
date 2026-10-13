@@ -21,3 +21,9 @@ uuid.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
+
+[features]
+default = []
+# Test seams: deterministic park points inside the writer task (ma-sdk-state
+# r9 item 3). Only enabled by driver integration tests.
+test-stub = []

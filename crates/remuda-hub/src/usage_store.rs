@@ -980,13 +980,30 @@ pub enum BudgetStatus {
 /// several native-session lineages proving one message id never double-count
 /// the turn (c-ctxusage r16 item 3); every other row (session growth points,
 /// legacy NULL-scope events) is summed as before.
+/// Aggregate all persisted events for one instance.
+///
+/// Turn rows fold to one winner per scope id; cumulative SESSION snapshots
+/// fold to their LATEST accepted stock per session (c-ctxusage r22 item 2),
+/// never a sum of snapshots. A per-turn flow is included only when no session
+/// stock covers its native session — emitters like Codex send BOTH per turn and
+/// a cumulative session snapshot that already contains the turn's totals, so
+/// adding the turn on top would double count.
 pub fn aggregate_instance(
     conn: &Connection,
     instance_id: &str,
 ) -> rusqlite::Result<UsageAggregate> {
     conn.query_row(
         &format!(
-            "SELECT COUNT(*),
+            "WITH winning_sessions AS ({WINNING_SESSION_ROWS_SQL}),
+                 covered_turns AS (
+                     SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                     FROM ({WINNING_TURN_ROWS_SQL}) t
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM winning_sessions s
+                         WHERE {TURN_COVERED_BY_SESSION_SQL}
+                     )
+                 )
+             SELECT COUNT(*),
                     CASE WHEN COUNT(*) = COUNT(total_tokens)
                          THEN SUM(total_tokens) END,
                     CASE WHEN COUNT(*) = COUNT(input_tokens)
@@ -997,11 +1014,14 @@ pub fn aggregate_instance(
                          THEN SUM(CAST(cost_usd AS REAL)) END
              FROM (
                  SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM ({WINNING_TURN_ROWS_SQL})
+                 FROM winning_sessions
+                 UNION ALL
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM covered_turns
                  UNION ALL
                  SELECT total_tokens, input_tokens, output_tokens, cost_usd
                  FROM usage_events
-                 WHERE instance_id = ?1 AND scope <> 'turn'
+                 WHERE instance_id = ?1 AND scope NOT IN ('turn', 'session')
              )"
         ),
         params![instance_id],
@@ -1034,25 +1054,50 @@ pub fn aggregate_supply(
     model: &str,
 ) -> rusqlite::Result<UsageAggregate> {
     conn.query_row(
-        "WITH winning_turns AS (
+        "WITH winning_sessions AS (
             SELECT total_tokens, input_tokens, output_tokens, cost_usd,
-                   profile_id, model FROM (
+                   scope_id, profile_id, model FROM (
                 SELECT total_tokens, input_tokens, output_tokens, cost_usd,
-                       profile_id, model,
+                       scope_id, profile_id, model,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY instance_id, scope_id
+                           ORDER BY seq DESC, rowid DESC
+                       ) AS rn
+                FROM usage_events
+                WHERE scope = 'session' AND scope_id IS NOT NULL
+            ) WHERE rn = 1
+              AND profile_id = ?1 AND model = ?2
+            UNION ALL
+            SELECT total_tokens, input_tokens, output_tokens, cost_usd,
+                   scope_id, profile_id, model
+            FROM usage_events
+            WHERE scope = 'session' AND scope_id IS NULL
+              AND profile_id = ?1 AND model = ?2
+         ),
+         winning_turns AS (
+            SELECT total_tokens, input_tokens, output_tokens, cost_usd FROM (
+                SELECT total_tokens, input_tokens, output_tokens, cost_usd,
+                       source_session_id, profile_id, model,
                        ROW_NUMBER() OVER (
                            PARTITION BY instance_id, scope_id
                            ORDER BY seq DESC, rowid DESC
                        ) AS rn
                 FROM usage_events
                 WHERE scope = 'turn' AND scope_id IS NOT NULL
-            ) WHERE rn = 1
+            ) t WHERE rn = 1
               AND profile_id = ?1 AND model = ?2
+              AND NOT EXISTS (
+                  SELECT 1 FROM winning_sessions s
+                  WHERE s.scope_id IS NOT NULL AND t.source_session_id = s.scope_id
+              )
             UNION ALL
-            SELECT total_tokens, input_tokens, output_tokens, cost_usd,
-                   profile_id, model
-            FROM usage_events
-            WHERE scope = 'turn' AND scope_id IS NULL
+            SELECT total_tokens, input_tokens, output_tokens, cost_usd
+            FROM usage_events t
+            WHERE scope = 'turn' AND t.scope_id IS NULL
               AND profile_id = ?1 AND model = ?2
+              AND NOT EXISTS (
+                  SELECT 1 FROM winning_sessions s WHERE s.scope_id IS NULL
+              )
          )
          SELECT COUNT(*),
                 CASE WHEN COUNT(*) = COUNT(total_tokens)
@@ -1065,11 +1110,14 @@ pub fn aggregate_supply(
                      THEN SUM(CAST(cost_usd AS REAL)) END
          FROM (
              SELECT total_tokens, input_tokens, output_tokens, cost_usd
+             FROM winning_sessions
+             UNION ALL
+             SELECT total_tokens, input_tokens, output_tokens, cost_usd
              FROM winning_turns
              UNION ALL
              SELECT total_tokens, input_tokens, output_tokens, cost_usd
              FROM usage_events
-             WHERE profile_id = ?1 AND model = ?2 AND scope <> 'turn'
+             WHERE profile_id = ?1 AND model = ?2 AND scope NOT IN ('turn', 'session')
          )",
         params![profile_id, model],
         |row| {
@@ -1185,6 +1233,35 @@ const WINNING_TURN_ROWS_SQL: &str = "SELECT * FROM (
      SELECT *, NULL AS turn_lineage_rn
      FROM usage_events
      WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NULL";
+
+/// Winning cumulative-session STOCK per session scope id, folded the same way
+/// as turns (c-ctxusage r22 item 2): one latest accepted row per scope id
+/// across native-session lineages, plus the legacy NULL-scope chain. Session
+/// rows are cumulative, so an aggregate takes the LATEST stock rather than
+/// summing every snapshot. Binds `?1` to the instance id.
+const WINNING_SESSION_ROWS_SQL: &str = "SELECT * FROM (
+        SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY scope_id ORDER BY seq DESC, rowid DESC
+        ) AS session_lineage_rn
+        FROM usage_events
+        WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NOT NULL
+     ) WHERE session_lineage_rn = 1
+     UNION ALL
+     SELECT *, NULL AS session_lineage_rn
+     FROM usage_events
+     WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NULL";
+
+/// True when a turn row is already represented by a winning cumulative-session
+/// stock for the SAME native session (matched on the turn's
+/// `source_session_id` and the stock's session `scope_id`, with NULL matching
+/// the legacy NULL-scope chain). Used to drop per-turn flows an emitter (Codex)
+/// sends ALONGSIDE its cumulative session snapshot (c-ctxusage r22 item 2).
+const TURN_COVERED_BY_SESSION_SQL: &str = "(
+            t.source_session_id IS NOT NULL
+                AND s.scope_id IS NOT NULL
+                AND t.source_session_id = s.scope_id
+            OR t.source_session_id IS NULL AND s.scope_id IS NULL
+        )";
 
 /// Sum the per-call (scope='turn') token flow within a rate window. Session
 /// snapshots are a CUMULATIVE STOCK replaced in place, never a per-window flow,
@@ -2377,6 +2454,119 @@ mod tests {
         assert_eq!(rollup.tpm_out_60s, None);
         assert_eq!(rollup.tpm_in_5m, None);
         assert_eq!(rollup.tpm_out_5m, None);
+    }
+
+    /// c-ctxusage r22 item 2: cumulative SESSION snapshots fold to the LATEST
+    /// accepted stock — 100 then 200 is 200, one event, never 300.
+    #[test]
+    fn successive_session_snapshots_fold_to_the_latest_stock() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let session_row = |seq: i64, revision: i64, input: i64, output: i64| UsageEventRow {
+            instance_id: "ins_stock".into(),
+            seq,
+            profile_id: Some("pvp".into()),
+            model: Some("m".into()),
+            scope: "session".into(),
+            scope_id: Some("sess-1".into()),
+            mode: "snapshot".into(),
+            metric_revision: revision,
+            source_session_id: Some("sess-1".into()),
+            total_tokens: Some(input + output),
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: None,
+            accounting: "estimated".into(),
+            observed_at: "2026-10-13T00:00:00.000Z".into(),
+            observed_at_source: "native".into(),
+        };
+        assert!(insert_usage_event(&conn, &session_row(1, 1, 100, 0)).unwrap());
+        assert!(insert_usage_event(&conn, &session_row(2, 2, 200, 0)).unwrap());
+
+        let agg = aggregate_instance(&conn, "ins_stock").unwrap();
+        assert_eq!(agg.events, 1, "one latest stock, not two snapshots");
+        assert_eq!(
+            agg.total_tokens,
+            Some(200),
+            "latest cumulative stock, not 300"
+        );
+        assert_eq!(agg.input_tokens, Some(200));
+
+        let supply = aggregate_supply(&conn, "pvp", "m").unwrap();
+        assert_eq!(supply.events, 1);
+        assert_eq!(supply.total_tokens, Some(200));
+    }
+
+    /// c-ctxusage r22 item 2: when an emitter (Codex) sends BOTH per-turn flows
+    /// and a cumulative session snapshot that already contains them, the
+    /// aggregate counts the STOCK once and drops the covered turns; turns of a
+    /// session with no stock are still summed.
+    #[test]
+    fn mixed_turn_and_session_emissions_count_the_stock_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let row = |seq: i64,
+                   scope: &str,
+                   scope_id: &str,
+                   lineage: Option<&str>,
+                   input: i64,
+                   output: i64| {
+            UsageEventRow {
+                instance_id: "ins_mix".into(),
+                seq,
+                profile_id: Some("pvp".into()),
+                model: Some("m".into()),
+                scope: scope.into(),
+                scope_id: Some(scope_id.into()),
+                mode: "snapshot".into(),
+                metric_revision: 1,
+                source_session_id: lineage.map(str::to_string),
+                total_tokens: Some(input + output),
+                input_tokens: Some(input),
+                output_tokens: Some(output),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                cost_usd: None,
+                accounting: "estimated".into(),
+                observed_at: "2026-10-13T00:00:00.000Z".into(),
+                observed_at_source: "native".into(),
+            }
+        };
+        // Session "covered" emits a per-turn flow AND a cumulative stock that
+        // already contains it (the Codex shape): 100/10 turn + 100/10 stock.
+        assert!(
+            insert_usage_event(&conn, &row(1, "turn", "msg-1", Some("covered"), 100, 10),).unwrap()
+        );
+        assert!(
+            insert_usage_event(
+                &conn,
+                &row(2, "session", "covered", Some("covered"), 100, 10)
+            )
+            .unwrap()
+        );
+        // A second session emits ONLY a turn (no stock): its flow must count.
+        assert!(
+            insert_usage_event(&conn, &row(3, "turn", "msg-2", Some("uncovered"), 7, 1)).unwrap()
+        );
+
+        let agg = aggregate_instance(&conn, "ins_mix").unwrap();
+        assert_eq!(
+            agg.events, 2,
+            "the covered stock (1) + the uncovered turn (1); the covered turn is dropped"
+        );
+        assert_eq!(
+            agg.total_tokens,
+            Some(118),
+            "100+10 stock plus 7+1 turn, no double count"
+        );
+        assert_eq!(agg.input_tokens, Some(107));
+        assert_eq!(agg.output_tokens, Some(11));
+
+        let supply = aggregate_supply(&conn, "pvp", "m").unwrap();
+        assert_eq!(supply.events, 2);
+        assert_eq!(supply.total_tokens, Some(118));
     }
 
     /// U1 (c-ctxusage r17 item 6), turn context basket: the newest call's

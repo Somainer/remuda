@@ -6043,3 +6043,65 @@ it("GATE33 item 1: every session mutation (logout) bumps the auth generation and
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE33 item 2: an Outbox initializer whose auth generation goes stale before it finishes installs NO box and flushes NOTHING; the new identity gets a fresh outbox", async () => {
+  // Start ensureOutbox with a gate holding the storage-open, change identity
+  // (helper bumps gen + invalidates) before release, then let the old
+  // initializer finish: it must dispose its box, leave this.outbox null and
+  // not flush. A fresh ensureOutbox under the current gen installs a new box.
+  vi.useFakeTimers();
+  vi.setSystemTime(1_110_000);
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 200) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g33_2");
+    const { hubStore } = await fresh();
+    const h = hubStore as unknown as {
+      outbox: { lifetime: string } | null;
+      outboxInit: Promise<boolean> | null;
+      authGenForTest: number;
+      setOutboxOpenGateForTest: (g: ((r: () => void) => void) | null) => void;
+      applyAuthIdentityChangeForTest: () => void;
+      ensureOutbox: () => Promise<boolean>;
+      flushAllOutbox: () => Promise<void>;
+    };
+
+    // Gate the FIRST initializer before its storage-open resolves.
+    let releaseOld: () => void = () => undefined;
+    h.setOutboxOpenGateForTest((resolve) => {
+      releaseOld = resolve;
+    });
+    const firstInit = h.ensureOutbox();
+    await pump(50);
+    expect(h.outbox).toBeNull(); // still opening
+
+    // Identity changes while the initializer is in flight: gen bumps, the
+    // pending init is invalidated (outboxInit cleared).
+    h.applyAuthIdentityChangeForTest();
+    const genAfter = h.authGenForTest;
+    expect(h.outboxInit).toBeNull();
+
+    // Let the obsolete initializer finish: it must install nothing.
+    releaseOld();
+    await expect(firstInit).resolves.toBe(false);
+    await pump(100);
+    expect(h.outbox).toBeNull();
+
+    // The CURRENT identity's initializer (no gate) installs a fresh outbox.
+    h.setOutboxOpenGateForTest(null);
+    const ok = await h.ensureOutbox();
+    expect(ok).toBe(true);
+    expect(h.outbox).not.toBeNull();
+    expect(h.authGenForTest).toBe(genAfter);
+    // It is a live, usable outbox (a flush runs without throwing).
+    await h.flushAllOutbox();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

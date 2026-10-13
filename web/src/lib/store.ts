@@ -1239,14 +1239,32 @@ class HubStore {
     if (this.outbox) return Promise.resolve(true);
     if (this.outboxInit) return this.outboxInit;
     this.registerPeerAuthWatch();
+    // Capture the auth generation this initializer starts under (gate 33
+    // item 2). It may complete after an auth change bumped authGen; in that
+    // case it must not install the box it built nor run its post-load flush.
+    const gen = this.authGen;
+    const obsolete = () => gen !== this.authGen;
     this.outboxInit = (async () => {
       try {
+        // Test gate: hold the initializer mid-open so a test can change auth
+        // identity before completion (gate 33 item 2).
         if (this.outboxOpenGateForTest) {
           await new Promise<void>((resolve) => this.outboxOpenGateForTest?.(resolve));
         }
         const opened = await openOutboxStorage();
+        // Auth changed while the storage backend was opening: discard
+        // everything without touching current state.
+        if (obsolete() || !this.outboxInit) {
+          return false;
+        }
         this.outboxDegraded = opened.degraded;
         const box = await Outbox.load(opened.storage);
+        if (obsolete() || !this.outboxInit) {
+          // Another identity won: dispose the box we just built and leave the
+          // current outbox (if a newer initializer installed one) untouched.
+          box.dispose();
+          return false;
+        }
         this.outbox = box;
         this.outboxUnsubscribe = box.subscribe(() => this.emit({ outboxPending: box.pendingCount() }));
         // Gate 11 item 5: a tracked lease-expiry wakeup inside Outbox reclaims
@@ -1279,9 +1297,10 @@ class HubStore {
         // Rows left inflight by a closed tab are due immediately — but never
         // from an initializer whose identity is already obsolete (it may have
         // been superseded by a newer one that owns the flush).
-        void this.flushAllOutbox();
+        if (!obsolete() && this.outbox === box) void this.flushAllOutbox();
         return true;
       } catch {
+        if (obsolete()) return false;
         this.outboxDegraded = true;
         return false;
       }

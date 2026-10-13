@@ -235,20 +235,31 @@ impl UsageWaiter {
                 match kq.kevent(&[], std::slice::from_mut(&mut event), Some(timeout)) {
                     Ok(0) => return false, // deadline reached
                     Ok(_) => {
-                        // A deleted/revoked -wal vnode is dead: drop the held
-                        // descriptor (which disarms its knote) so the
-                        // replacement vnode gets a fresh watch below.
+                        // c-ctxusage r18 item 4: a checkpoint/WAL restart
+                        // UNLINKS hub.sqlite-wal (NOTE_DELETE) or RENAMES it
+                        // (NOTE_RENAME); macOS later marks the reclaimed vnode
+                        // NOTE_REVOKE. ANY of those death flags means this
+                        // knote watches a dead vnode — drop the held
+                        // descriptor (close disarms the knote: one fd per -wal
+                        // incarnation, no leak) so the REPLACEMENT vnode gets a
+                        // fresh watch. The old check used contains(A|B), which
+                        // required BOTH NOTE_DELETE and NOTE_REVOKE, so an
+                        // ordinary unlink (NOTE_DELETE alone) left the dead
+                        // knote armed forever and the new -wal unwatched.
                         if let Some(file) = wal_file.as_ref()
                             && event.ident() == file.as_raw_fd() as usize
-                            && (event
-                                .fflags()
-                                .contains(FilterFlag::NOTE_DELETE | FilterFlag::NOTE_REVOKE))
+                            && wal_vnode_died(event.fflags())
                         {
                             wal_file = None;
                         }
-                        // Arm a -wal that appeared after spawn. While the
-                        // existing watch is held this is skipped, so no
-                        // descriptor changes hands on a steady-state wake.
+                        // Re-arm the -wal whenever the watch is not held. This
+                        // runs on BOTH the death wake above AND the directory
+                        // NOTE_WRITE that announces the new -wal's creation:
+                        // the immediate post-unlink arm usually opens nothing
+                        // (the replacement is created lazily on the next
+                        // transaction), and the directory event re-attempts it.
+                        // A steady-state write wake finds the watch held and
+                        // skips the arm, so descriptors never churn or leak.
                         if wal_file.is_none() {
                             wal_file = arm(
                                 &wal_path,
@@ -296,6 +307,26 @@ impl UsageWaiter {
     fn join(self) -> bool {
         self.0.join().unwrap_or(false)
     }
+}
+
+/// Whether a watched `-wal` vnode is DEAD and must be disarmed/re-armed
+/// against its replacement (c-ctxusage r18 item 4).
+///
+/// macOS unlink delivers NOTE_DELETE, a checkpoint rename NOTE_RENAME, and a
+/// later vnode reclaim NOTE_REVOKE — each possibly on its own, so the test is
+/// INTERSECTION (any death flag), not equality. The old `contains(DELETE |
+/// REVOKE)` required BOTH and therefore missed an ordinary WAL-restart
+/// unlink, leaving the replacement `-wal` unwatched.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+fn wal_vnode_died(fflags: nix::sys::event::FilterFlag) -> bool {
+    use nix::sys::event::FilterFlag;
+    fflags.intersects(FilterFlag::NOTE_DELETE | FilterFlag::NOTE_RENAME | FilterFlag::NOTE_REVOKE)
 }
 
 fn turn_row_exists(conn: &rusqlite::Connection, instance_id: &str) -> bool {
@@ -630,4 +661,52 @@ async fn a_native_shell_pty_claude_session_reports_a_usage_rollup() {
     // Guaranteed cleanup runs whether the assertions passed or failed.
     cleanup.await;
     checks.expect("usage rollup assertions");
+}
+
+/// Unit coverage for the kqueue `-wal` death predicate (c-ctxusage r18
+/// item 4). Compiled on the BSD/macOS targets where nix's kqueue flags
+/// exist; the Linux box cross-checks the same boolean combinator in the
+/// scratch bitflags harness.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+#[cfg(test)]
+mod kqueue_wal_death_tests {
+    use super::wal_vnode_died;
+    use nix::sys::event::FilterFlag;
+
+    #[test]
+    fn a_plain_note_delete_is_a_wal_death() {
+        assert!(wal_vnode_died(FilterFlag::NOTE_DELETE));
+    }
+
+    #[test]
+    fn a_plain_note_rename_is_a_wal_death() {
+        assert!(wal_vnode_died(FilterFlag::NOTE_RENAME));
+    }
+
+    #[test]
+    fn a_note_revoke_is_a_wal_death() {
+        assert!(wal_vnode_died(FilterFlag::NOTE_REVOKE));
+    }
+
+    #[test]
+    fn ordinary_write_or_extend_is_not_a_death() {
+        assert!(!wal_vnode_died(FilterFlag::NOTE_WRITE));
+        assert!(!wal_vnode_died(FilterFlag::NOTE_EXTEND));
+        assert!(!wal_vnode_died(
+            FilterFlag::NOTE_WRITE | FilterFlag::NOTE_EXTEND
+        ));
+    }
+
+    #[test]
+    fn write_combined_with_delete_still_dies() {
+        assert!(wal_vnode_died(
+            FilterFlag::NOTE_WRITE | FilterFlag::NOTE_DELETE
+        ));
+    }
 }

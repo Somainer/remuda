@@ -612,6 +612,37 @@ impl RunningHub {
         self.state.nodes.generation_of(host_id).await
     }
 
+    /// Test helper: park a Landing row in the outcome-unknown state exactly
+    /// like the expired-recovery path (flag + reason), without waiting out the
+    /// real recovery window.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_mark_landing_unknown(
+        &self,
+        job_id: &str,
+        note: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        use remuda_protocol::GateJobState;
+        let note = note.to_owned();
+        let store = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let updated = store
+            .mutate_gate_job(job_id, move |row| {
+                if row.state != GateJobState::Landing {
+                    return None;
+                }
+                if !row.landing_outcome_unknown {
+                    row.landing_outcome_unknown = true;
+                    row.reason = Some(note.clone());
+                }
+                Some(())
+            })
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("job is not Landing"))?;
+        Ok(serde_json::to_value(updated).expect("gate job serializes"))
+    }
+
     /// Test helper: this Hub process's boot epoch.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-faults"))]

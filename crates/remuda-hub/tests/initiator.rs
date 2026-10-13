@@ -173,6 +173,7 @@ async fn service_inbound(
     pending: &tokio::sync::Mutex<HashSet<String>>,
     holds: &std::sync::Mutex<HashMap<String, ReplyHold>>,
     gate_run: &tokio::sync::Mutex<Option<Arc<GateRunHook>>>,
+    resolve: &tokio::sync::Mutex<Option<Value>>,
     frame: Value,
 ) {
     /// Send one JSON frame through the shared sink.
@@ -259,6 +260,14 @@ async fn service_inbound(
             "authorized": true,
             "generation": frame["params"]["generation"].clone(),
         }),
+        // r15 item 4: scriptable read-only Landing probe reply.
+        "gate.resolveLanding" => {
+            if let Some(reply) = resolve.lock().await.take() {
+                reply
+            } else {
+                json!({"jobId": frame["params"]["jobId"], "status": "unknown"})
+            }
+        }
         "worker.provision" => json!({
             "name": frame["params"]["name"].clone(),
             "branch": "wt/x/work",
@@ -289,6 +298,8 @@ struct FakeNode {
     holds: Arc<std::sync::Mutex<HashMap<String, ReplyHold>>>,
     /// Scripted parkable gate.run reply (one job at a time).
     gate_run: Arc<tokio::sync::Mutex<Option<Arc<GateRunHook>>>>,
+    /// Scripted gate.resolveLanding reply (r15 item 4).
+    resolve: Arc<tokio::sync::Mutex<Option<Value>>>,
     /// Verbatim node→Hub frames (e.g. a `gate.event` finished notification).
     raw: mpsc::UnboundedSender<RawFrame>,
 }
@@ -361,6 +372,9 @@ impl FakeNode {
         let gate_run: Arc<tokio::sync::Mutex<Option<Arc<GateRunHook>>>> =
             Arc::new(tokio::sync::Mutex::new(None));
         let gate_run_task = gate_run.clone();
+        let resolve: Arc<tokio::sync::Mutex<Option<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let resolve_task = resolve.clone();
         let (raw_tx, mut raw_rx): (
             mpsc::UnboundedSender<RawFrame>,
             mpsc::UnboundedReceiver<RawFrame>,
@@ -439,6 +453,7 @@ impl FakeNode {
                                         &answered_task,
                                         &holds_task,
                                         &gate_run_task,
+                                        &resolve_task,
                                         fr,
                                     )
                                     .await;
@@ -458,6 +473,7 @@ impl FakeNode {
                                     &answered_task,
                                     &holds_task,
                                     &gate_run_task,
+                                    &resolve_task,
                                     frame,
                                 )
                                 .await;
@@ -477,6 +493,7 @@ impl FakeNode {
                 pending: pending.clone(),
                 holds,
                 gate_run,
+                resolve,
                 raw: raw_tx,
             },
             hello["result"]["nodeToken"]
@@ -610,6 +627,11 @@ impl FakeNode {
     /// notification).
     fn send_raw(&self, frame: Value) {
         self.raw.send(frame).expect("raw frame channel");
+    }
+
+    /// Script the next `gate.resolveLanding` reply (r15 item 4).
+    async fn set_resolve_reply(&self, reply: Value) {
+        *self.resolve.lock().await = Some(reply);
     }
 
     /// Pop the next inbound `(method, params)` the Hub asked the Node to run.
@@ -3969,4 +3991,220 @@ async fn landing_evidence_and_probe_writers_validate_host_and_session_at_commit(
         .expect("the granted tuple probe settles");
     assert_eq!(settled["state"], json!("landed"), "{settled}");
     let _ = committed;
+}
+
+/// Shared setup for the r15 item 4 suite: a Landing parked outcome-unknown with
+/// a known granted (attempt, epoch, merge) tuple on the live fake carrier.
+async fn unknown_landing_fixture(ctx: &Ctx, node: &FakeNode) -> (String, String, u64, String) {
+    let job_id = queued_land_job(ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let session = ctx
+        .hub
+        .test_node_session(&ctx.host)
+        .await
+        .expect("carrier live");
+    let merge = "cccccccccccccccccccccccccccccccccccccccc";
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge, session)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+    let unknown = ctx
+        .hub
+        .test_mark_landing_unknown(&job_id, "the granted push was not confirmed ...")
+        .await
+        .unwrap();
+    assert_eq!(unknown["state"], json!("landing"));
+    // Keep the fake carrier connected (it owns `node`); ensure no stale probe
+    // answer is queued.
+    node.set_resolve_reply(json!({
+        "jobId": job_id, "status": "unknown",
+        "baseSha": null, "error": "test: no remote evidence"
+    }))
+    .await;
+    let epoch = unknown["landingSessionEpoch"]
+        .as_str()
+        .expect("grant epoch stamped")
+        .to_owned();
+    (job_id, merge.to_owned(), session, epoch)
+}
+
+/// r15 item 4: an AGENT caller (even one holding the land grant) cannot resolve
+/// an unknown Landing — the endpoint is operator-only and refuses 403.
+#[tokio::test]
+async fn an_agent_caller_cannot_resolve_an_unknown_landing() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let (job_id, merge, _session, epoch) = unknown_landing_fixture(&ctx, &node).await;
+    let body = json!({
+        "resolution": "failed",
+        "expectedAttempts": 1,
+        "expectedSessionEpoch": epoch,
+        "expectedMergeSha": merge,
+        "rationale": "agent must not be able to discard a landing",
+    });
+    let (status, reply) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate/jobs/{job_id}/resolve", ctx.project),
+            body,
+        )
+        .await;
+    assert_eq!(status, 403, "an agent caller must be refused: {reply}");
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("landing"),
+        "the row is untouched: {doc}"
+    );
+    assert_eq!(doc["landingOutcomeUnknown"], json!(true), "{doc}");
+}
+
+/// r15 item 4: the operator resolution must name the exact live granted tuple;
+/// a paused frame against a newer/other attempt, a missing epoch/merge, or an
+/// empty rationale is refused without touching the row. The exact tuple
+/// settles.
+#[tokio::test]
+async fn an_operator_resolution_validates_its_expected_tuple_and_rationale() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let (job_id, merge, _session, good_epoch) = unknown_landing_fixture(&ctx, &node).await;
+    let path = format!("/v1/projects/{}/gate/jobs/{job_id}/resolve", ctx.project);
+
+    // Empty rationale -> 400.
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 1,
+                "expectedSessionEpoch": good_epoch,
+                "expectedMergeSha": merge,
+                "rationale": "   ",
+            })),
+        )
+        .await;
+    assert_eq!(status, 400, "{reply}");
+
+    // Tuple naming a NEWER attempt (a paused frame after a re-dispatch) -> 409.
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 7,
+                "expectedSessionEpoch": good_epoch,
+                "expectedMergeSha": merge,
+                "rationale": "paused stale resolution",
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, 409,
+        "a newer/other attempt must be refused: {reply}"
+    );
+
+    // Wrong epoch and wrong merge -> 409.
+    for body in [
+        json!({
+            "resolution": "failed", "expectedAttempts": 1,
+            "expectedSessionEpoch": "epoch:totally-different",
+            "expectedMergeSha": merge, "rationale": "wrong epoch",
+        }),
+        json!({
+            "resolution": "failed", "expectedAttempts": 1,
+            "expectedSessionEpoch": good_epoch,
+            "expectedMergeSha": "dddddddddddddddddddddddddddddddddddddddd",
+            "rationale": "wrong merge",
+        }),
+    ] {
+        let (status, reply) = ctx.send("POST", &path, &ctx.human, None, Some(body)).await;
+        assert_eq!(status, 409, "{reply}");
+    }
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("landing"),
+        "refused resolutions never settle: {doc}"
+    );
+
+    // The exact live tuple, by the operator, with a rationale settles Failed.
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 1,
+                "expectedSessionEpoch": good_epoch,
+                "expectedMergeSha": merge,
+                "rationale": "operator verified the push is absent on origin out of band",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["state"], json!("failed"), "{reply}");
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("absent on origin out of band"),
+        "the rationale is persisted on the row: {reply}"
+    );
+}
+
+/// r15 item 4: a final read-only probe that ESTABLISHES the exact granted merge
+/// on the remote wins over the operator's "failed" resolution: the response is
+/// `landed`, never failed, and no operator failure is recorded.
+#[tokio::test]
+async fn an_established_landed_probe_wins_over_an_operator_failed_resolution() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let (job_id, merge, _session, epoch) = unknown_landing_fixture(&ctx, &node).await;
+    // The lane's read-only probe now answers LANDED with the exact merge.
+    node.set_resolve_reply(json!({
+        "jobId": job_id, "status": "landed",
+        "baseSha": "0123456789abcdef0123456789abcdef01234567",
+    }))
+    .await;
+    let path = format!("/v1/projects/{}/gate/jobs/{job_id}/resolve", ctx.project);
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 1,
+                "expectedSessionEpoch": epoch,
+                "expectedMergeSha": merge,
+                "rationale": "operator believed it failed",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(
+        reply["state"],
+        json!("landed"),
+        "established remote landed must win over the operator failed: {reply}"
+    );
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("landed"), "{doc}");
+    assert!(
+        !doc["error"].as_str().unwrap_or("").contains("operator"),
+        "no operator-failed error is recorded when the probe established landed: {doc}"
+    );
 }

@@ -17,7 +17,7 @@
 //! reads the evidence (evidence: docs/design/evidence/gate-log-1.md).
 
 use crate::AppState;
-use crate::agent_scope::{caller, caller_project_scope, require_grant};
+use crate::agent_scope::{caller, caller_project_scope, require_grant, require_operator};
 use crate::auth::require_origin;
 use crate::error::HubError;
 use crate::http::map_store;
@@ -613,22 +613,34 @@ async fn cancel_project_job(
     }
 }
 
-/// r14 R1 — body of the operator Landing-resolution request.
+/// r14 R1 / r15 item 4 — body of the OPERATOR Landing-resolution request.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ResolveLandingRequest {
     /// `failed` — the operator attests the push did not land; finish Failed.
     /// `requeue` — re-enter the queue for a fresh verify+land attempt.
     resolution: String,
+    /// The exact attempt ordinal the operator is resolving.
+    expected_attempts: u32,
+    /// The Running → Landing grant epoch the operator's view carried.
+    expected_session_epoch: String,
+    /// The exact granted merge sha the operator is resolving.
+    expected_merge_sha: String,
+    /// Mandatory human rationale; persisted on the row and journaled.
+    rationale: String,
 }
 
 /// `POST /v1/projects/{id}/gate/jobs/{jobId}/resolve`
 ///
-/// The explicit operator escape hatch for a Landing whose outcome cannot be
-/// established (it is parked in the outcome-unknown Landing state holding its
-/// lane). Only a row still `landing` AND marked `landingOutcomeUnknown` may be
-/// resolved this way; an established remote fact always wins over the
-/// operator. The writer records the operator's device id as the settler.
+/// The explicit OPERATOR-ONLY escape hatch for a Landing whose outcome cannot
+/// be established (it is parked in the outcome-unknown Landing state holding
+/// its lane). Agent callers are refused outright; the request must pin the
+/// exact granted (attempt, grant epoch, merge) the operator saw and carry a
+/// persisted rationale. An established remote fact always wins over the
+/// operator: with the lane carrier live, the Hub takes the same per-host
+/// authority guard the reconciler uses and makes one final read-only probe —
+/// a probe that establishes the merge on the remote settles LANDED, and the
+/// operator's failed/requeue is discarded (r15 item 4).
 async fn resolve_project_job(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -636,6 +648,9 @@ async fn resolve_project_job(
     Json(request): Json<ResolveLandingRequest>,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
+    // r15 item 4: Human/Bot operators only. An agent caller (even one holding
+    // the land grant) is not an operator and cannot discard an unknown Landing.
+    require_operator(&state, &headers).await?;
     let device = caller(&state, &headers).await?;
     let scope = caller_project_scope(&state, &device).await?;
     if !scope.allows_project(&project) {
@@ -650,6 +665,18 @@ async fn resolve_project_job(
             )));
         }
     };
+    let rationale = request.rationale.trim();
+    if rationale.is_empty() {
+        return Err(HubError::BadRequest(
+            "an operator Landing resolution requires a non-empty rationale".to_string(),
+        ));
+    }
+    if request.expected_merge_sha.trim().is_empty() || request.expected_session_epoch.is_empty() {
+        return Err(HubError::BadRequest(
+            "an operator Landing resolution must name the expected attempt, grant epoch and merge"
+                .to_string(),
+        ));
+    }
     let job = state
         .store
         .get_gate_job(&job_id)
@@ -659,27 +686,82 @@ async fn resolve_project_job(
     if job.project_id.as_id().as_str() != project {
         return Err(HubError::NotFound);
     }
-    require_grant(
-        &state,
-        &device,
-        if job.mode == GateMode::Land {
-            GrantVerb::Land
-        } else {
-            GrantVerb::Dispatch
-        },
-    )
-    .await?;
     if job.state != GateJobState::Landing || !job.landing_outcome_unknown {
         return Err(HubError::Conflict(
             "only a Landing parked with an unknown outcome accepts an operator resolution"
                 .to_string(),
         ));
     }
+    // Final read-only remote check under the per-host authority guard: an
+    // ESTABLISHED landed fact always beats the operator's failed/requeue. The
+    // guard pins the live carrier session across probe + commit exactly like
+    // the periodic reconciler (r15 item 3), so a concurrent takeover cannot
+    // make the probe land on a different session. A carrier-less host (or a
+    // home-pushed job whose group liveness is unattestable) falls through to
+    // the explicit operator decision.
+    if let Some(lane_host) = landing_lane_host(&state, &job).await {
+        let guard = state
+            .nodes
+            .host_authority(lane_host.as_id().as_str())
+            .await
+            .read_owned()
+            .await;
+        if let Some(responder_session) = state.nodes.generation_of(lane_host.as_id().as_str()).await
+        {
+            // Only authoritative for a lane-pushed job (the probe's dead-group
+            // attestation is the lane's own). The Landed fact is valid either
+            // way.
+            if matches!(
+                probe_landing_outcome(&state, &job).await,
+                LandingProbe::Landed
+            ) {
+                let grant_session = state
+                    .store
+                    .gate_job_dispatch_session(&job_id)
+                    .await
+                    .ok()
+                    .flatten();
+                let expected_session =
+                    probe_expected_session(&state, grant_session, responder_session);
+                settle_landing_landed(
+                    &state,
+                    &job,
+                    expected_session,
+                    responder_session,
+                    &lane_host,
+                )
+                .await;
+                let landed = state
+                    .store
+                    .get_gate_job(&job_id)
+                    .await
+                    .map_err(map_store)?
+                    .ok_or(HubError::NotFound)?;
+                if landed.state == GateJobState::Landed {
+                    return Ok(Json(json!(landed)));
+                }
+            }
+        }
+        drop(guard);
+    }
     let operator = device.id.clone();
+    let rationale = rationale.to_owned();
+    let expected_attempts = request.expected_attempts;
+    let expected_epoch = request.expected_session_epoch.clone();
+    let expected_merge = request.expected_merge_sha.clone();
     let outcome = state
         .store
         .mutate_gate_job(&job_id, move |row| {
             if row.state != GateJobState::Landing || !row.landing_outcome_unknown {
+                return None;
+            }
+            // r15 item 4: the writer validates the exact granted tuple the
+            // operator claims to resolve. A paused frame targeting a newer
+            // attempt (or a row whose grant/merge changed) refuses here.
+            if row.attempts != expected_attempts
+                || row.landing_session_epoch.as_deref() != Some(expected_epoch.as_str())
+                || row.merge_sha.as_deref() != Some(expected_merge.as_str())
+            {
                 return None;
             }
             row.home_land_in_flight = false;
@@ -698,22 +780,41 @@ async fn resolve_project_job(
                 row.reason = None;
                 row.log_object_id = None;
                 row.error = Some(format!(
-                    "landing outcome unknown; re-queued by explicit operator resolution ({operator})"
+                    "landing outcome unknown; re-queued by explicit operator resolution \
+                     ({operator}): {rationale}"
                 ));
             } else {
                 row.state = GateJobState::Failed;
                 row.finished_at = Some(now_ts());
                 row.error = Some(format!(
                     "landing outcome unknown after the bounded recovery window; settled failed by \
-                     explicit operator resolution ({operator})"
+                     explicit operator resolution ({operator}): {rationale}"
                 ));
-                row.reason = Some("failed; landing outcome unknown, resolved by operator".into());
+                row.reason = Some(format!(
+                    "failed; landing outcome unknown, resolved by operator: {rationale}"
+                ));
             }
             Some(())
         })
         .await
-        .map_err(map_store)?
-        .ok_or(HubError::NotFound)?;
+        .map_err(map_store)?;
+    let Some(outcome) = outcome else {
+        // Distinguish the two writer refusals for the caller.
+        let current = state
+            .store
+            .get_gate_job(&job_id)
+            .await
+            .map_err(map_store)?
+            .ok_or(HubError::NotFound)?;
+        if current.state != GateJobState::Landing || !current.landing_outcome_unknown {
+            return Err(HubError::NotFound);
+        }
+        return Err(HubError::Conflict(
+            "the live Landing is no longer the granted attempt/epoch/merge this resolution named; \
+             refresh and resolve the current attempt"
+                .to_string(),
+        ));
+    };
     if requeue {
         // Stop the granted land group BEFORE the scheduler can hand the lane
         // to the fresh attempt (an unresolved late verdict is generation-fenced).

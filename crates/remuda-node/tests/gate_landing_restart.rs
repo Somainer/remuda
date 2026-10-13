@@ -1077,12 +1077,21 @@ async fn expired_unconfirmed_landing_stays_unknown_until_operator_resolves() {
     assert_eq!(status, 409, "cancel must not settle an unknown Landing");
 
     // Resolve failed: the operator-attested terminal write frees the lane.
+    // r15 item 4: the resolution names the exact granted attempt/epoch/merge
+    // and a persisted rationale.
+    let resolve_body = json!({
+        "resolution": "failed",
+        "expectedAttempts": unknown["attempts"].as_u64().unwrap_or(1),
+        "expectedSessionEpoch": unknown["landingSessionEpoch"].as_str().unwrap_or(""),
+        "expectedMergeSha": unknown["mergeSha"].as_str().unwrap_or(""),
+        "rationale": "e2e: push confirmed absent on the remote out of band",
+    });
     let (status, resolved) = http(
         addr,
         "POST",
         &format!("/v1/projects/{project_id}/gate/jobs/{job_id}/resolve"),
         &dev_token,
-        Some(json!({"resolution": "failed"})),
+        Some(resolve_body),
     )
     .await;
     assert_eq!(status, 200, "{resolved}");

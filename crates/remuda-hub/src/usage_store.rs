@@ -1184,6 +1184,13 @@ const WINNING_TURN_ROWS_SQL: &str = "SELECT * FROM (
 /// item 3): frames of one message id replayed under different native-session
 /// lineages share the same native turn time, so the window never counts the
 /// same model call twice.
+///
+/// Ranking runs over ALL native rows per scope id BEFORE the window predicate
+/// (c-ctxusage r17 item 5): a winner accepted with a divergent per-lineage
+/// timestamp must be kept or dropped as a whole on ITS OWN observed_at.
+/// Filtering inside the ranking CTE hid the true winner when it landed
+/// outside the window and let the superseded in-window lineage's row win and
+/// be counted.
 fn sum_turn_tokens_since(
     conn: &Connection,
     instance_id: &str,
@@ -1191,16 +1198,17 @@ fn sum_turn_tokens_since(
 ) -> rusqlite::Result<(Option<i64>, Option<i64>)> {
     conn.query_row(
         "WITH ranked AS (
-            SELECT input_tokens, output_tokens,
+            SELECT input_tokens, output_tokens, observed_at,
                    ROW_NUMBER() OVER (
                        PARTITION BY scope_id ORDER BY seq DESC, rowid DESC
                    ) AS rn
             FROM usage_events
             WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NOT NULL
-              AND observed_at >= ?2 AND observed_at_source = 'native'
+              AND observed_at_source = 'native'
          ),
          window_turns AS (
-             SELECT input_tokens, output_tokens FROM ranked WHERE rn = 1
+             SELECT input_tokens, output_tokens FROM ranked
+             WHERE rn = 1 AND observed_at >= ?2
              UNION ALL
              SELECT input_tokens, output_tokens FROM usage_events
              WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NULL
@@ -2150,6 +2158,81 @@ mod tests {
             Some(((1_839 + 1_223) as f64 / 5.0).round() as i64)
         );
         assert_eq!(rollup.tpm_out_5m, Some(66));
+    }
+
+    /// c-ctxusage r17 item 5: the per-lineage winner is chosen across ALL
+    /// native rows BEFORE the rate window is applied. A superseded in-window
+    /// lineage must not be counted when the winning lineage's own timestamp
+    /// is outside the window, and a winner whose timestamp IS in the window is
+    /// counted despite an older lineage row lying outside it.
+    #[test]
+    fn tpm_ranks_lineages_before_applying_the_window() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let lineage_turn =
+            |seq: i64, scope_id: &str, lineage: &str, input: i64, output: i64, stamp: String| {
+                UsageEventRow {
+                    instance_id: "ins_tpm".into(),
+                    seq,
+                    profile_id: None,
+                    model: Some("m".into()),
+                    scope: "turn".into(),
+                    scope_id: Some(scope_id.into()),
+                    mode: "snapshot".into(),
+                    metric_revision: 1,
+                    source_session_id: Some(lineage.into()),
+                    total_tokens: Some(input + output),
+                    input_tokens: Some(input),
+                    output_tokens: Some(output),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                    cost_usd: None,
+                    accounting: "estimated".into(),
+                    observed_at: stamp,
+                    observed_at_source: "native".into(),
+                }
+            };
+
+        // Turn A: the in-window lineage (alpha, seq 10, 2 s ago) is superseded
+        // by beta (seq 20) whose own timestamp is 500 s ago — outside every
+        // rate window. Neither lineage's row may count.
+        assert!(
+            insert_usage_event(&conn, &lineage_turn(10, "turn-a", "alpha", 100, 10, ago(2)))
+                .unwrap()
+        );
+        assert!(
+            insert_usage_event(
+                &conn,
+                &lineage_turn(20, "turn-a", "beta", 200, 20, ago(500))
+            )
+            .unwrap()
+        );
+        // Turn B (control): the winner (beta, seq 21) is in the 60 s window;
+        // the older alpha row is 500 s old and loses, so beta counts once.
+        assert!(
+            insert_usage_event(&conn, &lineage_turn(11, "turn-b", "alpha", 11, 1, ago(500)))
+                .unwrap()
+        );
+        assert!(
+            insert_usage_event(&conn, &lineage_turn(21, "turn-b", "beta", 22, 2, ago(3))).unwrap()
+        );
+
+        let rollup = rollup_instance(&conn, "ins_tpm", "claude", Some("m"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rollup.tpm_in_60s,
+            Some(22),
+            "only turn-b's in-window winner counts; the superseded in-window \
+             turn-a lineage must not"
+        );
+        assert_eq!(rollup.tpm_out_60s, Some(2));
+        assert_eq!(rollup.tpm_in_5m, Some(4), "22 input over the 5-minute rate");
+        assert_eq!(
+            rollup.tpm_out_5m,
+            Some(0),
+            "2 output / 5 minutes rounds to 0"
+        );
     }
 
     /// Codex/Grok-shaped observations report only some channels. Missing

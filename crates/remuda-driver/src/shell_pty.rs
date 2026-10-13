@@ -850,6 +850,19 @@ impl ShellPtyDriver {
             .is_bound()
     }
 
+    /// Fire a live-drain request WITHOUT arming close (c-ctxusage r22 item 4);
+    /// resolves once the poller drains and acknowledges it.
+    #[cfg(feature = "test-faults")]
+    pub async fn test_request_drain_only(&self) {
+        let drain = self
+            .live_drain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let rx = drain.test_request_drain_only().await;
+        let _ = rx.await;
+    }
+
     /// Answer an ignored hook decision on the agent's own dialog, once (§14 risk 1).
     ///
     /// Reached only when the hook path *proved* it did not take the decision.

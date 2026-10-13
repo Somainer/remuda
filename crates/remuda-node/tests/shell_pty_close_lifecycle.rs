@@ -2106,3 +2106,73 @@ async fn retire_bound_releases_a_parked_finalise_and_completes() {
     driver.abort_event_workers_for_test().await;
     let _ = tokio::time::timeout(Duration::from_secs(30), drainer).await;
 }
+
+/// c-ctxusage r22 item 4: a live-drain wake consumed while the poller is parked
+/// in the normal-sample gate must be SERVICED on that same pass (the waiter
+/// acknowledged), not deferred until a second close/drain wakeup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drain_wake_consumed_in_the_sample_gate_is_serviced_immediately() {
+    let (_dir, workspace, _transcript, driver) = p1_promoted_layout();
+    let driver = std::sync::Arc::new(driver);
+    let faults = remuda_driver::test_faults::TranscriptFaults::new();
+    driver.set_test_faults(faults.clone());
+
+    let handle: remuda_driver::RunHandle = driver
+        .start(spec_for(&workspace, DriverKind::ShellPty))
+        .await
+        .expect("start");
+    let mut events_rx = handle.into_events();
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
+    let drainer = tokio::spawn(async move {
+        while let Some(observation) = events_rx.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+                && native.native_name == "transcript_bound"
+                && let Some(tx) = bound_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(20), bound_rx)
+        .await
+        .expect("never bound")
+        .expect("bound");
+
+    // Park every NORMAL sample; the poller sits in the gate select. Also arm
+    // the sample-entry hold: a drain wake that is NOT serviced inside the gate
+    // would leave the poller parked at the entry hold (no normal pass, so the
+    // loop-bottom drain service is never reached).
+    faults.arm_normal_sample_gate();
+    assert!(
+        faults.wait_normal_samples_parked(1, Duration::from_secs(20)),
+        "poller never parked in the sample gate"
+    );
+    faults.arm_sample_hold();
+    assert!(
+        !faults.sample_hold_entered(),
+        "poller must be at the gate, not sampling"
+    );
+
+    // Fire a non-closing drain request while the poller is parked. The wake is
+    // consumed inside the gate; it must be acked on the same pass.
+    let drain = tokio::spawn({
+        let driver = driver.clone();
+        async move { driver.test_request_drain_only().await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .expect("the gate-parked poller never serviced the drain wake (waited on a second wake)")
+        .expect("drain task panicked");
+
+    // Unwind.
+    faults.release_sample_hold();
+    faults.release_normal_samples();
+    tokio::time::timeout(Duration::from_secs(25), driver.close())
+        .await
+        .expect("close hung")
+        .expect("close ok");
+    driver.abort_event_workers_for_test().await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), drainer).await;
+}

@@ -832,6 +832,18 @@ impl LiveDrain {
         self.close_barrier.lock().await.take().is_some()
     }
 
+    /// Test-only: enqueue a live-drain waiter and notify WITHOUT arming the
+    /// close path (c-ctxusage r22 item 4). Returns the waiter's ack receiver;
+    /// used to prove a drain wake consumed inside the parked normal-sample
+    /// gate is serviced on the same pass rather than after a second wakeup.
+    #[cfg(feature = "test-faults")]
+    pub(super) async fn test_request_drain_only(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.waiters.lock().await.push(tx);
+        self.notify.notify_waiters();
+        rx
+    }
+
     /// Poller side of the handoff barrier: fire once per arm when it enters
     /// the non-terminal closing branch, BEFORE the tail collect, so close only
     /// runs the stop ladder once no normal poll (sample/demote/finalise) is in
@@ -1033,29 +1045,29 @@ pub(super) fn spawn(
             if closing || state.closed.load(Ordering::SeqCst) || events.is_closed() {
                 break;
             }
-            // c-ctxusage r15 item 7: while the promoted close ladder runs,
-            // do ONLY a non-terminal tail collect of the bound transcript.
-            // No process sampling (the writer is dying), no demote and no
-            // epoch-boundary hydrator finish: the close-time terminal finalise
-            // must keep owning the hydrator so the writer's termination append
-            // is drained while the sender is live.
-            if live_drain.is_closing() {
+            // A live drain is requested. This covers BOTH the promoted close
+            // path and a drain-only request consumed while parked at a test
+            // gate: the wake is SERVICED on this pass (c-ctxusage r22 item 4),
+            // not after waiting for a second wakeup.
+            if live_drain.is_closing() || drain_notified {
                 // Handoff barrier (P1, c-ctxusage r16 item 6): reaching here
                 // means any earlier in-flight normal poll already finished and
                 // THIS iteration will not sample, demote or finalise. Acknowledge
                 // before the tail collect so close, waiting on this ack, only
                 // signals the writer once interleaving is impossible.
-                live_drain.note_closing_observed().await;
-                let _ = pump(
-                    &hydrator,
-                    &pending,
-                    &flush_notify,
-                    &events,
-                    &seq,
-                    &ctx,
-                    faults.as_ref(),
-                )
-                .await;
+                if live_drain.is_closing() {
+                    live_drain.note_closing_observed().await;
+                    let _ = pump(
+                        &hydrator,
+                        &pending,
+                        &flush_notify,
+                        &events,
+                        &seq,
+                        &ctx,
+                        faults.as_ref(),
+                    )
+                    .await;
+                }
                 if drain_notified && live_drain.has_waiters().await {
                     pending.wait_empty().await;
                     for waiter in live_drain.take_waiters().await {
@@ -1094,7 +1106,9 @@ pub(super) fn spawn(
                 if closing || state.closed.load(Ordering::SeqCst) || events.is_closed() {
                     break;
                 }
-                if live_drain.is_closing() {
+                // Service a drain wake consumed inside the gate on THIS pass
+                // (c-ctxusage r22 item 4); do not wait for another wakeup.
+                if drain_notified || live_drain.is_closing() {
                     continue;
                 }
             }
@@ -1124,7 +1138,9 @@ pub(super) fn spawn(
                 if closing || state.closed.load(Ordering::SeqCst) || events.is_closed() {
                     break;
                 }
-                if live_drain.is_closing() {
+                // Service a drain wake consumed inside the gate on THIS pass
+                // (c-ctxusage r22 item 4); do not wait for another wakeup.
+                if drain_notified || live_drain.is_closing() {
                     continue;
                 }
             }

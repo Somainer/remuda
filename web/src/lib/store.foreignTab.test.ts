@@ -6464,101 +6464,26 @@ it("GATE34 item 4: a replacement login that REUSES the existing connection still
   }
 });
 
-it("GATE34 item 5: EVERY public auth path disposes the live outbox and bumps the generation — bootstrap login, pair login, passkey login, bootstrap 401, logout, and peer-tab storage event", async () => {
-  // Parameterized over the SIX public mutation paths (no private ensureOutbox
-  // calls): each must leave this.outbox null and a strictly higher authGen so
-  // an old acceptance can never credit the post-change outbox.
-  vi.useFakeTimers();
-  vi.setSystemTime(1_160_000);
-  const I = "ins_g34_5";
-  const originalNavigator = globalThis.navigator;
-  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
-  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
-  const pump = async (n = 2_000) => {
+it("GATE36 item 6(f) (replaces the GATE34 six-path test): an OUTSTANDING command issued through PUBLIC send() followed by a LATE acceptance across each public auth path retires the row but never credits the post-change outbox", async () => {
+  const paths = ["bootstrap-login", "pair-login", "passkey-login", "bootstrap-401", "logout", "peer-identity"] as const;
+  const pump = async (n = 3_000) => {
     for (let i = 0; i < n; i += 1) await Promise.resolve();
   };
-  const session = (deviceId: string) => ({ deviceId, token: `tok_${deviceId}`, name: deviceId });
-  const makeStore = async () => {
-    sessionStorage.setItem("remuda-outbox-owner", `owner_g34_5_${Math.random().toString(36).slice(2, 8)}`);
-    const { api, hubStore } = await fresh();
-    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
-    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
-    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
-    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
-    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
-    vi.spyOn(api, "instanceList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
-    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
-    vi.spyOn(api, "passkeyLoginStart").mockResolvedValue({
-      challengeId: "chal_g34_5",
-      options: { publicKey: { challenge: "Y2hhbA", allowCredentials: [] } } as never,
-    });
-    await bootLive(api, hubStore);
-    return { api, hubStore };
-  };
-
-  type H = {
-    outbox: { lifetime: string } | null;
-    authGenForTest: number;
-    ensureOutbox: () => Promise<string>;
-  };
-  // reAuth=true: the path establishes a new session, so bootstrap re-creates a
-  // box with a NEW lifetime (dispose-then-reinit). reAuth=false: logout/401/
-  // peer removal leave no box (null) until the next ensureOutbox.
-  const expectDisposed = async (hubStore: unknown, previousGen: number, reAuth: boolean) => {
-    const h = hubStore as unknown as H;
-    expect(h.authGenForTest).toBeGreaterThan(previousGen);
-    if (reAuth) {
-      // A fresh box with a different lifetime exists (or is available).
-      const status = await h.ensureOutbox();
-      expect(status).toBe("ok");
-      expect(h.outbox).not.toBeNull();
-      // Lifetime must differ from the pre-mutation box captured by caller.
-    } else {
-      expect(h.outbox).toBeNull();
-      expect(await h.ensureOutbox()).toBe("ok");
-      expect(h.outbox).not.toBeNull();
-    }
-    return h.authGenForTest;
-  };
-
-  try {
-    // 1) bootstrap login
-    {
-      const { api, hubStore } = await makeStore();
-      const gen = (hubStore as unknown as { authGenForTest: number; outbox: { lifetime: string } | null }).authGenForTest;
-      const life = (hubStore as unknown as { outbox: { lifetime: string } | null }).outbox!.lifetime;
-      vi.spyOn(api, "login").mockResolvedValue(session("dev_login"));
-      await hubStore.login("bootstrap", "secret", "dev_login");
-      await expectDisposed(hubStore, gen, true);
-      expect((hubStore as unknown as { outbox: { lifetime: string } | null }).outbox!.lifetime).not.toBe(life);
-    }
-    // 2) pair login
-    {
-      const { api, hubStore } = await makeStore();
-      const gen = (hubStore as unknown as { authGenForTest: number; outbox: { lifetime: string } | null }).authGenForTest;
-      const life = (hubStore as unknown as { outbox: { lifetime: string } | null }).outbox!.lifetime;
-      vi.spyOn(api, "pairRedeem").mockResolvedValue(session("dev_pair"));
-      await hubStore.login("pair", "pair-secret", "dev_pair");
-      await expectDisposed(hubStore, gen, true);
-      expect((hubStore as unknown as { outbox: { lifetime: string } | null }).outbox!.lifetime).not.toBe(life);
-    }
-    // 3) passkey login — stub the WebAuthn ceremony (jsdom has no
-    // navigator.credentials) so the PUBLIC passkeyLogin path runs end to end.
-    {
-      const { api, hubStore } = await makeStore();
-      const gen = (hubStore as unknown as { authGenForTest: number; outbox: { lifetime: string } | null }).authGenForTest;
-      const life = (hubStore as unknown as { outbox: { lifetime: string } | null }).outbox!.lifetime;
-      vi.stubGlobal("PublicKeyCredential", class { static isUserVerifyingPlatformAuthenticatorAvailable() { return Promise.resolve(true); } });
-      (globalThis as unknown as { PublicKeyCredential?: unknown }).PublicKeyCredential = (globalThis as unknown as { PublicKeyCredential?: unknown }).PublicKeyCredential;
-      Object.defineProperty(globalThis.navigator, "credentials", {
-        configurable: true,
-        value: {
+  for (let pi = 0; pi < paths.length; pi += 1) {
+    const path = paths[pi];
+    vi.useFakeTimers();
+    vi.setSystemTime(1_160_000 + pi * 1_000);
+    const I = `ins_g36_6f_${pi}`;
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      writable: true,
+      value: {
+        locks: fifoWebLocks().locks,
+        credentials: {
           get: () =>
             Promise.resolve({
-              id: "cred_g34_5",
+              id: `cred_g36_6f_${pi}`,
               type: "public-key",
               rawId: new ArrayBuffer(1),
               response: {
@@ -6569,136 +6494,253 @@ it("GATE34 item 5: EVERY public auth path disposes the live outbox and bumps the
               },
             }),
         },
-      });
-      vi.spyOn(api, "passkeyLoginFinish").mockResolvedValue(session("dev_passkey"));
-      const result = await hubStore.passkeyLogin("required", "dev_passkey");
-      expect(result).toBeTruthy();
-      await expectDisposed(hubStore, gen, true);
-      expect((hubStore as unknown as { outbox: { lifetime: string } | null }).outbox!.lifetime).not.toBe(life);
-    }
-    // 4) bootstrap 401 (hello rejects unauthorized after a session exists)
-    {
-      const { api, hubStore } = await makeStore();
-      const gen = (hubStore as unknown as { authGenForTest: number }).authGenForTest;
-      // Build the error from the SAME module instance the store uses
-      // (vi.resetModules gives this fresh module its own httpError class).
-      const { HubHttpError: HE } = (await import("./httpError")) as typeof import("./httpError");
-      vi.spyOn(api, "hello").mockRejectedValue(new HE(401, "unauthorized", "Unauthorized"));
-      await hubStore.bootstrap().catch(() => undefined);
-      await pump(500);
-      await expectDisposed(hubStore, gen, false);
-    }
-    // 5) logout
-    {
-      const { hubStore } = await makeStore();
-      const gen = (hubStore as unknown as { authGenForTest: number }).authGenForTest;
-      hubStore.logout();
-      await expectDisposed(hubStore, gen, false);
-    }
-    // 6) peer-tab storage event (a second document removes the session)
-    {
-      const { hubStore } = await makeStore();
-      const gen = (hubStore as unknown as { authGenForTest: number }).authGenForTest;
-      window.dispatchEvent(
-        new StorageEvent("storage", { key: "runtime.device-session", oldValue: "{}", newValue: null }),
-      );
-      await pump(200);
-      await expectDisposed(hubStore, gen, false);
-    }
-  } finally {
-    vi.useRealTimers();
-    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
-    sessionStorage.removeItem("remuda-outbox-owner");
-  }
-});
-
-it("GATE34 item 5: an obsolete initializer (suspended at storage-open OR at Outbox.load) with PENDING durable work installs nothing and posts nothing; an overlapping fresh initializer delivers the pending row exactly once", async () => {
-  for (const suspension of ["open", "load"] as const) {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_170_000 + (suspension === "open" ? 1 : 2));
-    const I = `ins_g34_5i_${suspension}`;
-    const originalNavigator = globalThis.navigator;
-    Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+      },
+    });
     localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
-    const pump = async (n = 2_000) => {
-      for (let i = 0; i < n; i += 1) await Promise.resolve();
-    };
+    const rows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
     try {
-      sessionStorage.setItem(`remuda-outbox-owner-g34-5i-${suspension}`, "owner");
+      sessionStorage.setItem("remuda-outbox-owner", `owner_g36_6f_${pi}`);
       const { api, hubStore } = await fresh();
       vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
       vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
       vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
       vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
-      const send = vi.spyOn(api, "instanceSend").mockImplementation(
-        (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
-          relatedCommandIds: [],
-          command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
-        })) as unknown as Api["instanceSend"],
-      );
-
-      // Seed PENDING durable work that a fresh box must later deliver.
-      const preStorage = new (await import("./outbox")).LocalStorageOutboxStorage();
-      await preStorage.put({
-        commandId: `cmd_g34_5i_${suspension}`, clientRequestId: `local_g34_5i_${suspension}`,
-        instanceId: I, prompt: `g34 5i ${suspension} P`, createdAt: 1, attempts: 0, state: "pending",
+      vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+      vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+      vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+      vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+      vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+      vi.spyOn(api, "instanceList").mockResolvedValue({
+        items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
       });
+      vi.spyOn(api, "passkeyLoginStart").mockResolvedValue({
+        challengeId: `chal_g36_6f_${pi}`,
+        options: { publicKey: { challenge: "Y2hhbA", allowCredentials: [] } } as never,
+      });
+      // Outstanding command: the POST is entered and then NEVER resolves — C is
+      // durably inflight under L1 (issuer = L1 lifetime) when the identity
+      // change happens.
+      const send = vi.spyOn(api, "instanceSend").mockImplementation(
+        (() => new Promise(() => { /* outstanding: issued, never accepted */ })) as unknown as Api["instanceSend"],
+      );
+      await bootLive(api, hubStore);
+      await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+      await hubStore.follow(I);
+      hubStore.setConnectionStateForTest("live");
 
-      const h = hubStore as unknown as {
-        outbox: unknown;
-        outboxInit: Promise<string> | null;
-        authGenForTest: number;
-        setOutboxOpenGateForTest: (g: ((r: () => void) => void) | null) => void;
-        setOutboxLoadGateForTest: (g: ((r: () => void) => void) | null) => void;
-        applyAuthIdentityChangeForTest: () => void;
-        ensureOutbox: () => Promise<string>;
-        flushAllOutbox: () => Promise<void>;
-      };
-
-      let releaseOld: () => void = () => undefined;
-      h.setOutboxOpenGateForTest(suspension === "open" ? ((r) => { releaseOld = r; }) : null);
-      h.setOutboxLoadGateForTest(suspension === "load" ? ((r) => { releaseOld = r; }) : null);
-
-      // OLD initializer starts and parks at the chosen suspension point.
-      const oldInit = h.ensureOutbox();
-      await pump(200);
-      expect(h.outbox).toBeNull();
-
-      // Identity changes: the parked init is now obsolete.
-      h.applyAuthIdentityChangeForTest();
-      const genAfter = h.authGenForTest;
-
-      // Release the obsolete initializer's gate AND drop both gates so an
-      // overlapping fresh initializer is not blocked by the old gate; then
-      // overlap the fresh initializer (starts while the old one is finishing
-      // its obsolete path).
-      releaseOld();
-      h.setOutboxOpenGateForTest(null);
-      h.setOutboxLoadGateForTest(null);
-      await expect(oldInit).resolves.toBe("obsolete");
-      expect(h.outbox).toBeNull();
-      expect(send).not.toHaveBeenCalled();
-
-      // The overlapping fresh initializer installs the current box and its
-      // post-load flush delivers the pending row EXACTLY once.
-      const freshInit = h.ensureOutbox();
-      await expect(freshInit).resolves.toBe("ok");
-      await h.flushAllOutbox();
-      await pump(3_000);
-      expect(h.authGenForTest).toBe(genAfter);
+      await hubStore.send(I, `g36 6f ${path} outstanding`);
+      for (let i = 0; i < 4_000 && send.mock.calls.length < 1; i += 1) await Promise.resolve();
       expect(send).toHaveBeenCalledTimes(1);
-      expect(send.mock.calls[0]?.[4]).toBe(`cmd_g34_5i_${suspension}`);
+      const cId = send.mock.calls[0]?.[4] as string;
+      const hx = hubStore as unknown as {
+        outbox: { lifetime: string } | null;
+        login: (k: "bootstrap" | "pair", s: string, d: string) => Promise<void>;
+        passkeyLogin: (m: "required", d?: string) => Promise<unknown>;
+        logout: () => void;
+        bootstrap: () => Promise<void>;
+      };
+      const life1 = hx.outbox!.lifetime;
+      expect(rows().find((r) => r.commandId === cId)?.state).toBe("inflight");
+      expect(rows().find((r) => r.commandId === cId)?.issuerLifetime).toBe(life1);
+      // The follow subscription that observed the outstanding POST — its
+      // callback is the channel for the LATE (post-change) acceptance.
+      const onBatchStale = vi.mocked(api.eventsSubscribe).mock.calls[0]?.[2] as (b: unknown) => void;
+      expect(typeof onBatchStale).toBe("function");
 
-      hubStore.logout();
+      const reAuth = path === "bootstrap-login" || path === "pair-login" || path === "passkey-login";
+      if (path === "bootstrap-login") {
+        vi.spyOn(api, "login").mockResolvedValue({ deviceId: `dev_6f_${pi}`, token: "tok", name: path });
+        await hx.login("bootstrap", "secret", `dev_6f_${pi}`);
+      } else if (path === "pair-login") {
+        vi.spyOn(api, "pairRedeem").mockResolvedValue({ deviceId: `dev_6f_${pi}`, token: "tok", name: path });
+        await hx.login("pair", "pair-secret", `dev_6f_${pi}`);
+      } else if (path === "passkey-login") {
+        vi.stubGlobal("PublicKeyCredential", class { static isUserVerifyingPlatformAuthenticatorAvailable() { return Promise.resolve(true); } });
+        vi.spyOn(api, "passkeyLoginFinish").mockResolvedValue({ deviceId: `dev_6f_${pi}`, token: "tok", name: path });
+        await hx.passkeyLogin("required", `dev_6f_${pi}`);
+      } else if (path === "bootstrap-401") {
+        const { HubHttpError: HE } = await import("./httpError");
+        vi.spyOn(api, "hello").mockRejectedValue(new HE(401, "unauthorized", "Unauthorized"));
+        vi.spyOn(api, "hasDeviceSession").mockReturnValue(false);
+        await hx.bootstrap().catch(() => undefined);
+      } else if (path === "logout") {
+        hx.logout();
+      } else {
+        window.dispatchEvent(
+          new StorageEvent("storage", { key: "runtime.device-session", oldValue: "{}", newValue: null }),
+        );
+      }
+      await pump(2_000);
+
+      if (reAuth) {
+        // The public credential path installed the post-change outbox itself.
+        expect(hx.outbox).not.toBeNull();
+        expect(hx.outbox!.lifetime).not.toBe(life1);
+      } else {
+        // 401 / logout / peer leave no box. Re-establish through a PUBLIC
+        // login (the real next user action) — never a private init.
+        expect(hx.outbox).toBeNull();
+        vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+        vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+        vi.spyOn(api, "login").mockResolvedValue({ deviceId: `dev_6f_${pi}_after`, token: "tok2", name: `${path}-after` });
+        await hx.login("bootstrap", "secret", `dev_6f_${pi}_after`);
+        await pump(2_000);
+        expect(hx.outbox).not.toBeNull();
+        expect(hx.outbox!.lifetime).not.toBe(life1);
+      }
+      const life2 = hx.outbox!.lifetime;
+
+      // LATE acceptance of the outstanding command arrives through the
+      // pre-change subscription. Journal evidence retires the durable row for
+      // EVERY identity, but the acceptance PROGRESS must never be credited to
+      // the post-change outbox (its CAS requires its own issuer lifetime).
+      onBatchStale({
+        subscriptionId: "sub_g26_stale",
+        journalId: JOURNAL,
+        fromSeq: "1",
+        toSeq: "1",
+        durableSeq: "1",
+        events: [g26JournalMessage(cId, "1")],
+      });
+      await pump(3_000);
+      const settled = rows().find((r) => r.commandId === cId)!;
+      expect(settled.state).toBe("done");
+      expect(settled.progressRecorded).toBeFalsy();
+      expect(settled.issuerLifetime).toBe(life1);
+      expect(life2).not.toBe(life1);
+      // The parked L1 POST remains the ONLY wire call — L2 never re-POSTed C.
+      expect(send).toHaveBeenCalledTimes(1);
+      vi.unstubAllGlobals();
+      hx.logout();
     } finally {
+      vi.unstubAllGlobals();
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
-      sessionStorage.removeItem(`remuda-outbox-owner-g34-5i-${suspension}`);
+      sessionStorage.removeItem(`remuda-outbox-owner-g36-6f-${pi}`);
     }
   }
 });
 
-it("GATE35 item 3: a delivery that reached its POST boundary under L1 is fenced off by a replacement login; L1 posts neither C1 nor C2 and L2 delivers both once in order", async () => {
+it("GATE36 item 6(d)+(g) (replaces the GATE34 obsolete-initializer test): old and fresh initializers actually OVERLAP, driven through PUBLIC send()+login() — the old one installs nothing; the fresh one delivers the seeded row and the send's own command", async () => {
+  for (const suspension of ["open", "load"] as const) {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_170_000 + (suspension === "open" ? 1 : 2));
+    const I = `ins_g36_6d_${suspension}`;
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+    const pump = async (n = 4_000) => {
+      for (let i = 0; i < n; i += 1) await Promise.resolve();
+    };
+    const rows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    const sessionStorageKey = `remuda-outbox-owner-g36-6d-${suspension}`;
+    try {
+      sessionStorage.setItem(sessionStorageKey, "owner");
+      const { api, hubStore } = await fresh();
+      vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+      vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+      vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+      vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+      const posted: Array<{ id: string; lifetime?: string }> = [];
+      const send = vi.spyOn(api, "instanceSend").mockImplementation(
+        (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => {
+          const r = rows().find((row) => row.commandId === commandId);
+          posted.push({ id: commandId ?? "", lifetime: r?.issuerLifetime });
+          return {
+            relatedCommandIds: [],
+            command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+          };
+        }) as unknown as Api["instanceSend"],
+      );
+      vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+      vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+      vi.spyOn(api, "instanceList").mockResolvedValue({
+        items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      });
+      vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+      vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+      vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+      // Deliberately NO bootLive/follow here: the store starts WITHOUT an
+      // installed outbox so the PUBLIC send() below is the initializer
+      // trigger (the old private-path test called ensureOutbox() directly).
+
+      // Pending durable work that predates the identity change.
+      const seedId = `cmd_g36_6d_${suspension}_seed`;
+      const preStorage = new (await import("./outbox")).LocalStorageOutboxStorage();
+      await preStorage.put({
+        commandId: seedId, clientRequestId: `local_g36_6d_${suspension}_seed`,
+        instanceId: I, prompt: `g36 6d ${suspension} seed`, createdAt: 1, attempts: 0, state: "pending",
+      });
+
+      const h = hubStore as unknown as {
+        send: (i: string, p: string) => Promise<boolean>;
+        login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+        outbox: { lifetime: string } | null;
+        setOutboxOpenGateForTest: (g: ((r: () => void) => void) | null) => void;
+        setOutboxLoadGateForTest: (g: ((r: () => void) => void) | null) => void;
+      };
+
+      // One gate that collects EVERY initializer's resolver so the old and
+      // fresh initializers can be held simultaneously.
+      const gateResolvers: Array<() => void> = [];
+      const gate = (resolve: () => void) => { gateResolvers.push(resolve); };
+      h.setOutboxOpenGateForTest(suspension === "open" ? gate : null);
+      h.setOutboxLoadGateForTest(suspension === "load" ? gate : null);
+
+      // PUBLIC send enters ensureOutbox: the OLD initializer parks.
+      const sendP = h.send(I, `g36 6d ${suspension} new command`);
+      for (let i = 0; i < 4_000 && gateResolvers.length < 1; i += 1) await Promise.resolve();
+      expect(gateResolvers.length).toBe(1);
+      expect(h.outbox).toBeNull();
+
+      // PUBLIC replacement login disposes the old identity and its finalizer
+      // starts the FRESH initializer BEFORE the old one completes: the two
+      // initializers are actually overlapped at the same suspension point.
+      vi.spyOn(api, "login").mockResolvedValue({ deviceId: `dev_g36_6d_${suspension}`, token: "tok", name: "g36_6d" });
+      const loginP = h.login("bootstrap", "secret", "dev");
+      for (let i = 0; i < 4_000 && gateResolvers.length < 2; i += 1) await Promise.resolve();
+      expect(gateResolvers.length).toBe(2);
+      expect(h.outbox).toBeNull(); // neither initializer has installed yet
+      expect(send).not.toHaveBeenCalled();
+
+      // Release BOTH parked initializers together: the old one must finish
+      // obsolete (install nothing); the fresh one installs and flushes.
+      gateResolvers.forEach((resolve) => resolve());
+      await loginP;
+      const sent = await sendP;
+      expect(sent).toBe(true);
+      await pump(8_000);
+
+      const freshLifetime = h.outbox?.lifetime;
+      expect(freshLifetime).toBeTruthy();
+      // Exactly the seeded row and the send's command, each once, both from
+      // the fresh box (seed first by createdAt ordering).
+      expect(posted).toHaveLength(2);
+      expect(posted[0]?.id).toBe(seedId);
+      expect(posted[1]?.id).toMatch(/^cmd_/);
+      expect(posted.every((p) => p.lifetime === freshLifetime)).toBe(true);
+      expect(send).toHaveBeenCalledTimes(2);
+      hubStore.logout();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+      sessionStorage.removeItem(sessionStorageKey);
+    }
+  }
+});
+
+
+it("GATE36 item 6(a) (replaces GATE35 item 3): C1's CLAIM parked before it resolves, replacement login completes, claim resumes — L1 issues ZERO POSTs; L2 delivers C1 then C2 once each in order under its own lifetime", async () => {
+  // The gate-35 version parked INSIDE api.instanceSend, so L1 had already
+  // crossed the fence and POSTed C1. This version parks at the CLAIM storage
+  // write (before the POST boundary) and attributes every POST to the
+  // delivering box's lifetime via the row's committed issuerLifetime.
   vi.useFakeTimers();
   vi.setSystemTime(1_180_000);
   const I = "ins_g35_3";
@@ -6708,6 +6750,7 @@ it("GATE35 item 3: a delivery that reached its POST boundary under L1 is fenced 
   const pump = async (n = 3_000) => {
     for (let i = 0; i < n; i += 1) await Promise.resolve();
   };
+  const rows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
   try {
     sessionStorage.setItem("remuda-outbox-owner", "owner_g35_3");
     const { api, hubStore } = await fresh();
@@ -6716,22 +6759,22 @@ it("GATE35 item 3: a delivery that reached its POST boundary under L1 is fenced 
     vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
     vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
     vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
-    vi.spyOn(api, "instanceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
     vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
     vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
     vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
     vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
-
-    // Park the FIRST instanceSend (C1's POST) so the L1 delivery is suspended
-    // exactly at the wire boundary AFTER its claim committed.
-    let releasePost: () => void = () => undefined;
-    let postParked = false;
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+    });
+    // Attribute each POST to the issuerLifetime stamped on the claimed row.
+    const posted: Array<{ id: string; lifetime?: string }> = [];
     const send = vi.spyOn(api, "instanceSend").mockImplementation(
-      (async (_iid: string, _prompt: string, _atts?: unknown, _mode?: unknown, commandId?: string) => {
-        if (!postParked) {
-          postParked = true;
-          await new Promise<void>((resolve) => { releasePost = resolve; });
-        }
+      (async (_iid: string, _prompt: string, _x?: unknown, _m?: unknown, commandId?: string) => {
+        const r = rows().find((row) => row.commandId === commandId);
+        posted.push({ id: commandId ?? "", lifetime: r?.issuerLifetime });
         return {
           relatedCommandIds: [],
           command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
@@ -6739,39 +6782,65 @@ it("GATE35 item 3: a delivery that reached its POST boundary under L1 is fenced 
       }) as unknown as Api["instanceSend"],
     );
     await bootLive(api, hubStore);
-    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
     await hubStore.follow(I);
     hubStore.setConnectionStateForTest("live");
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
 
-    // Two pending rows C1 then C2.
-    const obx = (hubStore as unknown as { outbox: { enqueue: (r: unknown) => Promise<unknown> } }).outbox;
+    // Two pending rows, C1 then C2.
+    const obx = (hubStore as unknown as { outbox: { storage: Record<string, unknown>; enqueue: (r: unknown) => Promise<unknown>; lifetime: string } }).outbox;
     await obx.enqueue({ commandId: "cmd_g35_3_c1", clientRequestId: "local_c1", instanceId: I, prompt: "g35 3 C1", createdAt: 1 });
     await obx.enqueue({ commandId: "cmd_g35_3_c2", clientRequestId: "local_c2", instanceId: I, prompt: "g35 3 C2", createdAt: 2 });
+    const life1 = obx.lifetime;
+
+    // Park C1's CLAIM write (not the POST): L1 holds the instance lock while
+    // its claim is suspended pre-resolution.
+    const storage = obx.storage as {
+      mergeUnlessDone: (id: string, p: unknown) => Promise<unknown>;
+    };
+    const realMerge = storage.mergeUnlessDone.bind(storage);
+    let releaseClaim: () => void = () => undefined;
+    let claimHeld = false;
+    storage.mergeUnlessDone = vi.fn(async (id: string, patch: unknown) => {
+      if (!claimHeld && (patch as { state?: string }).state === "inflight") {
+        claimHeld = true;
+        await new Promise<void>((resolve) => { releaseClaim = resolve; });
+      }
+      return realMerge(id, patch);
+    });
 
     void (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
-    for (let i = 0; i < 3_000 && !postParked; i += 1) await Promise.resolve();
-    expect(postParked).toBe(true); // L1 claimed C1 and is parked INSIDE its POST
-    // Replacement login disposes L1 while C1's POST is suspended.
+    for (let i = 0; i < 3_000 && !claimHeld; i += 1) await Promise.resolve();
+    expect(claimHeld).toBe(true);
+    expect(send).not.toHaveBeenCalled(); // parked BEFORE the POST boundary
+
+    // Complete the replacement login (and therefore L2 initialization) while
+    // L1's claim is still parked. L2's flush can only queue on the instance
+    // lock L1 still holds.
     vi.spyOn(api, "login").mockResolvedValue({ deviceId: "dev_g35_3", token: "tok", name: "g35_3" });
     const loginP = hubStore.login("bootstrap", "secret", "dev");
-    await pump(1_000);
-    // Release the parked L1 POST. It is already INSIDE api.instanceSend (the
-    // fence is before the call), so that one in-flight request resolves; but
-    // the token-fence makes the lock turn STALE on return — it must NOT walk on
-    // to C2. (C1's single in-flight POST is deduped by command id.)
-    releasePost();
     await loginP;
-    await pump(2_000);
-    // L2 (replacement box) delivers; total C1 = 1 (the deduped in-flight),
-    // C2 = 1, and crucially C1 was never POSTed twice and C2 never by L1.
-    await pump(5_000);
-    expect(send.mock.calls.map((c) => c[4])).toEqual(["cmd_g35_3_c1", "cmd_g35_3_c2"]);
+    await pump(3_000);
+    const life2 = (hubStore as unknown as { outbox: { lifetime: string } | null }).outbox?.lifetime;
+    expect(life2).toBeTruthy();
+    expect(life2).not.toBe(life1);
+    expect(send).not.toHaveBeenCalled(); // L1 parked; L2 waiting on the held lock
+
+    // Resume C1's claim: L1's fence is stale — it restores C1 and ends its
+    // turn with ZERO POSTs; L2's queued lock turn then drains C1, C2 in order.
+    releaseClaim();
+    await pump(8_000);
+    expect(posted).toEqual([
+      { id: "cmd_g35_3_c1", lifetime: life2 },
+      { id: "cmd_g35_3_c2", lifetime: life2 },
+    ]);
+    expect(posted.every((p) => p.lifetime !== life1)).toBe(true);
+    expect(send).toHaveBeenCalledTimes(2);
   } finally {
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner");
   }
-});;;
+});
 
 it("GATE35 item 4: a STALE fence at the attempt boundary (attempts 19) restores the retryable state and attempt count without consuming the final retry — C is delivered once, not marked unknown", async () => {
   vi.useFakeTimers();
@@ -6983,6 +7052,8 @@ it("GATE35 item 2: overlapping credential requests are serialized — while logi
     await pump(200);
     expect(aStarted).toBe(true);
     expect(h.authTransitionOpenForTest).toBe(true);
+    // Gate 36 item 6(b): no box exists for the whole window A is open.
+    expect(h.outbox).toBeNull();
 
     // A send while A is open waits for the serialized transition chain.
     const sendP = h.send(I, "g35 2 P")
@@ -7005,6 +7076,10 @@ it("GATE35 item 2: overlapping credential requests are serialized — while logi
     await pump(300);
     expect(bStarted).toBe(true);
     expect(h.authTransitionOpenForTest).toBe(true);
+    // Gate 36 item 6(b): the outbox stays ABSENT for the whole window B is
+    // open — A's finalizer initialization must be killed by B's acquisition
+    // and B's own finalizer has not run yet.
+    expect(h.outbox).toBeNull();
     // Still no box installed / no POST while B is open (the finalizer hasn't run).
     expect(send).not.toHaveBeenCalled();
 
@@ -7024,20 +7099,17 @@ it("GATE35 item 2: overlapping credential requests are serialized — while logi
   }
 });
 
-it("GATE35 item 1: a credential request whose request AND whose body reject still runs the current-generation finalizer so pending rows are delivered automatically, with no private ensureOutbox call", async () => {
+it("GATE36 item 6(c) (replaces GATE35 item 1): finalizer recovery distinguishes REQUEST rejection from HEADERS-OK/BODY failure and delivers pending work automatically in both", async () => {
   vi.useFakeTimers();
   vi.setSystemTime(1_220_000);
   const I = "ins_g35_1x";
   const originalNavigator = globalThis.navigator;
   Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
-  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
   const pump = async (n = 3_000) => {
     for (let i = 0; i < n; i += 1) await Promise.resolve();
   };
-  for (const mode of ["request-rejects", "body-rejects"] as const) {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_220_000 + (mode === "body-rejects" ? 1 : 2));
-    Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  for (const mode of ["request-rejects", "body-failure"] as const) {
+    vi.setSystemTime(1_220_000 + (mode === "body-failure" ? 1 : 2));
     localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
     const sessionStorageKey = `remuda-outbox-owner-g35-1x-${mode}`;
     try {
@@ -7065,19 +7137,39 @@ it("GATE35 item 1: a credential request whose request AND whose body reject stil
       // A pending durable row.
       const obx = (hubStore as unknown as { outbox: { enqueue: (r: unknown) => Promise<unknown> } }).outbox;
       await obx.enqueue({ commandId: `cmd_g35_1x_${mode}`, clientRequestId: `local_${mode}`, instanceId: I, prompt: `g35 1x ${mode} P`, createdAt: 1 });
-
       hubStore.setConnectionStateForTest("offline");
-      // Both modes: the credential request rejects (request-level failure is
-      // the same thrown api.login here; the finalizer must still initialize).
-      const { HubHttpError: HE } = (await import("./httpError")) as typeof import("./httpError");
-vi.spyOn(api, "login").mockRejectedValue(new HE(503, "busy", "host busy"));
-      await expect(hubStore.login("bootstrap", "bad", "dev")).rejects.toThrow(/busy/);
+
+      // Drive the REAL live api.login through rest():
+      //  - request-rejects: fetch itself rejects (half-open link / network).
+      //  - body-failure: response HEADERS are OK (200) but res.json() rejects
+      //    after headers — a genuinely different failure shape the old test
+      //    never exercised (both variants used the same immediate mock
+      //    rejection). No api.login spy: the request goes to the wire layer.
+      const fetchMock = vi.fn(async (url: string | URL) => {
+        expect(String(url)).toContain("/v1/login");
+        if (mode === "request-rejects") {
+          throw new TypeError("network down: login request failed");
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: () => Promise.reject(new Error("login response body truncated")),
+          text: () => Promise.reject(new Error("login response body truncated")),
+        } as unknown as Response;
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(hubStore.login("bootstrap", "bad", "dev")).rejects.toThrow();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      vi.unstubAllGlobals();
       await pump(3_000);
-      // The finalizer initialized a current box and the pending row is
-      // delivered automatically — no manual ensureOutbox / send / reload.
+      // Both failure shapes: the finalizer initialized a current box and the
+      // pending row is delivered automatically — no private ensureOutbox /
+      // manual send / reload.
       expect(send).toHaveBeenCalledTimes(1);
       expect(send.mock.calls[0]?.[4]).toBe(`cmd_g35_1x_${mode}`);
     } finally {
+      vi.unstubAllGlobals();
       vi.useRealTimers();
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
       sessionStorage.removeItem(sessionStorageKey);
@@ -7444,6 +7536,66 @@ it("GATE36 item 5: a public steer whose claim resumes across a replacement login
     await pump(8_000);
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0]?.[4]).toBe(commandId);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE36 item 6(e): bootstrap 401 disposes the box; a later public login with pending durable work delivers it automatically", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_260_000);
+  const I = "ins_g36_6e";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 4_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g36_6e");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await hubStore.follow(I);
+    // Pending durable C, kept from auto-delivery.
+    hubStore.setConnectionStateForTest("live");
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    hubStore.setConnectionStateForTest("offline");
+    const obx = (hubStore as unknown as { outbox: { enqueue: (r: unknown) => Promise<unknown> } }).outbox;
+    await obx.enqueue({ commandId: "cmd_g36_6e_c", clientRequestId: "local_g36_6e_c", instanceId: I, prompt: "g36 6e C", createdAt: 1 });
+    await pump(200);
+    expect(send).not.toHaveBeenCalled();
+
+    // A reload bootstrap loses the session to a 401: the box is disposed and
+    // no current outbox remains.
+    const { HubHttpError: HE } = await import("./httpError");
+    vi.spyOn(api, "hello").mockRejectedValue(new HE(401, "unauthorized", "Unauthorized"));
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(false);
+    await hubStore.bootstrap().catch(() => undefined);
+    await pump(300);
+    const h = hubStore as unknown as { outbox: unknown; login: (k: "bootstrap", s: string, d: string) => Promise<void> };
+    expect(h.outbox).toBeNull();
+
+    // A public login then establishes a new session. Its bootstrap + current
+    // box service the pending C with no manual send/flush/reload.
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "login").mockResolvedValue({ deviceId: "dev_g36_6e", token: "tok", name: "g36_6e" });
+    await h.login("bootstrap", "secret", "dev");
+    await pump(8_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBe("cmd_g36_6e_c");
   } finally {
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });

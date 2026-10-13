@@ -1202,6 +1202,100 @@ fn gate_summary(report: &MergeReport) -> String {
 /// cover ~4k commits without an unbounded unshallow on a huge repository.
 const ANCESTRY_DEEPENS: [&str; 2] = ["--deepen=256", "--deepen=4096"];
 
+/// Wall-clock bound for ONE deepen fetch subprocess (r17 item 5); a hung fetch
+/// is SIGKILLed (whole group) and reaped by the deadline, so a deepen can never
+/// outlive the caller.
+const ANCESTRY_DEEPEN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run a git child bounded by `deadline` in its own process group; on expiry
+/// SIGKILL the whole group and reap the leader so a `git fetch`/ssh cannot
+/// outlive the probe (r17 item 5). A timeout is a distinct TimedOut error.
+fn git_output_bounded(
+    repo: &Path,
+    args: &[&str],
+    deadline: std::time::Duration,
+) -> Result<std::process::Output, std::io::Error> {
+    git_output_bounded_bin("git", repo, args, deadline)
+}
+
+fn git_output_bounded_bin(
+    git_bin: &str,
+    repo: &Path,
+    args: &[&str],
+    deadline: std::time::Duration,
+) -> Result<std::process::Output, std::io::Error> {
+    use std::os::unix::process::CommandExt;
+    use std::sync::mpsc;
+
+    let mut command = std::process::Command::new(git_bin);
+    command
+        .current_dir(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    command.process_group(0);
+    let child = command.spawn()?;
+    let pgid = child.id() as i32;
+    let (tx, rx) = mpsc::channel();
+    let waiter = std::thread::spawn(move || tx.send(child.wait_with_output()));
+    match rx.recv_timeout(deadline) {
+        Ok(Ok(output)) => {
+            let _ = waiter.join();
+            Ok(output)
+        }
+        Ok(Err(error)) => {
+            let _ = waiter.join();
+            Err(error)
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(std::io::Error::other("git waiter thread disappeared"))
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            use nix::sys::signal::{Signal, killpg};
+            use nix::unistd::Pid;
+            let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGKILL));
+            let _ = waiter.join();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "git {} exceeded {deadline:?} and was killed",
+                    args.join(" ")
+                ),
+            ))
+        }
+    }
+}
+
+/// Per-repository shallow-deepen coalescing (r17 item 5): concurrent probes
+/// for the same clone serialize on a canonical-path slot so only one bounded
+/// `git fetch --deepen` runs at a time; waiters then re-check (history is now
+/// more complete) instead of fetching in parallel.
+fn with_deepen_coalescing<T>(repo: &Path, f: impl FnOnce() -> T) -> T {
+    use std::sync::{Condvar, LazyLock, Mutex};
+    static LOCKS: LazyLock<(
+        Mutex<std::collections::HashSet<std::path::PathBuf>>,
+        Condvar,
+    )> = LazyLock::new(|| (Mutex::new(std::collections::HashSet::new()), Condvar::new()));
+    let key = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let (set, cvar) = &*LOCKS;
+    {
+        let mut guard = set.lock().unwrap();
+        while guard.contains(&key) {
+            guard = cvar.wait(guard).unwrap();
+        }
+        guard.insert(key.clone());
+    }
+    let result = f();
+    {
+        let mut guard = set.lock().unwrap();
+        guard.remove(&key);
+    }
+    cvar.notify_all();
+    result
+}
+
 /// Whether the repository has a shallow boundary that could hide an ancestry
 /// edge. Query errors are themselves Unknown and reported as shallow (so the
 /// caller deepens or refuses rather than trusting exit 1).
@@ -1268,54 +1362,64 @@ fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
         RawAncestry::NotAncestor if !repository_is_shallow(repo) => Ok(false),
         RawAncestry::NotAncestor => {
             // Shallow: a merge-base "not ancestor" may be a graft illusion.
-            // Deepen safely (additive), then RE-READ — the edge can be
-            // revealed even while the repository stays shallow, once the
-            // boundary has moved past the queried tips.
-            let mut last_count = reachable_commit_count(repo);
-            for deepen in ANCESTRY_DEEPENS {
-                let deepened = git_output(repo, &["fetch", "-q", deepen, "origin"])?;
-                if !deepened.status.success() {
-                    bail!(
-                        "merge-base --is-ancestor exited 1 in a shallow clone and the bounded \
+            // r17 item 5: coalesce per repo and bound each deepen subprocess.
+            with_deepen_coalescing(repo, || {
+                let mut last_count = reachable_commit_count(repo);
+                for deepen in ANCESTRY_DEEPENS {
+                    let deepened = match git_output_bounded(
+                        repo,
+                        &["fetch", "-q", deepen, "origin"],
+                        ANCESTRY_DEEPEN_DEADLINE,
+                    ) {
+                        Ok(output) => output,
+                        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                            bail!("the bounded shallow deepen timed out and was killed: {error}")
+                        }
+                        Err(error) => bail!("the bounded shallow deepen could not run: {error}"),
+                    };
+                    if !deepened.status.success() {
+                        bail!(
+                            "merge-base --is-ancestor exited 1 in a shallow clone and the bounded \
                          deepen failed ({}); ancestry unknown: {}",
-                        deepened.status,
-                        String::from_utf8_lossy(&deepened.stderr).trim()
-                    );
-                }
-                match classify_ancestry_output(&git_output(
-                    repo,
-                    &["merge-base", "--is-ancestor", ancestor, descendant],
-                )?) {
-                    RawAncestry::Ancestor => return Ok(true),
-                    RawAncestry::Abnormal(message) => {
-                        return Err(anyhow::Error::msg(format!(
-                            "{message} (during shallow deepen)"
-                        )));
+                            deepened.status,
+                            String::from_utf8_lossy(&deepened.stderr).trim()
+                        );
                     }
-                    RawAncestry::NotAncestor => {}
-                }
-                if !repository_is_shallow(repo) {
-                    // History is now complete: the not-ancestor answer is
-                    // established.
-                    return Ok(false);
-                }
-                let next_count = reachable_commit_count(repo);
-                if next_count == last_count {
-                    // The remote itself is shallow at this boundary: no further
-                    // history can ever arrive, so a not-ancestor answer can
-                    // never be confirmed. Unknown.
-                    bail!(
-                        "merge-base --is-ancestor exited 1 in a shallow clone and the bounded \
+                    match classify_ancestry_output(&git_output(
+                        repo,
+                        &["merge-base", "--is-ancestor", ancestor, descendant],
+                    )?) {
+                        RawAncestry::Ancestor => return Ok(true),
+                        RawAncestry::Abnormal(message) => {
+                            return Err(anyhow::Error::msg(format!(
+                                "{message} (during shallow deepen)"
+                            )));
+                        }
+                        RawAncestry::NotAncestor => {}
+                    }
+                    if !repository_is_shallow(repo) {
+                        // History is now complete: the not-ancestor answer is
+                        // established.
+                        return Ok(false);
+                    }
+                    let next_count = reachable_commit_count(repo);
+                    if next_count == last_count {
+                        // The remote itself is shallow at this boundary: no further
+                        // history can ever arrive, so a not-ancestor answer can
+                        // never be confirmed. Unknown.
+                        bail!(
+                            "merge-base --is-ancestor exited 1 in a shallow clone and the bounded \
                          deepen added no history (a shallow remote?); ancestry of {ancestor} in \
                          {descendant} is unknown"
-                    );
+                        );
+                    }
+                    last_count = next_count;
                 }
-                last_count = next_count;
-            }
-            bail!(
-                "merge-base --is-ancestor still exits 1 after the bounded deepens completed some \
+                bail!(
+                    "merge-base --is-ancestor still exits 1 after the bounded deepens completed some \
                  history; ancestry of {ancestor} in {descendant} is unknown"
-            );
+                );
+            })
         }
     }
 }
@@ -1932,6 +2036,31 @@ mod tests {
             classify_ancestry_output(&output_from(9)),
             RawAncestry::Abnormal(_)
         ));
+    }
+
+    /// r17 item 5: a deepen subprocess past its deadline is SIGKILLed (whole
+    /// group) and reaped, returning TimedOut rather than hanging the probe.
+    #[test]
+    fn a_deepen_past_its_deadline_is_killed_and_timed_out() {
+        let keep = tempfile::tempdir().unwrap();
+        let git = keep.path().join("git");
+        // A "git" that sleeps beyond the deadline.
+        std::fs::write(&git, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let start = std::time::Instant::now();
+        let err = git_output_bounded_bin(
+            git.to_str().unwrap(),
+            keep.path(),
+            &["fetch", "-q", "--deepen=256", "origin"],
+            std::time::Duration::from_millis(300),
+        )
+        .expect_err("an over-deadline fetch must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the bound must apply promptly"
+        );
     }
 
     /// A depth-1 clone grafts both tips as roots: merge-base naively says "not

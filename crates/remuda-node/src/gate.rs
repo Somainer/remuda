@@ -3117,6 +3117,122 @@ const ANCESTRY_DEEPEN_ARGS: [&[&str]; 2] = [
     &["fetch", "-q", "--deepen=4096", "origin"],
 ];
 
+/// Wall-clock bound for ONE deepen fetch subprocess (r17 item 5). A hung fetch
+/// is SIGKILLed and reaped by the deadline, so a probe cannot outlive the RPC
+/// forever; two steps stay bounded under the Hub's read-only probe timeout.
+#[cfg(unix)]
+const ANCESTRY_DEEPEN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Run a git child to completion bounded by `deadline` (r17 item 5). The child
+/// runs in its own process group; on expiry the WHOLE group is SIGKILLed and the
+/// leader reaped (no orphaned `git fetch` keeps running after the probe gives
+/// up). Returns `Err(TimedOut)` distinct from spawn/other I/O errors.
+#[cfg(unix)]
+fn git_output_bounded(
+    repo: &Path,
+    args: &[&str],
+    deadline: Duration,
+) -> Result<std::process::Output, std::io::Error> {
+    git_output_bounded_bin("git", repo, args, deadline)
+}
+
+#[cfg(unix)]
+fn git_output_bounded_bin(
+    git_bin: &str,
+    repo: &Path,
+    args: &[&str],
+    deadline: Duration,
+) -> Result<std::process::Output, std::io::Error> {
+    use std::os::unix::process::CommandExt;
+    use std::sync::mpsc;
+
+    let mut command = std::process::Command::new(git_bin);
+    command
+        .current_dir(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // The fetch runs in its OWN group so a deadline kill reaps git and any
+    // ssh/git-remote child it spawned.
+    command.process_group(0);
+    let child = command.spawn()?;
+    let pgid = child.id() as i32;
+    let (tx, rx) = mpsc::channel();
+    // wait_with_output needs a mut child owned by the thread.
+    let waiter = std::thread::spawn(move || tx.send(child.wait_with_output()));
+    match rx.recv_timeout(deadline) {
+        Ok(Ok(output)) => {
+            let _ = waiter.join();
+            Ok(output)
+        }
+        Ok(Err(error)) => {
+            let _ = waiter.join();
+            Err(error)
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(std::io::Error::other("git waiter thread disappeared"))
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Kill the whole group; the waiter's wait_with_output then returns
+            // (its captured buffers are discarded), and the leader is reaped so
+            // no fetch survives the deadline.
+            use nix::sys::signal::{Signal, killpg};
+            use nix::unistd::Pid;
+            let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGKILL));
+            let _ = waiter.join();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "git {} exceeded {deadline:?} and was killed",
+                    args.join(" ")
+                ),
+            ))
+        }
+    }
+}
+
+/// Per-repository coalescing for blocking shallow-history deepening (r17 item
+/// 5). Concurrent read-only probes for the SAME clone serialize: the first
+/// holder runs the bounded deepen, waiters block and then re-check — the
+/// history is now (more) complete, so they never spawn a duplicate concurrent
+/// `git fetch --deepen`. Deepening is repository-global, so the key is the
+/// canonical repo path.
+#[cfg(unix)]
+static DEEPEN_LOCKS: std::sync::LazyLock<(
+    std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+    std::sync::Condvar,
+)> = std::sync::LazyLock::new(|| {
+    (
+        std::sync::Mutex::new(std::collections::HashSet::new()),
+        std::sync::Condvar::new(),
+    )
+});
+
+/// Run `f` while holding the per-repo deepen slot; a second caller for the same
+/// repo waits until the first completes before doing its own (now cheap)
+/// shallow check.
+#[cfg(unix)]
+fn with_deepen_coalescing<T>(repo: &Path, f: impl FnOnce() -> T) -> T {
+    let key = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let (set, cvar) = &*DEEPEN_LOCKS;
+    {
+        let mut guard = set.lock().unwrap();
+        while guard.contains(&key) {
+            guard = cvar.wait(guard).unwrap();
+        }
+        guard.insert(key.clone());
+    }
+    let result = f();
+    {
+        let mut guard = set.lock().unwrap();
+        guard.remove(&key);
+    }
+    cvar.notify_all();
+    result
+}
+
 /// Map a finished merge-base process to the tri-state verdict (r16 item 3):
 /// exit 0 / exit 1 are the only Established outcomes; any other exit code or
 /// death by signal (no exit code) is Unknown, never a guessed boolean.
@@ -3189,27 +3305,28 @@ fn establish_ancestry(repo: &Path, ancestor: &str, descendant: &str) -> Ancestry
         // Shallow but exit 0 (present edge) needs no extra history.
         verdict @ AncestryVerdict::Ancestor => verdict,
         AncestryVerdict::Unknown(error) => AncestryVerdict::Unknown(error),
-        AncestryVerdict::NotAncestor => {
+        AncestryVerdict::NotAncestor => with_deepen_coalescing(repo, || {
             let mut last_count = git_reachable_commit_count(repo);
             for args in ANCESTRY_DEEPEN_ARGS {
-                match std::process::Command::new("git")
-                    .current_dir(repo)
-                    .args(args)
-                    .env("GIT_TERMINAL_PROMPT", "0")
-                    .output()
-                {
+                match git_output_bounded(repo, args, ANCESTRY_DEEPEN_DEADLINE) {
                     Ok(output) if !output.status.success() => {
                         return AncestryVerdict::Unknown(format!(
-                            "shallow merge-base said not-ancestor and the bounded deepen failed \
-                             ({}): {}",
+                            "shallow merge-base said not-ancestor and the bounded deepen \
+                                 failed ({}): {}",
                             output.status,
                             String::from_utf8_lossy(&output.stderr).trim()
                         ));
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                        return AncestryVerdict::Unknown(format!(
+                            "shallow merge-base said not-ancestor and the bounded deepen \
+                                 timed out and was killed: {error}"
+                        ));
+                    }
                     Err(error) => {
                         return AncestryVerdict::Unknown(format!(
-                            "shallow merge-base said not-ancestor and the bounded deepen could not \
-                             run: {error}"
+                            "shallow merge-base said not-ancestor and the bounded deepen could \
+                                 not run: {error}"
                         ));
                     }
                     Ok(_) => {}
@@ -3229,7 +3346,7 @@ fn establish_ancestry(repo: &Path, ancestor: &str, descendant: &str) -> Ancestry
                 if next_count == last_count {
                     return AncestryVerdict::Unknown(
                         "merge-base said not-ancestor in a shallow clone and the bounded deepen \
-                         added no history (a shallow remote?); the edge cannot be confirmed"
+                             added no history (a shallow remote?); the edge cannot be confirmed"
                             .into(),
                     );
                 }
@@ -3240,7 +3357,7 @@ fn establish_ancestry(repo: &Path, ancestor: &str, descendant: &str) -> Ancestry
                  not complete"
                     .into(),
             )
-        }
+        }),
     }
 }
 
@@ -6467,6 +6584,30 @@ head -c 1 >/dev/null || exit 4
             super::classify_ancestry_output(&output(9)),
             super::AncestryVerdict::Unknown(_)
         ));
+    }
+
+    /// r17 item 5: a bounded deepen subprocess past its deadline is SIGKILLed
+    /// and reaped, returning TimedOut rather than hanging the read-only probe.
+    #[test]
+    fn a_bounded_deepen_past_its_deadline_is_killed_and_timed_out() {
+        let keep = tempfile::TempDir::new().unwrap();
+        let git = keep.path().join("git");
+        std::fs::write(&git, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let start = std::time::Instant::now();
+        let error = super::git_output_bounded_bin(
+            git.to_str().unwrap(),
+            keep.path(),
+            &["fetch", "-q", "--deepen=256", "origin"],
+            Duration::from_millis(300),
+        )
+        .expect_err("an over-deadline fetch must error");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the bound must apply promptly"
+        );
     }
 
     /// Helper for the shallow-history resolve tests: `git clone` through the

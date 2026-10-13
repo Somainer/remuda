@@ -19,6 +19,21 @@ import {
 import type { ModelCatalogView, ModelSelectionPath } from "./modelEffective";
 import css from "./effort.module.css";
 
+/** Order-preserving de-dup on the SHORT label the radio rows render by: full
+ *  ids that shorten to the same stop are one row (the gateway's `e2e/auto`
+ *  and the current `passthrough/auto` launch id are the same "auto" picker
+ *  stop). The fuller id wins by first occurrence — the catalog lists before
+ *  the fallback current. */
+function dedupeModels(ids: string[]): string[] {
+  const out: string[] = [];
+  for (const id of ids) {
+    if (id && !out.some((existing) => shortModel(existing) === shortModel(id))) {
+      out.push(id);
+    }
+  }
+  return out;
+}
+
 /**
  * The effort slider with the D-056 orthogonal Ultracode switch.
  *
@@ -199,7 +214,12 @@ export function EffortSlider({
   };
 
   const hasModelAxis = model !== undefined;
-  const currentModel = hasModelAxis ? shortModel(model) : "";
+  // The full current id: the READ-BACK running id (modelEffective) wins; the
+  // optimistic picker id is only the pre-readback value — otherwise a
+  // listed/typed alias that resolves to a different concrete id (e2e/fast →
+  // e2e/plain) leaves the panel stuck on the requested id after the verdict.
+  const currentModelId = hasModelAxis ? modelEffective || model || "" : "";
+  const currentModel = shortModel(currentModelId);
 
   // A local drag/keyboard draft survives within one gesture but resets once
   // a controlled value lands (tier or flag prop change). A mock parent that
@@ -244,11 +264,12 @@ export function EffortSlider({
     if (!currentModel) return [];
     // An explicit catalog list is used as-is (deduped); with no list, offer
     // the harness's built-in aliases plus the running id.
-    const base = models && models.length ? models : modelsFor(kind, [currentModel]);
-    const out: string[] = [];
-    for (const id of base) if (id && !out.includes(id)) out.push(id);
-    return out;
-  }, [currentModel, kind, models]);
+    const base = models && models.length ? models : modelsFor(kind, [currentModelId]);
+    // Dedup on the short label the rows render by, so e.g. the gateway's
+    // e2e/auto and the current passthrough/auto launch id don't produce two
+    // "auto" radio rows (full ids differ but they are the same picker stop).
+    return dedupeModels(base);
+  }, [currentModelId, currentModel, kind, models]);
   const modelPendingShort = modelPending ? shortModel(modelPending.id) : null;
 
   // ── Slider track (pill) ───────────────────────────────────────────────
@@ -435,7 +456,19 @@ export function EffortSlider({
 
   if (list) {
     return (
-      <div className={frame} data-testid={tid("slider-panel")} data-view="list" data-harness={kind}>
+      <div
+        className={frame}
+        data-testid={tid("slider-panel")}
+        data-view="list"
+        data-harness={kind}
+        // List-view provenance for the hub e2e/store consumers (main parity):
+        // the current short model, any in-flight switch and its listed/typed
+        // path, and which catalog the rows came from.
+        data-model-current={currentModel || ""}
+        data-model-pending={modelPending ? (modelPending.queued ? "queued" : "switching") : "0"}
+        data-model-path={modelSelectionPath ?? ""}
+        data-catalog-source={modelCatalog?.source ?? ""}
+      >
         <div className={css.effortListHead}>
           <button
             type="button"
@@ -494,6 +527,12 @@ export function EffortSlider({
                 const short = shortModel(id);
                 const selected = currentModel === short;
                 const pending = modelPendingShort === short;
+                const pathTag =
+                  selected && modelSelectionPath
+                    ? modelSelectionPath === "typed"
+                      ? "直输 id"
+                      : "列表内"
+                    : null;
                 return (
                   <button
                     key={id}
@@ -502,8 +541,9 @@ export function EffortSlider({
                     data-testid={`model-option-${short}`}
                     data-selected={selected ? "1" : "0"}
                     data-model-pending={pending ? (modelPending?.queued ? "queued" : "switching") : "0"}
+                    data-model-path={selected ? (modelSelectionPath ?? "") : ""}
                     disabled={Boolean(modelLockedReason)}
-                    title={modelLockedReason ?? undefined}
+                    title={modelLockedReason ?? id}
                     onClick={() => {
                       if (modelLockedReason) return;
                       onModel?.(id);
@@ -512,9 +552,14 @@ export function EffortSlider({
                   >
                     <span className={`${css.radio} ${selected ? css.radioOn : ""}`} />
                     <span className={css.effortName}>{short}</span>
-                    {selected && modelSelectionPath === "typed" ? (
+                    {pathTag ? (
                       <span className={css.effortPathTag} data-testid="model-option-path">
-                        直输 id
+                        {pathTag}
+                      </span>
+                    ) : null}
+                    {pending ? (
+                      <span className={css.effortDesc} data-testid="model-option-pending">
+                        {modelPending?.queued ? "排队中" : "切换中"}
                       </span>
                     ) : null}
                   </button>

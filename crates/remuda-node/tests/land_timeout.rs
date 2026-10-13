@@ -735,12 +735,13 @@ fi
     );
 }
 
-/// r14 item 9: a land child that exits nonzero WITHOUT a structured verdict
-/// must keep the drained stderr (a remote rejection/error) in the failure —
-/// the stderr handle is consumed by the concurrent pump, so without the
-/// captured-lines fallback the reason came back empty.
+/// r16 item 4 (R5): a RELEASED land child that exits nonzero WITHOUT a
+/// recognized structured verdict is UNCERTAIN — it may have pushed and crashed
+/// before reporting — never a definite Failed. The drained stderr (which the
+/// concurrent pump consumed) must still be carried in the error so the
+/// operator/reconciler can see what the child printed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_nonzero_land_exit_with_only_stderr_records_the_drained_stderr() {
+async fn a_nonzero_land_exit_with_only_stderr_is_uncertain_and_keeps_the_stderr() {
     let dir = tempfile::tempdir().unwrap();
     let origin = dir.path().join("origin.git");
     Command::new("git")
@@ -835,11 +836,11 @@ fi
     .expect("gate.run hung")
     .expect("gate.run errored");
 
-    assert_eq!(reply["status"], json!("failed"), "{reply}");
+    assert_eq!(reply["status"], json!("uncertain"), "{reply}");
     let error = reply["error"].as_str().unwrap_or_default();
     assert!(
         error.contains("GH013") && error.contains("rejected the update"),
-        "the drained land stderr must be retained in the failure reason: {error}"
+        "the drained land stderr must be retained in the uncertain reason: {error}"
     );
 }
 

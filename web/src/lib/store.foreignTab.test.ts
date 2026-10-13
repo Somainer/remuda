@@ -5126,7 +5126,8 @@ it("GATE28 a: a claim that fails before commit stamps no issuer — the stale co
 
     // Logout rotates the auth epoch; reinit epoch B.
     a.logout();
-    expect(localStorage.getItem(g28EpochKey)).toBeNull();
+    // gate31 item 3: logout writes a tombstone ("") rather than deleting.
+    expect(localStorage.getItem(g28EpochKey)).toBe("");
     const reopened = await (a as unknown as { ensureOutbox: () => Promise<boolean> }).ensureOutbox();
     expect(reopened).toBe(true);
     const boxB = () => (a as unknown as { outbox: { isDeliveryExhausted: (i: string) => boolean; pendingLeaseWakeups: () => string[] } | null }).outbox;

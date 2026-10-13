@@ -574,7 +574,7 @@ class IdbOutboxStorage implements OutboxStorage {
   }
 }
 
-class LocalStorageOutboxStorage implements OutboxStorage {
+export class LocalStorageOutboxStorage implements OutboxStorage {
   private read(): OutboxRecord[] {
     try {
       const raw = localStorage.getItem(LS_KEY);

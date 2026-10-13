@@ -2359,3 +2359,24 @@ it("GATE31 item 2: a logout/epoch rotation between the failed CAS and its retry 
     vi.useRealTimers();
   }
 });
+
+it("GATE31 item 6: the REAL backend CAS rejects a different auth epoch even when the page lifetime matches — removing only the epoch check goes RED", async () => {
+  // Uses the production LocalStorageOutboxStorage (not a check-duplicating
+  // fake): the row is stamped with THIS outbox's lifetime, so the lifetime leg
+  // passes and only the rotated epoch can reject.
+  const { LocalStorageOutboxStorage } = await import("./outbox");
+  localStorage.clear();
+  const storage = new LocalStorageOutboxStorage();
+  const box = await Outbox.load(storage, "owner_g31_epoch");
+  await storage.put(
+    rec({ commandId: "cmd_g31_epoch", instanceId: "ins_e", state: "sent", issuerEpoch: "ep_old", issuerLifetime: box.lifetime }),
+  );
+  // Same lifetime, NEW epoch (logout/reinit): must not flip.
+  expect(await box.casProgressRecorded("cmd_g31_epoch", "ep_new", box.lifetime)).toBe(false);
+  const rows = async () => (await storage.all()).find((r) => r.commandId === "cmd_g31_epoch");
+  expect((await rows())?.progressRecorded).toBeFalsy();
+  // The original epoch wins exactly once.
+  expect(await box.casProgressRecorded("cmd_g31_epoch", "ep_old", box.lifetime)).toBe(true);
+  expect((await rows())?.progressRecorded).toBe(true);
+  expect(await box.casProgressRecorded("cmd_g31_epoch", "ep_old", box.lifetime)).toBe(false);
+});

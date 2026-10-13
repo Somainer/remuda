@@ -132,6 +132,14 @@ pub struct AdapterHome {
     /// (c-usagefu r3 item 1). `None` for a promoted/foreign-launched process,
     /// whose session legitimately predates our attachment.
     pub launched_at: Option<time::OffsetDateTime>,
+    /// The native session id an explicit `codex resume <id>` continues
+    /// (c-usagefu r15 item 3). A real resume APPENDS to the existing rollout,
+    /// whose `session_meta.timestamp` is the ORIGINAL start and therefore
+    /// predates [`Self::launched_at`]; discovery binds that rollout BY ID
+    /// (cwd still verified) and never falls through to timestamp/cwd guessing,
+    /// which could bind a different pre-floor file. `None` for an ordinary
+    /// launch, where the timestamp floor remains the discovery rule.
+    pub resume_session_id: Option<String>,
 }
 
 /// A session the adapter should follow.

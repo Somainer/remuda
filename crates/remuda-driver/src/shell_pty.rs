@@ -1332,6 +1332,16 @@ impl ShellPtyDriver {
         if let Some(guard) = native_lifetime {
             *self.codex_lifetime.lock().await = Some(guard);
         }
+        // c-usagefu r15 item 3: a `codex resume <id>` continues the session's
+        // EXISTING rollout (whose session_meta predates the resume floor); the
+        // tail adapter binds it by id rather than by timestamp.
+        let resume_session_id = match &self.options.target {
+            Target::Agent {
+                resume: Some(session_id),
+                ..
+            } => Some(session_id.clone()),
+            _ => None,
+        };
         if let Some(handle) = self.spawn_adapters(
             &hooks,
             &recipe,
@@ -1341,6 +1351,7 @@ impl ShellPtyDriver {
             cwd,
             adapter_lifetime,
             launch_floor,
+            resume_session_id,
         )? {
             *self.adapters.lock().await = Some(handle);
         }
@@ -1466,6 +1477,10 @@ impl ShellPtyDriver {
         // adapter uses it as its discovery floor, so a gap rollout created
         // before the resume is refused by the real discovery path.
         launch_floor: time::OffsetDateTime,
+        // c-usagefu r15 item 3: native session id of an explicit
+        // `codex resume <id>`; the adapter binds that existing rollout by id
+        // even though its session_meta timestamp predates the resume floor.
+        resume_session_id: Option<String>,
     ) -> DriverResult<Option<crate::adapters::supervisor::AdapterHandle>> {
         let Some(hooks) = hooks else {
             return Ok(None);
@@ -1485,6 +1500,7 @@ impl ShellPtyDriver {
             // path decides instead of the newest session_index guess — the
             // floor is what refuses a pre-resume gap rollout (r14 item 5).
             launched_at: Some(launch_floor),
+            resume_session_id,
         };
         let stamp = crate::adapters::supervisor::stamp_ctx(
             ctx.instance_id.clone(),
@@ -4816,6 +4832,7 @@ mod tests {
             cwd: cwd.clone(),
             pid: None,
             launched_at: Some(floor),
+            resume_session_id: None,
         })
         .with_instance_key(Some("r12-item1-competitor".to_owned()));
         let prompt = "competitor prompt that must not win";
@@ -4976,6 +4993,7 @@ mod tests {
                 cwd: cwd.clone(),
                 pid: None,
                 launched_at: Some(floor),
+                resume_session_id: None,
             })
             .with_instance_key(Some(competitor_owner.to_owned()));
             let prompt = "r13 item 4 rollout born during close";
@@ -5236,6 +5254,7 @@ mod tests {
             cwd: cwd.clone(),
             pid: None,
             launched_at: Some(floor),
+            resume_session_id: None,
         })
         .with_instance_key(Some(next_owner.to_owned()));
         let prompt = "r13 item 3 later launch prompt";
@@ -5387,6 +5406,7 @@ mod tests {
             cwd: cwd.clone(),
             pid: None,
             launched_at: Some(time::OffsetDateTime::now_utc()),
+            resume_session_id: None,
         })
         .with_instance_key(Some("r14-item3a-rechecker".to_owned()));
         // poll() runs the production discover() (and therefore the registry
@@ -5416,6 +5436,7 @@ mod tests {
             cwd: cwd.clone(),
             pid: None,
             launched_at: Some(floor),
+            resume_session_id: None,
         })
         .with_instance_key(Some(next_owner.to_owned()));
         let prompt = "r14 item 3a later launch prompt";
@@ -5689,6 +5710,7 @@ mod tests {
             cwd: cwd.clone(),
             pid: None,
             launched_at: Some(time::OffsetDateTime::now_utc()),
+            resume_session_id: None,
         })
         .with_instance_key(Some("r14-item4-rechecker".to_owned()));
         assert!(rechecker.poll().unwrap().is_empty());
@@ -5711,6 +5733,7 @@ mod tests {
             cwd: cwd.clone(),
             pid: None,
             launched_at: Some(floor),
+            resume_session_id: None,
         })
         .with_instance_key(Some(next_owner.to_owned()));
         let prompt = "r14 item 4 later launch prompt";

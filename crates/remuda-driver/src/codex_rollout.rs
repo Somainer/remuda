@@ -512,6 +512,36 @@ pub fn locate_rollout_in(codex_home: &Path, session_id: &str) -> Option<PathBuf>
     None
 }
 
+/// Whether the rollout `path`'s `session_meta.cwd` matches `launch_cwd`.
+///
+/// c-usagefu r15 item 3: an explicit `codex resume <id>` binds the located
+/// rollout BY ID regardless of its original start timestamp, but it must still
+/// belong to the launch cwd — a name-index/homedir collision must never bind a
+/// foreign-cwd session under the resume instruction. Only the bounded first
+/// (session_meta) line is read.
+#[must_use]
+pub fn rollout_cwd_matches(path: &Path, launch_cwd: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut first = String::new();
+    if std::io::BufReader::new(file)
+        .take(1024 * 1024)
+        .read_line(&mut first)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(CodexRolloutRecord {
+        event: CodexRolloutEvent::SessionMeta { metadata, .. },
+        ..
+    }) = parse_rollout_line(&first)
+    else {
+        return false;
+    };
+    cwd_matches(metadata["cwd"].as_str(), launch_cwd)
+}
+
 /// Discovery result for a driver-launched (generic-pty) codex session that has
 /// no hook channel and no child pid: matching by cwd + launch time is the only
 /// ownership evidence available.

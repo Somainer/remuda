@@ -18,7 +18,7 @@ use remuda_driver::{
     Delegation, Driver, DriverKind, LaunchOrigin, ProviderHealth, ProviderKind, ProviderProfile,
 };
 use remuda_protocol::{
-    AgentKind, ContentBlock, DriverInput, InputOrigin, InstanceId, InstanceSpec,
+    AgentKind, ContentBlock, DriverInput, InputOrigin, InstanceId, InstanceSpec, Knowledge,
     ObservationPayload, PromptInput, PromptMode, TextBlock,
 };
 
@@ -83,12 +83,11 @@ fn spec_for(dir: &Path) -> InstanceSpec {
     spec
 }
 
-/// Append a real 0.154-shaped rollout with one priced token_usage_record into
-/// the hook session's shadow CODEX_HOME (plus the name index), whose first
-/// user message is the prompt the test dispatches through the real driver
-/// send. The shadow adapter binds it off the resume floor + prompt evidence
-/// (c-usagefu r14 item 5).
-fn append_native_usage_after_resume(dir: &Path, instance_id: &InstanceId, session_id: &str) {
+/// Write the session's ORIGINAL rollout exactly as the first codex run does:
+/// session_meta with the original timestamp, the real first user prompt, and
+/// one priced turn. c-usagefu r15 item 3: a real resume APPENDS to this file,
+/// never creating a fresh one.
+fn write_original_rollout(dir: &Path, instance_id: &InstanceId, session_id: &str) {
     let home = dir
         .join(instance_id.as_id().as_str())
         .join("launch")
@@ -121,6 +120,47 @@ fn append_native_usage_after_resume(dir: &Path, instance_id: &InstanceId, sessio
     .unwrap();
 }
 
+/// Append the resumed run's NEW turn to the existing rollout — codex resume
+/// leaves the original session_meta untouched and only appends records.
+fn append_resumed_turn(dir: &Path, instance_id: &InstanceId, session_id: &str) {
+    let home = dir
+        .join(instance_id.as_id().as_str())
+        .join("launch")
+        .join("codex-home");
+    let path = home
+        .join("sessions/2026/10/12")
+        .join(format!("rollout-{session_id}.jsonl"));
+    let at = time::OffsetDateTime::now_utc();
+    let at = at
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    use std::io::Write as _;
+    writeln!(
+        file,
+        "{{\"timestamp\":\"{at}\",\"ordinal\":6,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_u2\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"go\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}}}"
+    )
+    .unwrap();
+    writeln!(
+        file,
+        "{{\"timestamp\":\"{at}\",\"ordinal\":7,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"t2\"}}}}"
+    )
+    .unwrap();
+    writeln!(
+        file,
+        "{{\"timestamp\":\"{at}\",\"ordinal\":8,\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"t2\",\"response_id\":\"r2\",\"usage\":{{\"input_tokens\":60,\"cached_input_tokens\":60,\"cache_creation_input_tokens\":0,\"output_tokens\":30,\"reasoning_output_tokens\":0,\"total_tokens\":90}}}}}}"
+    )
+    .unwrap();
+    writeln!(
+        file,
+        "{{\"timestamp\":\"{at}\",\"ordinal\":9,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"t2\"}}}}"
+    )
+    .unwrap();
+}
+
 #[tokio::test]
 async fn close_resume_adopted_tail_emits_native_usage_appended_after_resume() {
     let dir = tempfile::tempdir().unwrap();
@@ -131,8 +171,12 @@ async fn close_resume_adopted_tail_emits_native_usage_appended_after_resume() {
     // START: real driver launch with a hook-configured codex shadow home.
     let driver = ShellPtyDriver::new(options_for(dir.path(), &instance_id, &spec));
     let mut first = driver.start(spec.clone()).await.expect("first start");
-    // Drain whatever the first run emits; the rollout does not exist yet.
+    // Drain whatever the first run emits.
     let _ = tokio::time::timeout(Duration::from_millis(300), first.recv()).await;
+    // The ORIGINAL rollout exists while the first run is alive: original
+    // session_meta timestamp with the first turn. codex resume appends to
+    // THIS file instead of creating a new one.
+    write_original_rollout(dir.path(), &instance_id, session_id);
 
     // CLOSE: kills the child, aborts the first run's adapter tasks, unbinds
     // hooks. The shadow directory survives for the continued run.
@@ -141,18 +185,16 @@ async fn close_resume_adopted_tail_emits_native_usage_appended_after_resume() {
 
     // RESUME: start_resumed_inner spawns the continued driver and adopts its
     // file-tail handle into the live slot (the production adoption call).
-    // The session id is the hook-confirmed native session the run continues.
+    // The session id is the native session the run continues; the resumed
+    // tail binds the existing rollout BY ID (r15 item 3), as a real
+    // `codex resume <id>` does.
     let mut resumed = driver
         .start_resumed(spec.clone(), session_id.to_owned())
         .await
         .expect("resume spawns the continued run");
 
-    // Native usage lands in the shadow home ONLY AFTER resume.
-    append_native_usage_after_resume(dir.path(), &instance_id, session_id);
-
-    // c-usagefu r14 item 5: the shadow adapter discovers off the resume floor
-    // plus the REAL dispatched prompt (the rollout's first user message is
-    // "go"), not the newest session_index guess.
+    // The real prompt is dispatched through the production send path BEFORE
+    // the resumed turn's records are appended to the original rollout.
     driver
         .send(DriverInput::Prompt(Box::new(PromptInput {
             mode: PromptMode::NewTurn,
@@ -164,17 +206,23 @@ async fn close_resume_adopted_tail_emits_native_usage_appended_after_resume() {
         })))
         .await
         .expect("the resumed live child accepts the prompt");
+    append_resumed_turn(dir.path(), &instance_id, session_id);
 
-    // The adopted tail must surface the Usage observation on the resumed
-    // run's channel. Adapter ticks are 250 ms; allow a generous budget.
-    let mut saw_usage = false;
+    // The adopted tail must surface the APPENDED turn's Usage observation on
+    // the resumed run's channel even though the rollout predates the resume
+    // floor. Adapter ticks are 250 ms; allow a generous budget.
+    let mut saw_resumed_usage = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining, resumed.recv()).await {
             Ok(Some(observation)) => {
-                if matches!(&observation.body, ObservationPayload::Usage(_)) {
-                    saw_usage = true;
+                let turn = match &observation.source.native_turn_id {
+                    Knowledge::Known { value } => Some(value.as_str()),
+                    _ => None,
+                };
+                if matches!(&observation.body, ObservationPayload::Usage(_)) && turn == Some("t2") {
+                    saw_resumed_usage = true;
                     break;
                 }
             }
@@ -182,8 +230,8 @@ async fn close_resume_adopted_tail_emits_native_usage_appended_after_resume() {
         }
     }
     assert!(
-        saw_usage,
-        "the adopted codex tail emits usage appended after close->resume"
+        saw_resumed_usage,
+        "the adopted codex tail binds the original rollout by id and emits the appended turn"
     );
 
     Driver::close(&driver).await.expect("final close");

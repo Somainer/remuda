@@ -67,6 +67,7 @@ fn replay_fixture() -> (tempfile::TempDir, GrokLive) {
             cwd,
             pid: Some(24069),
             launched_at: None,
+            resume_session_id: None,
         }),
         identity(),
     );

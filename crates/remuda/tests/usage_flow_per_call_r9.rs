@@ -184,6 +184,7 @@ fn run_real_codex_adapter(
         cwd: dir.to_path_buf(),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     })
     .with_fallback_model(MODEL);
     let mut all = Vec::new();

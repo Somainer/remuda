@@ -677,6 +677,9 @@ impl GenericPtyDriver {
             cwd: PathBuf::from(&recipe.cwd),
             pid: None,
             launched_at: Some(launched_at),
+            // Generic-pty resume is not wired through the native rollout id;
+            // discovery stays on the anonymous cwd + timestamp floor.
+            resume_session_id: None,
         };
         let stamp = crate::adapters::supervisor::stamp_ctx(
             self.options.instance_id.clone().unwrap_or_default(),

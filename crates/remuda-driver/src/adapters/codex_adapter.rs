@@ -358,6 +358,33 @@ impl CodexAdapter {
         if self.discovery_gave_up {
             return Ok(false);
         }
+        // c-usagefu r15 item 3: an explicit `codex resume <id>` continues an
+        // EXISTING session. codex appends new turns to that session's original
+        // rollout, whose session_meta.timestamp is the ORIGINAL start (before
+        // this launch's resume floor), so the timestamp rule can never bind it
+        // and the continued session would be lost. Locate it BY ID instead —
+        // the cwd is still verified — and refuse EVERY other file: there is no
+        // fallback to anonymous cwd/index guessing on a resumed launch. The
+        // file can appear/flush late, so not-found waits for the adapter's
+        // whole life, like every other discovery tier.
+        if let Some(resume_id) = self.home.resume_session_id.clone() {
+            let Some(path) = crate::codex_rollout::locate_rollout_in(&self.home.home, &resume_id)
+            else {
+                return Ok(false);
+            };
+            if !crate::codex_rollout::rollout_cwd_matches(&path, &self.home.cwd) {
+                // The named session belongs to a different cwd: fail closed,
+                // never bind any other rollout.
+                return Ok(false);
+            }
+            if self.bind(resume_id.clone(), path, true) {
+                // Remember the id the claim succeeded for; later polls take
+                // the same by-id shortcut above the floor scan.
+                self.discovered = Some(resume_id);
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         // Tier 1: a HOOK-confirmed id (channel A) — distinct from a cwd guess.
         if let Some(id) = self.confirmed.clone() {
             if let Some(path) = locate_rollout_in(&self.home.home, &id)

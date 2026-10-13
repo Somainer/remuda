@@ -3515,6 +3515,7 @@ mod tests {
             cwd: "/w".into(),
             pid: None,
             launched_at: None,
+            resume_session_id: None,
         });
         adapter.bind_rollout("codex-e2e", rollout.clone());
 
@@ -3705,6 +3706,7 @@ mod tests {
             cwd: "/w".into(),
             pid: None,
             launched_at: None,
+            resume_session_id: None,
         });
         probe.bind_rollout(session_id, rollout.clone());
         let observed = probe.poll().unwrap();
@@ -3886,6 +3888,7 @@ mod tests {
                 cwd: "/w".into(),
                 pid: None,
                 launched_at: None,
+                resume_session_id: None,
             });
             adapter.bind_rollout(session_id, rollout.clone());
             let polled = adapter.poll().unwrap();
@@ -4132,6 +4135,7 @@ mod tests {
             cwd: "/w".into(),
             pid: None,
             launched_at: None,
+            resume_session_id: None,
         });
         probe.bind_rollout(session_id, rollout);
         let observed = probe.poll().unwrap();
@@ -4754,6 +4758,7 @@ mod tests {
             cwd: "/w".into(),
             pid: None,
             launched_at: None,
+            resume_session_id: None,
         });
         adapter.bind_rollout("nt", rollout.clone());
         let observed = adapter.poll().unwrap();

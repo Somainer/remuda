@@ -283,6 +283,9 @@ pub fn promoted_home(kind: AgentKind, cwd: PathBuf, pid: Option<u32>) -> Option<
         // there is no launch floor, so its adapter keeps the name-index
         // discovery path. Only a driver launch (generic_pty) supplies one.
         launched_at: None,
+        // The operator attached to a running session; there is no resume
+        // instruction to bind by id (c-usagefu r15 item 3).
+        resume_session_id: None,
     })
 }
 

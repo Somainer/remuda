@@ -26,6 +26,7 @@ fn adapter_with_rollout(dir: &Path, session_id: &str) -> CodexAdapter {
         cwd: dir.to_path_buf(),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     });
     adapter.confirm_session(session_id);
     assert!(adapter.discover().unwrap());
@@ -116,6 +117,7 @@ fn interrupted_turn_comes_back_idle_not_failed() {
         cwd: std::path::PathBuf::from("/w"),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     });
     let observed = feed(&mut adapter, lines);
     let aborted = observed
@@ -155,6 +157,7 @@ fn a_foreign_abort_reason_does_not_end_the_turn() {
         cwd: std::path::PathBuf::from("/w"),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     });
     let observed = feed(&mut adapter, lines);
     assert!(
@@ -177,6 +180,7 @@ fn completed_items_map_messages_and_a_late_tool_result_keeps_the_old_turn() {
         cwd: std::path::PathBuf::from("/w"),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     });
     let observed = feed(&mut adapter, lines);
     // The late result carries the OLD turn id t1 (evidence ordinal 86).
@@ -216,6 +220,7 @@ fn duplicate_representations_do_not_double_journal() {
         cwd: std::path::PathBuf::from("/w"),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     });
     let observed = feed(&mut adapter, lines);
     let messages = observed
@@ -242,6 +247,7 @@ fn usage_events_produce_turn_and_session_snapshots_at_turn_end() {
         cwd: std::path::PathBuf::from("/w"),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     });
     let observed = feed(&mut adapter, lines);
     let usages: Vec<_> = observed
@@ -303,6 +309,7 @@ fn discovery_refuses_to_invent_a_session_when_the_index_is_empty() {
         cwd: dir.path().to_path_buf(),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     });
     assert!(adapter.poll().unwrap().is_empty());
     assert!(adapter.binding().is_none());
@@ -330,6 +337,7 @@ fn a_newline_terminated_partial_line_is_held_until_complete() {
         cwd: dir.path().to_path_buf(),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     });
     adapter.confirm_session(session);
     assert!(adapter.poll().unwrap().is_empty(), "partial line held");
@@ -413,6 +421,7 @@ fn a_driver_launch_binds_only_its_own_post_launch_same_cwd_rollout() {
         cwd: cwd.to_path_buf(),
         pid: None,
         launched_at: Some(floor),
+        resume_session_id: None,
     })
     .with_instance_key(Some(INST_A.to_owned()));
 
@@ -473,6 +482,7 @@ fn two_post_launch_same_cwd_rollouts_stay_unbound_then_resolve_when_unique() {
         cwd: cwd.to_path_buf(),
         pid: None,
         launched_at: Some(floor),
+        resume_session_id: None,
     })
     .with_instance_key(Some(INST_A.to_owned()));
     assert!(!adapter.discover().unwrap(), "two candidates bind nothing");
@@ -512,6 +522,7 @@ fn a_rollout_appearing_long_after_launch_binds_when_the_first_prompt_is_late() {
         cwd: cwd.to_path_buf(),
         pid: None,
         launched_at: Some(floor),
+        resume_session_id: None,
     })
     .with_instance_key(Some(INST_A.to_owned()));
     assert!(!adapter.discover().unwrap());
@@ -555,6 +566,7 @@ fn a_fresh_file_carrying_a_pre_launch_session_never_binds() {
         cwd: Path::new("/projects/alpha-r4old").to_path_buf(),
         pid: None,
         launched_at: Some(floor),
+        resume_session_id: None,
     });
     let old = (floor - time::Duration::seconds(600))
         .format(&Rfc3339)
@@ -616,6 +628,7 @@ fn launch_adapter_keyed(home: &Path, cwd: &str, floor: OffsetDateTime, key: &str
         cwd: Path::new(cwd).to_path_buf(),
         pid: None,
         launched_at: Some(floor),
+        resume_session_id: None,
     })
     .with_instance_key(Some(key.to_owned()))
 }
@@ -1704,6 +1717,7 @@ fn a_pending_launch_window_survives_another_window_releasing_before_adapter_buil
         cwd: PathBuf::from(cwd),
         pid: None,
         launched_at: Some(t_boundary),
+        resume_session_id: None,
     })
     .with_lifetime(b_lifetime.witness())
     .with_window(b_window)
@@ -1896,6 +1910,7 @@ fn a_window_releasing_inside_a_pending_launch_registration_cannot_prune_its_inte
         cwd: PathBuf::from(cwd),
         pid: None,
         launched_at: Some(t_b),
+        resume_session_id: None,
     })
     .with_lifetime(b_lifetime.witness())
     .with_window(b_window)
@@ -2015,6 +2030,7 @@ fn a_launch_blocked_before_the_lock_samples_its_boundary_after_a_close_and_refus
         cwd: PathBuf::from(cwd),
         pid: None,
         launched_at: Some(b_pending.launched_at),
+        resume_session_id: None,
     })
     .with_lifetime(b_lifetime.witness())
     .with_window(b_window)
@@ -2183,6 +2199,7 @@ fn a_resumed_instance_discovers_through_real_adapters_without_bridging_the_gap()
         cwd: PathBuf::from(cwd),
         pid: None,
         launched_at: Some(t100),
+        resume_session_id: None,
     })
     .with_lifetime(resumed.witness())
     .with_instance_key(Some(INST_A.to_owned()));
@@ -2597,6 +2614,7 @@ fn two_real_scans_race_one_claim_and_the_loser_binds_its_own_file() {
         cwd: PathBuf::from(cwd),
         pid: None,
         launched_at: Some(floor),
+        resume_session_id: None,
     })
     .with_lifetime(crate::adapters::codex_discovery::begin_lifetime(
         Path::new(cwd),
@@ -2613,6 +2631,7 @@ fn two_real_scans_race_one_claim_and_the_loser_binds_its_own_file() {
         cwd: PathBuf::from(cwd),
         pid: None,
         launched_at: Some(floor),
+        resume_session_id: None,
     })
     .with_lifetime(crate::adapters::codex_discovery::begin_lifetime(
         Path::new(cwd),
@@ -2781,6 +2800,7 @@ fn promoted_adapter_drop_releases_claim_after_unlink_with_exact_key() {
         cwd: home_path.clone(),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     });
     let mut adapter = adapter;
     assert!(adapter.discover().unwrap());
@@ -2976,12 +2996,14 @@ fn two_promoted_adapters_cannot_co_claim_the_same_indexed_session() {
         cwd: cwd.to_path_buf(),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     });
     let mut second = CodexAdapter::new(AdapterHome {
         home: home.path().to_path_buf(),
         cwd: cwd.to_path_buf(),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     });
     assert!(first.discover().unwrap(), "first promoted adapter binds");
     assert!(
@@ -3024,6 +3046,7 @@ fn stable_instance_key_reclaims_after_close_and_resume() {
             cwd: cwd.to_path_buf(),
             pid: None,
             launched_at: None,
+            resume_session_id: None,
         })
         .with_instance_key(Some(stable_key.to_owned()));
         assert!(first.discover().unwrap());
@@ -3040,6 +3063,7 @@ fn stable_instance_key_reclaims_after_close_and_resume() {
         cwd: cwd.to_path_buf(),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     })
     .with_instance_key(Some("ins-other".to_owned()));
     assert!(!foreign.discover().unwrap());
@@ -3050,6 +3074,7 @@ fn stable_instance_key_reclaims_after_close_and_resume() {
         cwd: cwd.to_path_buf(),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     })
     .with_instance_key(Some(stable_key.to_owned()));
     assert!(
@@ -3276,6 +3301,7 @@ fn a_duplicate_usage_record_emits_only_one_message_observation() {
         cwd: PathBuf::from("/w"),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     });
     let first = adapter.on_line(1, "dup-fixture", 0, &line(1));
     let second = adapter.on_line(2, "dup-fixture", 120, &line(2));
@@ -3309,6 +3335,7 @@ fn a_usage_record_without_response_id_emits_a_durable_message_identity() {
         cwd: PathBuf::from("/w"),
         pid: None,
         launched_at: None,
+        resume_session_id: None,
     });
 
     let obs = adapter.on_line(7, "rollout-F", 412, &line(7, "t1"));
@@ -3380,6 +3407,7 @@ fn a_byte_zero_replay_of_a_real_rollout_keeps_durable_response_identities() {
             cwd: home.to_path_buf(),
             pid: None,
             launched_at: Some(OffsetDateTime::now_utc()),
+            resume_session_id: None,
         })
         .with_instance_key(Some("replay-instance".to_owned()));
         adapter.bind_rollout("s-bo", path.clone());
@@ -3437,4 +3465,112 @@ fn a_byte_zero_replay_of_a_real_rollout_keeps_durable_response_identities() {
         replayed_ids[1].contains(&format!(":v2:{offset_of_t2}:")),
         "t2 id {replayed_ids:?} carries byte offset {offset_of_t2}"
     );
+}
+
+/// Write a rollout with an explicit session_meta timestamp/cwd (c-usagefu
+/// r15 item 3 resume-by-id tests).
+fn r15_write_rollout(home: &Path, id: &str, cwd: &str, at: &str) -> PathBuf {
+    let session_dir = home.join("sessions/2026/10/01");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let path = session_dir.join(format!("rollout-{id}.jsonl"));
+    std::fs::write(
+        &path,
+        format!(
+            "{{\"timestamp\":\"{at}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"session_id\":\"{id}\",\"cwd\":\"{cwd}\",\"timestamp\":\"{at}\"}}}}\n"
+        ),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn a_resumed_launch_binds_the_named_pre_floor_rollout_and_refuses_every_other_file() {
+    // c-usagefu r15 item 3: a real `codex resume <id>` appends to the EXISTING
+    // rollout, whose session_meta.timestamp is the original start — before the
+    // resume floor. The resumed adapter binds that file BY ID (cwd verified),
+    // not by the timestamp scan, and never binds another pre-floor file in the
+    // same cwd.
+    use time::Duration;
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    let home = tempfile::tempdir().unwrap();
+    let original_start = OffsetDateTime::now_utc() - Duration::seconds(3600);
+    r15_write_rollout(
+        home.path(),
+        "r15-resume-session",
+        "/r15item3",
+        &original_start.format(&Rfc3339).unwrap(),
+    );
+    // A DIFFERENT pre-floor session, same cwd — indistinguishable to the
+    // timestamp floor (both are before it); only the id may decide.
+    r15_write_rollout(
+        home.path(),
+        "r15-other-session",
+        "/r15item3",
+        &(original_start + Duration::seconds(10))
+            .format(&Rfc3339)
+            .unwrap(),
+    );
+
+    let mut adapter = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: "/r15item3".into(),
+        pid: None,
+        launched_at: Some(OffsetDateTime::now_utc()),
+        resume_session_id: Some("r15-resume-session".to_owned()),
+    })
+    .with_instance_key(Some("r15-item3-owner".to_owned()));
+
+    assert!(
+        adapter.discover().unwrap(),
+        "the resumed session binds by id even though its header predates the floor"
+    );
+    assert_eq!(
+        adapter.binding().unwrap().session_id,
+        "r15-resume-session",
+        "the other pre-floor file is refused"
+    );
+}
+
+#[test]
+fn a_named_resume_rollout_in_another_cwd_fails_closed_without_guessing() {
+    // c-usagefu r15 item 3: the located rollout's cwd must still match; a
+    // name-index/homedir collision must never bind a foreign-cwd session under
+    // the resume instruction, and discovery never falls through to the
+    // same-cwd file or the name-index guess.
+    use time::Duration;
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    let home = tempfile::tempdir().unwrap();
+    let original_start = OffsetDateTime::now_utc() - Duration::seconds(3600);
+    // The named session lives in a DIFFERENT cwd.
+    r15_write_rollout(
+        home.path(),
+        "r15-foreign-session",
+        "/somewhere-else",
+        &original_start.format(&Rfc3339).unwrap(),
+    );
+    // A same-cwd session the floor scan would otherwise be tempted by.
+    r15_write_rollout(
+        home.path(),
+        "r15-samecwd-session",
+        "/r15item3",
+        &original_start.format(&Rfc3339).unwrap(),
+    );
+
+    let mut adapter = CodexAdapter::new(AdapterHome {
+        home: home.path().to_path_buf(),
+        cwd: "/r15item3".into(),
+        pid: None,
+        launched_at: Some(OffsetDateTime::now_utc()),
+        resume_session_id: Some("r15-foreign-session".to_owned()),
+    });
+
+    assert!(
+        !adapter.discover().unwrap(),
+        "a foreign-cwd named session is refused, with no index/floor fallback"
+    );
+    assert!(adapter.binding().is_none(), "nothing else is bound");
 }

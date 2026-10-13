@@ -3086,56 +3086,243 @@ it("an aborted claim on the first queued row keeps FIFO: a later row is not POST
   expect(send.mock.calls[0]?.[4]).toBe("cmd_a_abort");
   hubStore.logout();
 });
-
-it("GATE22 item 4 (rebuilds gate-21 item-1a): two real stores — B blocked past 250 ms, A's wake-driven flush loses its suppressed IX read with the IY turn queued and recovery consumed covered; after release only the scoped epilogue re-arms R; real flows deliver every row", async () => {
-  // Rebuild of the gate-21 item-1a regression per RULES. The old outbox.test
-  // version drove bare Outboxes by hand (manual beginDeliveryPass /
-  // endDeliveryPasses, a hand-held lock, a vi.fn handoff) and stopped with A's
-  // row still PENDING. Here TWO real HubStores share one localStorage backend
-  // behind the FIFO Web Locks shim and every transition is a real delivery
-  // flow. The harness gates only WHEN flushes START (timing, never storage):
-  // the two SEND flushes and every wake flush but the first park; the FIRST
-  // wake flush (R's own registered deliver wake) runs for real and is the
-  // flush under test:
-  //  - B's real POST for S (IY) blocks inside the instance lock;
-  //  - A enqueues R (IX); R's wake fires (T does not exist yet, so the fire
-  //    reconciles no other row) and its guarded flush starts ONLY after T is
-  //    enqueued: snapshot [R,T pending, S live-inflight by B], pass covers
-  //    IX+IY; the suppressed in-lock read on IX aborts while S is unsent
-  //    (fault at A's real storage adapter) and the IY turn QUEUES behind B —
-  //    flush and scoped suppression stay alive. T's own wake fires LATER,
-  //    while IX is already covered, so its reconcile cannot cross-arm R (the
-  //    discovery branch skips covered instances), and that wake flush parks;
-  //  - fake time advances 400 ms while B is blocked: the bounded recovery
-  //    read is consumed under the live suppression, arms nothing, chain ends;
-  //  - the user REALLY retracts queued T while the IY turn is queued; after B
-  //    is released the queued turn finds T gone and posts NOTHING, so the
-  //    flush ends without another pass. With the gate-21 epilogue REMOVED
-  //    nothing re-reads: R strands; real code's scoped epilogue arms R's one
-  //    bounded wake;
-  //  - B's own drain claims R and fails it at the API boundary (POST + status
-  //    GET), restores R lease-less pending, and closes between passes;
-  //  - A's REAL epilogue-registered timer is the only remaining trigger:
-  //    same-command delivery of R. Final calls exactly B:[S, R-failed]
-  //    A:[R]; S and R durably sent, T deleted by the real retract.
+it("GATE23 item 4 (rebuilds gate-21 item-1a): two real stores — B blocks on S holding IY; A's parked flush loses R's claim while covered and its recovery is consumed suppressed; after B releases and T is really retracted, the scoped epilogue re-arms R and A's real timer delivers it", async () => {
+  // Rebuilt per gate-23 RULES: the gate-22 version REPLACED flushAllOutbox on
+  // A and choreographed flush #1/#2 by ERROR STACK ("fireLeaseWake") and call
+  // ordinals, and gated storage.all by stack string. Here flushAllOutbox,
+  // onClaimWake and every delivery callback are the REAL methods; the harness
+  // controls only (a) B's API-boundary POST via a promise gate and (b) A's
+  // real claim transaction by command id and DURABLE STATE. Every durable row
+  // comes from a real enqueue/claim flow.
+  //
+  // B sends S (IY); its real POST blocks holding the IY Web Lock. A really
+  // enqueues R (IX) and T (IY) while B holds that lock; the claim-fault is
+  // armed on A's real storage BEFORE the enqueues. The rows' registered
+  // deliver wakes fire: R's wake (its IX lock is free) starts the real guarded
+  // flush which covers IX+IY in one pass; the IY turn queues behind B while
+  // R's claim genuinely aborts (injected at A's real merge, while S is durably
+  // not sent), and the bounded 250 ms recovery is consumed under the live pass
+  // suppression. T's own fire queues on the held IY lock. The user REALLY
+  // retracts T (durable delete). When B releases, S settles and B closes
+  // before its pass 1 (its queued turns read empty behind A's); A's queued IY
+  // turn finds T gone and posts nothing; the pass posts nothing at all.
+  // Pre-gate-21 its finally only CLEARED suppression and R stranded; the
+  // scoped epilogue now releases and re-reads, arming R's one wake — R is
+  // delivered by A's real timer. Final calls exactly B:[S] A:[R].
   vi.useFakeTimers();
   vi.setSystemTime(900_000);
-  const ownerA = "owner_g22_i4_a";
-  const ownerB = "owner_g22_i4_b";
-  const IX = "ins_g22_i4_x";
-  const IY = "ins_g22_i4_y";
+  const ownerA = "owner_g23_i4_a";
+  const ownerB = "owner_g23_i4_b";
+  const IX = "ins_g23_i4_x";
+  const IY = "ins_g23_i4_y";
   const originalNavigator = globalThis.navigator;
   const shim = fifoWebLocks();
-  const realQuery = shim.locks.query;
-  shim.locks.query = async () => {
-    throw new Error("locks.query unavailable during load");
-  };
   Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: shim.locks } });
   localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
   const pump = async (n = 2_000) => {
     for (let i = 0; i < n; i += 1) await Promise.resolve();
   };
-  const lockName = (iid: string) => `remuda-outbox-${iid}`;
+  const accepted = (commandId: string) => ({
+    relatedCommandIds: [],
+    command: {
+      commandId,
+      id: commandId,
+      state: "accepted",
+      revision: "1",
+      dispatch: "native-acknowledged",
+      resolution: "clear",
+    },
+  });
+  try {
+    // B boots first and sends S: real claim, POST pending inside IY.
+    sessionStorage.setItem("remuda-outbox-owner", ownerB);
+    const { api: apiB, hubStore: b } = await fresh();
+    vi.spyOn(apiB, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(apiB, "screenRead").mockResolvedValue({ lines: [] });
+    const sendB = vi.spyOn(apiB, "instanceSend");
+    await bootLive(apiB, b);
+    let releaseB: (() => void) | null = null;
+    const bGate = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
+    sendB.mockImplementation(
+      (async (iid: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => {
+        if (iid === IY) {
+          await bGate; // S blocked holding IY
+          return accepted(commandId ?? "cmd_x");
+        }
+        throw new Error("g23-i4 B never POSTs another instance");
+      }) as unknown as Api["instanceSend"],
+    );
+    void b.send(IY, "g23 4 S");
+    for (let i = 0; i < 2_000 && sendB.mock.calls.length === 0; i += 1) await Promise.resolve();
+    const sId = sendB.mock.calls[0]?.[4] as string;
+    expect(sId).toBeTruthy();
+
+    // A boots (its empty boot flush posts nothing) and goes OFFLINE.
+    sessionStorage.setItem("remuda-outbox-owner", ownerA);
+    const { api: apiA, hubStore: a } = await fresh();
+    vi.spyOn(apiA, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(apiA, "screenRead").mockResolvedValue({ lines: [] });
+    const sendA = vi.spyOn(apiA, "instanceSend").mockImplementation(
+      (async (_iid: string, _p: string, _x?: unknown, _m?: string, commandId?: string) =>
+        accepted(commandId ?? "cmd_x")) as unknown as Api["instanceSend"],
+    );
+    await bootLive(apiA, a);
+    await pump(500);
+
+    const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    const rowOf = (prompt: string) => storedRows().find((r) => r.prompt === prompt);
+
+    // Fault at A's REAL claim transaction, armed BEFORE any enqueue: every R
+    // claim aborts BEFORE commit while S is durably not sent. Gated solely on
+    // the real durable row (prompt lookup) and durable state — no stack
+    // inspection, no ordinals, no storage writes.
+    const aStorage = (
+      a as unknown as {
+        outbox: {
+          storage: {
+            mergeUnlessDone: (
+              id: string,
+              patch: Partial<OutboxRecord>,
+            ) => Promise<OutboxRecord | null>;
+          };
+        };
+      }
+    ).outbox.storage;
+    const realMergeA = aStorage.mergeUnlessDone.bind(aStorage);
+    let claimFaults = 0;
+    aStorage.mergeUnlessDone = vi.fn(async (id, patch) => {
+      const existing = storedRows().find((r) => r.commandId === id);
+      if (
+        id.startsWith("cmd_") &&
+        (patch as { state?: string }).state === "inflight" &&
+        existing?.prompt === "g23 4 R" &&
+        rowOf("g23 4 S")?.state !== "sent"
+      ) {
+        claimFaults += 1;
+        throw new Error("g23-i4 R claim abort while S is unsent");
+      }
+      return await realMergeA(id, patch);
+    });
+
+    // R and T are really enqueued (awaited); their registered deliver wakes
+    // are the only triggers, and R's real claims hit the fault.
+    expect(await a.send(IX, "g23 4 R")).toBe(true);
+    expect(await a.send(IY, "g23 4 T")).toBe(true);
+    await pump(500);
+    const rId = rowOf("g23 4 R")!.commandId;
+    const tBubble = a.getSnapshot().bubbles.find((x) => x.text === "g23 4 T")!;
+    expect(rowOf("g23 4 T")?.state).toBe("pending");
+    expect(sendA).not.toHaveBeenCalled();
+
+    // R's real wake fires: the real flush covers IX+IY; R's claim aborts and
+    // the IY turn queues behind blocked B. T's real fire queues on the lock.
+    await vi.advanceTimersByTimeAsync(1);
+    await pump(2_000);
+    expect(claimFaults).toBeGreaterThanOrEqual(1);
+
+    // Advance past the bounded recovery while B stays blocked: the 250 ms read
+    // is consumed under the live pass suppression — it arms nothing, and no
+    // POST runs. R never committed a claim (still lease-less, one attempt).
+    await vi.advanceTimersByTimeAsync(2_000);
+    await pump(2_000);
+    expect(sendA).not.toHaveBeenCalled();
+    expect(sendB).toHaveBeenCalledTimes(1);
+    expect(rowOf("g23 4 R")?.state).toBe("pending");
+    expect(rowOf("g23 4 R")?.lease).toBeUndefined();
+    const aBox = (a as unknown as { outbox: { pendingLeaseWakeups: () => string[] } }).outbox;
+    expect(aBox.pendingLeaseWakeups()).not.toContain(rId);
+
+    // The user REALLY retracts queued T while the IY turn is queued.
+    await a.retract(tBubble.clientRequestId);
+    await pump(1_000);
+    expect(rowOf("g23 4 T")).toBeUndefined();
+    expect(sendA).not.toHaveBeenCalled();
+
+    // Release B: S settles; A's queued IY turns read T gone and post nothing;
+    // the pass posted nothing at all. Its scoped epilogue re-arms R's one
+    // wake (the claim fault clears once S is sent), and A's REAL timer
+    // delivers R under the same command id.
+    releaseB!();
+    // Let B's REAL flow settle S durably; B's pass-1 turns are queued on the
+    // FIFO Web Lock BEHIND A's turn that parked during the block. Close B the
+    // instant S commits: its queued turns then read an empty selection (and
+    // the flush loop bails on the replaced outbox), so B never drains R.
+    for (let i = 0; i < 2_000 && rowOf("g23 4 S")?.state !== "sent"; i += 1) {
+      await Promise.resolve();
+    }
+    b.logout();
+    // A's parked turn completes, the scoped epilogue re-arms R (claim fault
+    // cleared once S is sent), and A's REAL timer delivers R.
+    for (let i = 0; i < 400 && sendA.mock.calls.length === 0; i += 1) {
+      await vi.advanceTimersByTimeAsync(25);
+      await Promise.resolve();
+    }
+    expect(sendB.mock.calls.map((c) => c[4])).toEqual([sId]);
+    expect(sendA.mock.calls.map((c) => c[4])).toEqual([rId]);
+    expect(rowOf("g23 4 S")?.state).toBe("sent");
+    expect(rowOf("g23 4 R")?.state).toBe("sent");
+    expect(rowOf("g23 4 T")).toBeUndefined();
+
+    // Far past every deadline: exactly the combined calls, no duplicates.
+    await vi.advanceTimersByTimeAsync(120_000);
+    await pump(2_000);
+    expect(sendB.mock.calls.map((c) => c[4])).toEqual([sId]);
+    expect(sendA.mock.calls.map((c) => c[4])).toEqual([rId]);
+    a.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE23 item 5 (rebuilds gate-21 item-2): B's REAL blocked claims leave X with a 10 s lease and Y with a 30 s lease; B finishes X and restores Y pending before A boots; advancing only to X's deadline, A delivers Y 20 s before Y's own deadline", async () => {
+  // Rebuilt per gate-23 RULES: the gate-22 version SEEDED two handcrafted
+  // inflight rows/leases in localStorage. Here EVERY row and lease comes from
+  // B's REAL enqueue/claim flow. B runs without Web Locks (durable row lease
+  // is the single-deliverer boundary): its real X claim at t0 blocks in the
+  // POST with a 30 s lease; fake time advances 20 s; B's real Y claim blocks
+  // with a fresh 30 s lease (deadline t+50 s). A then boots WITH Web Locks —
+  // B never held any — so its real boot flush reads immediately: both rows
+  // carry B's LIVE row leases (X deadline t+30 s, Y deadline t+50 s), nothing
+  // is deliverable, and the central reconciliation arms both deadline wakes.
+  // B's blocked POSTs then settle for real: X accepted (sent); Y fails at the
+  // API boundary (POST rejects AND status GET rejects) and is restored
+  // lease-less pending, all near t+20 s; B closes with its pinned jittered
+  // retry cancelled. Advancing fake time ONLY to X's deadline: A's real X fire
+  // is the trigger — its authoritative read sees X sent and Y PENDING and
+  // arms Y's one 0 ms wake, whose real fire hands A's guarded flush Y, ~20 s
+  // before Y's own lease deadline. Combined API calls exactly B:[X, Y] A:[Y].
+  vi.useFakeTimers();
+  vi.setSystemTime(1_000_000);
+  const ownerA = "owner_g23_i5_a";
+  const ownerB = "owner_g23_i5_b";
+  const IX = "ins_g23_i5_x";
+  const IY = "ins_g23_i5_y";
+  const originalNavigator = globalThis.navigator;
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  // No Web Locks for B: the durable lease path. Switched to the FIFO shim
+  // before A boots.
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks: undefined },
+  });
   try {
     sessionStorage.setItem("remuda-outbox-owner", ownerB);
     const { api: apiB, hubStore: b } = await fresh();
@@ -3146,292 +3333,69 @@ it("GATE22 item 4 (rebuilds gate-21 item-1a): two real stores — B blocked past
       reachedAfterSeq: true,
     });
     vi.spyOn(apiB, "screenRead").mockResolvedValue({ lines: [] });
-    vi.spyOn(apiB, "instanceCommandStatus").mockRejectedValue(new Error("status network down"));
-    const sendB = vi.spyOn(apiB, "instanceSend");
-    await bootLive(apiB, b);
-    shim.locks.query = realQuery;
-
-    sessionStorage.setItem("remuda-outbox-owner", ownerA);
-    const { api: apiA, hubStore: a } = await fresh();
-    vi.spyOn(apiA, "eventsRead").mockResolvedValue({
-      events: [],
-      durableSeq: "0",
-      windowFromSeq: null,
-      reachedAfterSeq: true,
+    vi.spyOn(apiB, "instanceCommandStatus").mockRejectedValue(new Error("g23-i5 status network down"));
+    let releaseX: (() => void) | null = null;
+    const xGate = new Promise<void>((resolve) => {
+      releaseX = resolve;
     });
-    vi.spyOn(apiA, "screenRead").mockResolvedValue({ lines: [] });
-    const sendA = vi.spyOn(apiA, "instanceSend");
-    await bootLive(apiA, a);
-    await (a as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
-    await (b as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
-    vi.spyOn(Math, "random").mockReturnValue(0.999);
-
-    // Flush-start gates: send-triggered flushes park; the FIRST wake-triggered
-    // flush (R's own wake) runs on its own gate; every later flush parks until
-    // the scenario is over.
-    let resolveFirstWakeFlush: (() => void) | null = null;
-    const firstWakeFlushGate = new Promise<void>((resolve) => {
-      resolveFirstWakeFlush = resolve;
+    let releaseY: (() => void) | null = null;
+    const yGate = new Promise<void>((resolve) => {
+      releaseY = resolve;
     });
-    let resolveRecoveryFlush: (() => void) | null = null;
-    const recoveryFlushGate = new Promise<void>((resolve) => {
-      resolveRecoveryFlush = resolve;
-    });
-    let resolveParkedFlushes: (() => void) | null = null;
-    const parkedFlushesGate = new Promise<void>((resolve) => {
-      resolveParkedFlushes = resolve;
-    });
-    const aInternals = a as unknown as { flushAllOutbox: () => Promise<void> };
-    const realFlushA = aInternals.flushAllOutbox.bind(aInternals);
-    let wakeFlushes = 0;
-    aInternals.flushAllOutbox = (() => {
-      const fromWake = new Error("st").stack?.includes("fireLeaseWake");
-      if (fromWake) {
-        wakeFlushes += 1;
-        // Ordinal choreography: #1 = R's first wake (the flush under test);
-        // T's own wake is cancelled by the real retract, so #2 is R's
-        // scoped-epilogue recovery wake; anything later parks to the end.
-        if (wakeFlushes === 1) return firstWakeFlushGate.then(() => realFlushA());
-        if (wakeFlushes === 2) return recoveryFlushGate.then(() => realFlushA());
-      }
-      return parkedFlushesGate.then(() => realFlushA());
-    }) as typeof aInternals.flushAllOutbox;
-
-    // Suppressed in-lock reads on IX abort while B's S is unsent; fire reads
-    // (no suppression) and reads once S sent / outside IX pass untouched.
-    // Park epilogue/recovery reads (anything not under a delivery lock and
-    // not the flush's own snapshot read) between T's enqueue and the moment
-    // flush 1's scoped cover is established — otherwise T's post-commit
-    // epilogue reconciles BEFORE the flush suppresses and would cross-arm a
-    // fresh R wake, exactly the redundant-trigger path the gate-21 hand test
-    // excluded by construction.
-    let parkEpilogueReads = false;
-    let resolveEpilogueReads: (() => void) | null = null;
-    let epilogueReadsGate: Promise<void> | null = null;
-    const aBoxInternals = a as unknown as {
-      outbox: {
-        storage: { all: () => Promise<OutboxRecord[]> };
-        deliverySuppressed: Map<string, number>;
-      };
-    };
-    const realAllA = aBoxInternals.outbox.storage.all.bind(aBoxInternals.outbox.storage);
-    let suppressedFaults = 0;
-    aBoxInternals.outbox.storage.all = vi.fn((() => {
-      const syncStack = new Error("st").stack ?? "";
-      return (async () => {
-        const held = (await shim.locks.query()).held.map((h) => h.name);
-        // Park only post-commit / bounded-recovery reads (they enter via
-        // attemptReadRecovery): the flush snapshot, the in-lock deliverer
-        // read and the timer-fire read all proceed on their own timing.
-        if (parkEpilogueReads && syncStack.includes("attemptReadRecovery") && epilogueReadsGate) {
-          await epilogueReadsGate;
+    const sendB = vi.spyOn(apiB, "instanceSend").mockImplementation(
+      (async (_iid: string, prompt: string, _x?: unknown, _m?: string, commandId?: string) => {
+        if (prompt === "g23 5 x") {
+          await xGate;
+          return {
+            relatedCommandIds: [],
+            command: {
+              commandId,
+              id: commandId,
+              state: "accepted",
+              revision: "1",
+              dispatch: "native-acknowledged",
+              resolution: "clear",
+            },
+          };
         }
-        const sState = (JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[]).find(
-          (r) => r.prompt === "gate22 4 S",
-        )?.state;
-        if (held.includes(lockName(IX)) && sState !== "sent" && aBoxInternals.outbox.deliverySuppressed.has(IX)) {
-          suppressedFaults += 1;
-          throw new Error("g22-i4 suppressed in-lock read abort while sibling blocked");
-        }
-        return await realAllA();
-      })();
-    }) as typeof aBoxInternals.outbox.storage.all);
-
-    let releaseB: (() => void) | null = null;
-    const bGate = new Promise<void>((resolve) => {
-      releaseB = resolve;
-    });
-    const accepted = (commandId: string) => ({
-      relatedCommandIds: [],
-      command: {
-        commandId,
-        id: commandId,
-        state: "accepted",
-        revision: "1",
-        dispatch: "native-acknowledged",
-        resolution: "clear",
-      },
-    });
-    sendB.mockImplementation(
-      (async (iid: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => {
-        if (iid === IY && sendB.mock.calls.length === 1) {
-          await bGate; // S: blocked holding IY
-          return accepted(commandId ?? "cmd_x");
-        }
-        throw new Error("g22-i4 B boundary POST failure");
+        await yGate;
+        throw new Error("g23 5 boundary POST failure");
       }) as unknown as Api["instanceSend"],
     );
-    sendA.mockImplementation(
-      (async (_iid: string, _p: string, _x?: unknown, _m?: string, commandId?: string) =>
-        accepted(commandId ?? "cmd_x")) as unknown as Api["instanceSend"],
-    );
-
-    // 1) B sends S: real claim, POST pending inside IY.
-    void b.send(IY, "gate22 4 S");
-    for (let i = 0; i < 2_000 && sendB.mock.calls.length === 0; i += 1) await Promise.resolve();
-    const sId = sendB.mock.calls[0]?.[4] as string;
-    expect(sId).toBeTruthy();
-
-    // 2) A enqueues R; its send flush parks; R's deliver wake is registered.
-    void a.send(IX, "gate22 4 R");
+    // Pin B's store-retry jitter high; B closes before the retry can fire.
+    vi.spyOn(Math, "random").mockReturnValue(0.999);
+    await bootLive(apiB, b);
     const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
-    const rowOf = (prompt: string) => storedRows().find((r) => r.prompt === prompt);
-    for (let i = 0; i < 2_000 && !rowOf("gate22 4 R"); i += 1) await Promise.resolve();
-    const rId = rowOf("gate22 4 R")!.commandId;
+    const row = (id: string) => storedRows().find((r) => r.commandId === id);
+
+    // X's real claim at t0: POST blocked, live 30 s lease.
+    void b.send(IX, "g23 5 x");
+    for (let i = 0; i < 2_000 && sendB.mock.calls.length === 0; i += 1) await Promise.resolve();
+    const xId = sendB.mock.calls[0]?.[4] as string;
     await pump(500);
+    expect(row(xId)?.state).toBe("inflight");
+    expect(row(xId)?.lease?.owner).toBe(ownerB);
+    expect(row(xId)!.lease!.until - Date.now()).toBeGreaterThan(25_000);
 
-    // 3) R's wake fires while T does not exist: its flush parks at the
-    //    one-shot gate (nothing else is reconciled at that fire).
-    await vi.advanceTimersByTimeAsync(1);
-    for (let i = 0; i < 2_000 && wakeFlushes < 1; i += 1) await Promise.resolve();
-    expect(wakeFlushes).toBe(1);
+    // 20 s pass while X is still blocked (gates do not move with fake time).
+    await vi.advanceTimersByTimeAsync(20_000);
 
-    // 4) T is enqueued NOW with epilogue reads parked; its send flush parks.
-    //    Release R's wake flush: its own snapshot read passes the park (it is
-    //    the flush's read), covers IX+IY, the IX read faults and the IY turn
-    //    queues — THEN T's parked epilogue is released into a covered world,
-    //    where its reconcile cannot cross-arm R.
-    parkEpilogueReads = true;
-    epilogueReadsGate = new Promise<void>((resolve) => {
-      resolveEpilogueReads = resolve;
+    // Y's real claim at t+20 s: fresh live 30 s lease, deadline t+50 s.
+    void b.send(IY, "g23 5 y");
+    for (let i = 0; i < 2_000 && sendB.mock.calls.length < 2; i += 1) await Promise.resolve();
+    const yId = sendB.mock.calls[1]?.[4] as string;
+    await pump(500);
+    expect(row(yId)?.state).toBe("inflight");
+    expect(row(yId)!.lease!.until - Date.now()).toBeGreaterThan(25_000);
+    expect(sendB.mock.calls.map((c) => c[4])).toEqual([xId, yId]);
+
+    // A boots WITH Web Locks (B never held any): its real flush reads both
+    // live B leases, posts nothing and tracks both lease deadlines.
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      writable: true,
+      value: { locks: fifoWebLocks().locks },
     });
-    void a.send(IY, "gate22 4 T");
-    for (let i = 0; i < 2_000 && !rowOf("gate22 4 T"); i += 1) await Promise.resolve();
-    resolveFirstWakeFlush!();
-    for (let i = 0; i < 5_000 && suppressedFaults < 1; i += 1) await Promise.resolve();
-    expect(suppressedFaults).toBeGreaterThanOrEqual(1);
-    resolveEpilogueReads!();
-    parkEpilogueReads = false;
-    await pump(3_000);
-    const tBubble = a.getSnapshot().bubbles.find((x) => x.text === "gate22 4 T")!;
-    expect(sendA).not.toHaveBeenCalled();
-    expect(sendB).toHaveBeenCalledTimes(1);
-
-    // 5) Past the bounded recovery delays while B is blocked, with T's own
-    //    deliver wake still registered (fake time parked, no timer fires): the
-    //    recovery reads are consumed under suppression and arm nothing.
-    await vi.advanceTimersByTimeAsync(1_000);
-    await pump(3_000);
-    expect(sendB).toHaveBeenCalledTimes(1);
-    expect(sendA).not.toHaveBeenCalled();
-    expect((a as unknown as { outbox: { pendingLeaseWakeups: () => string[] } }).outbox.pendingLeaseWakeups()).not.toContain(rId);
-
-    // 6) The user REALLY retracts queued T while the IY turn is queued: its
-    //    registered wake is cancelled BEFORE it can fire, so no later fire
-    //    reconciles R past the flush's end.
-    await a.retract(tBubble.clientRequestId);
-    expect(rowOf("gate22 4 T")).toBeUndefined();
-    await pump(2_000);
-    expect(sendA).not.toHaveBeenCalled();
-
-    // 7) Release B: S settles; A's queued turn comes back empty and the flush
-    //    ends (scoped epilogue is the ONLY remaining R cover); B's drain
-    //    claims R and fails it at the boundary. Close B between passes.
-    releaseB!();
-    for (let i = 0; i < 10_000 && sendB.mock.calls.length < 2; i += 1) await Promise.resolve();
-    for (let i = 0; i < 10_000 && rowOf("gate22 4 R")?.state !== "pending"; i += 1) await Promise.resolve();
-    b.logout();
-    await pump(1_000);
-    expect(sendB.mock.calls.map((c) => c[4])).toEqual([sId, rId]);
-    expect(sendA).not.toHaveBeenCalled();
-    expect(rowOf("gate22 4 S")?.state).toBe("sent");
-    expect(rowOf("gate22 4 R")?.state).toBe("pending");
-    expect(rowOf("gate22 4 R")?.lease).toBeUndefined();
-
-    // 8) A's REAL scoped-epilogue timer is the only remaining trigger for R
-    //    (deliver wake or, if the epilogue read raced B's drain claim, the one
-    //    30 s lease-deadline wake — allow for the longer arm). Let its wake
-    //    flush (the third wake flush) run for real.
-    resolveRecoveryFlush!();
-    for (let i = 0; i < 400 && sendA.mock.calls.length === 0; i += 1) {
-      await vi.advanceTimersByTimeAsync(100);
-    }
-    expect(sendA.mock.calls.map((c) => c[4])).toEqual([rId]);
-    expect(rowOf("gate22 4 R")?.state).toBe("sent");
-
-    // Release every parked flush (nothing left); exact combined calls.
-    resolveParkedFlushes!();
-    await pump(3_000);
-    await vi.advanceTimersByTimeAsync(120_000);
-    expect(sendB.mock.calls.map((c) => c[4])).toEqual([sId, rId]);
-    expect(sendA.mock.calls.map((c) => c[4])).toEqual([rId]);
-    a.logout();
-  } finally {
-    vi.useRealTimers();
-    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
-    sessionStorage.removeItem("remuda-outbox-owner");
-  }
-});
-
-it("GATE22 item 5 (rebuilds gate-21 item-2): B really finishes X AND restores Y to pending before A's tracked X deadline, then closes — advancing only to X's deadline, A delivers Y before Y's original 30 s lease deadline", async () => {
-  // Rebuild of the gate-21 item-2 regression per RULES. The older version
-  // advanced all the way to Y's own 30 s lease deadline, so it never proved
-  // that the tracked X deadline was sufficient. Here TWO real HubStores share
-  // one localStorage backend behind the FIFO Web Locks shim; the initial
-  // inflight claims are the only seeded state and every later transition is a
-  // real delivery flow.
-  //
-  // A boots FIRST with X (instance IX, B lease 10 s) and Y (instance IY, B
-  // lease 30 s): it tracks the two deadline wakes and posts nothing. B boots
-  // second with locks.query FREE, so its load REALLY reclaims the two
-  // same-owner fresh leases to pending; its boot flush then sends X clear and
-  // fails Y at the API boundary (POST rejects AND status GET rejects), which
-  // restores Y lease-less pending — all near t0, BEFORE A's tracked X
-  // deadline. B closes with its pinned jittered retry cancelled.
-  //
-  // Advancing fake time ONLY to X's deadline: A's real X fire is the trigger
-  // — its authoritative read sees X sent and Y PENDING; the central
-  // reconciliation arms Y's one 0 ms wake, Y's real fire hands off to A's
-  // guarded flush and A delivers Y under the same id, ~20 s before Y's
-  // original 30 s lease deadline. Combined API calls exactly B:[X, Y] A:[Y];
-  // no second POST and no manual flush anywhere.
-  vi.useFakeTimers();
-  vi.setSystemTime(1_000_000);
-  const ownerA = "owner_g22_i5_a";
-  const ownerB = "owner_g22_i5_b";
-  const IX = "ins_g22_i5_x";
-  const IY = "ins_g22_i5_y";
-  const X = "cmd_g22_i5_x";
-  const Y = "cmd_g22_i5_y";
-  const shim = fifoWebLocks();
-  const originalNavigator = globalThis.navigator;
-  Object.defineProperty(globalThis, "navigator", {
-    configurable: true,
-    writable: true,
-    value: { locks: shim.locks },
-  });
-  localStorage.setItem(
-    OUTBOX_LS_KEY,
-    JSON.stringify([
-      {
-        commandId: X,
-        clientRequestId: `local_${X}`,
-        instanceId: IX,
-        journalId: JOURNAL,
-        prompt: "gate22 5 x",
-        createdAt: Date.now() - 2_000,
-        attempts: 1,
-        state: "inflight",
-        lease: { owner: ownerB, until: Date.now() + 10_000 },
-      } satisfies OutboxRecord,
-      {
-        commandId: Y,
-        clientRequestId: `local_${Y}`,
-        instanceId: IY,
-        journalId: JOURNAL,
-        prompt: "gate22 5 y",
-        createdAt: Date.now() - 1_000,
-        attempts: 1,
-        state: "inflight",
-        lease: { owner: ownerB, until: Date.now() + 30_000 },
-      } satisfies OutboxRecord,
-    ]),
-  );
-  const pump = async (n = 2_000) => {
-    for (let i = 0; i < n; i += 1) await Promise.resolve();
-  };
-  try {
-    // A boots first with the foreign live leases: tracks both deadlines.
     sessionStorage.setItem("remuda-outbox-owner", ownerA);
     const { api: apiA, hubStore: a } = await fresh();
     vi.spyOn(apiA, "eventsRead").mockResolvedValue({
@@ -3441,7 +3405,6 @@ it("GATE22 item 5 (rebuilds gate-21 item-2): B really finishes X AND restores Y 
       reachedAfterSeq: true,
     });
     vi.spyOn(apiA, "screenRead").mockResolvedValue({ lines: [] });
-    vi.spyOn(apiA, "instanceCommandStatus").mockRejectedValue(new Error("a status unused"));
     const sendA = vi.spyOn(apiA, "instanceSend").mockImplementation(
       (async (_iid: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
         relatedCommandIds: [],
@@ -3456,79 +3419,44 @@ it("GATE22 item 5 (rebuilds gate-21 item-2): B really finishes X AND restores Y 
       })) as unknown as Api["instanceSend"],
     );
     await bootLive(apiA, a);
-    const aOutbox = (a as unknown as { outbox: { pendingLeaseWakeups: () => string[] } }).outbox;
+    const aOutbox = (
+      a as unknown as { outbox: { pendingLeaseWakeups: () => string[] } }
+    ).outbox;
     await pump(1_000);
     expect(sendA).not.toHaveBeenCalled();
-    expect(aOutbox.pendingLeaseWakeups().sort()).toEqual([X, Y].sort());
+    expect(aOutbox.pendingLeaseWakeups().sort()).toEqual([xId, yId].sort());
 
-    // B boots: locks.query is FREE, its load reclaims both own fresh leases
-    // (real reclaimInflight) and its boot flush runs both rows for real.
-    sessionStorage.setItem("remuda-outbox-owner", ownerB);
-    const { api: apiB, hubStore: b } = await fresh();
-    vi.spyOn(apiB, "eventsRead").mockResolvedValue({
-      events: [],
-      durableSeq: "0",
-      windowFromSeq: null,
-      reachedAfterSeq: true,
-    });
-    vi.spyOn(apiB, "screenRead").mockResolvedValue({ lines: [] });
-    vi.spyOn(apiB, "instanceCommandStatus").mockRejectedValue(new Error("status network down"));
-    const sendB = vi.spyOn(apiB, "instanceSend").mockImplementation(
-      (async (_iid: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => {
-        if (commandId === X) {
-          return {
-            relatedCommandIds: [],
-            command: {
-              commandId: X,
-              id: X,
-              state: "accepted",
-              revision: "1",
-              dispatch: "native-acknowledged",
-              resolution: "clear",
-            },
-          };
-        }
-        throw new Error("gate22 5 boundary POST failure");
-      }) as unknown as Api["instanceSend"],
-    );
-    // Pin the store-retry jitter high and close B before any retry can fire.
-    vi.spyOn(Math, "random").mockReturnValue(0.999);
-    const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
-    const row = (id: string) => storedRows().find((r) => r.commandId === id);
-    await bootLive(apiB, b);
-    // B's real flow sends X, then claims Y, POSTs and fails the status GET,
-    // and restores Y lease-less pending — wait for the durable restore, THEN
-    // close B so its pinned jittered retry is cancelled.
-    for (let i = 0; i < 2_000; i += 1) {
-      if (sendB.mock.calls.length === 2 && row(Y)?.state === "pending") break;
+    // B's real flows settle: X accepted; Y boundary-fails (POST + status GET)
+    // and returns lease-less pending — all near t+20 s — then B closes.
+    releaseX!();
+    for (let i = 0; i < 2_000 && row(xId)?.state !== "sent"; i += 1) await Promise.resolve();
+    releaseY!();
+    for (let i = 0; i < 4_000; i += 1) {
+      if (sendB.mock.calls.length >= 2 && row(yId)?.state === "pending") break;
       await Promise.resolve();
     }
     b.logout();
-    expect(sendB.mock.calls.map((c) => c[4])).toEqual([X, Y]);
-
-    // Both transitions committed well before the X deadline (fake time still
-    // at the boot instant): X sent, Y lease-less pending.
-    expect(row(X)?.state).toBe("sent");
-    expect(row(Y)?.state).toBe("pending");
-    expect(row(Y)?.lease).toBeUndefined();
+    expect(sendB.mock.calls.map((c) => c[4])).toEqual([xId, yId]);
+    expect(row(xId)?.state).toBe("sent");
+    expect(row(yId)?.state).toBe("pending");
+    expect(row(yId)?.lease).toBeUndefined();
     expect(sendA).not.toHaveBeenCalled();
 
-    // Advance ONLY to the tracked X deadline (plus microtasks), nowhere near
-    // Y's original 30 s lease deadline.
+    // Advance ONLY to X's tracked deadline (t+30 s): A's real X fire reads Y
+    // pending and its reconciliation arms Y's one immediate wake; A delivers
+    // Y ~20 s before Y's own lease deadline, never POSTing X.
     await vi.advanceTimersByTimeAsync(10_000);
     for (let i = 0; i < 200 && sendA.mock.calls.length === 0; i += 1) {
       await Promise.resolve();
       await vi.advanceTimersByTimeAsync(1);
     }
     expect(sendA).toHaveBeenCalledTimes(1);
-    expect(sendA.mock.calls[0]?.[4]).toBe(Y);
-    expect(row(Y)?.state).toBe("sent");
-    // The whole recovery finished by ~10 s: Y never waited for its 30 s
-    // deadline and X was never posted by A.
-    expect(Date.now()).toBeLessThan(1_000_000 + 20_000);
-    expect(sendA.mock.calls.some((c) => c[4] === X)).toBe(false);
+    expect(sendA.mock.calls[0]?.[4]).toBe(yId);
+    expect(row(yId)?.state).toBe("sent");
+    expect(Date.now()).toBeLessThan(1_000_000 + 40_000);
+    expect(sendA.mock.calls.some((c) => c[4] === xId)).toBe(false);
 
-    // Far past every deadline: exactly the one A POST and B's two calls.
+    // Far past every deadline: exactly A's one POST and B's two calls.
     await vi.advanceTimersByTimeAsync(120_000);
     expect(sendA).toHaveBeenCalledTimes(1);
     expect(sendB).toHaveBeenCalledTimes(2);
@@ -3539,6 +3467,7 @@ it("GATE22 item 5 (rebuilds gate-21 item-2): B really finishes X AND restores Y 
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
 
 it("GATE22 item 6: a flush queued across logout/reinit releases its tokens and epilogue on the ISSUING box — the new epoch's outbox gets no stale tokens or reconcile and delivers the row itself", async () => {
   // flushAllOutbox captures the current outbox in a local `box`. Before gate

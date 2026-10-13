@@ -3367,14 +3367,17 @@ class HubStore {
    *
    * The decision is entirely DURABLE: the row's `progressRecorded` flag flips
    * false → true in one compare-and-set that also requires
-   * `issuerEpoch === current auth epoch`. So:
+   * `issuerLifetime === this outbox's lifetime` (c-reconnfu gate 32: an auth
+   * change always disposes the old outbox first, so lifetime is the whole
+   * issuer identity). So:
    *  - progress for a command is recorded AT MOST ONCE, across the POST, GET
    *    and journal arriving in any order, regardless of in-memory cache size;
    *  - a cancelled navigation / BFCache suspension / reload cannot lose or
    *    duplicate it (it lives on the row, not in a per-outbox set);
-   *  - an observation of a command issued by a previous login epoch (stale
-   *    journal catch-up after logout/reinit) never touches the new epoch,
-   *    though the journal done patch itself still retires the durable row;
+   *  - an observation of a command issued by another outbox (a stale journal
+   *    catch-up after logout/reinit/peer session removal, or another tab)
+   *    never touches this outbox, though the journal done patch itself still
+   *    retires the durable row;
    *  - rejected, failed, held or never-resolving outcomes never call this.
    */
   private async recordAcceptedDelivery(

@@ -2398,13 +2398,13 @@ mod tests {
     fn an_ingest_time_winner_supersedes_the_native_lineage_in_tpm() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
-        let mut lineage_turn = |seq: i64,
-                                scope_id: &str,
-                                lineage: &str,
-                                input: i64,
-                                output: i64,
-                                stamp: String,
-                                source: &str| {
+        let lineage_turn = |seq: i64,
+                            scope_id: &str,
+                            lineage: &str,
+                            input: i64,
+                            output: i64,
+                            stamp: String,
+                            source: &str| {
             UsageEventRow {
                 instance_id: "ins_tpm_prov".into(),
                 seq,

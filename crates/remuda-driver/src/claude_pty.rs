@@ -5802,6 +5802,112 @@ mod tests {
         }
         out
     }
+
+    /// c-ctxusage r25 item 4: a timestamped native usage record fed through the
+    /// REAL `spawn_transcript_pump` reaches the channel with the record's native
+    /// time and its deterministic usage identity. Main's design keeps
+    /// `observed_at` at RECEIPT time (`build_observation` stamps `now_ts()`);
+    /// the record time rides `native_at`, which the r24 `emit_mapped_obs`
+    /// wrapper must preserve end to end. Reverting that wrapper's
+    /// `observation.native_at = native_at` line makes this test go RED.
+    #[tokio::test]
+    async fn transcript_pump_preserves_native_time_and_usage_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        // Distinct native record time, safely before the wall clock the pump
+        // stamps at receipt.
+        let native_ts = "2026-10-13T10:00:00.000Z";
+        let record = json!({
+            "type": "assistant",
+            "uuid": "pump-ts-a",
+            "sessionId": "pump-session",
+            "version": "2.1.289",
+            "message": {
+                "id": "msg-pump-ts",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "output_tokens": 11
+                }
+            },
+            "timestamp": native_ts
+        });
+        std::fs::write(&transcript, format!("{record}\n")).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let seq = Arc::new(AtomicU64::new(0));
+        let instance_id = InstanceId::new();
+        let ctx = ObsCtx {
+            driver: DriverKind::ClaudePty,
+            instance_id: instance_id.clone(),
+            host_id: HostId::new(),
+            journal_id: Id::new("obj").unwrap(),
+            run_id: RunId::new(),
+            session_id: "pump-session".into(),
+            pin_version: "2.1.289".into(),
+        };
+        let slot = Arc::new(std::sync::Mutex::new(Some(
+            transcript.to_string_lossy().into_owned(),
+        )));
+        let _pump = spawn_transcript_pump(
+            slot,
+            tx,
+            ctx,
+            seq,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::claude_transcript::ResumeMode::Fresh,
+        );
+
+        // Collect until the usage observation arrives.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut got = None;
+        while let Ok(Some(obs)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if let ObservationPayload::Usage(usage) = &obs.body
+                && usage.scope_id == "msg-pump-ts"
+            {
+                got = Some(obs);
+                break;
+            }
+        }
+        let obs = got.expect("pump emitted the timestamped usage observation");
+        assert_eq!(
+            obs.native_at,
+            Knowledge::Known {
+                value: Timestamp::try_from(native_ts.to_string()).unwrap()
+            },
+            "pump carries native_at as the record time, not herdr-clock Unknown"
+        );
+        // Main's documented split: observed_at is the live RECEIPT time; the
+        // native record time is carried separately as native_at.
+        assert_ne!(
+            String::from(obs.observed_at.clone()),
+            native_ts,
+            "observed_at stays receipt time by main's design"
+        );
+        let expected_usage_id = Id::derive(
+            "obj",
+            instance_id.as_id().as_str(),
+            "usage:turn:msg-pump-ts",
+        )
+        .expect("derived usage id");
+        if let ObservationPayload::Usage(usage) = &obs.body {
+            assert_eq!(usage.scope_id, "msg-pump-ts");
+            assert_eq!(
+                usage.usage_id, expected_usage_id,
+                "the pump keeps the mapper's deterministic, replay-stable usage id"
+            );
+        }
+    }
 }
 
 /// Mapping / gating helpers used by `tests/claude_pty_review.rs`.

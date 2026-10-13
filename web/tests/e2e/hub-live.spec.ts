@@ -414,6 +414,13 @@ test("effort slider drag and keyboard send instance.configure", async ({ page })
     .getAttribute("value");
   await page.getByTestId("new-session-host").selectOption(host!);
   await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0);
+  // The decoupled orthogonal ultracode switch is gated to the Herdr
+  // claude-pty carrier (shell-pty cannot type version-gated words, so the
+  // switch intentionally stays locked there); the New Session default is the
+  // native shell-pty. Open advanced and select claude-pty, exactly like the
+  // effort-sync suite does.
+  await page.getByTestId("new-session-advanced").click();
+  await page.getByTestId("new-session-driver-claude-pty").click();
   await page.getByTestId("new-session-prompt").fill("effort slider e2e");
   await page.getByTestId("new-session-start").click();
   await expect(page).toHaveURL(/\/s\//, { timeout: 20_000 });
@@ -431,19 +438,32 @@ test("effort slider drag and keyboard send instance.configure", async ({ page })
   await page.getByTestId("model-effort-chip").click();
   const slider = page.getByTestId("effort-slider");
   await expect(slider).toBeVisible();
-  await expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max,ultracode");
+  await expect(slider).toHaveAttribute("data-tiers", "low,medium,high,xhigh,max");
   const box = await slider.boundingBox();
   expect(box).toBeTruthy();
   await page.mouse.move(box!.x + box!.width - 3, box!.y + box!.height / 2);
   await page.mouse.down();
   await page.mouse.move(box!.x + box!.width - 3, box!.y + box!.height / 2, { steps: 3 });
   await page.mouse.up();
-  // The far-right stop is ultracode: the xhigh tier plus the workflow flag.
-  // The chip only re-renders once instance.configure round-trips through the
-  // Hub, so these wait on the wire like every other live assertion here.
-  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "ultracode", {
+  // The far-right stop is MAX (a plain tier, no ember). D-056 ultracode is the
+  // separate switch under the pill.
+  await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "max", {
     timeout: 20_000,
   });
+  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "0", {
+    timeout: 20_000,
+  });
+  await expect
+    .poll(() =>
+      configureBodies.some(
+        (body) => body.operation === "instance.configure" && body.payload?.effort?.name === "max",
+      ),
+    )
+    .toBeTruthy();
+
+  // Flip the orthogonal switch on at max: the wire carries max + ultracode and
+  // the slider stays on max.
+  await page.getByTestId("effort-ultracode-switch").click();
   await expect(page.getByTestId("composer")).toHaveAttribute("data-ultracode", "1", {
     timeout: 20_000,
   });
@@ -453,7 +473,10 @@ test("effort slider drag and keyboard send instance.configure", async ({ page })
   await expect
     .poll(() =>
       configureBodies.some(
-        (body) => body.operation === "instance.configure" && body.payload?.effort?.name === "ultracode",
+        (body) =>
+          body.operation === "instance.configure"
+          && body.payload?.effort?.name === "max"
+          && (body.payload.effort as { ultracode?: boolean }).ultracode === true,
       ),
     )
     .toBeTruthy();
@@ -461,9 +484,6 @@ test("effort slider drag and keyboard send instance.configure", async ({ page })
   await slider.focus();
   await page.keyboard.press("Home");
   await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", "low", {
-    timeout: 20_000,
-  });
-  await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-ember", "0", {
     timeout: 20_000,
   });
   await expect

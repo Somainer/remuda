@@ -46,7 +46,7 @@ function effortValue(payload: unknown): string {
   const effective = asRecord(record?.effective);
   const name = effective?.name;
   if (typeof name !== "string" || !name) return "—";
-  // Claude reports ultracode sessions at level xhigh with the flag; the flag
-  // is the part that distinguishes the row, so carry it on the line.
+  // D-056: the suffix marks the orthogonal switch at any tier (the coupled
+  // build happened to park on xhigh; ≥2.1.284 keeps the slider where it is).
   return effective?.ultracode === true ? `${name} · ultracode` : name;
 }

@@ -3342,23 +3342,52 @@
       ],
       "type": "object"
     },
+    "EffortAxis": {
+      "description": "Which axis a live `instance.configure` effort switch intends to move.\n\nc-effortread r9 item 6: without this the pair `{name, ultracode}` is\nambiguous — a cold flag-on click `{high, true}` cannot be told apart from\na tier move. The web now states the intent explicitly so the driver\nexecutes exactly that operation instead of substituting a different one:\n\n- [`EffortAxis::Flag`] — the orthogonal ultracode switch only (`/effort\n  ultracode on|off` on decoupled builds; the tier is unchanged).\n- [`EffortAxis::Tier`] — a level move only (`/effort <level>`).\n\n`None` is a legacy client that omits the axis; the driver then\ndisambiguates from provenance and REJECTS a cold flag-on it cannot prove\nrather than guessing.",
+      "oneOf": [
+        {
+          "const": "flag",
+          "description": "Move the ultracode workflow flag, leaving the tier where it is.",
+          "type": "string"
+        },
+        {
+          "const": "tier",
+          "description": "Move the effort tier.",
+          "type": "string"
+        }
+      ]
+    },
     "EffortEffective": {
-      "description": "Effective effort, read back from a Claude assistant transcript record\n(`effort` / `perTurnEffort`); D-028 §9.1.\n\nThis is the *observed* tier, never the requested one. Claude reports\n`ultracode` sessions as level `xhigh` and does not repeat the workflow flag\non assistant records, so `ultracode` is `None` unless the observation path\nhas positive evidence (e.g. an immediately preceding `/effort ultracode`\nswitch the driver itself made).",
+      "description": "Effective effort, read back from a Claude assistant transcript record\n(`effort` / `perTurnEffort`); D-028 §9.1 / D-056.\n\nThis is the *observed* tier, never the requested one. Claude never repeats\nthe ultracode workflow flag on assistant records: it is read from the\n`/effort` verdicts and the `ultra_effort_enter` / `ultra_effort_exit`\nattachments instead. On coupled builds (2.1.203–2.1.283) the flag implies\nxhigh; on decoupled builds (≥ 2.1.284) it is an orthogonal toggle that\nlatches at every level. `ultracode` is `None` until this process has\npositive evidence either way.",
       "properties": {
         "name": {
-          "$ref": "#/$defs/EffortName",
-          "description": "Observed level name."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EffortName"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Observed level name. `None` ONLY on the read-back-unavailable edge\n(`readback_available == Some(false)`): a verified resume boundary\nbecame unverifiable mid-run, so the previously projected level is\nwithdrawn and consumers must render `?` rather than keep the stale\ntier. Normal observations always carry `Some(name)`."
         },
         "observedAt": {
           "$ref": "#/$defs/Timestamp",
           "description": "When the observation was made."
+        },
+        "readbackAvailable": {
+          "description": "D-056 (4): whether effort read-back is available for this process.\n`Some(false)` means a resume boundary that was verified became\nunverifiable mid-run: the tracked transcript shrank below the read\ncursor, was replaced (different inode/head), or vanished (EOF/ENOENT).\nConsumers must clear any projected effective level/flag (the UI renders\n`?`) and must not treat a pending switch as applied. Normal observations\nomit it (`None` = available).\n\nA session-local `exec` that keeps the shell pid is NOT a withdrawal\ntrigger: exec preserves the verified boundary, and no clock step ever\nis — only a subsequent shrink/replacement/vanish of the tracked file\nactually invalidates read-back (c-effortread r9 item 10).",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "source": {
           "$ref": "#/$defs/EffortSource",
           "description": "What established this level."
         },
         "ultracode": {
-          "description": "Observed dynamic-workflow flag; `None` when the transcript does not\nexpose it (the common case).",
+          "description": "Observed dynamic-workflow flag; `None` when the transcript does not\nexpose it (the common case), and also withdrawn on the\nread-back-unavailable edge.",
           "type": [
             "boolean",
             "null"
@@ -3366,7 +3395,6 @@
         }
       },
       "required": [
-        "name",
         "source",
         "observedAt"
       ],
@@ -3421,6 +3449,13 @@
         },
         "raw": {
           "description": "Native spelling read off the record (`effort` / `perTurnEffort`), kept\nfor diagnostics (`auto`, an unknown future name normalizes into `name`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requestId": {
+          "description": "Per-request id of the in-session switch THIS edge's `requested` echo\nbelongs to (c-effortread r10, items 1–4). The driver mints nothing: it\nechoes the id the configure carried (web → Hub → Node → driver). An\nolder driver/journal omits it; consumers then fall back to the\nnewer-than-baseline-and-queue axis/value rule.",
           "type": [
             "string",
             "null"
@@ -11876,6 +11911,31 @@
             "null"
           ]
         },
+        "effortAxis": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EffortAxis"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "c-effortread r9 item 6: the axis this switch intends to move.\n`\"flag\"` = the orthogonal ultracode switch at the current tier;\n`\"tier\"` = a level move. Absent on a legacy client, in which case the\ndriver disambiguates from provenance and refuses a cold flag-on rather\nthan typing a different operation."
+        },
+        "effortRequestId": {
+          "description": "c-effortread r10 items 1–4: per-request id the web mints for one\nswitch. The driver echoes it on every effort lifecycle edge\n(`effort-queued|applied|degraded`, via the lifecycle `relatedIds` map)\nand on the `effort` observation's requested echo, so a late edge for a\nreplaced request can never settle the newer in-flight one. Absent on\nolder clients, which keep the axis/value + timestamp fallback.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effortUltracode": {
+          "description": "D-056 orthogonal ultracode flag accompanying [`Self::effort`]. The\ndriver picks the exact in-session spelling (a bare `/effort ultracode`\non coupled builds, `/effort ultracode on|off` on decoupled ones) from\nthis boolean plus the tier and the reported binary version.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "modelId": {
           "description": "`model_id`; protocol §3.1.",
           "type": "string"
@@ -13551,7 +13611,7 @@
           "description": "Observed level."
         },
         "ultracode": {
-          "description": "Observed dynamic-workflow flag; positively true after\n`Set effort level to ultracode`, positively false after a plain level\naccept, `None` until a verdict says either way.",
+          "description": "Observed dynamic-workflow flag; positively true after an ultracode-on\nverdict/attachment, positively false after an ultracode-off verdict,\na slider ` · Ultracode off` suffix or a coupled plain-level accept, and\n`None` until this process has evidence either way.",
           "type": [
             "boolean",
             "null"

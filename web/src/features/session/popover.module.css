@@ -17,8 +17,15 @@
 
 /* The one scrolling region inside a height-capped popover: head and footer
    stay, the body scrolls. EffortSlider's list body and the wrapped
-   permission/usage menus all mark themselves with this attribute. */
+   permission/usage menus all mark themselves with this attribute.
+   It is itself a flex COLUMN: a flex:1/min-height:0 child (the effort
+   slider card) must resolve against this wrapper's capped height so the
+   card's OWN list body stays the scroll region — a block wrapper would let
+   the card grow to full content height and an 81-row catalog would not
+   scroll (the scroll moved up onto this wrapper instead). */
 .popover [data-popover-scroll="1"] {
+  display: flex;
+  flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;

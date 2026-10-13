@@ -73,7 +73,7 @@ fn poll_batch(
     let mut found = None;
     for (position, record) in batch {
         for obs in mapper
-            .map_record_at(record.clone(), *position)
+            .map_record_at(record.clone(), Some(*position))
             .expect("record maps")
         {
             if matches!(obs.body, ObservationPayload::Usage(_)) {

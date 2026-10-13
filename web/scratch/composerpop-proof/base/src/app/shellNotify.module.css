@@ -1,0 +1,154 @@
+/* @tokens strict */
+/*
+ * Notification surfaces (plan §2, exploration §5 P0-3).
+ *
+ * Two regions with different lifetimes and different visual weight. The info
+ * strip replaces the old 2.4-second `.toast`; the blocking area is new and is
+ * the reason the toast could be removed — a failure now has somewhere to stay.
+ * ui-overhaul §4.1: position and behaviour unchanged; raised surface,
+ * --shadow-2, 8px radius.
+ */
+
+/*
+ * One anchored stack holds both regions, so they can never overlap however
+ * tall either grows. Confirmations sit above the standing errors; the errors
+ * keep the anchored position nearest the user's attention.
+ */
+.stack {
+  position: fixed;
+  /* Unchanged anchor: clear of the phone home bar where one shows. */
+  bottom: calc(var(--phone-nav-h) + var(--safe-bottom) + var(--space-3));
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: center;
+  width: min(92vw, 520px);
+  z-index: 30;
+}
+
+/* Transient confirmations, above the errors in the same stack. */
+.info {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+  pointer-events: none;
+}
+
+.infoItem {
+  max-width: min(92vw, 420px);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-2);
+  color: var(--fg-body);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
+}
+
+/*
+ * Standing errors. A later success is laid out above them rather than over
+ * them, which is the P0-3 requirement the old single-toast slot could not
+ * meet: there was one slot, so the next message took it.
+ */
+.blocking {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+}
+
+.blockingItem {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 10px var(--space-3);
+  border: 1px solid var(--danger-border);
+  border-left-width: 3px;
+  border-radius: var(--radius-md);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-2);
+  color: var(--fg-body);
+}
+
+.blockingHead {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  justify-content: space-between;
+}
+
+.blockingText {
+  color: var(--fg-strong);
+  font-size: var(--text-title);
+  line-height: var(--lh-title);
+}
+
+/* The reason, when known. Never a placeholder when it is not. */
+.blockingReason {
+  display: block;
+  margin-top: 2px;
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.action {
+  min-height: var(--control-h);
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-body);
+  font-size: var(--text-ui);
+  cursor: pointer;
+}
+
+.action:hover {
+  background: var(--bg-hover);
+}
+
+.dismiss {
+  margin: -4px -6px 0 0;
+  padding: 4px 6px;
+  border: 0;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.dismiss:hover {
+  color: var(--fg-strong);
+}
+
+@media (max-width: 767px) {
+  .action,
+  .dismiss {
+    min-height: 44px;
+    min-width: 44px;
+  }
+}
+
+/* A screen-reader-only live region: announced, never seen. */
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

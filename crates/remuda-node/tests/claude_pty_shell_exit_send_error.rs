@@ -138,18 +138,22 @@ async fn a_refused_optional_shell_exit_send_does_not_abort_the_close() {
         .to_string(),
     )
     .unwrap();
-    // Drain buffered lifecycle frames so the assertion below observes
-    // channel CLOSURE (all senders retired) rather than the first queued row.
+    // Receive in the background so a full 64-slot buffer can never stall the
+    // close-time terminal emission (the driver keeps the sender for the
+    // process lifetime under ruling D; the test does not assert channel
+    // closure, only that the refused courtesy send did not abort the close).
     let drainer = tokio::spawn(async move {
         let mut events_rx = events_rx;
-        while events_rx.recv().await.is_some() {}
+        while let Some(_observation) = events_rx.recv().await {
+            // drain
+        }
     });
 
     // Ctrl+C terminates the agent (fake model): the pane reverts to its root
     // shell, so the polite close probes Gone and attempts the optional
     // `exit\r` send — which the fake refuses with a live-boot pane_not_found.
     // The close must swallow that courtesy refusal, finish the verified stop,
-    // reap the pane/tab/workspace and retire every event sender.
+    // reap the pane/tab/workspace.
     tokio::time::timeout(Duration::from_secs(45), driver.close())
         .await
         .expect("close hung past its bound")
@@ -157,14 +161,9 @@ async fn a_refused_optional_shell_exit_send_does_not_abort_the_close() {
             "a non-conn-lost refusal of the optional shell-exit send must not \
              abort the interrupt or skip reap",
         );
-
-    // Receiver closure proves the close ran to the terminal emission and
-    // retired every sender — a close that bailed at interrupt would leave the
-    // channel open (the interrupted path never reaps).
-    tokio::time::timeout(Duration::from_secs(15), drainer)
-        .await
-        .expect("the event channel never closed after the full close")
-        .expect("the drainer task panicked");
+    // The close completed through interrupt + reap; stop the drainer (the
+    // sender is intentionally retained) to finish the test cleanly.
+    drainer.abort();
 
     // Idempotent retry: the reaped close settles as a clean no-op, not an
     // error against resources the first (swallowed-error) close already

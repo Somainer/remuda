@@ -2958,6 +2958,9 @@ fn command_parts(
                 model: request.model.clone(),
                 effort: request.effort_name.clone(),
                 effort_index: request.effort_index,
+                effort_ultracode: request.effort_ultracode,
+                effort_axis: request.effort_axis.clone(),
+                effort_request_id: request.effort_request_id.clone(),
                 permission_mode: request.permission_mode.clone(),
             },
             false,
@@ -4631,6 +4634,9 @@ mod tests {
                 model: Some("haiku".to_owned()),
                 effort: None,
                 effort_index: None,
+                effort_ultracode: None,
+                effort_axis: None,
+                effort_request_id: None,
                 permission_mode: None,
             },
         )
@@ -5711,7 +5717,7 @@ mod tests {
                 "instanceId": created.instance.meta.id,
                 "origin": "human",
                 "model": "opus",
-                "effort": { "index": 3, "name": "ultracode", "kind": "claude" }
+                "effort": { "index": 3, "name": "xhigh", "ultracode": true, "kind": "claude" }
             }),
         )
         .await
@@ -5773,7 +5779,13 @@ mod tests {
                     native.native_name == "instance.configure"
                         && native.status
                             == Knowledge::Known {
-                                value: "applied model=opus effort=ultracode index=3 permission=-"
+                                // D-056: the orthogonal boolean reaches the
+                                // driver alongside the level (xhigh), never as
+                                // the legacy "ultracode" level name.
+                                // c-effortread r9 item 6: the explicit axis
+                                // reaches the driver too; this legacy request
+                                // omits it ("-").
+                                value: "applied model=opus effort=xhigh index=3 ultracode=true axis=- permission=-"
                                     .into(),
                             }
                 });

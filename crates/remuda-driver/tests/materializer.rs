@@ -1045,20 +1045,48 @@ mod shell_pty_agent {
     }
 
     pub(crate) fn recipe(spec: &InstanceSpec, tmp: &Path, origin: LaunchOrigin) -> LaunchRecipe {
-        let binary = stub_binary(tmp, "1.0.0");
+        recipe_version(spec, tmp, origin, "1.0.0")
+    }
+
+    /// Materialize against a stub binary that reports `version` on
+    /// `--version`, so D-056 version gates observe the pinned version.
+    pub(crate) fn recipe_version(
+        spec: &InstanceSpec,
+        tmp: &Path,
+        origin: LaunchOrigin,
+        version: &str,
+    ) -> LaunchRecipe {
+        try_recipe_version(spec, tmp, origin, version).unwrap()
+    }
+
+    /// Like [`recipe_version`] but returning the materialize result so a
+    /// version-gate refusal can be asserted without a panic.
+    pub(crate) fn try_recipe_version(
+        spec: &InstanceSpec,
+        tmp: &Path,
+        origin: LaunchOrigin,
+        version: &str,
+    ) -> Result<LaunchRecipe, DriverError> {
+        let binary = stub_binary(tmp, version);
         let home = tmp.join("home");
         fs::create_dir_all(&home).unwrap();
+        // Pin without exec (noexec-safe, like `pin_source`), but carry the
+        // requested version string so D-056's `--version` gate sees it.
+        let abs = fs::canonicalize(&binary).unwrap_or_else(|_| binary.clone());
+        let pin = BinarySource::Pinned(BinaryPin {
+            abs_path: abs.to_string_lossy().into_owned(),
+            version: version.to_owned(),
+            sha256: hash_file(&abs).expect("hash test stub"),
+        });
         let mut request = request(
             spec,
-            // A native login, so no provider overlay is injected and the argv
-            // under test is only what the recipe itself contributes.
             Box::leak(Box::new(native_profile())),
             &tmp.join(format!("launch-{:?}", spec.kind)),
             &home,
-            pin_source(&binary),
+            pin,
         );
         request.origin = origin;
-        materialize(&request).unwrap()
+        materialize(&request)
     }
 
     #[test]
@@ -1163,12 +1191,14 @@ mod shell_pty_agent {
         }
 
         // ultracode replaces the level on the flag: the native flag takes one
-        // value, and `--effort ultracode` is the measured spelling.
+        // value, and `--effort ultracode` is the measured spelling. It is a
+        // launchable request only on a pinned build that has the feature
+        // (2.1.203+); the coupled 2.1.277 stub here is such a build.
         spec.effort = Some(EffortSelection {
             name: EffortName::Xhigh,
             ultracode: true,
         });
-        let ultra = recipe(&spec, tmp.path(), LaunchOrigin::Human);
+        let ultra = recipe_version(&spec, tmp.path(), LaunchOrigin::Human, "2.1.277");
         assert_eq!(
             value_after(&ultra.argv, "--effort").as_deref(),
             Some("ultracode")
@@ -1177,6 +1207,34 @@ mod shell_pty_agent {
             ultra.argv.iter().filter(|t| *t == "--effort").count(),
             1,
             "one flag, never a level plus a boolean"
+        );
+
+        // D-056 (2): a build below 2.1.203 (or one whose version cannot be
+        // read) refuses ultracode at launch rather than emitting a flag it
+        // prints `Unknown --effort value 'ultracode'` for. Plain levels on the
+        // same old binary still launch.
+        spec.effort = Some(EffortSelection {
+            name: EffortName::High,
+            ultracode: true,
+        });
+        let err = try_recipe_version(&spec, tmp.path(), LaunchOrigin::Human, "2.1.180")
+            .expect_err("ultracode on a pre-2.1.203 binary must fail");
+        assert!(
+            matches!(err, DriverError::InvalidLaunchSpec(ref message) if message.contains("ultracode")),
+            "{err:?}"
+        );
+        spec.effort = Some(EffortSelection {
+            name: EffortName::High,
+            ultracode: false,
+        });
+        assert_eq!(
+            value_after(
+                &recipe_version(&spec, tmp.path(), LaunchOrigin::Human, "2.1.180").argv,
+                "--effort"
+            )
+            .as_deref(),
+            Some("high"),
+            "plain levels are not version-gated"
         );
     }
 

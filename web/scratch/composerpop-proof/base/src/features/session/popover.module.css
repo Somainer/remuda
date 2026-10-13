@@ -1,0 +1,32 @@
+/* The composer's anchored menus. Positioning (fixed left/top, flip and the
+   height cap) is computed by the AnchoredPopover primitive from the trigger
+   rect — the old left:0/absolute rules pinned every card to the composer's
+   left edge and let a tall catalog run off-screen. */
+.popover {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-2);
+  padding: 7px 0;
+  display: flex;
+  flex-direction: column;
+  width: min(300px, calc(100vw - 16px));
+  box-sizing: border-box;
+  z-index: 5;
+  overflow: hidden;
+}
+
+/* The one scrolling region inside a height-capped popover: head and footer
+   stay, the body scrolls. EffortSlider's list body and the wrapped
+   permission/usage menus all mark themselves with this attribute. */
+.popover [data-popover-scroll="1"] {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* Compact Codex-style effort card: ~300px, never wider than the viewport. */
+.popoverCard {
+  padding: 0;
+  box-shadow: 0 8px 24px var(--scrim);
+}

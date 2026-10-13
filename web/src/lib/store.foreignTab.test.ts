@@ -3463,6 +3463,9 @@ it("GATE23 item 5 (rebuilds gate-21 item-2): B's REAL blocked claims leave X wit
     a.logout();
   } finally {
     vi.useRealTimers();
+    // The jitter pin above must not leak into later tests (grok gate 24
+    // item 3), even though afterEach restores all mocks.
+    vi.mocked(Math.random).mockRestore();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner");
   }

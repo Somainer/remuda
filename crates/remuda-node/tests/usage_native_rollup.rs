@@ -63,8 +63,28 @@ fn remuda_relay_bin(root: &Path) -> std::path::PathBuf {
 /// is involved: the usage commit itself is the wake. A bounded poll inside
 /// the watch deadline is the safety bound, not the mechanism; the loop also
 /// returns immediately once the row exists.
+///
+/// The waiter (and its only test) compile solely on targets with an
+/// event-driven facility: inotify (Linux) or kqueue (macOS/BSDs). There is
+/// deliberately NO sleeping fallback for other OSes (c-ctxusage r18 item 5).
+#[cfg(any(
+    target_os = "linux",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
 struct UsageWaiter(std::thread::JoinHandle<bool>);
 
+#[cfg(any(
+    target_os = "linux",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
 impl UsageWaiter {
     #[cfg(target_os = "linux")]
     fn spawn(db_path: PathBuf, instance_id: String) -> Self {
@@ -246,9 +266,10 @@ impl UsageWaiter {
                         // required BOTH NOTE_DELETE and NOTE_REVOKE, so an
                         // ordinary unlink (NOTE_DELETE alone) left the dead
                         // knote armed forever and the new -wal unwatched.
+                        let wal_died = wal_vnode_died;
                         if let Some(file) = wal_file.as_ref()
                             && event.ident() == file.as_raw_fd() as usize
-                            && wal_vnode_died(event.fflags())
+                            && wal_died(event.fflags())
                         {
                             wal_file = None;
                         }
@@ -274,32 +295,6 @@ impl UsageWaiter {
                     Err(_) => return false,
                 }
             }
-        }))
-    }
-
-    /// Fallback for platforms with neither inotify nor kqueue (the gated e2e
-    /// and CI run on Linux/macOS; this keeps the test compiling elsewhere).
-    #[cfg(not(any(
-        target_os = "linux",
-        target_vendor = "apple",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly"
-    )))]
-    fn spawn(db_path: PathBuf, instance_id: String) -> Self {
-        Self(std::thread::spawn(move || {
-            let Ok(conn) = rusqlite::Connection::open(&db_path) else {
-                return false;
-            };
-            let deadline = std::time::Instant::now() + Duration::from_secs(45);
-            while std::time::Instant::now() < deadline {
-                if turn_row_exists(&conn, &instance_id) {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            false
         }))
     }
 
@@ -329,6 +324,14 @@ fn wal_vnode_died(fflags: nix::sys::event::FilterFlag) -> bool {
     fflags.intersects(FilterFlag::NOTE_DELETE | FilterFlag::NOTE_RENAME | FilterFlag::NOTE_REVOKE)
 }
 
+#[cfg(any(
+    target_os = "linux",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
 fn turn_row_exists(conn: &rusqlite::Connection, instance_id: &str) -> bool {
     conn.query_row(
         "SELECT 1 FROM usage_events WHERE instance_id = ?1 AND scope = 'turn' LIMIT 1",
@@ -396,6 +399,14 @@ const CARRIER_ENV: &str = "REMUDA_PTY_CARRIER";
 const EMULATOR_ENV: &str = "REMUDA_PTY_EMULATOR";
 const HOOKS_ENV: &str = "REMUDA_PTY_HOOKS";
 
+#[cfg(any(
+    target_os = "linux",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_native_shell_pty_claude_session_reports_a_usage_rollup() {
     // c-ctxusage r5 item 5a: a REAL self-skip. `ensure_workspace_bin` never
@@ -681,6 +692,7 @@ mod kqueue_wal_death_tests {
 
     #[test]
     fn a_plain_note_delete_is_a_wal_death() {
+        // WAL-restart unlink: NOTE_DELETE on its own, no NOTE_REVOKE yet.
         assert!(wal_vnode_died(FilterFlag::NOTE_DELETE));
     }
 

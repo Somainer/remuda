@@ -3436,6 +3436,17 @@ class HubStore {
   }
 
   /**
+   * Fence B synchronous check (c-reconnfu gate 34 item 2): a delivery that
+   * captured `originBox` before an await must still be running on the LIVE,
+   * non-disposed, current outbox at the instant before it POSTs. Auth
+   * transitions dispose the old box and null this.outbox, so a stale
+   * continuation fails this and never POSTs under the new credentials.
+   */
+  private deliveryFenceStale(originBox: Outbox): boolean {
+    return this.outbox !== originBox || originBox.isDisposed();
+  }
+
+  /**
    * The SINGLE acceptance-progress boundary (c-reconnfu gate 26/27; gate 28
    * replaces the in-memory books with durable row state): progress is a
    * property of the HUB'S ACCEPTANCE of a command, not of which local path
@@ -3646,6 +3657,18 @@ class HubStore {
     let accepted = false;
 
     try {
+      // FENCE B (c-reconnfu gate 34 item 2): SYNCHRONOUS guard immediately
+      // before the POST, with no await between the check and api.instanceSend.
+      // This delivery captured `box` before its (possibly long) claim await;
+      // an auth change in that window disposes the box and replaces
+      // this.outbox — the new cookie must never be used by L1's continuation.
+      // On mismatch: no POST; keep the row (its live lease is released below
+      // in finally) so the current-generation box's legitimate recovery
+      // claims and delivers it once.
+      if (this.deliveryFenceStale(box)) {
+        box.endActiveDelivery(commandId);
+        return false;
+      }
       const result = await api.instanceSend(
         current0.instanceId,
         current0.prompt,

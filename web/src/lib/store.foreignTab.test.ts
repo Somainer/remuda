@@ -6185,3 +6185,82 @@ it("GATE34 item 1: once a public send() commits C durably, an auth disposal befo
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });;
+
+it("GATE34 item 2 (Fence B): a flush delivery whose box is disposed while awaiting its claim never POSTs; the row is released and delivered once by the current box", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_130_000);
+  const I = "ins_g34_2";
+  const originalNavigator = globalThis.navigator;
+  const shim = fifoWebLocks();
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: shim.locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g34_2");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await hubStore.follow(I);
+    hubStore.setConnectionStateForTest("live");
+
+    // Enqueue a pending row but make the CLAIM write block at the storage
+    // backend, so the delivery parks inside deliverOutboxRecord awaiting the
+    // claim.
+    const outbox0 = (hubStore as unknown as { outbox: { storage: Record<string, unknown> } }).outbox;
+    const storage = outbox0.storage as {
+      mergeUnlessDone: (id: string, p: unknown) => Promise<unknown>;
+      all: () => Promise<OutboxRecord[]>;
+    };
+    const realMerge = storage.mergeUnlessDone.bind(storage);
+    let commandId = "";
+    let releaseClaim: () => void = () => undefined;
+    let claimHeld = false;
+    storage.mergeUnlessDone = vi.fn(async (id: string, patch: unknown) => {
+      if (!claimHeld && (patch as { state?: string }).state === "inflight") {
+        claimHeld = true;
+        await new Promise<void>((resolve) => { releaseClaim = resolve; });
+      }
+      return realMerge(id, patch);
+    });
+    expect(await hubStore.send(I, "g34 2 C")).toBe(true);
+    await pump(500);
+    for (let i = 0; i < 2_000 && !claimHeld; i += 1) await Promise.resolve();
+    expect(claimHeld).toBe(true);
+    commandId = send.mock.calls.length ? "" : commandId; // no POST yet
+    const rows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    commandId = rows().find((r) => r.prompt === "g34 2 C")!.commandId;
+    expect(send).not.toHaveBeenCalled(); // parked at the claim, pre-POST
+
+    // Dispose the originating box WHILE the claim await is parked (auth change).
+    (hubStore as unknown as { applyAuthIdentityChangeForTest: () => void }).applyAuthIdentityChangeForTest();
+    releaseClaim(); // the claim continuation now resumes on a disposed box
+    await pump(2_000);
+    // Fence B: L1's continuation must NOT POST even though the claim completed.
+    expect(send).not.toHaveBeenCalled();
+
+    // The current-generation box claims the released row (released by L1's
+    // finally) and delivers it exactly once.
+    const ok = await (hubStore as unknown as { ensureOutbox: () => Promise<string> }).ensureOutbox();
+    expect(ok).toBe("ok");
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await pump(3_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBe(commandId);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

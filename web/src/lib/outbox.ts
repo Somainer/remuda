@@ -1059,6 +1059,15 @@ export class Outbox {
   get lifetime(): Id {
     return this.lifetimeId;
   }
+  /**
+   * True once this outbox has been disposed by an auth-identity change
+   * (c-reconnfu gate 34 Fence B). Store delivery continuations check this
+   * synchronously immediately before issuing a POST; a disposed outbox never
+   * POSTs.
+   */
+  isDisposed(): boolean {
+    return this.disposed;
+  }
 
   subscribe(fn: () => void): () => void {
     this.listeners.add(fn);

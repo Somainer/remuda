@@ -5457,3 +5457,109 @@ it("GATE28 d: a reload of the SAME login keeps the restored reconciling row's is
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE29 item 2: one acceptance CAS storage failure keeps the acceptance pending — the bounded retry flips it once and delivers the older row", async () => {
+  // The Hub accepts the steer (POST verdict) but the FIRST durable CAS write
+  // fails. Pre-gate-29 the error was swallowed and the acceptance was lost for
+  // good (GET loop done, journal never replays); post-fix the observed
+  // acceptance retries on the 250 ms bounded chain, flips exactly once and the
+  // fresh epilogue delivers the exhausted older row.
+  vi.useFakeTimers();
+  vi.setSystemTime(1_060_000);
+  const I = "ins_g29_i2";
+  const originalNavigator = globalThis.navigator;
+  const good = fifoWebLocks().locks;
+  const bad = {
+    query: async () => ({ held: [] as Array<{ name: string }> }),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    request: (): Promise<any> => Promise.reject(new Error("g29 i2 locks down")),
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let locks: { query: () => Promise<unknown>; request: (...args: any[]) => Promise<unknown> } = bad;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { get locks() { return locks; } },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g29_i2");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    const boxHandle = () =>
+      hubStore as unknown as {
+        outbox: {
+          storage: { casProgressRecorded: (id: string, epoch: string) => Promise<boolean> };
+          isDeliveryExhausted: (i: string) => boolean;
+        } | null;
+      };
+    const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+
+    // Exhaust P with the locks down.
+    hubStore.setConnectionStateForTest("offline");
+    expect(await hubStore.send(I, "g29 i2 P")).toBe(true);
+    await pump(200);
+    const pId = storedRows().find((r) => r.prompt === "g29 i2 P")!.commandId;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(boxHandle().outbox!.isDeliveryExhausted(I)).toBe(true);
+
+    // First CAS write fails once; the second delegates to the real backend.
+    const storage = boxHandle().outbox!.storage;
+    const realCas = storage.casProgressRecorded.bind(storage);
+    // CASes of the steer (any id but P); the first steer CAS fails once.
+    let casCalls = 0;
+    storage.casProgressRecorded = vi.fn(async (id: string, epoch: string) => {
+      if (id !== pId) {
+        casCalls += 1;
+        if (casCalls === 1) throw new Error("g29 i2 CAS write aborted");
+      }
+      return await realCas(id, epoch);
+    });
+
+    // The accepted steer records progress; the CAS fails once.
+    locks = good;
+    hubStore.setConnectionStateForTest("live");
+    expect(await hubStore.send(I, "g29 i2 S", [], [], "steer")).toBe(true);
+    const sId = send.mock.calls[0]?.[4] as string;
+    await pump(1_000);
+    expect(casCalls).toBe(1);
+    // Failed first attempt: still exhausted, P not delivered yet.
+    expect(boxHandle().outbox!.isDeliveryExhausted(I)).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("pending");
+
+    // The bounded retry fires after the 250 ms backoff: second CAS commits.
+    await vi.advanceTimersByTimeAsync(300);
+    for (let i = 0; i < 400 && send.mock.calls.length < 2; i += 1) {
+      await vi.advanceTimersByTimeAsync(10);
+      await Promise.resolve();
+    }
+    expect(casCalls).toBe(2);
+    expect(send.mock.calls.map((c) => c[4])).toEqual([sId, pId]);
+    expect(storedRows().find((r) => r.commandId === sId)?.progressRecorded).toBe(true);
+    expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("sent");
+    expect(boxHandle().outbox!.isDeliveryExhausted(I)).toBe(false);
+
+    // Exactly once: no further CAS retries or P re-POSTs.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(casCalls).toBe(2);
+    expect(send.mock.calls.filter((c) => c[4] === pId)).toHaveLength(1);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

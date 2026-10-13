@@ -2262,9 +2262,14 @@ class HubStore {
     try {
       flipped = await box.casProgressRecorded(commandId, epoch);
     } catch {
-      // A storage failure here is not a lost delivery: the next acceptance
-      // observation (GET poll, journal, flush) retries the CAS.
-      flipped = false;
+      // The Hub already accepted the command, but the durable CAS write
+      // failed: the GET poll is over and the journal will not replay, so
+      // swallowing here would lose the acceptance for good. Keep the
+      // observation pending in the outbox's bounded, lifetime-aware recovery
+      // (c-reconnfu gate 29 item 2): it re-tries until the CAS commits, the
+      // row is gone/re-epoch'd, teardown, or the bounded cap.
+      box.retryAcceptedProgress(instanceId, commandId, epoch);
+      return;
     }
     if (!flipped) return;
     box.noteDeliveryProgress(instanceId);

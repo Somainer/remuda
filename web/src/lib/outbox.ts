@@ -786,6 +786,23 @@ export class Outbox {
    */
   private deliveryExhausted = new Set<Id>();
   /**
+   * A pending ACCEPTANCE whose durable CAS storage write keeps failing
+   * (c-reconnfu gate 29 item 2). The Hub has already accepted the command —
+   * the only thing outstanding is flipping progressRecorded durably — so the
+   * observation is kept and retried through the same bounded, lifetime-aware
+   * envelope as the read recovery, rather than dropped (the GET poll has
+   * ended and the journal never replays). One pending chain per command; it
+   * stops on success, a missing row, a changed/absent issuer epoch, teardown
+   * or the attempt cap.
+   */
+  private pendingAcceptance: {
+    instanceId: Id;
+    commandId: Id;
+    issuerEpoch: Id;
+    failures: number;
+    handle: ReturnType<typeof setTimeout> | null;
+  } | null = null;
+  /**
    * Per-FLUSH suppression of 0 ms delivery wakes (c-reconnfu gate 21 item 1):
    * each guarded flush receives a TOKEN scoped to the instances ITS pass read.
    * The count is REFERENCE-COUNTED because flushes overlap (a timer fires
@@ -1250,6 +1267,10 @@ export class Outbox {
     this.deliveryPasses.clear();
     this.deliverySuppressed.clear();
     this.storeRetryPending.clear();
+    // Cancel a pending acceptance CAS (c-reconnfu gate 29 item 2): lifetime-
+    // aware like the read chain — a cancelled-navigation restore re-arms from
+    // a fresh observation, a disposed outbox never completes it.
+    this.clearPendingAcceptance();
   }
 
   /** The page stayed / was restored (BFCache): allow reconciliation again. */
@@ -1273,14 +1294,96 @@ export class Outbox {
   }
 
   /**
-   * Durable acceptance compare-and-set (c-reconnfu gate 28), serialised across
-   * tabs with the SAME exclusion the delivery claim uses on this backend
-   * (c-reconnfu gate 29 item 1): a Web Lock on a per-command name when the
-   * API exists, otherwise the durable per-key lease fallback. The IndexedDB
-   * CAS transaction is itself atomic, but the localStorage backend's
-   * read/check/write is only atomic within one document — under the guard
-   * exactly one of two racing tabs observes the flag unset and wins.
+   * Keep an observed ACCEPTANCE pending after its CAS storage write failed and
+   * retry the durable flip through the bounded, lifetime-aware recovery
+   * (c-reconnfu gate 29 item 2). Uses the same 250 ms·2ⁿ / 5 s backoff and
+   * {@link CLAIM_WAKE_MAX_FAILURES} cap as the other delivery recoveries. Each
+   * attempt first re-reads the row and stops when the row is gone, its issuer
+   * epoch changed or the flag is already set; a successful flip records
+   * progress and runs the fresh delivery epilogue, exactly as the direct path.
    */
+  retryAcceptedProgress(instanceId: Id, commandId: Id, issuerEpoch: Id): void {
+    if (this.disposed || this.unloading) return;
+    if (this.pendingAcceptance?.commandId === commandId) return;
+    this.pendingAcceptance = { instanceId, commandId, issuerEpoch, failures: 1, handle: null };
+    // The immediate CAS already failed once; the first RECOVERY attempt waits
+    // the base backoff, then each further failure grows it (bounded).
+    const pending = this.pendingAcceptance;
+    pending.handle = setTimeout(() => void this.attemptAcceptedProgress(), this.acceptanceRetryDelay(1));
+  }
+
+  private async attemptAcceptedProgress(): Promise<void> {
+    const pending = this.pendingAcceptance;
+    if (!pending || this.disposed || this.unloading) return;
+    let proceed = false;
+    try {
+      const rows = await this.readDurable();
+      const row = rows.find((r) => r.commandId === pending.commandId);
+      // Row gone (retract/cleanup) or the command no longer belongs to this
+      // auth epoch (logout/reinit/re-issue): nothing left to record.
+      if (row && row.issuerEpoch === pending.issuerEpoch && !row.progressRecorded) {
+        proceed = true;
+      }
+    } catch {
+      // The re-read failed: treat it like a failed CAS attempt and back off.
+      proceed = true;
+    }
+    if (!proceed) {
+      this.clearPendingAcceptance();
+      return;
+    }
+    let flipped = false;
+    let casThrew = false;
+    try {
+      flipped = await this.casProgressRecorded(pending.commandId, pending.issuerEpoch);
+    } catch {
+      flipped = false;
+      casThrew = true;
+    }
+    // The pending slot may have been cancelled (teardown) while the CAS ran.
+    if (this.disposed || this.unloading || this.pendingAcceptance !== pending) return;
+    if (flipped) {
+      this.noteDeliveryProgress(pending.instanceId);
+      this.clearPendingAcceptance();
+      await this.deliveryEpilogue().catch(() => undefined);
+      return;
+    }
+    // No flip. Classify with a fresh read: row gone, epoch changed, or the
+    // flag already set (another tab/document recorded it) are TERMINAL — stop
+    // quietly. Only an actual storage failure keeps the bounded retry alive.
+    if (!casThrew) {
+      this.clearPendingAcceptance();
+      return;
+    }
+    try {
+      const rows = await this.readDurable();
+      const row = rows.find((r) => r.commandId === pending.commandId);
+      if (!row || row.issuerEpoch !== pending.issuerEpoch || row.progressRecorded) {
+        this.clearPendingAcceptance();
+        return;
+      }
+    } catch {
+      /* read failed too: fall through to the backoff and retry. */
+    }
+    pending.failures += 1;
+    if (pending.failures >= CLAIM_WAKE_MAX_FAILURES) {
+      this.clearPendingAcceptance();
+      this.onReadRecoveryExhausted?.();
+      return;
+    }
+    pending.handle = setTimeout(() => void this.attemptAcceptedProgress(), this.acceptanceRetryDelay(pending.failures));
+  }
+
+  private acceptanceRetryDelay(failures: number): number {
+    return Math.min(CLAIM_WAKE_MAX_RETRY_MS, CLAIM_WAKE_BASE_RETRY_MS * 2 ** Math.max(0, failures - 1));
+  }
+
+  private clearPendingAcceptance() {
+    if (this.pendingAcceptance?.handle) clearTimeout(this.pendingAcceptance.handle);
+    this.pendingAcceptance = null;
+  }
+
+
   async casProgressRecorded(commandId: Id, issuerEpoch: Id): Promise<boolean> {
     const locks = (globalThis as { navigator?: Navigator & { locks?: LockManager } }).navigator?.locks;
     if (locks?.request) {

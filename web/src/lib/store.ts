@@ -107,7 +107,6 @@ import {
   dropDeviceCookie,
   readLoggedOut,
   readSession,
-  readAuthEpoch,
   writeSession,
   type DeviceSession,
   type PairCode,
@@ -1169,14 +1168,61 @@ class HubStore {
    * send that races first mount or unit-test callers). Resolves false when no
    * storage backend is writable — send then uses the legacy direct path.
    */
+  /**
+   * Dispose the current Outbox INSTANCE for an auth-identity change
+   * (c-reconnfu gate 32 invariant). Idempotent. Durable rows stay in storage;
+   * the next ensureOutbox runs Outbox.load which mints a NEW lifetime id, so a
+   * pending acceptance of the disposed outbox can never record (its retries
+   * re-check the live outbox and lifetime) and no wake can flush under the old
+   * identity. Used by local logout/reinit and by the peer-tab storage listener
+   * when another document removes/replaces the session.
+   */
+  private disposeOutboxForAuthChange() {
+    this.outbox?.dispose();
+    this.outbox = null;
+    this.outboxUnsubscribe?.();
+    this.outboxUnsubscribe = null;
+    this.outboxInit = null;
+    this.outboxDegraded = false;
+  }
+
+  /**
+   * Peer-tab auth-identity watcher (c-reconnfu gate 32 item 1b). localStorage
+   * 'storage' events fire only in OTHER documents, so this observes a login/
+   * logout/session replacement in another tab and disposes THIS tab's Outbox
+   * BEFORE anything else runs — satisfying the invariant that an outbox never
+   * survives an auth identity change. Registered once for the HubStore
+   * lifetime (not per connection bootstrap).
+   */
+  private static readonly SESSION_STORAGE_KEYS = new Set([
+    "runtime.device-session",
+    "runtime.device-id",
+    "runtime.logged-out",
+  ]);
+  private onPeerAuthChange = (event: StorageEvent) => {
+    if (!event.key || !HubStore.SESSION_STORAGE_KEYS.has(event.key)) return;
+    // A peer logged out or replaced the session: drop our outbox so its
+    // lifetime no longer matches any durable issuer. No reconnect here — the
+    // UI/next action decides whether this tab re-auths.
+    this.disposeOutboxForAuthChange();
+  };
+  private peerAuthWatchRegistered = false;
+  private registerPeerAuthWatch() {
+    if (this.peerAuthWatchRegistered) return;
+    if (typeof window === "undefined" || typeof window.addEventListener !== "function") return;
+    window.addEventListener("storage", this.onPeerAuthChange);
+    this.peerAuthWatchRegistered = true;
+  }
+
   private ensureOutbox(): Promise<boolean> {
     if (this.outbox) return Promise.resolve(true);
     if (this.outboxInit) return this.outboxInit;
+    this.registerPeerAuthWatch();
     this.outboxInit = (async () => {
       try {
         const opened = await openOutboxStorage();
         this.outboxDegraded = opened.degraded;
-        const box = await Outbox.load(opened.storage, undefined, readAuthEpoch);
+        const box = await Outbox.load(opened.storage);
         this.outbox = box;
         this.outboxUnsubscribe = box.subscribe(() => this.emit({ outboxPending: box.pendingCount() }));
         // Gate 11 item 5: a tracked lease-expiry wakeup inside Outbox reclaims
@@ -3338,19 +3384,22 @@ class HubStore {
   ): Promise<void> {
     const box = origin ?? this.outbox;
     if (this.pageIsUnloading || !box || this.outbox !== box) return;
-    const epoch = readAuthEpoch();
+    // c-reconnfu gate 32: the outbox page-lifetime is the sole issuer
+    // identity. A live `box` is current by construction — logout/reinit (in
+    // this page or observed from a peer) disposes it before this can run, and
+    // every CAS retry re-checks that it is still the same live outbox.
     const lifetime = box.lifetime;
     let flipped = false;
     try {
-      flipped = await box.casProgressRecorded(commandId, epoch, lifetime);
+      flipped = await box.casProgressRecorded(commandId, lifetime);
     } catch {
       // The Hub already accepted the command, but the durable CAS write
       // failed: the GET poll is over and the journal will not replay, so
       // swallowing here would lose the acceptance for good. Keep the
       // observation pending in the outbox's bounded, lifetime-aware recovery
       // (c-reconnfu gate 29 item 2): it re-tries until the CAS commits, the
-      // row is gone/re-issued, teardown, or the bounded cap.
-      box.retryAcceptedProgress(instanceId, commandId, epoch, lifetime);
+      // row is gone/re-issued, the outbox is disposed, or the bounded cap.
+      box.retryAcceptedProgress(instanceId, commandId, lifetime);
       return;
     }
     if (!flipped) return;
@@ -3433,13 +3482,12 @@ class HubStore {
     // previous delivery whose finishing write aborted) is stale and must not
     // be POSTed under.
     const claimToken = localId();
-    // c-reconnfu gate 28/30: the COMMITTED claim stamps the durable row with
-    // the issuing auth epoch AND this outbox's page-lifetime id (the single
-    // writer for the command). The epoch survives reloads of the same login
-    // but changes on logout/reinit; the lifetime id is fresh per page. Only
-    // this write committing stamps either — a failed/never-attempted claim
-    // leaves both unset.
-    const claimEpoch = readAuthEpoch();
+    // c-reconnfu gate 32 single-writer invariant: the COMMITTED claim stamps
+    // ONLY this outbox's page-lifetime id as the issuer. Auth identity changes
+    // always dispose the old outbox (new lifetime) BEFORE anything runs, so the
+    // lifetime alone separates every auth identity, tab and reload. Only this
+    // write committing stamps it — a failed/never-attempted claim leaves it
+    // unset.
     const claimLifetime = box.lifetime;
     let claimed;
     try {
@@ -3447,7 +3495,7 @@ class HubStore {
         state: "inflight",
         attempts: isFreshAttempt ? current0.attempts + 1 : current0.attempts,
         lease: { owner: box.ownerId, until: Date.now() + LEASE_TTL_MS, claimToken },
-        ...(claimEpoch ? { issuerEpoch: claimEpoch, issuerLifetime: claimLifetime } : {}),
+        issuerLifetime: claimLifetime,
       });
     } catch {
       // Gate 22 item 1 (coordinator ruling): a durable mutation that COMMITTED
@@ -3938,14 +3986,9 @@ class HubStore {
     this.effortReconcileTimers.clear();
     // Drop the outbox INSTANCE (durable rows stay in storage): dispose()
     // cancels every central lease/delivery wake and drops the delivery
-    // callbacks so no wake can flush a logged-out auth epoch; the next
-    // bootstrap re-runs Outbox.load and reconciles from durable rows.
-    this.outbox?.dispose();
-    this.outbox = null;
-    this.outboxUnsubscribe?.();
-    this.outboxUnsubscribe = null;
-    this.outboxInit = null;
-    this.outboxDegraded = false;
+    // callbacks so no wake can flush a logged-out auth identity; the next
+    // bootstrap re-runs Outbox.load (a NEW lifetime) and reconciles.
+    this.disposeOutboxForAuthChange();
     if (this.unloadClearTimer) {
       clearTimeout(this.unloadClearTimer);
       this.unloadClearTimer = null;

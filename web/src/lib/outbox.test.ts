@@ -90,11 +90,11 @@ class MemStorage implements OutboxStorage {
     return await run;
   }
   /** Atomic acceptance compare-and-set on the same serialized chain. */
-  async casProgressRecorded(commandId: string, issuerEpoch: string, issuerLifetime: string): Promise<boolean> {
+  async casProgressRecorded(commandId: string, issuerLifetime: string): Promise<boolean> {
     const run = this.writeChain.then(async () => {
       await new Promise((r) => setTimeout(r, 1));
       const existing = this.map.get(commandId);
-      if (!existing || existing.issuerEpoch !== issuerEpoch || existing.issuerLifetime !== issuerLifetime || existing.progressRecorded) {
+      if (!existing || existing.issuerLifetime !== issuerLifetime || existing.progressRecorded) {
         return false;
       }
       const marked: OutboxRecord = { ...existing, progressRecorded: true };
@@ -2198,7 +2198,7 @@ describe("Outbox", () => {
   // flips exactly once. No __caslock__ lease row is ever written.
   const shared = new MemStorage();
   await shared.put(
-    rec({ commandId: "cmd_single_writer", issuerEpoch: "epoch_1", issuerLifetime: "life_issuer" }),
+    rec({ commandId: "cmd_single_writer", issuerLifetime: "life_issuer" }),
   );
   const originalLocks = (globalThis.navigator as { locks?: LockManager }).locks;
   Object.defineProperty(globalThis.navigator, "locks", { configurable: true, value: undefined });
@@ -2208,19 +2208,19 @@ describe("Outbox", () => {
       Outbox.load(shared, "owner_sw_b"),
     ]);
     // Foreign-lifetime observer first, flag unset: must not record.
-    expect(await b.casProgressRecorded("cmd_single_writer", "epoch_1", b.lifetime)).toBe(false);
+    expect(await b.casProgressRecorded("cmd_single_writer", b.lifetime)).toBe(false);
     // The issuer then wins exactly once; its repeat observation loses on the
     // flag.
-    expect(await a.casProgressRecorded("cmd_single_writer", "epoch_1", "life_issuer")).toBe(true);
-    expect(await a.casProgressRecorded("cmd_single_writer", "epoch_1", "life_issuer")).toBe(false);
+    expect(await a.casProgressRecorded("cmd_single_writer", "life_issuer")).toBe(true);
+    expect(await a.casProgressRecorded("cmd_single_writer", "life_issuer")).toBe(false);
     // B still loses afterwards.
-    expect(await b.casProgressRecorded("cmd_single_writer", "epoch_1", b.lifetime)).toBe(false);
+    expect(await b.casProgressRecorded("cmd_single_writer", b.lifetime)).toBe(false);
     const stored = (await shared.all()).find((r) => r.commandId === "cmd_single_writer");
     expect(stored?.progressRecorded).toBe(true);
     expect(stored?.issuerLifetime).toBe("life_issuer");
     expect((await shared.all()).find((r) => r.commandId.startsWith("__caslock__"))).toBeUndefined();
-    // A different epoch loses regardless of lifetime.
-    expect(await a.casProgressRecorded("cmd_single_writer", "epoch_2", "life_issuer")).toBe(false);
+    // A non-issuer lifetime loses even when presented as the issuer arg.
+    expect(await a.casProgressRecorded("cmd_single_writer", "some_other_life")).toBe(false);
   } finally {
     Object.defineProperty(globalThis.navigator, "locks", {
       configurable: true,
@@ -2234,8 +2234,8 @@ it("GATE30 item 3: two different commands fail their acceptance CAS back to back
   const storage = new MemStorage();
   const setup = await Outbox.load(storage, "owner_g30_i3");
   const life = setup.lifetime;
-  await storage.put(rec({ commandId: "cmd_g30_x", instanceId: "ins_x", state: "sent", issuerEpoch: "ep", issuerLifetime: life }));
-  await storage.put(rec({ commandId: "cmd_g30_y", instanceId: "ins_y", state: "sent", issuerEpoch: "ep", issuerLifetime: life }));
+  await storage.put(rec({ commandId: "cmd_g30_x", instanceId: "ins_x", state: "sent", issuerLifetime: life }));
+  await storage.put(rec({ commandId: "cmd_g30_y", instanceId: "ins_y", state: "sent", issuerLifetime: life }));
   vi.useFakeTimers();
   try {
     const box = setup;
@@ -2256,16 +2256,16 @@ it("GATE30 item 3: two different commands fail their acceptance CAS back to back
     // First CAS for EACH command fails once; later attempts commit.
     const realCas = storage.casProgressRecorded.bind(storage);
     const failedOnce = new Set<string>();
-    storage.casProgressRecorded = vi.fn(async (id: string, epoch: string, lifetime: string) => {
+    storage.casProgressRecorded = vi.fn(async (id: string, lifetime: string) => {
       if (!failedOnce.has(id)) {
         failedOnce.add(id);
         throw new Error(`g30 i3 CAS aborted ${id}`);
       }
-      return await realCas(id, epoch, lifetime);
+      return await realCas(id, lifetime);
     });
 
-    box.retryAcceptedProgress("ins_x", "cmd_g30_x", "ep", life);
-    box.retryAcceptedProgress("ins_y", "cmd_g30_y", "ep", life);
+    box.retryAcceptedProgress("ins_x", "cmd_g30_x", life);
+    box.retryAcceptedProgress("ins_y", "cmd_g30_y", life);
     // Bounded backoff: both chains run independently.
     await vi.advanceTimersByTimeAsync(2_000);
     await Promise.resolve();
@@ -2296,7 +2296,7 @@ it("GATE31 item 1: a persistently failing acceptance CAS retries exactly CLAIM_W
   // Seeded under REAL timers (MemStorage commits on a 1 ms chain timer).
   const storage = new MemStorage();
   const seeded = await Outbox.load(storage, "owner_g31_cap");
-  await storage.put(rec({ commandId: "cmd_g31_cap", instanceId: "ins_cap", state: "sent", issuerEpoch: "ep", issuerLifetime: seeded.lifetime }));
+  await storage.put(rec({ commandId: "cmd_g31_cap", instanceId: "ins_cap", state: "sent", issuerLifetime: seeded.lifetime }));
   // Every CAS storage write rejects (persistent backend failure).
   storage.casProgressRecorded = vi.fn(async () => {
     throw new Error("g31 cap CAS always fails");
@@ -2305,7 +2305,7 @@ it("GATE31 item 1: a persistently failing acceptance CAS retries exactly CLAIM_W
   try {
     // The store's immediate CAS already failed once; the outbox gets the
     // observation pending and starts the bounded retry chain.
-    seeded.retryAcceptedProgress("ins_cap", "cmd_g31_cap", "ep", seeded.lifetime);
+    seeded.retryAcceptedProgress("ins_cap", "cmd_g31_cap", seeded.lifetime);
     // Drive well past the longest bounded backoff (cap is 12).
     await vi.advanceTimersByTimeAsync(120_000);
     await Promise.resolve();
@@ -2324,59 +2324,65 @@ it("GATE31 item 1: a persistently failing acceptance CAS retries exactly CLAIM_W
   }
 });
 
-it("GATE31 item 2: a logout/epoch rotation between the failed CAS and its retry stops the retry — no credit to the obsolete epoch", async () => {
-  // Seed under real timers; the live epoch provider is mutable.
+it("GATE32 item 1: a pending acceptance retry of a DISPOSED outbox never records — logout before the scheduled retry kills it", async () => {
+  // c-reconnfu gate 32: the outbox is disposed (local logout/reinit, or a
+  // peer-tab session removal) BEFORE the bounded retry fires. The retry must
+  // observe a non-live outbox and stop without touching the CAS.
   const storage = new MemStorage();
-  let epoch = "ep_before";
-  const seeded = await Outbox.load(storage, "owner_g31_epoch", () => epoch);
-  await storage.put(rec({ commandId: "cmd_g31_rot", instanceId: "ins_rot", state: "sent", issuerEpoch: "ep_before", issuerLifetime: seeded.lifetime }));
-  // The FIRST retry CAS rejects; later ones would succeed.
+  const seeded = await Outbox.load(storage, "owner_g32_disp");
+  await storage.put(rec({ commandId: "cmd_g32_disp", instanceId: "ins_d", state: "sent", issuerLifetime: seeded.lifetime }));
+  // First CAS (creating the pending entry) is driven by the test directly:
+  // it rejects, then the bounded retry is scheduled.
   let casAttempts = 0;
   storage.casProgressRecorded = vi.fn(async (id: string) => {
     casAttempts += 1;
-    if (casAttempts === 1) throw new Error("g31 epoch CAS first failure");
+    if (casAttempts === 1) throw new Error("g32 CAS first failure");
     return storage.map.get(id) ? true : false;
   });
   vi.useFakeTimers();
   try {
-    seeded.retryAcceptedProgress("ins_rot", "cmd_g31_rot", "ep_before", seeded.lifetime);
-    // Logout/reinit rotates the auth epoch BEFORE the scheduled retry fires.
-    epoch = "ep_after";
+    // The immediate CAS fails (as the store's recordAcceptedDelivery catch
+    // would see it); that schedules the first bounded retry.
+    await expect(seeded.casProgressRecorded("cmd_g32_disp", seeded.lifetime)).rejects.toThrow();
+    seeded.retryAcceptedProgress("ins_d", "cmd_g32_disp", seeded.lifetime);
+    // Logout/reinit disposes the outbox BEFORE the retry fires.
+    seeded.dispose();
     await vi.advanceTimersByTimeAsync(600);
     await Promise.resolve();
     await Promise.resolve();
-    // The scheduled retry re-read the CURRENT epoch (ep_after), saw the row
-    // stamped ep_before, and stopped BEFORE touching the CAS: zero retry
-    // writes (the single failed attempt that created the pending entry was the
-    // store-side immediate CAS), and no credit.
-    expect(storage.casProgressRecorded).not.toHaveBeenCalled();
-    expect(storage.map.get("cmd_g31_rot")?.progressRecorded).toBeFalsy();
-    // Advancing further schedules nothing.
+    // The scheduled retry sees a disposed outbox: no retry CAS, no credit.
+    expect(casAttempts).toBe(1); // only the immediate failed attempt
+    expect(storage.map.get("cmd_g32_disp")?.progressRecorded).toBeFalsy();
     await vi.advanceTimersByTimeAsync(30_000);
-    expect(storage.casProgressRecorded).not.toHaveBeenCalled();
-    seeded.dispose();
+    expect(casAttempts).toBe(1);
   } finally {
     vi.useRealTimers();
   }
 });
 
-it("GATE31 item 6: the REAL backend CAS rejects a different auth epoch even when the page lifetime matches — removing only the epoch check goes RED", async () => {
-  // Uses the production LocalStorageOutboxStorage (not a check-duplicating
-  // fake): the row is stamped with THIS outbox's lifetime, so the lifetime leg
-  // passes and only the rotated epoch can reject.
-  const { LocalStorageOutboxStorage } = await import("./outbox");
-  localStorage.clear();
-  const storage = new LocalStorageOutboxStorage();
-  const box = await Outbox.load(storage, "owner_g31_epoch");
-  await storage.put(
-    rec({ commandId: "cmd_g31_epoch", instanceId: "ins_e", state: "sent", issuerEpoch: "ep_old", issuerLifetime: box.lifetime }),
-  );
-  // Same lifetime, NEW epoch (logout/reinit): must not flip.
-  expect(await box.casProgressRecorded("cmd_g31_epoch", "ep_new", box.lifetime)).toBe(false);
-  const rows = async () => (await storage.all()).find((r) => r.commandId === "cmd_g31_epoch");
-  expect((await rows())?.progressRecorded).toBeFalsy();
-  // The original epoch wins exactly once.
-  expect(await box.casProgressRecorded("cmd_g31_epoch", "ep_old", box.lifetime)).toBe(true);
-  expect((await rows())?.progressRecorded).toBe(true);
-  expect(await box.casProgressRecorded("cmd_g31_epoch", "ep_old", box.lifetime)).toBe(false);
+it("GATE32 item 1: a pending retry whose captured lifetime no longer equals the live outbox lifetime stops without recording", async () => {
+  // Defensive: even if a stale pending entry somehow survives, the retry
+  // compares the captured lifetime with THIS outbox instance and refuses a
+  // mismatch. The row is stamped with a foreign lifetime.
+  const storage = new MemStorage();
+  const box = await Outbox.load(storage, "owner_g32_life");
+  await storage.put(rec({ commandId: "cmd_g32_life", instanceId: "ins_l", state: "sent", issuerLifetime: "some_other_lifetime" }));
+  let casAttempts = 0;
+  storage.casProgressRecorded = vi.fn(async () => {
+    casAttempts += 1;
+    return false;
+  });
+  vi.useFakeTimers();
+  try {
+    box.retryAcceptedProgress("ins_l", "cmd_g32_life", "some_other_lifetime");
+    await vi.advanceTimersByTimeAsync(600);
+    await Promise.resolve();
+    // Lifetime mismatch with the live outbox → never calls the CAS.
+    expect(casAttempts).toBe(0);
+    expect(storage.map.get("cmd_g32_life")?.progressRecorded).toBeFalsy();
+    box.dispose();
+  } finally {
+    vi.useRealTimers();
+  }
 });
+

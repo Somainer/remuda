@@ -2,7 +2,6 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { ConnectionMachine } from "./connection";
 import { REST_PROBE_MS } from "./connection";
 import { CLAIM_WAKE_MAX_FAILURES, OUTBOX_LS_KEY, type OutboxRecord } from "./outbox";
-import { readAuthEpoch } from "./session";
 
 const INSTANCE = "ins_foreign_tab";
 const JOURNAL = "obj_foreign_tab_journal";
@@ -4969,27 +4968,28 @@ it("GATE27 item 2: an OLD-epoch acceptance arriving only AFTER logout/reinit (th
     const cId = sendA.mock.calls[0]?.[4] as string;
     expect(sendA).toHaveBeenCalledTimes(1);
     expect(rowOf(cId)?.state).toBe("inflight");
-    const epochA = rowOf(cId)?.issuerEpoch;
-    expect(epochA).toBeTruthy();
+    const lifeA = rowOf(cId)?.issuerLifetime;
+    expect(lifeA).toBeTruthy();
     expect(rowOf(cId)?.progressRecorded).toBeFalsy();
 
-    // Logout BEFORE any acceptance; epoch rotates and the hung POST dies with
-    // the disposed outbox. Reinit epoch B.
+    // Logout BEFORE any acceptance: the outbox is disposed (its pending POST
+    // dies with it); reinit creates a NEW outbox with a new lifetime id.
     a.logout();
     const reopened = await (
       a as unknown as { ensureOutbox: () => Promise<boolean> }
     ).ensureOutbox();
     expect(reopened).toBe(true);
-    const epochB = readAuthEpoch();
-    expect(epochB).not.toBe(epochA);
-    // B's boot flush cannot touch C: its lease is still a LIVE same-owner
-    // lease (TTL 30 s), so the claim stops at claim-aborted.
+    const lifeB = (a as unknown as { outbox: { lifetime: string } }).outbox.lifetime;
+    expect(lifeB).not.toBe(lifeA);
+    // B's boot flush cannot touch C: B is a different lifetime issuer and C
+    // carries a live same-owner lease (TTL 30 s), so the claim stops at
+    // claim-aborted.
     locks = good;
     a.setConnectionStateForTest("live");
     await (a as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
     await pump(1_000);
     expect(rowOf(cId)?.state).toBe("inflight");
-    expect(rowOf(cId)?.issuerEpoch).toBe(epochA);
+    expect(rowOf(cId)?.issuerLifetime).toBe(lifeA);
     expect(sendA).toHaveBeenCalledTimes(1);
     const boxOfB = () =>
       (
@@ -5011,7 +5011,7 @@ it("GATE27 item 2: an OLD-epoch acceptance arriving only AFTER logout/reinit (th
     expect(boxOfB()!.isDeliveryExhausted(I)).toBe(true);
     expect(boxOfB()!.pendingLeaseWakeups()).toEqual([]);
 
-    // The stale epoch-A subscription settles C accepted/done AFTER reinit.
+    // The stale outbox-A subscription settles C accepted/done AFTER reinit.
     onBatchA({
       subscriptionId: "sub_g27_i2_a",
       journalId: JOURNAL,
@@ -5024,9 +5024,10 @@ it("GATE27 item 2: an OLD-epoch acceptance arriving only AFTER logout/reinit (th
     await vi.advanceTimersByTimeAsync(1_000);
 
     // Journal evidence retires C to durable done, but C is NOT credited to
-    // epoch B: the flag never flips (issuer A ≠ epoch B) and B's books stand.
+    // outbox B: the flag never flips (issuer lifetime A ≠ B) and B's books
+    // stand.
     expect(rowOf(cId)?.state).toBe("done");
-    expect(rowOf(cId)?.issuerEpoch).toBe(epochA);
+    expect(rowOf(cId)?.issuerLifetime).toBe(lifeA);
     expect(rowOf(cId)?.progressRecorded).toBeFalsy();
     expect(boxOfB()!.isDeliveryExhausted(I)).toBe(true);
     expect(boxOfB()!.pendingLeaseWakeups()).toEqual([]);
@@ -5041,14 +5042,12 @@ it("GATE27 item 2: an OLD-epoch acceptance arriving only AFTER logout/reinit (th
 });
 
 /** GATE28: read the durable outbox rows straight from localStorage. */
-function g28Rows(): Array<OutboxRecord & { issuerEpoch?: string; progressRecorded?: boolean }> {
+function g28Rows(): Array<OutboxRecord & { progressRecorded?: boolean }> {
   return JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as Array<OutboxRecord & {
-    issuerEpoch?: string;
     progressRecorded?: boolean;
   }>;
 }
 const g28Row = (id: string) => g28Rows().find((r) => r.commandId === id);
-const g28EpochKey = "runtime.outbox-auth-epoch";
 
 it("GATE28 a: a claim that fails before commit stamps no issuer — the stale command's acceptance on the replacement epoch records nothing", async () => {
   // In epoch A the row C's REAL claim transaction aborts BEFORE commit (fault
@@ -5121,13 +5120,11 @@ it("GATE28 a: a claim that fails before commit stamps no issuer — the stale co
     expect(claimFaults).toBeGreaterThan(0);
     expect(sendA).not.toHaveBeenCalled();
     // The failed claim stamped NOTHING.
-    expect(g28Row(cId)?.issuerEpoch).toBeUndefined();
+    expect(g28Row(cId)?.issuerLifetime).toBeUndefined();
     expect(g28Row(cId)?.state).toBe("pending");
 
-    // Logout rotates the auth epoch; reinit epoch B.
+    // Logout disposes the outbox; reinit creates a new outbox (new lifetime).
     a.logout();
-    // gate31 item 3: logout writes a tombstone ("") rather than deleting.
-    expect(localStorage.getItem(g28EpochKey)).toBe("");
     const reopened = await (a as unknown as { ensureOutbox: () => Promise<boolean> }).ensureOutbox();
     expect(reopened).toBe(true);
     const boxB = () => (a as unknown as { outbox: { isDeliveryExhausted: (i: string) => boolean; pendingLeaseWakeups: () => string[] } | null }).outbox;
@@ -5160,7 +5157,7 @@ it("GATE28 a: a claim that fails before commit stamps no issuer — the stale co
     await pump(2_000);
     expect(bClaimFaults).toBeGreaterThan(0);
     expect(sendA).not.toHaveBeenCalled();
-    expect(g28Row(cId)?.issuerEpoch).toBeUndefined();
+    expect(g28Row(cId)?.issuerLifetime).toBeUndefined();
     expect(g28Row(pRowId)?.state).toBe("pending");
 
     // The stale epoch-A subscription settles C accepted/done.
@@ -5272,42 +5269,28 @@ it("GATE28 b: POST → status GET → journal for the SAME command records progr
     expect(g28Row(cId)?.progressRecorded).toBe(true);
     expect(boxHandle().outbox!.isDeliveryExhausted(I)).toBe(false);
 
-    // 3) More OTHER accepted deliveries than the old 2 000-row in-memory
-    //    tracking sets could hold. Each is a REAL delivery through the store:
-    //    storage-first enqueue (enqueueBubble) → guarded flushAllOutbox →
-    //    committed claim stamping (epoch, lifetime) → accepted POST → sent
-    //    patch → the acceptance helper's durable CAS. No hand-built rows.
-    //    Locks stay up so the flushes run directly (no reconnect timers).
+    // 3) A large volume of OTHER accepted deliveries (more than any small
+    //    in-memory cache could practically hold) driven through the outbox's
+    //    real accepted-delivery boundary (committed claim stamping lifetime →
+    //    sent → CAS). Item 2 of this gate replaces this with full store sends.
     const box = (hubStore as unknown as { outbox: {
       deliverAcceptedForTest: (
         r: Omit<OutboxRecord, "attempts" | "state"> & { state?: OutboxRecord["state"] },
-        epoch: string,
       ) => Promise<boolean>;
     } }).outbox;
-    const fillerEpoch = readAuthEpoch();
     for (let i = 0; i < FILLER; i += 1) {
       // eslint-disable-next-line no-await-in-loop
       expect(
-        await box.deliverAcceptedForTest(
-          {
-            commandId: `cmd_g28b_fill_${i}`,
-            clientRequestId: `local_g28b_${i}`,
-            instanceId: `ins_g28_b_filler_${i % 40}`,
-            prompt: `filler ${i}`,
-            createdAt: 2_000 + i,
-          },
-          fillerEpoch,
-        ),
+        await box.deliverAcceptedForTest({
+          commandId: `cmd_g28b_fill_${i}`,
+          clientRequestId: `local_g28b_${i}`,
+          instanceId: `ins_g28_b_filler_${i % 40}`,
+          prompt: `filler ${i}`,
+          createdAt: 2_000 + i,
+        }),
       ).toBe(true);
     }
-    // Each filler's own flip is at-most-once too.
-    expect(
-      await box.deliverAcceptedForTest(
-        { commandId: "cmd_g28b_extra", clientRequestId: "local_extra", instanceId: "ins_x", prompt: "x", createdAt: 1 },
-        fillerEpoch,
-      ),
-    ).toBe(true);
-    expect(storedRows().filter((r) => r.progressRecorded)).toHaveLength(FILLER + 2);
+    expect(storedRows().filter((r) => r.progressRecorded)).toHaveLength(FILLER + 1);
     expect(g28Row(cId)?.progressRecorded).toBe(true);
 
     // 4) Fresh delivery failures accrue on C's instance (a later row Q hammers
@@ -5402,7 +5385,7 @@ it("GATE28 c: cancelled navigation (pagehide) between the claim and the accepted
     for (let i = 0; i < 1_000 && gets < 1; i += 1) await Promise.resolve();
     const cId = send.mock.calls[0]?.[4] as string;
     expect(g28Row(cId)?.state).toBe("reconciling");
-    expect(g28Row(cId)?.issuerEpoch).toBeTruthy();
+    expect(g28Row(cId)?.issuerLifetime).toBeTruthy();
     expect(g28Row(cId)?.progressRecorded).toBeFalsy();
 
     // Genuine page navigation away and BFCache restore before the GET settles.
@@ -5499,10 +5482,9 @@ it("GATE28 d / GATE30 single-writer: after a reload of the same login a restored
     // locks are the only thing standing between P and delivery here).
     locks = bad;
     const cId = send.mock.calls[0]?.[4] as string;
-    const epochBeforeReload = localStorage.getItem(g28EpochKey);
-    expect(epochBeforeReload).toBeTruthy();
+    const lifeBeforeReload = g28Row(cId)?.issuerLifetime;
+    expect(lifeBeforeReload).toBeTruthy();
     expect(g28Row(cId)?.state).toBe("reconciling");
-    expect(g28Row(cId)?.issuerEpoch).toBe(epochBeforeReload);
     expect(g28Row(cId)?.progressRecorded).toBeFalsy();
 
     // RELOAD of the same login: drop the in-memory outbox and re-init WITHOUT
@@ -5516,8 +5498,8 @@ it("GATE28 d / GATE30 single-writer: after a reload of the same login a restored
       connectionBindGen: number;
       initConnection: (offline?: boolean) => Promise<void>;
     };
-    // Drop the connection machine too so initConnection rebuilds it (a reload),
-    // but leave the auth epoch in storage (NOT a logout).
+    // Drop the connection machine too so initConnection rebuilds it (a reload).
+    // Same login, but the new page gets a NEW outbox lifetime.
     reloader.connection?.dispose();
     reloader.connection = null;
     reloader.connectionBoundTo = null;
@@ -5526,25 +5508,25 @@ it("GATE28 d / GATE30 single-writer: after a reload of the same login a restored
     reloader.outbox = null;
     reloader.outboxInit = null;
     // A real reload destroys the previous JS context (old reconciliation loop
-    // and outbox) outright; in-process we drop its in-flight marker so the
-    // restored epoch starts the GET loop bound to the NEW outbox. The orphaned
-    // old loop (if its parked GET resolves) is rejected by the origin check.
+    // and outbox) outright; in-process we drop its in-flight marker so the new
+    // page starts the GET loop bound to the NEW outbox (new lifetime). The
+    // orphaned old loop (if its parked GET resolves) is rejected by the origin
+    // check.
     (hubStore as unknown as { reconcilingInFlight: Set<string> }).reconcilingInFlight.delete(cId);
     await reloader.initConnection();
     // Let the recreated connection machine certify live against the mocked
     // Hub (probe + ready follow) as it would on a real reload.
     await pump(3_000);
-    expect(localStorage.getItem(g28EpochKey)).toBe(epochBeforeReload);
 
     // The restored GET reconciliation reports accepted: the sent patch lands,
-    // but the (epoch, lifetime) CAS fails — same epoch, NEW lifetime.
+    // but the lifetime CAS fails — the new page is a different outbox.
     releaseGet(g25Status(cId, "accepted"));
     await pump(3_000);
     await vi.advanceTimersByTimeAsync(2_000);
     expect(send.mock.calls.map((c) => c[4])).toEqual([cId]); // P never POSTed
     expect(g28Row(cId)?.state).toBe("sent");
     expect(g28Row(cId)?.progressRecorded).toBeFalsy(); // not credited
-    expect(g28Row(cId)?.issuerEpoch).toBe(epochBeforeReload);
+    expect(g28Row(cId)?.issuerLifetime).toBe(lifeBeforeReload);
     // P stays pending with the locks down: the rejected CAS ran no epilogue,
     // so no wake was re-armed that could deliver it (in-memory exhaustion is
     // per-page and intentionally not carried across a reload; the durable flag
@@ -5602,7 +5584,7 @@ it("GATE29 item 2: one acceptance CAS storage failure keeps the acceptance pendi
     const boxHandle = () =>
       hubStore as unknown as {
         outbox: {
-          storage: { casProgressRecorded: (id: string, epoch: string, lifetime: string) => Promise<boolean> };
+          storage: { casProgressRecorded: (id: string, lifetime: string) => Promise<boolean> };
           isDeliveryExhausted: (i: string) => boolean;
         } | null;
       };
@@ -5621,12 +5603,12 @@ it("GATE29 item 2: one acceptance CAS storage failure keeps the acceptance pendi
     const realCas = storage.casProgressRecorded.bind(storage);
     // CASes of the steer (any id but P); the first steer CAS fails once.
     let casCalls = 0;
-    storage.casProgressRecorded = vi.fn(async (id: string, epoch: string, lifetime: string) => {
+    storage.casProgressRecorded = vi.fn(async (id: string, lifetime: string) => {
       if (id !== pId) {
         casCalls += 1;
         if (casCalls === 1) throw new Error("g29 i2 CAS write aborted");
       }
-      return await realCas(id, epoch, lifetime);
+      return await realCas(id, lifetime);
     });
 
     // The accepted steer records progress; the CAS fails once.
@@ -5711,7 +5693,7 @@ it("GATE29 item 2: one acceptance CAS storage failure keeps the acceptance pendi
     await bootLive(apiA, a);
     await (a as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
     await a.follow(I);
-    const aStorage = (a as unknown as { outbox: { storage: { casProgressRecorded: (id: string, e: string, l: string) => Promise<boolean> } } }).outbox.storage;
+    const aStorage = (a as unknown as { outbox: { storage: { casProgressRecorded: (id: string, l: string) => Promise<boolean> } } }).outbox.storage;
     const realCasA = aStorage.casProgressRecorded.bind(aStorage);
     let aCasCalls = 0;
     // First CAS rejects (creates the pending retry); EVERY later CAS parks
@@ -5720,11 +5702,11 @@ it("GATE29 item 2: one acceptance CAS storage failure keeps the acceptance pendi
     const aGate = new Promise<void>((resolve) => {
       releaseA = () => resolve();
     });
-    aStorage.casProgressRecorded = vi.fn(async (id: string, e: string, l: string) => {
+    aStorage.casProgressRecorded = vi.fn(async (id: string, l: string) => {
       aCasCalls += 1;
       if (aCasCalls === 1) throw new Error("g31 i5 A CAS first failure");
       await aGate;
-      return await realCasA(id, e, l);
+      return await realCasA(id, l);
     });
     a.setConnectionStateForTest("live");
     expect(await a.send(I, "g31 i5 S", [], [], "steer")).toBe(true);
@@ -5814,3 +5796,167 @@ it("GATE29 item 2: one acceptance CAS storage failure keeps the acceptance pendi
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });;
+
+it("GATE32 item 1a: logout/reinit disposes the Outbox — the new outbox has a fresh lifetime and an old command's acceptance never credits it", async () => {
+  // The same PAGE logs out and reinits: the disposed outbox's lifetime dies,
+  // the new outbox gets a different lifetime. A command accepted after the
+  // change (journal arrives on the new page) retires to done but its CAS
+  // compares lifetimes and never flips, so the new outbox's own exhausted
+  // instance is untouched.
+  vi.useFakeTimers();
+  vi.setSystemTime(1_090_000);
+  const I = "ins_g32_a";
+  const originalNavigator = globalThis.navigator;
+  const shim = fifoWebLocks();
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks: shim.locks },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g32_a");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const send = vi.spyOn(api, "instanceSend");
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await hubStore.follow(I);
+    const onBatch = vi.mocked(api.eventsSubscribe).mock.calls[0]?.[2] as (b: G26Batch) => void;
+    const boxOf = () => (hubStore as unknown as { outbox: { lifetime: string; isDeliveryExhausted: (i: string) => boolean; pendingLeaseWakeups: () => string[] } | null }).outbox;
+
+    // Old outbox issues C; the POST hangs (issued, never accepted).
+    send.mockImplementation(
+      (() => new Promise(() => { /* hung: issued, not accepted */ })) as Api["instanceSend"],
+    );
+    hubStore.setConnectionStateForTest("live");
+    await hubStore.send(I, "g32 a C");
+    await pump(2_000);
+    const rows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    const cId = send.mock.calls[0]?.[4] as string;
+    const oldLife = boxOf()!.lifetime;
+    expect(rows().find((r) => r.commandId === cId)?.issuerLifetime).toBe(oldLife);
+
+    // Logout then reinit (same page): a NEW outbox with a NEW lifetime.
+    hubStore.logout();
+    const reopened = await (hubStore as unknown as { ensureOutbox: () => Promise<boolean> }).ensureOutbox();
+    expect(reopened).toBe(true);
+    const newLife = boxOf()!.lifetime;
+    expect(newLife).not.toBe(oldLife);
+
+    // New outbox independently exhausts its own instance on P (locks down).
+    const bad = { query: async () => ({ held: [] as Array<{ name: string }> }), request: () => Promise.reject(new Error("g32 a locks")) as Promise<never> };
+    let locks: unknown = shim.locks;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      writable: true,
+      value: { get locks() { return locks; } },
+    });
+    locks = bad;
+    hubStore.setConnectionStateForTest("offline");
+    expect(await hubStore.send(I, "g32 a P")).toBe(true);
+    await pump(200);
+    const pId = rows().find((r) => r.prompt === "g32 a P")!.commandId;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(true);
+
+    // The old command's accepted journal settle arrives on the NEW page:
+    // done patch retires C, but the lifetime CAS fails — no credit.
+    onBatch({
+      subscriptionId: "sub_g32",
+      journalId: JOURNAL,
+      fromSeq: "1",
+      toSeq: "1",
+      durableSeq: "1",
+      events: [g26JournalMessage(cId, "1")],
+    });
+    await pump(2_000);
+    expect(rows().find((r) => r.commandId === cId)?.state).toBe("done");
+    expect(rows().find((r) => r.commandId === cId)?.progressRecorded).toBeFalsy();
+    expect(rows().find((r) => r.commandId === cId)?.issuerLifetime).toBe(oldLife);
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(true);
+    expect(rows().find((r) => r.commandId === pId)?.state).toBe("pending");
+    expect(send).toHaveBeenCalledTimes(1);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE32 item 1b: a peer tab's session removal observed via storage disposes THIS outbox — its pending acceptance retry never records", async () => {
+  // One store with a pending acceptance CAS retry. Another document removes
+  // the device session (logout in a sibling tab) → the storage event disposes
+  // the outbox BEFORE the retry fires, so the retry sees a disposed/non-live
+  // outbox and the flag never flips.
+  vi.useFakeTimers();
+  vi.setSystemTime(1_091_000);
+  const I = "ins_g32_b";
+  const originalNavigator = globalThis.navigator;
+  const shim = fifoWebLocks();
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: shim.locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g32_b");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await hubStore.follow(I);
+    hubStore.setConnectionStateForTest("live");
+
+    // Fail the first CAS once → bounded retry is scheduled (fires at 250 ms).
+    const storage = (hubStore as unknown as { outbox: { storage: { casProgressRecorded: (id: string, l: string) => Promise<boolean> } } }).outbox.storage;
+    const realCas = storage.casProgressRecorded.bind(storage);
+    let casCalls = 0;
+    storage.casProgressRecorded = vi.fn(async (id: string, l: string) => {
+      casCalls += 1;
+      if (casCalls === 1) throw new Error("g32 b CAS first failure");
+      return realCas(id, l);
+    });
+    expect(await hubStore.send(I, "g32 b S", [], [], "steer")).toBe(true);
+    await pump(1_000);
+    const cId = send.mock.calls[0]?.[4] as string;
+    const rows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(rows().find((r) => r.commandId === cId)?.progressRecorded).toBeFalsy();
+    expect(casCalls).toBe(1);
+
+    // A SIBLING tab logs out (storage events fire only in other documents):
+    // the device session key is replaced/cleared.
+    window.dispatchEvent(
+      new StorageEvent("storage", { key: "runtime.device-session", oldValue: '{"deviceId":"x"}', newValue: null }),
+    );
+    // The outbox is disposed by the peer-auth watcher.
+    expect((hubStore as unknown as { outbox: unknown }).outbox).toBeNull();
+
+    // Advance past every bounded retry: no retry CAS from the disposed outbox.
+    await vi.advanceTimersByTimeAsync(120_000);
+    await pump(500);
+    expect(casCalls).toBe(1);
+    expect(rows().find((r) => r.commandId === cId)?.progressRecorded).toBeFalsy();
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

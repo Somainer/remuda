@@ -1456,28 +1456,47 @@ git push origin HEAD:main
         .send(json!({"jsonrpc":"2.0","id":"run-1","method":"gate.run","params":p1}))
         .await;
     // Authorize it (the bridge is A's Hub-facing controller).
-    // Wait bounded for the child to start.
-    let started_deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !state_dir.join("started").exists()
-        && started_deadline.elapsed() < Duration::from_secs(10)
-    {
+    // Wait bounded for the child to start. r16 item 8: the deadline used to be
+    // `Instant::now() + 10s` and the loop measured `deadline.elapsed()` — the
+    // elapsed of a FUTURE instant is 0 (or panics on stricter toolchains), so
+    // the bound never applied and, more importantly, a failure to authorize
+    // hung the test with no diagnostic instead of proving gen 1 authorized.
+    let wait_started = std::time::Instant::now();
+    let mut authorized_gen_1 = false;
+    while !state_dir.join("started").exists() {
+        assert!(
+            wait_started.elapsed() < Duration::from_secs(10),
+            "the gen-1 verify child never started (was generation 1 authorized: {authorized_gen_1})"
+        );
         // Frames must still be serviced while we wait for the marker, so the
-        // gate.authorize exchange completes.
+        // gate.authorize exchange completes BEFORE the runner spawns the child
+        // (the child cannot start without a true authorization).
         if let Ok(Some(frame)) =
             tokio::time::timeout(Duration::from_millis(100), peer_a.next_opt()).await
             && frame.get("method").and_then(Value::as_str) == Some("gate.authorize")
         {
+            // The daemon must ask authorization for EXACTLY generation 1.
+            assert_eq!(
+                frame["params"]["generation"],
+                json!(1),
+                "the gen-1 dispatch must request a gen-1 authorization: {frame}"
+            );
             peer_a
                 .send(json!({
                     "jsonrpc":"2.0","id":frame["id"].clone(),
                     "result":{"authorized":true,"generation":1}
                 }))
                 .await;
+            authorized_gen_1 = true;
         }
     }
     assert!(
         state_dir.join("started").exists(),
         "the gen-1 verify child never started"
+    );
+    assert!(
+        authorized_gen_1,
+        "generation 1 was never authorized before the child started"
     );
 
     // Cancel gen 1 on A: the blocked group is killed and the run settles

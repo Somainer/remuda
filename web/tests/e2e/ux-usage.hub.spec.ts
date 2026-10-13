@@ -246,9 +246,12 @@ test("context chip: ring percentage and popover rollup over three turns", async 
   await expect(page.getByTestId("context-usage-cell-缓存读")).toContainText("63.1k");
   await expect(page.getByTestId("context-usage-turns")).toHaveText("2");
 
-  // Turn 3 — Grok-shaped: output only (`-` channels). Session sums keep
-  // growing for reported channels; the context figure becomes unknown and
-  // the headline names the channel that would supply it.
+  // Turn 3 — Grok-shaped: output only (`-` channels). U1 (c-ctxusage r16
+  // item 4): a bucket omitted by ANY contributing turn folds the SESSION sum
+  // to Unknown, so the input/cache cells become "—" (never the turns 1-2
+  // partial sum, never 0); output was reported by every turn and keeps
+  // growing. The next-request context figure is unknown as well and the
+  // headline names the channel that would supply it.
   await sendUsageTurn(page, "-,420,-,-", true);
   await expect(chip).toHaveText("—", { timeout: 15_000 });
   await chip.click();
@@ -259,9 +262,9 @@ test("context chip: ring percentage and popover rollup over three turns", async 
     .getByTestId("context-usage-headline")
     .getAttribute("title");
   expect(headlineTitle ?? "").toMatch(/input|cacheRead|cacheCreation/);
-  await expect(page.getByTestId("context-usage-cell-入")).toContainText("6.6k");
+  await expect(page.getByTestId("context-usage-cell-入")).toContainText("—");
   await expect(page.getByTestId("context-usage-cell-出")).toContainText("865");
-  await expect(page.getByTestId("context-usage-cell-缓存读")).toContainText("63.1k");
+  await expect(page.getByTestId("context-usage-cell-缓存读")).toContainText("—");
   await expect(page.getByTestId("context-usage-turns")).toHaveText("3");
 
   await page.keyboard.press("Escape");

@@ -1354,7 +1354,7 @@ class HubStore {
       // GET reconciliation instead of leaving 状态待确认 on the row forever.
       // Never re-POSTs — the Hub already recorded the forward.
       for (const r of restored) {
-        if (r.state === "reconciling") this.reconcileReconcilingRow(r.instanceId, r.commandId);
+        if (r.state === "reconciling") this.reconcileReconcilingRow(r.instanceId, r.commandId, box);
       }
     }
 
@@ -2143,21 +2143,30 @@ class HubStore {
    * single-deliverer lock (it can take the whole 30 s deadline and must not
    * block another row of the instance, e.g. a steer); such a row is
    * non-deliverable, so no other owner can POST it meanwhile.
+   *
+   * `origin` is the outbox that handed the row here. A delayed ACCEPTANCE can
+   * land seconds after the POST (c-reconnfu gate 25 item 1) — by then a
+   * logout/reinit may have replaced the auth epoch; progress is recorded only
+   * while `origin` is still the current outbox.
    */
-  private reconcileReconcilingRow(instanceId: Id, commandId: Id): void {
+  private reconcileReconcilingRow(instanceId: Id, commandId: Id, origin: Outbox): void {
     // One bounded GET loop per row per page lifetime: a row can be handed here
     // by both the POST landing and an outbox restore only across a real reload
     // (different page), but never run two loops concurrently in one page.
     if (this.reconcilingInFlight.has(commandId)) return;
     this.reconcilingInFlight.add(commandId);
-    void this.runReconcileReconcilingRow(instanceId, commandId).finally(() => {
+    void this.runReconcileReconcilingRow(instanceId, commandId, origin).finally(() => {
       this.reconcilingInFlight.delete(commandId);
     });
   }
 
   private readonly reconcilingInFlight = new Set<Id>();
 
-  private async runReconcileReconcilingRow(instanceId: Id, commandId: Id): Promise<void> {
+  private async runReconcileReconcilingRow(
+    instanceId: Id,
+    commandId: Id,
+    origin: Outbox,
+  ): Promise<void> {
     const deadline = Date.now() + RECONCILE_GET_DEADLINE_MS;
     for (;;) {
       // Journal evidence is authoritative acceptance (the Node ran the
@@ -2178,15 +2187,28 @@ class HubStore {
         }))) {
           return;
         }
+        // Rejection is not acceptance: the instance's exhaustion stays
+        // latched and no delivery wakes are re-armed (gate 25 item 1).
         return;
       }
       if (verdict === "sent") {
-        await this.reconcilePatch(commandId, { state: "sent", gotResponse: true });
+        const wrote = await this.reconcilePatch(commandId, { state: "sent", gotResponse: true });
+        // c-reconnfu gate 25 item 1: the Hub/Node accepted a POST whose
+        // immediate answer was still uncertain (queued+forwarded+reconciling).
+        // While uncertain the outcome recorded NO progress (exhaustion stayed
+        // latched); the delayed acceptance now records it on the ORIGINATING
+        // outbox — only while it is still the current auth epoch — and runs
+        // its fresh delivery epilogue, so the central reconciliation re-arms
+        // the instance's stranded pending rows and the real timer delivers
+        // them. A dropped patch (row already terminal done) needs no epilogue.
+        if (wrote) await this.recordAcceptedReconciliation(instanceId, origin);
         return;
       }
       if (verdict === "held") {
         // Host went offline mid-reconcile: fall back to held retry (refund the
-        // attempt and arm the bounded same-id re-POST).
+        // attempt and arm the bounded same-id re-POST). Held is not
+        // acceptance: exhaustion stays latched until the held retry's own POST
+        // is accepted at the shared boundary.
         const wrote = await this.reconcilePatch(commandId, {
           state: "held",
           gotResponse: true,
@@ -2197,10 +2219,26 @@ class HubStore {
       }
       if (Date.now() >= deadline) {
         await this.reconcilePatch(commandId, { state: "unknown", lastError: "reconciliation deadline" });
+        // Never resolved: uncertainty to the end — exhaustion stays latched.
         return;
       }
       await new Promise((r) => setTimeout(r, RECONCILE_GET_INTERVAL_MS));
     }
+  }
+
+  /**
+   * A delayed reconciling-GET acceptance landed (c-reconnfu gate 25 item 1).
+   * Record the successful delivery on the outbox that STARTED the GET loop
+   * only while it is still the current one: a logout/reinit while the GET was
+   * pending disposed the old epoch, whose stale continuation must never clear
+   * books or reconcile the new outbox (same rule as the gate 22 flush epilogue).
+   * The fresh delivery epilogue re-reads authoritatively and, exhaustion now
+   * cleared, re-arms every pending row of the instance.
+   */
+  private async recordAcceptedReconciliation(instanceId: Id, origin: Outbox): Promise<void> {
+    if (this.pageIsUnloading || this.outbox !== origin) return;
+    origin.noteDeliveryProgress(instanceId);
+    await origin.deliveryEpilogue().catch(() => undefined);
   }
 
   /**
@@ -2381,7 +2419,7 @@ class HubStore {
         this.scheduleHeldRetry(current0.instanceId);
       } else if (classified === "reconciling") {
         await finish({ state: "reconciling", serverState: result.command.state, gotResponse: true });
-        await this.reconcileReconcilingRow(current0.instanceId, commandId);
+        await this.reconcileReconcilingRow(current0.instanceId, commandId, box);
       } else {
         await finish({ state: "sent", serverState: result.command.state, gotResponse: true });
         accepted = true;
@@ -2401,7 +2439,7 @@ class HubStore {
           this.scheduleHeldRetry(current0.instanceId);
         } else if (reconciled === "reconciling") {
           await finish({ state: "reconciling", gotResponse: true });
-          await this.reconcileReconcilingRow(current0.instanceId, commandId);
+          await this.reconcileReconcilingRow(current0.instanceId, commandId, box);
         } else {
           // Truly undelivered: keep pending, bounded same-id retry. Same-id
           // retries are safe in ANY link state (the 20-attempt / 24 h envelope

@@ -3968,3 +3968,349 @@ it("GATE24 item 2 (rebuilds gate-23 item-2): a real HubStore with two real enque
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+/** GATE25 item 1 harness bits: the queued+forwarded+reconciling Hub answer. */
+function g25ReconcilingAnswer(commandId: string) {
+  return {
+    relatedCommandIds: [],
+    command: {
+      commandId,
+      id: commandId,
+      revision: "1",
+      state: "queued",
+      dispatch: "transport-written",
+      resolution: "reconciling",
+    },
+  };
+}
+type G25Status = Awaited<ReturnType<Api["instanceCommandStatus"]>>;
+const g25Status = (commandId: string, shape: "reconciling" | "accepted" | "rejected"): G25Status => {
+  const base = {
+    commandId,
+    instanceId: "ins_g25_i1",
+    state: shape === "accepted" ? "accepted" : shape === "rejected" ? "settled" : "queued",
+    resolution: shape === "reconciling" ? "reconciling" : "clear",
+    forwarded: true,
+  };
+  return (shape === "rejected"
+    ? { ...base, settlement: { outcome: "rejected" as const, reason: "g25 rejected" } }
+    : base) as unknown as G25Status;
+};
+
+it("GATE25 item 1 (positive): an exhausted instance's reconciling steer is accepted by the delayed GET — progress on the originating outbox + fresh epilogue deliver the older row by its real timer", async () => {
+  // The POST answers queued+forwarded+RECONCILING (Node ack timeout): no
+  // acceptance yet, so exhaustion must stay latched. The async command-status
+  // GET first still reports reconciling, then ACCEPTED. Pre-fix the delayed
+  // acceptance only patched the steer row to sent — it never recorded progress
+  // nor re-ran the delivery epilogue, so the older exhausted row stayed
+  // stranded. Post-fix the originating, still-current outbox records progress
+  // and its fresh epilogue re-arms P; the real timer delivers P.
+  vi.useFakeTimers();
+  vi.setSystemTime(980_000);
+  const I = "ins_g25_i1";
+  const originalNavigator = globalThis.navigator;
+  const good = fifoWebLocks().locks;
+  const bad = {
+    query: async () => ({ held: [] as Array<{ name: string }> }),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    request: (): Promise<any> => Promise.reject(new Error("g25 locks down")),
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let locks: { query: () => Promise<unknown>; request: (...args: any[]) => Promise<unknown> } = bad;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { get locks() { return locks; } },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g25_i1");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_iid: string, prompt: string, _x?: unknown, _m?: string, commandId?: string) =>
+        prompt === "g25 1 S"
+          ? g25ReconcilingAnswer(commandId ?? "cmd_x")
+          : {
+              relatedCommandIds: [],
+              command: {
+                commandId, id: commandId, state: "accepted", revision: "1",
+                dispatch: "native-acknowledged", resolution: "clear",
+              },
+            }) as unknown as Api["instanceSend"],
+    );
+    let gets = 0;
+    vi.spyOn(api, "instanceCommandStatus").mockImplementation(
+      (async (_iid: string, commandId: string) => {
+        gets += 1;
+        // GET 1 still reconciling; GET 2 authoritative acceptance.
+        return g25Status(commandId, gets === 1 ? "reconciling" : "accepted");
+      }) as Api["instanceCommandStatus"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    const boxOf = () =>
+      (
+        hubStore as unknown as {
+          outbox: {
+            isDeliveryExhausted: (i: string) => boolean;
+            pendingLeaseWakeups: () => string[];
+          } | null;
+        }
+      ).outbox;
+    const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+
+    // P spends the bounded budget with locks down (reads succeed).
+    hubStore.setConnectionStateForTest("offline");
+    locks = bad;
+    expect(await hubStore.send(I, "g25 1 P")).toBe(true);
+    await pump(200);
+    const pId = storedRows().find((r) => r.prompt === "g25 1 P")!.commandId;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+
+    // Locks recover: the steer POSTs and answers reconciling — NOT accepted.
+    locks = good;
+    hubStore.setConnectionStateForTest("live");
+    const steerAccepted = await hubStore.send(I, "g25 1 S", [], [], "steer");
+    expect(steerAccepted).toBe(false); // reconciling is not an interrupt receipt
+    await pump(500);
+    const sId = send.mock.calls[0]?.[4] as string;
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(storedRows().find((r) => r.commandId === sId)?.state).toBe("reconciling");
+
+    // The async GET loop starts with the POST; its first poll (still
+    // reconciling) completes on the microtask queue without any timer moving.
+    // Uncertain → exhaustion latched, P uncovered, no second POST.
+    for (let i = 0; i < 1_000 && gets < 1; i += 1) await Promise.resolve();
+    expect(gets).toBe(1);
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("pending");
+
+    // The 1 s poll wait elapses: GET 2 is accepted. Progress clears the latch
+    // on the originating outbox and the fresh epilogue re-arms P — A's REAL
+    // timer delivers it.
+    await vi.advanceTimersByTimeAsync(1_000);
+    for (let i = 0; i < 400 && send.mock.calls.length < 2; i += 1) {
+      await vi.advanceTimersByTimeAsync(10);
+      await Promise.resolve();
+    }
+    expect(send.mock.calls.map((c) => c[4])).toEqual([sId, pId]);
+    expect(storedRows().find((r) => r.commandId === sId)?.state).toBe("sent");
+    expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("sent");
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(false);
+
+    // Well after every deadline: the steer never re-POSTs.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(send.mock.calls.map((c) => c[4])).toEqual([sId, pId]);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE25 item 1 (negative: delayed GET rejects): a reconciling steer later rejected by the GET keeps exhaustion latched and never delivers the older row", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(981_000);
+  const I = "ins_g25_i1n1";
+  const originalNavigator = globalThis.navigator;
+  const good = fifoWebLocks().locks;
+  const bad = {
+    query: async () => ({ held: [] as Array<{ name: string }> }),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    request: (): Promise<any> => Promise.reject(new Error("g25 n1 locks down")),
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let locks: { query: () => Promise<unknown>; request: (...args: any[]) => Promise<unknown> } = bad;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { get locks() { return locks; } },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g25_n1");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_iid: string, prompt: string, _x?: unknown, _m?: string, commandId?: string) =>
+        prompt === "g25 n1 S"
+          ? g25ReconcilingAnswer(commandId ?? "cmd_x")
+          : {
+              relatedCommandIds: [],
+              command: {
+                commandId, id: commandId, state: "accepted", revision: "1",
+                dispatch: "native-acknowledged", resolution: "clear",
+              },
+            }) as unknown as Api["instanceSend"],
+    );
+    let gets = 0;
+    vi.spyOn(api, "instanceCommandStatus").mockImplementation(
+      (async (_iid: string, commandId: string) => {
+        gets += 1;
+        return g25Status(commandId, gets === 1 ? "reconciling" : "rejected");
+      }) as Api["instanceCommandStatus"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    const boxOf = () =>
+      (
+        hubStore as unknown as {
+          outbox: {
+            isDeliveryExhausted: (i: string) => boolean;
+            pendingLeaseWakeups: () => string[];
+          } | null;
+        }
+      ).outbox;
+    const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+
+    hubStore.setConnectionStateForTest("offline");
+    locks = bad;
+    expect(await hubStore.send(I, "g25 n1 P")).toBe(true);
+    await pump(200);
+    const pId = storedRows().find((r) => r.prompt === "g25 n1 P")!.commandId;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(true);
+
+    locks = good;
+    hubStore.setConnectionStateForTest("live");
+    expect(await hubStore.send(I, "g25 n1 S", [], [], "steer")).toBe(false);
+    await pump(500);
+    const sId = send.mock.calls[0]?.[4] as string;
+
+    // GET 1 uncertain, GET 2 rejected: no progress ever.
+    await vi.advanceTimersByTimeAsync(3_000);
+    await pump(1_000);
+    expect(storedRows().find((r) => r.commandId === sId)?.state).toBe("rejected");
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(true);
+    expect(boxOf()!.pendingLeaseWakeups()).toEqual([]);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("pending");
+
+    // Far past every deadline: P stays stranded, rejected steer not re-POSTed.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("pending");
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE25 item 1 (negative: GET never resolves): a reconciling steer whose GET stays uncertain to the deadline ends unknown and leaves exhaustion latched", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(982_000);
+  const I = "ins_g25_i1n2";
+  const originalNavigator = globalThis.navigator;
+  const good = fifoWebLocks().locks;
+  const bad = {
+    query: async () => ({ held: [] as Array<{ name: string }> }),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    request: (): Promise<any> => Promise.reject(new Error("g25 n2 locks down")),
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let locks: { query: () => Promise<unknown>; request: (...args: any[]) => Promise<unknown> } = bad;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { get locks() { return locks; } },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g25_n2");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_iid: string, prompt: string, _x?: unknown, _m?: string, commandId?: string) =>
+        prompt === "g25 n2 S"
+          ? g25ReconcilingAnswer(commandId ?? "cmd_x")
+          : {
+              relatedCommandIds: [],
+              command: {
+                commandId, id: commandId, state: "accepted", revision: "1",
+                dispatch: "native-acknowledged", resolution: "clear",
+              },
+            }) as unknown as Api["instanceSend"],
+    );
+    vi.spyOn(api, "instanceCommandStatus").mockImplementation(
+      (async (_iid: string, commandId: string) => g25Status(commandId, "reconciling")) as Api["instanceCommandStatus"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    const boxOf = () =>
+      (
+        hubStore as unknown as {
+          outbox: {
+            isDeliveryExhausted: (i: string) => boolean;
+            pendingLeaseWakeups: () => string[];
+          } | null;
+        }
+      ).outbox;
+    const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+
+    hubStore.setConnectionStateForTest("offline");
+    locks = bad;
+    expect(await hubStore.send(I, "g25 n2 P")).toBe(true);
+    await pump(200);
+    const pId = storedRows().find((r) => r.prompt === "g25 n2 P")!.commandId;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(true);
+
+    locks = good;
+    hubStore.setConnectionStateForTest("live");
+    expect(await hubStore.send(I, "g25 n2 S", [], [], "steer")).toBe(false);
+    await pump(500);
+    const sId = send.mock.calls[0]?.[4] as string;
+
+    // Through the full 30 s GET deadline the answer stays uncertain: the steer
+    // ends unknown, exhaustion remains latched and P is never delivered.
+    await vi.advanceTimersByTimeAsync(35_000);
+    await pump(2_000);
+    expect(storedRows().find((r) => r.commandId === sId)?.state).toBe("unknown");
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("pending");
+
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("pending");
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

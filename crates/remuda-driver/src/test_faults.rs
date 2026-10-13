@@ -83,6 +83,12 @@ pub(crate) struct FaultState {
     /// cannot prove this (c-ctxusage r10 item 5).
     promoter_started: Mutex<bool>,
     promoter_started_cv: Condvar,
+    /// Total promotion poller spawns across runs (c-ctxusage r20 item 2):
+    /// unlike the one-shot `promoter_started` bool this counts run 1 AND the
+    /// resumed run 2, so a test can prove run 2's poller spawned while the
+    /// predecessor was still parked in finalise.
+    promoter_starts: Mutex<u64>,
+    promoter_starts_cv: Condvar,
     skip_cooperative_finalise: AtomicBool,
     /// Overrides the driver's bounded cooperative-close wait so an abort test
     /// crosses the bound deterministically without the production 15 s / 2 s
@@ -189,6 +195,8 @@ impl FaultState {
             flusher_idle_cv: Condvar::new(),
             promoter_started: Mutex::new(false),
             promoter_started_cv: Condvar::new(),
+            promoter_starts: Mutex::new(0),
+            promoter_starts_cv: Condvar::new(),
             skip_cooperative_finalise: AtomicBool::new(false),
             close_timeout_ms: AtomicU64::new(0),
             pending_capacity: AtomicU64::new(0),
@@ -514,6 +522,26 @@ impl FaultState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         self.promoter_started_cv.notify_all();
+        let mut starts = self
+            .promoter_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *starts += 1;
+        self.promoter_starts_cv.notify_all();
+    }
+
+    /// Bounded wait for `n` promotion poller spawns (c-ctxusage r20 item 2);
+    /// called from the driver (which holds `Arc<FaultState>`).
+    pub(crate) fn wait_promoter_starts_state(&self, n: u64, timeout: Duration) -> bool {
+        let guard = self
+            .promoter_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (guard, _) = self
+            .promoter_starts_cv
+            .wait_timeout_while(guard, timeout, |starts| *starts < n)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard >= n
     }
 
     /// The injected bounded-pending capacity override, if a test armed one.
@@ -839,6 +867,23 @@ impl TranscriptFaults {
             .wait_timeout_while(guard, timeout, |arms| *arms < n)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard >= n
+    }
+
+    /// Number of promotion poller tasks spawned so far (c-ctxusage r20
+    /// item 2): a non-blocking hard assertion at a parked barrier.
+    #[must_use]
+    pub fn promoter_start_count(&self) -> u64 {
+        *self
+            .inner
+            .promoter_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Block until `n` promotion pollers have spawned, bounded
+    /// (c-ctxusage r20 item 2).
+    pub fn wait_promoter_starts(&self, n: u64, timeout: Duration) -> bool {
+        self.inner.wait_promoter_starts_state(n, timeout)
     }
 
     /// Block until at least `n` promotion polls have bound a transcript

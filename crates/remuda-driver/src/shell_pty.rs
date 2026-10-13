@@ -809,6 +809,22 @@ impl ShellPtyDriver {
         )
     }
 
+    /// Stable identity (inner-Arc pointer) of the driver's CURRENT promoted
+    /// slot (c-ctxusage r20 item 2). A resume swaps this pointer when it adopts
+    /// the new run's slots, so a test can prove the current slot is still the
+    /// predecessor's while retirement is parked and changes after adoption.
+    #[cfg(feature = "test-faults")]
+    #[must_use]
+    pub fn test_promoted_slot_id(&self) -> usize {
+        Arc::as_ptr(
+            &*self
+                .promoted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .addr()
+    }
+
     /// Answer an ignored hook decision on the agent's own dialog, once (§14 risk 1).
     ///
     /// Reached only when the hook path *proved* it did not take the decision.
@@ -2227,6 +2243,25 @@ impl ShellPtyDriver {
             Ok(handle) => handle,
             Err(error) => return Err(error),
         };
+        // Test-only hard barrier (c-ctxusage r20 item 2): do not retire the
+        // predecessor until the new run's poller task is actually live
+        // (two poller spawns: predecessor + run 2). In production the spawn
+        // handle already implies the task is registered; this ack wait exists
+        // only when faults are injected so a race test can assert run 2's
+        // poller exists BEFORE the predecessor finalise parks.
+        if self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            .is_some_and(|faults| {
+                !faults.wait_promoter_starts_state(2, std::time::Duration::from_secs(10))
+            })
+        {
+            return Err(DriverError::Io(io::Error::other(
+                "resumed poller did not acknowledge startup before predecessor retirement",
+            )));
+        }
         // The new run is up: now retire the predecessor (bounded) — its poller
         // and exit waiter stop, and its detection slots are discarded. The new
         // run's slots are independent, so a predecessor finalise that lands

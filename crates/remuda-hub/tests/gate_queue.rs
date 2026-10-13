@@ -2042,16 +2042,22 @@ async fn no_second_dispatch_while_the_first_is_landing() -> Result<()> {
     Ok(())
 }
 
-/// r13 item 1: with the lane carrier connected but the exact granted merge NOT
-/// on the remote, a Landing row stays Landing while the bounded recovery window
-/// is open (the push may still complete) and settles failed with an explicit
-/// indeterminate reason only once that window elapses — never re-run, never
-/// guessed early. A later `landed` verdict is ignored against the terminal row.
+/// r13 item 1 / r15 R1+R5: with the lane carrier connected but the exact
+/// granted merge NOT on the remote, a Landing row stays Landing when the bounded
+/// recovery window elapses and is SURFACED as outcome-unknown (flag + reason)
+/// instead of being force-settled failed by time. Elapsed time is never a
+/// verdict. Repeated reconciliation keeps probing without settling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn restart_landing_unconfirmed_settles_failed_indeterminate() -> Result<()> {
-    // Bound the recovery window to ~nothing so the post-restart probe that
-    // cannot confirm the merge immediately classifies the push as over.
-    let ctx = Ctx::spawn_with_config(1, |_| {}, |cfg| cfg.gate_landing_recovery_ms = 1).await?;
+async fn restart_landing_unconfirmed_stays_landing_and_is_surfaced_unknown() -> Result<()> {
+    let ctx = Ctx::spawn_with_config(
+        1,
+        |_| {},
+        |cfg| {
+            cfg.gate_landing_recovery_ms = 1;
+            cfg.gate_landing_probe_interval_ms = 1;
+        },
+    )
+    .await?;
     let hold = Arc::new(Notify::new());
     *ctx.scripts[0].landing_hold.lock().unwrap() = Some(hold.clone());
     ctx.scripts[0].script(
@@ -2071,25 +2077,40 @@ async fn restart_landing_unconfirmed_settles_failed_indeterminate() -> Result<()
     ctx.wait_state(&id, &["landing"]).await;
 
     ctx.hub.test_reconcile().await;
-    let settled = ctx.wait_state(&id, &["failed", "landed"]).await;
-    assert_eq!(settled["state"], "failed", "{settled}");
-    let error = settled["error"].as_str().unwrap_or("");
-    assert!(
-        error.contains("outcome unknown") && error.contains("recovery window"),
-        "indeterminate bounded-recovery error: {error}"
-    );
-    assert_eq!(ctx.scripts[0].resolve_calls.lock().unwrap().len(), 1);
-
-    // The granted child now reports landed, but the row is terminal and must
-    // not flip.
-    hold.notify_waiters();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let after = ctx.job(&id).await;
-    assert_eq!(
-        after["state"], "failed",
-        "late landed verdict changed the row: {after}"
-    );
-    Ok(())
+    for _ in 0..100 {
+        let doc = ctx.job(&id).await;
+        if doc["landingOutcomeUnknown"] == json!(true) {
+            assert_eq!(
+                doc["state"],
+                json!("landing"),
+                "R1: time never fails a Landing: {doc}"
+            );
+            assert!(
+                doc["reason"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("outcome unknown"),
+                "surfaced outcome-unknown reason: {}",
+                doc["reason"]
+            );
+            assert_eq!(ctx.scripts[0].resolve_calls.lock().unwrap().len(), 1);
+            ctx.hub.test_reconcile().await;
+            // Probe throttle: poll bounded until the second forced probe lands.
+            for _ in 0..100 {
+                if ctx.scripts[0].resolve_calls.lock().unwrap().len() == 2 {
+                    break;
+                }
+                ctx.hub.test_reconcile().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(ctx.scripts[0].resolve_calls.lock().unwrap().len(), 2);
+            assert_eq!(ctx.job(&id).await["state"], json!("landing"));
+            hold.notify_waiters();
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("expired unconfirmed Landing was never surfaced outcome-unknown");
 }
 
 /// r12 item 1: a Hub restart with a Landing row whose granted merge the lane

@@ -1138,7 +1138,15 @@ pub(super) fn spawn(
                     &mut withdrawn_sessions,
                     &mut active_session,
                 ) {
-                    hydrator = None;
+                    // c-usagefu r17 item 2: the authenticated report rebound
+                    // this foreground to a DIFFERENT native session, so publish
+                    // the old hydrator's buffered group — its open turn's usage
+                    // is only emitted by mapper.finish() — BEFORE discarding it.
+                    // Dropping it outright (`hydrator = None`) lost every token
+                    // of the in-flight turn on /clear and /resume rebinds. The
+                    // binding seam above and the withdrawal bookkeeping inside
+                    // `apply_native_session_binding` are unchanged.
+                    finalize_hydrator(&mut hydrator, &events, &seq, &ctx).await;
                     announced = None;
                 }
             }

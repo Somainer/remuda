@@ -7072,6 +7072,124 @@ mod tests {
         Driver::close(&driver).await.unwrap();
     }
 
+    /// c-usagefu r17 item 2: an authenticated native-session rebind in the
+    /// SAME foreground pid (an in-TUI `/clear` reports a new SessionStart)
+    /// must finalize and publish the OLD hydrator's buffered group before
+    /// discarding it. The open turn's usage is emitted only by
+    /// mapper.finish(); `hydrator = None` dropped it silently, so every token
+    /// of the pre-/clear turn never reached the Hub.
+    #[tokio::test]
+    async fn a_native_session_rebind_publishes_the_old_hydrators_buffered_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let cwd = dir.path().to_path_buf();
+        let slug = crate::claude_transcript::project_dir(&home, &cwd);
+        std::fs::create_dir_all(&slug).unwrap();
+        let args = Arc::new(std::sync::Mutex::new(format!(
+            "claude --session-id {R7_S1}"
+        )));
+        let driver = r7_login_driver(dir.path(), &home, Arc::clone(&args));
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        // S1 reports at boot, before its transcript exists (measured Fresh).
+        let s1_path = slug.join(format!("{R7_S1}.jsonl"));
+        r7_send_session_start(&hooks, pgid, R7_S1, &s1_path).await;
+        r7_collect(&mut events, std::time::Duration::from_millis(1000)).await;
+
+        // The prompt and one assistant turn land: real counters but NO
+        // stop_reason, so the usage stays buffered in the hydrator across
+        // ordinary poll flushes (published only by finish()).
+        let open_turn = r7_record(
+            R7_S1,
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": "s1-open-assistant",
+                "timestamp": "2026-10-14T00:00:00.000Z",
+                "isSidechain": false,
+                "message": {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_s1_open",
+                    "model": "claude-opus-5-5",
+                    "content": [{"type": "text", "text": "working on it"}],
+                    "stop_reason": null,
+                    "usage": {
+                        "input_tokens": 3,
+                        "cache_read_input_tokens": 4000,
+                        "cache_creation_input_tokens": 7,
+                        "output_tokens": 11
+                    }
+                }
+            }),
+        );
+        std::fs::write(
+            &s1_path,
+            format!("{}{open_turn}", r7_user(R7_S1, "s1-prompt", "first prompt")),
+        )
+        .unwrap();
+        // Bind + at least one poll: the conversation hydrates, the buffered
+        // usage does NOT publish yet.
+        let before_rebind = r7_collect(&mut events, std::time::Duration::from_millis(1800)).await;
+        assert!(
+            !before_rebind
+                .iter()
+                .any(|o| matches!(o.body, remuda_protocol::ObservationPayload::Usage(_))),
+            "the open turn's usage stays buffered across poll flushes"
+        );
+
+        // /clear in the same pid: a second authenticated SessionStart names
+        // the new session S2, whose transcript already holds history (sized
+        // from the authenticated report; that history is gated, not current).
+        let s2_path = slug.join(format!("{R7_Z}.jsonl"));
+        std::fs::write(&s2_path, r7_user(R7_Z, "s2-history", "old cleared turn")).unwrap();
+        r7_send_session_start(&hooks, pgid, R7_Z, &s2_path).await;
+        let rebound = r7_collect(&mut events, std::time::Duration::from_millis(2600)).await;
+
+        // The OLD session's buffered usage is finalised as part of the rebind,
+        // before the new hydrator opens — the counters are the open turn's.
+        let buffered: Vec<_> = rebound
+            .iter()
+            .filter_map(|o| match &o.body {
+                remuda_protocol::ObservationPayload::Usage(payload) => Some(payload),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            buffered.len(),
+            1,
+            "the rebind publishes the old hydrator's buffered usage exactly once"
+        );
+        let known = |value: &remuda_protocol::Knowledge<remuda_protocol::U64>| match value {
+            remuda_protocol::Knowledge::Known { value } => value.0,
+            other => panic!("expected Known counter, got {other:?}"),
+        };
+        assert_eq!(known(&buffered[0].input_tokens), 3);
+        assert_eq!(known(&buffered[0].cache_read_tokens), 4_000);
+        assert_eq!(known(&buffered[0].cache_write_tokens), 7);
+        assert_eq!(known(&buffered[0].output_tokens), 11);
+        // The gated history never hydrates as conversation.
+        assert!(!r7_conversation_has(&rebound, "old cleared turn"));
+
+        // After the rebind, S2 continues in its OWN hydrator: bytes appended
+        // past the anchor hydrate as current conversation.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&s2_path)
+            .unwrap()
+            .write_all(r7_user(R7_Z, "s2-prompt", "after clear").as_bytes())
+            .unwrap();
+        let after = r7_collect(&mut events, std::time::Duration::from_millis(1800)).await;
+        assert!(
+            r7_conversation_has(&after, "after clear"),
+            "the rebound session continues in a fresh hydrator"
+        );
+
+        Driver::close(&driver).await.unwrap();
+    }
+
     /// r7 item 1, lazy-create arm: the user /resume's BEFORE ever sending a
     /// prompt, so the launch session S1 never gets a transcript and no
     /// binding exists when Y's authenticated SessionStart arrives. The

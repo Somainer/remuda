@@ -3503,10 +3503,18 @@ class HubStore {
       // exact row whose claim is about to be written.
       if (opts.skipCurrentlyHeld && fresh.state === "held") continue;
       const outcome = await this.deliverOutboxRecord(token, fresh);
-      if (outcome === "stale" || outcome === "claim-aborted") {
-        // FIFO: the first deliverable row could not be delivered; a STALE
-        // token (auth change) or aborted claim ENDS THE WHOLE LOCK TURN — never
-        // POST a later row under the old identity/lease.
+      if (outcome === "stale") {
+        // Gate 36 item 5: propagate the distinct STALE result to the lock
+        // caller so a direct steer/held turn can return BEFORE touching
+        // current-box state (this.outbox may be null mid-transition). The
+        // flush caller ends the whole flush on it.
+        return "stale";
+      }
+      if (outcome === "claim-aborted") {
+        // FIFO: the first deliverable row could not be claimed this turn; a
+        // later row in the SAME lock turn must never POST ahead of it — stop
+        // this turn (the bounded recovery retries the first row), but this is
+        // not a stale identity: other instances' turns may continue.
         return null;
       }
       if (!outcome) continue;
@@ -5382,19 +5390,28 @@ class HubStore {
       // wake. A rejected lock/lease turn is attributed like a flush failure so
       // the bounded backoff applies.
       let steerFailed = false;
+      let steerStale = false;
       const steerToken = this.deliveryToken(this.outbox);
       try {
-        await this.outbox.withInstanceLock(instanceId, (iid, rows) =>
+        const lockResult = await steerToken.box.withInstanceLock(instanceId, (iid, rows) =>
           this.deliverOneRow(steerToken, iid, rows),
         );
+        if (lockResult === "stale") steerStale = true;
       } catch {
-        this.outbox.noteDeliveryFailure(instanceId);
+        // Gate 36 item 5: attribute against the CAPTURED box — the current
+        // outbox may already be null (an auth transition disposed it).
+        steerToken.box.noteDeliveryFailure(instanceId);
         steerFailed = true;
       }
-      await this.outbox.deliveryEpilogue().catch(() => undefined);
+      // Gate 36 item 5: the turn's identity was replaced while the claim was
+      // parked (this.outbox may be null). Return BEFORE reading any
+      // current-box state; the replacement identity's finalizer owns
+      // delivery of the durable row.
+      if (steerStale) return false;
+      await steerToken.box.deliveryEpilogue().catch(() => undefined);
       if (steerFailed) return false;
       this.syncBubbleFromOutbox(commandId);
-      const finalState = this.outbox.get(commandId)?.state;
+      const finalState = steerToken.box.get(commandId)?.state;
       return finalState === "sent" || finalState === "done";
     }
     // Online ordinary send: flush now in the background; the POST never
@@ -5680,22 +5697,35 @@ class HubStore {
     // epilogue as the live steer route and the guarded flush — a finishing
     // write that aborts leaves the row inflight with no patch epilogue.
     let steerFailed = false;
-    const heldSteerToken = this.deliveryToken(this.outbox);
+    let steerStale = false;
+    // Gate 36 item 5: the enqueue await above is a suspension point — an auth
+    // transition may have disposed the box since ensureOutbox. With no live
+    // box the replacement identity owns delivery; report the steer as not yet
+    // accepted rather than dereferencing null.
+    const heldBox = this.outbox;
+    if (!heldBox) return false;
+    const heldSteerToken = this.deliveryToken(heldBox);
     try {
-      await this.outbox.withInstanceLock(instanceId, (id, rows) => this.deliverOneRow(heldSteerToken, id, rows));
+      const lockResult = await heldSteerToken.box.withInstanceLock(instanceId, (id, rows) =>
+        this.deliverOneRow(heldSteerToken, id, rows),
+      );
+      if (lockResult === "stale") steerStale = true;
     } catch {
       // Lock/lease failure: never claim the interrupt (the bounded retry /
-      // reconnect delivers the same id later). Attribute the failed turn so
-      // the bounded backoff applies, then run the shared epilogue.
-      this.outbox.noteDeliveryFailure(instanceId);
+      // reconnect delivers the same id later). Attribute the failed turn
+      // against the CAPTURED box, then run the shared epilogue.
+      heldSteerToken.box.noteDeliveryFailure(instanceId);
       steerFailed = true;
     }
-    await this.outbox.deliveryEpilogue().catch(() => undefined);
+    // Gate 36 item 5: the turn's identity was replaced mid-lock; return before
+    // reading current-box state (this.outbox may be null).
+    if (steerStale) return false;
+    await heldSteerToken.box.deliveryEpilogue().catch(() => undefined);
     if (steerFailed) return false;
     this.syncBubbleFromOutbox(commandId);
     // Receipt only on AUTHORITATIVE acceptance (sent/done), never while merely
     // queued/reconciling/offline.
-    const finalState = this.outbox.get(commandId)?.state;
+    const finalState = heldSteerToken.box.get(commandId)?.state;
     return finalState === "done" || finalState === "sent";
   }
 

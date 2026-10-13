@@ -7350,3 +7350,103 @@ it("GATE36 item 4 (passkey): from a logged-out store, passkey login A succeeds a
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE36 item 5: a public steer whose claim resumes across a replacement login returns STALE (no null-box TypeError, no POST from the old box); the replacement box delivers the row once", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_250_000);
+  const I = "ins_g36_5x";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 4_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g36_5x");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+    });
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await hubStore.follow(I);
+    hubStore.setConnectionStateForTest("live");
+
+    // Park the steer row's CLAIM inside the storage backend.
+    const outbox0 = (hubStore as unknown as { outbox: { storage: Record<string, unknown> } }).outbox;
+    const storage = outbox0.storage as {
+      mergeUnlessDone: (id: string, p: unknown) => Promise<unknown>;
+    };
+    const realMerge = storage.mergeUnlessDone.bind(storage);
+    let releaseClaim: () => void = () => undefined;
+    let claimHeld = false;
+    storage.mergeUnlessDone = vi.fn(async (id: string, patch: unknown) => {
+      if (!claimHeld && (patch as { state?: string }).state === "inflight") {
+        claimHeld = true;
+        await new Promise<void>((resolve) => { releaseClaim = resolve; });
+      }
+      return realMerge(id, patch);
+    });
+
+    // Public live steer: enqueues and parks inside the claimed lock turn.
+    const steerP = hubStore.send(I, "g36 5x steer", [], [], "steer");
+    for (let i = 0; i < 4_000 && !claimHeld; i += 1) await Promise.resolve();
+    expect(claimHeld).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+    const rows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    const commandId = rows().find((r) => r.prompt === "g36 5x steer")!.commandId;
+
+    // Replacement login with its BODY held: the old box is disposed and no
+    // replacement box exists yet while the steer claim resumes.
+    let releaseLogin: () => void = () => undefined;
+    vi.spyOn(api, "login").mockImplementation(
+      () => new Promise((resolve) => {
+        releaseLogin = () => resolve({ deviceId: "dev_g36_5x", token: "tok", name: "g36_5x" });
+      }),
+    );
+    const h = hubStore as unknown as {
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      outbox: unknown;
+    };
+    const loginP = h.login("bootstrap", "secret", "dev");
+    await pump(500);
+    expect(h.outbox).toBeNull(); // disposed, body still held
+
+    // Resume the steer claim under the open transition. The stale turn must
+    // settle honestly (false = interrupt not accepted) — never throw on the
+    // nulled current box and never POST.
+    releaseClaim();
+    await expect(steerP).resolves.toBe(false);
+    expect(send).not.toHaveBeenCalled();
+
+    // The replacement login settles; L2 installs and delivers the parked steer
+    // row exactly once.
+    releaseLogin();
+    await loginP;
+    await pump(8_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBe(commandId);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

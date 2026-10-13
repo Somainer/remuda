@@ -249,12 +249,14 @@ impl Supervisor {
     /// here rather than observed on some later drop.
     async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
-        if let Some(maintenance) = self
+        // Take the sweep handle and drop the std-mutex guard BEFORE awaiting
+        // it (never hold a blocking guard across an await).
+        let maintenance = self
             .maintenance
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
+            .take();
+        if let Some(maintenance) = maintenance {
             maintenance.abort();
             let _ = maintenance.await;
         }

@@ -86,11 +86,13 @@ fn acquire_launch_registration(cwd: &Path) -> std::sync::MutexGuard<'static, ()>
     }
 }
 
-/// One-shot signal installed by a test: fired when a window release for `cwd`
-/// first finds LAUNCH_REGISTRATION held (r14 item 6).
+/// One-shot signal installed by a test: fired when a window release for a
+/// cwd first finds LAUNCH_REGISTRATION held (r14 item 6).
 #[cfg(test)]
-static RELEASE_BLOCKED: LazyLock<Mutex<Option<(PathBuf, std::sync::mpsc::Sender<()>)>>> =
-    LazyLock::new(|| Mutex::new(None));
+type ReleaseBlockedSlot = Option<(PathBuf, std::sync::mpsc::Sender<()>)>;
+
+#[cfg(test)]
+static RELEASE_BLOCKED: LazyLock<Mutex<ReleaseBlockedSlot>> = LazyLock::new(|| Mutex::new(None));
 
 /// Test seam: receive a signal once a window release in `cwd` is blocked
 /// waiting for LAUNCH_REGISTRATION (r14 item 6).
@@ -659,7 +661,7 @@ impl Drop for PendingLaunchBarrier {
         if let Ok(mut slot) = PENDING_LAUNCH_BARRIER.try_lock() {
             let still_us = slot
                 .get(&self.cwd)
-                .is_some_and(|barrier| std::sync::Arc::as_ptr(barrier) == self as *const Self);
+                .is_some_and(|barrier| std::ptr::eq(std::sync::Arc::as_ptr(barrier), self));
             if still_us {
                 slot.remove(&self.cwd);
             }

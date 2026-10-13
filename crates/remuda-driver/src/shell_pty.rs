@@ -480,6 +480,11 @@ pub struct ShellPtyDriver {
     /// File-tail signal adapters (codex rollout, grok ACP files). Dropped on
     /// close, which stops their poll tasks (D-028 P6).
     adapters: Mutex<Option<crate::adapters::supervisor::AdapterHandle>>,
+    /// Detached one-shot model-catalog refresh task. Published on a
+    /// successful launch and cancelled/adopted on a same-driver resume
+    /// (c-ctxusage r17 item 4), so a prior run's pending refresh never
+    /// outlives that run.
+    catalog_refresh: Mutex<Option<JoinHandle<()>>>,
     /// Recipe from the last start, reused by [`Driver::close`] to journal what
     /// it stopped and by the Node to audit what was launched.
     recipe: std::sync::Mutex<Option<LaunchRecipe>>,
@@ -542,6 +547,7 @@ impl ShellPtyDriver {
             fallbacks: crate::hook_answer::FallbackLedger::new(),
             hooks: Mutex::new(None),
             adapters: Mutex::new(None),
+            catalog_refresh: Mutex::new(None),
             recipe: std::sync::Mutex::new(None),
             exited: Arc::new(std::sync::Mutex::new(None)),
             effort_bridge: Mutex::new(Arc::new(crate::effort::EffortBridge::new())),
@@ -1420,10 +1426,20 @@ impl ShellPtyDriver {
                 return Err(error);
             }
         }
-        // On a successful launch the one-shot catalog refresh outlives this
-        // function and must keep running detached; dropping its JoinHandle
-        // (without abort) does exactly that.
-        drop(catalog_refresh_task);
+        // On a successful launch publish the one-shot catalog-refresh task to
+        // the driver field (c-ctxusage r17 item 4): it keeps running detached
+        // AND a same-driver resume can cancel/adopt it. Without this the task
+        // is unowned and resume cannot stop a prior run's still-pending
+        // refresh (and the new run's spawn would conflict with it). Cancel any
+        // prior run's pending refresh before publishing.
+        if let Some(refresh) = catalog_refresh_task.take() {
+            if let Some(mut previous) = self.catalog_refresh.lock().await.take() {
+                previous.abort();
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), &mut previous).await;
+            }
+            *self.catalog_refresh.lock().await = Some(refresh);
+        }
         if self.options.promote {
             // Built before `hooks` moves into the poller: the silence probe
             // needs the live session's *real* socket path. Under a long data
@@ -1883,6 +1899,10 @@ impl ShellPtyDriver {
         *self.hooks.lock().await = resumed.hooks.lock().await.take();
         *self.poller.lock().await = resumed.poller.lock().await.take();
         *self.waiter.lock().await = resumed.waiter.lock().await.take();
+        // c-ctxusage r17/r24 item 2: adopt the resumed run's file adapters and
+        // catalog-refresh task so the temporary driver dropping does not abort
+        // them.
+        self.adopt_run_scoped_handles(&resumed).await;
         // §9.1: adopt the resumed run's switch coordination. Its worker and
         // mapper share a bridge, and its event sender is the live one. When a
         // switch was mid-flight at resume, adopt the resumed bridge so the
@@ -1944,6 +1964,21 @@ impl ShellPtyDriver {
             ours.clone_from(&theirs);
         }
         Ok(handle)
+    }
+
+    async fn adopt_run_scoped_handles(&self, resumed: &ShellPtyDriver) {
+        if let Some(mut previous) = self.catalog_refresh.lock().await.take() {
+            previous.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut previous).await;
+        }
+        *self.catalog_refresh.lock().await = resumed.catalog_refresh.lock().await.take();
+        if let Some(mut previous) = self.adapters.lock().await.take() {
+            previous.abort();
+            for task in &mut previous.tasks {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+            }
+        }
+        *self.adapters.lock().await = resumed.adapters.lock().await.take();
     }
 }
 
@@ -2900,6 +2935,12 @@ impl Driver for ShellPtyDriver {
         if let Some(poller) = self.poller.lock().await.take() {
             poller.abort();
         }
+        // c-ctxusage r17 item 4: stop the detached catalog-refresh task so it
+        // does not keep an event sender alive past close.
+        if let Some(mut refresh) = self.catalog_refresh.lock().await.take() {
+            refresh.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut refresh).await;
+        }
         if let Ok(mut slot) = self.promoted.lock() {
             *slot = None;
         }
@@ -3625,6 +3666,51 @@ impl crate::permission::PermissionSwitchIo for ShellPermissionIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// c-ctxusage r24 item 2: resume transfers the run-scoped catalog refresh
+    /// and file-adapter handles OFF the temporary resumed driver; dropping it
+    /// afterwards must not abort the new run's adapter tasks.
+    #[tokio::test]
+    async fn adapter_and_catalog_handles_transfer_off_the_resumed_driver() {
+        let current = ShellPtyDriver::new(ShellPtyOptions::login(std::path::PathBuf::from(
+            "/unused/a",
+        )));
+        let resumed = ShellPtyDriver::new(ShellPtyOptions::login(std::path::PathBuf::from(
+            "/unused/b",
+        )));
+        *resumed.catalog_refresh.lock().await = Some(tokio::spawn(std::future::pending::<()>()));
+        *resumed.adapters.lock().await =
+            Some(crate::adapters::supervisor::AdapterHandle { tasks: vec![] });
+
+        current.adopt_run_scoped_handles(&resumed).await;
+
+        assert!(
+            resumed.catalog_refresh.lock().await.is_none(),
+            "source gives up refresh"
+        );
+        assert!(
+            resumed.adapters.lock().await.is_none(),
+            "source gives up adapters"
+        );
+        assert!(
+            current.catalog_refresh.lock().await.is_some(),
+            "current owns refresh"
+        );
+        assert!(
+            current.adapters.lock().await.is_some(),
+            "current owns adapters"
+        );
+
+        // Dropping the source driver must NOT abort the transferred task.
+        drop(resumed);
+        let taken = current.catalog_refresh.lock().await.take();
+        assert!(taken.is_some(), "task survived the source driver drop");
+        if let Some(task) = taken {
+            task.abort();
+            let _ = task.await;
+        }
+        *current.adapters.lock().await = None;
+    }
 
     struct RecordingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
 

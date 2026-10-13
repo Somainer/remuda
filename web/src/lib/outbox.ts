@@ -41,6 +41,14 @@ export type Lease = {
   owner: Id;
   /** Epoch ms after which a crashed owner's lease may be stolen. */
   until: number;
+  /**
+   * Unique token of THIS claim ATTEMPT (c-reconnfu gate 23 item 1, claim
+   * identity ruling): minted per claim and persisted with the lease. A claim
+   * whose promise rejects after commit is proven committed ONLY when a fresh
+   * authoritative read finds THIS token — an older lease of the same owner is
+   * not proof.
+   */
+  claimToken?: Id;
 };
 
 export type OutboxRecord = {
@@ -1063,16 +1071,38 @@ export class Outbox {
    * lifetime-aware recovery in the BACKGROUND (never awaited — the caller has
    * a rejected promise to settle now) and this resolves null so an
    * unconfirmed mutation stays an honest failure rather than a phantom row.
+   *
+   * Gate 23 item 1 (claim identity ruling): when the rejected writer was a
+   * CLAIM, `claimToken` is THIS claim attempt's unique token (persisted with
+   * the lease). The read is always a FRESH AUTHORITATIVE one straight from the
+   * durable backend — never this.cache, which can hold the pre-claim row or an
+   * older same-owner lease — and a committed claim is recognised ONLY when
+   * the stored row is inflight under this owner carrying THIS token. A stale
+   * lease of the same owner (a previous delivery whose finishing write
+   * aborted) proves nothing: the outcome stays claim-aborted.
    */
-  async committedIfAny(commandId: Id): Promise<OutboxRecord | null> {
+  async committedIfAny(commandId: Id, claimToken?: Id): Promise<OutboxRecord | null> {
     if (this.disposed) return null;
+    let rows: OutboxRecord[];
     try {
-      await this.readDurable();
+      rows = (await this.storage.all()).filter((r) => commandIdFromKey(r.commandId));
     } catch {
       void this.refreshDurableRecovering(1).catch(() => undefined);
       return null;
     }
-    return this.cache.get(commandId) ?? null;
+    if (this.disposed) return null;
+    const rec = rows.find((r) => r.commandId === commandId) ?? null;
+    const matches =
+      rec !== null &&
+      (claimToken === undefined ||
+        (rec.state === "inflight" &&
+          rec.lease?.owner === this.ownerId &&
+          rec.lease?.claimToken === claimToken));
+    // Import the authoritative row into the storage-first cache only when it
+    // is the proof the caller asked for; otherwise the stale cache view must
+    // not masquerade as a fresh read.
+    if (matches) this.cache.set(commandId, rec);
+    return matches ? rec : null;
   }
 
   /**

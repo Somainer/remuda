@@ -2270,28 +2270,38 @@ class HubStore {
     // B never sent. Checked again after the claim below.
     if (current0.state === "done") return false;
     const isFreshAttempt = current0.state !== "held";
+    // Gate 23 item 1 (claim identity ruling): EVERY claim attempt mints its
+    // OWN unique token, persisted with the lease. If the claim's promise
+    // rejects after commit, only a fresh durable read carrying THIS token can
+    // establish the claim as won — the same owner's OLDER inflight lease (a
+    // previous delivery whose finishing write aborted) is stale and must not
+    // be POSTed under.
+    const claimToken = localId();
     let claimed;
     try {
       claimed = await box.patch(commandId, {
         state: "inflight",
         attempts: isFreshAttempt ? current0.attempts + 1 : current0.attempts,
-        lease: { owner: box.ownerId, until: Date.now() + LEASE_TTL_MS },
+        lease: { owner: box.ownerId, until: Date.now() + LEASE_TTL_MS, claimToken },
       });
     } catch {
       // Gate 22 item 1 (coordinator ruling): a durable mutation that COMMITTED
       // is a success. The claim promise can reject AFTER mergeUnlessDone
       // committed this owner's inflight lease; one authoritative read decides.
-      // A row carrying THIS owner's inflight lease is a WON claim — POST under
+      // Gate 23 item 1: the read is fresh (never the cache) and the row must
+      // carry THIS attempt's token. A token match is a WON claim — POST under
       // it at once (no 30 s lease wait, attempts already holds the one claim
-      // that reached the wire). Anything else keeps the claim-aborted path:
-      // FIFO stop plus the bounded, lifetime-aware recovery.
+      // that reached the wire). An older lease of the same owner, or anything
+      // else, keeps the claim-aborted path: FIFO stop plus the bounded,
+      // lifetime-aware recovery.
       let won: OutboxRecord | null = null;
       try {
-        const durablyCommitted = await box.committedIfAny(commandId);
+        const durablyCommitted = await box.committedIfAny(commandId, claimToken);
         if (
           durablyCommitted &&
           durablyCommitted.state === "inflight" &&
-          durablyCommitted.lease?.owner === box.ownerId
+          durablyCommitted.lease?.owner === box.ownerId &&
+          durablyCommitted.lease?.claimToken === claimToken
         ) {
           won = durablyCommitted;
         }

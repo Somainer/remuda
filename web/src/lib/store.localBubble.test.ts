@@ -614,6 +614,179 @@ async function pump<T>(fn: () => T | null | undefined, tries = 1_000): Promise<T
   throw new Error("pump timed out");
 }
 
+/**
+ * GATE23 item 1 — claim identity ruling. A rejected claim promise counts as a
+ * committed claim ONLY when a FRESH AUTHORITATIVE durable read shows a row
+ * carrying THIS attempt's unique claim token (persisted with the lease). An
+ * older lease of the SAME owner is not proof: a prior delivery whose finishing
+ * write aborted leaves exactly such a stale lease behind.
+ */
+
+/** Outbox test surface for the claim-identity regressions. */
+type ClaimIdentityOutbox = {
+  ownerId: string;
+  pendingLeaseWakeups: () => string[];
+  isDeliveryExhausted: (instanceId: string) => boolean;
+};
+
+it("GATE23 item 1a: an older same-owner lease is not a committed claim — a genuinely aborted next claim POSTs nothing on the stale token", async () => {
+  // Sequence (every transition a REAL flow): P's first claim commits with
+  // token T1 and the POST is accepted, but the finishing (sent) write aborts
+  // BEFORE commit, so P durably stays inflight under the same owner's live T1
+  // lease. After the lease deadline the real timer flush writes a NEW claim
+  // (token T2, attempts 2) whose transaction genuinely aborts BEFORE commit,
+  // while every READ succeeds. Pre-fix the catch's authoritative read saw the
+  // row inflight under the SAME owner and treated the stale T1 lease as a won
+  // claim: an immediate second POST on a lease this attempt never owned.
+  // Post-fix the fresh read carries T1, not T2: claim-aborted, no POST; the
+  // bounded wake retries and, once real commits succeed, delivers under T3.
+  vi.useFakeTimers();
+  vi.setSystemTime(700_000);
+  try {
+    const { api, hubStore } = await fresh();
+    stubPostSend(api);
+    const { sendSpy, storage } = await bootLiveWithFaultableStorage(api, hubStore);
+
+    let finishAbort = true;
+    let abortNewClaims = false;
+    const realMerge = storage.mergeUnlessDone.bind(storage);
+    storage.mergeUnlessDone = vi.fn(async (id, patch) => {
+      const p = patch as { state?: string; lease?: { claimToken?: string } };
+      if (String(id).startsWith("cmd_") && p.state === "sent" && finishAbort) {
+        finishAbort = false;
+        throw new Error("g23 1a finishing write aborted before commit");
+      }
+      if (p.state === "inflight" && abortNewClaims) {
+        throw new Error("g23 1a claim genuinely aborted before commit");
+      }
+      return await realMerge(id, patch);
+    });
+
+    // 1) Real delivery: claim T1 commits, POST accepted, finishing write
+    //    aborts once — the row stays inflight under the live T1 lease.
+    void hubStore.send(INSTANCE, "gate23 1a");
+    const pId = await pump(() => {
+      const b = hubStore.getSnapshot().bubbles.find((x) => x.text === "gate23 1a");
+      return b?.commandId && sendSpy.mock.calls.some((c) => c[4] === b.commandId)
+        ? (b.commandId as string)
+        : null;
+    });
+    const stored = () =>
+      (JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as Array<{
+        commandId: string;
+        state: string;
+        attempts: number;
+        lease?: { owner: string; until: number; claimToken?: string };
+      }>).find((r) => r.commandId === pId)!;
+    await pump(() => (stored()?.state === "inflight" ? true : null));
+    const box = (
+      hubStore as unknown as { outbox: ClaimIdentityOutbox | null }
+    ).outbox!;
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(stored().state).toBe("inflight");
+    expect(stored().attempts).toBe(1);
+    expect(stored().lease?.owner).toBe(box.ownerId);
+    const t1 = stored().lease?.claimToken;
+    expect(stored().lease!.until - Date.now()).toBeGreaterThan(20_000);
+
+    // 2) From now on every NEW claim aborts before committing; reads succeed.
+    abortNewClaims = true;
+
+    // 3) Advance past the T1 lease deadline: the REAL deadline wake flushes;
+    //    its T2 claim aborts pre-commit and the fresh read finds only the
+    //    stale T1 lease → claim-aborted. No POST on the stale lease. (The
+    //    token assertion below the behavioral one: pre-fix code never mints
+    //    tokens at all, and the ruling violation is the unauthorized POST.)
+    await vi.advanceTimersByTimeAsync(LEASE_TTL_MS + 250);
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(stored().state).toBe("inflight");
+    // The aborted T2 claim never committed: attempts and token stay T1.
+    expect(stored().attempts).toBe(1);
+    // The bounded recovery kept exactly one cover for the row.
+    expect(box.pendingLeaseWakeups()).toContain(pId);
+    // The fresh claim-identity machinery the ruling requires: THIS attempt's
+    // token rode along with the real claim and is durable.
+    expect(t1).toBeTruthy();
+    expect(stored().lease?.claimToken).toBe(t1);
+
+    // 4) Several more backed-off fires: claims keep genuinely aborting, never
+    //    POSTing. No third-party lease is ever mistaken for a won claim.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(stored().attempts).toBe(1);
+    expect(stored().lease?.claimToken).toBe(t1);
+
+    // 5) Storage really recovers: the next real wake commits a fresh claim
+    //    (T3) and the POST proceeds under the same command id.
+    abortNewClaims = false;
+    await vi.advanceTimersByTimeAsync(5_000);
+    await pump(() => (stored()?.state === "sent" ? true : null));
+    expect(sendSpy).toHaveBeenCalledTimes(2);
+    expect(sendSpy.mock.calls.map((c) => c[4])).toEqual([pId, pId]);
+    expect(stored().state).toBe("sent");
+    expect(stored().attempts).toBe(2);
+    expect(stored().lease).toBeUndefined();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("GATE23 item 1b: a claim whose merge promise rejects AFTER committing THIS attempt's token is a won claim — the POST proceeds immediately", async () => {
+  // Positive half of the identity ruling: mergeUnlessDone's promise rejects
+  // AFTER it committed the inflight lease carrying THIS attempt's fresh
+  // claimToken. The catch's fresh authoritative read finds that exact token →
+  // won claim → POST now (no 30 s wait, one attempt). The persisted lease
+  // really carries the per-attempt token that makes the verdict possible.
+  vi.useFakeTimers();
+  vi.setSystemTime(750_000);
+  try {
+    const { api, hubStore } = await fresh();
+    stubPostSend(api);
+    const { sendSpy, storage } = await bootLiveWithFaultableStorage(api, hubStore);
+
+    let claimTokenSeen: string | undefined;
+    const realMerge = storage.mergeUnlessDone.bind(storage);
+    storage.mergeUnlessDone = vi.fn(async (id, patch) => {
+      const p = patch as { state?: string; lease?: { claimToken?: string } };
+      const stored = await realMerge(id, patch);
+      // Post-COMMIT rejection of the claim's own real transition; the finish
+      // patch passes untouched.
+      if (String(id).startsWith("cmd_") && p.state === "inflight") {
+        claimTokenSeen = p.lease?.claimToken;
+        throw new Error("g23 1b post-commit claim rejection");
+      }
+      return stored;
+    });
+
+    const startedAt = Date.now();
+    void hubStore.send(INSTANCE, "gate23 1b");
+    // Bounded microtask pump (no fake-timer advance): the POST is immediate.
+    await pump(() => {
+      const b = hubStore.getSnapshot().bubbles.find((x) => x.text === "gate23 1b");
+      return b?.commandId && sendSpy.mock.calls.some((c) => c[4] === b.commandId)
+        ? (b.commandId as string)
+        : null;
+    });
+    expect(Date.now() - startedAt).toBeLessThan(LEASE_GUARD_MS);
+    expect(claimTokenSeen).toBeTruthy();
+    const pId = sendSpy.mock.calls[0]?.[4] as string;
+    const mine = () =>
+      (JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as Array<{
+        commandId: string;
+        state: string;
+        attempts: number;
+      }>).find((r) => r.commandId === pId)!;
+    await pump(() => (mine()?.state === "sent" ? true : null));
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(mine().state).toBe("sent");
+    expect(mine().attempts).toBe(1);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it("GATE22 item 2: a live steer whose rejected finishing write aborts once is recovered at its lease deadline — the direct route ends through the shared epilogue", async () => {
   // The guarded flush ends every pass with endDeliveryPasses (fresh
   // authoritative reconcile through bounded recovery); the LIVE DIRECT STEER

@@ -2728,6 +2728,14 @@ impl Hydrator {
     /// stop_reason still publishes its counters. A poll read error is treated
     /// as "nothing new" here: the finalise itself must never be skipped.
     ///
+    /// c-usagefu r17 item 3: the open turn's buffered usage lives in the
+    /// MAPPER, not on disk — a failed FINAL read (the transcript vanished or
+    /// became unreadable between the last poll and close) used to skip the
+    /// whole block and therefore `finish()`, suppressing that usage. The
+    /// successfully read final lines are mapped as usual and `finish()` is
+    /// called and emitted UNCONDITIONALLY, matching the `finish_sync` Drop
+    /// safety net.
+    ///
     /// Best-effort by contract: when the event channel is already gone the
     /// observations are dropped rather than failing the shutdown.
     async fn finalize(
@@ -2736,25 +2744,28 @@ impl Hydrator {
         seq: &AtomicU64,
         ctx: &PromoteCtx,
     ) {
-        if let Ok(read) = self.tail.poll() {
-            let mut batches: Vec<_> = read
+        let mut batches: Vec<_> = match self.tail.poll() {
+            Ok(read) => read
                 .lines
                 .iter()
                 .zip(read.positions.iter().copied())
                 .map(|(line, position)| self.mapper.map_line_at(line, Some(position)))
-                .collect();
-            batches.push(self.mapper.finish());
-            for batch in batches {
-                let Ok(mapped) = batch else {
-                    continue;
-                };
-                for observation in mapped {
-                    if emit_mapped(events, seq, ctx, SourceChannel::Transcript, observation)
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
+                .collect(),
+            // The final read failed (vanished/unreadable transcript): nothing
+            // new to map, but finish() below still runs.
+            Err(_) => Vec::new(),
+        };
+        batches.push(self.mapper.finish());
+        for batch in batches {
+            let Ok(mapped) = batch else {
+                continue;
+            };
+            for observation in mapped {
+                if emit_mapped(events, seq, ctx, SourceChannel::Transcript, observation)
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
             }
         }
@@ -4072,6 +4083,117 @@ mod tests {
         assert_eq!(known(&payload.cache_read_tokens), 4_000);
         assert_eq!(known(&payload.cache_write_tokens), 7);
         assert_eq!(known(&payload.output_tokens), 11);
+    }
+
+    /// c-usagefu r17 item 3: a FAILED final transcript read must not suppress
+    /// the buffered usage. The open turn's counters live in the mapper, not on
+    /// disk: when the bound file vanishes between the last poll and the close
+    /// finalise (a Fresh tail returns ENOENT as an error), the successfully
+    /// read lines are mapped (none here) and mapper.finish() still runs and
+    /// emits the held usage. The old `if let Ok(read)` skipped finish() too.
+    #[tokio::test]
+    async fn hydrator_finalise_emits_buffered_usage_when_the_final_read_fails() {
+        use crate::claude_transcript::{BindingSource, TranscriptBinding};
+        use remuda_protocol::Knowledge;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let session = "eeeeeeee-aaaa-4bbb-8ccc-eeeeeeeeeeee";
+
+        // Same open-turn shape: real counters, stop_reason null.
+        let body = serde_json::json!({
+            "type": "assistant",
+            "uuid": "uuid-final",
+            "timestamp": "2026-10-08T00:00:00.000Z",
+            "isSidechain": false,
+            "message": {
+                "type": "message",
+                "role": "assistant",
+                "id": "msg_vanished_turn",
+                "model": "claude-opus-5-5",
+                "content": [{"type": "text", "text": "DONE"}],
+                "stop_reason": null,
+                "usage": {
+                    "input_tokens": 5,
+                    "cache_read_input_tokens": 6000,
+                    "cache_creation_input_tokens": 9,
+                    "output_tokens": 13,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 9,
+                        "ephemeral_1h_input_tokens": 0
+                    }
+                }
+            }
+        });
+        let path = slug_session(&home, &cwd, session, &format!("{}\n", body));
+
+        let binding = TranscriptBinding {
+            session_id: session.into(),
+            path: path.clone(),
+            cwd: cwd.clone(),
+            source: BindingSource::Hook,
+        };
+        let ctx = ctx_in(&cwd);
+        let mut hydrator = Hydrator::open(
+            &ctx,
+            &binding,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::claude_transcript::ResumeMode::Fresh,
+            None,
+            None,
+        )
+        .expect("hydrator binds the seeded transcript");
+
+        let (tx, mut rx) = mpsc::channel::<Observation>(64);
+        // One ordinary pump maps the record; the open usage stays buffered.
+        pump(
+            &mut hydrator,
+            &tx,
+            &std::sync::atomic::AtomicU64::new(0),
+            &ctx,
+        )
+        .await
+        .expect("pump");
+        while rx.try_recv().is_ok() {}
+
+        // The transcript VANISHES before the close finalise (rotation/cleanup):
+        // a Fresh tail's final poll returns the ENOENT error.
+        std::fs::remove_file(&path).expect("the bound transcript vanishes");
+        assert!(
+            hydrator.tail.poll().is_err(),
+            "the test genuinely drives the failed-final-read path"
+        );
+
+        hydrator
+            .finalize(&tx, &std::sync::atomic::AtomicU64::new(0), &ctx)
+            .await;
+        drop(tx);
+
+        let mut finalised = Vec::new();
+        while let Some(observation) = rx.recv().await {
+            if let ObservationPayload::Usage(payload) = observation.body {
+                finalised.push(payload);
+            }
+        }
+        assert_eq!(
+            finalised.len(),
+            1,
+            "the buffered usage still finalises exactly once after a failed final read"
+        );
+        let known = |value: &Knowledge<remuda_protocol::U64>| match value {
+            Knowledge::Known { value } => value.0,
+            other => panic!("expected Known counter, got {other:?}"),
+        };
+        assert_eq!(known(&finalised[0].input_tokens), 5);
+        assert_eq!(known(&finalised[0].cache_read_tokens), 6_000);
+        assert_eq!(known(&finalised[0].cache_write_tokens), 9);
+        assert_eq!(known(&finalised[0].output_tokens), 13);
     }
 
     // =======================================================================

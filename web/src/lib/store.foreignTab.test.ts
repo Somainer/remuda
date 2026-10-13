@@ -5253,6 +5253,15 @@ it("GATE28 b: POST → status GET → journal for the SAME command records progr
         } | null;
       };
     const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    // Spy on the REAL acceptance CAS (no bypass): the filler POSTs and C's GET
+    // acceptance run through production; the final journal observation of C
+    // must invoke the CAS and get false (the flag is already set by the GET).
+    const casStorage = (hubStore as unknown as {
+      outbox: { storage: { casProgressRecorded: (id: string, l: string) => Promise<boolean> } };
+    }).outbox.storage;
+    const realCas = casStorage.casProgressRecorded.bind(casStorage);
+    const casCalls = vi.fn(async (id: string, l: string) => realCas(id, l));
+    casStorage.casProgressRecorded = casCalls;
 
     // 1) POST: the steer answers queued+forwarded+reconciling — no acceptance.
     hubStore.setConnectionStateForTest("live");
@@ -5269,27 +5278,22 @@ it("GATE28 b: POST → status GET → journal for the SAME command records progr
     expect(g28Row(cId)?.progressRecorded).toBe(true);
     expect(boxHandle().outbox!.isDeliveryExhausted(I)).toBe(false);
 
-    // 3) A large volume of OTHER accepted deliveries (more than any small
-    //    in-memory cache could practically hold) driven through the outbox's
-    //    real accepted-delivery boundary (committed claim stamping lifetime →
-    //    sent → CAS). Item 2 of this gate replaces this with full store sends.
-    const box = (hubStore as unknown as { outbox: {
-      deliverAcceptedForTest: (
-        r: Omit<OutboxRecord, "attempts" | "state"> & { state?: OutboxRecord["state"] },
-      ) => Promise<boolean>;
-    } }).outbox;
+    // 3) More OTHER accepted deliveries than any small in-memory cache could
+    //    practically hold. Every one is a REAL delivery through the store: an
+    //    ordinary send (storage-first enqueue) → the guarded flushAllOutbox
+    //    commits the claim (stamping this outbox's lifetime) → the accepted
+    //    API POST → the sent patch → the acceptance helper's durable CAS.
+    //    Each filler is on its own instance so none touches C's. The send mock
+    //    accepts every non-C prompt.
     for (let i = 0; i < FILLER; i += 1) {
+      const iid = `ins_g28_b_filler_${i % 40}`;
       // eslint-disable-next-line no-await-in-loop
-      expect(
-        await box.deliverAcceptedForTest({
-          commandId: `cmd_g28b_fill_${i}`,
-          clientRequestId: `local_g28b_${i}`,
-          instanceId: `ins_g28_b_filler_${i % 40}`,
-          prompt: `filler ${i}`,
-          createdAt: 2_000 + i,
-        }),
-      ).toBe(true);
+      expect(await hubStore.send(iid, `filler ${i}`)).toBe(true);
+      // eslint-disable-next-line no-await-in-loop
+      await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
     }
+    // C plus every filler was really POSTed and recorded once.
+    expect(send.mock.calls).toHaveLength(FILLER + 1);
     expect(storedRows().filter((r) => r.progressRecorded)).toHaveLength(FILLER + 1);
     expect(g28Row(cId)?.progressRecorded).toBe(true);
 
@@ -5305,8 +5309,10 @@ it("GATE28 b: POST → status GET → journal for the SAME command records progr
     const callsBeforeJournal = send.mock.calls.length;
 
     // 5) JOURNAL settle of the SAME command C (the third acceptance
-    //    observation): durable flag already true → no second recording; Q's
+    //    observation): it really reaches the production CAS and returns false
+    //    (flag already set by the accepted GET) → no second recording; Q's
     //    exhaustion/backoff and C's one POST are untouched.
+    const casBefore = casCalls.mock.calls.length;
     onBatch({
       subscriptionId: "sub_g26",
       journalId: JOURNAL,
@@ -5317,6 +5323,15 @@ it("GATE28 b: POST → status GET → journal for the SAME command records progr
     });
     await pump(2_000);
     await vi.advanceTimersByTimeAsync(1_000);
+    // The journal observation invoked the REAL CAS for C...
+    expect(casCalls.mock.calls.length).toBeGreaterThan(casBefore);
+    // ...and its CAS result is false (flag already set by the accepted GET).
+    const cResults = await Promise.all(
+      casCalls.mock.results
+        .filter((_, i) => casCalls.mock.calls[i][0] === cId)
+        .map((r) => r.value),
+    );
+    expect(cResults).toContain(false);
     expect(g28Row(cId)?.state).toBe("done");
     expect(g28Row(cId)?.progressRecorded).toBe(true);
     expect(boxHandle().outbox!.isDeliveryExhausted(I)).toBe(true);

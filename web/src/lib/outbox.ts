@@ -1127,21 +1127,6 @@ export class Outbox {
     return full;
   }
 
-  /** Temporary test helper (removed in gate 32 item 2). */
-  async deliverAcceptedForTest(
-    rec: Omit<OutboxRecord, "attempts" | "state"> & { state?: OutboxState },
-  ): Promise<boolean> {
-    const full = await this.enqueue(rec);
-    await this.patch(full.commandId, {
-      state: "inflight",
-      attempts: 1,
-      lease: { owner: this.ownerId, until: Date.now() + LEASE_TTL_MS },
-      issuerLifetime: this.lifetimeId,
-    });
-    await this.patch(full.commandId, { state: "sent", gotResponse: true });
-    return await this.casProgressRecorded(full.commandId, this.lifetimeId);
-  }
-
   /**
    * Storage-first state write with an ATOMIC terminal guarantee: the stored
    * row is re-read inside the same readwrite transaction that writes it, so a

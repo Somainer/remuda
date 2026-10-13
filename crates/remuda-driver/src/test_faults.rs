@@ -106,6 +106,12 @@ pub(crate) struct FaultState {
     /// window (c-ctxusage r13 item 2): one decremented failure per close
     /// attempt, so a retried close probes cleanly.
     close_probe_failures: AtomicU64,
+    /// Remaining shell-pty SPAWN attempts that must fail right after launch
+    /// materialization and before the child exists — the
+    /// materialize/PTY-open/spawn_command failure shape (c-ctxusage r20
+    /// item 1). Consumed inside `spawn_at`, so a resumed spawn that consumes
+    /// it fails while the predecessor run is left untouched.
+    spawn_failures: AtomicU64,
     /// Arms the one-shot gate that parks the first close between its final
     /// drain and its reap/terminal emission (c-ctxusage r14 item 5).
     close_tail_armed: AtomicBool,
@@ -189,6 +195,7 @@ impl FaultState {
             agent_exit_grace_ms: AtomicU64::new(0),
             close_barrier_timeout_ms: AtomicU64::new(0),
             close_probe_failures: AtomicU64::new(0),
+            spawn_failures: AtomicU64::new(0),
             close_tail_armed: AtomicBool::new(false),
             close_tail_entered: Mutex::new(false),
             close_tail_entered_cv: Condvar::new(),
@@ -541,6 +548,19 @@ impl FaultState {
             .is_ok()
     }
 
+    /// Consume one armed shell-pty spawn failure (c-ctxusage r20 item 1).
+    pub(crate) fn take_spawn_failure(&self) -> bool {
+        self.spawn_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                if remaining > 0 {
+                    Some(remaining - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+    }
+
     /// Whether the flusher has already exited.
     #[cfg(feature = "test-faults")]
     fn flusher_exited_now(&self) -> bool {
@@ -631,6 +651,15 @@ impl TranscriptFaults {
     pub fn arm_close_probe_failures(&self, attempts: u32) {
         self.inner
             .close_probe_failures
+            .store(u64::from(attempts), Ordering::SeqCst);
+    }
+
+    /// The next `attempts` shell-pty spawns fail after launch materialization
+    /// (c-ctxusage r20 item 1), modelling a materialize/PTY-open/spawn_command
+    /// error before the child process exists.
+    pub fn arm_spawn_failures(&self, attempts: u32) {
+        self.inner
+            .spawn_failures
             .store(u64::from(attempts), Ordering::SeqCst);
     }
 

@@ -1795,3 +1795,123 @@ fn last_session_pid(events_path: &Path) -> u64 {
         .next_back()
         .expect("a harness session_start pid")
 }
+
+/// c-ctxusage r20 item 1: a same-driver resume whose NEW run fails to spawn
+/// must leave the predecessor run completely intact — its poller still tails
+/// the transcript, its detection slots still hold the live writer, and a
+/// later close() takes the promoted path. Retirement must happen only AFTER a
+/// successful spawn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_resume_spawn_leaves_the_predecessor_run_intact() {
+    use remuda_driver::test_faults::TranscriptFaults;
+    let (_dir, workspace, transcript, driver) = p1_promoted_layout();
+    let driver = std::sync::Arc::new(driver);
+    let faults = TranscriptFaults::new();
+    driver.set_test_faults(faults.clone());
+
+    let handle = driver
+        .start(spec_for(&workspace, DriverKind::ShellPty))
+        .await
+        .expect("start");
+    let mut events_rx = handle.into_events();
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
+    let (scope_tx, scope_rx) = tokio::sync::mpsc::channel::<String>(64);
+    let drainer = tokio::spawn(async move {
+        while let Some(observation) = events_rx.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+                && native.native_name == "transcript_bound"
+                && let Some(tx) = bound_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+            if let ObservationPayload::Usage(payload) = &observation.body {
+                let _ = scope_tx.send(payload.scope_id.clone()).await;
+            }
+        }
+    });
+    let mut scope_rx = scope_rx;
+    tokio::time::timeout(Duration::from_secs(20), bound_rx)
+        .await
+        .expect("run 1 never bound")
+        .expect("bound oneshot closed without firing");
+    assert_eq!(
+        driver.promoted_kind(),
+        Some(AgentKind::Claude),
+        "run 1 is promoted before the failed resume"
+    );
+
+    // Arm ONE post-materialize spawn failure, then resume. The new run never
+    // starts a child and the resume must return the error WITHOUT retiring
+    // run 1.
+    faults.arm_spawn_failures(1);
+    let failed = tokio::time::timeout(Duration::from_secs(30), async {
+        driver
+            .start_resumed(
+                spec_for(&workspace, DriverKind::ShellPty),
+                SESSION_ID.into(),
+            )
+            .await
+    })
+    .await
+    .expect("the failed resume hung past its bound");
+    assert!(
+        failed.is_err(),
+        "the injected spawn failure must surface: {failed:?}"
+    );
+
+    // The predecessor's detection slots are untouched.
+    assert_eq!(
+        driver.promoted_kind(),
+        Some(AgentKind::Claude),
+        "the failed resume must not clear the predecessor's promotion slot"
+    );
+
+    // The predecessor poller still tails: an external append after the failed
+    // resume is delivered event-driven (bounded recv, no sleep).
+    use std::io::Write;
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .expect("reopen transcript");
+        file.write_all(flushing_record(POST_FAILED_CLOSE_MSG_ID, 7).as_bytes())
+            .expect("append after the failed resume");
+        file.sync_all().expect("sync");
+    }
+    let mut seen = Vec::new();
+    seen = await_usage_scope(&mut scope_rx, POST_FAILED_CLOSE_MSG_ID, seen).await;
+
+    // close() still takes the PROMOTED path: the live writer is signalled, its
+    // termination append drained, and teardown completes.
+    tokio::time::timeout(Duration::from_secs(25), driver.close())
+        .await
+        .expect("close hung past its bound")
+        .expect("close takes the promoted path after a failed resume");
+
+    driver.abort_event_workers_for_test().await;
+    tokio::time::timeout(Duration::from_secs(30), drainer)
+        .await
+        .expect("event channel never closed")
+        .expect("drainer panicked");
+    while let Ok(scope) = tokio::time::timeout(Duration::from_secs(2), scope_rx.recv()).await
+        && let Some(scope) = scope
+    {
+        seen.push(scope);
+    }
+    assert_eq!(
+        seen.iter()
+            .filter(|scope| **scope == TERMINATION_MSG_ID)
+            .count(),
+        1,
+        "the promoted close delivered run 1's termination usage exactly once"
+    );
+    assert_eq!(
+        seen.iter()
+            .filter(|scope| **scope == POST_FAILED_CLOSE_MSG_ID)
+            .count(),
+        1,
+        "the post-failed-resume append was delivered by the live predecessor poller"
+    );
+}

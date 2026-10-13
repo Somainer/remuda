@@ -463,10 +463,13 @@ const FALLBACK_CONFIRM_POLL: std::time::Duration = std::time::Duration::from_mil
 pub struct ShellPtyDriver {
     options: ShellPtyOptions,
     inner: Mutex<Option<Arc<PtyState>>>,
-    /// Set by the poller while a known agent CLI holds the foreground.
-    promoted: Arc<std::sync::Mutex<Option<Detected>>>,
-    /// Screen-derived readiness of that agent, when promoted.
-    status: Arc<std::sync::Mutex<Option<ScreenStatus>>>,
+    /// Set by the CURRENT run's poller while a known agent CLI holds the
+    /// foreground. Per-run detection state (c-ctxusage r20 item 1): the outer
+    /// mutex swaps which inner slot is current when a same-driver resume adopts
+    /// a new run, while the running poller keeps its own inner `Arc`.
+    promoted: std::sync::Mutex<Arc<std::sync::Mutex<Option<Detected>>>>,
+    /// Screen-derived readiness of the current run's agent, when promoted.
+    status: std::sync::Mutex<Arc<std::sync::Mutex<Option<ScreenStatus>>>>,
     /// Deterministic transcript binding for the current promotion epoch.
     bindings: promotion::BindingHandle,
     /// Promotion poller, stopped on close.
@@ -696,8 +699,8 @@ impl ShellPtyDriver {
         Self {
             options,
             inner: Mutex::new(None),
-            promoted: Arc::new(std::sync::Mutex::new(None)),
-            status: Arc::new(std::sync::Mutex::new(None)),
+            promoted: std::sync::Mutex::new(Arc::new(std::sync::Mutex::new(None))),
+            status: std::sync::Mutex::new(Arc::new(std::sync::Mutex::new(None))),
             bindings: promotion::BindingHandle::empty(),
             poller: Mutex::new(None),
             close_phase: tokio::sync::Mutex::new(()),
@@ -748,10 +751,9 @@ impl ShellPtyDriver {
     /// Currently promoted agent kind, if the PTY's foreground is an agent CLI.
     #[must_use]
     pub fn promoted_kind(&self) -> Option<AgentKind> {
-        self.promoted
-            .lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|found| found.kind))
+        let promoted = self.promoted.lock().ok()?;
+        let slot = promoted.lock().ok()?;
+        slot.as_ref().map(|found| found.kind)
     }
 
     /// Whether the hook path has produced a session binding for this PTY.
@@ -783,7 +785,28 @@ impl ShellPtyDriver {
     /// `idle` — so a caller guarding on idleness gets a conservative answer.
     #[must_use]
     pub fn screen_status(&self) -> Option<ScreenStatus> {
-        self.status.lock().ok().and_then(|slot| *slot)
+        let status = self.status.lock().ok()?;
+        status.lock().ok().and_then(|slot| *slot)
+    }
+
+    /// Clone the current run's inner promoted slot (c-ctxusage r20 item 1).
+    fn current_promoted(&self) -> Arc<std::sync::Mutex<Option<Detected>>> {
+        Arc::clone(
+            &*self
+                .promoted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Clone the current run's inner status slot.
+    fn current_status(&self) -> Arc<std::sync::Mutex<Option<ScreenStatus>>> {
+        Arc::clone(
+            &*self
+                .status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// Answer an ignored hook decision on the agent's own dialog, once (§14 risk 1).
@@ -908,12 +931,9 @@ impl ShellPtyDriver {
     /// The live promoted process, or our direct agent child before detection.
     /// A login shell's PID is never evidence for a hand-typed agent.
     fn session_pid(&self) -> Option<i32> {
-        if let Some(pid) = self
-            .promoted
-            .lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|found| found.pid))
-            .filter(|pid| *pid > 0)
+        if let Ok(slot) = self.promoted.lock()
+            && let Ok(inner) = slot.lock()
+            && let Some(pid) = inner.as_ref().map(|found| found.pid).filter(|pid| *pid > 0)
         {
             return Some(pid);
         }
@@ -1235,6 +1255,21 @@ impl ShellPtyDriver {
             })??
         };
         let cmd = build_command(&self.options, cwd, &recipe, hooks.as_ref())?;
+        // Test-only spawn failure (c-ctxusage r20 item 1): fail AFTER launch
+        // materialization and BEFORE spawn_command, so no child process exists
+        // and dropping this run leaves nothing running — used to prove a failed
+        // same-driver resume does not touch the predecessor run.
+        let spawn_fails = self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            .is_some_and(crate::test_faults::FaultState::take_spawn_failure);
+        if spawn_fails {
+            return Err(pty_err(io::Error::other(
+                "injected shell-pty spawn failure after materialization",
+            )));
+        }
         let child = pair.slave.spawn_command(cmd).map_err(pty_err)?;
         drop(pair.slave);
         // `portable-pty` calls `setsid()` before `exec`, so the child leads its
@@ -1492,12 +1527,15 @@ impl ShellPtyDriver {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
+            // Hand the poller the CURRENT inner detection slots.
+            let promoted = self.current_promoted();
+            let status = self.current_status();
             *self.poller.lock().await = Some(promotion::spawn(
                 Arc::clone(&state),
                 hook_ctx.clone(),
                 Arc::clone(&self.table),
-                Arc::clone(&self.promoted),
-                Arc::clone(&self.status),
+                promoted,
+                status,
                 self.bindings.clone(),
                 hooks,
                 matches!(self.options.target, Target::Shell),
@@ -1566,7 +1604,7 @@ impl ShellPtyDriver {
             tx,
             Arc::clone(&self.seq),
             Arc::clone(&self.exited),
-            Arc::clone(&self.promoted),
+            self.current_promoted(),
             eof_rx,
         ));
         if let Ok(mut slot) = self.recipe.lock() {
@@ -1641,7 +1679,7 @@ impl ShellPtyDriver {
         ctx: &promotion::PromoteCtx,
         events: mpsc::Sender<remuda_protocol::Observation>,
     ) -> crate::adapters::supervisor::AdapterHandle {
-        let promoted = Arc::clone(&self.promoted);
+        let promoted = self.current_promoted();
         let options_cwd = self.options.cwd.clone();
         let seq = Arc::clone(&self.seq);
         let stamp_ctx = crate::adapters::supervisor::stamp_ctx(
@@ -1776,12 +1814,24 @@ impl ShellPtyDriver {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut waiter).await;
         }
         // The predecessor's detection slots are stale; the new run's poller
-        // repopulates them on its own bind/demote.
-        if let Ok(mut slot) = self.promoted.lock() {
-            *slot = None;
+        // repopulates them on its own bind/demote. This clears the CURRENT
+        // (predecessor, at retirement time) inner slots; the resumed run owns
+        // separate slots and is unaffected (c-ctxusage r20 item 1).
+        self.clear_current_detection_slots();
+    }
+
+    /// Clear the promoted/status values held in the current run's inner slots.
+    /// The outer current-run pointer is left in place.
+    fn clear_current_detection_slots(&self) {
+        if let Ok(slot) = self.promoted.lock()
+            && let Ok(mut inner) = slot.lock()
+        {
+            *inner = None;
         }
-        if let Ok(mut slot) = self.status.lock() {
-            *slot = None;
+        if let Ok(slot) = self.status.lock()
+            && let Ok(mut inner) = slot.lock()
+        {
+            *inner = None;
         }
     }
 
@@ -2125,10 +2175,14 @@ impl ShellPtyDriver {
             },
             Arc::clone(&self.table),
         );
-        // The adopted poller/bus must update the same control handles that
-        // callers retain on `self`, including native cancel confirmation.
-        resumed.promoted = Arc::clone(&self.promoted);
-        resumed.status = Arc::clone(&self.status);
+        // The resumed run gets its OWN fresh detection slots (c-ctxusage r20
+        // item 1): promoted/status are per-run state the poller writes. It is
+        // spawned with those fresh slots FIRST; only after a SUCCESSFUL spawn
+        // is the predecessor retired and the new run's slots adopted as this
+        // driver's current ones. Sharing self's slots here (the old shape)
+        // meant a run-2 bind raced predecessor retirement's slot clear.
+        // Bindings, pid/interrupt/seq coordination and the exit journal stay
+        // shared — they are not detection slots.
         resumed.bindings = self.bindings.clone();
         resumed.interrupt_pid = Arc::clone(&self.interrupt_pid);
         resumed.interrupt_screen_markers = Arc::clone(&self.interrupt_screen_markers);
@@ -2159,25 +2213,38 @@ impl ShellPtyDriver {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(faults);
         }
-        // Retire the PREDECESSOR run's poller/waiter BEFORE spawning this
-        // run's poller (c-ctxusage r19 item 1). Both runs share the
-        // promoted/status detection slots, and retirement clears them. If run
-        // 2's poller spawned first it could bind its writer — setting those
-        // slots — WHILE the predecessor was still finalising; the clear at the
-        // end of retirement then wiped run 2's promotion, so a close() before
-        // run 2's next sample took the unpromoted path and lost its
-        // termination usage. Retiring first clears the stale slots while no
-        // run-2 poller exists; the spawn below repopulates them and nothing
-        // clears them afterwards.
-        self.retire_predecessor_run().await;
-        let handle = match spec {
-            Some(spec) => resumed.spawn_at(&spec.cwd.clone(), Some(&spec)).await?,
-            None => resumed.spawn().await?,
+        // Spawn the new run FIRST, on its own fresh detection slots. A spawn
+        // failure (materialize / PTY-open / spawn_command) must leave the
+        // predecessor completely intact: return before retiring anything, so
+        // `resumed` — and the failed run's slots/poller it never finished
+        // installing — simply drop while self's poller, exit waiter and
+        // promoted/status keep owning the live writer (c-ctxusage r20 item 1).
+        let spawn_result = match spec {
+            Some(spec) => resumed.spawn_at(&spec.cwd.clone(), Some(&spec)).await,
+            None => resumed.spawn().await,
         };
+        let handle = match spawn_result {
+            Ok(handle) => handle,
+            Err(error) => return Err(error),
+        };
+        // The new run is up: now retire the predecessor (bounded) — its poller
+        // and exit waiter stop, and its detection slots are discarded. The new
+        // run's slots are independent, so a predecessor finalise that lands
+        // here can never clear a slot the new poller has written.
+        self.retire_predecessor_run().await;
         // Adopt the new PTY: the caller holds *this* driver, so control
         // operations have to reach the process that was just started.
         *self.inner.lock().await = resumed.inner.lock().await.take();
         *self.hooks.lock().await = resumed.hooks.lock().await.take();
+        // The detection slots become the NEW run's own slots (adopted, not
+        // shared-then-cleared): from here close() and the poller agree on the
+        // current promotion.
+        if let Ok(mut promoted) = self.promoted.lock() {
+            *promoted = resumed.current_promoted();
+        }
+        if let Ok(mut status) = self.status.lock() {
+            *status = resumed.current_status();
+        }
         *self.poller.lock().await = resumed.poller.lock().await.take();
         *self.poller_shutdown.lock().await = resumed.poller_shutdown.lock().await.take();
         *self.poller_finalised.lock().await = resumed.poller_finalised.lock().await.take();
@@ -3226,7 +3293,8 @@ impl Driver for ShellPtyDriver {
         let promoted = self
             .promoted
             .lock()
-            .map(|slot| slot.is_some())
+            .ok()
+            .and_then(|slot| slot.lock().ok().map(|inner| inner.is_some()))
             .unwrap_or(false);
         if promoted {
             self.stop_promoted_writer_before_retire().await?;
@@ -3306,12 +3374,7 @@ impl Driver for ShellPtyDriver {
                 poller.abort();
             }
         }
-        if let Ok(mut slot) = self.promoted.lock() {
-            *slot = None;
-        }
-        if let Ok(mut slot) = self.status.lock() {
-            *slot = None;
-        }
+        self.clear_current_detection_slots();
         // Release any hook parked on an approval before the socket goes away.
         // Otherwise each one holds its agent's turn open until its own
         // deadline, minutes after the session has stopped.
@@ -4792,7 +4855,7 @@ mod tests {
         Driver::cancel(&driver).await.unwrap();
         assert_eq!(written.lock().unwrap().as_slice(), b"\x03");
         written.lock().unwrap().clear();
-        *driver.promoted.lock().unwrap() = Some(Detected {
+        *driver.current_promoted().lock().unwrap() = Some(Detected {
             kind: AgentKind::Claude,
             pid: 42,
             session_id: None,
@@ -4823,7 +4886,7 @@ mod tests {
         assert!(driver.hook_receipt());
         // The hook has already accepted a turn while the screen still shows
         // the old composer. That stale idle frame must not swallow cancel.
-        *driver.status.lock().unwrap() = Some(ScreenStatus::Idle);
+        *driver.current_status().lock().unwrap() = Some(ScreenStatus::Idle);
         assert!(
             Driver::wait_control(&driver).await.is_err(),
             "a SessionStart receipt cannot admit a prompt during a hook-confirmed turn"
@@ -4837,7 +4900,7 @@ mod tests {
         );
         written.lock().unwrap().clear();
         hooks.confirm_screen_interrupt(42);
-        *driver.status.lock().unwrap() = Some(ScreenStatus::Working);
+        *driver.current_status().lock().unwrap() = Some(ScreenStatus::Working);
         assert!(Driver::wait_control(&driver).await.is_ok());
         let ack = Driver::cancel(&driver).await.unwrap();
         assert_eq!(ack.dispatch, remuda_protocol::DispatchState::NotDispatched);
@@ -4845,7 +4908,7 @@ mod tests {
             written.lock().unwrap().is_empty(),
             "Esc on an idle Claude can quit the session"
         );
-        *driver.status.lock().unwrap() = Some(ScreenStatus::Blocked);
+        *driver.current_status().lock().unwrap() = Some(ScreenStatus::Blocked);
         assert!(Driver::wait_control(&driver).await.is_err());
         Driver::close(&driver).await.unwrap();
     }
@@ -4929,7 +4992,7 @@ mod tests {
         let driver = ShellPtyDriver::new(options);
         driver.spawn().await.expect("spawns");
         if let Some(kind) = kind {
-            *driver.promoted.lock().unwrap() = Some(crate::promote::Detected {
+            *driver.current_promoted().lock().unwrap() = Some(crate::promote::Detected {
                 kind,
                 pid: 1,
                 session_id: None,
@@ -4957,7 +5020,7 @@ mod tests {
     #[tokio::test]
     async fn an_agent_whose_screen_says_idle_is_ready() {
         let driver = agent_pty(Some(AgentKind::Claude)).await;
-        *driver.status.lock().unwrap() = Some(ScreenStatus::Idle);
+        *driver.current_status().lock().unwrap() = Some(ScreenStatus::Idle);
         assert!(Driver::wait_control(&driver).await.is_ok());
         let _ = Driver::close(&driver).await;
     }
@@ -4967,7 +5030,7 @@ mod tests {
         // Typing into a running turn is how a prompt gets swallowed.
         let driver = agent_pty(Some(AgentKind::Claude)).await;
         for status in [ScreenStatus::Working, ScreenStatus::Blocked] {
-            *driver.status.lock().unwrap() = Some(status);
+            *driver.current_status().lock().unwrap() = Some(status);
             assert!(
                 Driver::wait_control(&driver).await.is_err(),
                 "{status:?} must not accept a prompt"
@@ -4999,13 +5062,13 @@ mod tests {
         // Promoted rather than launched, because the two are the same session
         // to every line of code below this point (§1.0) and the promoted shape
         // needs no materializer inputs.
-        *driver.promoted.lock().unwrap() = Some(crate::promote::Detected {
+        *driver.current_promoted().lock().unwrap() = Some(crate::promote::Detected {
             kind: AgentKind::Claude,
             pid: 1,
             session_id: None,
             hydrates_transcript: true,
         });
-        *driver.status.lock().unwrap() = Some(ScreenStatus::Idle);
+        *driver.current_status().lock().unwrap() = Some(ScreenStatus::Idle);
 
         let ack = Driver::cancel(&driver)
             .await

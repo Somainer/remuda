@@ -229,6 +229,12 @@ export const LEASE_TTL_MS = 30_000;
 export const CLAIM_WAKE_MAX_FAILURES = 12;
 export const CLAIM_WAKE_BASE_RETRY_MS = 250;
 export const CLAIM_WAKE_MAX_RETRY_MS = 5_000;
+/**
+ * Bound on the per-outbox issued/accepted command tracking sets (gate 27):
+ * far above any single auth epoch's live command count, small enough that the
+ * dedupe state cannot grow without limit. Overflow evicts the oldest ids.
+ */
+const ACCEPTANCE_TRACK_LIMIT = 2_000;
 
 /**
  * The Web Lock name guarding delivery for ONE instance. This is the ONLY place
@@ -704,6 +710,15 @@ export class Outbox {
    */
   private deliveryExhausted = new Set<Id>();
   /**
+   * Commands whose Hub ACCEPTANCE has already recorded progress on THIS outbox
+   * (c-reconnfu gate 27 item 1): progress per command is recorded AT MOST
+   * ONCE. A second observation of the same command id in any order (the POST
+   * verdict, the status GET, a journal settle) is a no-op — without this the
+   * late duplicate would wipe failures/backoff the instance earned AFTER the
+   * first acceptance. Insertion-ordered and bounded.
+   */
+  private acceptedCommands = new Set<Id>();
+  /**
    * Per-FLUSH suppression of 0 ms delivery wakes (c-reconnfu gate 21 item 1):
    * each guarded flush receives a TOKEN scoped to the instances ITS pass read.
    * The count is REFERENCE-COUNTED because flushes overlap (a timer fires
@@ -1165,6 +1180,10 @@ export class Outbox {
     this.readRecoveryExhausted = false;
     this.deliveryFailures.clear();
     this.deliveryExhausted.clear();
+    // The per-command acceptance book belongs to the same envelope: a genuine
+    // teardown (or a pagehide that is later undone) resets it with the failure
+    // state it gates (c-reconnfu gate 27 item 1).
+    this.acceptedCommands.clear();
     this.deliveryPasses.clear();
     this.deliverySuppressed.clear();
     this.storeRetryPending.clear();
@@ -1188,6 +1207,31 @@ export class Outbox {
   /** Test visibility: kind of an armed wake. */
   leaseWakeKind(commandId: Id): "lease" | "deliver" | undefined {
     return this.leaseWakeups.get(commandId)?.kind;
+  }
+
+  /**
+   * Record an acceptance observation for a command AT MOST ONCE (gate 27
+   * item 1). Returns false (and changes nothing) when a second observation of
+   * the same command id arrives — the instance's failures/backoff earned after
+   * the first acceptance must survive it.
+   */
+  noteAcceptedOnce(commandId: Id): boolean {
+    if (this.acceptedCommands.has(commandId)) return false;
+    this.capTracking(this.acceptedCommands);
+    this.acceptedCommands.add(commandId);
+    return true;
+  }
+
+  /** Evict the oldest tracking entries once a set passes its bound. */
+  private capTracking(set: Set<Id>) {
+    if (set.size < ACCEPTANCE_TRACK_LIMIT) return;
+    const dropUntil = ACCEPTANCE_TRACK_LIMIT - Math.floor(ACCEPTANCE_TRACK_LIMIT / 4);
+    let dropped = 0;
+    for (const id of set) {
+      if (dropped >= dropUntil) break;
+      set.delete(id);
+      dropped += 1;
+    }
   }
 
   /**

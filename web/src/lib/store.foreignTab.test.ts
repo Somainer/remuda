@@ -4487,20 +4487,32 @@ it("GATE26 item 1a: journal settles the reconciling steer done BEFORE the status
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
-
-it("GATE26 item 1b: the journal commits done DURING the accepted GET — the GET's local patch is dropped as stale yet progress is still recorded and P is delivered", async () => {
+it("GATE26 item 1b: another tab's journal settle commits done DURING A's accepted GET — the dropped-patch GET verdict is the ONLY progress source for A and delivers P", async () => {
+  // Gate 27 item 3 hardening: the journal-done and the accepted GET can both
+  // record progress, so the old version of this test stayed green even when
+  // the GET path stopped recording (the journal observation covered for it).
+  // Here the done commit comes from a SECOND, real HubStore B's journal
+  // settle on the shared backend while B is PAGE-HIDDEN: B retires S to
+  // durably done (journal evidence always applies; B loaded S at boot), but
+  // B never issued S and a hidden box neither records progress nor
+  // reconciles — so for A the journal cannot be the source. A never receives
+  // the event. When A's parked GET then resolves accepted, its local sent
+  // patch is dropped (stored row already done); ONLY the GET-path recording
+  // clears A's exhaustion and P is delivered by A's real timer. B never
+  // POSTs.
   vi.useFakeTimers();
   vi.setSystemTime(991_000);
   const I = "ins_g26_b";
   const originalNavigator = globalThis.navigator;
-  const good = fifoWebLocks().locks;
+  const shim = fifoWebLocks();
+  const good = shim.locks;
   const bad = {
     query: async () => ({ held: [] as Array<{ name: string }> }),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     request: (): Promise<any> => Promise.reject(new Error("g26 b locks down")),
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let locks: { query: () => Promise<unknown>; request: (...args: any[]) => Promise<unknown> } = bad;
+  let locks: { query: () => Promise<unknown>; request: (...args: any[]) => Promise<unknown> } = good;
   Object.defineProperty(globalThis, "navigator", {
     configurable: true,
     writable: true,
@@ -4511,18 +4523,20 @@ it("GATE26 item 1b: the journal commits done DURING the accepted GET — the GET
     for (let i = 0; i < n; i += 1) await Promise.resolve();
   };
   try {
-    sessionStorage.setItem("remuda-outbox-owner", "owner_g26_b");
-    const { api, hubStore } = await fresh();
-    vi.spyOn(api, "eventsRead").mockResolvedValue({
+    // A boots with locks UP and sends the reconciling steer; its accepted GET
+    // parks.
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g26_b_a");
+    const { api: apiA, hubStore: a } = await fresh();
+    vi.spyOn(apiA, "eventsRead").mockResolvedValue({
       events: [],
       durableSeq: "0",
       windowFromSeq: null,
       reachedAfterSeq: true,
     });
-    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
-    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
-    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
-    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+    vi.spyOn(apiA, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(apiA, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(apiA, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const sendA = vi.spyOn(apiA, "instanceSend").mockImplementation(
       (async (_iid: string, prompt: string, _x?: unknown, _m?: string, commandId?: string) =>
         prompt === "g26 b S"
           ? g25ReconcilingAnswer(commandId ?? "cmd_x")
@@ -4535,61 +4549,113 @@ it("GATE26 item 1b: the journal commits done DURING the accepted GET — the GET
             }) as unknown as Api["instanceSend"],
     );
     let releaseGet: (r: unknown) => void = () => undefined;
-    vi.spyOn(api, "instanceCommandStatus").mockImplementation(
+    vi.spyOn(apiA, "instanceCommandStatus").mockImplementation(
       () =>
         new Promise((resolve) => {
           releaseGet = resolve as (r: unknown) => void;
         }) as never,
     );
-    await bootLive(api, hubStore);
-    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
-    await hubStore.follow(I);
-    const subscribe = vi.mocked(api.eventsSubscribe);
-    for (let i = 0; i < 2_000 && !subscribe.mock.calls[0]?.[2]; i += 1) await Promise.resolve();
-    const onBatch = subscribe.mock.calls[0]?.[2] as (b: G26Batch) => void;
+    await bootLive(apiA, a);
+    await (a as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    expect(await a.send(I, "g26 b S", [], [], "steer")).toBe(false);
+    await pump(500);
+    const sId = sendA.mock.calls[0]?.[4] as string;
     const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(storedRows().find((r) => r.commandId === sId)?.state).toBe("reconciling");
 
-    hubStore.setConnectionStateForTest("offline");
+    // B boots second: its boot flush reads the shared backend (S is
+    // reconciling/non-deliverable, so it POSTs nothing) and its restored
+    // reconciling GET parks forever. Then B is PAGE-HIDDEN.
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g26_b_b");
+    const { api: apiB, hubStore: b } = await fresh();
+    vi.spyOn(apiB, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(apiB, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(apiB, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(apiB, "eventsSubscribe").mockResolvedValue(
+      { ...g26Subscription(), subscriptionId: "sub_g26_b" } as never,
+    );
+    vi.spyOn(apiB, "instanceCommandStatus").mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
+    const sendB = vi.spyOn(apiB, "instanceSend");
+    await bootLive(apiB, b);
+    await pump(1_000);
+    await b.follow(I);
+    const subscribeB = vi.mocked(apiB.eventsSubscribe);
+    for (let i = 0; i < 2_000 && !subscribeB.mock.calls[0]?.[2]; i += 1) await Promise.resolve();
+    const onBatchB = subscribeB.mock.calls[0]?.[2] as (batch: G26Batch) => void;
+    (b as unknown as { onPageHide: (e?: Event) => void }).onPageHide(new Event("pagehide"));
+    expect((b as unknown as { pageIsUnloadingForTest: boolean }).pageIsUnloadingForTest).toBe(true);
+    expect(sendB).not.toHaveBeenCalled();
+
+    const boxOfA = () =>
+      (
+        a as unknown as {
+          outbox: {
+            isDeliveryExhausted: (i: string) => boolean;
+            pendingLeaseWakeups: () => string[];
+          } | null;
+        }
+      ).outbox;
+
+    // Web Locks go down: A enqueues P while offline and its real timer wakes
+    // exhaust the instance. B is hidden — it never reconciles or POSTs.
+    a.setConnectionStateForTest("offline");
     locks = bad;
-    expect(await hubStore.send(I, "g26 b P")).toBe(true);
+    expect(await a.send(I, "g26 b P")).toBe(true);
     await pump(200);
     const pId = storedRows().find((r) => r.prompt === "g26 b P")!.commandId;
     await vi.advanceTimersByTimeAsync(120_000);
+    expect(boxOfA()!.isDeliveryExhausted(I)).toBe(true);
+    expect(sendA).toHaveBeenCalledTimes(1);
+    expect(sendB).not.toHaveBeenCalled();
 
+    // Locks recover (A is back live). B's REAL journal settle commits S done
+    // WHILE A's GET is parked: the hidden B retires the row but records and
+    // reconciles nothing.
     locks = good;
-    hubStore.setConnectionStateForTest("live");
-    expect(await hubStore.send(I, "g26 b S", [], [], "steer")).toBe(false);
-    await pump(500);
-    const sId = send.mock.calls[0]?.[4] as string;
-    expect(storedRows().find((r) => r.commandId === sId)?.state).toBe("reconciling");
-
-    // The journal commits done WHILE the accepted GET is parked; then the GET
-    // resolves accepted — its local sent patch is dropped (stored row already
-    // done), but the Hub verdict still records progress.
-    onBatch({
-      subscriptionId: "sub_g26",
+    a.setConnectionStateForTest("live");
+    onBatchB({
+      subscriptionId: "sub_g26_b",
       journalId: JOURNAL,
       fromSeq: "1",
       toSeq: "1",
       durableSeq: "1",
       events: [g26JournalMessage(sId, "1")],
     });
-    await pump(200);
+    await pump(2_000);
+    expect(storedRows().find((r) => r.commandId === sId)?.state).toBe("done");
+    // A never saw the journal event: still exhausted, P uncovered.
+    expect(boxOfA()!.isDeliveryExhausted(I)).toBe(true);
+    expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("pending");
+    expect(sendA).toHaveBeenCalledTimes(1);
+    expect(sendB).not.toHaveBeenCalled();
+
+    // A's parked GET resolves ACCEPTED: its sent patch is dropped against the
+    // committed done, yet the GET verdict alone records progress on A — the
+    // epilogue re-arms P and A's real timer delivers it.
     releaseGet(g25Status(sId, "accepted"));
-    for (let i = 0; i < 400 && send.mock.calls.length < 2; i += 1) {
+    for (let i = 0; i < 400 && sendA.mock.calls.length < 2; i += 1) {
       await vi.advanceTimersByTimeAsync(10);
       await Promise.resolve();
     }
-    expect(send.mock.calls.map((c) => c[4])).toEqual([sId, pId]);
-    // The dropped sent patch never downgraded the journal done.
-    const sRow = storedRows().find((r) => r.commandId === sId)!;
-    expect(sRow.state).toBe("done");
-    expect(sRow.serverState).toBe("journal-settled");
+    expect(sendA.mock.calls.map((c) => c[4])).toEqual([sId, pId]);
+    expect(storedRows().find((r) => r.commandId === sId)?.state).toBe("done");
     expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("sent");
+    expect(boxOfA()!.isDeliveryExhausted(I)).toBe(false);
+    // B's hidden box never POSTed anything.
+    expect(sendB).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(120_000);
-    expect(send.mock.calls.map((c) => c[4])).toEqual([sId, pId]);
-    hubStore.logout();
+    expect(sendA.mock.calls.map((c) => c[4])).toEqual([sId, pId]);
+    expect(sendB).not.toHaveBeenCalled();
+    a.logout();
+    b.logout();
   } finally {
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
@@ -4706,6 +4772,122 @@ it("GATE26 item 1c: a Hub-rejected steer stays rejected when journal traffic arr
     expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("pending");
     expect(boxOf()!.isDeliveryExhausted(I)).toBe(true);
     expect(boxOf()!.pendingLeaseWakeups()).toEqual([]);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE27 item 1: a second acceptance observation of the SAME command is a no-op — failures accrued after the first acceptance survive a late journal settle", async () => {
+  // An accepted POST records progress once. The instance then earns NEW
+  // delivery failures (a later pending row hammers the down Web Lock to the
+  // cap). When a journal settle for the SAME already-accepted command id
+  // arrives late, pre-gate-27 the helper cleared the instance's books a
+  // second time and wiped the new backoff/exhaustion; post-fix the second
+  // observation is a no-op and the failures stay exactly as accrued.
+  vi.useFakeTimers();
+  vi.setSystemTime(1_000_000);
+  const I = "ins_g27_i1";
+  const originalNavigator = globalThis.navigator;
+  const good = fifoWebLocks().locks;
+  const bad = {
+    query: async () => ({ held: [] as Array<{ name: string }> }),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    request: (): Promise<any> => Promise.reject(new Error("g27 i1 locks down")),
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let locks: { query: () => Promise<unknown>; request: (...args: any[]) => Promise<unknown> } = bad;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { get locks() { return locks; } },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g27_i1");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_iid: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: {
+          commandId, id: commandId, state: "accepted", revision: "1",
+          dispatch: "native-acknowledged", resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await hubStore.follow(I);
+    const subscribe = vi.mocked(api.eventsSubscribe);
+    for (let i = 0; i < 2_000 && !subscribe.mock.calls[0]?.[2]; i += 1) await Promise.resolve();
+    const onBatch = subscribe.mock.calls[0]?.[2] as (b: G26Batch) => void;
+    const boxOf = () =>
+      (
+        hubStore as unknown as {
+          outbox: {
+            isDeliveryExhausted: (i: string) => boolean;
+            pendingLeaseWakeups: () => string[];
+          } | null;
+        }
+      ).outbox;
+    const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+
+    // 1) The accepted POST records progress the first time.
+    locks = good;
+    hubStore.setConnectionStateForTest("live");
+    expect(await hubStore.send(I, "g27 1 C")).toBe(true);
+    await pump(500);
+    const cId = send.mock.calls[0]?.[4] as string;
+    expect(storedRows().find((r) => r.commandId === cId)?.state).toBe("sent");
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(false);
+
+    // 2) Locks go down; a NEW pending row spends the bounded budget — fresh
+    //    failures accrue and the instance is exhausted again.
+    locks = bad;
+    hubStore.setConnectionStateForTest("offline");
+    expect(await hubStore.send(I, "g27 1 P2")).toBe(true);
+    await pump(200);
+    const p2Id = storedRows().find((r) => r.prompt === "g27 1 P2")!.commandId;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(true);
+    expect(storedRows().find((r) => r.commandId === p2Id)?.state).toBe("pending");
+    const callsAtExhaustion = send.mock.calls.length;
+
+    // 3) A late journal settle of the SAME, already-accepted command id: the
+    //    second acceptance observation must be a no-op. The row is sent (not
+    //    re-patched), the latch and P2's cover are untouched.
+    onBatch({
+      subscriptionId: "sub_g26",
+      journalId: JOURNAL,
+      fromSeq: "1",
+      toSeq: "1",
+      durableSeq: "1",
+      events: [g26JournalMessage(cId, "1")],
+    });
+    await pump(2_000);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(true);
+    expect(boxOf()!.pendingLeaseWakeups()).toEqual([]);
+    expect(send.mock.calls.length).toBe(callsAtExhaustion);
+    expect(storedRows().find((r) => r.commandId === p2Id)?.state).toBe("pending");
+    // Journal evidence still retires the already-accepted row to done — the
+    // no-op is only the PROGRESS side (latch/wakes), not the durable patch.
+    expect(storedRows().find((r) => r.commandId === cId)?.state).toBe("done");
+
     hubStore.logout();
   } finally {
     vi.useRealTimers();

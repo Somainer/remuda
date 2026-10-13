@@ -2176,7 +2176,7 @@ class HubStore {
       // records progress through the same helper as every other path
       // (c-reconnfu gate 26).
       if (this.outbox?.get(commandId)?.state === "done") {
-        this.recordAcceptedDelivery(instanceId, origin);
+        this.recordAcceptedDelivery(instanceId, commandId, origin);
         return;
       }
       const verdict = await this.reconcileCommandViaGet(instanceId, commandId);
@@ -2203,7 +2203,7 @@ class HubStore {
         // verdict, not of the local patch applying. Record progress regardless
         // (c-reconnfu gate 26).
         await this.reconcilePatch(commandId, { state: "sent", gotResponse: true });
-        this.recordAcceptedDelivery(instanceId, origin);
+        this.recordAcceptedDelivery(instanceId, commandId, origin);
         return;
       }
       if (verdict === "held") {
@@ -2230,25 +2230,29 @@ class HubStore {
 
   /**
    * The SINGLE acceptance-progress boundary (c-reconnfu gate 26 coordinator
-   * ruling): progress is a property of the HUB'S ACCEPTANCE of a command, not
-   * of which local path observed it. Every authoritative acceptance
-   * observation routes through here once:
+   * ruling; gate 27 refinement): progress is a property of the HUB'S
+   * ACCEPTANCE of a command, not of which local path observed it. Every
+   * authoritative acceptance observation routes through here once:
    *  - the POST response classified sent (deliverOutboxRecord),
    *  - the command-status GET confirming sent, and a done seen while polling,
    *  - a journal message settling the row as accepted/done
    *    (live onEvents and catch-up settleFromJournal).
    *
-   * Idempotent: recording twice is harmless (noteDeliveryProgress just
-   * clears maps; the epilogue only re-reads/reconciles), and INDEPENDENT of
-   * whether the local row patch applied or was dropped as stale. Rejected,
-   * failed, held or never-resolving observations never call this. Only the
-   * ORIGINATING outbox — while still the current auth epoch — is touched, so
-   * a logout/reinit while an observation was pending can never clear the new
-   * epoch's books or reconcile it (same rule as the gate 22 flush epilogue).
+   * Gate 27 item 1 rule — AT MOST ONCE per command: a second observation of
+   * the same command id in any order is a no-op, so failures/backoff earned
+   * on the instance AFTER the first acceptance are not wiped by a late
+   * duplicate.
+   *
+   * Rejected, failed, held or never-resolving observations never call this.
    */
-  private recordAcceptedDelivery(instanceId: Id, origin?: Outbox | null): void {
+  private recordAcceptedDelivery(
+    instanceId: Id,
+    commandId: Id,
+    origin?: Outbox | null,
+  ): void {
     const box = origin ?? this.outbox;
     if (this.pageIsUnloading || !box || this.outbox !== box) return;
+    if (!box.noteAcceptedOnce(commandId)) return;
     box.noteDeliveryProgress(instanceId);
     void box.deliveryEpilogue().catch(() => undefined);
   }
@@ -2471,7 +2475,7 @@ class HubStore {
       // Hub-ACCEPTED verdict clears the per-instance backoff/exhaustion and
       // re-runs the delivery epilogue; rejected/held/failed/uncertain outcomes
       // leave the latch exactly as they found it.
-      if (accepted) this.recordAcceptedDelivery(current0.instanceId, box);
+      if (accepted) this.recordAcceptedDelivery(current0.instanceId, commandId, box);
     }
     this.syncBubbleFromOutbox(commandId);
     if (!box.pendingFor(current0.instanceId).length) this.clearOutboxRetry(current0.instanceId);
@@ -2531,22 +2535,24 @@ class HubStore {
   private settleFromJournal(instanceId: Id, events: Observation[]) {
     const next = settleBubbles(this.state.bubbles, instanceId, events);
     if (this.outbox) {
-      // c-reconnfu gate 26: a journal message settling a row as accepted/done
-      // is an authoritative ACCEPTANCE observation — record progress through
-      // the single helper (independent of whether the patch applies), so an
-      // exhausted instance's other rows get re-armed. Non-message events and
-      // already-terminal (done/rejected/unknown) rows record nothing.
-      let acceptedObservation = false;
+      // c-reconnfu gate 26/27: a journal message settling a row as
+      // accepted/done is an authoritative ACCEPTANCE observation routed
+      // through the single helper — which records AT MOST ONCE per command and
+      // ONLY for a command this outbox issued (a stale catch-up after
+      // logout/reinit still retires the durable row below, but never clears the
+      // new epoch's books). Non-message events and already-terminal
+      // (done/rejected/unknown) rows record nothing.
       for (const ev of events) {
         if (ev.kind !== "message") continue;
         const commandId = (ev.payload as { commandId?: Id }).commandId;
         const rec = commandId ? this.outbox.get(commandId) : null;
         if (commandId && rec && rec.state !== "done" && rec.state !== "rejected" && rec.state !== "unknown") {
+          // Journal evidence always retires the durable row, independent of
+          // which epoch issued it; progress itself is gated inside the helper.
           void this.outbox.patch(commandId, { state: "done", serverState: "journal-settled" });
-          acceptedObservation = true;
+          this.recordAcceptedDelivery(instanceId, commandId, this.outbox);
         }
       }
-      if (acceptedObservation) this.recordAcceptedDelivery(instanceId, this.outbox);
     }
     this.emit({ bubbles: next });
   }
@@ -3257,22 +3263,22 @@ class HubStore {
           // row: retire the matching outbox rows so a later reconnect cannot
           // keep retrying a command that demonstrably executed.
           if (this.outbox) {
-            // c-reconnfu gate 26: each such journal-done retirement is an
+            // c-reconnfu gate 26/27: each journal-done retirement is an
             // authoritative acceptance observation routed through the single
-            // progress helper. A row already rejected records nothing: a
-            // stray/late journal event after a Hub rejection must not clear
-            // the instance's exhaustion.
-            let acceptedObservation = false;
+            // progress helper, which records at most once and only for a
+            // command THIS outbox issued (a stale batch after reinit still
+            // retires the row below but cannot clear the new epoch's books).
+            // A row already rejected/terminal records nothing: a stray/late
+            // journal event after a Hub rejection must not clear exhaustion.
             for (const ev of next) {
               if (ev.kind !== "message") continue;
               const commandId = (ev.payload as { commandId?: Id }).commandId;
               const rec = commandId ? this.outbox.get(commandId) : null;
               if (commandId && rec && rec.state !== "done" && rec.state !== "rejected") {
                 void this.outbox.patch(commandId, { state: "done", serverState: "journal-settled" });
-                acceptedObservation = true;
+                this.recordAcceptedDelivery(instanceId, commandId, this.outbox);
               }
             }
-            if (acceptedObservation) this.recordAcceptedDelivery(instanceId, this.outbox);
           }
           this.emit({
             instances: applyInstanceActivity(this.state.instances, events),

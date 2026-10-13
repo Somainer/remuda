@@ -3451,26 +3451,21 @@ async fn an_rpc_failure_for_attempt_one_does_not_fail_running_attempt_two() {
     assert_eq!(doc["state"], json!("running"), "{doc}");
 
     // Attempt 1's parked gate.run now answers with a JSON-RPC error. It is the
-    // stale dispatch's callback; its failure must NOT fail attempt 2. Assert
-    // the row STAYS running under a bounded latch instead of a blind sleep:
-    // the negative fact ("the stale error had no effect") is proven by
-    // observing running immediately and watching it remain running across a
-    // window comfortably longer than a verdict write takes.
+    // stale dispatch's callback; its failure must NOT fail attempt 2. The
+    // latching is the PRODUCTION decision: the gate.run reply runs fail_rpc's
+    // writer job, and the test waits for that handler's completion latch, then
+    // reads the row once. No stability window and no sleeps.
     hook1.reply_error();
     hook1.release_and_wait_proceeded().await;
-    let stability = tokio::time::Instant::now() + Duration::from_millis(250);
-    loop {
-        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-        assert_eq!(
-            doc["state"],
-            json!("running"),
-            "stale attempt-1 RPC failure must not fail attempt 2: {doc}"
-        );
-        if tokio::time::Instant::now() >= stability {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let stale_barrier = ctx.store().gate_apply_barrier();
+    let rpc_before = stale_barrier.rpc_completed_count();
+    stale_barrier.wait_rpc_completed(rpc_before + 1).await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("running"),
+        "stale attempt-1 RPC failure must not fail attempt 2: {doc}"
+    );
 
     // The CURRENT (attempt 2) gate.run RPC error does fail it.
     hook2.reply_error();
@@ -3499,7 +3494,10 @@ async fn a_stale_attempts_step_event_does_not_overwrite_the_current_steps() {
         .unwrap();
     genuine_requeue_to_attempt_two(&ctx, &job_id).await;
 
-    // A current-attempt (2) step lands.
+    // A current-attempt (2) step lands; latch on the production event
+    // completion instead of polling with sleeps.
+    let event_barrier = ctx.store().gate_apply_barrier();
+    let events_before = event_barrier.event_completed_count();
     node.send_raw(json!({
         "jsonrpc": "2.0",
         "method": "gate.event",
@@ -3510,74 +3508,43 @@ async fn a_stale_attempts_step_event_does_not_overwrite_the_current_steps() {
             "step": { "name": "cargo-test", "status": "running", "durationMs": 0 },
         },
     }));
-    for _ in 0..100 {
-        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-        if doc["steps"].as_array().map(|a| a.len()).unwrap_or(0) == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    event_barrier.wait_event_completed(events_before + 1).await;
+    let applied = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        applied["steps"].as_array().map(|a| a.len()).unwrap_or(0),
+        1,
+        "attempt-2 step applied: {applied}"
+    );
 
-    // A stale attempt-1 step for the SAME step name must be ignored. Bounded
-    // latch, not a sleep: the step applies (or is rejected) when its event is
-    // processed, so observe the attempt-2 state once and then confirm it never
-    // changes across a window that comfortably covers an event write — the
-    // same stability idiom the production waits use.
-    node.send_raw(json!({
-        "jsonrpc": "2.0",
-        "method": "gate.event",
-        "params": {
-            "jobId": job_id,
-            "generation": 1,
-            "kind": "step",
-            "step": { "name": "cargo-test", "status": "ok", "durationMs": 9999 },
-        },
-    }));
-    // A raw sleep cannot prove the stale step was ignored: assert the step
-    // STAYS attempt-2's across a bounded deadline (an accepted step applies
-    // well within it).
-    node.send_raw(json!({
-        "jsonrpc": "2.0",
-        "method": "gate.event",
-        "params": {
-            "jobId": job_id,
-            "generation": 1,
-            "kind": "step",
-            "step": { "name": "cargo-test", "status": "ok", "durationMs": 9999 },
-        },
-    }));
-    // First, latch the stable attempt-2 state.
-    let stable = async {
-        loop {
-            let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-            let step = doc.get("steps").and_then(|s| s.get(0));
-            if step.is_some_and(|step| step["name"] == json!("cargo-test")) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(2), stable)
-        .await
-        .expect("attempt-2 step applied");
-    // Then hold it for a short stability window proving the rejected stale
-    // step never lands.
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
-    loop {
-        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-        let step = &doc["steps"][0];
-        assert_eq!(step["name"], json!("cargo-test"));
-        assert_eq!(
-            step["status"],
-            json!("running"),
-            "stale attempt-1 step must not overwrite attempt-2 step: {doc}"
-        );
-        assert_eq!(step["durationMs"], json!(0), "{doc}");
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    // A stale attempt-1 step for the SAME step name must be ignored. The
+    // rejection is latched on the production event-completion signal, not a
+    // stability window: send two stale steps (would set status ok/9999ms),
+    // wait for BOTH event handlers to fully return, then read the row once.
+    for _ in 0..2 {
+        node.send_raw(json!({
+            "jsonrpc": "2.0",
+            "method": "gate.event",
+            "params": {
+                "jobId": job_id,
+                "generation": 1,
+                "kind": "step",
+                "step": { "name": "cargo-test", "status": "ok", "durationMs": 9999 },
+            },
+        }));
     }
+    event_barrier.wait_event_completed(events_before + 2).await;
+    // The event writers decided before this read: the step must still be
+    // attempt 2's (running, 0ms); a stale step that applied would show
+    // ok/9999.
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    let step = &doc["steps"][0];
+    assert_eq!(step["name"], json!("cargo-test"), "{doc}");
+    assert_eq!(
+        step["status"],
+        json!("running"),
+        "stale attempt-1 step must not overwrite attempt-2 step: {doc}"
+    );
+    assert_eq!(step["durationMs"], json!(0), "{doc}");
 }
 
 /// r12 item 8: after a GENUINE base-moved requeue claims attempt 2, attempt

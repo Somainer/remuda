@@ -316,6 +316,7 @@ pub(super) fn cleanup_pins(repo: &Path, reference: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::merge::{MergeArgs, new_report};
 
     #[test]
     fn slugs_keep_branch_characters_and_replace_separators() {
@@ -599,5 +600,107 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn concurrent_publishers_of_the_same_tuple_all_leave_one_record_and_no_temp() {
+        // r15 item 8: many lanes publish the SAME immutable identity at once.
+        // The create-new link/rename must (a) let every publisher succeed (the
+        // record is content-addressed), (b) leave exactly ONE final file whose
+        // contents are the shared tuple, and (c) leave NO staging temp files
+        // behind (a loser must clean up its own temp, never the winner's).
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = temporary.path();
+        super::super::git(repo, &["init", "-b", "main"]).unwrap();
+        let reference = "refs/heads/wt/concurrent";
+        let report = test_report("wt/concurrent", "base-sha", "head-sha");
+        let path = immutable_report_path(repo, reference, "merge-sha").unwrap();
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..16 {
+                let report = &report;
+                handles.push(scope.spawn(move || save(repo, reference, report)));
+            }
+            for handle in handles {
+                handle.join().unwrap().expect("every publisher succeeds");
+            }
+        });
+
+        // Exactly one published record, content-addressed and correct.
+        let files: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert_eq!(files.len(), 1, "concurrent publishers left {files:?}");
+        let published: MergeReport =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(published.base.as_deref(), Some("base-sha"));
+        assert_eq!(published.head.as_deref(), Some("head-sha"));
+        assert_eq!(published.merged.as_deref(), Some("merge-sha"));
+
+        // No staging files left anywhere under the report dir.
+        let leftover: Vec<_> = walkdir(&report_dir(repo, reference).unwrap())
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "tmp"))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "temp staging files leaked: {leftover:?}"
+        );
+    }
+
+    #[test]
+    fn concurrent_publishers_of_different_tuples_do_not_replace_each_other() {
+        // r15 item 8: two DIFFERENT (base, head, merged) captures for the same
+        // merge id must not overwrite each other; the loser keeps its file and
+        // the conflict is surfaced (never a silent last-writer-wins).
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = temporary.path();
+        super::super::git(repo, &["init", "-b", "main"]).unwrap();
+        let reference = "refs/heads/wt/diverge";
+        let mk = |base: &str| test_report("wt/diverge", base, &format!("{base}-head"));
+        let a = mk("base-a");
+        let b = mk("base-b");
+        // Seed A, then B must fail (different tuple for the same identity).
+        save(repo, reference, &a).unwrap();
+        let b_result = save(repo, reference, &b);
+        assert!(b_result.is_err(), "a different tuple must not replace A");
+        let persisted: MergeReport = serde_json::from_str(
+            &std::fs::read_to_string(immutable_report_path(repo, reference, "merge-sha").unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.base.as_deref(), Some("base-a"));
+    }
+
+    fn test_report(branch: &str, base: &str, head: &str) -> MergeReport {
+        let args = MergeArgs {
+            branch: Some(branch.into()),
+            ..MergeArgs::default_for_test()
+        };
+        let mut report = new_report(branch, &args);
+        report.exit_code = 0;
+        report.status = "verified".into();
+        report.base = Some(base.into());
+        report.head = Some(head.into());
+        report.merged = Some("merge-sha".into());
+        report
+    }
+
+    fn walkdir(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(root) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    out.extend(walkdir(&p));
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
     }
 }

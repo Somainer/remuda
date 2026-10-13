@@ -114,6 +114,37 @@ fn default_affected() -> bool {
     true
 }
 
+#[cfg(test)]
+impl MergeArgs {
+    /// Minimal args for unit tests that only build a MergeReport.
+    pub(crate) fn default_for_test() -> Self {
+        Self {
+            branch: None,
+            gate: false,
+            list: false,
+            message: None,
+            dry_run: false,
+            onto: None,
+            land: false,
+            report: None,
+            queue: Vec::new(),
+            lanes: 2,
+            e2e_port_base: None,
+            e2e_lock: None,
+            e2e_lane: 1,
+            affected: true,
+            full: false,
+            web: false,
+            web_e2e: false,
+            no_push: false,
+            json: false,
+            wait: false,
+            repo: None,
+            target_dir: None,
+        }
+    }
+}
+
 fn default_lanes() -> usize {
     2
 }

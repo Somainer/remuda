@@ -296,35 +296,80 @@ queued → running → (only via gate.landGrant) → landing → landed
     the writer) may settle a Landing. A probe/verdict from an older generation
     never settles a newer attempt; a Finished from a session the Hub no longer
     considers current is stood down; only the live current session settles.
+    Every Landing settlement/evidence writer takes a per-host authority guard:
+    a carrier hello (takeover) or socket teardown holds the guard exclusively
+    for its lifetime, so a verdict cannot commit between a pre-check and a
+    socket replacement — the decision either happens entirely before the new
+    session registers or the probe/verdict is stood down by the commit-time
+    predicate (which now also matches the authenticated host id). Evidence
+    writes (`insert_gate_log`) reject a null-session Landing verdict and
+    refuse another session/host for the same row.
   - **R3 — session ids never repeat, even across Hub restarts.** The carrier
     session id is `(boot_epoch << 32) | per-boot counter`; the boot epoch is a
-    persisted monotonic counter in the Hub SQLite DB seeded on boot. The Node
-    durable daemon keeps its own persisted controller generation in its data
-    dir, so a new process hands out an id above every id the prior process
-    issued.
+    persisted monotonic counter in the Hub SQLite DB allocated in ONE immediate
+    transaction on boot. The Hub refuses to start (it does not mint sessions)
+    when the epoch row is missing alongside retained carrier sessions, or is
+    older than the highest retained session epoch — a cloned/partially restored
+    data dir cannot mint a repeated id. A same-boot carrier reconnect
+    re-binds the host's in-flight Landing rows to the fresh session before the
+    forced post-hello probe (that reconnect is the same boot's continuation of
+    authority; rows from an older boot keep their stale binding and reconcile
+    by the persisted id). The Node durable daemon keeps its own persisted
+    controller generation in its data dir, so a new process hands out an id
+    above every id the prior process issued; the product `remuda node daemon`
+    builds this durable control (not an in-memory one) and pre-collects its host
+    inventory once at startup, so a bridge handshake sends its Hub hello
+    immediately.
   - **R4 — a failed/absent/requeue verdict needs an established fact.** A
     non-`landed` outcome requires either provable absence of the granted merge
     on remote main AND a verified-dead land process group (the Node durably
     fences its land group at grant and attests `absent` only after
     TERM→bounded-wait→whole-group-KILL and an ESRCH group check), or the
-    explicit operator-resolution endpoint (`POST
-    /v1/projects/{id}/gate/jobs/{jobId}/resolve`, body
-    `{"resolution":"failed"|"requeue"}`), which records the operator, device and
-    reason and clears lane occupancy on requeue.
+    explicit operator-resolution endpoint. Resolution is operator-only: agent
+    callers are refused 403. The request must name the exact granted attempt
+    (`expectedAttempts`), grant epoch (`expectedSessionEpoch`) and merge
+    (`expectedMergeSha`), include a mandatory non-empty `rationale`, and the
+    writer validates the whole tuple before committing — a stale frame naming a
+    newer attempt or merge cannot discard the row. The rationale is persisted
+    on the row. With a live carrier the endpoint first takes one final
+    read-only probe under the authority guard; an established `landed` fact
+    wins over the operator decision.
+  - **R5 — fail closed on unestablished evidence (2026-10-13).** Every
+    evidence read is either Established or Unknown. A failed command (a failed
+    `git fetch`/`merge-base`/`ref`/rev-parse, a missing or unreadable durable
+    fence ledger, missing `/proc` process identity) is Unknown, never a
+    negative fact. On the Node: the granted-land durable fence is written
+    before the land child is released (child-start barrier on the child's
+    stdin), a fencing failure fails the launch locally (nothing pushed); a
+    stale/unknown cancel or abort never signals another attempt's group; a
+    startup fence that cannot read positive leader identity keeps the record
+    (Unknown ownership) and signals only on a positive start-time match;
+    group termination always runs the full TERM→bounded-wait→whole-group-KILL
+    and claims death only by a kernel ESRCH, and the `/proc` enumeration is
+    test-gated with a portable start identity (`ps lstart` fallback) so a
+    missing `/proc` (e.g. macOS) never makes the scan return an empty list.
+    The merge CLI reports a failed land push as `uncertain` (exit 4) whenever
+    any recovery read fails, keeps its reachability pin until an established
+    landed/absent fact, and a waiting land child blocks on an
+    `REMUDA_START_BARRIER_FD` release byte (EOF/error exits before touching git).
   A failed land push (`merge --land`) fetches origin FIRST and only reports a
-  failure when the exact merge is absent; a push whose acknowledgement was lost
-  is resolved against the remote before any verdict and a merge that landed
-  with the lost ack is reported `landed`, never failed or base-moved.
+  failure when the exact merge is absent AND the remote ref is unchanged; a
+  push whose acknowledgement was lost is resolved against the remote before
+  any verdict and a merge that landed with the lost ack is reported `landed`,
+  never failed or base-moved.
 - **Land timeout is synchronous and reported uncertain.** If a granted land child
   overruns its budget, the Node terminates its **whole process group** before
-  returning: SIGTERM the group, boundedly wait for every non-zombie member
-  (enumerated via `/proc`, so a SIGTERM-ignoring git/ssh descendant is killed
-  too), SIGKILL survivors, then reap. The verdict is `uncertain`, never
-  `failed`: even with the group dead, the remote may already have accepted
-  the ref, so the Hub leaves the row Landing and establishes the outcome via
-  the remote reconciliation above. The land child's stderr is drained
-  concurrently for its whole life, so a large remote rejection cannot block the
-  pipe.
+  returning: SIGTERM the group, boundedly wait through the whole TERM grace for
+  a TERM-ignoring leader (readiness is proven by a marker written only after
+  the trap is installed, not a fixed sleep), SIGKILL the whole group
+  unconditionally, then reap the leader and verify the group is gone by ESRCH.
+  Death is claimed only on the kernel answer; a missing/transient `/proc`
+  scan is diagnostic-only and never shortens the kill. The verdict is
+  `uncertain`, never `failed`: even with the group dead, the remote may already
+  have accepted the ref, so the Hub leaves the row Landing and establishes the
+  outcome via the remote reconciliation above. The land child's stderr is
+  drained concurrently for its whole life, so a large remote rejection cannot
+  block the pipe.
 
 Several agents sharing one worktree is a different situation, covered by
 [CONTRIBUTING.md](../../CONTRIBUTING.md) "Staged-content verification":

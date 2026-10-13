@@ -50,6 +50,7 @@ futures.workspace = true
 nix = { version = "0.28", features = ["signal"] }
 remuda-driver = { workspace = true, features = ["test-stub"] }
 remuda-hub.workspace = true
+remuda-node = { workspace = true, features = ["test-faults"] }
 remuda-protocol.workspace = true
 remuda-signal.workspace = true
 remuda-testing.workspace = true

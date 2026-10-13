@@ -2,9 +2,10 @@
 //! restart, using the production stack:
 //!   * a real in-process Hub is started, ENQUEUED, then SHUT DOWN and a SECOND
 //!     Hub is started on the SAME data dir and port (a genuine restart);
-//!   * a real DevNode over the real outbound WSS carrier runs the consumed
-//!     merge/land CLI (a tiny stand-in that performs REAL `git` against a real
-//!     local BARE origin — same shape as the stdio land round-trip);
+//!   * a real DevNode over the real outbound WSS carrier runs the REAL `remuda
+//!     merge` CLI (r15 item 8), which performs REAL `git` against a real local
+//!     BARE origin; timing is controlled by a gate shim and real git hooks
+//!     instead of a fake merge double;
 //!   * the verify→land GRANT is the production Hub Running → Landing writer;
 //!   * after the restart a fresh carrier session reconnects and the Hub settles
 //!     the Landing ONLY by a read-only `gate.resolveLanding` probe (real
@@ -73,6 +74,10 @@ fn build_origin(root: &std::path::Path) -> Origin {
     std::fs::write(seed.join("file.txt"), "task\n").unwrap();
     git(&seed, &["add", "."]);
     git(&seed, &["commit", "-q", "-m", "task change"]);
+    // The real gate CLI requires scripts/ci/gate.sh in every checked-out tree.
+    write_gate_shim(&seed);
+    git(&seed, &["add", "scripts/ci/gate.sh"]);
+    git(&seed, &["commit", "-q", "-m", "add gate shim"]);
     git(
         &seed,
         &["remote", "add", "origin", origin.to_str().unwrap()],
@@ -93,6 +98,19 @@ fn build_origin(root: &std::path::Path) -> Origin {
     git(&lane, &["config", "user.email", "t@example.com"]);
     git(&lane, &["config", "user.name", "T"]);
     git(&lane, &["fetch", "-q", "origin"]);
+    // A real coordinator lane holds a LOCAL tracking checkout of the source
+    // branch (the real `remuda merge` resolves refs/heads/<branch>, not the
+    // remote-tracking ref; the gate worktree checks out the captured merge).
+    git(
+        &lane,
+        &[
+            "checkout",
+            "-q",
+            "-b",
+            "wt/land/restart",
+            "origin/wt/land/restart",
+        ],
+    );
     Origin {
         lane,
         origin,
@@ -100,67 +118,148 @@ fn build_origin(root: &std::path::Path) -> Origin {
     }
 }
 
-/// Write the controllable merge/land CLI. `CASE=push_then_block` pushes in the
-/// land phase BEFORE waiting (the push landed before the crash); `block_then_push`
-/// waits for `$GATE_DIR/proceed` and only then pushes (a still-outstanding push).
-/// Every successful land push appends one line to `$GATE_DIR/pushes.log`.
-fn write_merge_cli(dir: &std::path::Path) -> PathBuf {
-    let bin = dir.join("fake-merge.sh");
+/// The REAL `remuda` merge CLI (r15 item 8): the gate e2e drives the actual
+/// product binary, not a fake-merge.sh double. Timing is controlled with real
+/// mechanisms — a gate shim the real CLI executes (`scripts/ci/gate.sh`) and
+/// real git hooks on the lane/origin.
+fn real_merge_bin() -> PathBuf {
+    // This test lives in the `remuda` package, so cargo injects its own bin.
+    PathBuf::from(env!("CARGO_BIN_EXE_remuda"))
+}
+
+/// Which push/verify timing scenario the real CLI is driven through.
+#[derive(Clone, Copy)]
+enum TimingCase {
+    /// Verify gate blocks until released; never enters land.
+    VerifyBlock,
+    /// Land push is outstanding: a lane pre-push hook blocks until released
+    /// (nothing reaches the remote until release).
+    BlockThenPush,
+    /// The ref is already on the remote when the push hangs: a bare-origin
+    /// post-receive hook (running AFTER the ref update) blocks until released.
+    PushThenBlock,
+}
+
+impl TimingCase {
+    fn as_str(self) -> &'static str {
+        match self {
+            TimingCase::VerifyBlock => "verify_block",
+            TimingCase::BlockThenPush => "block_then_push",
+            TimingCase::PushThenBlock => "push_then_block",
+        }
+    }
+}
+
+/// Seed `scripts/ci/gate.sh` into the repo BEFORE the initial push, so every
+/// gate scratch worktree the real CLI checks out contains a runnable gate. The
+/// shim supports `--list` (the CLI reads its step plan) and `--report FILE`
+/// (the CLI reads step results), and optionally blocks on a marker so a verify
+/// can be parked mid-gate.
+fn write_gate_shim(seed: &std::path::Path) {
+    let dir = seed.join("scripts/ci");
+    std::fs::create_dir_all(&dir).unwrap();
     let script = r#"#!/bin/bash
+# Minimal gate shim for the r15 real-CLI e2e: emulates scripts/ci/gate.sh's
+# --list/--report contract without running the repo's real gate.
 set -eu
-branch=""; onto="main"; mode=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --onto) onto="$2"; shift 2;;
-    --land) mode=land; shift;;
-    --gate) mode=gate; shift;;
-    --no-push) shift;;
-    --repo|--target-dir) shift 2;;
-    --*) shift;;
-    merge) shift;;
-    *) if [ -z "$branch" ]; then branch="$1"; fi; shift;;
+report=""
+list=0
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    --list) list=1;;
+    --report) report="${args[$((i+1))]}";;
   esac
 done
-git fetch -q origin
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/remuda-mq-$$-0-XXXXXX")
-echo '{"name":"cargo-test","status":"ok","durationMs":5,"attempts":1,"retried":false}' > "$scratch/gate.jsonl"
-wait_proceed() {
-  for _ in $(seq 1 600); do [ -f "$GATE_DIR/proceed" ] && return 0; sleep 0.1; done
-}
-if [ "$mode" = "gate" ]; then
-  # The real merge CLI verifies in its OWN scratch gate worktree checked out at
-  # origin/<onto>; emulate that with a forced reset so a second verify on this
-  # shared lane checkout never inherits the previous verify's merged tree.
-  git checkout -qB "$onto" "origin/$onto"
-  git reset -q --hard "origin/$onto"
-  base=$(git rev-parse "$onto")
-  head=$(git rev-parse "origin/$branch")
-  git merge -q --no-ff "origin/$branch" -m "gate merge $branch"
-  if [ "${CASE:-block_then_push}" = "verify_block" ]; then
-    echo verifying >> "$GATE_DIR/verify-state.log"
-    wait_proceed
-  fi
-  merged=$(git rev-parse HEAD)
-  printf '{"exitCode":0,"status":"verified","branch":"%s","base":"%s","head":"%s","merged":"%s","steps":[{"name":"cargo-test","status":"ok","durationMs":5}]}\n' "$branch" "$base" "$head" "$merged"
-else
-  if [ "${CASE:-block_then_push}" = "push_then_block" ]; then
-    git push -q origin "HEAD:$onto"
-    echo pushed >> "$GATE_DIR/pushes.log"
-    wait_proceed
-  else
-    wait_proceed
-    git push -q origin "HEAD:$onto"
-    echo pushed >> "$GATE_DIR/pushes.log"
-  fi
-  merged=$(git rev-parse HEAD)
-  current=$(git rev-parse "origin/$onto")
-  printf '{"exitCode":0,"status":"landed","branch":"%s","merged":"%s","currentMain":"%s","steps":[{"name":"cargo-test","status":"ok","durationMs":5}]}\n' "$branch" "$merged" "$current"
+if [ "$list" = "1" ]; then
+  echo '[{"name":"cargo-test","command":["true"],"cwd":".","maxAttempts":1,"timeoutSeconds":0,"status":"planned","durationMs":0,"attempts":0,"retried":false}]'
+  exit 0
+fi
+if [ "${GATE_BLOCK:-}" = "1" ]; then
+  echo verifying >> "$GATE_DIR/verify-state.log"
+  for _ in $(seq 1 1200); do [ -f "$GATE_DIR/proceed" ] && break; sleep 0.05; done
+fi
+if [ -n "$report" ]; then
+  mkdir -p "$(dirname "$report")"
+  echo '{"name":"cargo-test","status":"ok","durationMs":5,"attempts":1,"retried":false,"command":["true"],"cwd":".","timeoutSeconds":0}' >> "$report"
 fi
 "#;
-    std::fs::write(&bin, script).unwrap();
+    let path = dir.join("gate.sh");
+    std::fs::write(&path, script).unwrap();
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    bin
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn make_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Block the CLIENT's `git push` before the ref reaches the server (waits on
+/// `$GATE_DIR/proceed`). Records every released push to pushes.log.
+fn install_pre_push_hook(lane: &std::path::Path) {
+    let hook = lane.join(".git/hooks/pre-push");
+    std::fs::write(
+        &hook,
+        r#"#!/bin/bash
+set -eu
+for _ in $(seq 1 1200); do [ -f "$GATE_DIR/proceed" ] && break; sleep 0.05; done
+echo pushed >> "$GATE_DIR/pushes.log"
+"#,
+    )
+    .unwrap();
+    make_executable(&hook);
+}
+
+/// Block AFTER the server updated the ref (post-receive runs post-update), so
+/// the client's `git push` hangs while the ref is already on the remote.
+fn install_post_receive_hook(origin: &std::path::Path) {
+    let hook = origin.join("hooks/post-receive");
+    std::fs::write(
+        &hook,
+        r#"#!/bin/bash
+set -eu
+echo pushed >> "$GATE_DIR/pushes.log"
+for _ in $(seq 1 1200); do [ -f "$GATE_DIR/proceed" ] && break; sleep 0.05; done
+"#,
+    )
+    .unwrap();
+    make_executable(&hook);
+}
+
+/// Build the lane-env map the real merge CLI/gate/hooks read.
+fn lane_env(gate_dir: &std::path::Path, case: TimingCase) -> serde_json::Value {
+    let mut env = serde_json::Map::new();
+    env.insert(
+        "PATH".into(),
+        json!(std::env::var("PATH").unwrap_or_default()),
+    );
+    // The real `remuda` binary (config resolution) and git need HOME/TMPDIR;
+    // the Node clears the child environment before applying this map.
+    if let Ok(home) = std::env::var("HOME") {
+        env.insert("HOME".into(), json!(home));
+    }
+    if let Ok(tmpdir) = std::env::var("TMPDIR") {
+        env.insert("TMPDIR".into(), json!(tmpdir));
+    }
+    if let Ok(tmpdir) = std::env::var("TMPDIR") {
+        env.insert("TMPDIR".into(), json!(tmpdir));
+    } else {
+        // The merge CLI creates its gate scratch in TMPDIR; an inherited,
+        // existing value is required for the child (the Node clears its env).
+        env.insert("TMPDIR".into(), json!("/tmp"));
+    }
+    // Gate gate subprocesses need a writable XDG runtime dir.
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        env.insert("XDG_RUNTIME_DIR".into(), json!(xdg));
+    }
+    env.insert("GITEA_TERMINAL_PROMPT".into(), json!("0"));
+    env.insert("GATE_DIR".into(), json!(gate_dir.to_string_lossy()));
+    env.insert("CASE".into(), json!(case.as_str()));
+    if matches!(case, TimingCase::VerifyBlock) {
+        env.insert("GATE_BLOCK".into(), json!("1"));
+    }
+    json!(env)
 }
 
 async fn http(
@@ -256,7 +355,7 @@ async fn landing_already_pushed_settles_landed_once_after_real_hub_restart() {
     let gate_dir = dir.path().join("gatedir");
     std::fs::create_dir_all(&gate_dir).unwrap();
     let origin = build_origin(dir.path());
-    let bin = write_merge_cli(dir.path());
+    install_post_receive_hook(&origin.origin); // push_then_block: ref lands remotely, push hangs
 
     let data_dir = dir.path().join("hub-data");
     let port = free_port();
@@ -267,7 +366,7 @@ async fn landing_already_pushed_settles_landed_once_after_real_hub_restart() {
             .with_workspace_roots(remuda_testing::test_workspace_roots!()),
     )
     .expect("dev node");
-    node.gate_test_set_merge_bin(bin).await;
+    node.gate_test_set_merge_bin(real_merge_bin()).await;
     let host_id = node.host().meta.id.as_id().as_str().to_owned();
     let workspace_id = node
         .workspaces()
@@ -312,8 +411,7 @@ async fn landing_already_pushed_settles_landed_once_after_real_hub_restart() {
                 "repoPath": origin.lane.to_string_lossy(),
                 "targetDir": dir.path().join("target").to_string_lossy(),
                 "ports": "58610-58619",
-                "env": {"GATE_DIR": gate_dir.to_string_lossy(), "CASE": "push_then_block",
-                        "PATH": std::env::var("PATH").unwrap_or_default()},
+                "env": lane_env(&gate_dir, TimingCase::PushThenBlock),
                 "lockPath": dir.path().join("gate.lock").to_string_lossy(),
                 "pwEndpoint": "ws://127.0.0.1:0/"
             }]
@@ -417,7 +515,7 @@ async fn landing_still_pushing_keeps_occupancy_until_established_after_restart()
     let gate_dir = dir.path().join("gatedir");
     std::fs::create_dir_all(&gate_dir).unwrap();
     let origin = build_origin(dir.path());
-    let bin = write_merge_cli(dir.path());
+    install_pre_push_hook(&origin.lane); // block_then_push: push outstanding
 
     let data_dir = dir.path().join("hub-data");
     let port = free_port();
@@ -429,7 +527,7 @@ async fn landing_still_pushing_keeps_occupancy_until_established_after_restart()
             .with_workspace_roots(remuda_testing::test_workspace_roots!()),
     )
     .expect("dev node");
-    node.gate_test_set_merge_bin(bin).await;
+    node.gate_test_set_merge_bin(real_merge_bin()).await;
     let host_id = node.host().meta.id.as_id().as_str().to_owned();
     let workspace_id = node
         .workspaces()
@@ -471,8 +569,7 @@ async fn landing_still_pushing_keeps_occupancy_until_established_after_restart()
                 "repoPath": origin.lane.to_string_lossy(),
                 "targetDir": dir.path().join("target").to_string_lossy(),
                 "ports": "58620-58629",
-                "env": {"GATE_DIR": gate_dir.to_string_lossy(), "CASE": "block_then_push",
-                        "PATH": std::env::var("PATH").unwrap_or_default()},
+                "env": lane_env(&gate_dir, TimingCase::BlockThenPush),
                 "lockPath": dir.path().join("gate.lock").to_string_lossy(),
                 "pwEndpoint": "ws://127.0.0.0:0/"
             }]
@@ -601,7 +698,7 @@ async fn carrier_drop_after_grant_keeps_landing_until_reconnect_probe_lands() {
     let gate_dir = dir.path().join("gatedir");
     std::fs::create_dir_all(&gate_dir).unwrap();
     let origin = build_origin(dir.path());
-    let bin = write_merge_cli(dir.path());
+    install_post_receive_hook(&origin.origin); // push_then_block: ref lands remotely, push hangs
 
     let data_dir = dir.path().join("hub-data");
     let port = free_port();
@@ -613,7 +710,7 @@ async fn carrier_drop_after_grant_keeps_landing_until_reconnect_probe_lands() {
             .with_workspace_roots(remuda_testing::test_workspace_roots!()),
     )
     .expect("dev node");
-    node.gate_test_set_merge_bin(bin).await;
+    node.gate_test_set_merge_bin(real_merge_bin()).await;
     let host_id = node.host().meta.id.as_id().as_str().to_owned();
     let workspace_id = node
         .workspaces()
@@ -656,8 +753,7 @@ async fn carrier_drop_after_grant_keeps_landing_until_reconnect_probe_lands() {
                 "repoPath": origin.lane.to_string_lossy(),
                 "targetDir": dir.path().join("target").to_string_lossy(),
                 "ports": "58630-58639",
-                "env": {"GATE_DIR": gate_dir.to_string_lossy(), "CASE": "push_then_block",
-                        "PATH": std::env::var("PATH").unwrap_or_default()},
+                "env": lane_env(&gate_dir, TimingCase::PushThenBlock),
                 "lockPath": dir.path().join("gate.lock").to_string_lossy(),
                 "pwEndpoint": "ws://127.0.0.1:0/"
             }]
@@ -797,7 +893,7 @@ async fn real_cancel_during_verify_kills_the_run_and_never_grants_or_pushes() {
     let gate_dir = dir.path().join("gatedir");
     std::fs::create_dir_all(&gate_dir).unwrap();
     let origin = build_origin(dir.path());
-    let bin = write_merge_cli(dir.path());
+    // verify_block: the gate shim parks in GATE; no push hook needed.
 
     let data_dir = dir.path().join("hub-data");
     let port = free_port();
@@ -809,7 +905,7 @@ async fn real_cancel_during_verify_kills_the_run_and_never_grants_or_pushes() {
             .with_workspace_roots(remuda_testing::test_workspace_roots!()),
     )
     .expect("dev node");
-    node.gate_test_set_merge_bin(bin).await;
+    node.gate_test_set_merge_bin(real_merge_bin()).await;
     let host_id = node.host().meta.id.as_id().as_str().to_owned();
     let workspace_id = node
         .workspaces()
@@ -850,8 +946,7 @@ async fn real_cancel_during_verify_kills_the_run_and_never_grants_or_pushes() {
                 "repoPath": origin.lane.to_string_lossy(),
                 "targetDir": dir.path().join("target").to_string_lossy(),
                 "ports": "58640-58649",
-                "env": {"GATE_DIR": gate_dir.to_string_lossy(), "CASE": "verify_block",
-                        "PATH": std::env::var("PATH").unwrap_or_default()},
+                "env": lane_env(&gate_dir, TimingCase::VerifyBlock),
                 "lockPath": dir.path().join("gate.lock").to_string_lossy(),
                 "pwEndpoint": "ws://127.0.0.1:0/"
             }]
@@ -927,7 +1022,7 @@ async fn expired_unconfirmed_landing_stays_unknown_until_operator_resolves() {
     let gate_dir = dir.path().join("gatedir");
     std::fs::create_dir_all(&gate_dir).unwrap();
     let origin = build_origin(dir.path());
-    let bin = write_merge_cli(dir.path());
+    install_pre_push_hook(&origin.lane); // block_then_push: push outstanding
 
     let data_dir = dir.path().join("hub-data");
     let port = free_port();
@@ -939,7 +1034,7 @@ async fn expired_unconfirmed_landing_stays_unknown_until_operator_resolves() {
             .with_workspace_roots(remuda_testing::test_workspace_roots!()),
     )
     .expect("dev node");
-    node.gate_test_set_merge_bin(bin).await;
+    node.gate_test_set_merge_bin(real_merge_bin()).await;
     let host_id = node.host().meta.id.as_id().as_str().to_owned();
     let workspace_id = node
         .workspaces()
@@ -984,8 +1079,7 @@ async fn expired_unconfirmed_landing_stays_unknown_until_operator_resolves() {
                 "repoPath": origin.lane.to_string_lossy(),
                 "targetDir": dir.path().join("target").to_string_lossy(),
                 "ports": "58650-58659",
-                "env": {"GATE_DIR": gate_dir.to_string_lossy(), "CASE": "block_then_push",
-                        "PATH": std::env::var("PATH").unwrap_or_default()},
+                "env": lane_env(&gate_dir, TimingCase::BlockThenPush),
                 "lockPath": dir.path().join("gate.lock").to_string_lossy(),
                 "pwEndpoint": "ws://127.0.0.1:0/"
             }]

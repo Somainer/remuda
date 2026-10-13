@@ -120,7 +120,43 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 impl Store {
-    /// r14 R3 / r15 item 6: allocate this Hub process's boot epoch (the high 32
+    /// r15 item 8 (authority continuity): rebind the host's in-flight Landing
+    /// rows to a freshly connected SAME-BOOT carrier session. A same-epoch
+    /// reconnect is that boot's continuation of authority for rows dispatched
+    /// before the socket dropped; the landing probe/settle predicates require
+    /// the CURRENT session, so the persisted binding must follow it. Rows from
+    /// an OLDER boot epoch are deliberately left bound to their stale session
+    /// (the post-restart reconciler matches those by their persisted id).
+    pub(crate) async fn rebind_same_boot_landing_sessions(
+        &self,
+        host_id: &str,
+        new_session: u64,
+        boot_epoch: u64,
+    ) -> Result<u64, crate::store::StoreError> {
+        let host_id = host_id.to_owned();
+        self.run_named("rebind_same_boot_landing_sessions", move |conn| {
+            let tx = crate::store::immediate_tx(conn)?;
+            let affected = tx.execute(
+                "UPDATE gate_jobs
+                    SET dispatch_session = ?1
+                  WHERE state = 'landing'
+                    AND json_extract(doc_json, '$.hostId') = ?2
+                    AND dispatch_session IS NOT NULL
+                    AND dispatch_session <> ?1
+                    AND (dispatch_session >> 32) = ?3",
+                params![
+                    i64::try_from(new_session).unwrap_or(0),
+                    host_id,
+                    i64::try_from(boot_epoch).unwrap_or(0)
+                ],
+            )?;
+            tx.commit()?;
+            Ok(u64::try_from(affected).unwrap_or(0))
+        })
+        .await
+    }
+
+    /// r14 R3: atomically allocate this Hub process's boot epoch (the high 32
     /// bits of every gate carrier session identity) in ONE immediate
     /// transaction that both validates against retained sessions and claims the
     /// next value, so a crash or a partial restore can never roll the counter
@@ -227,6 +263,16 @@ pub struct GateApplyBarrier {
     /// apply_result calls fully returned, and their notify.
     completed: std::sync::atomic::AtomicUsize,
     completed_notify: tokio::sync::Notify,
+    /// fail_rpc_inner calls fully returned (every gate.run RPC error/timeout),
+    /// and their notify — lets tests latch on the stale-RPC-failure decision
+    /// instead of a stability window.
+    rpc_completed: std::sync::atomic::AtomicUsize,
+    rpc_completed_notify: tokio::sync::Notify,
+    /// on_event notifications fully handled (a step/log/phase event has run
+    /// its writer), and their notify — lets tests latch event rejection
+    /// instead of holding a stability window.
+    event_completed: std::sync::atomic::AtomicUsize,
+    event_completed_notify: tokio::sync::Notify,
 }
 
 #[cfg(any(test, feature = "test-faults"))]
@@ -240,6 +286,10 @@ impl GateApplyBarrier {
             notify: tokio::sync::Notify::new(),
             completed: std::sync::atomic::AtomicUsize::new(0),
             completed_notify: tokio::sync::Notify::new(),
+            rpc_completed: std::sync::atomic::AtomicUsize::new(0),
+            rpc_completed_notify: tokio::sync::Notify::new(),
+            event_completed: std::sync::atomic::AtomicUsize::new(0),
+            event_completed_notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -247,6 +297,10 @@ impl GateApplyBarrier {
     pub fn arm(&self) {
         self.parked.store(0, std::sync::atomic::Ordering::SeqCst);
         self.completed.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.rpc_completed
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.event_completed
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         self.fired.store(false, std::sync::atomic::Ordering::SeqCst);
         self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -331,6 +385,60 @@ impl GateApplyBarrier {
                 );
             }
         }
+    }
+
+    /// Wait until `n` fail_rpc (gate.run RPC error/timeout) handlers have fully
+    /// returned (no sleeps). Used to latch the "stale RPC failure stood down"
+    /// production decision instead of watching a stability time window.
+    pub async fn wait_rpc_completed(&self, n: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let notified = self.rpc_completed_notify.notified();
+            if self.rpc_completed.load(std::sync::atomic::Ordering::SeqCst) >= n {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                panic!(
+                    "only {} fail_rpc calls completed (wanted {n})",
+                    self.rpc_completed.load(std::sync::atomic::Ordering::SeqCst)
+                );
+            }
+        }
+    }
+
+    /// Wait until `n` gate.event notifications have been fully handled.
+    pub async fn wait_event_completed(&self, n: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let notified = self.event_completed_notify.notified();
+            if self
+                .event_completed
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= n
+            {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                panic!(
+                    "only {} gate.event calls completed (wanted {n})",
+                    self.event_completed
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                );
+            }
+        }
+    }
+
+    /// Number of gate.event notifications fully handled so far.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn event_completed_count(&self) -> usize {
+        self.event_completed
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Number of fail_rpc handlers fully returned so far.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn rpc_completed_count(&self) -> usize {
+        self.rpc_completed.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -1379,6 +1487,16 @@ async fn fail_rpc_inner(state: &AppState, job_id: &str, expected_generation: u32
     if let Ok(Some(job)) = updated {
         journal(state, &job.requested_by, "gate.failed", &job).await;
     }
+    // Test-only completion latch (no-op in release): lets a test wait for the
+    // stale-RPC-failure decision to fully return instead of sleeping.
+    #[cfg(any(test, feature = "test-faults"))]
+    {
+        let barrier = state.store.gate_apply_barrier();
+        barrier
+            .rpc_completed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        barrier.rpc_completed_notify.notify_waiters();
+    }
 }
 
 /// Apply a `gate.event` Node notification (runs for both WSS and ssh-stdio
@@ -1432,6 +1550,16 @@ pub(crate) async fn on_event(
             // so a replacement carrier cannot finish-settle a granted Landing.
             apply_result(state, &job_id, *result, source_session).await
         }
+    }
+    // Test-only completion latch (no-op in release): the event's writer has
+    // run, so a test can assert the post-decision row without a sleep.
+    #[cfg(any(test, feature = "test-faults"))]
+    {
+        let barrier = state.store.gate_apply_barrier();
+        barrier
+            .event_completed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        barrier.event_completed_notify.notify_waiters();
     }
     Ok(())
 }

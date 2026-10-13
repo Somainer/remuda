@@ -472,6 +472,18 @@ pub(crate) fn spawn_post_hello_tasks(state: &AppState, host_id: String) {
     // loop; the periodic reconciler retries anything still uncertain.
     let state = state.clone();
     tokio::spawn(async move {
+        // r15 item 8: rebind same-boot in-flight Landings to THIS session
+        // before the forced probe, so the session predicate matches a
+        // reconnect that took over within the same boot (older-boot rows keep
+        // their stale binding and reconcile by the persisted id).
+        let session = state.nodes.generation_of(&host_id).await;
+        let boot = state.nodes.boot_epoch();
+        if let Some(session) = session {
+            let _ = state
+                .store
+                .rebind_same_boot_landing_sessions(&host_id, session, boot)
+                .await;
+        }
         crate::gatequeue::reconcile_landings(&state, Some(&host_id)).await;
     });
 }

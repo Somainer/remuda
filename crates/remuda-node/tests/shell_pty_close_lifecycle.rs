@@ -1615,3 +1615,183 @@ async fn a_natural_exit_before_resume_retires_the_predecessor_poller() {
         .expect("run-2 channel never closed")
         .expect("run-2 drainer panicked");
 }
+
+/// c-ctxusage r19 item 1: same-driver resume after a natural exit must not let
+/// predecessor retirement clear the NEW run's promotion.
+///
+/// Barrier-controlled ordering: the predecessor's natural-demote terminal
+/// finalise is parked (finish gate); the resume is started while it is parked.
+/// When the new run's poller is spawned BEFORE retirement (the pre-fix order)
+/// its first tick binds during the park (bind barrier #2); releasing the gate
+/// then lets retirement CLEAR the shared promoted/status slots after that bind.
+/// A close() issued immediately after resume — before the new run's next
+/// sample — used to take the unpromoted path and lose run 2's termination
+/// usage. The fix retires (and clears) BEFORE spawning run 2, so the clear
+/// can only ever precede run 2's bind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retirement_after_run2_binds_does_not_clear_run2_promotion() {
+    use remuda_driver::test_faults::TranscriptFaults;
+    let (_dir, workspace, _transcript, events_path, driver) = p1_promoted_layout_tagged();
+    let driver = std::sync::Arc::new(driver);
+    let faults = TranscriptFaults::new();
+    // Park the cooperative finalise: run 1's natural-demote finalise blocks
+    // there until released, holding predecessor retirement open.
+    faults.arm_finish_gate();
+    driver.set_test_faults(faults.clone());
+
+    // ---- run 1: bind, then die naturally (no close) --------------------
+    let handle = driver
+        .start(spec_for(&workspace, DriverKind::ShellPty))
+        .await
+        .expect("start");
+    let mut events_rx1 = handle.into_events();
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    let exit_tx = std::sync::Mutex::new(Some(exit_tx));
+    let drainer1 = tokio::spawn(async move {
+        while let Some(observation) = events_rx1.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+            {
+                if native.native_name == "transcript_bound"
+                    && let Some(tx) = bound_tx.lock().unwrap().take()
+                {
+                    let _ = tx.send(());
+                }
+                if native.native_name == "native_exit"
+                    && let Some(tx) = exit_tx.lock().unwrap().take()
+                {
+                    let _ = tx.send(());
+                }
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(20), bound_rx)
+        .await
+        .expect("run 1 never bound")
+        .expect("bound oneshot closed without firing");
+    assert!(
+        faults.wait_promoter_binds(1, Duration::from_secs(20)),
+        "run 1 bind barrier never fired"
+    );
+
+    let pid1 = last_session_pid(&events_path);
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", &pid1.to_string()])
+            .status()
+            .expect("spawn kill")
+            .success(),
+        "SIGTERM delivered to the run-1 writer"
+    );
+    // The natural exit is observed by the exit waiter; the poller itself has
+    // demoted and is idle-looping. Its terminal finalise — where the finish
+    // gate parks — only runs once retirement signals shutdown below.
+    tokio::time::timeout(Duration::from_secs(20), exit_rx)
+        .await
+        .expect("the natural native_exit was never observed")
+        .expect("exit oneshot closed without firing");
+
+    // ---- resume while the predecessor finalise is parked ----------------
+    let mut resume = tokio::spawn({
+        let driver = driver.clone();
+        async move {
+            driver
+                .start_resumed(
+                    spec_for(&workspace, DriverKind::ShellPty),
+                    SESSION_ID.into(),
+                )
+                .await
+        }
+    });
+
+    // On the pre-fix order run 2 spawned before retirement: its first tick
+    // binds WHILE the predecessor is parked. (On the fixed order run 2 is not
+    // spawned until retirement completes, so this bounded wait simply elapses
+    // — it is a condvar wait, never a sleep loop.)
+    let bound_during_park = faults.wait_promoter_binds(2, Duration::from_secs(2));
+
+    // Let the parked predecessor finalise finish; retirement completes and
+    // resume returns.
+    faults.release();
+    let handle2 = tokio::time::timeout(Duration::from_secs(30), &mut resume)
+        .await
+        .expect("resume hung past its bound")
+        .expect("resume task panicked")
+        .expect("resume after the natural exit");
+
+    // ---- run 2 bound; close BEFORE its next 800 ms sample ---------------
+    let mut events_rx2 = handle2.into_events();
+    let (bound2_tx, bound2_rx) = tokio::sync::oneshot::channel();
+    let bound2_tx = std::sync::Mutex::new(Some(bound2_tx));
+    let (scope_tx, scope_rx) = tokio::sync::mpsc::channel::<String>(64);
+    let drainer2 = tokio::spawn(async move {
+        while let Some(observation) = events_rx2.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+                && native.native_name == "transcript_bound"
+                && let Some(tx) = bound2_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+            if let ObservationPayload::Usage(payload) = &observation.body
+                && payload.scope_id.starts_with(TERMINATION_MSG_ID)
+            {
+                let _ = scope_tx.send(payload.scope_id.clone()).await;
+            }
+        }
+    });
+    let mut scope_rx = scope_rx;
+    tokio::time::timeout(Duration::from_secs(20), bound2_rx)
+        .await
+        .expect("run 2 never bound")
+        .expect("run-2 bound oneshot closed without firing");
+    // Close immediately: with the fix run 2's promotion slot survived
+    // retirement, so this is the PROMOTED draining path (which delivers the
+    // termination append). No wall-clock settle.
+    tokio::time::timeout(Duration::from_secs(25), driver.close())
+        .await
+        .expect("close hung past its bound")
+        .expect("close takes the promoted draining path and completes");
+
+    driver.abort_event_workers_for_test().await;
+    tokio::time::timeout(Duration::from_secs(30), drainer1)
+        .await
+        .expect("run-1 channel never closed")
+        .expect("run-1 drainer panicked");
+    tokio::time::timeout(Duration::from_secs(30), drainer2)
+        .await
+        .expect("run-2 channel never closed")
+        .expect("run-2 drainer panicked");
+
+    // Run 2's writer appended its tagged termination record during the
+    // promoted draining close; delivered exactly once.
+    let pid2 = last_session_pid(&events_path);
+    assert_ne!(pid1, pid2, "resume started a distinct harness process");
+    let scope2 = format!("{TERMINATION_MSG_ID}-{pid2}");
+    let mut scopes = Vec::new();
+    while let Ok(scope) = tokio::time::timeout(Duration::from_millis(500), scope_rx.recv()).await
+        && let Some(scope) = scope
+    {
+        scopes.push(scope);
+    }
+    assert_eq!(
+        scopes.iter().filter(|scope| **scope == scope2).count(),
+        1,
+        "run 2 termination usage delivered exactly once; bound_during_park={bound_during_park}, \
+         got {scopes:?}"
+    );
+}
+
+/// Last `session_start` pid in the shared harness events file.
+fn last_session_pid(events_path: &Path) -> u64 {
+    let events_text = std::fs::read_to_string(events_path).expect("harness events");
+    events_text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|row| row.get("event").and_then(serde_json::Value::as_str) == Some("session_start"))
+        .filter_map(|row| row.get("pid").and_then(serde_json::Value::as_u64))
+        .next_back()
+        .expect("a harness session_start pid")
+}

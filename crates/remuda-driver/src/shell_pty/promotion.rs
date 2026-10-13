@@ -2072,6 +2072,12 @@ async fn maintain_binding(
         );
         if let Some(opened) = opened {
             hydrator.publish(opened);
+            // Test-only bind barrier (c-ctxusage r19 item 1): notify the
+            // moment a hydrator is established, so a resume race test can
+            // prove the new run bound before predecessor retirement proceeds.
+            if let Some(faults) = faults.as_ref() {
+                faults.note_promoter_bind();
+            }
             // Announce the bind BEFORE the first (potentially minute-long)
             // replay pump: this is a lightweight identity fact, and emitting
             // it only after the map meant observers learned about the bound

@@ -140,6 +140,13 @@ pub(crate) struct FaultState {
     /// r17 item 3).
     close_barrier_arms: Mutex<u64>,
     close_barrier_arms_cv: Condvar,
+    /// Number of promotion polls that established a hydrator (a transcript
+    /// BIND), across runs. A same-driver resume test waits for the SECOND run's
+    /// bind while the predecessor poller is held parked, so the bind provably
+    /// lands before predecessor retirement clears the shared detection slots
+    /// (c-ctxusage r19 item 1).
+    promoter_binds: Mutex<u64>,
+    promoter_binds_cv: Condvar,
 }
 
 /// A parked phase must never wait forever on a test that forgot to release:
@@ -193,6 +200,8 @@ impl FaultState {
             close_barrier_waiting_cv: Condvar::new(),
             close_barrier_arms: Mutex::new(0),
             close_barrier_arms_cv: Condvar::new(),
+            promoter_binds: Mutex::new(0),
+            promoter_binds_cv: Condvar::new(),
         })
     }
 
@@ -455,6 +464,17 @@ impl FaultState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *arms += 1;
         self.close_barrier_arms_cv.notify_all();
+    }
+
+    /// Record that a promotion poll established a hydrator (a transcript
+    /// bind); wakes [`Self::wait_promoter_binds`] (c-ctxusage r19 item 1).
+    pub(crate) fn note_promoter_bind(&self) {
+        let mut binds = self
+            .promoter_binds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *binds += 1;
+        self.promoter_binds_cv.notify_all();
     }
 
     /// Acknowledge that the streaming flusher exited. A test holding a
@@ -788,6 +808,23 @@ impl TranscriptFaults {
             .inner
             .close_barrier_arms_cv
             .wait_timeout_while(guard, timeout, |arms| *arms < n)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard >= n
+    }
+
+    /// Block until at least `n` promotion polls have bound a transcript
+    /// (across runs), bounded (c-ctxusage r19 item 1). Used to prove the
+    /// resumed run's poller bound WHILE the predecessor finalise was parked.
+    pub fn wait_promoter_binds(&self, n: u64, timeout: Duration) -> bool {
+        let guard = self
+            .inner
+            .promoter_binds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (guard, _) = self
+            .inner
+            .promoter_binds_cv
+            .wait_timeout_while(guard, timeout, |binds| *binds < n)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard >= n
     }

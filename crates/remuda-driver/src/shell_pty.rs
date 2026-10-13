@@ -2159,18 +2159,23 @@ impl ShellPtyDriver {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(faults);
         }
+        // Retire the PREDECESSOR run's poller/waiter BEFORE spawning this
+        // run's poller (c-ctxusage r19 item 1). Both runs share the
+        // promoted/status detection slots, and retirement clears them. If run
+        // 2's poller spawned first it could bind its writer — setting those
+        // slots — WHILE the predecessor was still finalising; the clear at the
+        // end of retirement then wiped run 2's promotion, so a close() before
+        // run 2's next sample took the unpromoted path and lost its
+        // termination usage. Retiring first clears the stale slots while no
+        // run-2 poller exists; the spawn below repopulates them and nothing
+        // clears them afterwards.
+        self.retire_predecessor_run().await;
         let handle = match spec {
             Some(spec) => resumed.spawn_at(&spec.cwd.clone(), Some(&spec)).await?,
             None => resumed.spawn().await?,
         };
         // Adopt the new PTY: the caller holds *this* driver, so control
         // operations have to reach the process that was just started.
-        //
-        // First retire the PREDECESSOR run's poller/waiter. After a natural
-        // exit the previous run's poller is still live; the handle
-        // assignments below used to overwrite and detach it (c-ctxusage r18
-        // item 3).
-        self.retire_predecessor_run().await;
         *self.inner.lock().await = resumed.inner.lock().await.take();
         *self.hooks.lock().await = resumed.hooks.lock().await.take();
         *self.poller.lock().await = resumed.poller.lock().await.take();

@@ -2475,18 +2475,49 @@ fn classify_released_land_outcome(
         };
     };
     let status = report.get("status").and_then(Value::as_str);
+    // r18 item 1: EVERY definitive outcome (landed/base_moved/gate_failed) must
+    // carry a nonempty "merged" equal to the GRANTED merge; a refusal with a
+    // missing or different merge cannot be trusted to describe THIS attempt and
+    // is Unknown. The outer result keeps the verified merge_sha regardless.
+    let reported_merge = string_field(&report, "merged");
+    let merge_matches_grant = |outcome: &str| -> bool {
+        match (
+            granted_merge.filter(|sha| !sha.is_empty()),
+            reported_merge.as_deref(),
+        ) {
+            (Some(granted), Some(reported)) => {
+                if reported != granted {
+                    tracing::warn!(
+                        outcome,
+                        granted,
+                        reported,
+                        "land verdict merge does not match the grant; treating as Unknown"
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    outcome,
+                    "land verdict carries no nonempty merged sha for the grant; Unknown"
+                );
+                false
+            }
+        }
+    };
     if output.status.success() {
         // r17 item 4: a zero exit must report the recognized `landed` verdict
         // for the EXACT granted merge. Anything else is Unknown.
-        let reported_merge = string_field(&report, "merged");
-        if status == Some("landed")
-            && let Some(granted) = granted_merge.filter(|sha| !sha.is_empty())
-            && reported_merge.as_deref() == Some(granted)
-        {
+        if status == Some("landed") && merge_matches_grant("landed") {
             return ReleasedLandOutcome::Landed(report);
         }
-        // A structured CAS-loss verdict riding a zero exit is still honored.
-        if matches!(status, Some("base_moved") | Some("base-moved")) {
+        // A structured CAS-loss verdict riding a zero exit is honored only when
+        // it names the granted merge.
+        if matches!(status, Some("base_moved") | Some("base-moved"))
+            && merge_matches_grant("base_moved")
+        {
             return ReleasedLandOutcome::BaseMoved(report);
         }
         return ReleasedLandOutcome::Uncertain {
@@ -2499,7 +2530,9 @@ fn classify_released_land_outcome(
         };
     }
     match status {
-        Some("base_moved") | Some("base-moved") => ReleasedLandOutcome::BaseMoved(report),
+        Some("base_moved") | Some("base-moved") if merge_matches_grant("base_moved") => {
+            ReleasedLandOutcome::BaseMoved(report)
+        }
         Some("uncertain") => ReleasedLandOutcome::Uncertain {
             error: string_field(&report, "error").unwrap_or_else(|| {
                 "land push outcome could not be established against the remote".into()
@@ -2509,19 +2542,23 @@ fn classify_released_land_outcome(
         // The merge CLI's one recognized failure verdict (exit 1): it only
         // reaches this status for a pre-push error (nothing pushed) or after
         // recovery established the exact merge absent with the remote base
-        // unchanged (a genuine rejection).
-        Some("gate_failed") if exit_code == 1 => ReleasedLandOutcome::Failed(format!(
-            "land failed after grant (exit 1): {}",
-            string_field(&report, "error")
-                .unwrap_or_else(|| stderr_text.clone())
-                .trim()
-        )),
+        // unchanged (a genuine rejection). It must name the granted merge.
+        Some("gate_failed") if exit_code == 1 && merge_matches_grant("gate_failed") => {
+            ReleasedLandOutcome::Failed(format!(
+                "land failed after grant (exit 1): {}",
+                string_field(&report, "error")
+                    .unwrap_or_else(|| stderr_text.clone())
+                    .trim()
+            ))
+        }
         other => ReleasedLandOutcome::Uncertain {
             error: format!(
-                "the land child exited {exit_code} with an unrecognized verdict {other:?}; the \
-                 push may have reached the remote (stderr: {stderr_text})"
+                "the land child exited {exit_code} with an unrecognized or merge-mismatched \
+                 verdict {other:?} (reported merged={reported_merge:?}, granted={granted_merge:?}); \
+                 the push may have reached the remote (stderr: {stderr_text})"
             ),
-            reason: "land child verdict unrecognized; push outcome uncertain".into(),
+            reason: "land child verdict unrecognized/merge-mismatched; push outcome uncertain"
+                .into(),
         },
     }
 }
@@ -6583,8 +6620,10 @@ Running 8 tests across 2 projects
                 stderr: stderr.as_bytes().to_vec(),
             }
         }
-        let gate_failed = r#"{"exitCode":1,"status":"gate_failed","error":"hook refused"}"#;
         let granted = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let gate_failed = &format!(
+            r#"{{"exitCode":1,"status":"gate_failed","merged":"{granted}","error":"hook refused"}}"#
+        );
         let landed = &format!(r#"{{"exitCode":0,"status":"landed","merged":"{granted}"}}"#);
 
         // exit 0 with a recognized landed report naming the granted merge →
@@ -6623,10 +6662,17 @@ Running 8 tests across 2 projects
                 "exit-0 stdout {stdout:?} grant {grant:?} must be Unknown"
             );
         }
-        // A structured base_moved riding a zero exit is honored.
+        // A structured base_moved riding a zero exit is honored when it names
+        // the granted merge (r18 item 1).
         assert!(matches!(
             super::classify_released_land_outcome(
-                &output_from(0, r#"{"status":"base_moved","currentMain":"abc"}"#, ""),
+                &output_from(
+                    0,
+                    &format!(
+                        r#"{{"status":"base_moved","merged":"{granted}","currentMain":"abc"}}"#
+                    ),
+                    ""
+                ),
                 "",
                 Some(granted)
             ),
@@ -6641,10 +6687,16 @@ Running 8 tests across 2 projects
             ),
             super::ReleasedLandOutcome::Failed(message) if message.contains("hook refused")
         ));
-        // base_moved keeps its recognized verdict.
+        // base_moved keeps its recognized verdict when it names the merge.
         assert!(matches!(
             super::classify_released_land_outcome(
-                &output_from(2 << 8, r#"{"status":"base_moved","currentMain":"abc"}"#, ""),
+                &output_from(
+                    2 << 8,
+                    &format!(
+                        r#"{{"status":"base_moved","merged":"{granted}","currentMain":"abc"}}"#
+                    ),
+                    ""
+                ),
                 "",
                 Some(granted)
             ),
@@ -6702,6 +6754,82 @@ Running 8 tests across 2 projects
                     super::ReleasedLandOutcome::Uncertain { .. }
                 ),
                 "signal {signal} must be Unknown"
+            );
+        }
+    }
+
+    /// r18 item 1: refusal verdicts (base_moved / gate_failed) are accepted
+    /// ONLY when they carry a nonempty merged sha equal to the grant; a missing
+    /// or different merge makes the refusal Unknown.
+    #[cfg(unix)]
+    #[test]
+    fn refusal_verdicts_require_the_granted_merge_else_unknown() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{ExitStatus, Output};
+        fn output(raw: i32, stdout: &str) -> Output {
+            Output {
+                status: ExitStatus::from_raw(raw),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: b"boom".to_vec(),
+            }
+        }
+        let granted = "cccccccccccccccccccccccccccccccccccccccc";
+        let other = "dddddddddddddddddddddddddddddddddddddddd";
+        let base_moved = |merge: Option<&str>| match merge {
+            Some(sha) => format!(
+                r#"{{"exitCode":2,"status":"base_moved","merged":"{sha}","currentMain":"abc"}}"#
+            ),
+            None => r#"{"exitCode":2,"status":"base_moved","currentMain":"abc"}"#.into(),
+        };
+        let gate_failed = |merge: Option<&str>| match merge {
+            Some(sha) => format!(
+                r#"{{"exitCode":1,"status":"gate_failed","merged":"{sha}","error":"rejected"}}"#
+            ),
+            None => r#"{"exitCode":1,"status":"gate_failed","error":"rejected"}"#.into(),
+        };
+
+        // Correct merge on either exit → recognized refusal.
+        assert!(matches!(
+            super::classify_released_land_outcome(
+                &output(2 << 8, &base_moved(Some(granted))),
+                "",
+                Some(granted)
+            ),
+            super::ReleasedLandOutcome::BaseMoved(_)
+        ));
+        assert!(matches!(
+            super::classify_released_land_outcome(
+                &output(1 << 8, &gate_failed(Some(granted))),
+                "",
+                Some(granted)
+            ),
+            super::ReleasedLandOutcome::Failed(_)
+        ));
+        // base_moved riding exit 0 with the grant is also honored.
+        assert!(matches!(
+            super::classify_released_land_outcome(
+                &output(0, &base_moved(Some(granted))),
+                "",
+                Some(granted)
+            ),
+            super::ReleasedLandOutcome::BaseMoved(_)
+        ));
+
+        // Missing merge or a different merge → Unknown on every refusal path.
+        for (raw, stdout) in [
+            (2 << 8, base_moved(None)),
+            (2 << 8, base_moved(Some(other))),
+            (0, base_moved(None)),
+            (0, base_moved(Some(other))),
+            (1 << 8, gate_failed(None)),
+            (1 << 8, gate_failed(Some(other))),
+        ] {
+            assert!(
+                matches!(
+                    super::classify_released_land_outcome(&output(raw, &stdout), "", Some(granted)),
+                    super::ReleasedLandOutcome::Uncertain { .. }
+                ),
+                "refusal {raw} with {stdout} must be Unknown"
             );
         }
     }

@@ -897,7 +897,10 @@ impl GateRegistry {
     /// The land leader has already been reaped by the caller. Finish off any
     /// surviving group member with SIGKILL, verify the whole group is ESRCH (the
     /// kernel's authoritative answer — never a `/proc` enumeration, r15 R5),
-    /// and only then remove the durable fence record.
+    /// and only then write the durable DEATH CERTIFICATE and remove the fence
+    /// record. A later probe with no live run and no fence then attests death
+    /// from the certificate rather than guessing from a missing ledger
+    /// (r16 item 2, R5). If the cert cannot be written the fence record stays.
     #[cfg(unix)]
     async fn settle_land_group(&self, job_id: &str, pgid: i32) {
         let dir = self.land_fence_dir.clone();
@@ -910,7 +913,7 @@ impl GateRegistry {
                 wait_until_group_gone(pgid, Duration::from_millis(500));
             }
             if !land_group_exists(pgid) {
-                remove_land_fence(&dir, &job_id);
+                certify_dead_and_remove_fence(&dir, &job_id, pgid);
             }
             // ESRCH still not proven (e.g. EPERM, or a zombie under a
             // subreaper): the record stays and the startup fence proves it
@@ -919,36 +922,55 @@ impl GateRegistry {
         .await;
     }
 
-    /// Whether a granted push for `job_id` can still land: a live run whose
-    /// land group is (or may be) alive in this process, or a durable fence
-    /// record the startup fence has not cleared. `false` attests the land
-    /// process group is verified gone, which lets a read-only remote probe
-    /// answer `absent` (r14 R1).
-    async fn land_group_may_push(&self, job_id: &str) -> bool {
+    /// Whether a granted push for `job_id` can still land, as a tri-state
+    /// evidence verdict (r16 item 2, R5):
+    /// * [`LandPushLiveness::MayPush`] — a live run in THIS process has a land
+    ///   group the kernel still reports present, or the grant may be in flight
+    ///   before that group is recorded, or a durable fence ledger exists;
+    /// * [`LandPushLiveness::VerifiedDead`] — an AUTHORITATIVE observation that
+    ///   the exact attempt's land group is gone: either the live run's recorded
+    ///   group now answers ESRCH, or a durable death certificate (written only
+    ///   after the kernel verified ESRCH) is on disk;
+    /// * [`LandPushLiveness::Unknown`] — everything else, crucially a MISSING
+    ///   OR UNREADABLE ledger. No ledger is never proof of death: without a
+    ///   death certificate the push remains possible (an older Node, a lost
+    ///   record, an unwitnessed crash), so a read-only probe must stay Unknown
+    ///   rather than attest `absent`.
+    #[cfg(unix)]
+    async fn land_push_liveness(&self, job_id: &str) -> LandPushLiveness {
         let table = self.runs.lock().await;
         if let Some(run) = table.runs.get(job_id) {
             let land_pgid = *run
                 .land_pgid
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            match land_pgid {
-                Some(pgid) => return land_group_exists(pgid),
+            return match land_pgid {
+                // The kernel's authoritative killpg(pgid, 0) answer on the
+                // exact group this process spawned and recorded.
+                Some(pgid) => {
+                    if land_group_exists(pgid) {
+                        LandPushLiveness::MayPush
+                    } else {
+                        LandPushLiveness::VerifiedDead
+                    }
+                }
                 // The run exists and the grant may already have been taken but
                 // the land child has not recorded its group yet: conservative.
-                None => return true,
-            }
+                None => LandPushLiveness::MayPush,
+            };
         }
         drop(table);
-        #[cfg(unix)]
-        {
-            land_fence_path(&self.land_fence_dir, job_id).exists()
-        }
-        #[cfg(not(unix))]
-        {
-            // Without process-group accounting an absent verdict cannot be
-            // attested by the Node.
-            true
-        }
+        let dir = self.land_fence_dir.clone();
+        let job_id = job_id.to_owned();
+        tokio::task::spawn_blocking(move || land_ledger_liveness(&dir, &job_id))
+            .await
+            .unwrap_or(LandPushLiveness::Unknown)
+    }
+
+    /// Platforms without process-group accounting can never attest death.
+    #[cfg(not(unix))]
+    async fn land_push_liveness(&self, _job_id: &str) -> LandPushLiveness {
+        LandPushLiveness::Unknown
     }
 
     /// Register the live session's Hub-authority hook (called on connect).
@@ -1428,16 +1450,19 @@ impl DevNode {
             serde_json::from_value(params.clone()).map_err(|error| {
                 NodeError::InvalidRequest(format!("invalid gate.resolveLanding params: {error}"))
             })?;
-        // r14 R1: `absent` is only attestable when the land group that could
-        // still push this job is verified gone — no live run in this process
-        // and no durable fence record (a leftover record is fenced at boot).
-        // Otherwise a not-on-remote fetch result stays `unknown`.
-        let land_group_may_push = self
-            .gate_registry()
-            .land_group_may_push(&request.job_id)
-            .await;
+        // r14 R1 / r16 item 2 R5: `absent` is attestable ONLY with
+        // authoritative death evidence for the exact attempt — a live kernel
+        // ESRCH on the group this process recorded, or a durable death
+        // certificate. A missing/unreadable fence ledger with no cert is
+        // Unknown, never "the push is dead".
+        let land_group_verified_dead = matches!(
+            self.gate_registry()
+                .land_push_liveness(&request.job_id)
+                .await,
+            LandPushLiveness::VerifiedDead
+        );
         let result = tokio::task::spawn_blocking(move || {
-            resolve_landing_after_restart(&request, land_group_may_push)
+            resolve_landing_after_restart(&request, land_group_verified_dead)
         })
         .await
         .map_err(|error| NodeError::InvalidRequest(format!("resolveLanding join: {error}")))?;
@@ -2849,15 +2874,16 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<(), String> {
 /// * `landed` when the granted merge is already an ancestor of
 ///   `origin/<base>`;
 /// * `absent` when a fresh fetch succeeded, the merge is NOT an ancestor, and
-///   `land_group_may_push` is false — the caller attested the only process
-///   group that could still push this job is verified gone, so the push is
-///   provably not coming (r14 R1);
-/// * `unknown` for every fetch/parse failure, non-ancestry while a land group
-///   may still be alive, or an empty granted sha. It never pushes and never
+///   `land_group_verified_dead` is true — the caller holds AUTHORITATIVE death
+///   evidence for the exact attempt's land group (a live kernel ESRCH or a
+///   durable death certificate; r14 R1, r16 item 2 R5);
+/// * `unknown` for every fetch/parse/ancestry failure, non-ancestry without
+///   authoritative death evidence, and crucially a MISSING OR UNREADABLE
+///   ledger (missing proof is not proof of death). It never pushes and never
 ///   asserts a push it cannot prove.
 fn resolve_landing_after_restart(
     request: &GateResolveLandingParams,
-    land_group_may_push: bool,
+    land_group_verified_dead: bool,
 ) -> GateResolveLandingResult {
     let repo = PathBuf::from(&request.repo_path);
     let unknown = |error: String| GateResolveLandingResult {
@@ -2896,9 +2922,10 @@ fn resolve_landing_after_restart(
             base_sha: Some(base_sha),
             error: None,
         },
-        Ok(_) if land_group_may_push => unknown(format!(
-            "{} is not an ancestor of {remote_base} but the granted land process group may still \
-             push; push outcome unknown",
+        Ok(_) if !land_group_verified_dead => unknown(format!(
+            "{} is not an ancestor of {remote_base} but the granted land group's death is not \
+             authoritatively established (no live ESRCH or death certificate; a missing ledger is \
+             not proof); push outcome unknown",
             request.merge_sha
         )),
         Ok(_) => GateResolveLandingResult {
@@ -2924,11 +2951,60 @@ fn git_output(repo: &Path, args: &[&str]) -> Result<String, String> {
 // written right after the land child spawns, removed only once the whole group
 // is verified gone, and fenced (TERM → bounded wait → KILL → ESRCH) at the next
 // boot before any carrier is served. A read-only landing probe reports `absent`
-// only when no live run and no ledger record can still push the job.
+// only with AUTHORITATIVE death evidence: a live kernel ESRCH on the group it
+// spawned, or a durable DEATH CERTIFICATE (`dead-<job>.json`) written only when
+// the kernel verified the group ESRCH. A missing or unreadable ledger/cert is
+// Unknown — never proof the push is dead (r16 item 2, R5).
+
+/// What the Node can establish about a granted land's push liveness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LandPushLiveness {
+    /// A live land group may still push the granted merge.
+    MayPush,
+    /// The exact attempt's land group is authoritatively dead (live ESRCH on the
+    /// recorded group, or a durable death certificate).
+    VerifiedDead,
+    /// Nothing could be established (missing/unreadable ledger, no cert); the
+    /// caller must hold, never attest absence.
+    Unknown,
+}
+
+/// Ledger-only half of [`GateRegistry::land_push_liveness`] (no live run):
+/// a present fence ledger (readable or not) says a group MAY push; with no
+/// ledger the push is provably dead ONLY when a valid death certificate for
+/// the exact job exists. Missing both, a stat/read/parse error, or a cert for a
+/// different job is Unknown.
+#[cfg(unix)]
+fn land_ledger_liveness(dir: &std::path::Path, job_id: &str) -> LandPushLiveness {
+    match std::fs::metadata(land_fence_path(dir, job_id)) {
+        Ok(_) => LandPushLiveness::MayPush,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match read_land_group_dead_cert(dir, job_id) {
+                Some(_) => LandPushLiveness::VerifiedDead,
+                None => LandPushLiveness::Unknown,
+            }
+        }
+        // A stat/read error on the ledger directory is Unknown.
+        Err(_) => LandPushLiveness::Unknown,
+    }
+}
 
 #[cfg(unix)]
 fn land_fence_path(dir: &std::path::Path, job_id: &str) -> std::path::PathBuf {
-    let slug: String = job_id
+    dir.join(format!("land-{}.json", land_slug(job_id)))
+}
+
+/// Durable DEATH CERTIFICATE path: written only after the kernel verified the
+/// granted land group ESRCH, and the only durable evidence that lets a later
+/// read-only probe attest the push cannot still land (r16 item 2, R5).
+#[cfg(unix)]
+fn land_dead_cert_path(dir: &std::path::Path, job_id: &str) -> std::path::PathBuf {
+    dir.join(format!("dead-{}.json", land_slug(job_id)))
+}
+
+#[cfg(unix)]
+fn land_slug(job_id: &str) -> String {
+    job_id
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
@@ -2937,8 +3013,57 @@ fn land_fence_path(dir: &std::path::Path, job_id: &str) -> std::path::PathBuf {
                 '-'
             }
         })
-        .collect();
-    dir.join(format!("land-{slug}.json"))
+        .collect()
+}
+
+/// Persist the death certificate for a verified-gone land group. Takes the
+/// fence RECORD's provenance (job, generation, pgid, leader identity) so the
+/// certificate attests the death of that EXACT attempt, plus an authoritative
+/// timestamp. Atomic like the fence write; any error propagates (the caller
+/// then keeps the fence record rather than lose the only proof).
+#[cfg(unix)]
+fn write_land_group_dead_cert(
+    dir: &std::path::Path,
+    record: &Value,
+    pgid: i32,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let Some(job_id) = record.get("jobId").and_then(Value::as_str) else {
+        return Err(std::io::Error::other(
+            "land fence record has no jobId for the death certificate",
+        ));
+    };
+    let mut cert = record.clone();
+    cert["diedAt"] = json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    );
+    cert["cause"] = json!("killpg-esrch");
+    let path = land_dead_cert_path(dir, job_id);
+    let temporary = dir.join(format!(".dead-{pgid}-{}.tmp", std::process::id()));
+    std::fs::write(&temporary, serde_json::to_vec(&cert).unwrap_or_default())?;
+    std::fs::rename(&temporary, &path)?;
+    Ok(())
+}
+
+/// Read and VALIDATE a death certificate for the exact job. `None` covers a
+/// missing file, any read/parse error, a job mismatch, or missing provenance
+/// (pgid + leader identity) — every one of those is Unknown, never a valid
+/// death attestation.
+#[cfg(unix)]
+fn read_land_group_dead_cert(dir: &std::path::Path, job_id: &str) -> Option<Value> {
+    let text = std::fs::read_to_string(land_dead_cert_path(dir, job_id)).ok()?;
+    let cert: Value = serde_json::from_str(&text).ok()?;
+    if cert.get("jobId").and_then(Value::as_str) != Some(job_id) {
+        return None;
+    }
+    cert.get("pgid")
+        .and_then(Value::as_i64)
+        .filter(|pgid| i32::try_from(*pgid).is_ok())?;
+    LeaderIdentity::from_record(&cert)?;
+    Some(cert)
 }
 
 /// Env var telling the granted land child to read its one start-release byte
@@ -3154,6 +3279,9 @@ fn write_land_fence(
     });
     identity.write(&mut record);
     let path = land_fence_path(dir, job_id);
+    // A new granted attempt supersedes any death certificate for the same job
+    // (e.g. a requeue): the old cert must never attest death for THIS attempt.
+    let _ = std::fs::remove_file(land_dead_cert_path(dir, job_id));
     let temporary = dir.join(format!(".land-{pgid}-{}.tmp", std::process::id()));
     std::fs::write(&temporary, serde_json::to_vec(&record).unwrap_or_default())?;
     std::fs::rename(&temporary, &path)?;
@@ -3163,6 +3291,35 @@ fn write_land_fence(
 #[cfg(unix)]
 fn remove_land_fence(dir: &std::path::Path, job_id: &str) {
     let _ = std::fs::remove_file(land_fence_path(dir, job_id));
+}
+
+/// Authoritative group death has been observed (killpg ESRCH on the recorded
+/// pgid): persist the death certificate FROM the fence record's provenance, and
+/// only then remove the fence. Any missing/unreadable/malformed record or cert
+/// write failure KEEPS the fence (Unknown never silently loses its proof).
+#[cfg(unix)]
+fn certify_dead_and_remove_fence(dir: &std::path::Path, job_id: &str, pgid: i32) {
+    let Ok(text) = std::fs::read_to_string(land_fence_path(dir, job_id)) else {
+        // No record to certify from (or unreadable): keep whatever is on disk;
+        // a missing fence with no certificate is Unknown to later probes.
+        return;
+    };
+    let Ok(record) = serde_json::from_str::<Value>(&text) else {
+        tracing::warn!(
+            job_id,
+            "land group verified dead but its fence record is unreadable; keeping it (Unknown)"
+        );
+        return;
+    };
+    if write_land_group_dead_cert(dir, &record, pgid).is_ok() {
+        remove_land_fence(dir, job_id);
+    } else {
+        tracing::warn!(
+            job_id,
+            "land group verified dead but the death certificate could not be written; keeping the \
+             fence record"
+        );
+    }
 }
 
 /// Boundedly poll until the kernel reports the group gone (`killpg(pgid,0)`
@@ -3254,8 +3411,10 @@ fn fence_orphaned_land_groups(dir: &std::path::Path) {
                 // positive identity match.
                 match sample_leader_identity(pgid) {
                     Some(current) if current == recorded_identity => {
-                        if terminate_and_verify_group(pgid, LAND_GROUP_TERM_GRACE) {
-                            let _ = std::fs::remove_file(&path);
+                        if terminate_and_verify_group(pgid, LAND_GROUP_TERM_GRACE)
+                            && let Some(job) = record.get("jobId").and_then(Value::as_str)
+                        {
+                            certify_dead_and_remove_fence(dir, job, pgid);
                         }
                         // Still not provably gone: keep for the next boot.
                     }
@@ -3280,8 +3439,10 @@ fn fence_orphaned_land_groups(dir: &std::path::Path) {
                 // group can no longer be positively distinguished from a
                 // same-session process that joined it: only an authoritative
                 // group ESRCH settles it; anything else keeps the record.
-                if !land_group_exists(pgid) {
-                    let _ = std::fs::remove_file(&path);
+                if !land_group_exists(pgid)
+                    && let Some(job) = record.get("jobId").and_then(Value::as_str)
+                {
+                    certify_dead_and_remove_fence(dir, job, pgid);
                 }
             }
             Err(error) => {
@@ -5340,6 +5501,22 @@ Running 8 tests across 2 projects
         assert!(!super::land_group_exists(pgid));
         super::fence_orphaned_land_groups(dir.path());
         assert!(!path.exists(), "ESRCH must release the record");
+        // r16 item 2: the fence removal leaves a DURABLE DEATH CERTIFICATE for
+        // the exact job, so a later ledger read attests VerifiedDead instead of
+        // guessing from the missing ledger (which is Unknown on its own).
+        assert!(
+            super::read_land_group_dead_cert(dir.path(), "dead").is_some(),
+            "authoritative ESRCH at startup must leave a death certificate"
+        );
+        assert_eq!(
+            super::land_ledger_liveness(dir.path(), "dead"),
+            super::LandPushLiveness::VerifiedDead
+        );
+        assert_eq!(
+            super::land_ledger_liveness(dir.path(), "other-job"),
+            super::LandPushLiveness::Unknown,
+            "the certificate is scoped to the exact job"
+        );
     }
 
     #[test]
@@ -5446,5 +5623,108 @@ Running 8 tests across 2 projects
         let barrier = super::LandStartBarrier::failed(std::io::Error::other("boom"));
         let error = barrier.release_after(|| Ok(())).expect_err("no release");
         assert!(error.to_string().contains("start barrier unavailable"));
+    }
+
+    /// r16 item 2: ledger-only liveness. A missing ledger with no death
+    /// certificate is UNKNOWN, not "dead". A present fence (even malformed)
+    /// says a group may push; a valid certificate for the exact job is the only
+    /// durable death evidence; malformed/foreign certificates stay Unknown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn land_push_liveness_a_missing_ledger_is_unknown_without_a_death_cert() {
+        use super::LandPushLiveness::*;
+        let fixture = fixture(PASSING_SCRIPT);
+        let registry = fixture.node.gate_registry();
+        let dir = registry.land_fence_dir.clone();
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = "gjb_liveness";
+        let fence = super::land_fence_path(&dir, job);
+        let cert = super::land_dead_cert_path(&dir, job);
+        let _ = std::fs::remove_file(&fence);
+        let _ = std::fs::remove_file(&cert);
+
+        // Nothing on disk: Unknown — never a death attestation.
+        assert_eq!(registry.land_push_liveness(job).await, Unknown);
+
+        // A malformed fence ledger is still a PRESENT ledger: may push.
+        std::fs::write(&fence, b"not json").unwrap();
+        assert_eq!(registry.land_push_liveness(job).await, MayPush);
+
+        // Ledger gone, malformed cert: Unknown.
+        std::fs::remove_file(&fence).unwrap();
+        std::fs::write(&cert, b"not json").unwrap();
+        assert_eq!(registry.land_push_liveness(job).await, Unknown);
+
+        // Cert present but missing its leader identity: Unknown.
+        std::fs::write(
+            &cert,
+            br#"{"jobId":"gjb_liveness","generation":1,"pgid":12345}"#,
+        )
+        .unwrap();
+        assert_eq!(registry.land_push_liveness(job).await, Unknown);
+
+        // Cert naming a different job never proves THIS job dead.
+        let foreign =
+            serde_json::json!({"jobId":"gjb_other","generation":1,"pgid":1,"startTick":7});
+        super::write_land_group_dead_cert(&dir, &foreign, 1).unwrap();
+        assert_eq!(registry.land_push_liveness(job).await, Unknown);
+
+        // A complete certificate for the exact job: VerifiedDead.
+        let own = serde_json::json!({"jobId":job,"generation":1,"pgid":12345,"startTick":42});
+        super::write_land_group_dead_cert(&dir, &own, 12345).unwrap();
+        assert_eq!(registry.land_push_liveness(job).await, VerifiedDead);
+    }
+
+    /// r16 item 2 end-to-end through the read-only `gate.resolveLanding` RPC:
+    /// with the granted merge NOT on the fetched remote, a missing ledger keeps
+    /// the verdict `unknown`; only a valid death certificate for the exact job
+    /// lets it settle `absent`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_landing_absent_requires_a_death_certificate() {
+        let fixture = fixture(PASSING_SCRIPT);
+        // A real dangling root commit in the lane: a valid object that is NOT
+        // an ancestor of origin/main (merge-base --is-ancestor exits 1).
+        let tree = git(&fixture.lane, &["rev-parse", "main^{tree}"]);
+        let orphan = git(&fixture.lane, &["commit-tree", &tree, "-m", "orphan"]);
+        assert_ne!(orphan, fixture_lane_main(&fixture));
+
+        let params = serde_json::json!({
+            "jobId": "gjb_deadprobe",
+            "repoPath": fixture.lane.to_string_lossy(),
+            "baseBranch": "main",
+            "mergeSha": orphan,
+        });
+        // No live run, no fence ledger, no certificate → Unknown.
+        let reply = fixture
+            .node
+            .run_gate_resolve_landing(&params)
+            .await
+            .unwrap();
+        assert_eq!(reply["status"], json!("unknown"), "{reply}");
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not authoritatively established"),
+            "{reply}"
+        );
+
+        // A valid death certificate for the exact job attests VerifiedDead, so
+        // the non-ancestry result settles `absent` with the remote base sha.
+        let dir = fixture.node.gate_registry().land_fence_dir.clone();
+        let record = serde_json::json!({
+            "jobId": "gjb_deadprobe", "generation": 1, "pgid": 4242, "startTick": 99
+        });
+        super::write_land_group_dead_cert(&dir, &record, 4242).unwrap();
+        let reply = fixture
+            .node
+            .run_gate_resolve_landing(&params)
+            .await
+            .unwrap();
+        assert_eq!(reply["status"], json!("absent"), "{reply}");
+        assert!(reply["baseSha"].is_string(), "{reply}");
+    }
+
+    fn fixture_lane_main(fixture: &Fixture) -> String {
+        git(&fixture.lane, &["rev-parse", "origin/main"])
     }
 }

@@ -291,6 +291,11 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
     let mut host_id: Option<String> = None;
     let mut hello_done = false;
     let mut session_generation: Option<u64> = None;
+    // Set by the hello handler: whether THIS hello displaced a still-live older
+    // socket (a takeover). Captured at hello time so the detached post-hello
+    // Landing decision cannot be changed by an old socket tearing down later
+    // (r16 item 6).
+    let mut hello_displaced_live = false;
 
     loop {
         tokio::select! {
@@ -342,7 +347,19 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                     }
                     break;
                 }
-                match handle_node_method(&state, &token, &mut host_id, &mut hello_done, &mut session_generation, method, params, &out_tx, &pending).await {
+                match handle_node_method(
+                    &state,
+                    &token,
+                    &mut host_id,
+                    &mut hello_done,
+                    &mut session_generation,
+                    &mut hello_displaced_live,
+                    method,
+                    params,
+                    &out_tx,
+                    &pending,
+                )
+                .await {
                     // Normal replies ride the same FIFO as handler-emitted
                     // frames (object.pull streams its chunks just before this
                     // reply), so they are queued rather than written straight
@@ -364,8 +381,14 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                         // carriers go through this one helper.
                         if is_hello
                             && let Some(h) = host_id.clone()
+                            && let Some(generation) = session_generation
                         {
-                            spawn_post_hello_tasks(&state, h);
+                            spawn_post_hello_tasks(
+                                &state,
+                                h,
+                                generation,
+                                hello_displaced_live,
+                            );
                         }
                     }
                     Ok(None) => {}
@@ -415,9 +438,12 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
         if let Some(generation) = session_generation {
             crate::gatequeue::recover_ended_session(&state, &host_id, generation).await;
         }
-        // The taking-over session is over; subsequent registrations on this host
-        // are fresh reconnects (no live older socket), so allow grant rebinding.
-        state.nodes.clear_live_takeover(&host_id).await;
+        // r16 item 6: no unconditional clear here. The live-takeover mark is
+        // keyed by the TAKEOVER generation and cleared under the per-host guard
+        // ONLY by remove_generation removing that exact current session (which
+        // ran above). A stale older socket's guarded removal changes nothing, so
+        // the new session never inherits A's Landing grant when A tears down
+        // after the new hello.
         if stale {
             // D-048: tear down relay streams this link owned. A vanished proxy
             // host ends streams with via-host-offline and blocks routed
@@ -460,7 +486,15 @@ pub(crate) fn spawn_egress_reinstall(state: &AppState, host_id: String) {
 /// the sweep (see [`crate::workspaces::abort_unsettled_unregisters_on_reconnect`])
 /// must not abort DELETEs accepted on THIS new link, so only commands
 /// created before it are touched.
-pub(crate) fn spawn_post_hello_tasks(state: &AppState, host_id: String) {
+/// `generation` and `displaced_live` are the values captured AT HELLO (not
+/// re-queried later), so a stale older socket that tears down after this hello
+/// cannot change the Landing-rebind decision (r16 item 6).
+pub(crate) fn spawn_post_hello_tasks(
+    state: &AppState,
+    host_id: String,
+    generation: u64,
+    displaced_live: bool,
+) {
     spawn_egress_reinstall(state, host_id.clone());
     crate::workspaces::spawn_unregister_abort_sweep(
         state,
@@ -475,25 +509,35 @@ pub(crate) fn spawn_post_hello_tasks(state: &AppState, host_id: String) {
     // loop; the periodic reconciler retries anything still uncertain.
     let state = state.clone();
     tokio::spawn(async move {
-        // r15 item 8: after a GENUINE carrier reconnect (the old socket tore
-        // down first) rebind same-boot in-flight Landings to THIS session
-        // before the forced probe: that reconnect is the boot's continuation
-        // of authority for rows dispatched before the drop. A live takeover
-        // where an older socket is still registered does NOT inherit A's
-        // grant — the new socket must refuse to settle A's Landing (see
-        // gate_session_fence); so skip the rebind when another session is live.
-        let session = state.nodes.generation_of(&host_id).await;
-        let boot = state.nodes.boot_epoch();
-        if let Some(session) = session {
-            // Live socket takeover (old session still registered at hello):
-            // the new socket does NOT inherit A's Landing grants. A genuine
-            // reconnect (empty slot at insert) rebinds the in-flight rows.
-            if !state.nodes.host_had_live_takeover(&host_id).await {
+        // r15 item 8 / r16 item 6: a GENUINE reconnect (the old socket tore
+        // down before this hello — displaced_live captured at hello) is the
+        // boot's continuation of authority, so rebind same-boot in-flight
+        // Landings to THIS session before the forced probe. A live socket
+        // takeover (an older socket still registered) never inherits A's
+        // grant. The rebind is a GUARDED COMPARE-AND-SET under the per-host
+        // authority lock: if an even newer hello made the captured generation
+        // non-current before this detached task ran, this task stands down and
+        // leaves the rows to the live session.
+        if !displaced_live {
+            let boot = state.nodes.boot_epoch();
+            let guard = state
+                .nodes
+                .host_authority(&host_id)
+                .await
+                .read_owned()
+                .await;
+            if state.nodes.is_current_session(&host_id, generation).await
+                && !state
+                    .nodes
+                    .host_had_live_takeover(&host_id, generation)
+                    .await
+            {
                 let _ = state
                     .store
-                    .rebind_same_boot_landing_sessions(&host_id, session, boot)
+                    .rebind_same_boot_landing_sessions(&host_id, generation, boot)
                     .await;
             }
+            drop(guard);
         }
         crate::gatequeue::reconcile_landings(&state, Some(&host_id)).await;
     });
@@ -506,6 +550,7 @@ pub(crate) async fn handle_node_method(
     host_id: &mut Option<String>,
     hello_done: &mut bool,
     session_generation: &mut Option<u64>,
+    hello_displaced_live: &mut bool,
     method: &str,
     params: Value,
     out_tx: &mpsc::Sender<Value>,
@@ -615,6 +660,9 @@ pub(crate) async fn handle_node_method(
                 )
                 .await;
             *session_generation = Some(inserted.generation);
+            // r16 item 6: capture the hello-time takeover flag for the detached
+            // post-hello Landing decision (never re-queried after).
+            *hello_displaced_live = inserted.displaced_live;
             let watermarks = state
                 .store
                 .list_instance_watermarks(host.host_id.clone())

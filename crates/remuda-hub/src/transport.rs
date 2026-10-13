@@ -7,7 +7,7 @@ use crate::error::HubError;
 use futures::Future;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -465,6 +465,12 @@ pub(crate) struct InsertedSession {
     /// when the host had fully disappeared in between (so it can never equal a
     /// superseded socket's identity).
     pub(crate) generation: u64,
+    /// True when an older LIVE socket still occupied the slot at insert — a
+    /// socket-level takeover rather than a reconnect after a full disconnect.
+    /// The detached post-hello Landing decision uses this (under the per-host
+    /// guard) instead of re-querying the map, so an old socket tearing down
+    /// after the hello cannot change the answer (r16 item 6).
+    pub(crate) displaced_live: bool,
 }
 
 /// Connected Node transports, keyed by host id.
@@ -480,10 +486,13 @@ pub struct ConnectedNodes {
     /// writer's commit predicate matches nothing (r15 item 3, R2).
     authority: Arc<Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>>,
     /// Hosts whose CURRENT session was installed while an older socket was
-    /// still live (a socket-level takeover). Cleared when that session ends;
-    /// used to deny the new socket inheritance of the old session's Landing
-    /// grants (a genuine reconnect after a full disconnect leaves this clear).
-    live_takeover: Arc<Mutex<HashSet<String>>>,
+    /// still live (a socket-level takeover). Maps host → the TAKEOVER
+    /// generation (the newer session). It is cleared only when THAT
+    /// generation is removed under the per-host guard; a stale OLDER socket
+    /// tearing down later must never clear it (r16 item 6). It denies the new
+    /// socket inheritance of the old session's Landing grants (a genuine
+    /// reconnect after a full disconnect leaves the map empty).
+    live_takeover: Arc<Mutex<HashMap<String, u64>>>,
     /// Test-only: notified once per host when a session replacement (insert)
     /// has to WAIT for an in-flight Landing authority decision to commit — the
     /// deterministic witness that takeover and verdict-writer are serialized
@@ -515,7 +524,7 @@ impl ConnectedNodes {
         Ok(Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             authority: Arc::new(Mutex::new(HashMap::new())),
-            live_takeover: Arc::new(Mutex::new(HashSet::new())),
+            live_takeover: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(any(test, feature = "test-faults"))]
             authority_contention: Arc::new(Mutex::new(HashMap::new())),
             boot_epoch,
@@ -534,7 +543,7 @@ impl ConnectedNodes {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             authority: Arc::new(Mutex::new(HashMap::new())),
-            live_takeover: Arc::new(Mutex::new(HashSet::new())),
+            live_takeover: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(any(test, feature = "test-faults"))]
             authority_contention: Arc::new(Mutex::new(HashMap::new())),
             boot_epoch,
@@ -554,15 +563,28 @@ impl ConnectedNodes {
     }
 
     /// True when the host's current session was installed over an older LIVE
-    /// socket (a socket takeover, not a reconnect-after-disconnect). The new
-    /// session must not inherit the old one's in-flight Landing grants.
-    pub(crate) async fn host_had_live_takeover(&self, host_id: &str) -> bool {
-        self.live_takeover.lock().await.contains(host_id)
+    /// socket AND `generation` is exactly that takeover generation — the check
+    /// a post-hello Landing decision makes under the per-host guard.
+    pub(crate) async fn host_had_live_takeover(&self, host_id: &str, generation: u64) -> bool {
+        self.live_takeover.lock().await.get(host_id) == Some(&generation)
     }
 
-    /// Clear the live-takeover marker when the session that took over ends.
-    pub(crate) async fn clear_live_takeover(&self, host_id: &str) {
-        self.live_takeover.lock().await.remove(host_id);
+    /// Clear the takeover mark by GENERATION under the already-held per-host
+    /// authority guard. Only the removal of the matching CURRENT session clears
+    /// it: a stale OLDER socket tearing down after a newer hello must not wipe
+    /// the mark (r16 item 6). Returns true when the mark was cleared here.
+    pub(crate) async fn clear_live_takeover_generation_locked(
+        &self,
+        host_id: &str,
+        generation: u64,
+    ) -> bool {
+        let mut live_takeover = self.live_takeover.lock().await;
+        if live_takeover.get(host_id) == Some(&generation) {
+            live_takeover.remove(host_id);
+            true
+        } else {
+            false
+        }
     }
 
     /// Call a JSON-RPC method on a connected Node. `Ok(None)` = not connected.
@@ -651,9 +673,14 @@ impl ConnectedNodes {
         let displaced_live = inner.contains_key(&host_id);
         inner.insert(host_id.clone(), NodeSlot { generation, link });
         if displaced_live {
-            self.live_takeover.lock().await.insert(host_id);
+            // Keyed by the NEW (takeover) generation; only that session's
+            // guarded removal clears it (r16 item 6).
+            self.live_takeover.lock().await.insert(host_id, generation);
         }
-        InsertedSession { generation }
+        InsertedSession {
+            generation,
+            displaced_live,
+        }
     }
 
     /// Test-only: latch for "an insert is waiting on this host's authority
@@ -683,20 +710,44 @@ impl ConnectedNodes {
     pub async fn remove(&self, host_id: &str) {
         // Exclusive with in-flight authority decisions, like insert (r15 item 3).
         let _authority = self.host_authority(host_id).await.write_owned().await;
-        self.inner.lock().await.remove(host_id);
+        let removed_generation = {
+            let mut inner = self.inner.lock().await;
+            let generation = inner.get(host_id).map(|slot| slot.generation);
+            if generation.is_some() {
+                inner.remove(host_id);
+            }
+            generation
+        };
+        // Clear the takeover mark only if it names the session actually
+        // removed (r16 item 6).
+        if let Some(generation) = removed_generation {
+            self.clear_live_takeover_generation_locked(host_id, generation)
+                .await;
+        }
     }
 
     /// Drop the session only if `generation` is still current (stale WS must not offline a live host).
     pub async fn remove_generation(&self, host_id: &str, generation: u64) -> bool {
         let _authority = self.host_authority(host_id).await.write_owned().await;
-        let mut inner = self.inner.lock().await;
-        match inner.get(host_id) {
-            Some(slot) if slot.generation == generation => {
-                inner.remove(host_id);
-                true
+        let removed = {
+            let mut inner = self.inner.lock().await;
+            match inner.get(host_id) {
+                Some(slot) if slot.generation == generation => {
+                    inner.remove(host_id);
+                    true
+                }
+                _ => false,
             }
-            _ => false,
+        };
+        if removed {
+            // The guard is still held; clear the mark only when it was this
+            // exact generation. A stale older socket's remove_generation(old)
+            // matched nothing and never reaches here, so it cannot clear a
+            // newer takeover mark (r16 item 6).
+            self.clear_live_takeover_generation_locked(host_id, generation)
+                .await;
         }
+        removed
     }
 
     /// Carrier for a connected host, if any.
@@ -785,6 +836,67 @@ mod session_tests {
         // Different hosts draw independent values from the same global counter.
         let d = nodes.insert("other".into(), dead_link()).await.generation;
         assert_ne!(c, d);
+    }
+
+    /// r16 item 6: the live-takeover mark is keyed by the TAKEOVER generation
+    /// and survives a STALE older socket tearing down AFTER the new hello.
+    /// Regression for the old unconditional `clear_live_takeover(host)` in the
+    /// teardown path: A displaced B while still live; A then ended; the old code
+    /// wiped the host's mark, after which B was treated as a genuine reconnect
+    /// and inherited A's in-flight Landing grants.
+    #[tokio::test]
+    async fn a_stale_socket_teardown_does_not_clear_a_newer_takeover_mark() {
+        let nodes = ConnectedNodes::for_tests(1);
+        // A connects.
+        let a = nodes.insert("h".into(), dead_link()).await.generation;
+        assert!(nodes.is_current_session("h", a).await);
+        // B takes over while A is still live: the takeover mark names B.
+        let inserted_b = nodes.insert("h".into(), dead_link()).await;
+        let b = inserted_b.generation;
+        assert!(inserted_b.displaced_live, "B displaced a live A");
+        assert_ne!(a, b);
+        assert!(
+            nodes.host_had_live_takeover("h", b).await,
+            "B is the recorded live takeover"
+        );
+
+        // The OLD socket A tears down AFTER B's hello. Its guarded removal is
+        // stale and must NOT clear B's takeover mark.
+        let stale = nodes.remove_generation("h", a).await;
+        assert!(!stale, "A is no longer current; its removal is stale");
+        assert!(
+            nodes.host_had_live_takeover("h", b).await,
+            "A's stale teardown must not clear B's takeover mark"
+        );
+        assert!(
+            nodes.is_current_session("h", b).await,
+            "B is still the live session after A's teardown"
+        );
+
+        // A FULL disconnect of B (the marked generation) clears the mark again.
+        assert!(nodes.remove_generation("h", b).await);
+        assert!(!nodes.host_had_live_takeover("h", b).await);
+        assert!(!nodes.is_current_session("h", b).await);
+    }
+
+    /// r16 item 6: a genuine reconnect into an EMPTY slot is not a takeover and
+    /// therefore rebinds (displaced_live=false), and its teardown leaves no
+    /// stale mark.
+    #[tokio::test]
+    async fn a_genuine_reconnect_after_full_disconnect_is_not_a_takeover() {
+        let nodes = ConnectedNodes::for_tests(1);
+        let a = nodes.insert("h".into(), dead_link()).await.generation;
+        assert!(nodes.remove_generation("h", a).await);
+        let inserted_b = nodes.insert("h".into(), dead_link()).await;
+        assert!(
+            !inserted_b.displaced_live,
+            "reconnect into an empty slot is not a takeover"
+        );
+        assert!(
+            !nodes
+                .host_had_live_takeover("h", inserted_b.generation)
+                .await
+        );
     }
 }
 

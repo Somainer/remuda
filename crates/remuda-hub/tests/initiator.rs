@@ -4088,6 +4088,83 @@ async fn the_granted_merge_is_bound_in_grant_verdict_and_evidence_writers() {
     assert_eq!(landed["mergeSha"], json!(merge), "{landed}");
 }
 
+/// r16 item 6: when a NEW carrier B takes over while the older socket A is
+/// still live, B is a live TAKEOVER and must NOT inherit A's in-flight Landing
+/// grant. The post-hello reconciliation runs on B (its gate.resolveLanding
+/// probe completes), but the row's bound dispatch_session stays A — even after
+/// the stale A socket tears down. A genuine reconnect (empty slot) would
+/// rebind; the takeover must not.
+#[tokio::test]
+async fn a_live_takeover_socket_does_not_inherit_the_old_landing_grant() {
+    let (ctx, node_a) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let job_id = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let session_a = ctx.hub.test_node_session(&ctx.host).await.expect("A live");
+    let merge = "ababababababababababababababababababababab";
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge, session_a)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+    assert_eq!(
+        ctx.hub.test_gate_dispatch_session(&job_id).await.unwrap(),
+        Some(session_a as i64)
+    );
+
+    // B connects while A is STILL OPEN (a socket-level takeover).
+    let mut node_b = FakeNode::reconnect(&ctx.hub, &ctx.creds, &ctx.workspace)
+        .await
+        .unwrap();
+    let session_b = ctx
+        .hub
+        .test_node_session(&ctx.host)
+        .await
+        .expect("B became current");
+    assert_ne!(session_a, session_b);
+
+    // Latch B's post-hello task to completion via its forced Landing probe.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout(Duration::from_millis(200), node_b.next_frame()).await {
+            Ok((method, _)) if method == "gate.resolveLanding" => break,
+            Ok(_) => {}
+            Err(_) => assert!(
+                std::time::Instant::now() < deadline,
+                "B's post-hello Landing probe never ran"
+            ),
+        }
+    }
+
+    // B's post-hello reconciliation completed WITHOUT inheriting A's grant:
+    // the Landing is still bound to session A.
+    assert_eq!(
+        ctx.hub.test_gate_dispatch_session(&job_id).await.unwrap(),
+        Some(session_a as i64),
+        "a live takeover must not rebind the old Landing grant to B"
+    );
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("landing"), "{doc}");
+
+    // The stale A socket now tears down AFTER B's hello. Nothing rebinds.
+    node_a.disconnect();
+    assert_eq!(
+        ctx.hub.test_gate_dispatch_session(&job_id).await.unwrap(),
+        Some(session_a as i64),
+        "the stale A teardown must not transfer the Landing grant to B"
+    );
+    assert_eq!(
+        ctx.hub.test_node_session(&ctx.host).await,
+        Some(session_b),
+        "B remains the live carrier"
+    );
+}
+
 /// Shared setup for the r15 item 4 suite: a Landing parked outcome-unknown with
 /// a known granted (attempt, epoch, merge) tuple on the live fake carrier.
 async fn unknown_landing_fixture(ctx: &Ctx, node: &FakeNode) -> (String, String, u64, String) {

@@ -780,6 +780,18 @@ impl RunningHub {
         Ok(job.map(|job| serde_json::to_value(job).expect("gate job serializes")))
     }
 
+    /// Test-only: the Hub-only carrier session a gate job is currently
+    /// dispatched/granted to (r16 item 6).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_gate_dispatch_session(&self, job_id: &str) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .gate_job_dispatch_session(job_id)
+            .await?)
+    }
+
     /// Test-only: the ordered audit-log actions recorded for one gate job id
     /// (e.g. `gate.running`, `gate.landed`).
     #[doc(hidden)]

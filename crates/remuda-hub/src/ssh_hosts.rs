@@ -575,6 +575,8 @@ async fn bridge_stdio_session<T: NodeTransport>(
     let pending = crate::transport::new_pending_rpcs();
     let mut host_id = None;
     let mut hello_done = false;
+    // r16 item 6: capture the hello-time takeover flag for post-hello rebind.
+    let mut hello_displaced_live = false;
     let mut params = hello["params"].clone();
     params["label"] = json!(record.label);
     params["transport"] = json!("ssh-stdio");
@@ -588,6 +590,7 @@ async fn bridge_stdio_session<T: NodeTransport>(
         &mut host_id,
         &mut hello_done,
         generation,
+        &mut hello_displaced_live,
         "node.hello",
         params,
         &out_tx,
@@ -617,7 +620,12 @@ async fn bridge_stdio_session<T: NodeTransport>(
     // an SSH-managed daemon keeps a stale unbinding mark until ITS process
     // restarts. Both spawn after the reply so their frames cannot overtake
     // it on the bounded out_rx channel.
-    crate::ws::spawn_post_hello_tasks(state, managed.id.clone());
+    crate::ws::spawn_post_hello_tasks(
+        state,
+        managed.id.clone(),
+        generation.unwrap_or(0),
+        hello_displaced_live,
+    );
     state
         .store
         .ssh_status(managed.id.clone(), "online", None)
@@ -642,7 +650,7 @@ async fn bridge_stdio_session<T: NodeTransport>(
                     continue;
                 }
                 let method = frame["method"].as_str().unwrap_or("");
-                let result = crate::ws::handle_node_method(state, &session_token, &mut host_id, &mut hello_done, generation, method, frame["params"].clone(), &out_tx, &pending).await;
+                let result = crate::ws::handle_node_method(state, &session_token, &mut host_id, &mut hello_done, generation, &mut hello_displaced_live, method, frame["params"].clone(), &out_tx, &pending).await;
                 if let Some(id) = frame.get("id").filter(|id| !id.is_null()) {
                     let reply = match result { Ok(Some(value)) => crate::error::rpc_ok(id.clone(), value), Ok(None) => continue, Err(error) => crate::error::rpc_error(id.clone(), -32000, &error.to_string()) };
                     tokio::time::timeout(Duration::from_secs(15), carrier.send_json(&reply)).await??;

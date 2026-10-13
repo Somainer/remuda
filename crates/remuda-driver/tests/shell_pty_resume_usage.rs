@@ -17,7 +17,24 @@ use remuda_driver::shell_pty::{AgentLaunch, HookConfig, ShellPtyDriver, ShellPty
 use remuda_driver::{
     Delegation, Driver, DriverKind, LaunchOrigin, ProviderHealth, ProviderKind, ProviderProfile,
 };
-use remuda_protocol::{AgentKind, InstanceId, InstanceSpec, ObservationPayload};
+use remuda_protocol::{
+    AgentKind, ContentBlock, DriverInput, InputOrigin, InstanceId, InstanceSpec,
+    ObservationPayload, PromptInput, PromptMode, TextBlock,
+};
+
+/// A pinned fake codex: answers the binary pin's --version probe, ignores the
+/// codex argv, and stays alive so the resumed run can accept a real prompt.
+fn fake_codex_script(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-codex-resume-usage.sh");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\ncase \"$1\" in --version|version) echo 'codex 0.154.0'; exit 0;; esac\nexec sleep 120\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
 
 fn options_for(dir: &Path, instance_id: &InstanceId, spec: &InstanceSpec) -> ShellPtyOptions {
     let instance_dir = dir.join(instance_id.as_id().as_str());
@@ -37,9 +54,10 @@ fn options_for(dir: &Path, instance_id: &InstanceId, spec: &InstanceSpec) -> She
             launch_dir: instance_dir.join("launch"),
             native_home: dir.join("codex-native-home"),
             // The child never has to be a real codex: the file-tail adapter
-            // reads the shadow CODEX_HOME directly. /bin/sh parses the codex
-            // argv and exits; the close/stop ladder handles an exited group.
-            binary: Some(PathBuf::from("/bin/sh")),
+            // reads the shadow CODEX_HOME directly. The script answers the
+            // version pin and sleeps, so the resumed run is alive to receive
+            // the production prompt send below.
+            binary: Some(fake_codex_script(dir)),
             origin: LaunchOrigin::Human,
             native_home_managed: true,
             settings_overlay: None,
@@ -48,7 +66,7 @@ fn options_for(dir: &Path, instance_id: &InstanceId, spec: &InstanceSpec) -> She
     options.instance_id = Some(instance_id.clone());
     options.hooks = Some(HookConfig {
         instance_dir,
-        // Never executed by the /bin/sh child; embedded only in hook config.
+        // Never executed by the fake child; embedded only in hook config.
         relay_binary: PathBuf::from("/bin/true"),
         tui: remuda_driver::launch::TuiMode::Default,
     });
@@ -66,9 +84,10 @@ fn spec_for(dir: &Path) -> InstanceSpec {
 }
 
 /// Append a real 0.154-shaped rollout with one priced token_usage_record into
-/// the hook session's shadow CODEX_HOME, plus the name index the adapter
-/// follows when no SessionStart hook confirmed a session (this /bin/sh
-/// child never sends one).
+/// the hook session's shadow CODEX_HOME (plus the name index), whose first
+/// user message is the prompt the test dispatches through the real driver
+/// send. The shadow adapter binds it off the resume floor + prompt evidence
+/// (c-usagefu r14 item 5).
 fn append_native_usage_after_resume(dir: &Path, instance_id: &InstanceId, session_id: &str) {
     let home = dir
         .join(instance_id.as_id().as_str())
@@ -130,6 +149,21 @@ async fn close_resume_adopted_tail_emits_native_usage_appended_after_resume() {
 
     // Native usage lands in the shadow home ONLY AFTER resume.
     append_native_usage_after_resume(dir.path(), &instance_id, session_id);
+
+    // c-usagefu r14 item 5: the shadow adapter discovers off the resume floor
+    // plus the REAL dispatched prompt (the rollout's first user message is
+    // "go"), not the newest session_index guess.
+    driver
+        .send(DriverInput::Prompt(Box::new(PromptInput {
+            mode: PromptMode::NewTurn,
+            blocks: vec![ContentBlock::Text(Box::new(TextBlock {
+                text: "go".into(),
+            }))],
+            origin: InputOrigin::Human,
+            native_client_message_id: "r9-item7".into(),
+        })))
+        .await
+        .expect("the resumed live child accepts the prompt");
 
     // The adopted tail must surface the Usage observation on the resumed
     // run's channel. Adapter ticks are 250 ms; allow a generous budget.

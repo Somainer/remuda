@@ -792,6 +792,23 @@ impl RunningHub {
             .await?)
     }
 
+    /// Test-only: bind a gate job's dispatch/grant session to an arbitrary
+    /// value (r16 item 7 — makes a snapshot settle writer refuse while the
+    /// remote probe still establishes landed).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_set_gate_dispatch_session_raw(
+        &self,
+        job_id: &str,
+        session: u64,
+    ) -> anyhow::Result<()> {
+        self.store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
+            .set_gate_dispatch_session(job_id, session)
+            .await?;
+        Ok(())
+    }
+
     /// Test-only: the ordered audit-log actions recorded for one gate job id
     /// (e.g. `gate.running`, `gate.landed`).
     #[doc(hidden)]

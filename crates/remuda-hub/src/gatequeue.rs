@@ -916,6 +916,20 @@ async fn resolve_project_job(
                 if landed.state == GateJobState::Landed {
                     return Ok(Json(json!(landed)));
                 }
+                // r16 item 7: the exact merge was OBSERVED on the remote but
+                // the snapshot-settling writer refused (the live row advanced
+                // under the probe — a newer attempt/grant). The operator's
+                // failed/requeue must NEVER run from here (it would discard
+                // the established fact and requeue/fail a push that landed).
+                // Keep the Landing and hand the operator a 409 carrying the
+                // current state, exactly like any authority mismatch.
+                drop(guard);
+                return Err(HubError::Conflict(format!(
+                    "the remote probe established the exact granted merge landed, but the live row \
+                     no longer matches that snapshot (now {}); the Landing was kept — refresh and \
+                     resolve the current attempt",
+                    landed.state.as_str()
+                )));
             }
         }
         drop(guard);

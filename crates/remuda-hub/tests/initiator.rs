@@ -4381,6 +4381,60 @@ async fn an_established_landed_probe_wins_over_an_operator_failed_resolution() {
     );
 }
 
+/// r16 item 7: when the probe OBSERVES the exact merge landed on the remote but
+/// the snapshot-settling writer refuses (the live row's bound grant session no
+/// longer matches the responder), the operator resolution must not fall through
+/// to failed/requeue and discard the fact. The request returns 409 and the row
+/// stays Landing holding the landed merge.
+#[tokio::test]
+async fn an_observed_landed_fact_whose_settlement_is_refused_returns_conflict_not_failed() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let (job_id, merge, session, epoch) = unknown_landing_fixture(&ctx, &node).await;
+    // Rebind the persisted grant to a DIFFERENT same-boot session: the live
+    // carrier (answering the probe) is still the fixture session, so the
+    // snapshot settle writer refuses while the probe establishes landed.
+    ctx.hub
+        .test_set_gate_dispatch_session_raw(&job_id, session.wrapping_add(1))
+        .await
+        .unwrap();
+    node.set_resolve_reply(json!({
+        "jobId": job_id, "status": "landed",
+        "baseSha": "0123456789abcdef0123456789abcdef01234567",
+    }))
+    .await;
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &format!("/v1/projects/{}/gate/jobs/{job_id}/resolve", ctx.project),
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 1,
+                "expectedSessionEpoch": epoch,
+                "expectedMergeSha": merge,
+                "rationale": "operator believed it failed while the remote proved landed",
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, 409,
+        "an observed landed fact the writer cannot settle is a conflict, never failed: {reply}"
+    );
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("landing"),
+        "the Landing is kept, not discarded to failed/requeue: {doc}"
+    );
+    assert_eq!(doc["mergeSha"], json!(merge), "{doc}");
+    assert!(
+        doc["landingOutcomeUnknown"] == json!(true),
+        "the row stays parked outcome-unknown for a valid later transition: {doc}"
+    );
+}
+
 /// r15 item 5: a Landing whose bounded recovery window expires WHILE the lane
 /// carrier is disconnected is still marked outcome-unknown — the expiry
 /// evaluation happens before the connectivity check. The row keeps Landing and

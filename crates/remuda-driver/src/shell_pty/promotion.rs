@@ -1002,6 +1002,11 @@ pub(super) fn spawn(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut closing = false;
         let mut drain_notified = false;
+        // c-ctxusage r21 item 3: test-only gate that holds NORMAL samples
+        // (parking before process sampling) while letting close/live-drain/
+        // shutdown wakeups pass. None in production and without test-faults.
+        #[cfg(feature = "test-faults")]
+        let mut normal_gate = faults.as_ref().map(|faults| faults.normal_gate_receiver());
         loop {
             tokio::select! {
                 // Wakes close between ticks; a tick still drives normal polls.
@@ -1059,6 +1064,39 @@ pub(super) fn spawn(
                 }
                 drain_notified = false;
                 continue;
+            }
+            // c-ctxusage r21 item 3: while the normal-sample gate is armed,
+            // park BEFORE process sampling. The wait is async-aware and, like
+            // the top select, releases on shutdown and live-drain (close arm)
+            // wakeups — only the normal tick/sample path is held, so a close
+            // issued while the gate is engaged still takes the closing branch.
+            #[cfg(feature = "test-faults")]
+            if let (Some(faults), Some(gate)) = (faults.as_ref(), normal_gate.as_mut())
+                && faults.normal_gate_is_armed()
+            {
+                faults.note_normal_sample_parked();
+                tokio::select! {
+                    biased;
+                    result = shutdown.changed() => match result {
+                        Ok(()) => closing = *shutdown.borrow_and_update(),
+                        Err(_closed) => break,
+                    },
+                    _ = live_drain.notify.notified() => {
+                        drain_notified = true;
+                    }
+                    released = gate.wait_for(|open| *open) => {
+                        let _ = released;
+                    }
+                }
+                // Re-run the epoch/closing gates after the park before any
+                // sample: shutdown or a close arm must never fall through to
+                // normal sampling.
+                if closing || state.closed.load(Ordering::SeqCst) || events.is_closed() {
+                    break;
+                }
+                if live_drain.is_closing() {
+                    continue;
+                }
             }
             let Sample { rows, mut found } = sample(&state, table.as_ref(), alias.as_ref()).await;
             // Detection can still be late: `ps` has not caught the exec yet,

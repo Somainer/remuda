@@ -86,11 +86,24 @@ pub(crate) struct FaultState {
     /// Total promotion poller spawns across runs (c-ctxusage r20 item 2):
     /// unlike the one-shot `promoter_started` bool this counts run 1 AND the
     /// resumed run 2, so a test can prove run 2's poller spawned while the
-    /// predecessor was still parked in finalise.
+    /// predecessor was still parked in finalise. Compiled only with
+    /// `test-faults` (zero cost in production, c-ctxusage r21 item 2).
     #[cfg(feature = "test-faults")]
     promoter_starts: Mutex<u64>,
     #[cfg(feature = "test-faults")]
     promoter_starts_cv: Condvar,
+    /// NORMAL-sample gate (c-ctxusage r21 item 3): while armed the poller may
+    /// not run a normal process sample, but close/drain/shutdown wakeups still
+    /// pass. Async-aware (a `watch` future), so parking never blocks a runtime
+    /// worker. Release sets the watch true.
+    #[cfg(feature = "test-faults")]
+    normal_gate_armed: AtomicBool,
+    #[cfg(feature = "test-faults")]
+    normal_gate_tx: tokio::sync::watch::Sender<bool>,
+    #[cfg(feature = "test-faults")]
+    normal_parked: Mutex<u64>,
+    #[cfg(feature = "test-faults")]
+    normal_parked_cv: Condvar,
     skip_cooperative_finalise: AtomicBool,
     /// Overrides the driver's bounded cooperative-close wait so an abort test
     /// crosses the bound deterministically without the production 15 s / 2 s
@@ -201,6 +214,14 @@ impl FaultState {
             promoter_starts: Mutex::new(0),
             #[cfg(feature = "test-faults")]
             promoter_starts_cv: Condvar::new(),
+            #[cfg(feature = "test-faults")]
+            normal_gate_armed: AtomicBool::new(false),
+            #[cfg(feature = "test-faults")]
+            normal_gate_tx: tokio::sync::watch::channel(false).0,
+            #[cfg(feature = "test-faults")]
+            normal_parked: Mutex::new(0),
+            #[cfg(feature = "test-faults")]
+            normal_parked_cv: Condvar::new(),
             skip_cooperative_finalise: AtomicBool::new(false),
             close_timeout_ms: AtomicU64::new(0),
             pending_capacity: AtomicU64::new(0),
@@ -554,6 +575,41 @@ impl FaultState {
         *guard >= n
     }
 
+    /// A receiver on the normal-sample release gate (c-ctxusage r21 item 3).
+    /// The poll loop awaits this (alongside shutdown/drain) only while the
+    /// gate is armed.
+    #[cfg(feature = "test-faults")]
+    pub(crate) fn normal_gate_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.normal_gate_tx.subscribe()
+    }
+
+    /// Whether the normal-sample gate currently parks the poll loop.
+    #[cfg(feature = "test-faults")]
+    pub(crate) fn normal_gate_is_armed(&self) -> bool {
+        self.normal_gate_armed.load(Ordering::SeqCst)
+    }
+
+    /// Count one normal-sample park and acknowledge it (c-ctxusage r21
+    /// item 3): a test waits for this before issuing the close so it knows
+    /// both pollers are holding normal samples.
+    #[cfg(feature = "test-faults")]
+    pub(crate) fn note_normal_sample_parked(&self) {
+        let mut parked = self
+            .normal_parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *parked += 1;
+        self.normal_parked_cv.notify_all();
+    }
+
+    /// Release the normal-sample gate and disarm it (c-ctxusage r21 item 3):
+    /// every parked poller resumes normal sampling.
+    #[cfg(feature = "test-faults")]
+    pub(crate) fn release_normal_samples_state(&self) {
+        self.normal_gate_armed.store(false, Ordering::SeqCst);
+        let _ = self.normal_gate_tx.send(true);
+    }
+
     /// The injected bounded-pending capacity override, if a test armed one.
     pub(crate) fn pending_capacity(&self) -> Option<usize> {
         match self.pending_capacity.load(Ordering::SeqCst) {
@@ -894,6 +950,53 @@ impl TranscriptFaults {
     /// (c-ctxusage r20 item 2).
     pub fn wait_promoter_starts(&self, n: u64, timeout: Duration) -> bool {
         self.inner.wait_promoter_starts_state(n, timeout)
+    }
+
+    /// Hold NORMAL promotion samples (c-ctxusage r21 item 3). Close, live
+    /// drain and shutdown wakeups still pass while armed; the poll loop parks
+    /// at an async gate until [`Self::release_normal_samples`].
+    pub fn arm_normal_sample_gate(&self) {
+        // Re-arm the watch if a previous run already released it.
+        if *self.inner.normal_gate_tx.borrow() {
+            let _ = self.inner.normal_gate_tx.send(false);
+        }
+        self.inner.normal_gate_armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Resume normal sampling (c-ctxusage r21 item 3).
+    pub fn release_normal_samples(&self) {
+        self.inner.release_normal_samples_state();
+    }
+
+    /// Block until `n` normal samples parked, bounded (c-ctxusage r21 item 3).
+    pub fn wait_normal_samples_parked(&self, n: u64, timeout: Duration) -> bool {
+        let guard = self
+            .inner
+            .normal_parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (guard, _) = self
+            .inner
+            .normal_parked_cv
+            .wait_timeout_while(guard, timeout, |parked| *parked < n)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard >= n
+    }
+
+    /// Whether the normal-sample gate is armed (c-ctxusage r21 item 3).
+    #[must_use]
+    pub fn normal_sample_gate_armed(&self) -> bool {
+        self.inner.normal_gate_is_armed()
+    }
+
+    /// Count of normal samples that have parked (c-ctxusage r21 item 3).
+    #[must_use]
+    pub fn normal_sample_park_count(&self) -> u64 {
+        *self
+            .inner
+            .normal_parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Block until at least `n` promotion polls have bound a transcript

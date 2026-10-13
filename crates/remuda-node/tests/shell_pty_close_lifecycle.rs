@@ -1616,35 +1616,45 @@ async fn a_natural_exit_before_resume_retires_the_predecessor_poller() {
         .expect("run-2 drainer panicked");
 }
 
-/// c-ctxusage r19 item 1 / r20 item 2 (acknowledged barriers): same-driver
-/// resume after a natural exit must spawn the new run on its OWN detection
-/// slots BEFORE retiring the predecessor, and must not adopt run 2's slot as
-/// current until the predecessor finalise has finished.
+/// c-ctxusage r19/r20/r21: same-driver resume after a natural exit must spawn
+/// the new run on its OWN detection AND binding state BEFORE retiring the
+/// predecessor, and a post-death normal sample must never race the
+/// predecessor's finalise.
 ///
-/// Hard, acknowledged ordering (every wait fails the test on timeout):
-///  1. run 1 binds and dies naturally; its terminal finalise parks on the
-///     finish gate only once resume retires it.
-///  2. resume spawns run 2 and the driver ACK-waits for run 2's poller before
-///     retiring; retirement then parks the predecessor in finalise.
-///  3. AT THAT PARK: two pollers have started (count == 2) AND the driver's
-///     CURRENT promoted slot is still run 1's (adoption has not swapped it).
-///  4. release: predecessor retires, run 2's slots are adopted and run 2
-///     binds; the current slot id has changed to run 2's and is promoted.
-///  5. close() before another normal sample: the PROMOTED draining path
-///     delivers run 2's tagged termination usage exactly once.
+/// Deterministic, acknowledged barriers (c-ctxusage r21 item 3): a test-only
+/// gate holds NORMAL samples — while letting shutdown/live-drain/close wakeups
+/// through — engaged before run 1 is killed, so no post-death demote sample can
+/// beat the predecessor finalise park.
 ///
-/// With the ordering reverted (retire-before-spawn) only ONE poller exists at
-/// the park — run 2 is not spawned — so the count == 2 hard assertion fails
-/// deterministically.
+///  1. run 1 binds; BOTH the normal-sample gate and the finish gate are armed;
+///     run 1 is killed; its post-death poll parks at the normal gate.
+///  2. resume spawns run 2; the driver ACK-waits for run 2's poller (two
+///     poller starts) before retiring; run 2's first normal sample parks at
+///     the same gate; retirement parks run 1 in its terminal finalise.
+///  3. HARD assertions at that park: exactly two pollers started, one more
+///     normal sample parked since resume, the current promoted slot is still
+///     run 1's, and run 2's fresh BindingHandle is NOT bound to run 1's
+///     transcript (c-ctxusage r21 item 1).
+///  4. release the finish gate: predecessor retires and run 2's handles are
+///     adopted. Release the normal gate: run 2 binds through its OWN handle;
+///     the current slot changes and is promoted.
+///  5. re-arm the normal gate and close immediately: only shutdown/drain
+///     wakeups reach the poller; the PROMOTED draining close delivers run 2's
+///     tagged termination usage exactly once.
+///
+/// Reverting the spawn/retire ordering leaves one poller at the park (hard
+/// count failure); reverting per-run bindings leaves run 2 bound to the
+/// predecessor's transcript at step 3.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retirement_after_run2_binds_does_not_clear_run2_promotion() {
     use remuda_driver::test_faults::TranscriptFaults;
     let (_dir, workspace, _transcript, events_path, driver) = p1_promoted_layout_tagged();
     let driver = std::sync::Arc::new(driver);
     let faults = TranscriptFaults::new();
+    // Finish gate parks the predecessor terminal finalise during retirement;
+    // the normal-sample gate freezes every normal poll (close/drain/shutdown
+    // still pass). A short retire bound keeps any failure fast.
     faults.arm_finish_gate();
-    // Bound a reverted-order run's stuck predecessor join so a RED run cannot
-    // hang; the fixed path completes the join on release well inside this.
     faults.arm_close_timeout(Duration::from_secs(5));
     driver.set_test_faults(faults.clone());
 
@@ -1681,8 +1691,14 @@ async fn retirement_after_run2_binds_does_not_clear_run2_promotion() {
         .expect("run 1 never bound")
         .expect("bound oneshot closed without firing");
     let predecessor_slot = driver.test_promoted_slot_id();
-    assert_ne!(predecessor_slot, 0, "run 1 owns a promoted slot");
+    assert!(
+        driver.test_bindings_is_bound(),
+        "run 1 established a binding claim"
+    );
 
+    // Freeze normal samples BEFORE the death: the post-death demote tick (and
+    // run 2's first tick) park here instead of racing the finalise.
+    faults.arm_normal_sample_gate();
     let pid1 = last_session_pid(&events_path);
     assert!(
         std::process::Command::new("kill")
@@ -1696,8 +1712,14 @@ async fn retirement_after_run2_binds_does_not_clear_run2_promotion() {
         .await
         .expect("the natural native_exit was never observed")
         .expect("exit oneshot closed without firing");
+    // The predecessor's post-death normal sample is held.
+    assert!(
+        faults.wait_normal_samples_parked(1, Duration::from_secs(20)),
+        "run 1's post-death normal sample never parked"
+    );
+    let parked_before_resume = faults.normal_sample_park_count();
 
-    // ---- resume: spawns run 2, then parks the predecessor ---------------
+    // ---- resume ---------------------------------------------------------
     let mut resume = tokio::spawn({
         let driver = driver.clone();
         async move {
@@ -1711,32 +1733,67 @@ async fn retirement_after_run2_binds_does_not_clear_run2_promotion() {
     });
     assert!(
         faults.wait_finish_entered(),
-        "the predecessor terminal finalise never parked (resume did not retire it)"
+        "the predecessor terminal finalise never parked during retirement"
     );
 
-    // HARD park assertions (no soft waits): run 2's poller already exists AND
-    // the driver's current slot is still the predecessor's (no adoption yet).
+    // HARD park assertions.
     assert_eq!(
         faults.promoter_start_count(),
         2,
-        "at the predecessor-finalise park run 2's poller must already be          spawned (spawn-before-retire); reverting the order leaves exactly one poller here"
+        "at the park both poller tasks exist (spawn-before-retire); reverting          the order leaves exactly one here"
+    );
+    assert!(
+        faults.wait_normal_samples_parked(parked_before_resume + 1, Duration::from_secs(20)),
+        "run 2's first normal sample never parked while the gate was held"
     );
     assert_eq!(
         driver.test_promoted_slot_id(),
         predecessor_slot,
-        "the driver's CURRENT slot must still be run 1's at the park: run 2's          bind must not become the current promotion before predecessor retirement completes"
+        "the current promoted slot is still run 1's at the park"
     );
+    // The current BINDING handle is still run 1's here (run 2's fresh handle
+    // is adopted only after retirement); the per-run-binding assertion is made
+    // below once adoption has happened but before run 2 has sampled.
 
-    // Release the parked finalise; retirement completes, slots are adopted and
-    // resume returns.
+    // Release the predecessor finalise: retirement completes and run 2's
+    // handles are adopted; resume returns.
     faults.release();
     let handle2 = tokio::time::timeout(Duration::from_secs(30), &mut resume)
         .await
         .expect("resume hung past its bound")
         .expect("resume task panicked")
         .expect("resume completes after predecessor retirement");
+    assert!(
+        !driver.test_bindings_is_bound(),
+        "run 2's adopted handle is still unbound before its own first sample"
+    );
 
-    // ---- run 2 binds through its adopted slot ---------------------------
+    // Let run 2 run its own normal sample(s) and bind via its OWN handle.
+    faults.release_normal_samples();
+    assert!(
+        faults.wait_promoter_binds(2, Duration::from_secs(20)),
+        "run 2 never bound through its own BindingHandle"
+    );
+    assert_ne!(
+        driver.test_promoted_slot_id(),
+        predecessor_slot,
+        "the current slot is run 2's after adoption"
+    );
+    assert_eq!(
+        driver.promoted_kind(),
+        Some(AgentKind::Claude),
+        "run 2's promotion is current"
+    );
+    assert!(
+        driver.test_bindings_is_bound(),
+        "run 2's handle is now bound"
+    );
+
+    // Re-freeze normal samples and close immediately: the promoted close must
+    // run purely on shutdown/drain wakeups and still drain the writer.
+    faults.arm_normal_sample_gate();
+
+    // ---- run 2 events + close ------------------------------------------
     let mut events_rx2 = handle2.into_events();
     let (bound2_tx, bound2_rx) = tokio::sync::oneshot::channel();
     let bound2_tx = std::sync::Mutex::new(Some(bound2_tx));
@@ -1762,21 +1819,7 @@ async fn retirement_after_run2_binds_does_not_clear_run2_promotion() {
         .await
         .expect("run 2 never bound")
         .expect("run-2 bound oneshot closed without firing");
-    assert_ne!(
-        driver.test_promoted_slot_id(),
-        predecessor_slot,
-        "after adoption the current slot is run 2's own slot"
-    );
-    assert_eq!(
-        driver.promoted_kind(),
-        Some(AgentKind::Claude),
-        "run 2's promotion is the current one before close"
-    );
 
-    // ---- close immediately (before run 2's next normal sample) ----------
-    // The parked predecessor is gone; only run 2's poller remains, and the
-    // promoted draining close drives it through the closing branch (shutdown
-    // and close-drain wakeups) regardless of normal sampling.
     tokio::time::timeout(Duration::from_secs(25), driver.close())
         .await
         .expect("close hung past its bound")

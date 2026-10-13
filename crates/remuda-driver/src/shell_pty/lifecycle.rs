@@ -1232,17 +1232,38 @@ pub(crate) fn process_running(pid: i32) -> bool {
     })
 }
 
-/// Non-Linux unix: no `/proc` start time; the signal-0/`ps` disposition is the
-/// evidence, with Unknown kept alive (Ruling F). The struct itself is the
+/// Map one observed non-`/proc` child disposition to the pid-only,
+/// Unknown-strength SURVIVOR decision (COORDINATOR RULING F', c-usagefu r16
+/// item 5).
+///
+/// macOS has no safe start-time API (unsafe libproc FFI is forbidden), so a
+/// survivor identity is pid-only. The entry stays ALIVE unless the pid is
+/// CONFIRMED gone — only [`ChildDisposition::Gone`], which requires a
+/// signal-0 `ESRCH`:
+///
+/// * [`ChildDisposition::Zombie`] still answers signal 0 (it is not ESRCH)
+///   and a pid-only identity cannot prove the corpse is the captured process,
+///   so it is kept;
+/// * a reused pid answers signal 0 as well — kept (conservative, accepted by
+///   F');
+/// * [`ChildDisposition::Unknown`] and [`ChildDisposition::Alive`] are kept.
+///
+/// Split out so the decision is unit-tested with injected outcomes on every
+/// host, including macOS.
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+pub(crate) fn macos_survivor_alive(disposition: ChildDisposition) -> bool {
+    !matches!(disposition, ChildDisposition::Gone)
+}
+
+/// Non-Linux unix: no `/proc` start time. The identity is pid-only and
+/// Unknown-strength; [`process_identity_alive`] closes ONLY on a confirmed
+/// signal-0 `ESRCH` (Ruling F', c-usagefu r16 item 5). The struct itself is the
 /// single `#[cfg(unix)]` definition above (c-usagefu r16 item 1: the two
 /// overlapping unix definitions made macOS fail to compile).
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn process_identity_alive(identity: ProcessIdentity) -> bool {
     let _ = identity.start_ticks;
-    !matches!(
-        child_disposition(identity.pid),
-        ChildDisposition::Gone | ChildDisposition::Zombie
-    )
+    macos_survivor_alive(child_disposition(identity.pid))
 }
 
 /// Build the stop-ladder survivor identity for `pid`: pid plus the captured
@@ -1746,6 +1767,53 @@ mod tests {
         assert!(
             !members.iter().any(|member| !member.zombie),
             "an all-dead table must read as gone even before waitpid"
+        );
+    }
+
+    /// c-usagefu r16 item 5 (Ruling F') — the macOS/non-`/proc` SURVIVOR
+    /// decision with injected dispositions. The identity there is pid-only and
+    /// Unknown-strength: an entry closes ONLY when EVERY captured pid is
+    /// confirmed gone (signal-0 `ESRCH` -> [`ChildDisposition::Gone`]). Gated
+    /// to unix so it runs on macOS (and on Linux CI via the test-built helper).
+    #[cfg(unix)]
+    #[test]
+    fn macos_survivor_decision_closes_only_on_confirmed_esrch_gone() {
+        assert!(
+            !macos_survivor_alive(ChildDisposition::Gone),
+            "a confirmed signal-0 ESRCH (Gone) closes"
+        );
+        assert!(
+            macos_survivor_alive(ChildDisposition::Zombie),
+            "a zombie still answers signal 0 (not ESRCH); pid-only identity keeps it"
+        );
+        assert!(macos_survivor_alive(ChildDisposition::Alive));
+        assert!(
+            macos_survivor_alive(ChildDisposition::Unknown),
+            "Unknown never closes an interval (Ruling F')"
+        );
+
+        // The registry aggregates identities with `any(alive)`: a single
+        // non-Gone pid among confirmed-gone pids keeps the whole entry open,
+        // and only when EVERY captured pid reads Gone does it close (a reused
+        // pid that answers signal 0 is kept — conservative, accepted by F').
+        let mixed = [
+            ChildDisposition::Gone,
+            ChildDisposition::Zombie,
+            ChildDisposition::Gone,
+        ];
+        assert!(
+            mixed.iter().copied().any(macos_survivor_alive),
+            "one not-confirmed-gone pid keeps the entry open"
+        );
+        let reused_pid = [ChildDisposition::Gone, ChildDisposition::Alive];
+        assert!(
+            reused_pid.iter().copied().any(macos_survivor_alive),
+            "a reused pid (signal-0 Ok) keeps it open"
+        );
+        let all_gone = [ChildDisposition::Gone, ChildDisposition::Gone];
+        assert!(
+            !all_gone.iter().copied().any(macos_survivor_alive),
+            "every captured pid confirmed ESRCH-gone is the only close"
         );
     }
 

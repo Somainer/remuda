@@ -1094,16 +1094,25 @@ impl ShellPtyDriver {
         // same-cwd generic launch doing prompt-only discovery needs a complete
         // census that includes THIS native instance; the driver holds one
         // cohort clone for the whole run and hands another to the adapter.
-        let launch_floor = time::OffsetDateTime::now_utc();
-        let native_lifetime = if self.options.target.agent_kind() == Some(AgentKind::Codex) {
-            Some(crate::adapters::codex_discovery::begin_lifetime(
-                std::path::Path::new(cwd),
-                hook_ctx.instance_id.as_id().as_str(),
-                Some(launch_floor),
-            ))
-        } else {
-            None
-        };
+        //
+        // c-usagefu r15 item 4 (Ruling L1): this hook-confirmed path is a
+        // production registration too, so the boundary is sampled INSIDE the
+        // LAUNCH_REGISTRATION critical section together with the lifetime
+        // insert (register_confirmed_launch), never on a free-standing clock
+        // before the call — a launch blocked on the lock must decide from the
+        // instant it actually registered. No discovery window opens here: the
+        // hook supplies session identity and with_instance_key must not open
+        // one against the attached lifetime witness.
+        let (native_lifetime, launch_floor) =
+            if self.options.target.agent_kind() == Some(AgentKind::Codex) {
+                let (guard, boundary) = crate::adapters::codex_discovery::register_confirmed_launch(
+                    std::path::Path::new(cwd),
+                    hook_ctx.instance_id.as_id().as_str(),
+                );
+                (Some(guard), boundary)
+            } else {
+                (None, time::OffsetDateTime::now_utc())
+            };
         let child = pair.slave.spawn_command(cmd).map_err(pty_err)?;
         drop(pair.slave);
         // `portable-pty` calls `setsid()` before `exec`, so the child leads its

@@ -156,24 +156,27 @@ impl CodexAdapter {
     /// adapter's launch floor). Production registers it BEFORE spawning the
     /// agent and attaches the existing guard through
     /// [`Self::with_lifetime`]; in that case this does not open a second
-    /// interval.
+    /// interval NOR a second window (c-usagefu r15 item 4): a
+    /// hook-confirmed shell-pty launch carries a lifetime but performs no
+    /// prompt-only discovery, so the launch site's claim that "no window
+    /// opens" must hold. The generic-pty pending bundle likewise attaches the
+    /// window it opened before the spawn via [`Self::with_window`].
     #[must_use]
     pub fn with_instance_key(mut self, key: Option<String>) -> Self {
         if let Some(ref key) = key
             && self.window.is_none()
+            && self.lifetime.is_none()
             && let Some(launched_at) = self.home.launched_at
         {
             self.window = Some(crate::adapters::codex_discovery::DiscoveryWindow::open(
                 &self.home.cwd,
                 key.clone(),
             ));
-            if self.lifetime.is_none() {
-                self.lifetime = Some(crate::adapters::codex_discovery::begin_lifetime(
-                    &self.home.cwd,
-                    key,
-                    Some(launched_at),
-                ));
-            }
+            self.lifetime = Some(crate::adapters::codex_discovery::begin_lifetime(
+                &self.home.cwd,
+                key,
+                Some(launched_at),
+            ));
         }
         self.instance_key = key;
         self

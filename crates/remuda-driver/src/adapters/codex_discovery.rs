@@ -464,6 +464,66 @@ pub(crate) fn register_pending_launch(cwd: &Path, owner: &str) -> PendingCodexLa
     }
 }
 
+/// Register a HOOK-CONFIRMED native launch's census lifetime (the
+/// shell-pty shadow-home path): L1 exactly as [`register_pending_launch`],
+/// but WITHOUT a pending discovery window — a hook-confirmed launch does no
+/// prompt-only discovery and its adapter opens no window.
+///
+/// c-usagefu r15 item 4: L1 applies to EVERY production registration path.
+/// The shell-pty spawn used to sample its boundary with a free-standing
+/// `now_utc()` before calling [`begin_lifetime`], outside
+/// [`LAUNCH_REGISTRATION`]; a launch queued behind another registration could
+/// then carry a floor sampled while the cwd's world had already moved. The
+/// boundary is sampled INSIDE the critical section here and returned to the
+/// spawn site and the adapter.
+pub(crate) fn register_confirmed_launch(
+    cwd: &Path,
+    owner: &str,
+) -> (LifetimeGuard, OffsetDateTime) {
+    #[cfg(test)]
+    pending_launch_pre_lock_barrier(cwd);
+    let _registration = acquire_launch_registration(cwd);
+    #[cfg(test)]
+    let launched_at = take_test_launch_boundary(cwd).unwrap_or_else(OffsetDateTime::now_utc);
+    #[cfg(not(test))]
+    let launched_at = OffsetDateTime::now_utc();
+    let lifetime = begin_lifetime(cwd, owner, Some(launched_at));
+    (lifetime, launched_at)
+}
+
+/// Test seam: number of discovery windows currently open in `cwd`.
+#[cfg(test)]
+pub(crate) fn open_window_count(cwd: &Path) -> usize {
+    OPEN_WINDOWS
+        .lock()
+        .expect("codex discovery windows")
+        .get(&canonical(cwd))
+        .map_or(0, |entry| entry.count as usize)
+}
+
+/// Test seam: number of prompt windows retained for `(cwd, owner)`.
+#[cfg(test)]
+pub(crate) fn recorded_prompt_window_count(cwd: &Path, owner: &str) -> usize {
+    SENT_INPUTS
+        .lock()
+        .expect("codex sent inputs")
+        .get(&canonical(cwd))
+        .and_then(|by_owner| by_owner.get(owner))
+        .map_or(0, |log| log.windows.len())
+}
+
+/// Test seam: retained prompt text is never longer than the storage cap.
+#[cfg(test)]
+pub(crate) fn recorded_prompt_texts(cwd: &Path, owner: &str) -> Vec<String> {
+    SENT_INPUTS
+        .lock()
+        .expect("codex sent inputs")
+        .get(&canonical(cwd))
+        .and_then(|by_owner| by_owner.get(owner))
+        .map(|log| log.windows.iter().map(|input| input.text.clone()).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 static PENDING_LAUNCH_BARRIER: std::sync::LazyLock<
     std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<PendingLaunchBarrier>>>,
@@ -995,6 +1055,25 @@ const INPUT_MATCH_SLACK: time::Duration = time::Duration::seconds(5);
 /// cannot authorize a much-later rollout.
 const INPUT_MAX_AGE: time::Duration = time::Duration::hours(1);
 
+/// Hard bound on the retained TEXT of one prompt window, in chars
+/// (c-usagefu r15 item 4). Prompt evidence is bounded on every axis; a pasted
+/// document-sized prompt must not be retained verbatim for the lifetime of
+/// the process. Stored text and the rollout's first-user text are BOTH
+/// normalized through the same bounded prefix (see [`normalize_input`]), so a
+/// genuine match still compares equal; only two prompts sharing an 8 KiB
+/// prefix become indistinguishable — on top of the sole-live census and the
+/// time window that is not an attribution the file channel could prove
+/// anyway.
+const MAX_PROMPT_CHARS: usize = 8 * 1024;
+
+/// Maximum dispatch windows retained per owner, even while its discovery is
+/// still OPEN (c-usagefu r15 item 4). r11 item 10 ruled out a cap to protect
+/// a lazily-scanned rollout's original prompt; this round bounds retention
+/// absolutely, oldest-first. At a human dispatch cadence 256 windows is far
+/// beyond any real discovery need, and a single owner can never make prompt
+/// text accumulate without bound.
+const MAX_PROMPT_WINDOWS_PER_OWNER: usize = 256;
+
 /// Evict all recorded inputs older than `now - INPUT_MAX_AGE` (r7 item 10).
 /// Called on every record_input so stale per-instance prompts disappear
 /// without a background task.
@@ -1017,9 +1096,11 @@ pub(crate) fn evict_expired_inputs(now: OffsetDateTime) {
     map.retain(|cwd, by_instance| {
         by_instance.retain(|owner, log| {
             if live.get(cwd).is_some_and(|set| set.contains(owner)) {
-                // Live unbound discoverer: keep EVERY dispatch window until
-                // bind/close (c-usagefu r11 item 10) — no age eviction, no cap,
-                // no merging of resends.
+                // Live unbound discoverer: every dispatch window stays
+                // eligible regardless of age (a lazily-scanned rollout can be
+                // discovered long after the keystroke), but retention is still
+                // bounded by MAX_PROMPT_WINDOWS_PER_OWNER (r15 item 4); the
+                // length trim happens in put_input on the write lock.
                 return !log.windows.is_empty();
             }
             log.windows.retain(|input| input.at >= cutoff);
@@ -1040,12 +1121,16 @@ struct SentInput {
 
 /// Per-instance prompt evidence (c-usagefu r11 item 10, Ruling): while a
 /// discovery is OPEN every dispatched prompt is retained as its OWN window —
-/// there is no length cap and a later RESEND never overwrites an earlier
-/// window (the old anchor+recent shape drained an unbound discoverer's 33rd
-/// distinct prompt and moved a resent prompt's window forward, losing evidence
-/// a lazily-scanned rollout still needed). Reclamation is by lifecycle: a bind
-/// releases the window and window close clears the cwd's prompts in
-/// [`DiscoveryWindow::release`].
+/// a later RESEND never overwrites an earlier window (the old anchor+recent
+/// shape drained an unbound discoverer's 33rd distinct prompt and moved a
+/// resent prompt's window forward, losing evidence a lazily-scanned rollout
+/// still needed). Reclamation is by lifecycle: a bind releases the window and
+/// window close clears the cwd's prompts in [`DiscoveryWindow::release`].
+///
+/// c-usagefu r15 item 4 bounds the accumulation absolutely: the TEXT of every
+/// window is capped at [`MAX_PROMPT_CHARS`] and at most
+/// [`MAX_PROMPT_WINDOWS_PER_OWNER`] windows are retained (oldest first), live
+/// discoverers included.
 #[derive(Default)]
 struct PromptLog {
     windows: Vec<SentInput>,
@@ -1063,9 +1148,16 @@ type SentInputs = HashMap<PathBuf, HashMap<String, PromptLog>>;
 static SENT_INPUTS: LazyLock<Mutex<SentInputs>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Whitespace-trimmed comparison form (codex stores the prompt verbatim in
-/// the `input_text` item).
+/// the `input_text` item), bounded to [`MAX_PROMPT_CHARS`] (c-usagefu r15
+/// item 4). Both the dispatched prompt and the rollout's first user text pass
+/// through this same form in [`evaluate_prompt`], so a real prompt — even one
+/// longer than the cap — still matches; only a shared bounded prefix collides.
 fn normalize_input(text: &str) -> String {
-    text.trim().to_owned()
+    let trimmed = text.trim();
+    match trimmed.char_indices().nth(MAX_PROMPT_CHARS) {
+        Some((idx, _)) => trimmed[..idx].to_owned(),
+        None => trimmed.to_owned(),
+    }
 }
 
 fn put_input(cwd: &Path, owner: &str, text: &str, at: OffsetDateTime) {
@@ -1083,6 +1175,12 @@ fn put_input(cwd: &Path, owner: &str, text: &str, at: OffsetDateTime) {
     // Every dispatch is a distinct window: even an identical resend is pushed,
     // so the earlier window keeps its own send-time back edge.
     log.windows.push(SentInput { text, at });
+    // c-usagefu r15 item 4: hard per-owner window cap, oldest first — prompt
+    // evidence never accumulates without bound, even for a live discoverer.
+    if log.windows.len() > MAX_PROMPT_WINDOWS_PER_OWNER {
+        let excess = log.windows.len() - MAX_PROMPT_WINDOWS_PER_OWNER;
+        log.windows.drain(..excess);
+    }
 }
 
 /// Record that instance `owner` dispatched `text` in `cwd` at `now`.

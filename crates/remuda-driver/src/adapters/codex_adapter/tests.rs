@@ -3574,3 +3574,168 @@ fn a_named_resume_rollout_in_another_cwd_fails_closed_without_guessing() {
     );
     assert!(adapter.binding().is_none(), "nothing else is bound");
 }
+
+#[test]
+fn a_confirmed_launch_samples_its_boundary_inside_the_registration_lock() {
+    // c-usagefu r15 item 4 (Ruling L1) on the hook-confirmed shell-pty path:
+    // register_confirmed_launch samples the boundary INSIDE
+    // LAUNCH_REGISTRATION. A registration parked before the lock must carry
+    // the post-release instant, never the instant it decided to launch.
+    use crate::adapters::codex_discovery::PendingLaunchBarrier;
+    use std::time::Duration as StdDuration;
+    use time::OffsetDateTime;
+
+    let cwd = "/projects/r15-item4-confirmed-boundary";
+    let owner = "r15-item4-confirmed";
+    let barrier = PendingLaunchBarrier::arm_pre_lock(Path::new(cwd));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let builder = std::thread::Builder::new()
+        .name("r15-item4-confirmed-launch".into())
+        .spawn(move || {
+            let registration =
+                crate::adapters::codex_discovery::register_confirmed_launch(Path::new(cwd), owner);
+            tx.send(registration).unwrap();
+        })
+        .unwrap();
+    barrier.wait_before_lock();
+    // World moves for over a second while the registration is queued.
+    let before = OffsetDateTime::now_utc();
+    std::thread::sleep(StdDuration::from_millis(1100));
+    barrier.release_pre_lock();
+    let (guard, boundary) = rx.recv().unwrap();
+    builder.join().unwrap();
+    assert!(
+        boundary - before >= time::Duration::milliseconds(900),
+        "the confirmed-launch boundary is sampled inside the lock, after the wait"
+    );
+    drop(guard);
+    crate::adapters::codex_discovery::forget_lifetime(Path::new(cwd), owner);
+}
+
+#[test]
+fn with_instance_key_opens_no_window_when_a_lifetime_is_already_attached() {
+    // c-usagefu r15 item 4: the shell-pty spawn attaches its pre-registered
+    // lifetime witness. with_instance_key must then NOT open a
+    // DiscoveryWindow (hook-confirmed launches do no prompt-only discovery);
+    // the old shape opened one anyway.
+    use time::OffsetDateTime;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let floor = OffsetDateTime::now_utc() - time::Duration::seconds(2);
+    let owner = "r15-item4-window";
+
+    // The witness the production shell-pty spawn attaches.
+    let guard = crate::adapters::codex_discovery::begin_lifetime(&cwd, owner, Some(floor));
+    let adapter = CodexAdapter::new(AdapterHome {
+        home: dir.path().join("shadow"),
+        cwd: cwd.clone(),
+        pid: None,
+        launched_at: Some(floor),
+        resume_session_id: None,
+    })
+    .with_lifetime(guard.witness())
+    .with_instance_key(Some(owner.to_owned()));
+    assert_eq!(
+        crate::adapters::codex_discovery::open_window_count(&cwd),
+        0,
+        "an attached lifetime suppresses the discovery window"
+    );
+    drop(adapter);
+    assert_eq!(
+        crate::adapters::codex_discovery::open_window_count(&cwd),
+        0,
+        "no window was opened or leaked"
+    );
+    drop(guard);
+    crate::adapters::codex_discovery::forget_lifetime(&cwd, owner);
+
+    // Control: with NO pre-registered lifetime the window DOES open (the
+    // unbundled direct-construction discovery path).
+    let control = CodexAdapter::new(AdapterHome {
+        home: dir.path().join("shadow2"),
+        cwd: cwd.clone(),
+        pid: None,
+        launched_at: Some(floor),
+        resume_session_id: None,
+    })
+    .with_instance_key(Some("r15-item4-window-control".to_owned()));
+    assert_eq!(
+        crate::adapters::codex_discovery::open_window_count(&cwd),
+        1,
+        "without a lifetime the legacy window-open behaviour is unchanged"
+    );
+    drop(control);
+}
+
+#[test]
+fn prompt_evidence_is_bounded_by_text_length_and_window_count_even_while_live() {
+    // c-usagefu r15 item 4: SENT_INPUTS must never accumulate prompt text
+    // without bound — each stored prompt is capped and the per-owner window
+    // count is capped oldest-first, live discoverer included. A genuine long
+    // prompt still matches because the rollout text is bounded identically.
+    use crate::adapters::codex_discovery::DiscoveryWindow;
+    use time::OffsetDateTime;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let owner = "r15-item4-prompts";
+    let now = OffsetDateTime::now_utc();
+    // A LIVE unbound discoverer: its window used to exempt prompts from every
+    // cap.
+    let window = DiscoveryWindow::open(&cwd, owner);
+
+    // One document-sized dispatch is stored only up to the text cap.
+    let long_prompt = "x".repeat(20_000);
+    crate::adapters::codex_discovery::record_input_at(&cwd, owner, &long_prompt, now);
+    let texts = crate::adapters::codex_discovery::recorded_prompt_texts(&cwd, owner);
+    assert_eq!(texts.len(), 1);
+    assert_eq!(
+        texts[0].chars().count(),
+        8 * 1024,
+        "the retained prompt text is capped at 8 KiB chars"
+    );
+
+    // 300 further dispatches: the window count stays bounded, oldest first.
+    for i in 1..=300 {
+        crate::adapters::codex_discovery::record_input_at(
+            &cwd,
+            owner,
+            &format!("dispatch number {i}"),
+            now + time::Duration::seconds(i as i64),
+        );
+    }
+    assert_eq!(
+        crate::adapters::codex_discovery::recorded_prompt_window_count(&cwd, owner),
+        256,
+        "prompt windows never accumulate past the per-owner cap"
+    );
+    let texts = crate::adapters::codex_discovery::recorded_prompt_texts(&cwd, owner);
+    assert_eq!(
+        texts[0], "dispatch number 45",
+        "oldest windows were evicted first"
+    );
+    assert_eq!(
+        texts[255], "dispatch number 300",
+        "newest windows are retained"
+    );
+    drop(window);
+
+    // The genuine long prompt still matches a rollout carrying it: both
+    // normalize to the same bounded prefix.
+    let owner2 = "r15-item4-longmatch";
+    let floor = now + time::Duration::minutes(2);
+    let _lifetime = crate::adapters::codex_discovery::begin_lifetime(&cwd, owner2, Some(floor));
+    crate::adapters::codex_discovery::record_input_at(&cwd, owner2, &long_prompt, floor);
+    let started = floor + time::Duration::seconds(10);
+    assert!(
+        crate::adapters::codex_discovery::sole_instance_matches(
+            &cwd,
+            owner2,
+            &long_prompt,
+            started
+        ),
+        "a real over-cap prompt still matches its rollout through the shared bounded prefix"
+    );
+    crate::adapters::codex_discovery::forget_lifetime(&cwd, owner2);
+}

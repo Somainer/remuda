@@ -1721,6 +1721,19 @@ impl ShellPtyDriver {
             reaper,
         )
         .await?;
+        // Test seam: override ONLY the ladder verdict (simulating a member the
+        // ladder could not kill), consumed BEFORE the real snapshot-rescan so
+        // an escaped descendant is still found and unioned below. The real
+        // signals, snapshot and rescan all run; nothing substitutes them.
+        #[cfg(test)]
+        if let Some(forced) = self
+            .test_stop_outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            outcome = forced;
+        }
         #[cfg(target_os = "linux")]
         {
             use lifecycle::ProcessTableObservation;
@@ -1735,37 +1748,44 @@ impl ShellPtyDriver {
                     outcome.survivors.clear();
                 }
                 ProcessTableObservation::Established(tree) => {
-                    if outcome.group_gone {
-                        // Live descendants OUTSIDE the signalled group escaped
-                        // it (e.g. a setsid daemonising child): name them as
-                        // stop-incomplete survivors the termination
-                        // watcher/registry probes by (pid, start time).
-                        //
-                        // c-usagefu r15 item 6: rescan the snapshot members'
-                        // CURRENT groups, not just their snapshot pgrp.
-                        //
-                        // c-usagefu r16 item 2 (F'): a rescan table that
-                        // cannot be read is Unknown — retain EVERY captured
-                        // non-leader identity rather than dropping the lot as
-                        // "no survivor"; only a later confirmed probe discards
-                        // one.
-                        match lifecycle::rescan_escaped_snapshot_members(&tree, pgid) {
-                            ProcessTableObservation::Unknown => {
-                                outcome.group_gone = false;
-                                outcome.survivors = tree
-                                    .iter()
-                                    .filter(|member| member.pid != pgid)
-                                    .map(|member| member.pid)
-                                    .collect();
-                            }
-                            ProcessTableObservation::Established(escaped) => {
-                                if !escaped.is_empty() {
-                                    outcome.group_gone = false;
-                                    outcome.survivors =
-                                        escaped.iter().map(|identity| identity.pid).collect();
+                    // c-usagefu r16 item 3: the rescan runs after EVERY ladder
+                    // — whether the signalled group was proved gone OR the
+                    // ladder was incomplete — and its findings are UNIONED with
+                    // the ladder's named survivors. A setsid descendant escaped
+                    // the group kill precisely by leaving the group, so an
+                    // incomplete/inconclusive group result can never speak for
+                    // it: a missing rescan used to leave such a survivor
+                    // unnamed and the interval closed while it could still
+                    // write.
+                    //
+                    // Start from the ladder's named survivors and add distinct
+                    // rescan members (r15 item 6 uses each member's CURRENT
+                    // group, catching a mid-grace setsid too).
+                    let mut unioned: Vec<i32> = outcome.survivors.clone();
+                    let mut rescan_unknown = false;
+                    match lifecycle::rescan_escaped_snapshot_members(&tree, pgid) {
+                        ProcessTableObservation::Unknown => {
+                            // r16 item 2 (F'): retain EVERY captured non-leader
+                            // member as an Unknown-strength identity; only a
+                            // later confirmed probe discards one.
+                            rescan_unknown = true;
+                            for member in tree.iter().filter(|member| member.pid != pgid) {
+                                if !unioned.contains(&member.pid) {
+                                    unioned.push(member.pid);
                                 }
                             }
                         }
+                        ProcessTableObservation::Established(escaped) => {
+                            for identity in escaped {
+                                if !unioned.contains(&identity.pid) {
+                                    unioned.push(identity.pid);
+                                }
+                            }
+                        }
+                    }
+                    if rescan_unknown || !unioned.is_empty() {
+                        outcome.group_gone = false;
+                        outcome.survivors = unioned;
                     }
                 }
             }
@@ -2987,19 +3007,6 @@ impl Driver for ShellPtyDriver {
         // ladder working rather than as an unexplained crash.
         state.closed.store(true, Ordering::SeqCst);
         let outcome = self.stop_tree(&state).await;
-        // Test seam: force the stop-incomplete outcome (with the survivor
-        // process identity to watch) while leaving the real ladder run.
-        #[cfg(test)]
-        let mut outcome = outcome;
-        #[cfg(test)]
-        if let Some(forced) = self
-            .test_stop_outcome
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            outcome = Ok(forced);
-        }
         if let Some(waiter) = self.waiter.lock().await.take() {
             waiter.abort();
         }
@@ -6197,6 +6204,194 @@ time.sleep(120)'
         crate::adapters::codex_discovery::forget_lifetime(&cwd, &owner);
     }
 
+    /// Launch a REAL codex-target driver whose agent child daemonises a
+    /// `setsid sleep` descendant at LAUNCH (pre-signal escape: its own session
+    /// and group before the ladder ever signals), then `wait`s. Production
+    /// spawn path only (c-usagefu r16 item 3).
+    #[cfg(target_os = "linux")]
+    async fn spawn_preescaped_setsid_fixture()
+    -> (tempfile::TempDir, ShellPtyDriver, PathBuf, String, i32) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-codex-r16item3.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$1\" in --version|version) echo 'codex 0.154.0'; exit 0;; esac\n\
+             setsid sleep 78 &\nwait\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let instance_id = InstanceId::new();
+        let instance_dir = dir.path().join(instance_id.as_id().as_str());
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.kind = AgentKind::Codex;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+        spec.model_id = Some("gpt-5.4".into());
+
+        let mut options = ShellPtyOptions::agent(
+            dir.path().to_path_buf(),
+            AgentKind::Codex,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::OpenaiResponses,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["gpt-5.4".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: instance_dir.join("launch"),
+                native_home: dir.path().join("codex-native-home"),
+                binary: Some(script.clone()),
+                origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: true,
+                settings_overlay: None,
+            },
+        );
+        options.instance_id = Some(instance_id.clone());
+        options.hooks = Some(HookConfig {
+            instance_dir: instance_dir.clone(),
+            relay_binary: PathBuf::from("/bin/true"),
+            tui: crate::launch::TuiMode::Default,
+        });
+
+        let driver = ShellPtyDriver::new(options);
+        let mut run = driver.start(spec.clone()).await.expect("real codex spawn");
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), run.recv()).await;
+        let cwd: PathBuf = spec.cwd.clone().into();
+        let owner = instance_id.as_id().as_str().to_owned();
+        let root_pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        (dir, driver, cwd, owner, root_pgid)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_incomplete_ladder_still_rescans_and_unions_the_escaped_descendant() {
+        // c-usagefu r16 item 3: the OLD post-ladder rescan ran only when the
+        // ladder reported the signalled group GONE. A ladder that was
+        // INCOMPLETE skipped it entirely, so a setsid descendant that had
+        // escaped the group kill was never named: the empty survivor set (plus
+        // a now-dead group number) let the census interval CLOSE while the
+        // escaped process lived. The rescan now runs after EVERY ladder and is
+        // unioned with the ladder's named survivors regardless of the group
+        // result.
+        //
+        // The ladder verdict is forced incomplete with NO named survivor to
+        // stand in for an un-killable in-group member that cannot be produced
+        // hermetically; the real signals, the pre-signal snapshot, the rescan
+        // and the escaped identity are all production, and the census cohort is
+        // the real launch-registered one.
+        use crate::adapters::FileSignalAdapter as _;
+
+        let _term_lock = crate::termination::termination_test_lock();
+        lifecycle::set_test_watch_bound(Some(std::time::Duration::from_millis(400)));
+        crate::termination::set_test_maintenance_interval(None);
+        crate::termination::shutdown_pending_terminations().await;
+
+        let (_dir, driver, cwd, owner, root_pgid) = spawn_preescaped_setsid_fixture().await;
+        assert!(
+            driver.codex_lifetime.lock().await.is_some(),
+            "the codex spawn path owns the census guard — nothing hand-installed"
+        );
+
+        // The REAL pre-signal escaped descendant (own group from launch).
+        let escaped_pid = {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let tree = match lifecycle::snapshot_process_tree(root_pgid) {
+                    lifecycle::ProcessTableObservation::Established(tree) => tree,
+                    lifecycle::ProcessTableObservation::Unknown => {
+                        panic!("/proc is readable in this test")
+                    }
+                };
+                if let Some(proc_info) = tree.iter().find(|proc_info| {
+                    proc_info.pid != root_pgid
+                        && proc_info.pgrp != root_pgid
+                        && lifecycle::process_running(proc_info.pid)
+                }) {
+                    break proc_info.pid;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the setsid descendant appears"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        };
+
+        // Force ONLY the ladder verdict: incomplete, with no named survivor.
+        // The real ladder still runs and kills the signalled group; the real
+        // rescan is what must now discover the escapee.
+        *driver.test_stop_outcome.lock().unwrap() = Some(lifecycle::StopOutcome {
+            rung: lifecycle::StopRung::Kill,
+            group_gone: false,
+            pgid: Some(root_pgid),
+            survivors: Vec::new(),
+            observation_unknown: false,
+        });
+        Driver::close(&driver).await.unwrap();
+
+        assert!(
+            lifecycle::process_running(escaped_pid),
+            "the pre-escaped setsid descendant is genuinely alive"
+        );
+        for _ in 0..10 {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+                "an incomplete ladder still rescans; the escaped descendant keeps the interval live"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        let transfer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !crate::termination::test_has_pending_for(&cwd) {
+            assert!(tokio::time::Instant::now() < transfer_deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Confirmed exit closes the unioned identity only via a recheck.
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(escaped_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "the exit alone never closes; only a recheck does"
+        );
+        let recheck_home = tempfile::tempdir().unwrap();
+        let mut rechecker = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+            home: recheck_home.path().to_path_buf(),
+            cwd: cwd.clone(),
+            pid: None,
+            launched_at: Some(time::OffsetDateTime::now_utc()),
+            resume_session_id: None,
+        })
+        .with_instance_key(Some("r16-item3-rechecker".to_owned()));
+        assert!(rechecker.poll().unwrap().is_empty());
+        assert!(
+            !crate::termination::test_has_pending_for(&cwd),
+            "the unioned escapee identity is resolved on confirmed exit"
+        );
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "confirmed death of the unioned escapee closes the interval"
+        );
+        drop(rechecker);
+
+        lifecycle::set_test_watch_bound(None);
+        crate::termination::set_test_maintenance_interval(None);
+        crate::termination::shutdown_pending_terminations().await;
+        crate::adapters::codex_discovery::forget_lifetime(&cwd, &owner);
+    }
+
+    ///
+    /// Promoted rather than launched: §1.0 makes the two the same session to
     /// everything below the spawn, and the promoted shape needs no materializer
     /// inputs. What is being tested is the gate, which reads `session_kind` —
     /// satisfied by either.

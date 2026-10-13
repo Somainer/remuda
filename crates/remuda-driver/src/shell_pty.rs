@@ -3028,10 +3028,18 @@ impl Driver for ShellPtyDriver {
             }
         }
         if !group_gone && !unconfirmed.is_empty() {
-            let (pgid, survivors) = match &outcome {
+            let (pgid, survivor_pids) = match &outcome {
                 Ok(outcome) => (outcome.pgid, outcome.survivors.clone()),
                 Err(_) => (Some(state.pgid.load(Ordering::SeqCst)), Vec::new()),
             };
+            // r15 item 5 (Ruling F): each named survivor is a (pid, start
+            // time) identity captured NOW; a later reused pid with a different
+            // start time reads as the original having exited. An unreadable
+            // stat yields no baseline, which only ever fails conservative.
+            let survivors = survivor_pids
+                .into_iter()
+                .map(lifecycle::survivor_identity)
+                .collect::<Vec<_>>();
             // r14 W1: the bounded per-close watcher owns the guards, and on
             // bound expiry they move — identity included — to the Node-owned
             // pending-termination registry instead of being abandoned.

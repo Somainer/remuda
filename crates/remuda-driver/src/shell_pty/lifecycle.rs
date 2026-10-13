@@ -1035,36 +1035,140 @@ pub(crate) fn termination_watch_bound() -> Duration {
 
 /// Whether a stop-incomplete survivor identity is still running: the signalled
 /// process GROUP still has a live member OR one of the explicitly named
-/// survivor pids is live (c-usagefu r14 item 4: a descendant that called
-/// `setsid` escaped the group kill, so a dead group with a named survivor is
-/// still alive).
-pub(crate) fn termination_identity_alive(pgid: Option<i32>, survivors: &[i32]) -> bool {
+/// survivor identities is live. c-usagefu r15 item 5 (COORDINATOR RULING F):
+/// a named survivor is a (pid, start time) identity — a reused pid with a
+/// different start time means the ORIGINAL process exited, and an unreadable
+/// process state is Unknown (kept), never death.
+pub(crate) fn termination_identity_alive(pgid: Option<i32>, survivors: &[ProcessIdentity]) -> bool {
     let group_alive = pgid
         .filter(|pgid| *pgid > 0)
         .is_some_and(group_has_live_member);
-    group_alive || survivors.iter().copied().any(process_running)
+    group_alive || survivors.iter().copied().any(process_identity_alive)
+}
+
+/// One process the stop ladder could not confirm dead, identified per Ruling F
+/// by (pid, start time). `start_ticks` is the `/proc/<pid>/stat` starttime
+/// field captured BEFORE the ladder (clock ticks since boot); `None` on hosts
+/// or read failures where no start-time baseline exists, in which case the
+/// entry can never be start-time proven gone.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProcessIdentity {
+    pub(crate) pid: i32,
+    pub(crate) start_ticks: Option<u64>,
+}
+
+/// Whether one named process identity is still running.
+///
+/// COORDINATOR RULING F (fail closed): only CONFIRMED exit closes.
+/// * a zombie/exiting state is dead (an unreaped corpse cannot write);
+/// * a start-time mismatch against the captured baseline is a REUSED pid —
+///   the original process exited even though the pid is live again;
+/// * a vanished pid is dead only when signal 0 confirms `ESRCH`;
+/// * every other unreadable state (`/proc` permission/IO errors, an `EPERM`
+///   signal probe, absent `/proc` data) is UNKNOWN → reported alive, so the
+///   registry keeps the interval instead of closing on a guess.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub(crate) fn process_identity_alive(identity: ProcessIdentity) -> bool {
+    let stat = match read_proc_stat(identity.pid) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A hidden /proc can make a live pid read NotFound too, so death
+            // needs the confirming ESRCH (Ruling F).
+            return !matches!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(identity.pid), None),
+                Err(nix::errno::Errno::ESRCH)
+            );
+        }
+        Err(_) => return true, // permission / resource exhaustion: Unknown
+    };
+    let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start()) else {
+        return process_alive(identity.pid);
+    };
+    let Some((state, start_ticks)) = parse_proc_state_start(after_comm) else {
+        return process_alive(identity.pid);
+    };
+    if state_is_dead(state) {
+        return false;
+    }
+    if let Some(expected) = identity.start_ticks
+        && start_ticks != expected
+    {
+        // The pid was reused: a different start time means the captured
+        // process exited.
+        return false;
+    }
+    true
+}
+
+/// Capture a pid's starttime baseline (stat field 22, clock ticks since boot)
+/// for a later start-time identity comparison (Ruling F). None when the pid
+/// is gone or its stat cannot be read/parsed.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_start_ticks(pid: i32) -> Option<u64> {
+    let stat = read_proc_stat(pid).ok()?;
+    let after_comm = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start())?;
+    parse_proc_state_start(after_comm).map(|(_, ticks)| ticks)
+}
+
+/// Test seam: force every `/proc/<pid>/stat` READ to fail as a permission
+/// error, so Ruling F's unreadable-state branch is exercised deterministically
+/// (c-usagefu r15 item 5). Process-global; termination tests serialize on the
+/// termination test lock.
+#[cfg(all(test, target_os = "linux"))]
+static TEST_PROC_READ_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn set_test_proc_read_failure(force: bool) {
+    TEST_PROC_READ_FAILURE.store(force, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn read_proc_stat(pid: i32) -> std::io::Result<String> {
+    if TEST_PROC_READ_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected /proc read failure",
+        ));
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+fn read_proc_stat(pid: i32) -> std::io::Result<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+}
+
+/// Parse the state letter and the starttime field (22nd stat field, the 20th
+/// after `comm`) from a `/proc/<pid>/stat` tail.
+#[cfg(target_os = "linux")]
+fn parse_proc_state_start(after_comm: &str) -> Option<(&str, u64)> {
+    let mut fields = after_comm.split_whitespace();
+    let state = fields.next()?;
+    // In the tail after `comm`: ppid(0) pgrp(1) session(2) tty_nr(3)
+    // tpgid(4) flags(5) minflt(6) cminflt(7) majflt(8) cmajflt(9)
+    // utime(10) stime(11) cutime(12) cstime(13) priority(14) nice(15)
+    // num_threads(16) itrealvalue(17) starttime(18) — stat field 22.
+    let starttime: u64 = fields.nth(18)?.parse().ok()?;
+    Some((state, starttime))
 }
 
 /// Whether a single pid is still running AND not merely an unreaped zombie.
 ///
 /// `kill(pid, 0)` returns success for a zombie, which must not keep a census
 /// interval live; read the `/proc` state letter first (zombie/exiting states
-/// are dead — [`state_is_dead`]), and fall back to the signal probe only when
-/// the stat file cannot be read (a process that vanished reads as gone).
+/// are dead — [`state_is_dead`]), and treat an unreadable state as Unknown
+/// (Ruling F): it stays alive rather than being guessed dead.
 #[must_use]
 pub(crate) fn process_running(pid: i32) -> bool {
     #[cfg(target_os = "linux")]
     {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
-        };
-        let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start()) else {
-            return process_alive(pid);
-        };
-        match after_comm.split_whitespace().next() {
-            Some(state) => !state_is_dead(state),
-            None => process_alive(pid),
-        }
+        process_identity_alive(ProcessIdentity {
+            pid,
+            start_ticks: None,
+        })
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
@@ -1075,6 +1179,60 @@ pub(crate) fn process_running(pid: i32) -> bool {
         let _ = pid;
         false
     }
+}
+
+/// Non-Linux unix: no `/proc` start time; the signal-0/`ps` disposition is the
+/// evidence, with Unknown kept alive (Ruling F).
+#[cfg(all(unix, not(target_os = "linux")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProcessIdentity {
+    pub(crate) pid: i32,
+    pub(crate) start_ticks: Option<u64>,
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn process_identity_alive(identity: ProcessIdentity) -> bool {
+    let _ = identity.start_ticks;
+    !matches!(
+        child_disposition(identity.pid),
+        ChildDisposition::Gone | ChildDisposition::Zombie
+    )
+}
+
+/// Build the stop-ladder survivor identity for `pid`: pid plus the captured
+/// start-time baseline where `/proc` provides one (Ruling F).
+#[cfg(target_os = "linux")]
+pub(crate) fn survivor_identity(pid: i32) -> ProcessIdentity {
+    ProcessIdentity {
+        pid,
+        start_ticks: process_start_ticks(pid),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn survivor_identity(pid: i32) -> ProcessIdentity {
+    ProcessIdentity {
+        pid,
+        start_ticks: None,
+    }
+}
+
+/// Non-unix hosts name survivors by pid alone; nothing closes except via the
+/// platform's own exit detection.
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProcessIdentity {
+    pub(crate) pid: i32,
+}
+
+#[cfg(not(unix))]
+pub(crate) fn survivor_identity(pid: i32) -> ProcessIdentity {
+    ProcessIdentity { pid }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn process_identity_alive(_identity: ProcessIdentity) -> bool {
+    false
 }
 
 /// One process captured in the pre-signal tree snapshot: its pid and process

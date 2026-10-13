@@ -7,7 +7,7 @@ use crate::error::HubError;
 use futures::Future;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -479,6 +479,11 @@ pub struct ConnectedNodes {
     /// session is still current, or the replacement completes first and the
     /// writer's commit predicate matches nothing (r15 item 3, R2).
     authority: Arc<Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>>,
+    /// Hosts whose CURRENT session was installed while an older socket was
+    /// still live (a socket-level takeover). Cleared when that session ends;
+    /// used to deny the new socket inheritance of the old session's Landing
+    /// grants (a genuine reconnect after a full disconnect leaves this clear).
+    live_takeover: Arc<Mutex<HashSet<String>>>,
     /// Test-only: notified once per host when a session replacement (insert)
     /// has to WAIT for an in-flight Landing authority decision to commit — the
     /// deterministic witness that takeover and verdict-writer are serialized
@@ -510,6 +515,7 @@ impl ConnectedNodes {
         Ok(Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             authority: Arc::new(Mutex::new(HashMap::new())),
+            live_takeover: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(any(test, feature = "test-faults"))]
             authority_contention: Arc::new(Mutex::new(HashMap::new())),
             boot_epoch,
@@ -528,6 +534,7 @@ impl ConnectedNodes {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             authority: Arc::new(Mutex::new(HashMap::new())),
+            live_takeover: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(any(test, feature = "test-faults"))]
             authority_contention: Arc::new(Mutex::new(HashMap::new())),
             boot_epoch,
@@ -544,6 +551,18 @@ impl ConnectedNodes {
             .entry(host_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
             .clone()
+    }
+
+    /// True when the host's current session was installed over an older LIVE
+    /// socket (a socket takeover, not a reconnect-after-disconnect). The new
+    /// session must not inherit the old one's in-flight Landing grants.
+    pub(crate) async fn host_had_live_takeover(&self, host_id: &str) -> bool {
+        self.live_takeover.lock().await.contains(host_id)
+    }
+
+    /// Clear the live-takeover marker when the session that took over ends.
+    pub(crate) async fn clear_live_takeover(&self, host_id: &str) {
+        self.live_takeover.lock().await.remove(host_id);
     }
 
     /// Call a JSON-RPC method on a connected Node. `Ok(None)` = not connected.
@@ -625,7 +644,15 @@ impl ConnectedNodes {
         // Pack the persisted boot epoch and this boot's monotonic counter so the
         // id is unique across Hub restarts as well as within one boot (r14 R3).
         let generation = self.boot_epoch << 32 | u64::from(counter);
-        inner.insert(host_id, NodeSlot { generation, link });
+        // A registration while another live session occupies the slot is a
+        // socket-level takeover (the old socket has not torn down). Record it
+        // so post-hello Landing handling does not rebind A's grants to B; a
+        // registration into an empty slot (genuine reconnect) leaves it clear.
+        let displaced_live = inner.contains_key(&host_id);
+        inner.insert(host_id.clone(), NodeSlot { generation, link });
+        if displaced_live {
+            self.live_takeover.lock().await.insert(host_id);
+        }
         InsertedSession { generation }
     }
 

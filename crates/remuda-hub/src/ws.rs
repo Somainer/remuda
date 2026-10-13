@@ -415,6 +415,9 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
         if let Some(generation) = session_generation {
             crate::gatequeue::recover_ended_session(&state, &host_id, generation).await;
         }
+        // The taking-over session is over; subsequent registrations on this host
+        // are fresh reconnects (no live older socket), so allow grant rebinding.
+        state.nodes.clear_live_takeover(&host_id).await;
         if stale {
             // D-048: tear down relay streams this link owned. A vanished proxy
             // host ends streams with via-host-offline and blocks routed
@@ -472,17 +475,25 @@ pub(crate) fn spawn_post_hello_tasks(state: &AppState, host_id: String) {
     // loop; the periodic reconciler retries anything still uncertain.
     let state = state.clone();
     tokio::spawn(async move {
-        // r15 item 8: rebind same-boot in-flight Landings to THIS session
-        // before the forced probe, so the session predicate matches a
-        // reconnect that took over within the same boot (older-boot rows keep
-        // their stale binding and reconcile by the persisted id).
+        // r15 item 8: after a GENUINE carrier reconnect (the old socket tore
+        // down first) rebind same-boot in-flight Landings to THIS session
+        // before the forced probe: that reconnect is the boot's continuation
+        // of authority for rows dispatched before the drop. A live takeover
+        // where an older socket is still registered does NOT inherit A's
+        // grant — the new socket must refuse to settle A's Landing (see
+        // gate_session_fence); so skip the rebind when another session is live.
         let session = state.nodes.generation_of(&host_id).await;
         let boot = state.nodes.boot_epoch();
         if let Some(session) = session {
-            let _ = state
-                .store
-                .rebind_same_boot_landing_sessions(&host_id, session, boot)
-                .await;
+            // Live socket takeover (old session still registered at hello):
+            // the new socket does NOT inherit A's Landing grants. A genuine
+            // reconnect (empty slot at insert) rebinds the in-flight rows.
+            if !state.nodes.host_had_live_takeover(&host_id).await {
+                let _ = state
+                    .store
+                    .rebind_same_boot_landing_sessions(&host_id, session, boot)
+                    .await;
+            }
         }
         crate::gatequeue::reconcile_landings(&state, Some(&host_id)).await;
     });

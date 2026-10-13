@@ -414,6 +414,13 @@ test("effort slider drag and keyboard send instance.configure", async ({ page })
     .getAttribute("value");
   await page.getByTestId("new-session-host").selectOption(host!);
   await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0);
+  // The decoupled orthogonal ultracode switch is gated to the Herdr
+  // claude-pty carrier (shell-pty cannot type version-gated words, so the
+  // switch intentionally stays locked there); the New Session default is the
+  // native shell-pty. Open advanced and select claude-pty, exactly like the
+  // effort-sync suite does.
+  await page.getByTestId("new-session-advanced").click();
+  await page.getByTestId("new-session-driver-claude-pty").click();
   await page.getByTestId("new-session-prompt").fill("effort slider e2e");
   await page.getByTestId("new-session-start").click();
   await expect(page).toHaveURL(/\/s\//, { timeout: 20_000 });

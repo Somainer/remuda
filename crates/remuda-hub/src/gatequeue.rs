@@ -3830,13 +3830,35 @@ impl Store {
                 tx.commit()?;
                 return Ok(None);
             }
-            // r13 item 4 + r15 item 3: while the row is Landing the evidence
-            // belongs to the GRANTED carrier session on the GRANTED host only.
-            // An evidence write from a replacement session/host must not
-            // replace the granted attempt's evidence, checked in the SAME
-            // immediate transaction. A Landing verdict must always carry an
-            // authenticated session: a NULL source is passed as sentinel -1 and
-            // never matches a real dispatch_session.
+            // r17 item 3: read the row's current state, grant tuple and the
+            // accepted log digest INSIDE this transaction, so the validation
+            // and the (no-op or replace) write are atomic against the verdict
+            // settlement. A late evidence frame after terminal settlement is
+            // checked below, not skipped.
+            let (current_state, row_merge, current_digest): (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = tx
+                .query_row(
+                    "SELECT json_extract(doc_json, '$.state'),
+                            json_extract(doc_json, '$.mergeSha'),
+                            lo.digest
+                       FROM gate_jobs j
+                       LEFT JOIN gate_log_objects lo ON lo.id = json_extract(j.doc_json, '$.logObjectId')
+                      WHERE j.id = ?1",
+                    params![job_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+                .unwrap_or((None, None, None));
+            // The exact-grant tuple is required while the row is a LANDING
+            // (session + host + merge) and, r17 item 3, on a settled
+            // landed/failed land row too. A terminal settlement NULLS
+            // dispatch_session by design, so there the surviving identity is
+            // host + merge (both retained); a post-settlement frame from a
+            // different host or for a different merge is refused. Evidence
+            // CONTENT is separately immutable below.
             let source_or_sentinel = source_session_i64.unwrap_or(-1);
             // r16 item 5: the evidence is also bound to the GRANTED MERGE. A
             // Landing row always names its mergeSha; the write is refused
@@ -3845,20 +3867,62 @@ impl Store {
             // delete/insert. An empty auth merge is passed as NULL and never
             // matches.
             let auth_merge_nonempty = auth_merge.filter(|sha| !sha.trim().is_empty());
-            let landing_for_other: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM gate_jobs
-                  WHERE id = ?1
-                    AND state = 'landing'
-                    AND (dispatch_session IS NULL
-                         OR dispatch_session != ?2
-                         OR (?3 IS NOT NULL AND json_extract(doc_json, '$.hostId') != ?3)
-                         OR json_extract(doc_json, '$.mergeSha') IS NULL
-                         OR ?4 IS NULL
-                         OR json_extract(doc_json, '$.mergeSha') != ?4)",
-                params![job_id, source_or_sentinel, source_host, auth_merge_nonempty],
-                |row| row.get(0),
-            )?;
-            if landing_for_other > 0 {
+            if current_state.as_deref() == Some("landing") {
+                let tuple_for_other: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM gate_jobs
+                      WHERE id = ?1
+                        AND (dispatch_session IS NULL
+                             OR dispatch_session != ?2
+                             OR (?3 IS NOT NULL AND json_extract(doc_json, '$.hostId') != ?3)
+                             OR json_extract(doc_json, '$.mergeSha') IS NULL
+                             OR ?4 IS NULL
+                             OR json_extract(doc_json, '$.mergeSha') != ?4)",
+                    params![job_id, source_or_sentinel, source_host, auth_merge_nonempty],
+                    |row| row.get(0),
+                )?;
+                if tuple_for_other > 0 {
+                    tx.commit()?;
+                    return Ok(None);
+                }
+            } else if matches!(current_state.as_deref(), Some("landed" | "failed"))
+                && row_merge.is_some()
+            {
+                // Settled land row: the bound session is nulled, so validate
+                // the surviving host + granted merge.
+                let terminal_for_other: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM gate_jobs
+                      WHERE id = ?1
+                        AND ((?2 IS NOT NULL AND json_extract(doc_json, '$.hostId') != ?2)
+                             OR ?3 IS NULL
+                             OR json_extract(doc_json, '$.mergeSha') != ?3)",
+                    params![job_id, source_host, auth_merge_nonempty],
+                    |row| row.get(0),
+                )?;
+                if terminal_for_other > 0 {
+                    tx.commit()?;
+                    return Ok(None);
+                }
+            }
+            // r17 item 3: once the job has reached a terminal state with an
+            // ACCEPTED log object, the evidence is IMMUTABLE. A different digest
+            // (even from the exact grant session) is rejected; only an
+            // identical duplicate (the Node's finished-event + RPC-reply pair)
+            // is accepted, touching nothing. running/landing/queued rows still
+            // settle their evidence and keep the prior replace semantics.
+            let row_is_terminal = !matches!(
+                current_state.as_deref(),
+                None | Some("running" | "landing" | "queued")
+            );
+            if row_is_terminal
+                && let Some(accepted_digest) = current_digest.as_deref()
+                && accepted_digest != digest
+            {
+                tracing::info!(
+                    job_id,
+                    current_state = current_state.as_deref().unwrap_or(""),
+                    "rejecting mismatched evidence after terminal settlement (immutable accepted \
+                     log)"
+                );
                 tx.commit()?;
                 return Ok(None);
             }

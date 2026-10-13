@@ -4206,6 +4206,169 @@ async fn the_granted_merge_is_bound_in_grant_verdict_and_evidence_writers() {
     assert_eq!(landed["mergeSha"], json!(merge), "{landed}");
 }
 
+/// r17 item 3: after a Landing settles, the accepted evidence is IMMUTABLE and
+/// stays grant-bound. A post-settlement write is accepted only when it is an
+/// exact duplicate (same digest — the Node's finished-event + RPC-reply pair);
+/// a different digest from ANY session, or any write from a replacement
+/// session/host/merge, is rejected and can never replace the accepted log.
+#[tokio::test]
+async fn accepted_landing_evidence_is_immutable_and_grant_bound_after_settlement() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let job_id = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let session = ctx.hub.test_node_session(&ctx.host).await.unwrap();
+    let merge = "7878787878787878787878787878787878787878";
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge, session)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+
+    // The accepted evidence from the exact grant tuple, delivered the way the
+    // Node delivers it: a `landed` verdict carrying the bounded run log.
+    // apply_result links the returned object id onto the job row and settles
+    // the Landing landed in one committed transaction.
+    ctx.hub
+        .test_apply_gate_result(
+            &job_id,
+            json!({
+                "jobId": job_id,
+                "generation": 1,
+                "status": "landed",
+                "mergeSha": merge,
+                "runLog": {
+                    "step": "*",
+                    "kind": "failed",
+                    "headline": "ACCEPTED-LAND-LOG",
+                    "summary": [],
+                    "tail": [],
+                    "capturedLines": 1,
+                    "truncated": false,
+                    "attempts": 1,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("landed"), "{doc}");
+    let object_id = doc["logObjectId"]
+        .as_str()
+        .expect("the accepted evidence is linked onto the row")
+        .to_owned();
+
+    // 1) A DIFFERENT digest from the exact grant session is rejected.
+    let changed = ctx
+        .hub
+        .test_insert_gate_log(
+            &ctx.project,
+            &job_id,
+            br#"{"headline":"TAMPERED"}"#.to_vec(),
+            "digest-tampered".into(),
+            "dev",
+            1,
+            Some(session),
+            Some(&ctx.host),
+            Some(merge),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        changed, None,
+        "a different digest must not replace the accepted log"
+    );
+
+    // 2) Any digest (even the accepted one re-hashed) from a replacement
+    //    session/host/merge is rejected by the grant tuple.
+    let other_host = "hst_other_host_id";
+    let other_merge = "9999999999999999999999999999999999999999";
+    for (bad_session, bad_host, bad_merge) in [
+        (
+            Some(session.wrapping_add(1)),
+            Some(ctx.host.as_str()),
+            Some(merge),
+        ),
+        (Some(session), Some(other_host), Some(merge)),
+        (Some(session), Some(ctx.host.as_str()), Some(other_merge)),
+    ] {
+        let refused = ctx
+            .hub
+            .test_insert_gate_log(
+                &ctx.project,
+                &job_id,
+                br#"{"headline":"TAMPERED"}"#.to_vec(),
+                "digest-tampered".into(),
+                "dev",
+                1,
+                bad_session,
+                bad_host,
+                bad_merge,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            refused, None,
+            "post-settlement non-grant evidence must refuse"
+        );
+    }
+
+    // 3) The identical evidence delivered again (the Node's finished-event +
+    //    RPC-reply pair) is an idempotent duplicate: re-send the same landed
+    //    verdict/run-log through production; the row stays landed and the object
+    //    id is unchanged.
+    ctx.hub
+        .test_apply_gate_result(
+            &job_id,
+            json!({
+                "jobId": job_id,
+                "generation": 1,
+                "status": "landed",
+                "mergeSha": merge,
+                "runLog": {
+                    "step": "*",
+                    "kind": "failed",
+                    "headline": "ACCEPTED-LAND-LOG",
+                    "summary": [],
+                    "tail": [],
+                    "capturedLines": 1,
+                    "truncated": false,
+                    "attempts": 1,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    let duplicated = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        duplicated["logObjectId"].as_str(),
+        Some(object_id.as_str()),
+        "the duplicate keeps the same evidence object"
+    );
+
+    // The served log is still the accepted evidence.
+    let (status, served) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{object_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{served}");
+    assert_eq!(
+        served["log"]["headline"],
+        json!("ACCEPTED-LAND-LOG"),
+        "the accepted evidence survived every post-settlement write: {served}"
+    );
+}
+
 /// r16 item 6: when a NEW carrier B takes over while the older socket A is
 /// still live, B is a live TAKEOVER and must NOT inherit A's in-flight Landing
 /// grant. The post-hello reconciliation runs on B (its gate.resolveLanding

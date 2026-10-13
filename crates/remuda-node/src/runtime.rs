@@ -109,6 +109,10 @@ pub(crate) struct DevNodeInner {
     /// Root for materialized attachments. Set by `compose` from the Node data
     /// dir; `None` on an in-memory Node, where attachments are refused.
     pub(crate) attachment_root: std::sync::RwLock<Option<std::path::PathBuf>>,
+    /// Identity used to scope this Node's stop-incomplete census blocks
+    /// (c-usagefu r18 items 2/3). Minted per composed Node, handed to the
+    /// driver factories, and retired on shutdown.
+    pub(crate) census_epoch: remuda_driver::NodeEpoch,
     queue_capacity: usize,
     host: Host,
     workspace: Workspace,
@@ -134,6 +138,16 @@ pub(crate) struct DevNodeInner {
 #[derive(Clone)]
 pub struct DevNode {
     pub(crate) inner: Arc<DevNodeInner>,
+}
+
+impl DevNode {
+    /// This Node's census epoch (c-usagefu r18 items 2/3): drivers built by
+    /// the Node register their codex census intervals under it, and shutdown
+    /// retires only its own retained blocks.
+    #[must_use]
+    pub fn census_epoch(&self) -> remuda_driver::NodeEpoch {
+        self.inner.census_epoch.clone()
+    }
 }
 
 /// Last-clone teardown.
@@ -210,6 +224,24 @@ impl DevNode {
         drivers: DriverRegistry,
         host_id: HostId,
     ) -> Result<Self, NodeError> {
+        Self::with_parts_on_host_epoch(
+            config,
+            store,
+            drivers,
+            host_id,
+            remuda_driver::NodeEpoch::mint(),
+        )
+    }
+
+    /// Like [`Self::with_parts_on_host`] with an explicit census epoch shared
+    /// with the driver registries built in `compose` (c-usagefu r18 items 2/3).
+    pub fn with_parts_on_host_epoch(
+        config: &crate::DevServerConfig,
+        store: Arc<dyn LocalStore>,
+        drivers: DriverRegistry,
+        host_id: HostId,
+        census_epoch: remuda_driver::NodeEpoch,
+    ) -> Result<Self, NodeError> {
         if config.instance_queue_capacity == 0 {
             return Err(NodeError::InvalidConfig(
                 "instance queue capacity must be positive".to_owned(),
@@ -250,6 +282,7 @@ impl DevNode {
                 gate: crate::gate::GateRegistry::new(),
                 api_relay: crate::api_relay::ApiRelayState::new(),
                 diagnostics: std::sync::RwLock::new(crate::DoctorContext::default()),
+                census_epoch,
                 #[cfg(test)]
                 create_reservation_barrier: tokio::sync::RwLock::new(None),
             }),

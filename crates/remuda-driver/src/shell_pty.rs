@@ -145,6 +145,10 @@ pub struct ShellPtyOptions {
     pub extra_env: std::collections::BTreeMap<String, String>,
     /// Authenticated instance context, injected only after environment filtering.
     pub agent_mcp: Option<crate::agent_mcp::AgentMcpContext>,
+    /// Identity of the Node that built this driver (c-usagefu r18 items 2/3).
+    /// `None` for drivers constructed outside a composed Node (unit tests,
+    /// embedded use): their retained blocks live in the detached bag.
+    pub node_epoch: Option<crate::adapters::codex_discovery::NodeEpoch>,
     /// Initial columns.
     pub cols: u16,
     /// Initial rows.
@@ -270,6 +274,7 @@ impl ShellPtyOptions {
             auto_trust_workspace: false,
             agent: None,
             instance_id: None,
+            node_epoch: None,
             #[cfg(any(test, feature = "test-stub"))]
             fail_after_spawn: false,
         }
@@ -547,8 +552,10 @@ pub struct ShellPtyDriver {
     /// c-usagefu r17 W0 test seam: when set, close() substitutes this ladder
     /// outcome (a stop-incomplete naming a survivor the regression controls)
     /// for the real one AFTER the real ladder has run — its signals and group
-    /// scan are never skipped.
-    #[cfg(test)]
+    /// scan are never skipped. Gated `test-stub` so Node integration tests
+    /// (remuda-node pulls the driver in with that feature) can drive the real
+    /// DevNode close/recompose path deterministically.
+    #[cfg(any(test, feature = "test-stub"))]
     test_stop_outcome: std::sync::Mutex<Option<StopOutcome>>,
 }
 
@@ -561,6 +568,27 @@ impl ShellPtyDriver {
     #[must_use]
     pub fn new(options: ShellPtyOptions) -> Self {
         Self::with_process_table(options, Arc::new(SystemProcessTable))
+    }
+
+    /// c-usagefu r17 W0 test seam (Node integration tests via `test-stub`):
+    /// force the next close's ladder verdict. The real ladder still runs; only
+    /// its verdict is substituted.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fn test_force_stop_outcome(&self, outcome: lifecycle::StopOutcome) {
+        *self
+            .test_stop_outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+    }
+
+    /// c-usagefu r18 items 2/3 test seam: the spawned child's process group.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fn test_pgid(&self) -> Option<i32> {
+        self.inner.try_lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|state| state.pgid.load(Ordering::SeqCst))
+        })
     }
 
     /// Build a driver whose promotion detection reads `table` instead of the
@@ -577,6 +605,8 @@ impl ShellPtyDriver {
             poller_shutdown: Mutex::new(None),
             poller_finalised: Mutex::new(None),
             close_lock: Mutex::new(()),
+            #[cfg(any(test, feature = "test-stub"))]
+            test_stop_outcome: std::sync::Mutex::new(None),
             waiter: Mutex::new(None),
             table,
             fallbacks: crate::hook_answer::FallbackLedger::new(),
@@ -604,8 +634,6 @@ impl ShellPtyDriver {
                 promotion::InterruptBaseline::default(),
             )),
             seq: Arc::new(AtomicU64::new(0)),
-            #[cfg(test)]
-            test_stop_outcome: std::sync::Mutex::new(None),
         }
     }
 
@@ -1884,7 +1912,7 @@ impl ShellPtyDriver {
         // Test seam: override ONLY the ladder verdict (simulating a member the
         // ladder could not kill). The real signals and group scan all run;
         // nothing substitutes them.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-stub"))]
         let outcome = {
             let mut outcome = outcome;
             if let Some(forced) = self
@@ -3380,6 +3408,18 @@ impl Driver for ShellPtyDriver {
             }
         }
         if !group_gone && !unconfirmed.is_empty() {
+            // c-usagefu r18 Ruling W0': an incomplete close while the owning
+            // Node is shutting down needs only this tracing warn! — its block
+            // ends with this Node (the epoch retirement drops the intervals
+            // below) and the pumps/workers are already stopped, so the operator
+            // observation is neither required nor worth reordering shutdown
+            // for. A LIVE Node's incomplete close additionally emits the
+            // lifecycle/Warning observation below.
+            let node_shutting_down = self
+                .options
+                .node_epoch
+                .as_ref()
+                .is_some_and(crate::adapters::codex_discovery::NodeEpoch::is_shutting_down);
             let cwd = unconfirmed
                 .first()
                 .map(|guard| guard.cwd().display().to_string())
@@ -3397,15 +3437,18 @@ impl Driver for ShellPtyDriver {
             tracing::warn!(
                 instance = %instance,
                 cwd = %cwd,
+                node_shutting_down,
                 "stop-incomplete: the census interval stays open until the Node restarts"
             );
             crate::adapters::codex_discovery::retain_unconfirmed_guards(unconfirmed);
-            // Surface the condition to the operator exactly once (close runs
-            // once per instance): a Diagnostic/Warning lifecycle naming the
-            // instance and cwd. Best-effort — the run channel may already be
-            // gone during teardown; the retained intervals are what enforce
-            // the conservative behaviour, not this emission.
-            if let (Some(events), Some(ctx)) = (close_events.as_ref(), close_ctx.as_ref())
+            // Live Node only: surface the condition to the operator exactly
+            // once (close runs once per instance) via a Diagnostic/Warning
+            // lifecycle naming the instance and cwd. Best-effort — the run
+            // channel may already be gone during teardown; the retained
+            // intervals are what enforce the conservative behaviour, not this
+            // emission.
+            if !node_shutting_down
+                && let (Some(events), Some(ctx)) = (close_events.as_ref(), close_ctx.as_ref())
                 && let Err(error) = promotion::emit_payload(
                     events,
                     &self.seq,
@@ -6407,7 +6450,7 @@ mod tests {
 
         // Node shutdown (the exact seam DevNode::shutdown calls): the retained
         // guards drop WITHOUT a recorded close — intervals stay live.
-        crate::adapters::codex_discovery::shutdown_unconfirmed_guards();
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
         for owner in [native_owner, promoted_owner] {
             assert!(
                 crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
@@ -6449,6 +6492,70 @@ mod tests {
             },
             _ => None,
         })
+    }
+
+    /// c-usagefu r18 Ruling W0': an incomplete close performed as part of the
+    /// owning Node's shutdown emits only a tracing warn! — no operator
+    /// lifecycle/Warning observation — because the block ends with that Node.
+    /// A live Node's incomplete close still emits the observation (covered by
+    /// the r17 W0 test).
+    #[tokio::test]
+    async fn a_shutdown_incomplete_close_emits_no_lifecycle_warning() {
+        use std::os::unix::process::CommandExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let survivor_pid = i32::try_from(child.id()).unwrap();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        let epoch = crate::adapters::codex_discovery::NodeEpoch::mint();
+        epoch.begin_shutdown();
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        options.node_epoch = Some(epoch.clone());
+        let driver = ShellPtyDriver::new(options);
+        let mut events = driver.spawn().await.unwrap().into_events();
+        *driver.test_stop_outcome.lock().unwrap() = Some(lifecycle::StopOutcome {
+            rung: lifecycle::StopRung::Kill,
+            group_gone: false,
+            pgid: Some(survivor_pid),
+            survivors: vec![survivor_pid],
+        });
+        *driver.codex_lifetime.lock().await =
+            Some(crate::adapters::codex_discovery::begin_lifetime(
+                &cwd,
+                "r18-item2-owner",
+                Some(time::OffsetDateTime::now_utc()),
+            ));
+        Driver::close(&driver).await.unwrap();
+
+        // Draining every observation is the assertion: a stop-incomplete
+        // lifecycle/Warning here fails the test above. The channel may carry
+        // unrelated observations (or be empty); only the warning is gated.
+        while let Ok(observation) = events.try_recv() {
+            if let remuda_protocol::ObservationPayload::Lifecycle(payload) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = &**payload
+                && native.topic == remuda_protocol::LifecycleTopic::Diagnostic
+                && native.severity == remuda_protocol::Severity::Warning
+                && native.native_name == "stop-incomplete"
+            {
+                panic!("a shutdown incomplete close must not emit the lifecycle warning");
+            }
+        }
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(survivor_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(Some(&epoch));
     }
 
     #[tokio::test]
@@ -6544,7 +6651,7 @@ mod tests {
             Some(nix::sys::signal::Signal::SIGKILL),
         )
         .unwrap();
-        crate::adapters::codex_discovery::shutdown_unconfirmed_guards();
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
     }
 
     /// c-usagefu r18 item 5 helper: a promoted login driver whose real poller
@@ -6709,7 +6816,7 @@ mod tests {
             buffered_usage_payloads(&mut events).is_empty(),
             "no second usage publication after the abort finalise"
         );
-        crate::adapters::codex_discovery::shutdown_unconfirmed_guards();
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
     }
 
     #[tokio::test]

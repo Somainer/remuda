@@ -20,8 +20,70 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use time::OffsetDateTime;
+
+/// Identity of the owning Node for census state (c-usagefu r18 items 2/3).
+///
+/// One [`NodeEpoch`] is minted per composed `DevNode`; drivers built by that
+/// Node carry a clone. In-process recompose (a second `compose()` in the same
+/// process) is therefore a NEW epoch: when the first Node shuts down its
+/// stop-incomplete census blocks retire for ITS epoch only, and the second
+/// Node's same-cwd prompt-only discovery is attributable again.
+///
+/// The epoch also carries the Node's shutdown flag: an incomplete close
+/// performed AS PART OF Node shutdown emits only a `tracing::warn!` — its
+/// block ends with that Node — while a live Node's incomplete close emits the
+/// operator lifecycle/Warning observation (Ruling W0').
+#[derive(Clone)]
+pub struct NodeEpoch {
+    inner: Arc<NodeEpochInner>,
+}
+
+impl std::fmt::Debug for NodeEpoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeEpoch")
+            .field("id", &self.inner.id)
+            .field(
+                "shutting_down",
+                &self.inner.shutting_down.load(Ordering::SeqCst),
+            )
+            .finish()
+    }
+}
+
+struct NodeEpochInner {
+    /// Monotonic per-process id used to scope retained census guards.
+    id: u64,
+    shutting_down: AtomicBool,
+}
+
+static NEXT_NODE_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+impl NodeEpoch {
+    /// Mint a fresh epoch for one composed Node.
+    #[must_use]
+    pub fn mint() -> Self {
+        Self {
+            inner: Arc::new(NodeEpochInner {
+                id: NEXT_NODE_EPOCH.fetch_add(1, Ordering::Relaxed),
+                shutting_down: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// Signal this Node is shutting down BEFORE its instances are closed, so
+    /// an incomplete stop during the close loop needs no operator observation
+    /// (c-usagefu r18 Ruling W0').
+    pub fn begin_shutdown(&self) {
+        self.inner.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.inner.shutting_down.load(Ordering::SeqCst)
+    }
+}
 
 #[derive(Default)]
 struct WindowEntry {
@@ -337,15 +399,19 @@ impl Drop for LifetimeGuard {
 /// while the agent was live, and a survivor that exits later (or a pid the
 /// kernel reused) can never produce a false close on this Node. Deliberately
 /// there is NO watcher, NO periodic sweep and NO process-identity tracking —
-/// this is only a bag of suppressed owner guards. On Node shutdown
-/// [`shutdown_unconfirmed_guards`] drains and drops them; because
-/// [`LifetimeGuard::suppress_drop_close`] was set when they entered, that drop
-/// records no closure. The next Node process reconciles the census afresh.
+/// this is only a bag of suppressed owner guards.
+///
+/// c-usagefu r18 item 3: the bag is keyed by the OWNING NODE's census epoch.
+/// On that Node's shutdown [`shutdown_unconfirmed_guards`] retires exactly
+/// ITS intervals from the census (removes the segments without recording a
+/// close) and drops its guards; another still-live Node's epoch is untouched.
+/// Guards whose driver carried no epoch (constructed outside a composed Node)
+/// live in the `None` detached bucket and are dropped unclosed as before.
 static UNCONFIRMED_GUARDS: LazyLock<Mutex<Vec<LifetimeGuard>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Retain the owner census guards of one stop-incomplete teardown for the
-/// rest of this Node's lifetime (Ruling W0). Drop-close is suppressed on
+/// rest of its Node's lifetime (Ruling W0). Drop-close is suppressed on
 /// every guard before it enters the bag; an explicit confirmed-exit close
 /// stays impossible here because the close path already classified the group
 /// as not gone.
@@ -362,11 +428,22 @@ pub(crate) fn retain_unconfirmed_guards(guards: Vec<LifetimeGuard>) {
         .extend(guards);
 }
 
-/// Node shutdown seam (called from `DevNode::shutdown`): drop every retained
-/// stop-incomplete census guard WITHOUT recording a close (Ruling W0). The
-/// intervals stay live in the census for the next Node process to reconcile.
-/// Synchronous and instant: the guards own no tasks.
-pub fn shutdown_unconfirmed_guards() {
+/// Node shutdown seam (called from `DevNode::shutdown`, c-usagefu r18 Ruling
+/// W0' / item 3): retire THIS Node's stop-incomplete census blocks.
+///
+/// The retained guards are dropped WITHOUT recording a close (their
+/// Drop-close was suppressed), and their still-open census SEGMENTS are then
+/// removed — not marked closed — so an in-process recompose (Node B, fresh
+/// epoch, same process) can attribute a same-cwd prompt-only discovery again.
+/// Other Nodes' epochs (including the detached `None` bucket of drivers
+/// built outside a composed Node) are left strictly alone. Synchronous: the
+/// guards own no tasks.
+pub fn shutdown_unconfirmed_guards(epoch: Option<&NodeEpoch>) {
+    // c-usagefu r18 item 2 intermediate: the epoch's shutdown flag is what
+    // suppresses the operator warning on shutdown closes. Per-epoch census
+    // scoping/retirement lands in item 3; here every retained guard drops
+    // without recording a close (r17 W0 semantics).
+    let _ = epoch;
     let guards = std::mem::take(
         &mut *UNCONFIRMED_GUARDS
             .lock()
@@ -1339,7 +1416,7 @@ fn put_input(cwd: &Path, owner: &str, text: &str, at: OffsetDateTime) {
 }
 
 /// Record that instance `owner` dispatched `text` in `cwd` at `now`.
-pub(crate) fn record_input(cwd: &Path, owner: &str, text: &str) {
+pub fn record_input(cwd: &Path, owner: &str, text: &str) {
     evict_expired_inputs(OffsetDateTime::now_utc());
     put_input(cwd, owner, text, OffsetDateTime::now_utc());
 }

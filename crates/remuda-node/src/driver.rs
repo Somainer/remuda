@@ -513,12 +513,16 @@ impl DriverRegistry {
     pub fn with_fake() -> Result<Self, NodeError> {
         let registry = Self::default();
         registry.register_factory(Arc::new(FakeDriverFactory))?;
-        registry.register_factory(Arc::new(ShellPtyFactory))?;
+        // Detached census epoch (no composed Node owns this registry).
+        registry.register_factory(Arc::new(ShellPtyFactory { epoch: None }))?;
         Ok(registry)
     }
 }
 
-struct ShellPtyFactory;
+struct ShellPtyFactory {
+    /// Owning Node's census epoch; None outside a composed Node.
+    epoch: Option<remuda_driver::NodeEpoch>,
+}
 
 impl DriverFactory for ShellPtyFactory {
     fn kind(&self) -> DriverKind {
@@ -528,6 +532,7 @@ impl DriverFactory for ShellPtyFactory {
     fn build(&self, launch: DriverLaunch) -> Result<Arc<dyn Driver>, DriverError> {
         let mut options = remuda_driver::ShellPtyOptions::login(launch.workspace_root);
         options.args = launch.request.args;
+        options.node_epoch = self.epoch.clone();
         Ok(Arc::new(NativeShellAdapter {
             inner: remuda_driver::ShellPtyDriver::new(options),
         }))

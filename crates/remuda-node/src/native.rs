@@ -176,6 +176,16 @@ fn node_herdr_session(data_dir: &Path, configured: Option<String>) -> String {
 /// Register `claude-print`, `claude-sdk`, `claude-pty`, and `claude-bg` as
 /// per-instance factories.
 pub fn native_driver_registry(config: NativeDriverConfig) -> Result<DriverRegistry, NodeError> {
+    native_driver_registry_for_epoch(config, None)
+}
+
+/// Like [`native_driver_registry`], but every built driver carries the owning
+/// Node's census epoch (c-usagefu r18 items 2/3) so its stop-incomplete blocks
+/// are scoped to that Node.
+pub fn native_driver_registry_for_epoch(
+    config: NativeDriverConfig,
+    epoch: Option<remuda_driver::NodeEpoch>,
+) -> Result<DriverRegistry, NodeError> {
     if config
         .claude_native_home
         .as_ref()
@@ -205,6 +215,7 @@ pub fn native_driver_registry(config: NativeDriverConfig) -> Result<DriverRegist
         registry.register_factory(Arc::new(NativeClaudeFactory {
             kind,
             config: config.clone(),
+            epoch: epoch.clone(),
         }))?;
     }
     Ok(registry)
@@ -213,6 +224,9 @@ pub fn native_driver_registry(config: NativeDriverConfig) -> Result<DriverRegist
 struct NativeClaudeFactory {
     kind: DriverKind,
     config: NativeDriverConfig,
+    /// Owning Node's census epoch; None for a registry built outside a
+    /// composed Node (unit/integration callers of `native_driver_registry`).
+    epoch: Option<remuda_driver::NodeEpoch>,
 }
 
 impl NativeClaudeFactory {
@@ -519,6 +533,10 @@ impl DriverFactory for NativeClaudeFactory {
                     &launch.request.extra_env,
                 ));
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
+                // c-usagefu r18 items 2/3: scope this driver's
+                // stop-incomplete census blocks (and its shutdown-warning
+                // behaviour) to the Node that built it.
+                options.node_epoch = self.epoch.clone();
                 // Unconditional, and deliberately not inside the `pty_hooks`
                 // block below: a promoted shell with hooks off would otherwise
                 // keep a random scope, and every id it derives (transcript

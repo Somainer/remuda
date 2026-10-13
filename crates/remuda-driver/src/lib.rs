@@ -51,6 +51,7 @@ mod fake;
 #[cfg(any(test, feature = "test-stub"))]
 pub mod test_support;
 
+pub use adapters::codex_discovery::NodeEpoch;
 /// Node shutdown seam: drop codex census guards retained by stop-incomplete
 /// teardowns WITHOUT recording closures (c-usagefu r17 Ruling W0).
 pub use adapters::codex_discovery::shutdown_unconfirmed_guards;
@@ -119,6 +120,8 @@ pub use secrets::KeychainSecretBroker;
 pub use secrets::{FileSecretStore, TokenBroker, fingerprint_secret};
 #[cfg(unix)]
 pub use secrets::{request_secret, serve_token_broker};
+#[cfg(any(test, feature = "test-stub"))]
+pub use shell_pty::lifecycle::StopOutcome as TestStopOutcome;
 pub use shell_pty::{
     EMULATOR_ENV, ShellPtyDriver, ShellPtyOptions, default_shell, emulator_enabled,
 };

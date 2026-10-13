@@ -118,7 +118,10 @@ pub use inventory::{
 pub use model::{
     CommandAction, CreateInstanceRequest, CreateInstanceResponse, InstanceCommandRequest,
 };
-pub use native::{NativeDriverConfig, ToolMediaStagerSlot, native_driver_registry};
+pub use native::{
+    NativeDriverConfig, ToolMediaStagerSlot, native_driver_registry,
+    native_driver_registry_for_epoch,
+};
 pub use runtime::DevNode;
 pub use runtime_link::attach_runtime;
 pub use server::{DevServer, dev_router, dispatch_hub_rpc};

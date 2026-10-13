@@ -4906,10 +4906,14 @@ fi
         );
     }
 
-    /// The fake CLI speaks the production child-start barrier protocol: the
-    /// verify child must NOT see the barrier variable; the LAND child must see
-    /// REMUDA_START_BARRIER_FD=0, block on one stdin byte before any git work,
-    /// and exit 4 on EOF (the real `remuda merge` does exactly this).
+    /// The fake CLI speaks the production child-start barrier protocol EXACTLY
+    /// like `remuda merge`'s `await_start_barrier`: the verify child must NOT see
+    /// the barrier variable; the LAND child must see REMUDA_START_BARRIER_FD=0
+    /// and block on one stdin byte before any git work (exiting 4 on EOF). If the
+    /// fd variable is ABSENT the real barrier call is a no-op, so a faithful
+    /// fake PROCEEDS immediately (writes `bypassed.marker`, emits landed) — that
+    /// is the dangerous path the env-clear-ordering bug exposed, and the
+    /// held-child regression asserts it never happens.
     const BARRIER_LAND_SCRIPT: &str = r#"
 dir=$(dirname "$0")
 echo "$*" >> "$dir/args.txt"
@@ -4924,8 +4928,11 @@ if ! printf '%s\n' "$*" | grep -q -- '--land'; then
   exit 0
 fi
 if [ "${REMUDA_START_BARRIER_FD-}" != "0" ]; then
-  echo "land child lost REMUDA_START_BARRIER_FD after env_clear" >&2
-  exit 98
+  # Faithful reproduction of the real CLI with no fd var: the start-barrier
+  # wait is skipped entirely, so the land proceeds WITHOUT a durable fence.
+  echo bypassed > "$dir/bypassed.marker"
+  echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\":\"$head\",\"steps\":[]}"
+  exit 0
 fi
 head -c 1 >/dev/null || { echo "start barrier closed before release" >&2; exit 4; }
 echo released > "$dir/released.marker"
@@ -4996,14 +5003,23 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
             argv.lines().any(|line| line.contains("--land")),
             "the land child spawned through the production builder: {argv}"
         );
+        // Give the (unblocked) child a real window to misbehave: if the barrier
+        // variable had been wiped by env_clear, the faithful fake proceeds past
+        // the barrier immediately and writes bypassed.marker. It must not.
+        std::thread::sleep(Duration::from_millis(300));
+        let marker_dir = fixture.bin.parent().unwrap();
         assert!(
-            !fixture
-                .bin
-                .parent()
-                .unwrap()
-                .join("released.marker")
-                .exists(),
+            !marker_dir.join("released.marker").exists(),
             "the child must not pass the barrier while the fence is unpersisted"
+        );
+        assert!(
+            !marker_dir.join("bypassed.marker").exists(),
+            "the child must not run past a missing barrier (the env var was wiped by env_clear)"
+        );
+        // The child stays ALIVE and parked: the run must still be in flight.
+        assert!(
+            !run.is_finished(),
+            "the blocked land child keeps the run in flight while the fence latch is held"
         );
         assert_eq!(
             origin_main(&fixture),
@@ -5042,6 +5058,15 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
                 .join("released.marker")
                 .exists(),
             "the child must never be released after the fence failed"
+        );
+        assert!(
+            !fixture
+                .bin
+                .parent()
+                .unwrap()
+                .join("bypassed.marker")
+                .exists(),
+            "the child never bypassed the barrier (the env var survived env_clear)"
         );
         assert_eq!(
             origin_main(&fixture),

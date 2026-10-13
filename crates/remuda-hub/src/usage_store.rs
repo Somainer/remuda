@@ -1549,12 +1549,21 @@ fn known_context_total(buckets: [Option<i64>; 3]) -> Option<i64> {
 /// c-ctxusage r4 item 4: "newest" is the NATIVE time, not the ingest seq — a
 /// late historical correction (replay of an older message at a high seq) must
 /// not become the current context. Ties break deterministically on seq.
+///
+/// c-ctxusage r18 item 1: the candidate rows are the lineage WINNERS first
+/// ([`WINNING_TURN_ROWS_SQL`]). Ordering the raw table picked the newest
+/// timestamp of ANY lineage, so a superseded in-window lineage (a revision-
+/// replaced row for the same message id) could supply the context even though
+/// a newer accepted frame in another lineage was the logical turn's current
+/// state. Fold to one winner per scope id, then order the winners by native
+/// timestamp and seq.
 fn latest_turn_basket(conn: &Connection, instance_id: &str) -> rusqlite::Result<Option<i64>> {
     conn.query_row(
-        "SELECT input_tokens, cache_read_tokens, cache_write_tokens
-         FROM usage_events
-         WHERE instance_id = ?1 AND scope = 'turn'
-         ORDER BY observed_at DESC, seq DESC LIMIT 1",
+        &format!(
+            "SELECT input_tokens, cache_read_tokens, cache_write_tokens
+             FROM ({WINNING_TURN_ROWS_SQL})
+             ORDER BY observed_at DESC, seq DESC LIMIT 1"
+        ),
         params![instance_id],
         |row| {
             let input: Option<i64> = row.get(0)?;
@@ -2277,6 +2286,16 @@ mod tests {
             rollup.tpm_out_5m,
             Some(0),
             "2 output / 5 minutes rounds to 0"
+        );
+        // c-ctxusage r18 item 1: the context basket is the newest LINEAGE
+        // WINNER, not the newest raw row. Turn-a's in-window alpha row
+        // (input 100, 2 s old) is superseded by its beta winner (500 s old);
+        // among the winners turn-b's 3 s old row is newest, so context is 22.
+        assert_eq!(
+            rollup.context_used_tokens,
+            Some(22),
+            "context comes from the newest winner; the superseded in-window \
+             turn-a lineage must not supply a 100 context"
         );
     }
 

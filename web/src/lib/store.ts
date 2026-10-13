@@ -1173,6 +1173,17 @@ class HubStore {
    * post-load flush) belonging to the previous identity.
    */
   private authGen = 0;
+  /**
+   * Auth-transition blocker (c-reconnfu gate 34 Fence A). While a credential
+   * request is in flight (its response sets the new cookie in HEADERS before
+   * the body parses), outbox initialization/delivery must be held so the old
+   * box cannot retry with the new cookie. runAuthTransition wraps every
+   * login/passkey call: it disposes BEFORE the request, blocks ensureOutbox
+   * until the body settles (success or failure), and then releases so a
+   * current-generation box initializes.
+   */
+  private authTransition: Promise<void> | null = null;
+  private resolveAuthTransition: (() => void) | null = null;
 
   /**
    * Lazily open the durable outbox (also used outside bootstrap, e.g. a
@@ -1193,6 +1204,34 @@ class HubStore {
     this.authGen += 1;
     this.disposeOutboxForAuthChange();
   }
+
+  /**
+   * FENCE A (c-reconnfu gate 34 item 3): wrap a credential-establishing
+   * request (bootstrap login, pairing, passkey finish). Disposes the current
+   * outbox and installs a transition blocker BEFORE the request is issued
+   * (the Hub sets the new cookie in response headers, ahead of the body);
+   * runs `issue` (which writes the session only on success); then releases the
+   * blocker whether the body succeeded, rejected or threw — a failed body
+   * leaves no new identity, but the disposed old box is simply re-initialized
+   * by the next ensureOutbox after release.
+   */
+  private async runAuthTransition<T>(issue: () => Promise<T>): Promise<T> {
+    this.applyAuthIdentityChange();
+    // Coalesce: if a transition is already open, await it before starting.
+    if (this.authTransition) await this.authTransition;
+    this.authTransition = new Promise<void>((resolve) => {
+      this.resolveAuthTransition = resolve;
+    });
+    try {
+      return await issue();
+    } finally {
+      const resolve = this.resolveAuthTransition;
+      this.resolveAuthTransition = null;
+      this.authTransition = null;
+      resolve?.();
+    }
+  }
+
 
   /**
    * Dispose the current Outbox INSTANCE for an auth-identity change.
@@ -1247,8 +1286,19 @@ class HubStore {
    *    the legacy direct POST may run, but ALWAYS carrying the client command
    *    id as its dedupe id.
    */
-  private ensureOutbox(): Promise<"ok" | "obsolete" | "unavailable"> {
-    if (this.outbox) return Promise.resolve("ok");
+  private async ensureOutbox(): Promise<"ok" | "obsolete" | "unavailable"> {
+    if (this.outbox) return "ok";
+    // Fence A (c-reconnfu gate 34 item 3): do not initialize while a
+    // credential transition is open — the new cookie is already live in
+    // headers but its body has not settled, and any box we install now could
+    // retry old rows under the new identity. Wait for the transition to settle,
+    // then initialize under the current generation.
+    if (this.authTransition) await this.authTransition;
+    if (this.outbox) return "ok";
+    return this.startOutboxInit();
+  }
+
+  private startOutboxInit(): Promise<"ok" | "obsolete" | "unavailable"> {
     if (this.outboxInit) return this.outboxInit;
     this.registerPeerAuthWatch();
     // Capture the auth generation this initializer starts under (gate 33
@@ -2751,6 +2801,11 @@ class HubStore {
   applyAuthIdentityChangeForTest(): void {
     this.applyAuthIdentityChange();
   }
+  /** Test seam: true while a Fence-A credential transition is open. */
+  get authTransitionOpenForTest(): boolean {
+    return this.authTransition !== null;
+  }
+
   private outboxOpenGateForTest: ((resolve: () => void) => void) | null = null;
   setOutboxOpenGateForTest(gate: ((resolve: () => void) => void) | null): void {
     this.outboxOpenGateForTest = gate;
@@ -3936,11 +3991,14 @@ class HubStore {
   }
 
   async login(kind: "bootstrap" | "pair", secret: string, deviceName: string) {
-    const session =
-      kind === "pair" ? await api.pairRedeem(secret, deviceName) : await api.login(secret, deviceName);
-    // c-reconnfu gate 33 item 1: a new identity — dispose the old outbox and
-    // invalidate any in-flight initialization BEFORE the new session is used.
-    this.applyAuthIdentityChange();
+    // Fence A: dispose + block init BEFORE the credential request (the new
+    // cookie lands in response headers); write the session only after the body
+    // resolves, then bootstrap. A body failure still releases the blocker.
+    const session = await this.runAuthTransition(() =>
+      kind === "pair"
+        ? api.pairRedeem(secret, deviceName)
+        : api.login(secret, deviceName),
+    );
     writeSession(session, { mock: api.mock });
     // bootstrap marks the session authenticated after cookie-backed reads finish.
     this.emit({ session: readSession(), error: null });
@@ -3973,10 +4031,9 @@ class HubStore {
     const envelope = await api.passkeyLoginStart(mediation === "conditional" ? "conditional" : undefined);
     const options = envelope.options as ServerRequestOptions;
     const assertion = await getPasskey(options, mediation, signal);
-    const session = await api.passkeyLoginFinish(envelope.challengeId, assertion, deviceName);
-    // c-reconnfu gate 33 item 1: passkey login is a new identity — dispose the
-    // old outbox before the new session is used.
-    this.applyAuthIdentityChange();
+    const session = await this.runAuthTransition(() =>
+      api.passkeyLoginFinish(envelope.challengeId, assertion, deviceName),
+    );
     writeSession(session, { mock: api.mock });
     this.emit({ session: readSession(), error: null });
     await this.bootstrap();

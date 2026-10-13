@@ -1269,13 +1269,33 @@ pub struct UsageAggregate {
     pub output_tokens: i64,
     /// Summed cost (decimal, estimated).
     pub cost_usd: f64,
+    /// c-usagefu r16 item 7: true on the rolled-back/legacy shape — the numbers
+    /// are NOT evidence (they are zero only because the new-schema projection
+    /// could not run). The client renders Unknown, never `0` / `$0.00`.
+    /// Distinct from a real zero (a migrated instance with no spend yet), which
+    /// leaves this false.
+    pub unavailable: bool,
 }
 
 impl UsageAggregate {
+    /// The explicit Unavailable state for a store the usage migration did not
+    /// upgrade (c-usagefu r16 item 7). No numeric field here is evidence.
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            unavailable: true,
+            ..Self::default()
+        }
+    }
+
     /// Budget status against an estimated cap: ok → warn (estimate reached) →
     /// stop (estimate × 1.15). Costs are labeled estimates.
     #[must_use]
     pub fn budget_status(&self, max_usd: Option<f64>) -> BudgetStatus {
+        // No spend evidence on the legacy shape: never grade a budget band off
+        // the placeholder zero.
+        if self.unavailable {
+            return BudgetStatus::Ok;
+        }
         let Some(max) = max_usd.filter(|v| *v > 0.0) else {
             return BudgetStatus::Ok;
         };
@@ -1607,10 +1627,11 @@ pub fn aggregate_instance(
     instance_id: &str,
 ) -> rusqlite::Result<UsageAggregate> {
     // c-usagefu r15 item 1: a rolled-back migration leaves a shape the
-    // new-schema aggregate SQL cannot run against; report an empty aggregate
-    // (budget band Ok, no spend evidence) rather than fail the endpoint.
+    // new-schema aggregate SQL cannot run against. c-usagefu r16 item 7: carry
+    // an explicit Unavailable state (never a zero that the client reads as
+    // real spend) while keeping the endpoint usable.
     if !usage_schema_is_current(conn)? {
-        return Ok(UsageAggregate::default());
+        return Ok(UsageAggregate::unavailable());
     }
     let sql = cost_select_sql(
         "instance_id = ?1",
@@ -1627,6 +1648,7 @@ pub fn aggregate_instance(
                 input_tokens: row.get(2)?,
                 output_tokens: row.get(3)?,
                 cost_usd: row.get(4)?,
+                unavailable: false,
             })
         },
     )
@@ -1638,9 +1660,10 @@ pub fn aggregate_supply(
     profile_id: &str,
     model: &str,
 ) -> rusqlite::Result<UsageAggregate> {
-    // c-usagefu r15 item 1: legacy-shape fallback, see [`aggregate_instance`].
+    // c-usagefu r15 item 1: legacy-shape fallback; c-usagefu r16 item 7 reports
+    // the explicit Unavailable state instead of a zero spend.
     if !usage_schema_is_current(conn)? {
-        return Ok(UsageAggregate::default());
+        return Ok(UsageAggregate::unavailable());
     }
     // Six bindings: stock CTE (profile, model), flow subquery (profile,
     // model), outer count/token totals (profile, model).
@@ -1659,6 +1682,7 @@ pub fn aggregate_supply(
                 input_tokens: row.get(2)?,
                 output_tokens: row.get(3)?,
                 cost_usd: row.get(4)?,
+                unavailable: false,
             })
         },
     )
@@ -1675,6 +1699,12 @@ pub fn aggregate_supply(
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceUsageRollup {
+    /// c-usagefu r16 item 7: the store is on the rolled-back/legacy shape, so
+    /// none of the counters below could be projected. The client renders this
+    /// as Unknown (never 0 and never a kind-guessed percentage). Distinct from
+    /// `rollup_instance` returning `None`, which means there is NO rollup
+    /// channel / no usage at all.
+    pub unavailable: bool,
     /// Tokens the next request will carry: the last turn's fresh input +
     /// cache read + cache creation. `None` when no component was reported.
     pub context_used_tokens: Option<i64>,
@@ -2185,11 +2215,13 @@ pub fn rollup_instance(
     req: &RollupRequest<'_>,
 ) -> rusqlite::Result<Option<InstanceUsageRollup>> {
     // c-usagefu r15 item 1: the rollup SQL references final-schema columns
-    // (scope_id/turn_id/observed_at_source). On a database the usage migration
-    // could not upgrade it reports Unknown (`None`) instead of failing the
-    // instance list/detail load — Hub APIs stay usable on the legacy shape.
+    // (scope_id/turn_id/observed_at_source). c-usagefu r16 item 7: on a
+    // database the usage migration could not upgrade it returns an explicit
+    // Unavailable rollup (`Some` with `unavailable: true`, every counter None)
+    // instead of the `None` "no channel" state — the instance list/detail load
+    // succeeds and the client renders Unknown rather than a guessed percentage.
     if !usage_schema_is_current(conn)? {
-        return Ok(None);
+        return Ok(Some(InstanceUsageRollup::unavailable()));
     }
     let instance_id = req.instance_id;
     // Turn count over the ELIGIBLE flow rows: distinct turn id of every
@@ -2341,6 +2373,7 @@ pub fn rollup_instance(
     let last_turn_at = totals.last_turn_at.or(stock.observed_at);
 
     Ok(Some(InstanceUsageRollup {
+        unavailable: false,
         context_used_tokens,
         context_window_tokens,
         context_pct,
@@ -2356,6 +2389,31 @@ pub fn rollup_instance(
         tpm_out_5m: per_minute_5m(out_5m),
         last_turn_at,
     }))
+}
+
+impl InstanceUsageRollup {
+    /// The explicit Unavailable rollup for a store the usage migration did not
+    /// upgrade (c-usagefu r16 item 7). Every counter is unknown; the client
+    /// renders Unknown rather than zero or a kind-fallback percentage.
+    fn unavailable() -> Self {
+        Self {
+            unavailable: true,
+            context_used_tokens: None,
+            context_window_tokens: None,
+            context_pct: None,
+            context_pct_approximate: false,
+            session_input_tokens: None,
+            session_output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            turns: 0,
+            tpm_in_60s: None,
+            tpm_out_60s: None,
+            tpm_in_5m: None,
+            tpm_out_5m: None,
+            last_turn_at: None,
+        }
+    }
 }
 
 /// Observe a fresh journal append: project + persist usage events. Called from
@@ -4405,7 +4463,11 @@ mod tests {
             "the additive DDL rolled back with the failed transaction"
         );
 
-        // Every read degrades; no "no such column" error.
+        // Every read degrades; no "no such column" error. c-usagefu r16 item 7:
+        // the legacy shape is an explicit Unavailable state, distinct from the
+        // None "no channel" state — Some(rollup) with unavailable=true, and
+        // aggregates carrying unavailable=true rather than a zero that reads as
+        // real spend.
         let req = RollupRequest {
             instance_id: "ins_r15legacy",
             kind: "codex",
@@ -4413,20 +4475,24 @@ mod tests {
             effective_model: None,
             profile_id: Some("pvp_r15"),
         };
+        let legacy_rollup = rollup_instance(&conn, &req).unwrap();
         assert!(
-            rollup_instance(&conn, &req).unwrap().is_none(),
-            "usage reports Unknown on the legacy shape, never a SQL error"
+            legacy_rollup
+                .as_ref()
+                .is_some_and(|rollup| rollup.unavailable),
+            "legacy shape reports an explicit Unavailable rollup, not None"
         );
         assert_eq!(
-            aggregate_instance(&conn, "ins_r15legacy").unwrap().events,
-            0
+            legacy_rollup.as_ref().unwrap().context_pct,
+            None,
+            "an Unavailable rollup never carries a guessed percentage"
         );
-        assert_eq!(
-            aggregate_supply(&conn, "pvp_r15", "gpt-5.4")
-                .unwrap()
-                .events,
-            0
-        );
+        let inst_agg = aggregate_instance(&conn, "ins_r15legacy").unwrap();
+        assert!(inst_agg.unavailable, "instance aggregate is Unavailable");
+        assert_eq!(inst_agg.events, 0);
+        let supply_agg = aggregate_supply(&conn, "pvp_r15", "gpt-5.4").unwrap();
+        assert!(supply_agg.unavailable, "supply aggregate is Unavailable");
+        assert_eq!(supply_agg.events, 0);
 
         // Writes keep recording through main's insert path (seq 2).
         let legacy_row = UsageEventRow {
@@ -4626,8 +4692,11 @@ mod tests {
             "the instance is listed"
         );
         assert!(
-            listed.iter().all(|record| record.usage_rollup.is_none()),
-            "usage is Unknown for every row on the legacy shape, no SQL error"
+            listed.iter().all(|record| record
+                .usage_rollup
+                .as_ref()
+                .is_some_and(|rollup| rollup.unavailable)),
+            "every row carries an explicit Unavailable rollup on the legacy shape"
         );
 
         // DETAIL: same load path, single instance.
@@ -4637,18 +4706,25 @@ mod tests {
             .expect("instance detail succeeds")
             .expect("the instance exists");
         assert!(
-            detail.usage_rollup.is_none(),
-            "detail reports usage Unknown on the legacy shape"
+            detail
+                .usage_rollup
+                .as_ref()
+                .is_some_and(|rollup| rollup.unavailable),
+            "detail reports an explicit Unavailable rollup on the legacy shape"
         );
 
-        // USAGE endpoint query: empty aggregate, never an error.
+        // USAGE endpoint query: an Unavailable aggregate, never an error.
         let agg = store
             .run_named("r15m1_usage", move |conn| {
                 aggregate_instance(conn, &instance_id).map_err(crate::store::StoreError::from)
             })
             .await
             .expect("the usage aggregate query succeeds");
-        assert_eq!(agg.events, 0, "usage Unknown reads as an empty aggregate");
+        assert_eq!(agg.events, 0);
+        assert!(
+            agg.unavailable,
+            "the zero placeholder is explicitly Unavailable, not real zero spend"
+        );
 
         drop(store);
         // Reopen still works: the failure persists and is still non-fatal.

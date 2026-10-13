@@ -133,7 +133,9 @@ export function ContextUsagePopover({
         <div className={css.usageSection}>
           <span className={css.usageInline}>
             <span className={css.usageLabel}>回合数</span>
-            <span data-testid="context-usage-turns">{rollup.turns}</span>
+            <span data-testid="context-usage-turns">
+              {rollup.unavailable ? "—" : rollup.turns}
+            </span>
           </span>
         </div>
 

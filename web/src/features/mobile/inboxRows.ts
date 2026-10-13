@@ -115,8 +115,10 @@ function contextPctOf(
   rollups: Record<string, UsageRollup>,
 ): number | null {
   const id = instance?.id;
-  const pct =
-    (id ? rollups[id]?.contextPct : null) ?? instance?.usageRollup?.contextPct ?? null;
+  const rollup = (id ? rollups[id] : undefined) ?? instance?.usageRollup ?? undefined;
+  // c-usagefu r16 item 7: an Unavailable rollup paints no ring/percentage.
+  if (rollup?.unavailable) return null;
+  const pct = rollup?.contextPct ?? null;
   return typeof pct === "number" && Number.isFinite(pct) ? pct : null;
 }
 
@@ -126,11 +128,9 @@ function contextApproxOf(
   rollups: Record<string, UsageRollup>,
 ): boolean {
   const id = instance?.id;
-  return (
-    (id ? rollups[id]?.contextPctApproximate : undefined) ??
-    instance?.usageRollup?.contextPctApproximate ??
-    false
-  );
+  const rollup = (id ? rollups[id] : undefined) ?? instance?.usageRollup ?? undefined;
+  if (rollup?.unavailable) return false;
+  return rollup?.contextPctApproximate ?? false;
 }
 
 /**

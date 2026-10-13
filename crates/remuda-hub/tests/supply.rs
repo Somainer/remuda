@@ -876,6 +876,101 @@ async fn usage_events_flow_through_journal_into_aggregation() -> Result<()> {
     Ok(())
 }
 
+/// c-usagefu r16 item 7: when the usage migration fails and rolls back, the Hub
+/// still opens on the legacy shape and the usage HTTP endpoints carry an
+/// explicit Unavailable marker — the client renders Unknown, never a zero `$`
+/// spend or a guessed context percentage. This is a REAL migration failure
+/// (the test-faults sentinel drives a failing statement inside the migration
+/// transaction the same way exhaustion/SQL error would), served over HTTP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rolled_back_usage_shape_is_explicitly_unavailable_over_http() -> Result<()> {
+    use rusqlite::Connection;
+
+    // Pre-seed hub.sqlite with origin/main's usage_events shape (no scope_id /
+    // turn_id / observed_at_source) plus the per-database force-failure
+    // sentinel, BEFORE the Hub boots and migrates.
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir)?;
+    {
+        let conn = Connection::open(data_dir.join("hub.sqlite"))?;
+        conn.execute_batch(
+            "CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (instance_id, seq)
+             );
+             CREATE TABLE remuda_test_force_usage_migration_failure (x);",
+        )?;
+        // A real legacy spend row exists on disk; the placeholder zero must not
+        // be mistaken for it.
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, mode, input_tokens, output_tokens,
+                 accounting, observed_at)
+             VALUES ('ins_legacy_http', 1, 'turn', 'snapshot', 40, 30,
+                     'estimated', '2026-10-13T00:00:00.000Z')",
+            [],
+        )?;
+    }
+
+    // The Hub opens despite the failed, rolled-back usage migration.
+    let hub = spawn(HubConfig::for_test(data_dir)).await?;
+    let cookie = login(hub.addr, hub.bootstrap_token.as_str()).await?;
+    let host = HostId::new().as_id().to_string();
+    let node = enroll_fake_node(&hub, &host, 8).await?;
+    let relay = create_relay(hub.addr, &cookie).await?;
+    let profile_id = relay["id"].as_str().unwrap();
+    let instance_id = seed_live_instance(&hub, &node, &host, profile_id, "gw/model_x[1m]").await?;
+
+    // Instance aggregate: explicit Unavailable, placeholder zeros, no error.
+    let (status, body) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}/usage"),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "the instance usage endpoint stays usable");
+    let inst: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(
+        inst["unavailable"], true,
+        "instance aggregate is Unavailable"
+    );
+    assert_eq!(inst["events"], 0, "placeholder zeros, not the legacy spend");
+
+    // Provider aggregate: one top-level Unavailable flag.
+    let (_, body) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/providers/{profile_id}/usage"),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    let prov: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(
+        prov["usageUnavailable"], true,
+        "provider usage reports Unavailable, not an empty/zero spend report"
+    );
+
+    hub.shutdown().await;
+    Ok(())
+}
+
 /// c-usagefu r2 item 5(c): the transcript-observed `modelEffective` (a `/model`
 /// switch) drives the context-window rollup served on the instance API, and the
 /// rollup is refreshed on the next read after the switch. No prior test

@@ -7,6 +7,18 @@ import { formatListTime } from "../../lib/format";
  * adapters report only subsets, and the UI must render `—`, never a fake 0.
  */
 export type UsageRollup = {
+  /**
+   * True when the Hub store is on the rolled-back/legacy usage shape: the
+   * migration did not complete, so NONE of these counters could be projected.
+   * The UI renders Unknown everywhere — never a zero, never a guessed
+   * percentage (c-usagefu r16 item 7). Distinct from `null` rollup (no usage
+   * channel yet) and from counters that are individually `null`.
+   *
+   * Optional in the type so hand-built fixtures can omit it, but EVERY rollup
+   * from the Hub passes through {@link coerceUsageRollup}, which always emits a
+   * concrete boolean (default false); all consumers read it with `=== true`.
+   */
+  unavailable?: boolean;
   /** Last turn's fresh input + cache read + cache creation. */
   contextUsedTokens: number | null;
   /** Context window ([1m] tag / model catalog / harness kind). */
@@ -51,6 +63,7 @@ type RawRollup = Partial<Record<keyof UsageRollup, unknown>>;
  * zero-token observation (which still reports known channels).
  */
 export const EMPTY_USAGE_ROLLUP: UsageRollup = {
+  unavailable: false,
   contextUsedTokens: null,
   contextWindowTokens: null,
   contextPct: null,
@@ -70,6 +83,13 @@ export const EMPTY_USAGE_ROLLUP: UsageRollup = {
 /** Empty-state headline for the context chip / card when no rollup exists. */
 export const EMPTY_USAGE_NOTE = "harness 未上报 usage";
 
+/**
+ * c-usagefu r16 item 7: the Hub opened on the rolled-back/legacy usage shape,
+ * so usage is explicitly Unavailable — distinct from "the harness has not
+ * reported yet". Every number renders Unknown, never zero or an estimate.
+ */
+export const USAGE_UNAVAILABLE_NOTE = "usage 数据暂不可用（存储未升级到用量 schema）";
+
 
 /** Numbers come over the wire as JSON integers (the OpenAPI shape); anything
  *  else (string, missing, NaN) is treated as unknown, never coerced to 0. */
@@ -84,6 +104,8 @@ export function coerceUsageRollup(raw: unknown): UsageRollup | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as RawRollup;
   return {
+    // Only an explicit boolean `true` marks the rollup Unavailable (r16 item 7).
+    unavailable: r.unavailable === true,
     contextUsedTokens: asCount(r.contextUsedTokens),
     contextWindowTokens: asCount(r.contextWindowTokens),
     contextPct: asCount(r.contextPct),
@@ -125,6 +147,7 @@ export type UsageCell = {
 };
 
 const MISSING: Record<string, string> = {
+  unavailable: "Hub 运行在旧版 usage 存储形状（迁移已回滚），本次用量暂时无法统计",
   context: "需要 harness 在 usage 观察中上报本轮的 input / cacheRead / cacheCreation token",
   window: "需要 model 目录、[1m] 后缀或 harness 默认窗口提供上下文长度",
   input: "需要 harness 在 usage 观察中上报 inputTokens（非缓存输入）",
@@ -142,6 +165,15 @@ export function contextHeadline(rollup: UsageRollup): {
   approximate: boolean;
   missing: string | null;
 } {
+  if (rollup.unavailable) {
+    // c-usagefu r16 item 7: the store could not project usage. Never show a
+    // number or a percentage — both sides read Unknown and the bar stays empty.
+    return {
+      text: "—/— (—%)",
+      approximate: false,
+      missing: MISSING.unavailable,
+    };
+  }
   if (rollup.contextUsedTokens == null || rollup.contextWindowTokens == null) {
     return {
       text: `${formatTokenCount(rollup.contextUsedTokens)}/${formatTokenCount(

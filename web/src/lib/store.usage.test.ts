@@ -193,6 +193,76 @@ it("r17 item 4: an authoritative Unavailable rollup replaces cached positive usa
   expect(contextHeadline(rollup2).text).toBe("34.3k/200.0k (18%)");
 });
 
+it("r18 item 4: an older deferred refresh cannot overwrite a newer availability state in either direction", async () => {
+  const base: Instance = mockDb.instances[0];
+  const instance: Instance = {
+    ...base,
+    id: "ins_usage_order",
+    journalId: "obj_usage_order",
+  };
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+
+  type Deferred<T> = { promise: Promise<T>; resolve: (value: T) => void };
+  const defer = <T>(): Deferred<T> => {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  };
+
+  const runDirection = async (
+    older: UsageRollup,
+    newer: UsageRollup,
+    olderName: string,
+    newerName: string,
+  ) => {
+    const olderList = defer<Awaited<ReturnType<typeof api.instanceList>>>();
+    const newerList = defer<Awaited<ReturnType<typeof api.instanceList>>>();
+    const olderInteractions = defer<Awaited<ReturnType<typeof api.interactionList>>>();
+    const newerInteractions = defer<Awaited<ReturnType<typeof api.interactionList>>>();
+
+    const listSpy = vi
+      .spyOn(api, "instanceList")
+      .mockImplementationOnce(() => olderList.promise)
+      .mockImplementationOnce(() => newerList.promise);
+    const interactionsSpy = vi
+      .spyOn(api, "interactionList")
+      .mockImplementationOnce(() => olderInteractions.promise)
+      .mockImplementationOnce(() => newerInteractions.promise);
+
+    // Older read starts first and stays pending; newer read starts and lands.
+    const olderRefresh = hubStore.refresh();
+    const newerRefresh = hubStore.refresh();
+    newerInteractions.resolve([]);
+    newerList.resolve({
+      items: [{ ...instance, durableSeq: "1", usageRollup: newer }],
+      nextCursor: null,
+    } as Awaited<ReturnType<typeof api.instanceList>>);
+    await newerRefresh;
+    expect(hubStore.usageRollupOf(instance.id)).toEqual(newer);
+
+    // The older read then resolves out of order and must be dropped wholesale.
+    olderInteractions.resolve([]);
+    olderList.resolve({
+      items: [{ ...instance, durableSeq: "1", usageRollup: older }],
+      nextCursor: null,
+    } as Awaited<ReturnType<typeof api.instanceList>>);
+    await olderRefresh;
+    expect(
+      hubStore.usageRollupOf(instance.id),
+      `${olderName} (the stale read) never overwrites the newer ${newerName}`,
+    ).toEqual(newer);
+    listSpy.mockRestore();
+    interactionsSpy.mockRestore();
+  };
+
+  // Direction 1: a stale Unavailable page arrives after a newer positive one.
+  await runDirection(rollupUnavailable, rollup2, "Unavailable", "positive");
+  // Direction 2: a stale positive page arrives after a newer Unavailable one.
+  await runDirection(rollup2, rollupUnavailable, "positive", "Unavailable");
+});
+
 it("r2 item 4: setUsageRollupForTest is inert without the e2e seam marker", () => {
   const instance: Instance = mockDb.instances[0];
   // Production default: no marker on window.

@@ -954,3 +954,72 @@ async fn a_close_barrier_on_a_foreign_drain_is_retryable_and_a_retry_completes()
         .expect("event channel never closed")
         .expect("event drainer panicked");
 }
+
+/// c-ctxusage r17 item 2: a promotion poller whose TASK HAS RETURNED (the
+/// observation receiver was dropped, so events closed and the loop exited)
+/// still occupies the driver's poller slot. Such a task has no in-flight
+/// normal poll, so it satisfies the close handoff: close must signal the
+/// writer immediately and complete once the process group is gone, instead
+/// of waiting the barrier bound and returning WriterStillLive forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_returned_poller_does_not_block_a_promoted_close() {
+    use remuda_driver::test_faults::TranscriptFaults;
+
+    let (_dir, workspace, _transcript, driver) = p1_promoted_layout();
+    let faults = TranscriptFaults::new();
+    // Shrink the dead-barrier bound so the pre-fix code fails fast instead
+    // of waiting the production 15 s before its retryable error.
+    faults.arm_close_barrier_timeout(Duration::from_millis(800));
+    driver.set_test_faults(faults.clone());
+
+    let handle = driver
+        .start(spec_for(&workspace, DriverKind::ShellPty))
+        .await
+        .expect("start");
+    let events_rx = handle.into_events();
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
+    let drainer = tokio::spawn(async move {
+        let mut events_rx = events_rx;
+        while let Some(observation) = events_rx.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+                && native.native_name == "transcript_bound"
+                && let Some(tx) = bound_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(20), bound_rx)
+        .await
+        .expect("the seeded replay never bound")
+        .expect("bound oneshot closed without firing");
+
+    // Close the observation channel (production: the run's event stream was
+    // dropped while the native writer keeps running) and drive the poller
+    // task to its RETURN; the driver slot stays occupied.
+    drainer.abort();
+    let _ = drainer.await;
+    assert!(
+        driver
+            .test_wait_poller_exited(Duration::from_secs(15))
+            .await,
+        "the poller never exited after the observation channel closed"
+    );
+    assert_eq!(
+        driver.test_poller_is_finished().await,
+        Some(true),
+        "the returned poller must still occupy its slot"
+    );
+
+    // The writer is alive and signable: close runs the ladder without a
+    // barrier wait and completes once the process group is verified gone.
+    tokio::time::timeout(Duration::from_secs(25), driver.close())
+        .await
+        .expect("close hung past its bound")
+        .expect(
+            "a finished poller satisfies the handoff; close signals the writer \
+             and completes once the group is gone",
+        );
+}

@@ -585,6 +585,55 @@ impl ShellPtyDriver {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = drain;
     }
 
+    /// Test-only: whether the spawned promotion poller task has already
+    /// RETURNED while its slot is still occupied (its observation receiver
+    /// was dropped, so events closed and the loop exited). `None` means no
+    /// poller was ever spawned. A promoted close must treat `Some(true)` as a
+    /// satisfied handoff and still signal the writer (c-ctxusage r17 item 2).
+    #[cfg(feature = "test-faults")]
+    pub async fn test_poller_is_finished(&self) -> Option<bool> {
+        self.poller
+            .lock()
+            .await
+            .as_ref()
+            .map(tokio::task::JoinHandle::is_finished)
+    }
+
+    /// Test-only: wait for the spawned promotion poller task to RETURN via its
+    /// own `finalised` handshake (the same channel close's teardown awaits),
+    /// bounded. The caller first closes the observation channel; the poller
+    /// then breaks its loop at the next tick. Consumes the receiver, so a
+    /// later close awaits the task handle directly (c-ctxusage r17 item 2).
+    #[cfg(feature = "test-faults")]
+    pub async fn test_wait_poller_exited(&self, bound: std::time::Duration) -> bool {
+        let fired = match self.poller_finalised.lock().await.take() {
+            Some(receiver) => tokio::time::timeout(bound, receiver).await.is_ok(),
+            None => return false,
+        };
+        if !fired {
+            return false;
+        }
+        // `finalised` is the task's last statement; completion lands a beat
+        // later. Cooperatively wait for the handle itself (no wall-clock
+        // sleep); the bound only guards a genuinely wedged task.
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            if self
+                .poller
+                .lock()
+                .await
+                .as_ref()
+                .is_none_or(tokio::task::JoinHandle::is_finished)
+            {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Test-only: stop the long-lived effort/model/permission worker tasks
     /// and wait for their event-sender clones to drop, so the last senders of
     /// the event channel are gone and a receiver observes closure. These
@@ -1651,14 +1700,21 @@ impl ShellPtyDriver {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let close_barrier = drain.arm_close().await;
-        // The handoff barrier exists to serialize with an IN-FLIGHT poll. In
-        // production a promoted agent exists only because the poller promoted
-        // it, so the poller handle is always live here. The only case with a
-        // promoted slot but no poller is the unit-test setup that injects the
-        // promotion state directly (login options): nothing can be mid-flight,
-        // so the barrier is trivially satisfied.
-        let poller_live = self.poller.lock().await.is_some();
-        if poller_live {
+        // The handoff barrier exists to serialize with an IN-FLIGHT poll. The
+        // slot being occupied only means a poller was SPAWNED; the task may
+        // already have RETURNED — its observation receiver was dropped, so
+        // events closed and the poll loop broke. A finished task cannot be
+        // mid sample/demote/finalise, so it satisfies the handoff exactly
+        // like the no-poller login-option setup. The same is re-checked after
+        // a barrier timeout: a task that exits WHILE close waits is not a live
+        // poll refusing to acknowledge (c-ctxusage r17 item 2).
+        let poller_running = self
+            .poller
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished());
+        if poller_running {
             // P1 (c-ctxusage r16 item 6): wait for the poller's handoff ack
             // BEFORE signalling the writer. An in-flight normal tick may
             // already have passed its closing check and be about to
@@ -1706,7 +1762,16 @@ impl ShellPtyDriver {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .as_deref()
                     .is_some_and(crate::test_faults::FaultState::pump_gate_holds);
-                if !parked_pump {
+                // A task that finished while close waited (its event receiver
+                // closed mid-barrier) has no in-flight poll either; its
+                // handoff is satisfied and the writer must be signalled.
+                let poller_finished = self
+                    .poller
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished);
+                if !parked_pump && !poller_finished {
                     tracing::warn!(
                         "promoted close barrier was not acknowledged; close stays retryable"
                     );
@@ -1715,8 +1780,9 @@ impl ShellPtyDriver {
                     ));
                 }
                 tracing::warn!(
-                    "promoted close barrier timed out against a parked blocking collect; \
-                     proceeding to the stop ladder and poller abort-rescue path"
+                    "promoted close barrier timed out against a parked blocking collect \
+                     or a poller that exited mid-barrier; proceeding to the stop ladder \
+                     (and the poller abort-rescue path when it is still parked)"
                 );
             }
         }

@@ -139,13 +139,12 @@ impl UsageWaiter {
         }))
     }
 
-    /// kqueue fallback (macOS/BSDs): an event-driven watch with no sleeps —
-    /// `EVFILT_VNODE` on the database directory, the db file and its lazily
-    /// created `-wal` file (c-ctxusage r16 item 7). Mirrors the Linux waiter:
-    /// the directory watch covers create/rename (the db/-wal appear lazily),
-    /// the file watches cover extend/write/delete; the predicate is re-checked
-    /// after every event, with a deadline-bounded `kevent` timeout only as
-    /// the safety bound.
+    /// kqueue fallback (macOS/BSDs): an event-driven watch with no sleeps and
+    /// no `unsafe` — nix's safe `Kqueue`/`KEvent` wrappers own the descriptors
+    /// (c-ctxusage r17 item 1). Mirrors the Linux waiter: the directory watch
+    /// covers create/rename (the db/-wal appear lazily), the file watches cover
+    /// extend/write/delete; the predicate is re-checked after every event,
+    /// with a deadline-bounded `kevent` timeout only as the safety bound.
     #[cfg(any(
         target_vendor = "apple",
         target_os = "freebsd",
@@ -154,55 +153,73 @@ impl UsageWaiter {
         target_os = "dragonfly"
     ))]
     fn spawn(db_path: PathBuf, instance_id: String) -> Self {
+        use nix::sys::event::{EventFilter, EventFlag, FilterFlag, KEvent, Kqueue};
+        use std::os::fd::AsRawFd;
         Self(std::thread::spawn(move || {
             let Ok(conn) = rusqlite::Connection::open(&db_path) else {
                 return false;
             };
-            let kq = unsafe { libc::kqueue() };
-            if kq < 0 {
+            let Ok(kq) = Kqueue::new() else {
                 return false;
-            }
-            use std::os::fd::AsRawFd;
+            };
             let parent = db_path
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."));
             let wal_path = db_path.with_extension("sqlite-wal");
 
-            // Add one EVFILT_VNODE watch. Missing files (the lazy -wal) are
-            // simply skipped and (re)armed after every wake. A duplicate ADD of
-            // an existing ident/filter re-arms the same watch. The opened fd
-            // is intentionally kept open (forgotten) for the watch lifetime.
-            // The `kevent` fields are assigned directly rather than via the
-            // libc `EV_SET` macro, which not every libc release exports.
-            let add_watch = |path: &Path, fflags: u32| {
-                let Ok(fd) = std::fs::File::open(path) else {
-                    return;
-                };
-                let change = libc::kevent {
-                    ident: fd.as_raw_fd() as libc::uintptr_t,
-                    filter: libc::EVFILT_VNODE,
+            // Open one vnode and arm one EVFILT_VNODE watch. The returned
+            // `File` is retained for exactly the watch's lifetime — a kqueue
+            // knote watches the open descriptor and closing it disarms the
+            // watch — so the lazy -wal is armed once per vnode instead of
+            // leaking a descriptor on every wake.
+            let arm = |path: &Path, fflags: FilterFlag| -> Option<std::fs::File> {
+                let file = std::fs::File::open(path).ok()?;
+                let change = KEvent::new(
+                    file.as_raw_fd() as usize,
+                    EventFilter::EVFILT_VNODE,
                     // EV_ADD | EV_CLEAR: edge-style, one event per batch.
-                    flags: (libc::EV_ADD | libc::EV_CLEAR) as u16,
+                    EventFlag::EV_ADD | EventFlag::EV_CLEAR,
                     fflags,
-                    data: 0,
-                    udata: std::ptr::null_mut(),
-                };
-                unsafe {
-                    std::mem::forget(fd);
-                    let mut event: libc::kevent = std::mem::zeroed();
-                    let _ = libc::kevent(kq, &change, 1, &mut event, 0, std::ptr::null());
-                }
+                    0,
+                    0,
+                );
+                // Apply the registration with an empty event list; a missing
+                // vnode or rejected watch simply leaves that path unwatched.
+                kq.kevent(std::slice::from_ref(&change), &mut [], None)
+                    .ok()?;
+                Some(file)
             };
             // Directory: entries added/removed/renamed (lazy -wal creation).
-            add_watch(&parent, libc::NOTE_WRITE);
+            let _dir_file = arm(&parent, FilterFlag::NOTE_WRITE);
             // Database file: growth/writes, unlink or rename.
-            add_watch(
+            let _db_file = arm(
                 &db_path,
-                libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_DELETE | libc::NOTE_RENAME,
+                FilterFlag::NOTE_WRITE
+                    | FilterFlag::NOTE_EXTEND
+                    | FilterFlag::NOTE_DELETE
+                    | FilterFlag::NOTE_RENAME,
+            );
+            // Arm the -wal immediately when it already exists (after the
+            // Hub's first transaction it usually does); otherwise it is armed
+            // once the directory announces the lazy creation.
+            let mut wal_file = arm(
+                &wal_path,
+                FilterFlag::NOTE_WRITE
+                    | FilterFlag::NOTE_EXTEND
+                    | FilterFlag::NOTE_DELETE
+                    | FilterFlag::NOTE_RENAME,
             );
 
             let deadline = std::time::Instant::now() + Duration::from_secs(45);
+            let mut event = KEvent::new(
+                0,
+                EventFilter::EVFILT_VNODE,
+                EventFlag::empty(),
+                FilterFlag::empty(),
+                0,
+                0,
+            );
             loop {
                 if turn_row_exists(&conn, &instance_id) {
                     return true;
@@ -211,30 +228,40 @@ impl UsageWaiter {
                 if remaining.is_zero() {
                     return false;
                 }
-                let mut timeout = libc::timespec {
+                let timeout = libc::timespec {
                     tv_sec: remaining.as_secs() as libc::time_t,
-                    tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
+                    tv_nsec: remaining.subsec_nanos() as libc::c_long,
                 };
-                let mut event: libc::kevent = unsafe { std::mem::zeroed() };
-                let ready =
-                    unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, &mut timeout) };
-                if ready == 0 {
-                    return false; // deadline reached
-                }
-                if ready < 0 {
-                    let errno = std::io::Error::last_os_error().raw_os_error();
-                    if errno == Some(libc::EINTR) {
-                        continue;
+                match kq.kevent(&[], std::slice::from_mut(&mut event), Some(timeout)) {
+                    Ok(0) => return false, // deadline reached
+                    Ok(_) => {
+                        // A deleted/revoked -wal vnode is dead: drop the held
+                        // descriptor (which disarms its knote) so the
+                        // replacement vnode gets a fresh watch below.
+                        if let Some(file) = wal_file.as_ref()
+                            && event.ident() == file.as_raw_fd() as usize
+                            && (event
+                                .fflags()
+                                .contains(FilterFlag::NOTE_DELETE | FilterFlag::NOTE_REVOKE))
+                        {
+                            wal_file = None;
+                        }
+                        // Arm a -wal that appeared after spawn. While the
+                        // existing watch is held this is skipped, so no
+                        // descriptor changes hands on a steady-state wake.
+                        if wal_file.is_none() {
+                            wal_file = arm(
+                                &wal_path,
+                                FilterFlag::NOTE_WRITE
+                                    | FilterFlag::NOTE_EXTEND
+                                    | FilterFlag::NOTE_DELETE
+                                    | FilterFlag::NOTE_RENAME,
+                            );
+                        }
                     }
-                    return false;
+                    Err(nix::Error::EINTR) => continue,
+                    Err(_) => return false,
                 }
-                // The WAL may be created lazily by the first transaction;
-                // (re)arm its file watch after every wake. Missing files are
-                // ignored until they exist.
-                add_watch(
-                    &wal_path,
-                    libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_DELETE | libc::NOTE_RENAME,
-                );
             }
         }))
     }

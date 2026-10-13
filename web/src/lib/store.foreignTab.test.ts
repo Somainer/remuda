@@ -6389,3 +6389,77 @@ it("GATE34 item 3 (Fence A): during a login whose body is delayed, no old-lifeti
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE34 item 4: a replacement login that REUSES the existing connection still initializes a current outbox and flushes a pending row automatically (no second send/reload)", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_150_000);
+  const I = "ins_g34_4";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g34_4");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "instanceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    await bootLive(api, hubStore);
+    await hubStore.follow(I);
+    hubStore.setConnectionStateForTest("live");
+    const h = hubStore as unknown as {
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      flushAllOutbox: () => Promise<void>;
+      connection: unknown;
+      outbox: { lifetime: string } | null;
+    };
+    // The connection machine exists and is reused by a replacement login.
+    expect(h.connection).not.toBeNull();
+    const oldLife = h.outbox!.lifetime;
+
+    // Pending row, enqueued live but held back from auto-flush by going
+    // offline right before the login transition.
+    hubStore.setConnectionStateForTest("offline");
+    const obx = (hubStore as unknown as { outbox: { enqueue: (r: unknown) => Promise<unknown> } }).outbox;
+    await obx.enqueue({
+      commandId: "cmd_g34_4_p", clientRequestId: "local_g34_4_p", instanceId: I,
+      prompt: "g34 4 P", createdAt: Date.now(),
+    });
+    await pump(200);
+    expect(send).not.toHaveBeenCalled();
+
+    // Replacement login resolves immediately (new cookie), reusing the
+    // connection. The delayed-body blocker is not needed: runAuthTransition
+    // disposes, login returns, bootstrap sees this.connection and (before the
+    // fix) returned without an outbox. After the fix it initializes the
+    // current box and the post-boot live state flushes the pending row.
+    vi.spyOn(api, "login").mockResolvedValue({ deviceId: "dev_g34_4_new", token: "tok_new", name: "new" });
+    await h.login("bootstrap", "secret", "dev");
+    await pump(3_000);
+    // No manual second send or flush: the replacement login's init serviced
+    // the row automatically.
+    expect(h.outbox).not.toBeNull();
+    expect(h.outbox!.lifetime).not.toBe(oldLife);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBe("cmd_g34_4_p");
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

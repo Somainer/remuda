@@ -2548,7 +2548,16 @@ class HubStore {
    * state and the outbox still restores/flushes on recovery.
    */
   private async initConnection(offline = false) {
-    if (this.connection) return;
+    // c-reconnfu gate 34 item 4: a REPLACEMENT login keeps this.connection but
+    // the old box was disposed by runAuthIdentityChange. Ensure a current-
+    // generation outbox on EVERY init path even when the connection machine is
+    // reused, otherwise pending durable rows sit unserviced until another send
+    // or a reload. (When the connection is brand new this also runs, as before.)
+    const connectionReused = this.connection !== null;
+    if (connectionReused) {
+      await this.ensureOutbox();
+      return;
+    }
     await this.ensureOutbox();
     const box = this.outbox;
     if (!box) return;

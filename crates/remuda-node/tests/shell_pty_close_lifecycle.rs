@@ -746,6 +746,21 @@ async fn an_incomplete_promoted_close_stays_live_and_a_retry_completes() {
 /// Build the promoted-claude fake-harness layout shared by the P1 race tests
 /// (c-ctxusage r16 item 6).
 fn p1_promoted_layout() -> (tempfile::TempDir, PathBuf, PathBuf, ShellPtyDriver) {
+    p1_promoted_layout_inner(false)
+}
+
+/// Same layout, but each fake-harness process tags its termination record
+/// with its own pid so a resumed run's append is distinguishable from the
+/// predecessor's persisted record (c-ctxusage r17 item 4).
+fn p1_promoted_layout_tagged() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, ShellPtyDriver) {
+    let (dir, workspace, transcript, driver) = p1_promoted_layout_inner(true);
+    let events_path = dir.path().join("harness-events.jsonl");
+    (dir, workspace, transcript, events_path, driver)
+}
+
+fn p1_promoted_layout_inner(
+    pid_tag: bool,
+) -> (tempfile::TempDir, PathBuf, PathBuf, ShellPtyDriver) {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().to_path_buf();
     let workspace = root.join("workspace");
@@ -791,6 +806,11 @@ fn p1_promoted_layout() -> (tempfile::TempDir, PathBuf, PathBuf, ShellPtyDriver)
     options
         .extra_env
         .insert("FAKE_HARNESS_APPEND_ON_SIGNAL".into(), "1".into());
+    if pid_tag {
+        options
+            .extra_env
+            .insert("FAKE_HARNESS_TERMINATION_PID_TAG".into(), "1".into());
+    }
     options.hooks = Some(HookConfig {
         instance_dir,
         relay_binary: relay_bin(),
@@ -1218,5 +1238,142 @@ async fn two_concurrent_promoted_closes_share_one_handoff_and_stop_once() {
         term_count.load(Ordering::SeqCst),
         1,
         "the writer was stopped once: a single termination usage across both closes"
+    );
+}
+
+/// c-ctxusage r17 item 4: a RESUMED run must get a fresh LiveDrain. The
+/// previous run's drain is permanently armed once close armed it
+/// (`closing` is never reset), so cloning it for the resumed run put the
+/// resumed poller in the non-terminal tail-only branch from its first tick:
+/// no process sampling, no hook binding, no promotion — and the retained
+/// driver's close armed a drain whose handoff could never be acknowledged.
+/// This test actually RESUMES (the r16 variant only swapped drains): the
+/// resumed run re-binds through its own drain, and a later close completes
+/// through the fresh handoff with the termination append delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resumed_run_uses_a_fresh_live_drain_and_rebinds() {
+    use remuda_driver::test_faults::TranscriptFaults;
+
+    let (_dir, workspace, _transcript, events_path, driver) = p1_promoted_layout_tagged();
+    let driver = std::sync::Arc::new(driver);
+    let faults = TranscriptFaults::new();
+    // Keep a hypothetical stuck-barrier case fast; with the fix the resumed
+    // close acks promptly and never reaches this bound.
+    faults.arm_close_barrier_timeout(Duration::from_millis(1500));
+    driver.set_test_faults(faults.clone());
+
+    // ---- run 1: bind, then fully close (arms the run-1 drain forever) ----
+    let handle = driver
+        .start(spec_for(&workspace, DriverKind::ShellPty))
+        .await
+        .expect("start");
+    let mut events_rx = handle.into_events();
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
+    let drainer1 = tokio::spawn(async move {
+        while let Some(observation) = events_rx.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+                && native.native_name == "transcript_bound"
+                && let Some(tx) = bound_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(20), bound_rx)
+        .await
+        .expect("the seeded replay never bound")
+        .expect("bound oneshot closed without firing");
+    tokio::time::timeout(Duration::from_secs(25), driver.close())
+        .await
+        .expect("run-1 close hung past its bound")
+        .expect("run-1 close completes");
+    tokio::time::timeout(Duration::from_secs(15), drainer1)
+        .await
+        .expect("run-1 event channel never closed")
+        .expect("run-1 drainer panicked");
+    assert!(
+        driver.test_live_drain_is_closing(),
+        "the closed run-1 drain stays armed (the state the resumed run must not inherit)"
+    );
+
+    // ---- run 2: real resume against the same native session id ----------
+    let handle2 = driver
+        .start_resumed(
+            spec_for(&workspace, DriverKind::ShellPty),
+            SESSION_ID.into(),
+        )
+        .await
+        .expect("resume");
+    assert!(
+        !driver.test_live_drain_is_closing(),
+        "the resumed run must start from a fresh, un-armed drain"
+    );
+    let mut events_rx2 = handle2.into_events();
+    let (bound2_tx, bound2_rx) = tokio::sync::oneshot::channel();
+    let bound2_tx = std::sync::Mutex::new(Some(bound2_tx));
+    // The harness tags each process' termination record with the writer's
+    // own pid, so the resumed writer's append is distinguishable from the
+    // predecessor's persisted record that the resume replay re-hydrates.
+    // Collect every tagged termination scope the run-2 channel carries.
+    let term_scopes: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let term_scopes_drain = Arc::clone(&term_scopes);
+    let drainer2 = tokio::spawn(async move {
+        while let Some(observation) = events_rx2.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+                && native.native_name == "transcript_bound"
+                && let Some(tx) = bound2_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+            if let ObservationPayload::Usage(payload) = &observation.body
+                && payload.scope_id.starts_with(TERMINATION_MSG_ID)
+            {
+                term_scopes_drain
+                    .lock()
+                    .unwrap()
+                    .push(payload.scope_id.clone());
+            }
+        }
+    });
+    // With the stale drain the resumed poller is tail-only forever, so the
+    // hook-driven bind never happens: this wait is the regression's bite.
+    tokio::time::timeout(Duration::from_secs(25), bound2_rx)
+        .await
+        .expect("the resumed run never re-bound through its fresh drain")
+        .expect("resume bound oneshot closed without firing");
+
+    // ---- run 2 close goes through the FRESH handoff and drains once -----
+    tokio::time::timeout(Duration::from_secs(25), driver.close())
+        .await
+        .expect("run-2 close hung past its bound")
+        .expect("run-2 close completes via the resumed run's fresh handoff");
+    driver.abort_event_workers_for_test().await;
+    tokio::time::timeout(Duration::from_secs(30), drainer2)
+        .await
+        .expect("run-2 event channel never closed")
+        .expect("run-2 drainer panicked");
+
+    // Both harness runs logged their pid in the shared events file; the LAST
+    // session_start is the resumed writer. Its uniquely-tagged termination
+    // usage must have been delivered exactly once (the predecessor's tag can
+    // only arrive via the resume replay).
+    let events_text = std::fs::read_to_string(&events_path).expect("harness events");
+    let pid2 = events_text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|row| row.get("event").and_then(serde_json::Value::as_str) == Some("session_start"))
+        .filter_map(|row| row.get("pid").and_then(serde_json::Value::as_u64))
+        .next_back()
+        .expect("the resumed harness logged its pid");
+    let scope2 = format!("{TERMINATION_MSG_ID}-{pid2}");
+    let scopes = term_scopes.lock().unwrap();
+    assert_eq!(
+        scopes.iter().filter(|scope| **scope == scope2).count(),
+        1,
+        "the resumed writer's termination usage delivered exactly once, got {scopes:?}"
     );
 }

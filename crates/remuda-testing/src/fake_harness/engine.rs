@@ -2836,14 +2836,25 @@ impl Engine {
         if self.dialect != Dialect::Claude {
             return;
         }
+        // Optional per-process identity suffix (c-ctxusage r17 item 4): a
+        // resumed run appends to the SAME transcript its predecessor already
+        // appended a termination record to, and the driver mapper emits
+        // assistant usage per record position, so a resume test needs the two
+        // processes' records to be distinguishable. Inert unless the env flag
+        // is set; every existing test keeps the fixed envelope.
+        let suffix = if std::env::var("FAKE_HARNESS_TERMINATION_PID_TAG").as_deref() == Ok("1") {
+            format!("-{}", std::process::id())
+        } else {
+            String::new()
+        };
         let record = json!({
             "type": "assistant",
-            "uuid": "termination-record-on-signal",
+            "uuid": format!("termination-record-on-signal{suffix}"),
             "timestamp": "2026-10-13T00:09:59.000Z",
             "isSidechain": false,
-            "requestId": "req_termination_signal",
+            "requestId": format!("req_termination_signal{suffix}"),
             "message": {
-                "id": "msg_termination_signal",
+                "id": format!("msg_termination_signal{suffix}"),
                 "role": "assistant",
                 "type": "message",
                 "model": "claude-opus-5-5",

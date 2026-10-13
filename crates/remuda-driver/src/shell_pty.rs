@@ -592,6 +592,18 @@ impl ShellPtyDriver {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = drain;
     }
 
+    /// Test-only: whether this driver's current run drain is armed for close.
+    /// A resumed run starts from a FRESH drain, so this reads false right
+    /// after resume even when the previous run was fully closed
+    /// (c-ctxusage r17 item 4).
+    #[cfg(feature = "test-faults")]
+    pub fn test_live_drain_is_closing(&self) -> bool {
+        self.live_drain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_closing()
+    }
+
     /// Test-only: drop the close handoff sender the current drain holds
     /// WITHOUT firing it, so the waiting close receives a Canceled — exactly
     /// what a concurrent close re-arming the barrier used to produce. Canceled
@@ -2061,19 +2073,20 @@ impl ShellPtyDriver {
         resumed.interrupt_screen_markers = Arc::clone(&self.interrupt_screen_markers);
         resumed.exited = Arc::clone(&self.exited);
         resumed.seq = Arc::clone(&self.seq);
-        // The resumed run's poller is adopted back onto THIS driver below, so
-        // it must coordinate close through THIS driver's LiveDrain and see
-        // the same test fault handle: a freshly constructed resumed driver has
-        // its own drain, and close() on the adopted driver would otherwise arm
-        // a channel its poller never observes — the handoff barrier and live
-        // drains would be lost on a resumed promoted close (P1,
-        // c-ctxusage r16 item 6).
-        resumed.live_drain = std::sync::Mutex::new(
-            self.live_drain
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
-        );
+        // Drain coordination belongs to the RUN (P1, c-ctxusage r17 item 4):
+        // build ONE fresh LiveDrain for the resumed run. The previous run's
+        // drain is permanently armed once it was close-armed (`closing` is
+        // never reset), and cloning it here made the resumed poller enter the
+        // non-terminal tail branch from its first tick — no sampling, no hook
+        // binding, no promotion, ever. The fresh drain is handed to the
+        // resumed driver BEFORE spawn so its poller captures it, then adopted
+        // onto THIS driver after the spawn, so close() on the retained driver
+        // arms exactly the drain the adopted poller observes.
+        let run_drain = promotion::LiveDrain::new();
+        *resumed
+            .live_drain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = run_drain.clone();
         if let Some(faults) = self
             .test_faults
             .lock()
@@ -2097,6 +2110,32 @@ impl ShellPtyDriver {
         *self.poller_shutdown.lock().await = resumed.poller_shutdown.lock().await.take();
         *self.poller_finalised.lock().await = resumed.poller_finalised.lock().await.take();
         *self.waiter.lock().await = resumed.waiter.lock().await.take();
+        // Adopt the resumed run's remaining run-scoped event senders. Without
+        // this they stay owned by the temporary `resumed` driver, which drops
+        // at the end of this function: the catalog refresh handle would
+        // DETACH (a JoinHandle drop does not stop the task) and the adapter
+        // tasks would only be aborted asynchronously, each keeping an event
+        // sender clone alive past a later close() on THIS driver
+        // (c-ctxusage r17 item 4).
+        if let Some(mut previous) = self.catalog_refresh.lock().await.take() {
+            previous.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut previous).await;
+        }
+        *self.catalog_refresh.lock().await = resumed.catalog_refresh.lock().await.take();
+        if let Some(mut previous) = self.adapters.lock().await.take() {
+            previous.abort();
+            for task in &mut previous.tasks {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+            }
+        }
+        *self.adapters.lock().await = resumed.adapters.lock().await.take();
+        // Adopt the resumed RUN's drain: the adopted poller above is already
+        // watching `run_drain`, so a later close on this driver must arm the
+        // same one (c-ctxusage r17 item 4).
+        *self
+            .live_drain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = run_drain;
         // §9.1: adopt the resumed run's switch coordination. Its worker and
         // mapper share a bridge, and its event sender is the live one. When a
         // switch was mid-flight at resume, adopt the resumed bridge so the

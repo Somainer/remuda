@@ -1019,6 +1019,15 @@ pub fn aggregate_instance(
 
 /// Aggregate persisted events for one `(profile, model)`. Same per-scope
 /// turn-lineage fold as [`aggregate_instance`] (c-ctxusage r16 item 3).
+///
+/// c-ctxusage r18 item 2: scoped turns are ranked across ALL profiles and
+/// models BEFORE the supply filter. Filtering first used to rank within one
+/// model, so a row superseded by a newer accepted frame for the same message
+/// id under ANOTHER model/profile still won inside its own filtered set and
+/// kept contributing to that model's provider totals. The winner of the
+/// logical turn is chosen globally per `(instance_id, scope_id)`; the
+/// profile/model predicate then decides whether that WINNING row belongs to
+/// this supply (its model/profile columns are carried through the CTE).
 pub fn aggregate_supply(
     conn: &Connection,
     profile_id: &str,
@@ -1026,18 +1035,21 @@ pub fn aggregate_supply(
 ) -> rusqlite::Result<UsageAggregate> {
     conn.query_row(
         "WITH winning_turns AS (
-            SELECT total_tokens, input_tokens, output_tokens, cost_usd FROM (
+            SELECT total_tokens, input_tokens, output_tokens, cost_usd,
+                   profile_id, model FROM (
                 SELECT total_tokens, input_tokens, output_tokens, cost_usd,
+                       profile_id, model,
                        ROW_NUMBER() OVER (
                            PARTITION BY instance_id, scope_id
                            ORDER BY seq DESC, rowid DESC
                        ) AS rn
                 FROM usage_events
                 WHERE scope = 'turn' AND scope_id IS NOT NULL
-                  AND profile_id = ?1 AND model = ?2
             ) WHERE rn = 1
+              AND profile_id = ?1 AND model = ?2
             UNION ALL
-            SELECT total_tokens, input_tokens, output_tokens, cost_usd
+            SELECT total_tokens, input_tokens, output_tokens, cost_usd,
+                   profile_id, model
             FROM usage_events
             WHERE scope = 'turn' AND scope_id IS NULL
               AND profile_id = ?1 AND model = ?2
@@ -5964,5 +5976,74 @@ mod tests {
         let agg = aggregate_supply(&conn, profile, "m").unwrap();
         assert_eq!(agg.cost_usd, None);
         assert_eq!(agg.budget_status(Some(5.0)), BudgetStatus::Unknown);
+    }
+
+    /// c-ctxusage r18 item 2: supply totals rank scoped turns across ALL
+    /// models/profiles before filtering. One logical turn (same scope id)
+    /// accepted under profile/model A is SUPERSEDED by a newer accepted frame
+    /// under B; A's supply must not resurrect the superseded row — zero
+    /// events for A — while B's supply owns the winning row.
+    #[test]
+    fn a_superseded_model_contributes_zero_events_to_its_supply() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let profile_a = "pvp_sup_a";
+        let profile_b = "pvp_sup_b";
+        let model_a = "model-a";
+        let model_b = "model-b";
+
+        // First accepted frame for msg-1 under A (lineage alpha).
+        let mut under_a = aggregate_turn_row(
+            10,
+            "msg-1",
+            Some(100),
+            Some(100),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some("1.00"),
+            Some(profile_a),
+            Some(model_a),
+        );
+        under_a.instance_id = "ins_sup".into();
+        under_a.source_session_id = Some("alpha".into());
+        assert!(insert_usage_event(&conn, &under_a).unwrap());
+
+        // A strictly newer accepted frame for the SAME message id under B
+        // (lineage beta) — the global winner for the scope id.
+        let mut under_b = aggregate_turn_row(
+            20,
+            "msg-1",
+            Some(200),
+            Some(200),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some("2.00"),
+            Some(profile_b),
+            Some(model_b),
+        );
+        under_b.instance_id = "ins_sup".into();
+        under_b.source_session_id = Some("beta".into());
+        assert!(insert_usage_event(&conn, &under_b).unwrap());
+
+        let supply_a = aggregate_supply(&conn, profile_a, model_a).unwrap();
+        assert_eq!(
+            supply_a.events, 0,
+            "the superseded A row must not count in A's provider supply"
+        );
+        assert_eq!(supply_a.total_tokens, None);
+        assert_eq!(supply_a.cost_usd, None);
+
+        let supply_b = aggregate_supply(&conn, profile_b, model_b).unwrap();
+        assert_eq!(supply_b.events, 1, "B owns the winning row");
+        assert_eq!(supply_b.total_tokens, Some(200));
+        assert_eq!(supply_b.cost_usd, Some(2.0));
+
+        // The instance-level fold still counts the logical turn exactly once.
+        let instance = aggregate_instance(&conn, "ins_sup").unwrap();
+        assert_eq!(instance.events, 1, "one logical turn across both lineages");
+        assert_eq!(instance.total_tokens, Some(200));
+        assert_eq!(instance.cost_usd, Some(2.0));
     }
 }

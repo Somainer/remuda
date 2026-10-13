@@ -2341,6 +2341,15 @@ class HubStore {
     const finish = async (patch: Partial<OutboxRecord>) => {
       await this.safePatch(commandId, { ...patch, lease: undefined });
     };
+    // c-reconnfu gate 24 item 1: ONLY a POST the Hub actually ACCEPTED
+    // (delivered/accepted verdict — durable state "sent") records progress and
+    // clears the per-instance exhaustion. A rejected, failed (network/5xx/
+    // 409), held, reconciling or otherwise uncertain outcome proves nothing
+    // about delivery: the latch must survive it so the bounded wakes stay
+    // cancelled. A held row has its own held-retry clock, which flushes
+    // directly regardless of the latch. A journal "done" already returned at
+    // the claim checks above, so the only acceptance here is the sent verdict.
+    let accepted = false;
 
     try {
       const result = await api.instanceSend(
@@ -2361,7 +2370,8 @@ class HubStore {
       } else if (classified === "held") {
         // Node offline: Hub holds the row; bounded same-id retry, no attempt
         // spent (the 20-attempt budget must not drain while the host is down).
-        // A host online→online resume (flushAllOutbox) re-POSTs.
+        // A host online→online resume (flushAllOutbox) re-POSTs. Held is not
+        // an accepted delivery: exhaustion is NOT cleared here.
         await finish({
           state: "held",
           serverState: result.command.state,
@@ -2374,6 +2384,7 @@ class HubStore {
         await this.reconcileReconcilingRow(current0.instanceId, commandId);
       } else {
         await finish({ state: "sent", serverState: result.command.state, gotResponse: true });
+        accepted = true;
       }
     } catch (err) {
       const networkFailure =
@@ -2384,6 +2395,7 @@ class HubStore {
           await finish({ state: "rejected", gotResponse: true, lastError: "rejected by node" });
         } else if (reconciled === "sent") {
           await finish({ state: "sent", gotResponse: true });
+          accepted = true;
         } else if (reconciled === "held") {
           await finish({ state: "held", gotResponse: true, attempts: current0.attempts });
           this.scheduleHeldRetry(current0.instanceId);
@@ -2404,16 +2416,13 @@ class HubStore {
       }
     } finally {
       box.endActiveDelivery(commandId);
-      // c-reconnfu gate 23 item 3 (exhaustion ruling): the shared POST
-      // boundary. A delivery that won its claim and ran its POST — whether
-      // entered by the guarded flush, a timer handoff, OR a direct live steer
-      // route — proves the instance's lock/storage path works and records
-      // progress, clearing the per-instance delivery-failure backoff and the
-      // surfaced exhaustion latch. This used to be recorded only in the flush
-      // loop, so a successful direct steer after exhaustion did not clear it
-      // and the steer epilogue left the instance's other pending rows
-      // uncoved.
-      box.noteDeliveryProgress(current0.instanceId);
+      // c-reconnfu gate 23 item 3 / gate 24 item 1 (exhaustion rulings): the
+      // shared POST boundary, but progress is recorded ONLY when the Hub
+      // accepted the POST. Gate 23 moved this from the flush loop so a direct
+      // steer could clear exhaustion; gate 24 narrowed it so a REJECTED (or
+      // otherwise unsuccessful) direct steer leaves the instance exhausted
+      // with no wakes re-armed, until a later accepted delivery clears it.
+      if (accepted) box.noteDeliveryProgress(current0.instanceId);
     }
     this.syncBubbleFromOutbox(commandId);
     if (!box.pendingFor(current0.instanceId).length) this.clearOutboxRetry(current0.instanceId);

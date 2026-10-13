@@ -3701,3 +3701,146 @@ it("GATE23 item 3: a successful DIRECT STEER records progress at the shared POST
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE24 item 1: a REJECTED direct steer leaves exhaustion latched and arms no wakes; a later ACCEPTED steer clears it and the older row is delivered by the real timer", async () => {
+  // Gate 24 narrowed the shared POST boundary: only a Hub-ACCEPTED POST
+  // records progress. P spends the bounded budget against persistently
+  // rejecting Web Locks (reads succeed). After recovery a direct steer S1 is
+  // REJECTED by the Hub: pre-fix the steer's finally cleared exhaustion
+  // anyway, its epilogue re-armed P and the rejected outcome masqueraded as
+  // delivery health. Post-fix exhaustion stays latched with no wakes; a later
+  // ACCEPTED steer S2 clears it at the boundary and A's REAL armed timer
+  // delivers P. The rejected S1 is POSTed exactly once (terminal, no retry).
+  vi.useFakeTimers();
+  vi.setSystemTime(960_000);
+  const I = "ins_g24_i1";
+  const originalNavigator = globalThis.navigator;
+  const good = fifoWebLocks().locks;
+  const bad = {
+    query: async () => ({ held: [] as Array<{ name: string }> }),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    request: () => Promise.reject(new Error("g24 i1 locks down")) as Promise<any>,
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let locks: { query: () => Promise<unknown>; request: (...args: any[]) => Promise<unknown> } = bad;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: {
+      get locks() {
+        return locks;
+      },
+    },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g24_i1");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    const acceptedResult = (commandId: string) => ({
+      relatedCommandIds: [],
+      command: {
+        commandId,
+        id: commandId,
+        state: "accepted",
+        revision: "1",
+        dispatch: "native-acknowledged",
+        resolution: "clear",
+      },
+    });
+    const rejectedResult = (commandId: string) => ({
+      relatedCommandIds: [],
+      command: {
+        commandId,
+        id: commandId,
+        state: "settled",
+        revision: "1",
+        dispatch: "native-acknowledged",
+        resolution: "clear",
+        settlement: { outcome: "rejected", reason: "g24 i1 steer rejected" },
+      },
+    });
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_iid: string, prompt: string, _x?: unknown, _m?: string, commandId?: string) =>
+        prompt === "g24 1 reject"
+          ? rejectedResult(commandId ?? "cmd_x")
+          : acceptedResult(commandId ?? "cmd_x")) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    const boxOf = () =>
+      (
+        hubStore as unknown as {
+          outbox: {
+            isDeliveryExhausted: (i: string) => boolean;
+            pendingLeaseWakeups: () => string[];
+          } | null;
+        }
+      ).outbox;
+    const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+
+    // 1) Locks down + offline: real enqueue P; real timer wakes spend the
+    //    bounded budget — exhausted, no wakes, P untouched.
+    hubStore.setConnectionStateForTest("offline");
+    locks = bad;
+    expect(await hubStore.send(I, "g24 1 P")).toBe(true);
+    await pump(200);
+    const pId = storedRows().find((r) => r.prompt === "g24 1 P")!.commandId;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(true);
+    expect(boxOf()!.pendingLeaseWakeups()).toEqual([]);
+    expect(send).not.toHaveBeenCalled();
+
+    // 2) Locks recover, link live: a direct steer the Hub REJECTS.
+    locks = good;
+    hubStore.setConnectionStateForTest("live");
+    const rejectedSteer = await hubStore.send(I, "g24 1 reject", [], [], "steer");
+    expect(rejectedSteer).toBe(false);
+    await pump(500);
+    const rjId = send.mock.calls[0]?.[4] as string;
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(storedRows().find((r) => r.commandId === rjId)?.state).toBe("rejected");
+
+    // 3) Ruling: rejection records NO progress — exhaustion stays latched and
+    //    the steer epilogue arms nothing for P. Time passes: no retry POST for
+    //    the rejected steer and P is still pending with no wake.
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(true);
+    expect(boxOf()!.pendingLeaseWakeups()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await pump(1_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("pending");
+
+    // 4) A direct steer the Hub ACCEPTS clears the exhaustion at the shared
+    //    boundary; its epilogue re-arms P and A's REAL timer delivers P.
+    const acceptedSteer = await hubStore.send(I, "g24 1 accept", [], [], "steer");
+    expect(acceptedSteer).toBe(true);
+    for (let i = 0; i < 400 && send.mock.calls.length < 3; i += 1) {
+      await vi.advanceTimersByTimeAsync(10);
+      await Promise.resolve();
+    }
+    const okId = send.mock.calls[1]?.[4] as string;
+    expect(send.mock.calls.map((c) => c[4])).toEqual([rjId, okId, pId]);
+    expect(storedRows().find((r) => r.commandId === pId)?.state).toBe("sent");
+    expect(storedRows().find((r) => r.commandId === rjId)?.state).toBe("rejected");
+    expect(boxOf()!.isDeliveryExhausted(I)).toBe(false);
+
+    // Far past every deadline: the rejected steer never re-POSTs.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(send.mock.calls.map((c) => c[4])).toEqual([rjId, okId, pId]);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

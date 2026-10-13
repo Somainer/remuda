@@ -71,7 +71,7 @@ async function boot(api: Api, hubStore: Store) {
   });
   vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
   await hubStore.bootstrap();
-  expect(await internalOf(hubStore).ensureOutbox()).toBe(true);
+  expect(await internalOf(hubStore).ensureOutbox()).toBe("ok");
 }
 
 function foreignInflightRow(until: number): OutboxRecord {

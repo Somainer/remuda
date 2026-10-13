@@ -407,7 +407,7 @@ async function bootLiveWithFaultableStorage(api: Api, hubStore: Store) {
     flushAllOutbox: () => Promise<void>;
     outbox: { storage: FaultableOutboxStorage } | null;
   };
-  expect(await internals.ensureOutbox()).toBe(true);
+  expect(await internals.ensureOutbox()).toBe("ok");
   // Settle the empty boot flush BEFORE faults are armed so its reads cannot
   // consume the one-shot faults below.
   await internals.flushAllOutbox();
@@ -819,7 +819,7 @@ it("GATE22 item 2: a live steer whose rejected finishing write aborts once is re
     stubPostSend(api);
     hubStore.setConnectionStateForTest("live");
     const internals = internalsOf(hubStore);
-    expect(await internals.ensureOutbox()).toBe(true);
+    expect(await internals.ensureOutbox()).toBe("ok");
     await internals.flushAllOutbox(); // settle the empty boot flush
     const storage = internals.outbox!.storage;
 

@@ -1694,7 +1694,7 @@ it("GATE18 item 2 (gate 20): aligned deadline wakes on two instances — a held 
       flushAllOutbox: () => Promise<void>;
       outbox: { pendingLeaseWakeups: () => string[] };
     };
-    expect(await internal.ensureOutbox()).toBe(true);
+    expect(await internal.ensureOutbox()).toBe("ok");
     await internal.flushAllOutbox();
 
     const cmd1 = "cmd_g18_i2_held";
@@ -1823,7 +1823,7 @@ it("GATE18 item 3 (gate 20): a command's deadline fire reconciles ANOTHER comman
         leaseWakeAt: (id: string) => number | undefined;
       };
     };
-    expect(await internal.ensureOutbox()).toBe(true);
+    expect(await internal.ensureOutbox()).toBe("ok");
     await internal.flushAllOutbox();
     expect(send).not.toHaveBeenCalled();
 
@@ -3565,7 +3565,7 @@ it("GATE22 item 6: a flush queued across logout/reinit releases its tokens and e
     const reopened = await (
       hubStore as unknown as { ensureOutbox: () => Promise<boolean> }
     ).ensureOutbox();
-    expect(reopened).toBe(true);
+    expect(reopened).toBe("ok");
     const newBox = boxOf()!;
     const newEnd = vi.spyOn(
       newBox as unknown as { endDeliveryPasses: (t: Iterable<number>) => Promise<void> },
@@ -4978,7 +4978,7 @@ it("GATE27 item 2: an OLD-epoch acceptance arriving only AFTER logout/reinit (th
     const reopened = await (
       a as unknown as { ensureOutbox: () => Promise<boolean> }
     ).ensureOutbox();
-    expect(reopened).toBe(true);
+    expect(reopened).toBe("ok");
     const lifeB = (a as unknown as { outbox: { lifetime: string } }).outbox.lifetime;
     expect(lifeB).not.toBe(lifeA);
     // B's boot flush cannot touch C: B is a different lifetime issuer and C
@@ -5126,7 +5126,7 @@ it("GATE28 a: a claim that fails before commit stamps no issuer — the stale co
     // Logout disposes the outbox; reinit creates a new outbox (new lifetime).
     a.logout();
     const reopened = await (a as unknown as { ensureOutbox: () => Promise<boolean> }).ensureOutbox();
-    expect(reopened).toBe(true);
+    expect(reopened).toBe("ok");
     const boxB = () => (a as unknown as { outbox: { isDeliveryExhausted: (i: string) => boolean; pendingLeaseWakeups: () => string[] } | null }).outbox;
 
     // B exhausts its own instance on P with the locks down.
@@ -5861,7 +5861,7 @@ it("GATE32 item 1a: logout/reinit disposes the Outbox — the new outbox has a f
     // Logout then reinit (same page): a NEW outbox with a NEW lifetime.
     hubStore.logout();
     const reopened = await (hubStore as unknown as { ensureOutbox: () => Promise<boolean> }).ensureOutbox();
-    expect(reopened).toBe(true);
+    expect(reopened).toBe("ok");
     const newLife = boxOf()!.lifetime;
     expect(newLife).not.toBe(oldLife);
 
@@ -6022,7 +6022,7 @@ it("GATE33 item 1: every session mutation (logout) bumps the auth generation and
 
     // reinit under the new identity: a fresh outbox/lifetime.
     const reopened = await (hubStore as unknown as { ensureOutbox: () => Promise<boolean> }).ensureOutbox();
-    expect(reopened).toBe(true);
+    expect(reopened).toBe("ok");
     const l2 = boxAt()!.lifetime;
     expect(l2).not.toBe(l1);
 
@@ -6087,14 +6087,14 @@ it("GATE33 item 2: an Outbox initializer whose auth generation goes stale before
 
     // Let the obsolete initializer finish: it must install nothing.
     releaseOld();
-    await expect(firstInit).resolves.toBe(false);
+    await expect(firstInit).resolves.toBe("obsolete");
     await pump(100);
     expect(h.outbox).toBeNull();
 
     // The CURRENT identity's initializer (no gate) installs a fresh outbox.
     h.setOutboxOpenGateForTest(null);
     const ok = await h.ensureOutbox();
-    expect(ok).toBe(true);
+    expect(ok).toBe("ok");
     expect(h.outbox).not.toBeNull();
     expect(h.authGenForTest).toBe(genAfter);
     // It is a live, usable outbox (a flush runs without throwing).
@@ -6105,3 +6105,83 @@ it("GATE33 item 2: an Outbox initializer whose auth generation goes stale before
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE34 item 1: once a public send() commits C durably, an auth disposal before the POST never falls back to an unkeyed direct POST — C is delivered at most once, by the current box", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_120_000);
+  const I = "ins_g34_1";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g34_1");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await hubStore.follow(I);
+    hubStore.setConnectionStateForTest("live");
+    const h = hubStore as unknown as {
+      logout: () => void;
+      send: (i: string, p: string) => Promise<boolean>;
+      ensureOutbox: () => Promise<string>;
+      setOutboxEnqueueGateForTest: (g: ((r: () => void) => void) | null) => void;
+      flushAllOutbox: () => Promise<void>;
+    };
+
+    // Gate the durable enqueue write so send() parks after it minted C but
+    // before C's storage.put commits.
+    let releaseEnqueue: () => void = () => undefined;
+    let enqueueStarted = false;
+    h.setOutboxEnqueueGateForTest((resolve) => {
+      enqueueStarted = true;
+      releaseEnqueue = resolve;
+    });
+    const sendPaused = h.send(I, "g34 1 C");
+    for (let i = 0; i < 2_000 && !enqueueStarted; i += 1) await Promise.resolve();
+    expect(enqueueStarted).toBe(true);
+
+    // Auth identity changes while C's commit is in flight.
+    h.logout();
+    releaseEnqueue(); // C now commits into durable storage
+    const result = await sendPaused;
+    // The committed command must NOT take the direct unkeyed fallback: the
+    // action does not execute from this call.
+    expect(result).toBe(false);
+    h.setOutboxEnqueueGateForTest(null);
+    await pump(500);
+    expect(send).not.toHaveBeenCalled();
+
+    // Re-auth implicitly via a fresh outbox (simulating the post-change page):
+    // ensureOutbox installs the current-generation box and the flush delivers
+    // the committed C EXACTLY once, carrying its own command id.
+    const status = await h.ensureOutbox();
+    expect(status).toBe("ok");
+    await h.flushAllOutbox();
+    await pump(2_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    const postedId = send.mock.calls[0]?.[4];
+    expect(postedId?.startsWith("cmd_")).toBe(true);
+    const rows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    expect(rows().some((r) => r.commandId === postedId)).toBe(true);
+    // Never a second POST.
+    await h.flushAllOutbox();
+    await pump(500);
+    expect(send).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});;

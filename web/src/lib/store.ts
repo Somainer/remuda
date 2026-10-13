@@ -1161,7 +1161,7 @@ class HubStore {
    * queueing N reads behind each other (c-reconnfu gate 6 item 4a).
    */
   private owedReconcileRunning = new Set<Id>();
-  private outboxInit: Promise<boolean> | null = null;
+  private outboxInit: Promise<"ok" | "obsolete" | "unavailable"> | null = null;
   /**
    * Auth-identity generation (c-reconnfu gate 33 item 2). Bumped by EVERY
    * session mutation via applyAuthIdentityChange (login, passkey login,
@@ -1235,8 +1235,20 @@ class HubStore {
     this.peerAuthWatchRegistered = true;
   }
 
-  private ensureOutbox(): Promise<boolean> {
-    if (this.outbox) return Promise.resolve(true);
+  /**
+   * Result of an outbox availability check (c-reconnfu gate 34 item 1):
+   *  - "ok": a current-generation Outbox is installed.
+   *  - "obsolete": the initializer lost an auth-generation race — durable
+   *    storage is fine and the CURRENT generation gets its own box; the caller
+   *    must NOT treat this as "storage unavailable" and must never POST
+   *    directly (no unkeyed duplicate); a durably committed command is left to
+   *    the current-generation box's recovery.
+   *  - "unavailable": durable storage genuinely could not be opened/written —
+   *    the legacy direct POST may run, but ALWAYS carrying the client command
+   *    id as its dedupe id.
+   */
+  private ensureOutbox(): Promise<"ok" | "obsolete" | "unavailable"> {
+    if (this.outbox) return Promise.resolve("ok");
     if (this.outboxInit) return this.outboxInit;
     this.registerPeerAuthWatch();
     // Capture the auth generation this initializer starts under (gate 33
@@ -1244,18 +1256,18 @@ class HubStore {
     // case it must not install the box it built nor run its post-load flush.
     const gen = this.authGen;
     const obsolete = () => gen !== this.authGen;
-    this.outboxInit = (async () => {
+    this.outboxInit = (async (): Promise<"ok" | "obsolete" | "unavailable"> => {
       try {
         // Test gate: hold the initializer mid-open so a test can change auth
-        // identity before completion (gate 33 item 2).
+        // identity before completion (gate 33 item 2 / gate 34 item 1).
         if (this.outboxOpenGateForTest) {
           await new Promise<void>((resolve) => this.outboxOpenGateForTest?.(resolve));
         }
         const opened = await openOutboxStorage();
-        // Auth changed while the storage backend was opening: discard
-        // everything without touching current state.
+        // Auth changed while the storage backend was opening: report OBSOLETE,
+        // not unavailable — storage is fine, the current generation owns it.
         if (obsolete() || !this.outboxInit) {
-          return false;
+          return "obsolete";
         }
         this.outboxDegraded = opened.degraded;
         const box = await Outbox.load(opened.storage);
@@ -1263,7 +1275,7 @@ class HubStore {
           // Another identity won: dispose the box we just built and leave the
           // current outbox (if a newer initializer installed one) untouched.
           box.dispose();
-          return false;
+          return "obsolete";
         }
         this.outbox = box;
         this.outboxUnsubscribe = box.subscribe(() => this.emit({ outboxPending: box.pendingCount() }));
@@ -1298,11 +1310,11 @@ class HubStore {
         // from an initializer whose identity is already obsolete (it may have
         // been superseded by a newer one that owns the flush).
         if (!obsolete() && this.outbox === box) void this.flushAllOutbox();
-        return true;
+        return "ok";
       } catch {
-        if (obsolete()) return false;
+        if (obsolete()) return "obsolete";
         this.outboxDegraded = true;
-        return false;
+        return "unavailable";
       }
     })();
     return this.outboxInit;
@@ -2742,6 +2754,11 @@ class HubStore {
   private outboxOpenGateForTest: ((resolve: () => void) => void) | null = null;
   setOutboxOpenGateForTest(gate: ((resolve: () => void) => void) | null): void {
     this.outboxOpenGateForTest = gate;
+  }
+  /** Gate the durable enqueue storage.put for gate-34 item-1 public-send test. */
+  private outboxEnqueueGateForTest: ((resolve: () => void) => void) | null = null;
+  setOutboxEnqueueGateForTest(gate: ((resolve: () => void) => void) | null): void {
+    this.outboxEnqueueGateForTest = gate;
   }
   private connectionStateOverride: ConnectionState | null = null;
   /** True during pagehide/beforeunload: no new outbox POSTs. */
@@ -4893,8 +4910,22 @@ class HubStore {
     const persistedMode =
       effectiveMode && effectiveMode !== "new-turn" ? effectiveMode : undefined;
 
-    const haveOutbox = await this.ensureOutbox();
-    const commandId = haveOutbox ? newCommandId() : null;
+    const outboxStatus = await this.ensureOutbox();
+    // c-reconnfu gate 34 item 1:
+    //  - unavailable storage: still mint C so the legacy direct POST carries
+    //    it as the dedupe id (never an unkeyed POST).
+    //  - obsolete initializer (auth changed while opening): do NOT mint/post
+    //    here; re-check once for the CURRENT generation's box. If it is now
+    //    available the send proceeds normally under it; otherwise stop without
+    //    any POST (no durable row was created, no action executed).
+    if (outboxStatus === "obsolete") {
+      const retry = await this.ensureOutbox();
+      if (retry !== "ok") return false;
+    }
+    const haveOutbox = this.outbox !== null;
+    // A command id is minted whenever we MIGHT POST: durable enqueue, or the
+    // legacy direct fallback when storage is genuinely unavailable.
+    const commandId: string | null = haveOutbox || outboxStatus === "unavailable" ? newCommandId() : null;
     const createdAtMs = Date.now();
     const journalIdForRow = this.state.instances.find((i) => i.id === instanceId)?.journalId;
     // Persist the upload manifest refs (objectId/index/kind/…), never the
@@ -4903,6 +4934,9 @@ class HubStore {
     const persistableAttachments = attachments.filter(
       (a): a is AttachmentRef => Boolean(a.objectId),
     );
+    // c-reconnfu gate 34 item 1: set true once C's enqueue commits. A send
+    // that committed C never POSTs directly after an auth disposal.
+    let committedDurably = false;
     if (this.outbox && commandId) {
       const outbox = this.outbox;
       // Storage-first: the bubble renders only AFTER the durable commit.
@@ -4932,10 +4966,16 @@ class HubStore {
       // id).
       const enqueueOnce = async (): Promise<boolean> => {
         try {
+          if (this.outboxEnqueueGateForTest) {
+            await new Promise<void>((resolve) => this.outboxEnqueueGateForTest?.(resolve));
+          }
           await outbox.enqueue(enqueueRecord);
+          committedDurably = true;
           return true;
         } catch {
-          return (await outbox.committedIfAny(commandId).catch(() => null)) !== null;
+          const seen = await outbox.committedIfAny(commandId).catch(() => null);
+          if (seen) committedDurably = true;
+          return seen !== null;
         }
       };
       if (!(await enqueueOnce()) && !(await enqueueOnce())) return false;
@@ -4956,9 +4996,15 @@ class HubStore {
     this.emit({ bubbles: this.state.bubbles.concat(bubble) });
 
     if (!this.outbox || !commandId) {
-      // No durable store (locked-down browser): legacy direct POST, and its
-      // failure is honestly 状态待确认 — never an optimistic retry.
-      return this.sendWithoutOutbox(instanceId, prompt, attachments, effectiveMode, clientRequestId);
+      // c-reconnfu gate 34 item 1:
+      //  - C committed durably but the box was disposed (auth change) AFTER
+      //    the commit: NEVER POST directly — C is durable and the
+      //    current-generation box's recovery delivers it exactly once.
+      //  - storage was genuinely unavailable (no commit): the legacy direct
+      //    POST runs, ALWAYS carrying C as the Hub/Node dedupe id.
+      if (committedDurably) return false;
+      if (!commandId) return false;
+      return this.sendWithoutOutbox(instanceId, prompt, attachments, effectiveMode, clientRequestId, commandId);
     }
     if (this.connectionState !== "live") {
       // The row stays pending; the connection machine flushes it on recovery.
@@ -5005,16 +5051,22 @@ class HubStore {
     return true;
   }
 
-  /** Legacy direct-POST path used only when durable storage is unavailable. */
+  /**
+   * Legacy direct-POST path used only when durable storage is unavailable.
+   * c-reconnfu gate 34 item 1: it ALWAYS receives the client command id and
+   * passes it to the POST as the Hub/Node dedupe id — an unkeyed fallback POST
+   * could not be deduplicated against any later durable replay.
+   */
   private async sendWithoutOutbox(
     instanceId: Id,
     prompt: string,
     attachments: AttachmentRef[],
     mode: PromptMode | undefined,
     clientRequestId: Id,
+    commandId: Id,
   ): Promise<boolean> {
     try {
-      const result = await api.instanceSend(instanceId, prompt, attachments, mode);
+      const result = await api.instanceSend(instanceId, prompt, attachments, mode, commandId);
       this.emit({
         bubbles: this.state.bubbles.map((b) =>
           b.clientRequestId === clientRequestId
@@ -5107,7 +5159,7 @@ class HubStore {
     // a steer of a later row clicked in the same burst cannot overtake an
     // earlier row's persistence; the flush chain itself serialises the POSTs
     // in createdAt order.
-    if (!(await this.ensureOutbox())) return;
+    if ((await this.ensureOutbox()) !== "ok") return;
     const items = this.heldBubbles(instanceId);
     for (const item of items) {
       const current = this.state.bubbles.find((b) => b.clientRequestId === item.clientRequestId);
@@ -5250,7 +5302,7 @@ class HubStore {
       (b) => b.clientRequestId === bubbleId && b.instanceId === instanceId && b.state === "queued",
     );
     if (!bubble) return false;
-    if (!(await this.ensureOutbox()) || !this.outbox) return false;
+    if ((await this.ensureOutbox()) !== "ok" || !this.outbox) return false;
 
     // enqueueBubble is idempotent: it assigns the single commandId if still
     // held, or promotes the existing queued row to steer; a racing

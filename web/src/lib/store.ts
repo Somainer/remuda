@@ -1895,6 +1895,13 @@ class HubStore {
       // deliverable unattempted row, and releases — letting queued conversions
       // interleave.
       for (let pass = 0; pass < MAX_FLUSH_PASSES; pass += 1) {
+        // c-reconnfu gate 22 item 6: this flush's tokens belong to the
+        // outbox that issued them (`box`). A logout/reinit WHILE the flush
+        // was queued (e.g. waiting on another instance's lock) replaces it;
+        // the stale continuation must not read, lock or POST through the new
+        // auth epoch. Stop here; the finally releases the tokens on the
+        // ISSUING (now disposed) box and never reconciles the new one.
+        if (this.outbox !== box) return;
         if (this.pageIsUnloading) return;
         // Pick the instance locks from FRESH durable rows, not the load-time
         // cache: another tab can persist a row after this tab loaded, and a
@@ -1912,7 +1919,7 @@ class HubStore {
           // joins that SAME chain only AFTER releasing this flush's
           // suppression, so its reconciliation cannot be skipped as covered.
           this.reconcileToast(err, "刷新待发队列");
-          void this.outbox?.deliveryAttemptFailed();
+          void box.deliveryAttemptFailed();
           return;
         }
         const instances = [
@@ -1928,7 +1935,7 @@ class HubStore {
         box.applyLeaseWakeReconcile(durable);
         let deliveredNew = false;
         for (const instanceId of instances) {
-          if (this.pageIsUnloading) return;
+          if (this.pageIsUnloading || this.outbox !== box) return;
           try {
             const id = await box.withInstanceLock(instanceId, (iid, deliverable) =>
               this.deliverOneRow(
@@ -1965,18 +1972,27 @@ class HubStore {
         if (!deliveredNew) break;
       }
     } finally {
-      const outbox = this.outbox;
-      if (!outbox) return;
+      // Gate 22 item 6: release tokens (and reconcile) against the CAPTURED
+      // outbox that issued this flush — `box`, never `this.outbox`, which a
+      // logout/reinit may have replaced mid-queued-turn. Old tokens applied to
+      // a new box would be meaningless suppression releases AND trigger a
+      // stray reconciliation of the new auth epoch.
       if (this.pageIsUnloading) {
         // A genuine teardown owns all cancellation (cancelAllWakesForUnload
         // already cleared the books); just drop the tokens, arm nothing.
-        for (const token of passTokens) outbox.releaseDeliveryPass(token);
+        for (const token of passTokens) box.releaseDeliveryPass(token);
+        return;
+      }
+      if (this.outbox !== box) {
+        // Issuing box was replaced: release its tokens on IT only. The
+        // disposed old box ignores the epilogue; the new box is untouched.
+        for (const token of passTokens) box.releaseDeliveryPass(token);
         return;
       }
       // Release ONLY this flush's suppression (overlapping flushes keep
       // theirs) and ALWAYS re-judge from a fresh authoritative snapshot: a
       // pass that posted nothing keeps exactly one wake per leftover row.
-      void outbox.endDeliveryPasses(passTokens).catch(() => undefined);
+      void box.endDeliveryPasses(passTokens).catch(() => undefined);
     }
   }
 

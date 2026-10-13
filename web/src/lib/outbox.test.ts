@@ -2124,4 +2124,52 @@ describe("Outbox", () => {
       Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     }
   });
+
+  it("GATE22 item 6: while storeRetryPending owns the instance, a reconcile cancels an already-armed deliver wake; clearing the marker re-arms it", async () => {
+    // A boundary failure leaves the row pending and the STORE's jittered
+    // retry owns the instance's next delivery. An outbox deliver wake that
+    // was armed earlier (e.g. by a flush epilogue racing the failure) used to
+    // stay armed and fire a parallel flush into the store's timer. Now the
+    // reconcile cancels it for as long as the marker holds; the store timer's
+    // own flush reconciles after clearStoreRetry and re-arms.
+    vi.useFakeTimers();
+    vi.setSystemTime(700_000);
+    const I = "ins_g22_i6";
+    const C = "cmd_g22_i6";
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: undefined } });
+    try {
+      const store = new MemStorage();
+      const put = store.put(rec({ commandId: C, instanceId: I, createdAt: 1_000 }));
+      await vi.advanceTimersByTimeAsync(5);
+      await put;
+
+      const box = await Outbox.load(store, "owner_g22_i6");
+      await box.refreshDurable();
+      expect(box.pendingLeaseWakeups()).toEqual([C]);
+      const armedAt = box.leaseWakeAt(C);
+      expect(armedAt).toBeGreaterThan(699_999);
+
+      // The store marks its jittered retry as owner of the next delivery:
+      // any reconcile (the racing patch epilogue, a sibling write, …) now
+      // cancels the armed deliver wake rather than leaving it.
+      box.noteStoreRetryScheduled(I);
+      await box.refreshDurable();
+      expect(box.pendingLeaseWakeups()).toEqual([]);
+      // And it stays cancelled across further reconciles.
+      await box.refreshDurable();
+      expect(box.pendingLeaseWakeups()).toEqual([]);
+
+      // The store timer fires, clears the marker and flushes: its fresh
+      // reconcile re-arms exactly the one deliver wake.
+      box.clearStoreRetry(I);
+      await box.refreshDurable();
+      expect(box.pendingLeaseWakeups()).toEqual([C]);
+
+      box.dispose();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
+  });
 });

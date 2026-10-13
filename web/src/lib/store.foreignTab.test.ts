@@ -3539,3 +3539,115 @@ it("GATE22 item 5 (rebuilds gate-21 item-2): B really finishes X AND restores Y 
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE22 item 6: a flush queued across logout/reinit releases its tokens and epilogue on the ISSUING box — the new epoch's outbox gets no stale tokens or reconcile and delivers the row itself", async () => {
+  // flushAllOutbox captures the current outbox in a local `box`. Before gate
+  // 22 item 6 a flush queued on another instance's Web Lock across a
+  // logout/reinit ran its finally against the CURRENT this.outbox — the NEW
+  // box — applying the disposed epoch's scoped suppression releases and a
+  // fresh-read reconciliation to the new auth epoch. The continuation also
+  // used to keep looping after the box was replaced. The fix bails every
+  // continuation once this.outbox !== box and releases tokens/epilogue on
+  // the issuing (disposed) box only; the new epoch independently boots and
+  // delivers the durable row once.
+  vi.useFakeTimers();
+  const originalNavigator = globalThis.navigator;
+  const shim = fifoWebLocks();
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { locks: shim.locks },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  const I = "ins_g22_i6_reinit";
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g22_i6_reinit");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({
+      events: [],
+      durableSeq: "0",
+      windowFromSeq: null,
+      reachedAfterSeq: true,
+    });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: {
+          commandId,
+          id: commandId,
+          state: "accepted",
+          revision: "1",
+          dispatch: "native-acknowledged",
+          resolution: "clear",
+        },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+
+    // Hold the instance lock ahead of the store's flush with a real queued turn.
+    let releaseBlocker: (() => void) | null = null;
+    const blockerGate = new Promise<void>((resolve) => {
+      releaseBlocker = resolve;
+    });
+    const boxOf = () =>
+      (
+        hubStore as unknown as {
+          outbox: { withInstanceLock: (i: string, f: () => Promise<number>) => Promise<number> } | null;
+        }
+      ).outbox;
+    void boxOf()!.withInstanceLock(I, async () => {
+      await blockerGate;
+      return 0;
+    });
+    await pump(200);
+
+    // Enqueue a row and start the store's real flush — it queues on the lock.
+    await hubStore.send(I, "gate22 6 reinit row");
+    const staleFlush = (
+      hubStore as unknown as { flushAllOutbox: () => Promise<void> }
+    ).flushAllOutbox();
+    await pump(200);
+    expect(send).not.toHaveBeenCalled();
+
+    // Logout (disposes the issuing box) and REINIT while the blocker still
+    // holds the lock: the stale flush is queued; the new epoch's boot flush
+    // queues behind it on the same Web Lock.
+    hubStore.logout();
+    expect(boxOf()).toBeNull();
+    const reopened = await (
+      hubStore as unknown as { ensureOutbox: () => Promise<boolean> }
+    ).ensureOutbox();
+    expect(reopened).toBe(true);
+    const newBox = boxOf()!;
+    const newEnd = vi.spyOn(
+      newBox as unknown as { endDeliveryPasses: (t: Iterable<number>) => Promise<void> },
+      "endDeliveryPasses",
+    );
+
+    // Release: the stale (old-box) turn runs first and must finish entirely on
+    // its ISSUING box — its disposed snapshot read posts nothing and its
+    // finally never calls the new box's epilogue. The new boot flush then
+    // delivers the row and runs exactly ONE epilogue (its own token).
+    releaseBlocker!();
+    await staleFlush.catch(() => undefined);
+    for (let i = 0; i < 300 && send.mock.calls.length === 0; i += 1) {
+      await vi.advanceTimersByTimeAsync(10);
+    }
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[1]).toBe("gate22 6 reinit row");
+    // Exactly the new epoch's boot-flush epilogue — a stale crossing would add
+    // a second endDeliveryPasses call here (pre-fix: 2).
+    expect(newEnd).toHaveBeenCalledTimes(1);
+
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

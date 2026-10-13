@@ -1469,6 +1469,18 @@ export class Outbox {
       // already-armed deliver wake whose failure count changed moves to the
       // new backoff instant (a failed attempt's recovery re-applies here).
       if (entry.kind === "deliver") {
+        // c-reconnfu gate 22 item 6: when the STORE's bounded jittered retry
+        // owns the instance's next delivery (scheduleOutboxRetry after a
+        // boundary failure), an already-armed outbox deliver wake must be
+        // CANCELLED, not left to fire a parallel flush into the store's
+        // timer. (Flush-pass suppression deliberately keeps the redundant
+        // wake — the running flush coalesces it — so only the store-retry
+        // marker cancels here.) The store timer's own flush reconciles and
+        // re-arms the wake when the marker clears.
+        if (this.storeRetryPending.has(d.instanceId)) {
+          this.cancelLeaseWake(id);
+          continue;
+        }
         const failures = this.deliveryFailures.get(d.instanceId) ?? 0;
         if (entry.failures !== failures) this.armDeliverWake(id, d.instanceId, now);
         continue;

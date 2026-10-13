@@ -99,6 +99,7 @@ import {
   dropDeviceCookie,
   readLoggedOut,
   readSession,
+  readAuthEpoch,
   writeSession,
   type DeviceSession,
   type PairCode,
@@ -2176,7 +2177,7 @@ class HubStore {
       // records progress through the same helper as every other path
       // (c-reconnfu gate 26).
       if (this.outbox?.get(commandId)?.state === "done") {
-        this.recordAcceptedDelivery(instanceId, commandId, origin);
+        await this.recordAcceptedDelivery(instanceId, commandId, origin);
         return;
       }
       const verdict = await this.reconcileCommandViaGet(instanceId, commandId);
@@ -2203,7 +2204,7 @@ class HubStore {
         // verdict, not of the local patch applying. Record progress regardless
         // (c-reconnfu gate 26).
         await this.reconcilePatch(commandId, { state: "sent", gotResponse: true });
-        this.recordAcceptedDelivery(instanceId, commandId, origin);
+        await this.recordAcceptedDelivery(instanceId, commandId, origin);
         return;
       }
       if (verdict === "held") {
@@ -2229,37 +2230,45 @@ class HubStore {
   }
 
   /**
-   * The SINGLE acceptance-progress boundary (c-reconnfu gate 26 coordinator
-   * ruling; gate 27 refinement): progress is a property of the HUB'S
-   * ACCEPTANCE of a command, not of which local path observed it. Every
-   * authoritative acceptance observation routes through here once:
-   *  - the POST response classified sent (deliverOutboxRecord),
-   *  - the command-status GET confirming sent, and a done seen while polling,
-   *  - a journal message settling the row as accepted/done
-   *    (live onEvents and catch-up settleFromJournal).
+   * The SINGLE acceptance-progress boundary (c-reconnfu gate 26/27; gate 28
+   * replaces the in-memory books with durable row state): progress is a
+   * property of the HUB'S ACCEPTANCE of a command, not of which local path
+   * observed it. Every authoritative acceptance observation routes through
+   * here once — the POST sent verdict, the command-status GET (sent or a done
+   * seen while polling), and a journal message settling the row
+   * (live onEvents and catch-up settleFromJournal).
    *
-   * Gate 27 final rules:
-   *  - AT MOST ONCE per command: a second observation of the same command id
-   *    in any order is a no-op, so failures/backoff earned on the instance
-   *    AFTER the first acceptance are not wiped by a late duplicate;
-   *  - ISSUING OUTBOX ONLY: the command must have been issued (enqueued or
-   *    claimed for delivery) by the still-current outbox; a stale journal
-   *    catch-up from a logout/reinit previous epoch never touches the
-   *    replacement's books, even though its done patch still retires the row.
-   *
-   * Rejected, failed, held or never-resolving observations never call this.
+   * The decision is entirely DURABLE: the row's `progressRecorded` flag flips
+   * false → true in one compare-and-set that also requires
+   * `issuerEpoch === current auth epoch`. So:
+   *  - progress for a command is recorded AT MOST ONCE, across the POST, GET
+   *    and journal arriving in any order, regardless of in-memory cache size;
+   *  - a cancelled navigation / BFCache suspension / reload cannot lose or
+   *    duplicate it (it lives on the row, not in a per-outbox set);
+   *  - an observation of a command issued by a previous login epoch (stale
+   *    journal catch-up after logout/reinit) never touches the new epoch,
+   *    though the journal done patch itself still retires the durable row;
+   *  - rejected, failed, held or never-resolving outcomes never call this.
    */
-  private recordAcceptedDelivery(
+  private async recordAcceptedDelivery(
     instanceId: Id,
     commandId: Id,
     origin?: Outbox | null,
-  ): void {
+  ): Promise<void> {
     const box = origin ?? this.outbox;
     if (this.pageIsUnloading || !box || this.outbox !== box) return;
-    if (!box.hasIssued(commandId)) return;
-    if (!box.noteAcceptedOnce(commandId)) return;
+    const epoch = readAuthEpoch();
+    let flipped = false;
+    try {
+      flipped = await box.casProgressRecorded(commandId, epoch);
+    } catch {
+      // A storage failure here is not a lost delivery: the next acceptance
+      // observation (GET poll, journal, flush) retries the CAS.
+      flipped = false;
+    }
+    if (!flipped) return;
     box.noteDeliveryProgress(instanceId);
-    void box.deliveryEpilogue().catch(() => undefined);
+    await box.deliveryEpilogue().catch(() => undefined);
   }
 
   /**
@@ -2337,12 +2346,18 @@ class HubStore {
     // previous delivery whose finishing write aborted) is stale and must not
     // be POSTed under.
     const claimToken = localId();
+    // c-reconnfu gate 28: the COMMITTED claim stamps the durable row with the
+    // issuing auth epoch (this logged-in device session, surviving reload of
+    // the same login, changed by logout/reinit). Only this write commits does
+    // the stamp exist — a failed/never-attempted claim leaves it unset.
+    const claimEpoch = readAuthEpoch();
     let claimed;
     try {
       claimed = await box.patch(commandId, {
         state: "inflight",
         attempts: isFreshAttempt ? current0.attempts + 1 : current0.attempts,
         lease: { owner: box.ownerId, until: Date.now() + LEASE_TTL_MS, claimToken },
+        ...(claimEpoch ? { issuerEpoch: claimEpoch } : {}),
       });
     } catch {
       // Gate 22 item 1 (coordinator ruling): a durable mutation that COMMITTED
@@ -2480,7 +2495,7 @@ class HubStore {
       // Hub-ACCEPTED verdict clears the per-instance backoff/exhaustion and
       // re-runs the delivery epilogue; rejected/held/failed/uncertain outcomes
       // leave the latch exactly as they found it.
-      if (accepted) this.recordAcceptedDelivery(current0.instanceId, commandId, box);
+      if (accepted) void this.recordAcceptedDelivery(current0.instanceId, commandId, box);
     }
     this.syncBubbleFromOutbox(commandId);
     if (!box.pendingFor(current0.instanceId).length) this.clearOutboxRetry(current0.instanceId);
@@ -2555,7 +2570,7 @@ class HubStore {
           // Journal evidence always retires the durable row, independent of
           // which epoch issued it; progress itself is gated inside the helper.
           void this.outbox.patch(commandId, { state: "done", serverState: "journal-settled" });
-          this.recordAcceptedDelivery(instanceId, commandId, this.outbox);
+          void this.recordAcceptedDelivery(instanceId, commandId, this.outbox);
         }
       }
     }
@@ -3281,7 +3296,7 @@ class HubStore {
               const rec = commandId ? this.outbox.get(commandId) : null;
               if (commandId && rec && rec.state !== "done" && rec.state !== "rejected") {
                 void this.outbox.patch(commandId, { state: "done", serverState: "journal-settled" });
-                this.recordAcceptedDelivery(instanceId, commandId, this.outbox);
+                void this.recordAcceptedDelivery(instanceId, commandId, this.outbox);
               }
             }
           }

@@ -5023,3 +5023,437 @@ it("GATE27 item 2: a stale journal catch-up from the previous outbox retires the
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+/** GATE28: read the durable outbox rows straight from localStorage. */
+function g28Rows(): Array<OutboxRecord & { issuerEpoch?: string; progressRecorded?: boolean }> {
+  return JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as Array<OutboxRecord & {
+    issuerEpoch?: string;
+    progressRecorded?: boolean;
+  }>;
+}
+const g28Row = (id: string) => g28Rows().find((r) => r.commandId === id);
+const g28EpochKey = "runtime.outbox-auth-epoch";
+
+it("GATE28 a: a claim that fails before commit stamps no issuer — the stale command's acceptance on the replacement epoch records nothing", async () => {
+  // In epoch A the row C's REAL claim transaction aborts BEFORE commit (fault
+  // gated by command id + durable state): the issuer epoch is part of that
+  // write, so the row stays without an issuer. Logout/reinit creates epoch B,
+  // which exhausts its own instance on P. The stale epoch-A subscription then
+  // delivers C's accepted journal settle: the durable CAS sees no matching
+  // issuer on the new epoch and does NOT flip — C retires to done but B stays
+  // exhausted and P stays uncovered.
+  vi.useFakeTimers();
+  vi.setSystemTime(1_020_000);
+  const I = "ins_g28_a";
+  const originalNavigator = globalThis.navigator;
+  const good = fifoWebLocks().locks;
+  const bad = {
+    query: async () => ({ held: [] as Array<{ name: string }> }),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    request: (): Promise<any> => Promise.reject(new Error("g28 a locks down")),
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let locks: { query: () => Promise<unknown>; request: (...args: any[]) => Promise<unknown> } = good;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { get locks() { return locks; } },
+  });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    // Epoch A: follow (capture subscription), enqueue C, make its real claim
+    // abort before commit while locks are up.
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g28_a_a");
+    const { api: apiA, hubStore: a } = await fresh();
+    vi.spyOn(apiA, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(apiA, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(apiA, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(apiA, "eventsSubscribe").mockResolvedValue({ ...g26Subscription(), subscriptionId: "sub_g28_a" } as never);
+    const sendA = vi.spyOn(apiA, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [], command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(apiA, a);
+    await (a as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await a.follow(I);
+    const subscribeA = vi.mocked(apiA.eventsSubscribe);
+    for (let i = 0; i < 2_000 && !subscribeA.mock.calls[0]?.[2]; i += 1) await Promise.resolve();
+    const onBatchA = subscribeA.mock.calls[0]?.[2] as (b: G26Batch) => void;
+    a.setConnectionStateForTest("live");
+    expect(await a.send(I, "g28 a C")).toBe(true);
+    const cId = g28Rows().find((r) => r.prompt === "g28 a C")!.commandId;
+    const aStorage = (a as unknown as { outbox: { storage: { mergeUnlessDone: (id: string, p: Partial<OutboxRecord>) => Promise<OutboxRecord | null> } } }).outbox.storage;
+    const realMergeA = aStorage.mergeUnlessDone.bind(aStorage);
+    let claimFaults = 0;
+    aStorage.mergeUnlessDone = vi.fn(async (id, patch) => {
+      if (id === cId && (patch as { state?: string }).state === "inflight") {
+        claimFaults += 1;
+        throw new Error("g28 a claim pre-commit abort");
+      }
+      return await realMergeA(id, patch);
+    });
+    // Kick the claim while a blocker holds the instance lock; simplest is the
+    // real boot/online flush after a second send — drive one flush directly.
+    void (a as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await pump(2_000);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await pump(1_000);
+    expect(claimFaults).toBeGreaterThan(0);
+    expect(sendA).not.toHaveBeenCalled();
+    // The failed claim stamped NOTHING.
+    expect(g28Row(cId)?.issuerEpoch).toBeUndefined();
+    expect(g28Row(cId)?.state).toBe("pending");
+
+    // Logout rotates the auth epoch; reinit epoch B.
+    a.logout();
+    expect(localStorage.getItem(g28EpochKey)).toBeNull();
+    const reopened = await (a as unknown as { ensureOutbox: () => Promise<boolean> }).ensureOutbox();
+    expect(reopened).toBe(true);
+    const boxB = () => (a as unknown as { outbox: { isDeliveryExhausted: (i: string) => boolean; pendingLeaseWakeups: () => string[] } | null }).outbox;
+
+    // B exhausts its own instance on P with the locks down.
+    locks = bad;
+    a.setConnectionStateForTest("offline");
+    expect(await a.send(I, "g28 a P")).toBe(true);
+    await pump(200);
+    const pRowId = g28Rows().find((r) => r.prompt === "g28 a P")!.commandId;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(boxB()!.isDeliveryExhausted(I)).toBe(true);
+
+    // Locks recover and ONE flush runs: C is first in FIFO but its real claim
+    // aborts BEFORE commit (fault re-armed on B's storage), so the flush stops
+    // and nothing POSTs. Gate 27's selection-time mark wrongly assigns C to B
+    // here; gate 28 stamps nothing because no claim committed.
+    const bStorage = (a as unknown as { outbox: { storage: { mergeUnlessDone: (id: string, p: Partial<OutboxRecord>) => Promise<OutboxRecord | null> } } }).outbox.storage;
+    const realMergeB = bStorage.mergeUnlessDone.bind(bStorage);
+    let bClaimFaults = 0;
+    bStorage.mergeUnlessDone = vi.fn(async (id, patch) => {
+      if (id === cId && (patch as { state?: string }).state === "inflight") {
+        bClaimFaults += 1;
+        throw new Error("g28 a B claim pre-commit abort");
+      }
+      return await realMergeB(id, patch);
+    });
+    locks = good;
+    await (a as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await pump(2_000);
+    expect(bClaimFaults).toBeGreaterThan(0);
+    expect(sendA).not.toHaveBeenCalled();
+    expect(g28Row(cId)?.issuerEpoch).toBeUndefined();
+    expect(g28Row(pRowId)?.state).toBe("pending");
+
+    // The stale epoch-A subscription settles C accepted/done.
+    onBatchA({
+      subscriptionId: "sub_g28_a",
+      journalId: JOURNAL,
+      fromSeq: "1",
+      toSeq: "1",
+      durableSeq: "1",
+      events: [g26JournalMessage(cId, "1")],
+    });
+    await pump(2_000);
+    await vi.advanceTimersByTimeAsync(1_000);
+    // Journal evidence retires C, but its acceptance recorded nothing on B.
+    expect(g28Row(cId)?.state).toBe("done");
+    expect(g28Row(cId)?.progressRecorded).toBeFalsy();
+    expect(boxB()!.isDeliveryExhausted(I)).toBe(true);
+    expect(boxB()!.pendingLeaseWakeups()).toEqual([]);
+    expect(g28Row(pRowId)?.state).toBe("pending");
+    expect(sendA).not.toHaveBeenCalled();
+    a.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE28 b: POST then a duplicate journal acceptance of the same command records progress exactly once — later failures survive (durable flag, no cache to evict)", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_030_000);
+  const I = "ins_g28_b";
+  const originalNavigator = globalThis.navigator;
+  const good = fifoWebLocks().locks;
+  const bad = {
+    query: async () => ({ held: [] as Array<{ name: string }> }),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    request: (): Promise<any> => Promise.reject(new Error("g28 b locks down")),
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let locks: { query: () => Promise<unknown>; request: (...args: any[]) => Promise<unknown> } = good;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { get locks() { return locks; } } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g28_b");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [], command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await hubStore.follow(I);
+    const subscribe = vi.mocked(api.eventsSubscribe);
+    for (let i = 0; i < 2_000 && !subscribe.mock.calls[0]?.[2]; i += 1) await Promise.resolve();
+    const onBatch = subscribe.mock.calls[0]?.[2] as (b: G26Batch) => void;
+    const box = () => (hubStore as unknown as { outbox: { isDeliveryExhausted: (i: string) => boolean } | null }).outbox;
+
+    // 1) An accepted steer POST records progress once: durable flag flips.
+    locks = good;
+    hubStore.setConnectionStateForTest("live");
+    expect(await hubStore.send(I, "g28 b C", [], [], "steer")).toBe(true);
+    await pump(500);
+    const cId = send.mock.calls[0]?.[4] as string;
+    expect(g28Row(cId)?.progressRecorded).toBe(true);
+    expect(box()!.isDeliveryExhausted(I)).toBe(false);
+
+    // 2) Fresh failures accrue on a later row Q (locks down to the cap).
+    locks = bad;
+    hubStore.setConnectionStateForTest("offline");
+    expect(await hubStore.send(I, "g28 b Q")).toBe(true);
+    await pump(200);
+    const qId = g28Rows().find((r) => r.prompt === "g28 b Q")!.commandId;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(box()!.isDeliveryExhausted(I)).toBe(true);
+    const callsAfterQ = send.mock.calls.length;
+
+    // 3) A duplicate journal acceptance of the SAME command id (a replayed
+    //    follow batch) finds the durable flag already true: no second record,
+    //    Q's exhaustion/backoff are untouched. The state lives on the row, so
+    //    no amount of other commands can evict it.
+    onBatch({
+      subscriptionId: "sub_g26",
+      journalId: JOURNAL,
+      fromSeq: "9",
+      toSeq: "9",
+      durableSeq: "9",
+      events: [g26JournalMessage(cId, "9")],
+    });
+    await pump(2_000);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(box()!.isDeliveryExhausted(I)).toBe(true);
+    expect(send.mock.calls.length).toBe(callsAfterQ);
+    expect(g28Row(qId)?.state).toBe("pending");
+    // Still exactly the one POST for C.
+    expect(send.mock.calls.filter((c) => c[4] === cId)).toHaveLength(1);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE28 c: cancelled navigation (pagehide) between the claim and the accepted GET still records progress once after BFCache restore", async () => {
+  // C claims (issuer stamped) and answers reconciling — no acceptance yet.
+  // The page is genuinely hidden (the old in-memory sets were cleared right
+  // here), then BFCache-restored. The parked GET then reports accepted: with
+  // durable row state the flag still flips exactly once and P is delivered.
+  vi.useFakeTimers();
+  vi.setSystemTime(1_040_000);
+  const I = "ins_g28_c";
+  const originalNavigator = globalThis.navigator;
+  const shim = fifoWebLocks();
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: shim.locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g28_c");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, prompt: string, _x?: unknown, _m?: string, commandId?: string) =>
+        prompt === "g28 c C"
+          ? g25ReconcilingAnswer(commandId ?? "cmd_x")
+          : { relatedCommandIds: [], command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" } }) as unknown as Api["instanceSend"],
+    );
+    let gets = 0;
+    vi.spyOn(api, "instanceCommandStatus").mockImplementation(
+      (async (_i: string, commandId: string) => g25Status(commandId, gets++ === 0 ? "reconciling" : "accepted")) as Api["instanceCommandStatus"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    const box = () => (hubStore as unknown as { outbox: { isDeliveryExhausted: (i: string) => boolean } | null }).outbox;
+
+    // Exhaust P first (locks down), then a reconciling steer with locks up.
+    const bad = { query: async () => ({ held: [] as Array<{ name: string }> }), request: () => Promise.reject(new Error("g28 c locks down")) as Promise<never> };
+    let locks: unknown = bad;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { get locks() { return locks; } } });
+    hubStore.setConnectionStateForTest("offline");
+    expect(await hubStore.send(I, "g28 c P")).toBe(true);
+    await pump(200);
+    const pId = g28Rows().find((r) => r.prompt === "g28 c P")!.commandId;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(box()!.isDeliveryExhausted(I)).toBe(true);
+
+    locks = shim.locks;
+    hubStore.setConnectionStateForTest("live");
+    expect(await hubStore.send(I, "g28 c C", [], [], "steer")).toBe(false);
+    for (let i = 0; i < 1_000 && gets < 1; i += 1) await Promise.resolve();
+    const cId = send.mock.calls[0]?.[4] as string;
+    expect(g28Row(cId)?.state).toBe("reconciling");
+    expect(g28Row(cId)?.issuerEpoch).toBeTruthy();
+    expect(g28Row(cId)?.progressRecorded).toBeFalsy();
+
+    // Genuine page navigation away and BFCache restore before the GET settles.
+    (hubStore as unknown as { onPageHide: (e?: Event) => void }).onPageHide(new Event("pagehide"));
+    expect((hubStore as unknown as { pageIsUnloadingForTest: boolean }).pageIsUnloadingForTest).toBe(true);
+    (hubStore as unknown as { onConnPageshow: (e: PageTransitionEvent) => void }).onConnPageshow(
+      { persisted: true } as PageTransitionEvent,
+    );
+    expect((hubStore as unknown as { pageIsUnloadingForTest: boolean }).pageIsUnloadingForTest).toBe(false);
+
+    // GET 2 accepted: the durable CAS survives the teardown — records once.
+    await vi.advanceTimersByTimeAsync(1_000);
+    for (let i = 0; i < 400 && send.mock.calls.length < 2; i += 1) {
+      await vi.advanceTimersByTimeAsync(10);
+      await Promise.resolve();
+    }
+    expect(send.mock.calls.map((c) => c[4])).toEqual([cId, pId]);
+    expect(g28Row(cId)?.progressRecorded).toBe(true);
+    expect(g28Row(pId)?.state).toBe("sent");
+    expect(box()!.isDeliveryExhausted(I)).toBe(false);
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE28 d: a reload of the SAME login keeps the restored reconciling row's issuer — its later GET acceptance records durable progress and delivers P", async () => {
+  // Not a logout: the auth epoch persists in localStorage. After recreating the
+  // outbox (page reload), the restored reconciling row C still carries its
+  // issuer epoch; its restarted GET loop's accepted verdict flips the durable
+  // flag exactly once and the fresh epilogue delivers the older P.
+  vi.useFakeTimers();
+  vi.setSystemTime(1_050_000);
+  const I = "ins_g28_d";
+  const originalNavigator = globalThis.navigator;
+  const shim = fifoWebLocks();
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: shim.locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g28_d");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, prompt: string, _x?: unknown, _m?: string, commandId?: string) =>
+        prompt === "g28 d C"
+          ? g25ReconcilingAnswer(commandId ?? "cmd_x")
+          : { relatedCommandIds: [], command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" } }) as unknown as Api["instanceSend"],
+    );
+    // Every status GET parks; one release resolves ALL parked GETs (the store
+    // keeps the reconciliation loop alive across the simulated reload, so the
+    // original parked call is the one that eventually returns).
+    const getWaiters: Array<(r: unknown) => void> = [];
+    let getAccepted = false;
+    const releaseGet = (r: unknown) => {
+      getAccepted = true;
+      const waiters = getWaiters.splice(0);
+      for (const w of waiters) w(r);
+    };
+    vi.spyOn(api, "instanceCommandStatus").mockImplementation(
+      async (_i: string, commandId: string) => {
+        if (getAccepted) return g25Status(commandId, "accepted");
+        await new Promise((resolve) => { getWaiters.push(resolve); });
+        return g25Status(commandId, "accepted");
+      },
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+
+    // Exhaust P (locks down) before the steer.
+    const bad = { query: async () => ({ held: [] as Array<{ name: string }> }), request: () => Promise.reject(new Error("g28 d locks down")) as Promise<never> };
+    let locks: unknown = bad;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { get locks() { return locks; } } });
+    hubStore.setConnectionStateForTest("offline");
+    expect(await hubStore.send(I, "g28 d P")).toBe(true);
+    await pump(200);
+    const pId = g28Rows().find((r) => r.prompt === "g28 d P")!.commandId;
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    locks = shim.locks;
+    hubStore.setConnectionStateForTest("live");
+    expect(await hubStore.send(I, "g28 d C", [], [], "steer")).toBe(false);
+    await pump(500);
+    const cId = send.mock.calls[0]?.[4] as string;
+    const epochBeforeReload = localStorage.getItem(g28EpochKey);
+    expect(epochBeforeReload).toBeTruthy();
+    expect(g28Row(cId)?.state).toBe("reconciling");
+    expect(g28Row(cId)?.issuerEpoch).toBe(epochBeforeReload);
+    expect(g28Row(cId)?.progressRecorded).toBeFalsy();
+
+    // RELOAD of the same login: drop the in-memory outbox and re-init WITHOUT
+    // clearing the session/epoch (unlike logout).
+    const reloader = hubStore as unknown as {
+      outbox: unknown;
+      outboxInit: unknown;
+      connection: { dispose: () => void } | null;
+      connectionBoundTo: unknown;
+      connectionBoundJournal: unknown;
+      connectionBindGen: number;
+      initConnection: (offline?: boolean) => Promise<void>;
+    };
+    // Drop the connection machine too so initConnection rebuilds it (a reload),
+    // but leave the auth epoch in storage (NOT a logout).
+    reloader.connection?.dispose();
+    reloader.connection = null;
+    reloader.connectionBoundTo = null;
+    reloader.connectionBoundJournal = null;
+    reloader.connectionBindGen = 0;
+    reloader.outbox = null;
+    reloader.outboxInit = null;
+    // A real reload destroys the previous JS context (old reconciliation loop
+    // and outbox) outright; in-process we drop its in-flight marker so the
+    // restored epoch starts the GET loop bound to the NEW outbox. The orphaned
+    // old loop (if its parked GET resolves) is rejected by the origin check.
+    (hubStore as unknown as { reconcilingInFlight: Set<string> }).reconcilingInFlight.delete(cId);
+    await reloader.initConnection();
+    // Let the recreated connection machine certify live against the mocked
+    // Hub (probe + ready follow) as it would on a real reload.
+    await pump(3_000);
+    expect(localStorage.getItem(g28EpochKey)).toBe(epochBeforeReload);
+
+    // The restored GET reconciliation now receives acceptance: durable CAS
+    // matches the surviving issuer epoch and records once.
+    releaseGet(g25Status(cId, "accepted"));
+    await pump(3_000);
+    for (let i = 0; i < 400 && send.mock.calls.length < 2; i += 1) {
+      await vi.advanceTimersByTimeAsync(10);
+      await Promise.resolve();
+    }
+    expect(send.mock.calls.map((c) => c[4])).toEqual([cId, pId]);
+    expect(g28Row(cId)?.progressRecorded).toBe(true);
+    expect(g28Row(cId)?.issuerEpoch).toBe(epochBeforeReload);
+    expect(g28Row(pId)?.state).toBe("sent");
+    hubStore.logout();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

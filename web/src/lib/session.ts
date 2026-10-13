@@ -58,9 +58,36 @@ export function clearSession(): void {
   try {
     localStorage.removeItem(LEGACY_ACCESS_KEY);
     localStorage.removeItem(SESSION_KEY);
+    localStorage.removeItem(ANON_EPOCH_KEY);
     localStorage.setItem(LOGGED_OUT_KEY, "1");
   } catch {
     /* ignore */
+  }
+}
+
+const ANON_EPOCH_KEY = "runtime.outbox-auth-epoch";
+
+/**
+ * The current AUTH EPOCH that owns outbox deliveries (c-reconnfu gate 28):
+ * normally the logged-in device session id (stable across reloads of the same
+ * login, changed by logout/reinit). When no device session exists (mock/test
+ * harness without a login), fall back to a stable id persisted in
+ * localStorage so a reload keeps the same epoch while a logout (which clears
+ * it via {@link clearSession}) starts a new one.
+ */
+export function readAuthEpoch(): string {
+  const deviceId = readSession()?.deviceId;
+  if (deviceId) return deviceId;
+  try {
+    const existing = localStorage.getItem(ANON_EPOCH_KEY);
+    if (existing) return existing;
+    const created = `epoch_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+    localStorage.setItem(ANON_EPOCH_KEY, created);
+    return created;
+  } catch {
+    // Storage unavailable: a per-document fallback still keys the session
+    // coherently within this page.
+    return `epoch_mem_${Math.random().toString(36).slice(2)}`;
   }
 }
 

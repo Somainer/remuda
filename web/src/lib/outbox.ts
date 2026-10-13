@@ -84,6 +84,21 @@ export type OutboxRecord = {
   gotResponse?: boolean;
   /** Set when state === "inflight": the durable single-deliverer lease. */
   lease?: Lease;
+  /**
+   * Auth epoch (logged-in device session id) that ISSUED the command — stamped
+   * durably by the COMMITTED claim write, surviving page reloads of the same
+   * login but changing on logout/reinit (c-reconnfu gate 28). Acceptance
+   * progress for the row is recorded only on an outbox whose current epoch
+   * matches. A failed or never-attempted claim stamps nothing.
+   */
+  issuerEpoch?: Id;
+  /**
+   * Durable at-most-once acceptance flag (c-reconnfu gate 28): flips
+   * false → true in the SAME durable write that authoritatively records
+   * delivery progress for the row (compare-and-set). Once true, later POST/
+   * GET/journal observations of the command are no-ops for progress.
+   */
+  progressRecorded?: boolean;
 };
 
 /** Automatic retry envelope (D-055): ≤20 attempts within 24 h. */
@@ -190,6 +205,19 @@ export interface OutboxStorage {
    */
   mergeUnlessDone(commandId: Id, patch: Partial<OutboxRecord>): Promise<OutboxRecord | null>;
   /**
+   * Durable compare-and-set for acceptance progress (c-reconnfu gate 28). In
+   * ONE readwrite transaction the stored row is read and
+   * `progressRecorded` is flipped false → true ONLY when the row exists AND
+   * its {@link OutboxRecord.issuerEpoch} equals `issuerEpoch` AND the flag is
+   * not already true. Resolves true when THIS call made the flip (the caller
+   * may then clear in-memory backoff/exhaustion and reconcile), false
+   * otherwise — a missing row, a command issued by another auth epoch, or a
+   * second observation already recorded. Nothing in-memory is consulted, so
+   * the decision survives reload/cancelled-navigation/BFCache and can never
+   * record twice. A storage failure rejects.
+   */
+  casProgressRecorded(commandId: Id, issuerEpoch: Id): Promise<boolean>;
+  /**
    * Atomically reclaim (load-time) a row THIS context observed inflight with a
    * lease snapshot `{ owner, until }`. In ONE readwrite transaction the stored
    * row is read and written to `state: "pending", lease: undefined` ONLY when
@@ -229,12 +257,6 @@ export const LEASE_TTL_MS = 30_000;
 export const CLAIM_WAKE_MAX_FAILURES = 12;
 export const CLAIM_WAKE_BASE_RETRY_MS = 250;
 export const CLAIM_WAKE_MAX_RETRY_MS = 5_000;
-/**
- * Bound on the per-outbox issued/accepted command tracking sets (gate 27):
- * far above any single auth epoch's live command count, small enough that the
- * dedupe state cannot grow without limit. Overflow evicts the oldest ids.
- */
-const ACCEPTANCE_TRACK_LIMIT = 2_000;
 
 /**
  * The Web Lock name guarding delivery for ONE instance. This is the ONLY place
@@ -422,6 +444,34 @@ class IdbOutboxStorage implements OutboxStorage {
   }
 
   /**
+   * Durable acceptance compare-and-set in ONE readwrite transaction (same
+   * serialization as {@link mergeUnlessDone}): get, epoch/flag check and put
+   * share `t`, so two concurrent observations of a row cannot both flip the
+   * flag — exactly one resolves true.
+   */
+  async casProgressRecorded(commandId: Id, issuerEpoch: Id): Promise<boolean> {
+    return await new Promise<boolean>((resolve, reject) => {
+      const t = this.db.transaction(IDB_STORE, "readwrite");
+      const store = t.objectStore(IDB_STORE);
+      let flipped = false;
+      const getReq = store.get(commandId);
+      getReq.onsuccess = () => {
+        const existing = getReq.result as OutboxRecord | undefined;
+        if (!existing) return; // missing: no flip
+        if (existing.issuerEpoch !== issuerEpoch) return; // another auth epoch
+        if (existing.progressRecorded) return; // already recorded
+        const marked: OutboxRecord = { ...existing, progressRecorded: true };
+        store.put(marked);
+        flipped = true;
+      };
+      getReq.onerror = () => reject(getReq.error);
+      t.oncomplete = () => resolve(flipped);
+      t.onabort = () => reject(t.error ?? getReq.error ?? new Error("IndexedDB CAS transaction aborted"));
+      t.onerror = () => reject(t.error ?? getReq.error);
+    });
+  }
+
+  /**
    * Conditional load-time reclaim in ONE readwrite transaction (same
    * serialization as {@link acquireLease}): the get, the lease comparison and
    * the put share `t`, so a sent/reconciling/done write from another tab whose
@@ -585,6 +635,21 @@ class LocalStorageOutboxStorage implements OutboxStorage {
   }
 
   /**
+   * Synchronous read-check-write turn for the acceptance CAS — atomic within
+   * the supported single-tab degraded case the same way mergeUnlessDone is.
+   */
+  async casProgressRecorded(commandId: Id, issuerEpoch: Id): Promise<boolean> {
+    const recs = this.read();
+    const existing = recs.find((r) => r.commandId === commandId);
+    if (!existing || existing.issuerEpoch !== issuerEpoch || existing.progressRecorded) {
+      return false;
+    }
+    const marked = { ...existing, progressRecorded: true as const };
+    this.write([...recs.filter((r) => r.commandId !== commandId), marked]);
+    return true;
+  }
+
+  /**
    * Conditional reclaim as one synchronous read-check-write turn — atomic in
    * the supported single-tab degraded case the same way mergeUnlessDone is.
    */
@@ -709,25 +774,6 @@ export class Outbox {
    * state and arms no further wake until a real POST (or teardown) clears it.
    */
   private deliveryExhausted = new Set<Id>();
-  /**
-   * Commands THIS outbox instance (one auth epoch / page lifetime) ISSUED —
-   * enqueued itself or claimed for a real delivery attempt. An acceptance
-   * observation (POST, command-status GET, journal settle) is allowed to
-   * record delivery progress ONLY for one of these: a stale journal catch-up
-   * batch arriving after logout/reinit carries commands issued by the
-   * PREVIOUS outbox and must never touch the replacement's books
-   * (c-reconnfu gate 27 item 2). Bounded like {@link acceptedCommands}.
-   */
-  private issuedCommands = new Set<Id>();
-  /**
-   * Commands whose Hub ACCEPTANCE has already recorded progress on THIS outbox
-   * (c-reconnfu gate 27 item 1): progress per command is recorded AT MOST
-   * ONCE. A second observation of the same command id in any order (the POST
-   * verdict, the status GET, a journal settle) is a no-op — without this the
-   * late duplicate would wipe failures/backoff the instance earned AFTER the
-   * first acceptance. Insertion-ordered and bounded.
-   */
-  private acceptedCommands = new Set<Id>();
   /**
    * Per-FLUSH suppression of 0 ms delivery wakes (c-reconnfu gate 21 item 1):
    * each guarded flush receives a TOKEN scoped to the instances ITS pass read.
@@ -1033,9 +1079,6 @@ export class Outbox {
   ): Promise<OutboxRecord> {
     const full: OutboxRecord = { attempts: 0, state: "pending", ...rec };
     await this.storage.put(full);
-    // THIS outbox issued the command: only its acceptance observations may
-    // later record progress (c-reconnfu gate 27 item 2).
-    this.markIssued(full.commandId);
     this.cache.set(full.commandId, full);
     this.emit();
     this.reconcileAfterCommittedWrite();
@@ -1193,11 +1236,6 @@ export class Outbox {
     this.readRecoveryExhausted = false;
     this.deliveryFailures.clear();
     this.deliveryExhausted.clear();
-    // The per-command acceptance/issuance books belong to the same envelope: a
-    // genuine teardown (or a pagehide that is later undone) resets them with
-    // the failure state they gate (c-reconnfu gate 27).
-    this.issuedCommands.clear();
-    this.acceptedCommands.clear();
     this.deliveryPasses.clear();
     this.deliverySuppressed.clear();
     this.storeRetryPending.clear();
@@ -1224,46 +1262,13 @@ export class Outbox {
   }
 
   /**
-   * Record that THIS outbox issued a command (its own enqueue, or a durable
-   * row it claimed and is about to deliver). Bounded.
+   * Durable acceptance compare-and-set (c-reconnfu gate 28): flips the row's
+   * progressRecorded false → true only when the row was issued by this auth
+   * epoch and has not been recorded. The returned boolean is the ONLY thing
+   * telling the store to clear per-instance backoff/exhaustion and reconcile.
    */
-  markIssued(commandId: Id) {
-    this.capTracking(this.issuedCommands);
-    this.issuedCommands.add(commandId);
-  }
-
-  /**
-   * Whether the command was issued by THIS outbox (gate 27 item 2): an
-   * acceptance observation for a command issued before a logout/reinit never
-   * records progress on the replacement outbox.
-   */
-  hasIssued(commandId: Id): boolean {
-    return this.issuedCommands.has(commandId);
-  }
-
-  /**
-   * Record an acceptance observation for a command AT MOST ONCE (gate 27
-   * item 1). Returns false (and changes nothing) when a second observation of
-   * the same command id arrives — the instance's failures/backoff earned after
-   * the first acceptance must survive it.
-   */
-  noteAcceptedOnce(commandId: Id): boolean {
-    if (this.acceptedCommands.has(commandId)) return false;
-    this.capTracking(this.acceptedCommands);
-    this.acceptedCommands.add(commandId);
-    return true;
-  }
-
-  /** Evict the oldest tracking entries once a set passes its bound. */
-  private capTracking(set: Set<Id>) {
-    if (set.size < ACCEPTANCE_TRACK_LIMIT) return;
-    const dropUntil = ACCEPTANCE_TRACK_LIMIT - Math.floor(ACCEPTANCE_TRACK_LIMIT / 4);
-    let dropped = 0;
-    for (const id of set) {
-      if (dropped >= dropUntil) break;
-      set.delete(id);
-      dropped += 1;
-    }
+  async casProgressRecorded(commandId: Id, issuerEpoch: Id): Promise<boolean> {
+    return await this.storage.casProgressRecorded(commandId, issuerEpoch);
   }
 
   /**
@@ -1904,13 +1909,6 @@ export class Outbox {
         (a, b) =>
           this.rank(a) - this.rank(b) || a.createdAt - b.createdAt || a.commandId.localeCompare(b.commandId),
       );
-    // THIS outbox selects each of these rows for one of its delivery turns
-    // (the claim happens inside, on BOTH the Web Lock and durable-lease
-    // paths): it becomes the issuing outbox for them, so its acceptance
-    // observations may later record progress (c-reconnfu gate 27 item 2). A
-    // row whose claim loses to a foreign lease is harmless to mark — progress
-    // is per instance and the journal-done acceptance is authoritative.
-    for (const r of deliverable) this.markIssued(r.commandId);
     return await fn(instanceId, deliverable);
   }
 

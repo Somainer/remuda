@@ -89,6 +89,21 @@ class MemStorage implements OutboxStorage {
     this.writeChain = run.then(() => undefined, () => undefined);
     return await run;
   }
+  /** Atomic acceptance compare-and-set on the same serialized chain. */
+  async casProgressRecorded(commandId: string, issuerEpoch: string): Promise<boolean> {
+    const run = this.writeChain.then(async () => {
+      await new Promise((r) => setTimeout(r, 1));
+      const existing = this.map.get(commandId);
+      if (!existing || existing.issuerEpoch !== issuerEpoch || existing.progressRecorded) {
+        return false;
+      }
+      const marked: OutboxRecord = { ...existing, progressRecorded: true };
+      this.map.set(commandId, marked);
+      return true;
+    });
+    this.writeChain = run.then(() => undefined, () => undefined);
+    return await run;
+  }
   /** Conditional reclaim on the same serialized critical section. */
   async reclaimInflight(
     commandId: string,
@@ -1900,6 +1915,9 @@ describe("Outbox", () => {
         throw new Error("IDB transaction aborted");
       },
       mergeUnlessDone: async () => {
+        throw new Error("IDB transaction aborted");
+      },
+      casProgressRecorded: async () => {
         throw new Error("IDB transaction aborted");
       },
       reclaimInflight: async () => {

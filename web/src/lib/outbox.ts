@@ -210,9 +210,11 @@ export interface OutboxStorage {
   mergeUnlessDone(commandId: Id, patch: Partial<OutboxRecord>): Promise<OutboxRecord | null>;
   /**
    * c-reconnfu gate 35 item 4: conditionally undo a committed claim. In ONE
-   * readwrite transaction read the row; if its lease claimToken still equals
-   * `claimToken`, write priorState/priorAttempts and clear the lease, return
-   * the restored row. If the token differs (a newer delivery won it), do
+   * readwrite transaction read the row; if it is STILL inflight AND its lease
+   * claimToken still equals `claimToken`, write priorState/priorAttempts and
+   * clear the lease, return the restored row. A terminal row (done/rejected/…
+   * — gate 36 item 1, e.g. a journal settlement that committed between claim
+   * and rollback while retaining the lease) or a differing token means do
    * nothing and return null.
    */
   restoreClaimIfTokenMatches(
@@ -475,6 +477,10 @@ class IdbOutboxStorage implements OutboxStorage {
       getReq.onsuccess = () => {
         const existing = getReq.result as OutboxRecord | undefined;
         if (!existing) return;
+        // Gate 36 item 1: a terminal row (a journal `done` that committed
+        // between the claim and this rollback, keeping the stale lease on
+        // record) is authoritative — the rollback must never resurrect it.
+        if (existing.state !== "inflight") return;
         if (existing.lease?.claimToken !== claimToken) return; // newer delivery owns it
         const { lease: _lease, ...withoutLease } = existing;
         void _lease;
@@ -687,7 +693,8 @@ export class LocalStorageOutboxStorage implements OutboxStorage {
   ): Promise<OutboxRecord | null> {
     const recs = this.read();
     const existing = recs.find((r) => r.commandId === commandId);
-    if (!existing || existing.lease?.claimToken !== claimToken) return null;
+    // Gate 36 item 1: never resurrect a terminal (journal-settled) row.
+    if (!existing || existing.state !== "inflight" || existing.lease?.claimToken !== claimToken) return null;
     const { lease: _lease, ...withoutLease } = existing;
     void _lease;
     const restored = { ...withoutLease, state: priorState, attempts: priorAttempts };

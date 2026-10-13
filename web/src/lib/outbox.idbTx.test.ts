@@ -1,5 +1,12 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { openOutboxStorage, Outbox, type OutboxRecord, type OutboxStorage } from "./outbox";
+import {
+  LocalStorageOutboxStorage,
+  OUTBOX_LS_KEY,
+  openOutboxStorage,
+  Outbox,
+  type OutboxRecord,
+  type OutboxStorage,
+} from "./outbox";
 
 /**
  * Minimal IndexedDB stand-in that can abort a transaction AFTER the object
@@ -704,4 +711,75 @@ it("Outbox.enqueue rejects and keeps the row out of its cache on a post-success 
   await box.enqueue(probeRecord("cmd_outbox_abort"));
   expect(box.get("cmd_outbox_abort")?.state).toBe("pending");
   expect(box.pendingCount()).toBe(1);
+});
+
+it("GATE36 item 1: a stale claim rollback queued behind a journal done preserves the terminal row (IndexedDB transaction order AND localStorage)", async () => {
+  // Transaction order from the defect: CLAIM (inflight + THIS claim token)
+  // commits; a late journal settlement queues a `done` write BEHIND no other
+  // tx here (the row simply becomes done while retaining its lease, exactly as
+  // settleFromJournal patches it); the stale delivery's rollback then runs.
+  // The rollback must require the row to STILL be inflight with the matching
+  // token — a terminal done is authoritative and must never be resurrected to
+  // pending (which would permit another keyed POST).
+  const TOKEN = "tok_claim_g36_1";
+  const claimedRow = (): OutboxRecord => ({
+    commandId: "cmd_g36_1",
+    clientRequestId: "local_g36_1",
+    instanceId: "ins_g36_1",
+    prompt: "g36 1 C",
+    createdAt: 1_000,
+    attempts: 7,
+    state: "inflight",
+    lease: { owner: "owner_g36_1", until: 4_000_000, claimToken: TOKEN },
+  });
+
+  // ---- IndexedDB: done tx commits AHEAD OF the queued rollback tx ----
+  const db = installFakeIndexedDB();
+  const opened = await openOutboxStorage();
+  const storage = opened.storage;
+  await storage.put(claimedRow());
+
+  let releaseDone: (() => void) | null = null;
+  db.commitGate = new Promise<void>((r) => void (releaseDone = r));
+  let doneEntered = false;
+  db.gatedCommitEntered = () => { doneEntered = true; };
+  // Journal settlement: state done, lease deliberately retained (the store
+  // patch does not clear it — the rollback guard must cope regardless).
+  const doneP = storage.mergeUnlessDone("cmd_g36_1", { state: "done", serverState: "journal-settled" });
+  const rollbackP = storage.restoreClaimIfTokenMatches("cmd_g36_1", TOKEN, "pending", 7);
+  for (let i = 0; i < 50 && !doneEntered; i += 1) await Promise.resolve();
+  expect(doneEntered).toBe(true); // done write parked pre-commit; rollback queued behind it
+  releaseDone!();
+  const doneRec = await doneP;
+  const rolledBack = await rollbackP;
+
+  expect(doneRec?.state).toBe("done");
+  // The rollback touched NOTHING: null result...
+  expect(rolledBack).toBeNull();
+  // ...and the authoritative terminal row survives with its lease.
+  const after = (await storage.all()).find((r) => r.commandId === "cmd_g36_1")!;
+  expect(after.state).toBe("done");
+  expect(after.lease?.claimToken).toBe(TOKEN);
+
+  // Control: while the row really IS still inflight with THIS token, the same
+  // rollback restores the retryable state as before (no over-broad guard).
+  db.commitGate = null;
+  db.gatedCommitEntered = null;
+  await storage.put(claimedRow());
+  const restored = await storage.restoreClaimIfTokenMatches("cmd_g36_1", TOKEN, "pending", 7);
+  expect(restored?.state).toBe("pending");
+  expect(restored?.attempts).toBe(7);
+  expect(restored?.lease).toBeUndefined();
+
+  // ---- localStorage backend: same guard, synchronous read-check-write ----
+  delete (globalThis as { indexedDB?: IDBFactory }).indexedDB;
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const ls = new LocalStorageOutboxStorage();
+  await ls.put(claimedRow());
+  await ls.mergeUnlessDone("cmd_g36_1", { state: "done", serverState: "journal-settled" });
+  const lsRollback = await ls.restoreClaimIfTokenMatches("cmd_g36_1", TOKEN, "pending", 7);
+  expect(lsRollback).toBeNull();
+  const lsRows = await ls.all();
+  expect(lsRows.find((r) => r.commandId === "cmd_g36_1")?.state).toBe("done");
+  localStorage.removeItem(OUTBOX_LS_KEY);
 });

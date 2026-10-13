@@ -4132,6 +4132,38 @@ async fn the_max_positive_i64_session_grants_but_a_2_31_epoch_is_refused() {
         refused.is_err(),
         "a 2^31-epoch session (negative i64) must not be granted: {refused:?}"
     );
+
+    // r18 item 8: the refusal must come from the PRODUCTION STORE grant, not
+    // merely the RunningHub wrapper's u64→i64 prevalidation. Call the store
+    // grant directly on a fresh claimed job and require it to fail too; it must
+    // not persist as session 0.
+    let job3 = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job3, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let raw_refused = ctx
+        .hub
+        .test_store_gate_land_grant_raw(&job3, &ctx.host, merge, overflow)
+        .await;
+    assert!(
+        raw_refused.is_err(),
+        "the STORE grant must itself reject a non-positive-i64 session (no wrapper): \
+         {raw_refused:?}"
+    );
+    assert_eq!(
+        ctx.hub.test_gate_dispatch_session(&job3).await.unwrap(),
+        None,
+        "a refused store grant must not collapse the session to 0/NULL"
+    );
+    // Dispatch + stale-session recovery around the LAST representable epoch:
+    // the max-positive session round-trips through the grant and is readable.
+    assert_eq!(
+        ctx.hub.test_gate_dispatch_session(&job).await.unwrap(),
+        Some(max_positive as i64),
+        "dispatch/recovery sees the last representable session"
+    );
 }
 
 /// r18 item 7: a winning landed verdict must reference ITS OWN evidence. The

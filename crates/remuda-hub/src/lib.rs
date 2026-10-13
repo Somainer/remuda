@@ -986,6 +986,34 @@ impl RunningHub {
         }))
     }
 
+    /// r18 item 8 test-only: call the STORE grant directly, bypassing the
+    /// RunningHub wrapper's u64→i64 prevalidation, to prove the STORE itself
+    /// refuses a non-positive-i64 session (epoch ≥ 2^31). Reverting the store's
+    /// `try_from` guard makes this call persist a 0 session and succeed.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_store_gate_land_grant_raw(
+        &self,
+        job_id: &str,
+        host_id: &str,
+        merge_sha: &str,
+        session: u64,
+    ) -> anyhow::Result<()> {
+        let store = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        let attempts = store
+            .get_gate_job(job_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("job missing"))?
+            .attempts;
+        store
+            .gate_land_grant(job_id, host_id, attempts, "test-epoch", merge_sha, session)
+            .await
+            .map(|_| ())
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
     /// Test-only: run the §7.5 direct-op admission (check + `admitted` row)
     /// without a live Node, for worker.provision/remove coverage while the
     /// worker routes themselves stay Agent-403 (ma-admission opens them).

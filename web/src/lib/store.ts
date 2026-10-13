@@ -1515,7 +1515,17 @@ class HubStore {
   /** context-usage-1: fold Hub-computed usage rollups from polled instances
    *  into the live map. The polled projection is always fresher than the
    *  retained one (its TPM windows are recomputed server-side at read
-   *  time), so a rollup with at least as many turns wins. */
+   *  time), so a rollup with at least as many turns wins.
+   *
+   *  c-usagefu r17 item 4: an AUTHORITATIVE AVAILABILITY transition wins
+   *  regardless of turn count. The explicit Unavailable rollup (the Hub
+   *  opened on the rolled-back usage shape) carries turns 0, so the
+   *  at-least-as-many-turns rule alone let a positive cached rollup mask it
+   *  forever and the chip kept painting the old percentage. Any change of
+   *  the `unavailable` flag — positive -> Unavailable or Unavailable ->
+   *  positive after a successful migration/restart — therefore replaces the
+   *  cached rollup. Response ordering is unchanged: rows fold in poll order.
+   */
   private hydrateUsageRollups(instances: Instance[]) {
     let updated = false;
     const next = { ...this.state.usageRollup };
@@ -1523,10 +1533,16 @@ class HubStore {
       const rollup = instance.usageRollup;
       if (!rollup) continue;
       const current = next[instance.id];
+      // An authoritative availability transition (positive <-> Unavailable)
+      // wins over the cached rollup regardless of the turn count.
+      const availabilityChanged =
+        current != null &&
+        (rollup.unavailable === true) !== (current.unavailable === true);
       // Equal turn count with equal content is not a change; the server
       // rebuilds the rollup object on every read.
       if (
         !current ||
+        availabilityChanged ||
         rollup.turns > current.turns ||
         (rollup.turns === current.turns && !structuralEqual(current, rollup))
       ) {

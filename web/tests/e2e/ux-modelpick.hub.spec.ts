@@ -113,7 +113,7 @@ async function openModelList(page: Page) {
 
 test("the tall catalog panel anchors to its trigger, fits, scrolls and switches", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
-  const instanceId = await createSession(page, "Model picker tall-catalog geometry");
+  const instanceId = await createSession(page, "compact-approval tall-catalog geometry");
 
   // Apply the persisted launch snapshot before opening the picker.
   await page.reload();
@@ -367,6 +367,56 @@ test("a tall catalog list over the parked approval card caps to the strip, scrol
   // bottoms — the panel extends down toward the trigger past the card end).
   expect(panelBox!.y).toBeGreaterThanOrEqual(approvalBox!.y + approvalBox!.height - 8 - 1);
   expect(Math.abs(panelBox!.height - strip) <= 2, `caps to the strip (${panelBox!.height} vs ${strip})`).toBeTruthy();
+});
+
+test("distinct full ids sharing one final segment stay separate and post the full id", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const instanceId = await createSession(page, "Model picker colliding-catalog");
+  await page.reload();
+  await page.getByTestId("model-effort-chip").waitFor({ timeout: 20_000 });
+  await clearApprovals(page, instanceId);
+  await openModelList(page);
+
+  // vendor-a/shared and vendor-b/shared are two real models the driver
+  // distinguishes by FULL id: two rows, full-id testids/labels, never one
+  // merged "shared" radio.
+  const rowA = page.getByTestId("model-option-vendor-a-shared");
+  const rowB = page.getByTestId("model-option-vendor-b-shared");
+  await expect(rowA).toBeVisible();
+  await expect(rowB).toBeVisible();
+  expect(await page.getByTestId("model-option-shared").count()).toBe(0);
+  await expect(rowA).toContainText("vendor-a/shared");
+  await expect(rowB).toContainText("vendor-b/shared");
+
+  // Clicking one posts exactly its full id.
+  const request = page.waitForRequest(
+    (r) =>
+      r.method() === "POST" &&
+      r.url().endsWith(`/v1/instances/${instanceId}/commands`) &&
+      r.postDataJSON()?.operation === "instance.configure",
+  );
+  await rowA.click();
+  expect((await request).postDataJSON().payload.model).toBe("vendor-a/shared");
+
+  // The verdict settles the listed selection on the SAME full id: A selected,
+  // B untouched (a short-label match would have selected both / posted B).
+  await openModelList(page);
+  await expect(page.getByTestId("effort-slider-panel")).toHaveAttribute("data-model-pending", "0", {
+    timeout: 10_000,
+  });
+  await expect(page.getByTestId("effort-slider-panel")).toHaveAttribute(
+    "data-model-current",
+    "shared",
+    { timeout: 10_000 },
+  );
+  await expect(page.getByTestId("model-option-vendor-a-shared")).toHaveAttribute(
+    "data-selected",
+    "1",
+  );
+  await expect(page.getByTestId("model-option-vendor-b-shared")).toHaveAttribute(
+    "data-selected",
+    "0",
+  );
 });
 
 test.afterEach(async ({ page }) => {

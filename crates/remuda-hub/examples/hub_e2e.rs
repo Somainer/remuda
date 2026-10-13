@@ -504,6 +504,15 @@ fn fake_launch_catalog(prompt: Option<&str>) -> (Value, Vec<String>) {
         std::iter::once("e2e/auto".to_owned())
             .chain((0..80).map(|i| format!("e2e/m-{i:02}")))
             .collect()
+    } else if prompt.is_some_and(|text| text.contains("colliding-catalog")) {
+        // Two DISTINCT full ids sharing one final segment: the driver matches
+        // models verbatim, so the web picker must render and select them by
+        // full id, never merge them on the "shared" short label.
+        vec![
+            "vendor-a/shared".to_owned(),
+            "vendor-b/shared".to_owned(),
+            "e2e/fast".to_owned(),
+        ]
     } else {
         vec![
             "e2e/auto".to_owned(),

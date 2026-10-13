@@ -1,0 +1,24 @@
+# r15 item 9 — coordinator guide states R1–R5 exactly
+
+File: docs/design/coordinator-guide.md, the "Outcome rules" section.
+
+Updated content (in the committed doc):
+- R2 expanded: per-host authority guard across the Landing
+  verdict/probe/grant/evidence stretch, commit-time host+session predicates,
+  null-session Landing evidence refused.
+- R3 expanded: epoch allocated in one immediate transaction, Hub refuses to
+  start on a missing/regressed epoch row vs retained sessions, same-boot
+  carrier reconnect rebinds in-flight Landings before the forced probe,
+  durable product daemon + pre-collected inventory.
+- R4 rewritten: operator-only (agents 403), expectedAttempts /
+  expectedSessionEpoch / expectedMergeSha + mandatory rationale validated
+  inside the writer and persisted; final established-landed probe wins.
+- NEW R5: fail-closed evidence — durable fence before child release
+  (child-start barrier), positive leader identity only, ESRCH-only death,
+  `/proc` diagnostic-only with portable identity, merge CLI exit 4 uncertain.
+- "Land timeout" paragraph corrected: whole-group KILL is unconditional
+  after the bounded TERM wait, death claimed only by ESRCH, `/proc` missing
+  never skips the kill; marker-based readiness instead of sleeps.
+
+The doc describes only what the code does; the stale "elapsed window settles
+failed" and "enumerate survivors via /proc" claims are removed.

@@ -1724,6 +1724,67 @@ impl ShellPtyDriver {
     /// writer's termination append after every stop-ladder rung. The
     /// promoter itself is retired afterwards by close's normal poller
     /// shutdown block.
+    /// Retire the PREVIOUS run's promotion poller and exit waiter before a
+    /// resumed run adopts this driver's shared handles (c-ctxusage r18
+    /// item 3). After a natural exit the poller is still running — the
+    /// writer's death demotes it, it does not stop it — and resume used to
+    /// overwrite `poller`/`poller_shutdown` outright: dropping the JoinHandle
+    /// DETACHED the task and dropping its watch sender only closed the
+    /// channel, which the poll loop treated as a no-op tick. The detached
+    /// predecessor kept its event-sender clone alive and kept tailing the
+    /// old transcript forever.
+    ///
+    /// Mirrors close's cooperative poller shutdown: signal the watch, wait
+    /// bounded for the finalise/task, abort only a genuinely wedged poller;
+    /// the exit waiter is cancelled and joined the same way close does, so no
+    /// predecessor sender clone survives into the new run.
+    async fn retire_predecessor_run(&self) {
+        if let Some(shutdown) = self.poller_shutdown.lock().await.take() {
+            let _ = shutdown.send(true);
+        }
+        let promoter_timeout = self
+            .test_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            .and_then(crate::test_faults::FaultState::close_timeout)
+            .unwrap_or_else(|| std::time::Duration::from_secs(15));
+        let finalised = self.poller_finalised.lock().await.take();
+        if let Some(mut poller) = self.poller.lock().await.take() {
+            let finished = if let Some(finalised) = finalised {
+                tokio::pin!(finalised);
+                tokio::time::timeout(promoter_timeout, async {
+                    tokio::select! {
+                        _ = &mut finalised => {}
+                        _ = &mut poller => {}
+                    }
+                })
+                .await
+                .is_ok()
+            } else {
+                tokio::time::timeout(promoter_timeout, &mut poller)
+                    .await
+                    .is_ok()
+            };
+            if !finished {
+                poller.abort();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut poller).await;
+            }
+        }
+        if let Some(mut waiter) = self.waiter.lock().await.take() {
+            waiter.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut waiter).await;
+        }
+        // The predecessor's detection slots are stale; the new run's poller
+        // repopulates them on its own bind/demote.
+        if let Ok(mut slot) = self.promoted.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.status.lock() {
+            *slot = None;
+        }
+    }
+
     async fn stop_promoted_writer_before_retire(&self) -> DriverResult<()> {
         let state = self.state().await?;
         // From here the poller only tail-reads the bound transcript; it does
@@ -2104,6 +2165,12 @@ impl ShellPtyDriver {
         };
         // Adopt the new PTY: the caller holds *this* driver, so control
         // operations have to reach the process that was just started.
+        //
+        // First retire the PREDECESSOR run's poller/waiter. After a natural
+        // exit the previous run's poller is still live; the handle
+        // assignments below used to overwrite and detach it (c-ctxusage r18
+        // item 3).
+        self.retire_predecessor_run().await;
         *self.inner.lock().await = resumed.inner.lock().await.take();
         *self.hooks.lock().await = resumed.hooks.lock().await.take();
         *self.poller.lock().await = resumed.poller.lock().await.take();

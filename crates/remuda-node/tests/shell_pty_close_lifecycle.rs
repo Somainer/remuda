@@ -1494,3 +1494,124 @@ async fn a_resumed_run_uses_a_fresh_live_drain_and_rebinds() {
         "the resumed writer's termination usage delivered exactly once, got {scopes:?}"
     );
 }
+
+/// c-ctxusage r18 item 3: a same-driver resume AFTER A NATURAL EXIT must
+/// retire the predecessor run's promotion poller instead of overwriting and
+/// detaching it. The writer's death only DEMOTES the poller (the shell is
+/// still there); with no close() in between, resume used to drop the old
+/// JoinHandle and its shutdown watch — the channel closed but the poll loop
+/// read that closure as a no-op tick, so the predecessor poller ran forever,
+/// tailing the old transcript and holding an event-sender clone (the old
+/// run's receiver never closed).
+///
+/// Here run 1 is killed externally (no close), its natural `native_exit` is
+/// observed, then a real resume starts run 2: the run-1 channel must close
+/// (predecessor retired), run 2 must re-bind and close cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_natural_exit_before_resume_retires_the_predecessor_poller() {
+    let (_dir, workspace, _transcript, events_path, driver) = p1_promoted_layout_tagged();
+    let driver = std::sync::Arc::new(driver);
+
+    // ---- run 1: bind, then let the writer die WITHOUT close() -----------
+    let handle = driver
+        .start(spec_for(&workspace, DriverKind::ShellPty))
+        .await
+        .expect("start");
+    let mut events_rx1 = handle.into_events();
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let bound_tx = std::sync::Mutex::new(Some(bound_tx));
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    let exit_tx = std::sync::Mutex::new(Some(exit_tx));
+    // Keep draining run 1 for the whole test: this task ends only when the
+    // predecessor's last event sender drops during resume retirement.
+    let drainer1 = tokio::spawn(async move {
+        while let Some(observation) = events_rx1.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+            {
+                if native.native_name == "transcript_bound"
+                    && let Some(tx) = bound_tx.lock().unwrap().take()
+                {
+                    let _ = tx.send(());
+                }
+                if native.native_name == "native_exit"
+                    && let Some(tx) = exit_tx.lock().unwrap().take()
+                {
+                    let _ = tx.send(());
+                }
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(20), bound_rx)
+        .await
+        .expect("run 1 never bound")
+        .expect("bound oneshot closed without firing");
+
+    // External SIGTERM: a NATURAL death from the driver's perspective — no
+    // close(), no stop ladder, the exit waiter reaps and reports native_exit.
+    let events_text = std::fs::read_to_string(&events_path).expect("harness events");
+    let pid1 = events_text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|row| row.get("event").and_then(serde_json::Value::as_str) == Some("session_start"))
+        .filter_map(|row| row.get("pid").and_then(serde_json::Value::as_u64))
+        .next_back()
+        .expect("run-1 harness logged its pid");
+    let kill = std::process::Command::new("kill")
+        .args(["-TERM", &pid1.to_string()])
+        .status()
+        .expect("spawn kill");
+    assert!(kill.success(), "SIGTERM delivered to the run-1 writer");
+    tokio::time::timeout(Duration::from_secs(20), exit_rx)
+        .await
+        .expect("the natural native_exit was never observed")
+        .expect("exit oneshot closed without firing");
+
+    // ---- run 2: real resume, still no intervening close ----------------
+    let handle2 = driver
+        .start_resumed(
+            spec_for(&workspace, DriverKind::ShellPty),
+            SESSION_ID.into(),
+        )
+        .await
+        .expect("resume after a natural exit");
+    let mut events_rx2 = handle2.into_events();
+    let (bound2_tx, bound2_rx) = tokio::sync::oneshot::channel();
+    let bound2_tx = std::sync::Mutex::new(Some(bound2_tx));
+    let drainer2 = tokio::spawn(async move {
+        while let Some(observation) = events_rx2.recv().await {
+            if let ObservationPayload::Lifecycle(lc) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = lc.as_ref()
+                && native.native_name == "transcript_bound"
+                && let Some(tx) = bound2_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+        }
+    });
+
+    // The predecessor poller (and every old run sender) was retired during
+    // resume: run 1's channel CLOSES, bounded, instead of staying held open by
+    // the detached poller forever.
+    tokio::time::timeout(Duration::from_secs(20), drainer1)
+        .await
+        .expect("run-1 channel never closed: the predecessor poller leaked past resume")
+        .expect("run-1 drainer panicked");
+
+    // The new run binds through its own fresh drain/poller.
+    tokio::time::timeout(Duration::from_secs(25), bound2_rx)
+        .await
+        .expect("run 2 never re-bound after resume")
+        .expect("resume bound oneshot closed without firing");
+
+    // Run 2 closes through its own handoff and fully retires.
+    tokio::time::timeout(Duration::from_secs(25), driver.close())
+        .await
+        .expect("run-2 close hung past its bound")
+        .expect("run-2 close completes");
+    driver.abort_event_workers_for_test().await;
+    tokio::time::timeout(Duration::from_secs(30), drainer2)
+        .await
+        .expect("run-2 channel never closed")
+        .expect("run-2 drainer panicked");
+}

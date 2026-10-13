@@ -995,8 +995,19 @@ pub(super) fn spawn(
         loop {
             tokio::select! {
                 // Wakes close between ticks; a tick still drives normal polls.
-                _ = shutdown.changed() => {
-                    closing = *shutdown.borrow_and_update();
+                result = shutdown.changed() => {
+                    match result {
+                        Ok(()) => closing = *shutdown.borrow_and_update(),
+                        // The watch sender was dropped without a final value
+                        // — the same-driver resume path retiring THIS run's
+                        // poller, or driver teardown. Channel closure is
+                        // shutdown too: the old arm read it as a false-valued
+                        // tick and the poller kept running, detached, after
+                        // its handle was overwritten (c-ctxusage r18 item 3).
+                        // Break into the same terminal finalise a `true`
+                        // shutdown runs.
+                        Err(_closed) => break,
+                    }
                 }
                 _ = tick.tick() => {}
                 // c-ctxusage r15 item 7: a live mid-close drain request.

@@ -4208,3 +4208,88 @@ async fn an_established_landed_probe_wins_over_an_operator_failed_resolution() {
         "no operator-failed error is recorded when the probe established landed: {doc}"
     );
 }
+
+/// r15 item 5: a Landing whose bounded recovery window expires WHILE the lane
+/// carrier is disconnected is still marked outcome-unknown — the expiry
+/// evaluation happens before the connectivity check. The row keeps Landing and
+/// its full occupancy (host/lane assignment), the operator resolve path stays
+/// available, and the unknown journal is emitted.
+#[tokio::test]
+async fn a_disconnected_carrier_still_marks_an_expired_landing_unknown() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let job_id = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let session = ctx.hub.test_node_session(&ctx.host).await.unwrap();
+    let merge = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge, session)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+
+    // Age the Landing past the 12-minute default recovery window.
+    ctx.hub
+        .test_set_landing_at(&job_id, "2000-01-01T00:00:00Z")
+        .await
+        .unwrap();
+
+    // Carrier drops; wait bounded until the Hub has no live session for the
+    // host.
+    node.disconnect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while ctx.hub.test_node_session(&ctx.host).await.is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "host never went offline"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The reconciler still runs (the periodic tick does the same); the row
+    // becomes unknown with NO carrier available.
+    ctx.hub.test_reconcile().await;
+
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("landing"), "{doc}");
+    assert_eq!(
+        doc["landingOutcomeUnknown"],
+        json!(true),
+        "an expired Landing goes unknown even with no carrier: {doc}"
+    );
+    // Occupancy is fully retained.
+    assert_eq!(doc["hostId"].as_str(), Some(ctx.host.as_str()), "{doc}");
+    assert_eq!(doc["laneId"], json!("lane1"), "{doc}");
+    assert_eq!(doc["mergeSha"], json!(merge), "{doc}");
+    let actions = ctx.hub.test_gate_audit_actions(&job_id).await.unwrap();
+    assert!(
+        actions.iter().any(|a| a == "gate.landing-unknown"),
+        "the unknown journal must fire while disconnected: {actions:?}"
+    );
+
+    // The operator resolve path stays available with no carrier: the final
+    // probe is impossible, so the explicit operator decision applies.
+    let epoch = doc["landingSessionEpoch"].as_str().unwrap();
+    let (status, resolved) = ctx
+        .send(
+            "POST",
+            &format!("/v1/projects/{}/gate/jobs/{job_id}/resolve", ctx.project),
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": doc["attempts"].as_u64().unwrap_or(1),
+                "expectedSessionEpoch": epoch,
+                "expectedMergeSha": merge,
+                "rationale": "operator confirmed absence after the carrier was lost",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{resolved}");
+    assert_eq!(resolved["state"], json!("failed"), "{resolved}");
+}

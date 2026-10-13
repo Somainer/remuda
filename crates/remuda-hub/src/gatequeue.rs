@@ -2573,14 +2573,30 @@ pub(crate) async fn reconcile_landings(state: &AppState, force_host: Option<&str
             .await
             .read_owned()
             .await;
-        // Only reconcile when the lane host has a live carrier; otherwise the
-        // outcome genuinely cannot be established yet — keep occupancy.
-        let Some(responder_session) = state.nodes.generation_of(lane_host.as_id().as_str()).await
-        else {
-            continue;
-        };
         let forced = force_host.is_some_and(|host| host == lane_host.as_id().as_str());
         let now = now();
+        let expired =
+            elapsed_since(&now, landing_at.as_deref()).is_some_and(|age| age >= recovery_ms);
+        // r15 item 5: evaluate expiry BEFORE the connectivity check. A
+        // disconnected carrier must not strand the row in a plain Landing that
+        // the operator resolve endpoint never accepts. Mark the EXACT attempt
+        // (state + attempts predicate) outcome-unknown once the window has
+        // elapsed; occupancy (host/lane assignment) is untouched and the
+        // operator resolve path stays available while the host is away.
+        let connected_session = state.nodes.generation_of(lane_host.as_id().as_str()).await;
+        let Some(responder_session) = connected_session else {
+            if expired && !job.landing_outcome_unknown {
+                mark_landing_unknown(
+                    state,
+                    &job,
+                    "the granted push was not confirmed before the carrier disconnected and its \
+                     outcome could not be established; waiting for an operator resolution or a \
+                     reconnect probe",
+                )
+                .await;
+            }
+            continue;
+        };
         if !forced
             && let Some(age) = elapsed_since(&now, probed_at.as_deref())
             && age < probe_interval_ms
@@ -2598,8 +2614,6 @@ pub(crate) async fn reconcile_landings(state: &AppState, force_host: Option<&str
             .store
             .mark_landing_probed(job.id.as_id().as_str(), &now)
             .await;
-        let expired =
-            elapsed_since(&now, landing_at.as_deref()).is_some_and(|age| age >= recovery_ms);
         match outcome {
             LandingProbe::Landed => {
                 settle_landing_landed(state, &job, grant_session, responder_session, &lane_host)
@@ -2715,10 +2729,13 @@ async fn mark_landing_unknown(state: &AppState, job: &GateJob, note: &str) {
     let flipped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flipped_writer = flipped.clone();
     let note = note.to_owned();
+    // r15 item 5: mark the EXACT attempt — a newer attempt that reclaimed the
+    // job slot between the list read and this write must not be flagged.
+    let expected_attempts = job.attempts;
     let outcome = state
         .store
         .mutate_gate_job(job.id.as_id().as_str(), move |row| {
-            if row.state != GateJobState::Landing {
+            if row.state != GateJobState::Landing || row.attempts != expected_attempts {
                 return None;
             }
             if !row.landing_outcome_unknown {
@@ -2746,8 +2763,6 @@ async fn mark_landing_unknown(state: &AppState, job: &GateJob, note: &str) {
     }
 }
 
-/// Settle a Landing whose exact granted merge the probe confirmed on the
-/// remote. Never re-queues or re-pushes.
 /// Settle a Landing whose exact granted merge the probe confirmed on the
 /// remote. Never re-queues or re-pushes. R2: the probe settles ONLY inside one
 /// transaction matching the live granted attempt it ran against — same

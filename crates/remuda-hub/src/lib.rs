@@ -612,6 +612,28 @@ impl RunningHub {
         self.state.nodes.generation_of(host_id).await
     }
 
+    /// Test helper: set a Landing row's `landing_at` timestamp directly (RFC
+    /// 3339), so recovery-window expiry can be exercised without waiting.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_set_landing_at(&self, job_id: &str, at: &str) -> anyhow::Result<()> {
+        let at = at.to_owned();
+        let job_id = job_id.to_owned();
+        let store = self
+            .store()
+            .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
+        store
+            .run_named("test_set_landing_at", move |conn| {
+                conn.execute(
+                    "UPDATE gate_jobs SET landing_at = ?2 WHERE id = ?1",
+                    rusqlite::params![job_id, at],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Test helper: park a Landing row in the outcome-unknown state exactly
     /// like the expired-recovery path (flag + reason), without waiting out the
     /// real recovery window.

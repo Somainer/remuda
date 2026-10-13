@@ -4134,6 +4134,89 @@ async fn the_max_positive_i64_session_grants_but_a_2_31_epoch_is_refused() {
     );
 }
 
+/// r18 item 2: only AUTHORITATIVE Landing outcomes (landed / base-moved) may
+/// move a granted Landing. A Finished event/RPC result with the right
+/// generation and merge but an unknown/empty/`passed` status must NOT fall
+/// through to Failed — the Landing is kept for reconciliation.
+#[tokio::test]
+async fn a_non_authoritative_landing_status_keeps_the_landing_not_failed() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let merge = "8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a";
+    for bad_status in [
+        "bogus",
+        "",
+        "passed",
+        "failed",
+        "canceled",
+        "canceled-after-land",
+    ] {
+        let job_id = queued_land_job(&ctx).await;
+        ctx.hub
+            .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+            .await
+            .unwrap()
+            .expect("claimed");
+        let session = ctx.hub.test_node_session(&ctx.host).await.unwrap();
+        let grant = ctx
+            .hub
+            .test_gate_land_grant(&job_id, &ctx.host, merge, session)
+            .await
+            .unwrap();
+        assert_eq!(grant["granted"], json!(true));
+
+        // The bogus verdict: right attempt + merge, unrecognized status.
+        ctx.hub
+            .test_apply_gate_result(
+                &job_id,
+                json!({
+                    "jobId": job_id,
+                    "generation": 1,
+                    "status": bad_status,
+                    "mergeSha": merge,
+                    "error": "definitely failed",
+                }),
+            )
+            .await
+            .unwrap();
+        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+        assert_eq!(
+            doc["state"],
+            json!("landing"),
+            "status {bad_status:?} must keep the Landing, got {doc}"
+        );
+        assert!(
+            doc["landingOutcomeUnknown"].as_bool() != Some(true)
+                || doc["state"] == json!("landing"),
+            "occupancy retained regardless of the unknown flag: {doc}"
+        );
+    }
+
+    // The authoritative statuses still move the row (sanity).
+    let job = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let session = ctx.hub.test_node_session(&ctx.host).await.unwrap();
+    ctx.hub
+        .test_gate_land_grant(&job, &ctx.host, merge, session)
+        .await
+        .unwrap();
+    ctx.hub
+        .test_apply_gate_result(
+            &job,
+            json!({"jobId": job, "generation": 1, "status": "landed", "mergeSha": merge}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.hub.test_get_gate_job(&job).await.unwrap().unwrap()["state"],
+        json!("landed")
+    );
+}
+
 /// 2. verdict: a `landed` finished frame for a different sha does not settle
 ///    the Landing, while the exact granted merge settles it;
 /// 3. evidence: a log carrying a mismatched merge (or none at all) is rejected

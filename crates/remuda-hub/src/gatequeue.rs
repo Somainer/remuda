@@ -1842,6 +1842,11 @@ pub(crate) async fn apply_result(
     // side effects must treat that the same as a pre-read Canceling row.
     let fresh_canceling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let fresh_canceling_writer = fresh_canceling.clone();
+    // Set by the writer when a Landing verdict carries a non-authoritative
+    // status (r18 item 2): the Landing is kept and reconciliation is scheduled
+    // after the writer stands down.
+    let non_authoritative_landing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let non_authoritative_landing_writer = non_authoritative_landing.clone();
     let outcome = state
         .store
         .mutate_gate_job(job_id, move |row| {
@@ -1933,6 +1938,22 @@ pub(crate) async fn apply_result(
                 // r13 item 5: uncertain never moves the Landing; the remote
                 // reconciler settles it.
                 if result.status == "uncertain" {
+                    return None;
+                }
+                // r18 item 2: only an AUTHORITATIVE Landing outcome may move a
+                // granted Landing. The whitelist is exactly landed / base-moved;
+                // anything else ("", "passed", "bogus", "failed", …) is an
+                // unknown terminal state — keep occupancy and let reconciliation
+                // establish the truth rather than fall through to Failed.
+                if !matches!(result.status.as_str(), "landed" | "base-moved") {
+                    tracing::warn!(
+                        verdict_status = %result.status,
+                        verdict_merge = ?result.merge_sha,
+                        "Landing verdict carries a non-authoritative status; keeping the Landing \
+                         for reconciliation (not Failed)"
+                    );
+                    non_authoritative_landing_writer
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     return None;
                 }
                 for step in &result.steps {
@@ -2127,8 +2148,19 @@ pub(crate) async fn apply_result(
         })
         .await;
     let Ok(Some(job)) = outcome else {
-        // Writer stood down (terminal guard / duplicate / generation mismatch
-        // inside the closure). Count it as completed for barrier tests.
+        // Writer stood down (terminal guard / duplicate / generation mismatch /
+        // non-authoritative Landing). A non-authoritative Landing verdict keeps
+        // occupancy and gets a reconciliation; either way count completion.
+        if non_authoritative_landing.load(std::sync::atomic::Ordering::Relaxed) {
+            let host = state
+                .store
+                .get_gate_job(job_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|job| job.host_id.map(|host| host.as_id().to_string()));
+            schedule_landing_reconcile(state, host);
+        }
         #[cfg(any(test, feature = "test-faults"))]
         barrier.note_completed();
         return;

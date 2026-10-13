@@ -5171,8 +5171,15 @@ it("GATE28 a: a claim that fails before commit stamps no issuer — the stale co
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+it("GATE28 b: POST → status GET → journal for the SAME command records progress exactly once, with more accepted commands than any cache could hold between them and later failures preserved", { timeout: 60_000 }, async () => {
 
-it("GATE28 b: POST then a duplicate journal acceptance of the same command records progress exactly once — later failures survive (durable flag, no cache to evict)", async () => {
+  // codex gate-29 NOT MET: the acceptance sequence must be POST, then the
+  // command-status GET, then a JOURNAL settle of the SAME command id — and
+  // enough OTHER commands accepted in between (more than the old 2 000-row
+  // in-memory tracking bound) that only durable row state can remember the
+  // first recording. Progress for C happens exactly once (the GET); the later
+  // journal observation and the filler volume change nothing; failures the
+  // instance earns after the GET survive the journal.
   vi.useFakeTimers();
   vi.setSystemTime(1_030_000);
   const I = "ins_g28_b";
@@ -5185,11 +5192,17 @@ it("GATE28 b: POST then a duplicate journal acceptance of the same command recor
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let locks: { query: () => Promise<unknown>; request: (...args: any[]) => Promise<unknown> } = good;
-  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { get locks() { return locks; } } });
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    writable: true,
+    value: { get locks() { return locks; } },
+  });
   localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
   const pump = async (n = 2_000) => {
     for (let i = 0; i < n; i += 1) await Promise.resolve();
   };
+  // More rows than the removed in-memory sets' eviction bound.
+  const FILLER = 2_050;
   try {
     sessionStorage.setItem("remuda-outbox-owner", "owner_g28_b");
     const { api, hubStore } = await fresh();
@@ -5198,9 +5211,19 @@ it("GATE28 b: POST then a duplicate journal acceptance of the same command recor
     vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
     vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
     const send = vi.spyOn(api, "instanceSend").mockImplementation(
-      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
-        relatedCommandIds: [], command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
-      })) as unknown as Api["instanceSend"],
+      (async (_i: string, prompt: string, _x?: unknown, _m?: string, commandId?: string) =>
+        prompt === "g28 b C"
+          ? g25ReconcilingAnswer(commandId ?? "cmd_x")
+          : {
+              relatedCommandIds: [],
+              command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+            }) as unknown as Api["instanceSend"],
+    );
+    // GET 1 still reconciling; GET 2 accepted; later GETs stay accepted.
+    let gets = 0;
+    vi.spyOn(api, "instanceCommandStatus").mockImplementation(
+      (async (_i: string, commandId: string) =>
+        g25Status(commandId, gets++ === 0 ? "reconciling" : "accepted")) as Api["instanceCommandStatus"],
     );
     await bootLive(api, hubStore);
     await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
@@ -5208,46 +5231,83 @@ it("GATE28 b: POST then a duplicate journal acceptance of the same command recor
     const subscribe = vi.mocked(api.eventsSubscribe);
     for (let i = 0; i < 2_000 && !subscribe.mock.calls[0]?.[2]; i += 1) await Promise.resolve();
     const onBatch = subscribe.mock.calls[0]?.[2] as (b: G26Batch) => void;
-    const box = () => (hubStore as unknown as { outbox: { isDeliveryExhausted: (i: string) => boolean } | null }).outbox;
+    const boxHandle = () =>
+      hubStore as unknown as {
+        outbox: {
+          isDeliveryExhausted: (i: string) => boolean;
+          pendingLeaseWakeups: () => string[];
+        } | null;
+      };
+    const storedRows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
 
-    // 1) An accepted steer POST records progress once: durable flag flips.
-    locks = good;
+    // 1) POST: the steer answers queued+forwarded+reconciling — no acceptance.
     hubStore.setConnectionStateForTest("live");
-    expect(await hubStore.send(I, "g28 b C", [], [], "steer")).toBe(true);
-    await pump(500);
+    expect(await hubStore.send(I, "g28 b C", [], [], "steer")).toBe(false);
+    for (let i = 0; i < 1_000 && gets < 1; i += 1) await Promise.resolve();
     const cId = send.mock.calls[0]?.[4] as string;
-    expect(g28Row(cId)?.progressRecorded).toBe(true);
-    expect(box()!.isDeliveryExhausted(I)).toBe(false);
+    expect(g28Row(cId)?.state).toBe("reconciling");
+    expect(g28Row(cId)?.progressRecorded).toBeFalsy();
 
-    // 2) Fresh failures accrue on a later row Q (locks down to the cap).
+    // 2) status GET confirms accepted — the ONE progress recording.
+    await vi.advanceTimersByTimeAsync(1_000);
+    for (let i = 0; i < 1_000; i += 1) await Promise.resolve();
+    expect(g28Row(cId)?.state).toBe("sent");
+    expect(g28Row(cId)?.progressRecorded).toBe(true);
+    expect(boxHandle().outbox!.isDeliveryExhausted(I)).toBe(false);
+
+    // 3) More OTHER accepted commands than the old tracking cache could hold.
+    //    Each goes through the real outbox: enqueue (storage-first) then the
+    //    same terminal sent patch a delivery would commit. No POSTs.
+    const outbox = (hubStore as unknown as { outbox: {
+      enqueue: (r: Omit<OutboxRecord, "attempts" | "state"> & { state?: OutboxRecord["state"] }) => Promise<OutboxRecord>;
+      patch: (id: string, p: Partial<OutboxRecord>) => Promise<OutboxRecord | null>;
+    } }).outbox;
+    for (let i = 0; i < FILLER; i += 1) {
+      const fid = `cmd_g28b_fill_${i}`;
+      // eslint-disable-next-line no-await-in-loop
+      await outbox.enqueue({
+        commandId: fid,
+        clientRequestId: `local_g28b_${i}`,
+        instanceId: "ins_g28_b_filler",
+        prompt: `filler ${i}`,
+        createdAt: 2_000 + i,
+      });
+      // eslint-disable-next-line no-await-in-loop
+      await outbox.patch(fid, { state: "sent", gotResponse: true, progressRecorded: true });
+    }
+    expect(storedRows().filter((r) => r.progressRecorded)).toHaveLength(FILLER + 1);
+
+    // 4) Fresh delivery failures accrue on C's instance (a later row Q hammers
+    //    the down lock to the cap).
     locks = bad;
     hubStore.setConnectionStateForTest("offline");
     expect(await hubStore.send(I, "g28 b Q")).toBe(true);
     await pump(200);
-    const qId = g28Rows().find((r) => r.prompt === "g28 b Q")!.commandId;
+    const qId = storedRows().find((r) => r.prompt === "g28 b Q")!.commandId;
     await vi.advanceTimersByTimeAsync(120_000);
-    expect(box()!.isDeliveryExhausted(I)).toBe(true);
-    const callsAfterQ = send.mock.calls.length;
+    expect(boxHandle().outbox!.isDeliveryExhausted(I)).toBe(true);
+    const callsBeforeJournal = send.mock.calls.length;
 
-    // 3) A duplicate journal acceptance of the SAME command id (a replayed
-    //    follow batch) finds the durable flag already true: no second record,
-    //    Q's exhaustion/backoff are untouched. The state lives on the row, so
-    //    no amount of other commands can evict it.
+    // 5) JOURNAL settle of the SAME command C (the third acceptance
+    //    observation): durable flag already true → no second recording; Q's
+    //    exhaustion/backoff and C's one POST are untouched.
     onBatch({
       subscriptionId: "sub_g26",
       journalId: JOURNAL,
-      fromSeq: "9",
-      toSeq: "9",
-      durableSeq: "9",
-      events: [g26JournalMessage(cId, "9")],
+      fromSeq: "1",
+      toSeq: "1",
+      durableSeq: "1",
+      events: [g26JournalMessage(cId, "1")],
     });
     await pump(2_000);
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(box()!.isDeliveryExhausted(I)).toBe(true);
-    expect(send.mock.calls.length).toBe(callsAfterQ);
-    expect(g28Row(qId)?.state).toBe("pending");
-    // Still exactly the one POST for C.
+    expect(g28Row(cId)?.state).toBe("done");
+    expect(g28Row(cId)?.progressRecorded).toBe(true);
+    expect(boxHandle().outbox!.isDeliveryExhausted(I)).toBe(true);
+    expect(boxHandle().outbox!.pendingLeaseWakeups()).toEqual([]);
+    expect(send.mock.calls.length).toBe(callsBeforeJournal);
     expect(send.mock.calls.filter((c) => c[4] === cId)).toHaveLength(1);
+    expect(g28Row(qId)?.state).toBe("pending");
     hubStore.logout();
   } finally {
     vi.useRealTimers();

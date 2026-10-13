@@ -113,7 +113,7 @@ async function openModelList(page: Page) {
 
 test("the tall catalog panel anchors to its trigger, fits, scrolls and switches", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
-  const instanceId = await createSession(page, "Model picker tall-catalog geometry");
+  const instanceId = await createSession(page, "compact-approval tall-catalog geometry");
 
   // Apply the persisted launch snapshot before opening the picker.
   await page.reload();
@@ -254,6 +254,272 @@ test("an unlisted typed id still configures, reaches the terminal and settles as
   await expect(row).toHaveAttribute("data-selected", "1");
   await expect(row).toHaveAttribute("data-model-path", "typed");
   await expect(page.getByTestId("model-option-path")).toContainText("直输 id");
+});
+
+test("a tall catalog list over the parked approval card caps to the strip, scrolls and never oscillates", async ({
+  page,
+}) => {
+  // c-effortui2 r26 item 1: with a parked approval card leaving a USABLE
+  // (>=120px) cleared strip over the composer, the popover opens up capped to
+  // that strip and the effort-list body scrolls. The flex-column scroll
+  // wrapper used to feed the CLAMPED height back into AnchoredPopover's
+  // natural-height measurement: the wrapper's own scrollHeight collapsed to
+  // its clamped clientHeight, `need` flipped from content-sized (blocked by
+  // the card → strip cap) to clamp-sized ("fits" → plain above-room cap) on
+  // every ResizeObserver cycle, resizing the panel and stopping the inner
+  // scroll. It must settle once.
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  // Geometry fixture. The dock parks the create-time approval card a fixed
+  // ~106px below the effort chip, which is the ~90px NARROW strip (the
+  // bounded-fallback geometry where this measurement bug is invisible). A
+  // persistent stylesheet lifts the parked card (AnchoredPopover reads
+  // getBoundingClientRect, and a stylesheet transform survives the store's
+  // 2s re-render that wipes inline styles) so its measured edge leaves the
+  // USABLE >=120px strip the strip-cap/non-overlap rule is specified for.
+  const instanceId = await createSession(page, "Model picker tall-catalog geometry");
+  await page.reload();
+  await page.addStyleTag({
+    content: "[data-testid='approval-card']{transform:translateY(-34px)!important}",
+  });
+  await page.getByTestId("model-effort-chip").waitFor({ timeout: 20_000 });
+  // Deliberately do NOT clear the approval: its card stays parked over the
+  // composer and shrinks the up-room.
+  const approval = page.getByTestId("approval-card");
+  await expect(approval).toBeVisible({ timeout: 15_000 });
+  // Record the panel box on every animation frame FROM the moment the menu
+  // mounts, before openModelList returns: the strip-cap ⇄ plain-cap
+  // oscillation (124 ⇄ ~600) happens on the first ResizeObserver cycles and a
+  // post-settle sample alone misses it.
+  await page.evaluate(() => {
+    (window as unknown as { __capHeights?: number[] }).__capHeights = [];
+    const seen = new WeakSet<object>();
+    const obs = new MutationObserver(() => {
+      const el = document.querySelector("[data-testid='effort-menu']") as HTMLElement | null;
+      if (el && !seen.has(el)) {
+        seen.add(el);
+        const tick = () => {
+          (window as unknown as { __capHeights: number[] }).__capHeights.push(
+            Math.round(el.getBoundingClientRect().height),
+          );
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      }
+    });
+    obs.observe(document.body, { childList: true, subtree: true, attributes: true });
+    (window as unknown as { __capObserver?: MutationObserver }).__capObserver = obs;
+  });
+  await openModelList(page);
+  await expect(page.getByTestId("model-option-m-79")).toBeVisible({ timeout: 10_000 });
+  // Let the resize feedback loop run a while.
+  await page.waitForTimeout(1200);
+  const menu = page.getByTestId("effort-menu");
+  const list = page.getByTestId("effort-list");
+  const trigger = page.getByTestId("model-effort-chip");
+
+  // The fixture must actually produce the usable strip this test is about.
+  const strip = await page.evaluate(() => {
+    const q = (t: string) => document.querySelector(`[data-testid='${t}']`) as HTMLElement;
+    const t = q("model-effort-chip").getBoundingClientRect();
+    const a = q("approval-card").getBoundingClientRect();
+    return t.top - (a.top + a.height) - 8 - 8;
+  });
+  expect(strip, `fixture must leave the >=120px usable strip (got ${strip})`).toBeGreaterThanOrEqual(120);
+
+  // The panel must NEVER jump off the strip cap to the plain above-room cap.
+  // With the measurement feedback bug the box oscillates up to ~600px (the
+  // 60vh cap) every frame; the fixed measurement keeps it at the strip.
+  const capHeights = await page.evaluate(
+    () => (window as unknown as { __capHeights?: number[] }).__capHeights ?? [],
+  );
+  expect(capHeights.length).toBeGreaterThan(10);
+  expect(
+    Math.max(...capHeights),
+    `panel never exceeds the strip cap (saw ${Math.max(...capHeights)}, strip ${strip})`,
+  ).toBeLessThanOrEqual(strip + 4);
+
+  // The inner list owns the scroll (81 catalog rows), regardless of the cap.
+  const listScrolls = await list.evaluate((el) => {
+    const body = el as HTMLElement;
+    return body.scrollHeight > body.clientHeight + 1;
+  });
+  expect(listScrolls).toBe(true);
+
+  // The popover height stays STABLE after the opening frames too.
+  const heights = await menu.evaluate(async (el) => {
+    const out: number[] = [];
+    for (let i = 0; i < 8; i += 1) {
+      out.push(Math.round((el as HTMLElement).getBoundingClientRect().height));
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return out;
+  });
+  expect(Math.max(...heights) - Math.min(...heights)).toBeLessThanOrEqual(1);
+
+  // Panel caps to the strip and clears the card (non-overlap, bottom edge on
+  // the card side of the trigger gap).
+  const panelBox = await menu.boundingBox();
+  const triggerBox = await trigger.boundingBox();
+  const approvalBox = await approval.boundingBox();
+  expect(panelBox && triggerBox && approvalBox).toBeTruthy();
+  // The panel sits in the strip ABOVE the card: its top edge starts at/below
+  // the card's bottom edge, so they never overlap (no edge ordering on
+  // bottoms — the panel extends down toward the trigger past the card end).
+  expect(panelBox!.y).toBeGreaterThanOrEqual(approvalBox!.y + approvalBox!.height - 8 - 1);
+  expect(Math.abs(panelBox!.height - strip) <= 2, `caps to the strip (${panelBox!.height} vs ${strip})`).toBeTruthy();
+});
+
+test("distinct full ids sharing one final segment stay separate and post the full id", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const instanceId = await createSession(page, "Model picker shared-tail-collision");
+  await page.reload();
+  await page.getByTestId("model-effort-chip").waitFor({ timeout: 20_000 });
+  await clearApprovals(page, instanceId);
+  await openModelList(page);
+
+  // vendor-a/shared and vendor-b/shared are two real models the driver
+  // distinguishes by FULL id: two rows, full-id testids/labels, never one
+  // merged "shared" radio.
+  const rowA = page.getByTestId("model-option-vendor-a-shared");
+  const rowB = page.getByTestId("model-option-vendor-b-shared");
+  await expect(rowA).toBeVisible();
+  await expect(rowB).toBeVisible();
+  expect(await page.getByTestId("model-option-shared").count()).toBe(0);
+  await expect(rowA).toContainText("vendor-a/shared");
+  await expect(rowB).toContainText("vendor-b/shared");
+
+  // Clicking one posts exactly its full id.
+  const request = page.waitForRequest(
+    (r) =>
+      r.method() === "POST" &&
+      r.url().endsWith(`/v1/instances/${instanceId}/commands`) &&
+      r.postDataJSON()?.operation === "instance.configure",
+  );
+  await rowA.click();
+  expect((await request).postDataJSON().payload.model).toBe("vendor-a/shared");
+
+  // The verdict settles the listed selection on the SAME full id: A selected,
+  // B untouched (a short-label match would have selected both / posted B).
+  await openModelList(page);
+  await expect(page.getByTestId("effort-slider-panel")).toHaveAttribute("data-model-pending", "0", {
+    timeout: 10_000,
+  });
+  await expect(page.getByTestId("effort-slider-panel")).toHaveAttribute(
+    "data-model-current",
+    "shared",
+    { timeout: 10_000 },
+  );
+  await expect(page.getByTestId("model-option-vendor-a-shared")).toHaveAttribute(
+    "data-selected",
+    "1",
+  );
+  await expect(page.getByTestId("model-option-vendor-b-shared")).toHaveAttribute(
+    "data-selected",
+    "0",
+  );
+});
+
+test("vendor /auto ids are distinct full models: selection, pending and posting all stay exact", async ({ page }) => {
+  // r26 r3: a final "/auto" segment is NOT a cross-model alias. Only bare
+  // `auto` / `passthrough/auto` collapse; vendor-a/auto, vendor-b/auto and
+  // vendor-b/auto_model are concrete models with exact full-id identity.
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const tid = (id: string) =>
+    `model-option-${id.replace(/[^a-zA-Z0-9]+/g, "-").toLowerCase()}`;
+  const postConfigure = async (id: string, model: string) =>
+    page.evaluate(
+      async ({ id, model }) => {
+        const res = await fetch(`/v1/instances/${id}/commands`, {
+          method: "POST",
+          credentials: "include",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ operation: "instance.configure", payload: { model } }),
+        });
+        return res.ok;
+      },
+      { id, model },
+    );
+  const waitForJournal = async (id: string, needle: string) =>
+    expect
+      .poll(
+        () =>
+          page.evaluate(
+            ({ id, needle }) =>
+              fetch(`/v1/instances/${id}/journal`, { credentials: "include" })
+                .then((r) => r.json())
+                .then((d) => (d.events ?? []).some((e: unknown) => JSON.stringify(e).includes(needle))),
+            { id, needle },
+          ),
+        { timeout: 10_000 },
+      )
+      .toBe(true);
+
+  // Case 1+2: both vendor ids listed (same-spelling and /auto vs /auto_model).
+  for (const { prompt, other, current } of [
+    { prompt: "Model auto-vendor-same identity", other: "vendor-a/auto", current: "vendor-b/auto" },
+    { prompt: "Model auto-vendor-spelling identity", other: "vendor-a/auto", current: "vendor-b/auto_model" },
+  ] as const) {
+    const instanceId = await createSession(page, prompt);
+    await page.reload();
+    await page.getByTestId("model-effort-chip").waitFor({ timeout: 20_000 });
+    await clearApprovals(page, instanceId);
+
+    // Verify the intended catalog was served BEFORE any configure: on the
+    // fresh session the running model is still the launch sentinel
+    // (passthrough/auto), so these rows can ONLY come from the launch
+    // catalog. The cross-spelling fixture must list vendor-b/auto_model and
+    // NOT vendor-b/auto (the same-spelling catalog would invert this).
+    await openModelList(page);
+    await expect(page.getByTestId(tid(other))).toBeVisible();
+    if (current.endsWith("auto_model")) {
+      await expect(page.getByTestId("model-option-vendor-b-auto-model")).toBeVisible();
+      await expect(page.getByTestId("model-option-vendor-b-auto")).toHaveCount(0);
+    } else {
+      await expect(page.getByTestId("model-option-vendor-b-auto")).toBeVisible();
+    }
+
+    // Resolve the running model to the vendor-b id (accepted configure), then
+    // queue a separate pending switch to vendor-a.
+    expect(await postConfigure(instanceId, current)).toBe(true);
+    await waitForJournal(instanceId, `"id":"${current}"`);
+    expect(await postConfigure(instanceId, `__queued__:${other}`)).toBe(true);
+    await waitForJournal(instanceId, "model-queued");
+
+    await openModelList(page);
+    await expect(page.getByTestId("model-option-auto")).toHaveCount(0);
+    // Retrying web-first assertions: these attributes must already hold at
+    // open time (before the click), so poll them instead of one-shot reads.
+    await expect(page.getByTestId(tid(current))).toHaveAttribute("data-selected", "1");
+    await expect(page.getByTestId(tid(other))).toHaveAttribute("data-selected", "0");
+    await expect(page.getByTestId(tid(other))).toHaveAttribute("data-model-pending", "queued");
+    await expect(page.getByTestId(tid(current))).toHaveAttribute("data-model-pending", "0");
+
+    // Clicking posts the exact full id.
+    const request = page.waitForRequest(
+      (r) =>
+        r.method() === "POST" &&
+        r.url().endsWith(`/v1/instances/${instanceId}/commands`) &&
+        r.postDataJSON()?.operation === "instance.configure",
+    );
+    await page.getByTestId(tid(other)).click();
+    expect((await request).postDataJSON().payload.model).toBe(other);
+  }
+
+  // Case 3: catalog lists ONLY vendor-a/auto; the vendor-b read-back is an
+  // unlisted running model and must be appended as its own selected row.
+  const instanceId = await createSession(page, "Model auto-vendor-append identity");
+  await page.reload();
+  await page.getByTestId("model-effort-chip").waitFor({ timeout: 20_000 });
+  await clearApprovals(page, instanceId);
+  expect(await postConfigure(instanceId, "vendor-b/auto")).toBe(true);
+  await waitForJournal(instanceId, '"id":"vendor-b/auto"');
+  await openModelList(page);
+  await expect(page.getByTestId(tid("vendor-a/auto"))).toBeVisible();
+  const appended = page.getByTestId(tid("vendor-b/auto"));
+  await expect(appended).toBeVisible();
+  await expect(appended).toHaveAttribute("data-selected", "1");
+  await expect(page.getByTestId(tid("vendor-a/auto"))).toHaveAttribute("data-selected", "0");
+  await expect(page.getByTestId("model-option-auto")).toHaveCount(0);
 });
 
 test.afterEach(async ({ page }) => {

@@ -85,6 +85,12 @@ pub enum DriverRequest {
         effort: Option<String>,
         /// Native effort index.
         effort_index: Option<u32>,
+        /// D-056 orthogonal ultracode flag.
+        effort_ultracode: Option<bool>,
+        /// c-effortread r9 item 6: explicit axis intent ("flag" | "tier").
+        effort_axis: Option<String>,
+        /// c-effortread r10: per-request id of the web's switch.
+        effort_request_id: Option<String>,
         /// Native permission-mode word.
         permission_mode: Option<String>,
     },
@@ -410,16 +416,23 @@ impl Driver for FakeDriver {
                     model,
                     effort,
                     effort_index,
+                    effort_ultracode,
+                    effort_axis,
+                    effort_request_id: _,
                     permission_mode,
                 } => Ok(vec![DriverEmission::NativeLifecycle {
                     name: "instance.configure".to_owned(),
                     status: format!(
-                        "applied model={} effort={} index={} permission={}",
+                        "applied model={} effort={} index={} ultracode={} axis={} permission={}",
                         model.as_deref().unwrap_or("-"),
                         effort.as_deref().unwrap_or("-"),
                         effort_index
                             .map(|n| n.to_string())
                             .unwrap_or_else(|| "-".into()),
+                        effort_ultracode
+                            .map(|on| if on { "true" } else { "false" })
+                            .unwrap_or("-"),
+                        effort_axis.as_deref().unwrap_or("-"),
                         permission_mode.as_deref().unwrap_or("-")
                     ),
                     severity: Severity::Info,

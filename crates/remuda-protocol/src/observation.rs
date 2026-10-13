@@ -931,6 +931,13 @@ pub struct EffortPayload {
     /// known on the observing side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested: Option<EffortSelection>,
+    /// Per-request id of the in-session switch THIS edge's `requested` echo
+    /// belongs to (c-effortread r10, items 1–4). The driver mints nothing: it
+    /// echoes the id the configure carried (web → Hub → Node → driver). An
+    /// older driver/journal omits it; consumers then fall back to the
+    /// newer-than-baseline-and-queue axis/value rule.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "requestId")]
+    pub request_id: Option<String>,
     /// The level actually observed in the assistant transcript record.
     pub effective: EffortEffective,
     /// Native spelling read off the record (`effort` / `perTurnEffort`), kept

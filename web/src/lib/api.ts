@@ -20,6 +20,7 @@ import type {
 } from "../features/providers";
 import { PROVIDER_PROFILES } from "../features/providers/fixtures";
 import { coerceUsageRollup } from "../features/session/contextUsage";
+import type { CapabilitySnapshot } from "../types/nativeRef";
 import type { components, paths } from "./api.generated";
 import { printCapabilities, ptyCapabilities, agentPtyCapabilities } from "./capabilities";
 import type { JournalRead } from "./journal";
@@ -242,6 +243,7 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     tui?: TuiMode | null;
     effortName?: string | null;
     effortIndex?: number | null;
+    effortUltracode?: boolean | null;
     effortEffective?:
       | {
           name?: string;
@@ -273,12 +275,28 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     apiRoute?: components["schemas"]["ApiRoute"] | null;
   };
   const ptyDriver = driver === "generic-pty" || driver === "claude-pty" || driver === "shell-pty";
-  const capabilities =
-    ptyDriver && kind !== "terminal"
+  // Clone EVERY synthesized snapshot: the non-PTY fallback below is a
+  // module-level object (HUB_CAPABILITIES), and stamping binaryVersion on it
+  // leaked one instance's reported version onto every other non-PTY instance
+  // (c-effortui r3 item 12a).
+  const capabilities: CapabilitySnapshot = {
+    ...(ptyDriver && kind !== "terminal"
       ? agentPtyCapabilities(kind, driver)
       : ptyDriver
         ? ptyCapabilities(driver)
-        : HUB_CAPABILITIES;
+        : HUB_CAPABILITIES),
+  };
+  // The gate runs ONLY on a REPORTED version. The print matrix's static
+  // "2.1.268" is fixture data, not this instance's CLI: blank it for the
+  // synthesized fallback (pty matrices already blank) and stamp just the
+  // Hub/Node record's value, so one claude-print/sdk instance can never
+  // fabricate coupled/decoupled for its peers and an unreported build is
+  // honestly "unknown" (switch locked with a named reason).
+  const reportedVersion = (
+    rec as { capabilities?: { binaryVersion?: unknown } | null }
+  ).capabilities?.binaryVersion;
+  capabilities.binaryVersion =
+    typeof reportedVersion === "string" && reportedVersion.trim() ? reportedVersion.trim() : "";
   const launchedBy =
     extra.launchedBy === "remuda" || extra.launchedBy === "user" ? extra.launchedBy : null;
   const signalTier =
@@ -352,6 +370,9 @@ export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Insta
     tui: extra.tui === "fullscreen" || extra.tui === "default" ? extra.tui : null,
     effortName: typeof extra.effortName === "string" ? extra.effortName : null,
     effortIndex: typeof extra.effortIndex === "number" ? extra.effortIndex : null,
+    // D-056 r2 item 4: the durable orthogonal flag must survive reload even
+    // when its effort event has fallen out of the journal tail.
+    effortUltracode: extra.effortUltracode === true,
     effortEffective:
       extra.effortEffective && typeof extra.effortEffective.name === "string"
         ? {
@@ -478,7 +499,27 @@ export type HelloResult = {
   features: string[];
 };
 
-export type EffortRef = { index: number; name: string };
+/** D-056 configure payload: native level word + orthogonal ultracode boolean. */
+export type EffortRef = {
+  index: number;
+  name: string;
+  ultracode?: boolean;
+  /**
+   * c-effortread r9 item 6: the axis this configure intends to move.
+   * "flag" = the orthogonal ultracode switch at the current tier;
+   * "tier" = a level move. The driver executes exactly that operation and
+   * refuses an ambiguous legacy flag-on rather than substituting a tier move.
+   */
+  axis?: "flag" | "tier";
+  /**
+   * c-effortread r10 items 1–4: per-request id minted in the tab. It rides to
+   * the driver and comes back on every effort lifecycle edge and the
+   * requested echo, so a stale edge for a replaced request can never settle
+   * the newer one. Absent on old drivers, which keep the timestamp/value
+   * fallback.
+   */
+  requestId?: string;
+};
 
 export type InstanceCreateSpec = {
   hostId: Id;
@@ -507,6 +548,8 @@ export type InstanceCreateSpec = {
   /** Composer/New Session effort. Stored in UI state; Hub ignores unknown create fields. */
   effortIndex?: number;
   effortName?: string;
+  /** D-056 orthogonal switch for launch (ultracode rides the same alias set). */
+  effortUltracode?: boolean;
   /**
    * D-047 per-dispatch delivery override: a proxy host id, `self` for the Hub
    * host, or `none` to force direct. A target the Hub cannot honour refuses
@@ -697,6 +740,18 @@ export type HubApi = {
   providerTest(id: string): Promise<ProviderTestResult>;
   /** Probe a gateway's `/v1/models` before the profile is saved. */
   providerDiscover(body: ProviderDiscoverBody): Promise<ProviderTestResult>;
+  /** D-056 static capability catalog (per-model default effort + ultracode). */
+  supplyCatalog(): Promise<{
+    revision?: number;
+    updated?: string;
+    models: Array<{
+      id: string;
+      aliases?: string[];
+      defaultEffort?: string | null;
+      ultracodeCapable?: boolean | null;
+      effortLevels?: readonly string[];
+    }>;
+  }>;
   eventsRead: JournalRead;
   eventsSubscribe(
     journalId: Id,
@@ -1001,6 +1056,7 @@ function createMockApi(): HubApi {
       if (spec.effortName != null) {
         instance.effortName = spec.effortName;
         instance.effortIndex = spec.effortIndex ?? 0;
+        instance.effortUltracode = spec.kind === "claude" ? spec.effortUltracode === true : null;
       }
       return {
         instance,
@@ -1250,6 +1306,18 @@ function createMockApi(): HubApi {
         latencyMs: 12,
         message: `reachable (200); ${models.length} models`,
         models,
+      };
+    },
+    async supplyCatalog() {
+      // Demo/offline mode: mirror the Hub catalog's Claude rows (D-056 §6).
+      return {
+        revision: 3,
+        models: [
+          { id: "claude-opus-5", aliases: ["opus"], defaultEffort: "medium", ultracodeCapable: true },
+          { id: "claude-sonnet-5", aliases: ["sonnet"], defaultEffort: "medium", ultracodeCapable: true },
+          { id: "claude-fable-5", aliases: ["fable"], defaultEffort: "high", ultracodeCapable: true },
+          { id: "claude-haiku-4-5", aliases: ["haiku"], defaultEffort: "high", ultracodeCapable: true },
+        ],
       };
     },
     async workspaceList(hostId) {
@@ -1522,7 +1590,15 @@ function createLiveApi(): HubApi {
         body: JSON.stringify({
           ...body,
           ...(spec.effortName != null
-            ? { effort: { name: spec.effortName, index: spec.effortIndex ?? 0, kind: spec.kind } }
+            ? {
+                effort: {
+                  name: spec.effortName,
+                  index: spec.effortIndex ?? 0,
+                  kind: spec.kind,
+                  // D-056: the switch rides launch as its own boolean.
+                  ...(spec.kind === "claude" ? { ultracode: spec.effortUltracode === true } : {}),
+                },
+              }
             : {}),
         }),
       });
@@ -1766,6 +1842,18 @@ function createLiveApi(): HubApi {
     },
     async providerDiscover(body) {
       return rest<ProviderTestResult>("/v1/providers/discover", { method: "POST", body: JSON.stringify(body) });
+    },
+    async supplyCatalog() {
+      return rest<{
+        revision?: number;
+        updated?: string;
+        models: Array<{
+          id: string;
+          aliases?: string[];
+          defaultEffort?: string | null;
+          ultracodeCapable?: boolean | null;
+        }>;
+      }>("/v1/supply/catalog");
     },
     async workspaceList(hostId) {
       const listed = hostId ? [await this.hostGet(hostId)] : (await this.hostList()).items;

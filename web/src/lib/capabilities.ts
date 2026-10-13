@@ -127,7 +127,19 @@ export function agentPtyCapabilities(
   driverKind: DriverKind = "shell-pty",
 ): CapabilitySnapshot {
   const snapshot = ptyCapabilities(driverKind);
+  // D-056: never invent a Claude Code binaryVersion here. The static matrix
+  // cannot know whether a live PTY runs 2.1.277 (coupled) or 2.1.289
+  // (decoupled); the version gate reads the REPORTED snapshot (transcript
+  // version, then the pinned binaryVersion from the Node). An unknown version
+  // disables ONLY the ultracode switch with a named reason — it does not
+  // claim decoupled behaviour. The web mock client (mock.ts) sets an explicit
+  // version for its demo instances.
   const row = AGENT_PTY_MATRIX[kind];
+  // The print snapshot's hardcoded "2.1.268" is specific to claude-print; an
+  // agent PTY has no known binary until the Node/transcript reports one, so
+  // blank it (an empty string parses to the "unknown" gate). Never fabricate
+  // a current-version string that would silently enable the decoupled switch.
+  snapshot.binaryVersion = "";
   if (!row) return snapshot;
   for (const name of ["steer", "queue", "interrupt"] as const) {
     const p = row[name];

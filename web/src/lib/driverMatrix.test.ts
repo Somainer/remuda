@@ -65,6 +65,24 @@ describe("New Session driver default (D-028 §5.1, matrix from the Node, never h
     expect(shellPtyAllowed(host, "grok")).toBe(false);
   });
 
+  it("an installed:false CLI with a launchable shell-pty inventory still refuses", () => {
+    // Round 2 item 8: the missing binary must count as absent even when the
+    // driver matrix would otherwise allow shell-pty.
+    const host: HostMatrix = {
+      cli: [{ kind: "claude", installed: false }],
+      capabilities: { driverInventory: [{ kind: "shell-pty", launchable: true }] },
+    };
+    expect(shellPtyAllowed(host, "claude")).toBe(false);
+  });
+
+  it("an installed:true CLI with a launchable shell-pty inventory allows", () => {
+    const host: HostMatrix = {
+      cli: [{ kind: "claude", installed: true }],
+      capabilities: { driverInventory: [{ kind: "shell-pty", launchable: true }] },
+    };
+    expect(shellPtyAllowed(host, "claude")).toBe(true);
+  });
+
   it("keeps the legacy drivers selectable but secondary", () => {
     expect(legacyDrivers("claude")).toEqual(["claude-pty", "generic-pty", "claude-print"]);
     expect(legacyDrivers("grok")).toEqual(["generic-pty"]);
@@ -107,5 +125,36 @@ describe("New Session driver default (D-028 §5.1, matrix from the Node, never h
     expect(launchPreview({ kind: "grok", yolo: true })).toContain("--always-approve");
     expect(launchPreview({ kind: "agy" })).toContain("agy");
     expect(launchPreview({ kind: "terminal" })).toContain("$SHELL");
+  });
+
+  it("previews exactly what the launch materializer emits for ultracode (r2 item 6)", () => {
+    // The materializer (remuda-driver effort_argv + launch.rs flag_value,
+    // checked on main and c-effortread) always emits the single coupled
+    // spelling, at ANY binary version, and never writes an ultracode key into
+    // the one settings overlay.
+    for (const on of [
+      launchPreview({ kind: "claude", effortName: "high", ultracode: true }),
+      launchPreview({ kind: "claude", effortName: "max", ultracode: true }),
+    ]) {
+      expect(on).toContain("--effort ultracode");
+      expect(on).not.toContain('{"ultracode": true}');
+      // Exactly one effort flag, no second overlay spelling.
+      expect(on.match(/--effort/g)).toHaveLength(1);
+      expect(on.match(/--settings/g)).toHaveLength(1);
+      // The coupled spelling itself implies xhigh: no level rides alongside.
+      expect(on).not.toContain("--effort high");
+      expect(on).not.toContain("--effort max");
+    }
+
+    // Flag off is just the pinned level.
+    expect(launchPreview({ kind: "claude", effortName: "high", ultracode: false })).toContain(
+      "--effort high",
+    );
+
+    // An unpinned draft (no pinned fields) previews NO effort flag at all —
+    // this must match the create payload, which omits the effort axes.
+    const unpinned = launchPreview({ kind: "claude" });
+    expect(unpinned).not.toContain("--effort");
+    expect(unpinned).not.toContain("ultracode");
   });
 });

@@ -139,7 +139,8 @@ mod repro {
             mapper: &mut TranscriptMapper,
             tail: &mut TranscriptTail,
         ) -> (Vec<serde_json::Value>, Vec<String>) {
-            let lines = tail.poll().unwrap_or_default();
+            let read = tail.poll().expect("poll");
+            let lines = read.lines;
             let mut raws = Vec::new();
             let mut edges = Vec::new();
             for line in &lines {

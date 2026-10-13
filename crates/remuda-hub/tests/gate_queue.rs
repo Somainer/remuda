@@ -2054,7 +2054,13 @@ async fn restart_landing_unconfirmed_stays_landing_and_is_surfaced_unknown() -> 
         |_| {},
         |cfg| {
             cfg.gate_landing_recovery_ms = 1;
-            cfg.gate_landing_probe_interval_ms = 1;
+            // Probe count determinism: the periodic reconciler must not race
+            // this test's forced test_reconcile() probes (a 1ms background
+            // tick could fire before the first forced probe and make the exact
+            // count assertions nondeterministic under full-binary load). The
+            // periodic interval clamps to a 250 ms floor, so 10 min effectively
+            // parks it; every probe below comes from the forced seam.
+            cfg.gate_landing_probe_interval_ms = 600_000;
         },
     )
     .await?;
@@ -2075,8 +2081,12 @@ async fn restart_landing_unconfirmed_stays_landing_and_is_surfaced_unknown() -> 
         .await;
     let id = job["id"].as_str().unwrap().to_owned();
     ctx.wait_state(&id, &["landing"]).await;
-
-    ctx.hub.test_reconcile().await;
+    // Deterministic forced probe for the single lane host. test_reconcile()
+    // (force_host=None) is THROTTLED like the periodic tick, so it cannot be
+    // used to count probes; with the periodic tick parked above, every probe
+    // here comes from this forced seam.
+    let lane_host = ctx.hosts[0].clone();
+    ctx.hub.test_force_landing_reconcile(&lane_host).await;
     for _ in 0..100 {
         let doc = ctx.job(&id).await;
         if doc["landingOutcomeUnknown"] == json!(true) {
@@ -2094,15 +2104,10 @@ async fn restart_landing_unconfirmed_stays_landing_and_is_surfaced_unknown() -> 
                 doc["reason"]
             );
             assert_eq!(ctx.scripts[0].resolve_calls.lock().unwrap().len(), 1);
-            ctx.hub.test_reconcile().await;
-            // Probe throttle: poll bounded until the second forced probe lands.
-            for _ in 0..100 {
-                if ctx.scripts[0].resolve_calls.lock().unwrap().len() == 2 {
-                    break;
-                }
-                ctx.hub.test_reconcile().await;
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            // A second FORCED pass bypasses the throttle and probes again
+            // immediately — repeated reconciliation keeps probing without
+            // settling.
+            ctx.hub.test_force_landing_reconcile(&lane_host).await;
             assert_eq!(ctx.scripts[0].resolve_calls.lock().unwrap().len(), 2);
             assert_eq!(ctx.job(&id).await["state"], json!("landing"));
             hold.notify_waiters();

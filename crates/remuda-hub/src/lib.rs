@@ -703,6 +703,15 @@ impl RunningHub {
         crate::gatequeue::reconcile_landings(&self.state, None).await;
     }
 
+    /// Test-only: run a FORCED Landing reconciliation for one lane host,
+    /// bypassing the probe throttle — deterministic stand-in for the
+    /// post-hello forced pass (r16 flake fix).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_force_landing_reconcile(&self, host_id: &str) {
+        crate::gatequeue::reconcile_landings(&self.state, Some(host_id)).await;
+    }
+
     /// Test-only: claim a queued gate job the way the scheduler tick would,
     /// without needing a registered lane Node. Returns the claimed job.
     #[doc(hidden)]

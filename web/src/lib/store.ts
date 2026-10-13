@@ -1320,6 +1320,11 @@ class HubStore {
           return "obsolete";
         }
         this.outboxDegraded = opened.degraded;
+        // Test gate: hold between storage-open and Outbox.load (the second
+        // obsolete-initializer suspension point, gate 34 item 5).
+        if (this.outboxLoadGateForTest) {
+          await new Promise<void>((resolve) => this.outboxLoadGateForTest?.(resolve));
+        }
         const box = await Outbox.load(opened.storage);
         if (obsolete() || !this.outboxInit) {
           // Another identity won: dispose the box we just built and leave the
@@ -2818,6 +2823,11 @@ class HubStore {
   private outboxOpenGateForTest: ((resolve: () => void) => void) | null = null;
   setOutboxOpenGateForTest(gate: ((resolve: () => void) => void) | null): void {
     this.outboxOpenGateForTest = gate;
+  }
+  /** Gate the Outbox.load step (second suspension point) for gate-34 item 5. */
+  private outboxLoadGateForTest: ((resolve: () => void) => void) | null = null;
+  setOutboxLoadGateForTest(gate: ((resolve: () => void) => void) | null): void {
+    this.outboxLoadGateForTest = gate;
   }
   /** Gate the durable enqueue storage.put for gate-34 item-1 public-send test. */
   private outboxEnqueueGateForTest: ((resolve: () => void) => void) | null = null;

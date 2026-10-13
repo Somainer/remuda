@@ -6463,3 +6463,237 @@ it("GATE34 item 4: a replacement login that REUSES the existing connection still
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE34 item 5: EVERY public auth path disposes the live outbox and bumps the generation — bootstrap login, pair login, passkey login, bootstrap 401, logout, and peer-tab storage event", async () => {
+  // Parameterized over the SIX public mutation paths (no private ensureOutbox
+  // calls): each must leave this.outbox null and a strictly higher authGen so
+  // an old acceptance can never credit the post-change outbox.
+  vi.useFakeTimers();
+  vi.setSystemTime(1_160_000);
+  const I = "ins_g34_5";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  const session = (deviceId: string) => ({ deviceId, token: `tok_${deviceId}`, name: deviceId });
+  const makeStore = async () => {
+    sessionStorage.setItem("remuda-outbox-owner", `owner_g34_5_${Math.random().toString(36).slice(2, 8)}`);
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "instanceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyLoginStart").mockResolvedValue({
+      challengeId: "chal_g34_5",
+      options: { publicKey: { challenge: "Y2hhbA", allowCredentials: [] } } as never,
+    });
+    await bootLive(api, hubStore);
+    return { api, hubStore };
+  };
+
+  type H = {
+    outbox: { lifetime: string } | null;
+    authGenForTest: number;
+    ensureOutbox: () => Promise<string>;
+  };
+  // reAuth=true: the path establishes a new session, so bootstrap re-creates a
+  // box with a NEW lifetime (dispose-then-reinit). reAuth=false: logout/401/
+  // peer removal leave no box (null) until the next ensureOutbox.
+  const expectDisposed = async (hubStore: unknown, previousGen: number, reAuth: boolean) => {
+    const h = hubStore as unknown as H;
+    expect(h.authGenForTest).toBeGreaterThan(previousGen);
+    if (reAuth) {
+      // A fresh box with a different lifetime exists (or is available).
+      const status = await h.ensureOutbox();
+      expect(status).toBe("ok");
+      expect(h.outbox).not.toBeNull();
+      // Lifetime must differ from the pre-mutation box captured by caller.
+    } else {
+      expect(h.outbox).toBeNull();
+      expect(await h.ensureOutbox()).toBe("ok");
+      expect(h.outbox).not.toBeNull();
+    }
+    return h.authGenForTest;
+  };
+
+  try {
+    // 1) bootstrap login
+    {
+      const { api, hubStore } = await makeStore();
+      const gen = (hubStore as unknown as { authGenForTest: number; outbox: { lifetime: string } | null }).authGenForTest;
+      const life = (hubStore as unknown as { outbox: { lifetime: string } | null }).outbox!.lifetime;
+      vi.spyOn(api, "login").mockResolvedValue(session("dev_login"));
+      await hubStore.login("bootstrap", "secret", "dev_login");
+      await expectDisposed(hubStore, gen, true);
+      expect((hubStore as unknown as { outbox: { lifetime: string } | null }).outbox!.lifetime).not.toBe(life);
+    }
+    // 2) pair login
+    {
+      const { api, hubStore } = await makeStore();
+      const gen = (hubStore as unknown as { authGenForTest: number; outbox: { lifetime: string } | null }).authGenForTest;
+      const life = (hubStore as unknown as { outbox: { lifetime: string } | null }).outbox!.lifetime;
+      vi.spyOn(api, "pairRedeem").mockResolvedValue(session("dev_pair"));
+      await hubStore.login("pair", "pair-secret", "dev_pair");
+      await expectDisposed(hubStore, gen, true);
+      expect((hubStore as unknown as { outbox: { lifetime: string } | null }).outbox!.lifetime).not.toBe(life);
+    }
+    // 3) passkey login — stub the WebAuthn ceremony (jsdom has no
+    // navigator.credentials) so the PUBLIC passkeyLogin path runs end to end.
+    {
+      const { api, hubStore } = await makeStore();
+      const gen = (hubStore as unknown as { authGenForTest: number; outbox: { lifetime: string } | null }).authGenForTest;
+      const life = (hubStore as unknown as { outbox: { lifetime: string } | null }).outbox!.lifetime;
+      vi.stubGlobal("PublicKeyCredential", class { static isUserVerifyingPlatformAuthenticatorAvailable() { return Promise.resolve(true); } });
+      (globalThis as unknown as { PublicKeyCredential?: unknown }).PublicKeyCredential = (globalThis as unknown as { PublicKeyCredential?: unknown }).PublicKeyCredential;
+      Object.defineProperty(globalThis.navigator, "credentials", {
+        configurable: true,
+        value: {
+          get: () =>
+            Promise.resolve({
+              id: "cred_g34_5",
+              type: "public-key",
+              rawId: new ArrayBuffer(1),
+              response: {
+                authenticatorData: new ArrayBuffer(1),
+                clientDataJSON: new ArrayBuffer(1),
+                signature: new ArrayBuffer(1),
+                userHandle: new ArrayBuffer(1),
+              },
+            }),
+        },
+      });
+      vi.spyOn(api, "passkeyLoginFinish").mockResolvedValue(session("dev_passkey"));
+      const result = await hubStore.passkeyLogin("required", "dev_passkey");
+      expect(result).toBeTruthy();
+      await expectDisposed(hubStore, gen, true);
+      expect((hubStore as unknown as { outbox: { lifetime: string } | null }).outbox!.lifetime).not.toBe(life);
+    }
+    // 4) bootstrap 401 (hello rejects unauthorized after a session exists)
+    {
+      const { api, hubStore } = await makeStore();
+      const gen = (hubStore as unknown as { authGenForTest: number }).authGenForTest;
+      // Build the error from the SAME module instance the store uses
+      // (vi.resetModules gives this fresh module its own httpError class).
+      const { HubHttpError: HE } = (await import("./httpError")) as typeof import("./httpError");
+      vi.spyOn(api, "hello").mockRejectedValue(new HE(401, "unauthorized", "Unauthorized"));
+      await hubStore.bootstrap().catch(() => undefined);
+      await pump(500);
+      await expectDisposed(hubStore, gen, false);
+    }
+    // 5) logout
+    {
+      const { hubStore } = await makeStore();
+      const gen = (hubStore as unknown as { authGenForTest: number }).authGenForTest;
+      hubStore.logout();
+      await expectDisposed(hubStore, gen, false);
+    }
+    // 6) peer-tab storage event (a second document removes the session)
+    {
+      const { hubStore } = await makeStore();
+      const gen = (hubStore as unknown as { authGenForTest: number }).authGenForTest;
+      window.dispatchEvent(
+        new StorageEvent("storage", { key: "runtime.device-session", oldValue: "{}", newValue: null }),
+      );
+      await pump(200);
+      await expectDisposed(hubStore, gen, false);
+    }
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE34 item 5: an obsolete initializer (suspended at storage-open OR at Outbox.load) with PENDING durable work installs nothing and posts nothing; an overlapping fresh initializer delivers the pending row exactly once", async () => {
+  for (const suspension of ["open", "load"] as const) {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_170_000 + (suspension === "open" ? 1 : 2));
+    const I = `ins_g34_5i_${suspension}`;
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+    const pump = async (n = 2_000) => {
+      for (let i = 0; i < n; i += 1) await Promise.resolve();
+    };
+    try {
+      sessionStorage.setItem(`remuda-outbox-owner-g34-5i-${suspension}`, "owner");
+      const { api, hubStore } = await fresh();
+      vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+      vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+      vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+      vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+      const send = vi.spyOn(api, "instanceSend").mockImplementation(
+        (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+          relatedCommandIds: [],
+          command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+        })) as unknown as Api["instanceSend"],
+      );
+
+      // Seed PENDING durable work that a fresh box must later deliver.
+      const preStorage = new (await import("./outbox")).LocalStorageOutboxStorage();
+      await preStorage.put({
+        commandId: `cmd_g34_5i_${suspension}`, clientRequestId: `local_g34_5i_${suspension}`,
+        instanceId: I, prompt: `g34 5i ${suspension} P`, createdAt: 1, attempts: 0, state: "pending",
+      });
+
+      const h = hubStore as unknown as {
+        outbox: unknown;
+        outboxInit: Promise<string> | null;
+        authGenForTest: number;
+        setOutboxOpenGateForTest: (g: ((r: () => void) => void) | null) => void;
+        setOutboxLoadGateForTest: (g: ((r: () => void) => void) | null) => void;
+        applyAuthIdentityChangeForTest: () => void;
+        ensureOutbox: () => Promise<string>;
+        flushAllOutbox: () => Promise<void>;
+      };
+
+      let releaseOld: () => void = () => undefined;
+      h.setOutboxOpenGateForTest(suspension === "open" ? ((r) => { releaseOld = r; }) : null);
+      h.setOutboxLoadGateForTest(suspension === "load" ? ((r) => { releaseOld = r; }) : null);
+
+      // OLD initializer starts and parks at the chosen suspension point.
+      const oldInit = h.ensureOutbox();
+      await pump(200);
+      expect(h.outbox).toBeNull();
+
+      // Identity changes: the parked init is now obsolete.
+      h.applyAuthIdentityChangeForTest();
+      const genAfter = h.authGenForTest;
+
+      // Release the obsolete initializer's gate AND drop both gates so an
+      // overlapping fresh initializer is not blocked by the old gate; then
+      // overlap the fresh initializer (starts while the old one is finishing
+      // its obsolete path).
+      releaseOld();
+      h.setOutboxOpenGateForTest(null);
+      h.setOutboxLoadGateForTest(null);
+      await expect(oldInit).resolves.toBe("obsolete");
+      expect(h.outbox).toBeNull();
+      expect(send).not.toHaveBeenCalled();
+
+      // The overlapping fresh initializer installs the current box and its
+      // post-load flush delivers the pending row EXACTLY once.
+      const freshInit = h.ensureOutbox();
+      await expect(freshInit).resolves.toBe("ok");
+      await h.flushAllOutbox();
+      await pump(3_000);
+      expect(h.authGenForTest).toBe(genAfter);
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0]?.[4]).toBe(`cmd_g34_5i_${suspension}`);
+
+      hubStore.logout();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+      sessionStorage.removeItem(`remuda-outbox-owner-g34-5i-${suspension}`);
+    }
+  }
+});

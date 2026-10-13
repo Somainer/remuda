@@ -3462,11 +3462,22 @@ it("GATE23 item 5 (rebuilds gate-21 item-2): B's REAL blocked claims leave X wit
     expect(sendB).toHaveBeenCalledTimes(2);
     a.logout();
   } finally {
-    vi.useRealTimers();
-    // The jitter pin above must not leak into later tests (grok gate 24
-    // item 3), even though afterEach restores all mocks.
-    vi.mocked(Math.random).mockRestore();
-    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    // Independent cleanup (grok gate 25 item 2): restore the leaked globals
+    // FIRST, each in its own guarded block, so one teardown call throwing can
+    // never prevent the navigator override or the Math.random jitter pin from
+    // being restored for later tests in this process.
+    const restore = (fn: () => void) => {
+      try {
+        fn();
+      } catch {
+        /* one cleanup failing must not skip the rest */
+      }
+    };
+    restore(() =>
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator }),
+    );
+    restore(() => vi.mocked(Math.random).mockRestore());
+    restore(() => vi.useRealTimers());
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });

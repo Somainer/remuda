@@ -3637,6 +3637,7 @@ async fn attempt_one_log_cannot_replace_attempt_two_after_a_genuine_requeue() {
             1,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3862,6 +3863,7 @@ async fn landing_evidence_and_probe_writers_validate_host_and_session_at_commit(
             1,
             None,
             Some(&ctx.host),
+            Some(merge),
         )
         .await
         .unwrap();
@@ -3882,6 +3884,7 @@ async fn landing_evidence_and_probe_writers_validate_host_and_session_at_commit(
             1,
             Some(session_a.wrapping_add(999)),
             Some(&ctx.host),
+            Some(merge),
         )
         .await
         .unwrap();
@@ -3899,6 +3902,7 @@ async fn landing_evidence_and_probe_writers_validate_host_and_session_at_commit(
             1,
             Some(session_a),
             Some("hst_different_host_id"),
+            Some(merge),
         )
         .await
         .unwrap();
@@ -3916,6 +3920,7 @@ async fn landing_evidence_and_probe_writers_validate_host_and_session_at_commit(
             1,
             Some(session_a),
             Some(&ctx.host),
+            Some(merge),
         )
         .await
         .unwrap()
@@ -3958,6 +3963,129 @@ async fn landing_evidence_and_probe_writers_validate_host_and_session_at_commit(
         .expect("the granted tuple probe settles");
     assert_eq!(settled["state"], json!("landed"), "{settled}");
     let _ = committed;
+}
+
+/// r16 item 5: the GRANTED MERGE is part of the identity bound in all three
+/// Landing writers.
+/// 1. grant idempotence: a re-grant for the same attempt/session but a
+///    DIFFERENT merge is refused and the recorded merge is untouched;
+/// 2. verdict: a `landed` finished frame for a different sha does not settle
+///    the Landing, while the exact granted merge settles it;
+/// 3. evidence: a log carrying a mismatched merge (or none at all) is rejected
+///    before persistence even from the granted host+session.
+#[tokio::test]
+async fn the_granted_merge_is_bound_in_grant_verdict_and_evidence_writers() {
+    let (ctx, node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let job_id = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let session = ctx.hub.test_node_session(&ctx.host).await.unwrap();
+    let merge = "dddddddddddddddddddddddddddddddddddddddd";
+    let other = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge, session)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+
+    // 1. Re-grant for a DIFFERENT merge on the same (attempt, host, session):
+    //    refused, and the granted merge recorded on the row is unchanged.
+    let regrant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, other, session)
+        .await
+        .unwrap();
+    assert_eq!(regrant["granted"], json!(false), "{regrant}");
+    let unchanged = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(unchanged["state"], json!("landing"), "{unchanged}");
+    assert_eq!(unchanged["mergeSha"], json!(merge), "{unchanged}");
+    // The same merge still gets the idempotent granted=true re-answer.
+    let again = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge, session)
+        .await
+        .unwrap();
+    assert_eq!(again["granted"], json!(true), "{again}");
+
+    // 2. A landed verdict for the OTHER merge must not settle this Landing.
+    //    Drive it through the production apply barrier: parked → released →
+    //    completed, so the stand-down is observed deterministically (no sleeps).
+    let barrier = ctx.store().gate_apply_barrier();
+    barrier.arm();
+    node.send_raw(json!({
+        "jsonrpc": "2.0", "method": "gate.event",
+        "params": {
+            "jobId": job_id, "generation": 1, "kind": "finished",
+            "result": {"jobId": job_id, "generation": 1, "status": "landed",
+                       "mergeSha": other},
+        },
+    }));
+    barrier.wait_parked(1).await;
+    barrier.release();
+    barrier.wait_completed(1).await;
+    let still = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(still["state"], json!("landing"), "{still}");
+    assert_eq!(still["mergeSha"], json!(merge), "{still}");
+
+    // 3. Evidence for the wrong merge (right host+session) is rejected; so is
+    //    evidence that carries no merge identity at all.
+    for auth_merge in [Some(other), None] {
+        let rejected = ctx
+            .hub
+            .test_insert_gate_log(
+                &ctx.project,
+                &job_id,
+                br#"{"headline":"WRONG-MERGE"}"#.to_vec(),
+                format!("digest-{auth_merge:?}"),
+                "dev",
+                1,
+                Some(session),
+                Some(&ctx.host),
+                auth_merge,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected, None, "evidence {auth_merge:?} must be rejected");
+    }
+    let committed = ctx
+        .hub
+        .test_insert_gate_log(
+            &ctx.project,
+            &job_id,
+            br#"{"headline":"GRANTED-MERGE"}"#.to_vec(),
+            "digest-granted-merge".into(),
+            "dev",
+            1,
+            Some(session),
+            Some(&ctx.host),
+            Some(merge),
+        )
+        .await
+        .unwrap()
+        .expect("evidence naming the exact granted merge commits");
+    let _ = committed;
+
+    // The correct verdict settles landed and keeps the exact merge.
+    barrier.arm();
+    node.send_raw(json!({
+        "jsonrpc": "2.0", "method": "gate.event",
+        "params": {
+            "jobId": job_id, "generation": 1, "kind": "finished",
+            "result": {"jobId": job_id, "generation": 1, "status": "landed",
+                       "mergeSha": merge},
+        },
+    }));
+    barrier.wait_parked(1).await;
+    barrier.release();
+    barrier.wait_completed(1).await;
+    let landed = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(landed["state"], json!("landed"), "{landed}");
+    assert_eq!(landed["mergeSha"], json!(merge), "{landed}");
 }
 
 /// Shared setup for the r15 item 4 suite: a Landing parked outcome-unknown with

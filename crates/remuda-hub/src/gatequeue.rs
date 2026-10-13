@@ -1771,6 +1771,9 @@ pub(crate) async fn apply_result(
                 LogAuth {
                     generation: result.generation,
                     session: source_session,
+                    // r16 item 5: bind the evidence to the exact merge the
+                    // verdict carries (the granted merge on a Landing row).
+                    merge_sha: result.merge_sha.clone(),
                 },
                 existing.host_id.as_ref().map(|host| host.as_id().as_str()),
             )
@@ -1878,6 +1881,22 @@ pub(crate) async fn apply_result(
                     tracing::info!(
                         ?verdict_host,
                         "dropping Landing verdict in writer: row host no longer matches"
+                    );
+                    return None;
+                }
+                // r16 item 5: bind the GRANTED MERGE inside the writer. The
+                // verdict may settle this Landing only when it names the exact
+                // merge the grant recorded; a verdict (including a landed one)
+                // for a different sha, or one carrying no merge identity at
+                // all, stands down and leaves the row Landing.
+                if let Some(granted_merge) = row.merge_sha.as_deref()
+                    && result.merge_sha.as_deref().filter(|sha| !sha.is_empty())
+                        != Some(granted_merge)
+                {
+                    tracing::info!(
+                        ?granted_merge,
+                        verdict_merge = ?result.merge_sha,
+                        "dropping Landing verdict in writer: merge does not match the granted merge"
                     );
                     return None;
                 }
@@ -2138,10 +2157,14 @@ pub(crate) async fn apply_result(
 /// What a bounded run log object is persisted for: the attempt generation and
 /// the authenticated carrier session the verdict rode (r13 item 4). Evidence
 /// for a Landing may only be written by the granted session.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct LogAuth {
     pub(crate) generation: u32,
     pub(crate) session: Option<u64>,
+    /// r16 item 5: the exact GRANTED merge sha this evidence belongs to. A
+    /// Landing evidence write is rejected unless it names the row's granted
+    /// merge — evidence for a different outcome is dropped before persistence.
+    pub(crate) merge_sha: Option<String>,
 }
 
 async fn persist_run_log(
@@ -3754,7 +3777,11 @@ impl Store {
         let created_by = created_by.to_owned();
         let source_session_i64 = auth.session.map(|s| i64::try_from(s).unwrap_or(0));
         let source_host = host.map(str::to_owned);
-        let generation = auth.generation; // Drain the one-shot insert fault before the 'static writer closure.
+        let generation = auth.generation;
+        // r16 item 5: the evidence must name the exact GRANTED merge; carried
+        // into the Landing predicate below.
+        let auth_merge = auth.merge_sha;
+        // Drain the one-shot insert fault before the 'static writer closure.
         #[cfg(any(test, feature = "test-faults"))]
         let insert_fault = self.take_gate_log_insert_fault();
         self.run_named("insert_gate_log", move |conn| {
@@ -3788,14 +3815,24 @@ impl Store {
             // authenticated session: a NULL source is passed as sentinel -1 and
             // never matches a real dispatch_session.
             let source_or_sentinel = source_session_i64.unwrap_or(-1);
+            // r16 item 5: the evidence is also bound to the GRANTED MERGE. A
+            // Landing row always names its mergeSha; the write is refused
+            // unless the evidence carries that exact non-empty sha, so a
+            // mismatched (or merge-less) outcome's log is rejected BEFORE any
+            // delete/insert. An empty auth merge is passed as NULL and never
+            // matches.
+            let auth_merge_nonempty = auth_merge.filter(|sha| !sha.trim().is_empty());
             let landing_for_other: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM gate_jobs
                   WHERE id = ?1
                     AND state = 'landing'
                     AND (dispatch_session IS NULL
                          OR dispatch_session != ?2
-                         OR (?3 IS NOT NULL AND json_extract(doc_json, '$.hostId') != ?3))",
-                params![job_id, source_or_sentinel, source_host],
+                         OR (?3 IS NOT NULL AND json_extract(doc_json, '$.hostId') != ?3)
+                         OR json_extract(doc_json, '$.mergeSha') IS NULL
+                         OR ?4 IS NULL
+                         OR json_extract(doc_json, '$.mergeSha') != ?4)",
+                params![job_id, source_or_sentinel, source_host, auth_merge_nonempty],
                 |row| row.get(0),
             )?;
             if landing_for_other > 0 {
@@ -4162,9 +4199,11 @@ impl Store {
                 });
             };
             // Already landing at this generation: idempotent re-answer, but
-            // ONLY for the same host AND the same authenticated carrier
-            // session the dispatch was bound to. A paused/old frame delivered
-            // to a replacement session (generation still equal) is refused.
+            // ONLY for the same host, the same authenticated carrier
+            // session the dispatch was bound to, AND the exact GRANTED MERGE
+            // (r16 item 5). A paused/old frame delivered to a replacement
+            // session (generation still equal) or a re-grant carrying a
+            // different verified merge is refused.
             if state == GateJobState::Landing.as_str() {
                 let same_tuple: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM gate_jobs
@@ -4172,8 +4211,10 @@ impl Store {
                         AND json_extract(doc_json,'$.attempts') = ?2
                         AND json_extract(doc_json,'$.hostId') = ?3
                         AND dispatch_session IS NOT NULL
-                        AND dispatch_session = ?4",
-                    params![job_id, generation, host_id, session_i64],
+                        AND dispatch_session = ?4
+                        AND json_extract(doc_json,'$.mergeSha') IS NOT NULL
+                        AND json_extract(doc_json,'$.mergeSha') = ?5",
+                    params![job_id, generation, host_id, session_i64, merge_sha],
                     |row| row.get(0),
                 )?;
                 return Ok(GateLandGrant {

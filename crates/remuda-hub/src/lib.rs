@@ -816,6 +816,7 @@ impl RunningHub {
         generation: u32,
         session: Option<u64>,
         host: Option<&str>,
+        merge_sha: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
         self.store()
             .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?
@@ -828,6 +829,7 @@ impl RunningHub {
                 crate::gatequeue::LogAuth {
                     generation,
                     session,
+                    merge_sha: merge_sha.map(str::to_owned),
                 },
                 host,
             )

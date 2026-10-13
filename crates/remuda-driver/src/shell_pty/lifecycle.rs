@@ -466,67 +466,89 @@ where
 
 /// How often the stop-incomplete termination watcher rechecks the survivor
 /// process group (c-usagefu r13 item 3).
-pub(super) const TERMINATION_WATCH_POLL: Duration = Duration::from_millis(250);
+pub(crate) const TERMINATION_WATCH_POLL: Duration = Duration::from_millis(250);
 
 /// Upper bound a stop-incomplete teardown watches a survivor that outlived
 /// SIGKILL before giving up. SIGKILL cannot be caught, so a process still here
 /// after the ladder is blocked in the kernel (uninterruptible IO) or an
 /// unreaped zombie its parent cannot collect; it almost always clears within
 /// seconds, but the watch is bounded so a wedged host cannot leave a polling
-/// task on this Node forever. Past the bound the census guards are dropped
-/// WITHOUT a recorded close (same as a Node shutdown): a false close is worse
-/// than an interval that stays live until the Node restarts.
+/// task on this Node forever. Past the bound the guards and process identity
+/// move to the Node-owned pending-termination registry (c-usagefu r14 item 3,
+/// Ruling W1) instead of being dropped: the interval closes only after
+/// confirmed exit, while a Node shutdown still drops them without recording a
+/// false close.
 pub(super) const TERMINATION_WATCH_BOUND: Duration = Duration::from_secs(300);
 
-/// Spawn the bounded watcher that owns codex census lifetime guards after a
-/// STOP-INCOMPLETE teardown (c-usagefu r13 item 3).
-///
-/// The stop ladder's contract forbids reporting the group gone while a
-/// survivor is still there, so the census interval must stay LIVE; r12 simply
-/// `mem::forget`-ed the guards, which abandoned the intervals for the whole
-/// Node lifetime and blocked same-cwd prompt-only discovery even after the
-/// survivor actually exited. The watcher polls the survivor process identity
-/// and closes every guard ONLY after confirmed exit — after that ordinary
-/// last-window pruning applies. Its guards' Drop is suppressed, so an abort
-/// on Node shutdown or a bounded expiry drops them without recording a false
-/// close.
-pub(super) fn spawn_termination_watch(
-    mut guards: Vec<crate::adapters::codex_discovery::LifetimeGuard>,
-    pgid: Option<i32>,
-    survivors: Vec<i32>,
-) {
-    for guard in &guards {
-        guard.suppress_drop_close();
-    }
-    tokio::spawn(async move {
-        let started = tokio::time::Instant::now();
-        loop {
-            if !termination_watch_alive(pgid, &survivors) {
-                for guard in &guards {
-                    guard.close_interval();
-                }
-                return;
-            }
-            if started.elapsed() >= TERMINATION_WATCH_BOUND {
-                // Never confirmed dead inside the bound: drop WITHOUT closing.
-                guards.clear();
-                return;
-            }
-            tokio::time::sleep(TERMINATION_WATCH_POLL).await;
-        }
-    });
+#[cfg(test)]
+static TEST_WATCH_BOUND_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test seam: shorten the per-close bound so a regression can drive the
+/// expiry→registry transfer without waiting 300 s. `None` restores the
+/// production bound.
+#[cfg(test)]
+pub(crate) fn set_test_watch_bound(d: Option<Duration>) {
+    TEST_WATCH_BOUND_MS.store(
+        d.map(|x| x.as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or(0),
+        std::sync::atomic::Ordering::SeqCst,
+    );
 }
 
-/// Whether the stop-incomplete survivor identity is still running. A process
-/// group is preferred: [`group_has_live_member`] is zombie-aware, so a dead
-/// leader waiting for reap already counts as gone. With no group (the ladder
-/// itself errored before learning one) the named survivor pids are probed
-/// directly.
-fn termination_watch_alive(pgid: Option<i32>, survivors: &[i32]) -> bool {
-    if let Some(pgid) = pgid.filter(|pgid| *pgid > 0) {
-        return group_has_live_member(pgid);
+/// The per-close bound a watcher uses (test seam or the production 300 s).
+pub(crate) fn termination_watch_bound() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = TEST_WATCH_BOUND_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
     }
-    survivors.iter().any(|pid| process_alive(*pid))
+    TERMINATION_WATCH_BOUND
+}
+
+/// Whether a stop-incomplete survivor identity is still running: the signalled
+/// process GROUP still has a live member OR one of the explicitly named
+/// survivor pids is live (c-usagefu r14 item 4: a descendant that called
+/// `setsid` escaped the group kill, so a dead group with a named survivor is
+/// still alive).
+pub(crate) fn termination_identity_alive(pgid: Option<i32>, survivors: &[i32]) -> bool {
+    let group_alive = pgid
+        .filter(|pgid| *pgid > 0)
+        .is_some_and(group_has_live_member);
+    group_alive || survivors.iter().copied().any(process_running)
+}
+
+/// Whether a single pid is still running AND not merely an unreaped zombie.
+///
+/// `kill(pid, 0)` returns success for a zombie, which must not keep a census
+/// interval live; read the `/proc` state letter first (zombie/exiting states
+/// are dead — [`state_is_dead`]), and fall back to the signal probe only when
+/// the stat file cannot be read (a process that vanished reads as gone).
+#[must_use]
+pub(crate) fn process_running(pid: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start()) else {
+            return process_alive(pid);
+        };
+        match after_comm.split_whitespace().next() {
+            Some(state) => !state_is_dead(state),
+            None => process_alive(pid),
+        }
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        process_alive(pid)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// Pids in `pgid` that are still running (not zombies), for a

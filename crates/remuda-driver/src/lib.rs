@@ -41,6 +41,7 @@ mod recipe;
 mod screenlive;
 mod secrets;
 pub mod shell_pty;
+pub mod termination;
 pub mod tty;
 pub mod usage;
 

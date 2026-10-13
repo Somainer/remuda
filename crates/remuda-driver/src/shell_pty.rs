@@ -2899,11 +2899,13 @@ impl Driver for ShellPtyDriver {
             }
             Ok(outcome) => {
                 // §5.3 step 4: say so rather than claiming a clean stop.
+                // The survivor may be a group member that outlived SIGKILL or
+                // a setsid descendant that escaped the group kill (r14 item 4).
                 tracing::error!(
                     rung = outcome.rung.label(),
                     pgid = outcome.pgid,
                     survivors = ?outcome.survivors,
-                    "stop-incomplete: the process group outlived SIGKILL"
+                    "stop-incomplete: survivor processes outlived the stop ladder"
                 );
             }
             Err(error) => tracing::error!(%error, "pty stop ladder failed"),
@@ -2944,7 +2946,13 @@ impl Driver for ShellPtyDriver {
                 Ok(outcome) => (outcome.pgid, outcome.survivors.clone()),
                 Err(_) => (Some(state.pgid.load(Ordering::SeqCst)), Vec::new()),
             };
-            lifecycle::spawn_termination_watch(unconfirmed, pgid, survivors);
+            // r14 W1: the bounded per-close watcher owns the guards, and on
+            // bound expiry they move — identity included — to the Node-owned
+            // pending-termination registry instead of being abandoned.
+            crate::termination::watch_pending_termination(
+                unconfirmed,
+                crate::termination::TerminationIdentity { pgid, survivors },
+            );
         }
         Ok(DriverAck::not_dispatched())
     }
@@ -5060,6 +5068,12 @@ mod tests {
         use crate::adapters::FileSignalAdapter as _;
         use std::os::unix::process::CommandExt as _;
 
+        // The global termination supervisor and the watch-bound seam are
+        // process-global; serialize every test that drives a stop-incomplete.
+        let _term_lock = crate::termination::termination_test_lock();
+        lifecycle::set_test_watch_bound(None);
+        crate::termination::set_test_maintenance_interval(None);
+
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_path_buf();
 
@@ -5210,6 +5224,271 @@ mod tests {
             assert!(tokio::time::Instant::now() < prune_deadline);
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        lifecycle::set_test_watch_bound(None);
+        crate::termination::set_test_maintenance_interval(None);
+        crate::termination::shutdown_pending_terminations().await;
+    }
+
+    #[tokio::test]
+    async fn a_survivor_outliving_the_watch_bound_closes_via_registry_recheck_then_a_later_launch_discovers()
+     {
+        // c-usagefu r14 item 3 (Ruling W1), regression 1: per-close polling
+        // stays BOUNDED. A survivor that outlives the bound moves, guards and
+        // process identity together, into the Node-owned pending-termination
+        // registry rather than being dropped (r13) — r13's drop left the
+        // intervals live for the rest of the Node lifetime. A later codex
+        // discovery in the same cwd rechecks the registry and closes the
+        // intervals on confirmed exit; a launch whose floor is AFTER that
+        // close is then sole-live and discovers.
+        use crate::adapters::FileSignalAdapter as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let _term_lock = crate::termination::termination_test_lock();
+        lifecycle::set_test_watch_bound(Some(std::time::Duration::from_millis(400)));
+        crate::termination::set_test_maintenance_interval(None);
+        // A fresh supervisor for this timeline (a prior test reset it).
+        crate::termination::shutdown_pending_terminations().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let survivor_pid = i32::try_from(child.id()).unwrap();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        let driver = ShellPtyDriver::new(options);
+        let _run = driver.spawn().await.expect("spawns");
+
+        let native_owner = "r14-item3a-native";
+        let promoted_owner = "r14-item3a-promoted";
+        *driver.codex_lifetime.lock().await =
+            Some(crate::adapters::codex_discovery::begin_lifetime(
+                &cwd,
+                native_owner,
+                Some(time::OffsetDateTime::now_utc()),
+            ));
+        driver.promoted_codex_lifetimes.lock().unwrap().push(
+            crate::adapters::codex_discovery::begin_lifetime(&cwd, promoted_owner, None),
+        );
+        *driver.test_stop_outcome.lock().unwrap() = Some(lifecycle::StopOutcome {
+            rung: lifecycle::StopRung::Kill,
+            group_gone: false,
+            pgid: Some(survivor_pid),
+            survivors: vec![survivor_pid],
+        });
+        Driver::close(&driver).await.unwrap();
+
+        // The survivor outlives the per-close bound; both intervals stay live
+        // while the watcher polls and after it transfers the entry.
+        for _ in 0..8 {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, native_owner),
+                "native interval stays live while the registry-bound survivor runs"
+            );
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, promoted_owner),
+                "promoted interval stays live while the registry-bound survivor runs"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let transfer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !crate::termination::test_has_pending_for(&cwd) {
+            assert!(tokio::time::Instant::now() < transfer_deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // The survivor exits after the registry transfer.
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(survivor_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, native_owner),
+            "nothing closes the interval on its own after the bound — only a recheck does"
+        );
+
+        // A later discovery in the same cwd performs the BOUNDED registry
+        // recheck: confirmed exit closes both intervals. This launch has no
+        // rollout yet and binds nothing; the close is what it contributes.
+        let recheck_home = tempfile::tempdir().unwrap();
+        let mut rechecker = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+            home: recheck_home.path().to_path_buf(),
+            cwd: cwd.clone(),
+            pid: None,
+            launched_at: Some(time::OffsetDateTime::now_utc()),
+        })
+        .with_instance_key(Some("r14-item3a-rechecker".to_owned()));
+        // poll() runs the production discover() (and therefore the registry
+        // recheck at its top); there is no rollout for the rechecker yet.
+        assert!(rechecker.poll().unwrap().is_empty());
+        assert!(
+            !crate::termination::test_has_pending_for(&cwd),
+            "the confirmed-gone entry is removed on the discovery recheck"
+        );
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, native_owner),
+            "the discovery recheck closes the native interval on confirmed exit"
+        );
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, promoted_owner),
+            "the discovery recheck closes the promoted interval on confirmed exit"
+        );
+        drop(rechecker);
+
+        // A LATER same-cwd launch — its floor is after the confirmed close —
+        // is sole-live and discovers its rollout through the REAL path.
+        let next_home = tempfile::tempdir().unwrap();
+        let floor = time::OffsetDateTime::now_utc() + time::Duration::milliseconds(500);
+        let next_owner = "r14-item3a-next";
+        let mut next = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+            home: next_home.path().to_path_buf(),
+            cwd: cwd.clone(),
+            pid: None,
+            launched_at: Some(floor),
+        })
+        .with_instance_key(Some(next_owner.to_owned()));
+        let prompt = "r14 item 3a later launch prompt";
+        crate::adapters::codex_discovery::record_input(&cwd, next_owner, prompt);
+        let started = floor + time::Duration::seconds(1);
+        let date_dir = format!(
+            "{:04}/{:02}/{:02}",
+            started.year(),
+            u8::from(started.month()),
+            started.day()
+        );
+        let month_dir = next_home.path().join("sessions").join(date_dir);
+        std::fs::create_dir_all(&month_dir).unwrap();
+        let started_rfc = started
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        std::fs::write(
+            month_dir.join("rollout-r14item3a.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{started_rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"r14item3a\",\"session_id\":\"r14item3a\",\"cwd\":\"{}\",\"timestamp\":\"{started_rfc}\"}}}}\n\
+                 {{\"timestamp\":\"{started_rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let observed = next.poll().unwrap();
+        assert!(
+            next.binding().is_some(),
+            "the later launch discovers once the registry recheck closed the intervals; \
+             emitted {observed:?}"
+        );
+        drop(next);
+
+        lifecycle::set_test_watch_bound(None);
+        crate::termination::set_test_maintenance_interval(None);
+        crate::termination::shutdown_pending_terminations().await;
+    }
+
+    #[tokio::test]
+    async fn node_shutdown_cancels_and_awaits_a_live_watcher_without_recording_a_close() {
+        // c-usagefu r14 item 3 (Ruling W1), regression 2: on Node shutdown the
+        // Node-level supervisor cancels and AWAITS every watcher while the
+        // Tokio runtime stays alive, and drops the guards WITHOUT recording a
+        // closure. Even after the survivor then exits, the interval stays
+        // live — a false close is worse than an interval the next Node process
+        // reconciles.
+        use std::os::unix::process::CommandExt as _;
+
+        let _term_lock = crate::termination::termination_test_lock();
+        // Short bound AND a short maintenance period: if shutdown failed to
+        // cancel the watcher, the survivor killed below would be confirmed
+        // dead inside the bound and the intervals closed — the shutdown
+        // requirement is proven behaviourally, not by a flag.
+        lifecycle::set_test_watch_bound(Some(std::time::Duration::from_millis(500)));
+        crate::termination::set_test_maintenance_interval(Some(std::time::Duration::from_millis(
+            100,
+        )));
+        crate::termination::shutdown_pending_terminations().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let survivor_pid = i32::try_from(child.id()).unwrap();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        let driver = ShellPtyDriver::new(options);
+        let _run = driver.spawn().await.expect("spawns");
+
+        let native_owner = "r14-item3b-native";
+        let promoted_owner = "r14-item3b-promoted";
+        *driver.codex_lifetime.lock().await =
+            Some(crate::adapters::codex_discovery::begin_lifetime(
+                &cwd,
+                native_owner,
+                Some(time::OffsetDateTime::now_utc()),
+            ));
+        driver.promoted_codex_lifetimes.lock().unwrap().push(
+            crate::adapters::codex_discovery::begin_lifetime(&cwd, promoted_owner, None),
+        );
+        *driver.test_stop_outcome.lock().unwrap() = Some(lifecycle::StopOutcome {
+            rung: lifecycle::StopRung::Kill,
+            group_gone: false,
+            pgid: Some(survivor_pid),
+            survivors: vec![survivor_pid],
+        });
+        Driver::close(&driver).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, native_owner)
+                && crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, promoted_owner),
+            "the stop-incomplete watcher keeps both intervals live"
+        );
+
+        // The exact call DevNode::shutdown makes after closing every instance
+        // (reclaim.rs), with the Tokio runtime alive: cancel and await.
+        crate::termination::shutdown_pending_terminations().await;
+        assert!(
+            crate::termination::test_global_is_shut(),
+            "the Node-level supervisor is torn down"
+        );
+        assert!(
+            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, native_owner)
+                && crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, promoted_owner),
+            "shutdown drops the suppressed guards WITHOUT recording a close"
+        );
+
+        // The survivor exits afterwards: with every watcher cancelled nothing
+        // closes the interval speculatively.
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(survivor_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, native_owner)
+                && crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, promoted_owner),
+            "a post-shutdown exit is never turned into a recorded close"
+        );
+
+        // Teardown hygiene: the intervals deliberately stayed live; forget the
+        // unique test owners so they cannot touch another test's census.
+        crate::adapters::codex_discovery::forget_lifetime(&cwd, native_owner);
+        crate::adapters::codex_discovery::forget_lifetime(&cwd, promoted_owner);
     }
 
     /// A driver whose PTY runs an inert process, carrying `kind` as its

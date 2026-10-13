@@ -128,6 +128,11 @@ fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Cross-module cwd canonicalization (r14 W1 pending-termination registry).
+pub(crate) fn canonical_path(path: &Path) -> PathBuf {
+    canonical(path)
+}
+
 // ---------------------------------------------------------------------------
 // Instance LIFETIMES (c-usagefu r9 item 1; r11 Ruling A2)
 // ---------------------------------------------------------------------------
@@ -238,6 +243,12 @@ struct LifetimeGuardInner {
 }
 
 impl LifetimeGuard {
+    /// Canonical cwd this guard's interval belongs to (r14 W1: scopes the
+    /// pending-termination registry recheck).
+    pub(crate) fn cwd(&self) -> &Path {
+        &self.inner.key
+    }
+
     /// Witness clone: shares the cohort but its Drop never closes the interval
     /// (file adapters are torn down BEFORE the stop ladder runs).
     pub(crate) fn witness(&self) -> Self {

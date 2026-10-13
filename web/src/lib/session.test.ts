@@ -54,3 +54,19 @@ describe("device session", () => {
     set.mockRestore();
   });
 });
+
+it("readAuthEpoch mints the anon epoch once per page lifetime even when storage rejects writes", async () => {
+  clearSession();
+  localStorage.clear();
+  // get works (returns null), setItem throws for the epoch key.
+  const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation((key: string) => {
+    if (key === "runtime.outbox-auth-epoch") throw new DOMException("quota", "QuotaExceededError");
+  });
+  vi.resetModules();
+  const first = await import("./session");
+  const a = first.readAuthEpoch();
+  const b = first.readAuthEpoch();
+  expect(a).toBe(b);
+  setItem.mockRestore();
+  vi.resetModules();
+});

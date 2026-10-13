@@ -66,6 +66,14 @@ export function clearSession(): void {
 }
 
 const ANON_EPOCH_KEY = "runtime.outbox-auth-epoch";
+/**
+ * Per-PAGE-LIFETIME anon epoch used only when neither localStorage persists
+ * one nor it can be written (c-reconnfu gate 29 item 5): minted at most once
+ * per loaded module, so repeated readAuthEpoch() calls under a failing
+ * storage keep returning the same id instead of starting a new "epoch" each
+ * time. A real reload intentionally gets a fresh document/module.
+ */
+let memoryAnonEpoch: string | null = null;
 
 /**
  * The current AUTH EPOCH that owns outbox deliveries (c-reconnfu gate 28):
@@ -81,13 +89,20 @@ export function readAuthEpoch(): string {
   try {
     const existing = localStorage.getItem(ANON_EPOCH_KEY);
     if (existing) return existing;
-    const created = `epoch_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
-    localStorage.setItem(ANON_EPOCH_KEY, created);
+    const created = memoryAnonEpoch ?? `epoch_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+    memoryAnonEpoch = created;
+    try {
+      localStorage.setItem(ANON_EPOCH_KEY, created);
+    } catch {
+      /* quota/private mode: the in-page memory epoch below still applies. */
+    }
     return created;
   } catch {
-    // Storage unavailable: a per-document fallback still keys the session
-    // coherently within this page.
-    return `epoch_mem_${Math.random().toString(36).slice(2)}`;
+    // Storage entirely unavailable: reuse the page-lifetime id.
+    if (!memoryAnonEpoch) {
+      memoryAnonEpoch = `epoch_mem_${Math.random().toString(36).slice(2)}`;
+    }
+    return memoryAnonEpoch;
   }
 }
 

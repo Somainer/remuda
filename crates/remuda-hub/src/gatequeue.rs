@@ -1898,12 +1898,18 @@ pub(crate) async fn apply_result(
                     );
                     return None;
                 }
-                // r16 item 5: bind the GRANTED MERGE inside the writer. The
-                // verdict may settle this Landing only when it names the exact
-                // merge the grant recorded; a verdict (including a landed one)
-                // for a different sha, or one carrying no merge identity at
-                // all, stands down and leaves the row Landing.
-                if let Some(granted_merge) = row.merge_sha.as_deref()
+                // r16 item 5: bind the GRANTED MERGE inside the writer for the
+                // TERMINAL merge outcomes. A `landed`/`failed` verdict settles
+                // THIS Landing only when it names the exact merge the grant
+                // recorded; a landed verdict for a different sha or one with no
+                // merge identity stands down and leaves the row Landing.
+                // base-moved is deliberately NOT bound: it is the CAS-loss
+                // requeue transition proving the granted merge did NOT land
+                // (the local main was stale), and it clears mergeSha on the
+                // Queued row below so a re-verification must pin a new merge.
+                if result.status != "base-moved"
+                    && result.status != "uncertain"
+                    && let Some(granted_merge) = row.merge_sha.as_deref()
                     && result.merge_sha.as_deref().filter(|sha| !sha.is_empty())
                         != Some(granted_merge)
                 {

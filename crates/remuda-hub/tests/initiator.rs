@@ -3750,6 +3750,57 @@ async fn a_probe_for_an_older_attempt_never_settles_a_newer_landing() {
     assert_eq!(current["mergeSha"], json!(merge2), "{current}");
 }
 
+/// r16 item 5: a `base-moved` verdict on a Landing row is the CAS-LOSS
+/// requeue, not a terminal merge outcome — it must requeue even though it
+/// carries no merge sha (the granted merge provably did not land), clearing
+/// the old granted merge for a fresh verify. The merge bind only gates
+/// terminal landed/failed verdicts.
+#[tokio::test]
+async fn a_base_moved_landing_verdict_without_a_merge_sha_still_requeues() {
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let job_id = queued_land_job(&ctx).await;
+    ctx.hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("claimed");
+    let merge = "1212121212121212121212121212121212121212";
+    let session = ctx.hub.test_node_session(&ctx.host).await.unwrap();
+    let grant = ctx
+        .hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge, session)
+        .await
+        .unwrap();
+    assert_eq!(grant["granted"], json!(true), "{grant}");
+
+    // CAS loss, no mergeSha in the verdict (it names the new remote base, not
+    // the old merge).
+    ctx.hub
+        .test_apply_gate_result(
+            &job_id,
+            json!({
+                "jobId": job_id,
+                "generation": 1,
+                "status": "base-moved",
+                "currentMainSha": "fedcba9876543210fedcba9876543210fedcba98",
+            }),
+        )
+        .await
+        .unwrap();
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("queued"), "{doc}");
+    assert_eq!(
+        doc["attempts"],
+        json!(1),
+        "the attempt count bumps on re-claim: {doc}"
+    );
+    assert!(
+        doc["mergeSha"].is_null(),
+        "the old granted merge is cleared: {doc}"
+    );
+}
+
 /// r15 item 3 (R2): a carrier TAKEOVER landing in the window between a
 /// Landing verdict's current-session pre-check and its writer commit is
 /// serialized WITH the writer. While the verdict is parked the replacement

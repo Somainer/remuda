@@ -811,14 +811,16 @@ export class Outbox {
    * always read from the row, never assumed, so an epoch another tab/page
    * changed cannot be credited.
    */
-  private pendingAcceptance: {
-    instanceId: Id;
-    commandId: Id;
-    issuerEpoch: Id;
-    issuerLifetime: Id;
-    failures: number;
-    handle: ReturnType<typeof setTimeout> | null;
-  } | null = null;
+  private pendingAcceptances = new Map<
+    Id,
+    {
+      instanceId: Id;
+      issuerEpoch: Id;
+      issuerLifetime: Id;
+      failures: number;
+      handle: ReturnType<typeof setTimeout> | null;
+    }
+  >();
   /**
    * Per-FLUSH suppression of 0 ms delivery wakes (c-reconnfu gate 21 item 1):
    * each guarded flush receives a TOKEN scoped to the instances ITS pass read.
@@ -1292,7 +1294,7 @@ export class Outbox {
     // 30 item 3 per-command map): lifetime-aware like the read chain — a
     // cancelled-navigation restore re-arms from a fresh observation, a
     // disposed outbox never completes any of them.
-    this.clearPendingAcceptance();
+    for (const commandId of [...this.pendingAcceptances.keys()]) this.clearPendingAcceptance(commandId);
   }
 
   /** The page stayed / was restored (BFCache): allow reconciliation again. */
@@ -1333,81 +1335,99 @@ export class Outbox {
     issuerLifetime: Id,
   ): void {
     if (this.disposed || this.unloading) return;
-    if (this.pendingAcceptance?.commandId === commandId) return;
-    this.pendingAcceptance = {
+    if (this.pendingAcceptances.has(commandId)) return;
+    // The immediate CAS already failed once; the first RECOVERY attempt waits
+    // the base backoff, then each further failure grows it (bounded).
+    this.pendingAcceptances.set(commandId, {
       instanceId,
-      commandId,
       issuerEpoch,
       issuerLifetime,
       failures: 1,
       handle: null,
-    };
-    const pending = this.pendingAcceptance;
-    pending.handle = setTimeout(() => void this.attemptAcceptedProgress(), this.acceptanceRetryDelay(1));
+    });
+    this.scheduleAcceptedRetry(commandId, 1);
   }
 
-  private async attemptAcceptedProgress(): Promise<void> {
-    const pending = this.pendingAcceptance;
+  private scheduleAcceptedRetry(commandId: Id, failures: number) {
+    const pending = this.pendingAcceptances.get(commandId);
+    if (!pending) return;
+    pending.handle = setTimeout(() => void this.attemptAcceptedProgress(commandId), this.acceptanceRetryDelay(failures));
+  }
+
+  private async attemptAcceptedProgress(commandId: Id): Promise<void> {
+    const pending = this.pendingAcceptances.get(commandId);
     if (!pending || this.disposed || this.unloading) return;
+    // Re-read the row: the CURRENT issuer always comes from storage, never
+    // from the stashed observation, so an epoch/lifetime another tab or page
+    // changed cannot be credited.
     let row: OutboxRecord | undefined;
     try {
       const rows = await this.readDurable();
-      row = rows.find((r) => r.commandId === pending.commandId);
+      row = rows.find((r) => r.commandId === commandId);
     } catch {
-      pending.failures += 1;
-      if (pending.failures >= CLAIM_WAKE_MAX_FAILURES) {
-        this.clearPendingAcceptance();
-        this.onReadRecoveryExhausted?.();
-        return;
-      }
-      pending.handle = setTimeout(() => void this.attemptAcceptedProgress(), this.acceptanceRetryDelay(pending.failures));
+      // Re-read failed: keep the observation pending and retry the CAS.
+      this.bumpAcceptedRetry(commandId, pending.failures);
       return;
     }
+    // Row gone (retract/cleanup), re-issued to another epoch/lifetime, or
+    // already recorded by the single writer: terminal, stop quietly.
     if (
       !row ||
       row.issuerEpoch !== pending.issuerEpoch ||
       row.issuerLifetime !== pending.issuerLifetime ||
       row.progressRecorded
     ) {
-      this.clearPendingAcceptance();
+      this.clearPendingAcceptance(commandId);
       return;
     }
     let flipped = false;
     let casThrew = false;
     try {
-      flipped = await this.casProgressRecorded(pending.commandId, pending.issuerEpoch, pending.issuerLifetime);
+      flipped = await this.casProgressRecorded(commandId, pending.issuerEpoch, pending.issuerLifetime);
     } catch {
       flipped = false;
       casThrew = true;
     }
-    if (this.disposed || this.unloading || this.pendingAcceptance !== pending) return;
+    // The pending entry may have been cancelled (teardown) while the CAS ran.
+    if (this.disposed || this.unloading || this.pendingAcceptances.get(commandId) !== pending) return;
     if (flipped) {
       this.noteDeliveryProgress(pending.instanceId);
-      this.clearPendingAcceptance();
+      this.clearPendingAcceptance(commandId);
+      // A successful flip ALWAYS runs the epilogue — even if a concurrent
+      // observation armed another flush, the per-instance backoff was just
+      // cleared and the pending rows must be re-armed (gate 30 item 3).
       await this.deliveryEpilogue().catch(() => undefined);
       return;
     }
+    // A clean false means the durable row no longer matches (gone/re-issued/
+    // already recorded): stop. Only a genuine storage failure retries.
     if (!casThrew) {
-      this.clearPendingAcceptance();
+      this.clearPendingAcceptance(commandId);
       return;
     }
-    pending.failures += 1;
-    if (pending.failures >= CLAIM_WAKE_MAX_FAILURES) {
-      this.clearPendingAcceptance();
+    this.bumpAcceptedRetry(commandId, pending.failures);
+  }
+
+  private bumpAcceptedRetry(commandId: Id, failures: number) {
+    const next = failures + 1;
+    if (next >= CLAIM_WAKE_MAX_FAILURES) {
+      this.clearPendingAcceptance(commandId);
       this.onReadRecoveryExhausted?.();
       return;
     }
-    pending.handle = setTimeout(() => void this.attemptAcceptedProgress(), this.acceptanceRetryDelay(pending.failures));
+    this.scheduleAcceptedRetry(commandId, next);
   }
 
   private acceptanceRetryDelay(failures: number): number {
     return Math.min(CLAIM_WAKE_MAX_RETRY_MS, CLAIM_WAKE_BASE_RETRY_MS * 2 ** Math.max(0, failures - 1));
   }
 
-  private clearPendingAcceptance() {
-    if (this.pendingAcceptance?.handle) clearTimeout(this.pendingAcceptance.handle);
-    this.pendingAcceptance = null;
+  private clearPendingAcceptance(commandId: Id) {
+    const pending = this.pendingAcceptances.get(commandId);
+    if (pending?.handle) clearTimeout(pending.handle);
+    this.pendingAcceptances.delete(commandId);
   }
+
 
   /**
    * Durable acceptance compare-and-set (c-reconnfu gate 30 single-writer):

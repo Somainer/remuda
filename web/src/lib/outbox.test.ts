@@ -2228,3 +2228,66 @@ describe("Outbox", () => {
     });
   }
 });
+
+it("GATE30 item 3: two different commands fail their acceptance CAS back to back — both are retried per-command and recorded exactly once", async () => {
+  // Load/seed under REAL timers (MemStorage commits on a 1 ms chain timer).
+  const storage = new MemStorage();
+  const setup = await Outbox.load(storage, "owner_g30_i3");
+  const life = setup.lifetime;
+  await storage.put(rec({ commandId: "cmd_g30_x", instanceId: "ins_x", state: "sent", issuerEpoch: "ep", issuerLifetime: life }));
+  await storage.put(rec({ commandId: "cmd_g30_y", instanceId: "ins_y", state: "sent", issuerEpoch: "ep", issuerLifetime: life }));
+  vi.useFakeTimers();
+  try {
+    const box = setup;
+    // Both instances have independently hit the delivery cap.
+    box.noteDeliveryFailure("ins_x");
+    box.noteDeliveryFailure("ins_y");
+    box.isDeliveryExhausted("ins_x"); // touch
+    // Force exhaustion deterministically: drive the cap via failures is
+    // exercised elsewhere; here the latch matters after recovery, so mark via
+    // repeated failures.
+    for (let i = 0; i < CLAIM_WAKE_MAX_FAILURES; i += 1) {
+      box.noteDeliveryFailure("ins_x");
+      box.noteDeliveryFailure("ins_y");
+    }
+    expect(box.isDeliveryExhausted("ins_x")).toBe(true);
+    expect(box.isDeliveryExhausted("ins_y")).toBe(true);
+
+    // First CAS for EACH command fails once; later attempts commit.
+    const realCas = storage.casProgressRecorded.bind(storage);
+    const failedOnce = new Set<string>();
+    storage.casProgressRecorded = vi.fn(async (id: string, epoch: string, lifetime: string) => {
+      if (!failedOnce.has(id)) {
+        failedOnce.add(id);
+        throw new Error(`g30 i3 CAS aborted ${id}`);
+      }
+      return await realCas(id, epoch, lifetime);
+    });
+
+    box.retryAcceptedProgress("ins_x", "cmd_g30_x", "ep", life);
+    box.retryAcceptedProgress("ins_y", "cmd_g30_y", "ep", life);
+    // Bounded backoff: both chains run independently.
+    await vi.advanceTimersByTimeAsync(2_000);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const x = storage.map.get("cmd_g30_x");
+    const y = storage.map.get("cmd_g30_y");
+    expect(x?.progressRecorded).toBe(true);
+    expect(y?.progressRecorded).toBe(true);
+    // Each successful flip cleared its OWN instance's backoff/exhaustion.
+    expect(box.isDeliveryExhausted("ins_x")).toBe(false);
+    expect(box.isDeliveryExhausted("ins_y")).toBe(false);
+    // Exactly one committed CAS per command (one failure + one success each).
+    const calls = vi.mocked(storage.casProgressRecorded).mock.calls;
+    expect(calls.filter((c) => c[0] === "cmd_g30_x")).toHaveLength(2);
+    expect(calls.filter((c) => c[0] === "cmd_g30_y")).toHaveLength(2);
+
+    // No further retries after success.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(vi.mocked(storage.casProgressRecorded).mock.calls).toHaveLength(4);
+    box.dispose();
+  } finally {
+    vi.useRealTimers();
+  }
+});

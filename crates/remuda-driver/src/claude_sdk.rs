@@ -65,6 +65,155 @@ impl ClaudeSdkDriver {
     pub async fn kill(&self) -> DriverResult<DriverAck> {
         self.inner.kill().await
     }
+
+    /// Test-only (`test-stub`): re-exported so SDK tests can detect
+    /// publication saturation.
+    #[cfg(feature = "test-stub")]
+    pub async fn publication_is_saturated(&self) -> bool {
+        self.inner.publication_is_saturated().await
+    }
+
+    /// Test-only (`test-stub`): arm the per-driver write-commit barrier.
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub fn arm_write_commit_barrier(
+        &self,
+    ) -> crate::claude_print::test_barrier::WriteCommitBarrier {
+        self.inner.arm_write_commit_barrier()
+    }
+
+    /// Test-only (`test-stub`): force the terminal exit build to fail.
+    #[cfg(feature = "test-stub")]
+    pub fn force_exit_build_to_fail(&self) {
+        self.inner.force_exit_build_to_fail();
+    }
+
+    /// Test-only (`test-stub`): Weak to the driver's Inner for drop-leak tests.
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub fn weak_inner(&self) -> std::sync::Weak<crate::claude_print::Inner> {
+        self.inner.weak_inner()
+    }
+
+    /// Test-only (`test-stub`): force writer call `n`+ to fail (r7 items 2/5).
+    #[cfg(feature = "test-stub")]
+    pub fn force_write_failure_from(&self, n: usize) {
+        self.inner.force_write_failure_from(n);
+    }
+
+    /// Test-only (`test-stub`, r9 item 3; r12 item 3): real writer in-window
+    /// gate; the `live` acquisition is a named bounded wait.
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub async fn bounded_write_window(
+        &self,
+        timeout: std::time::Duration,
+    ) -> remuda_claude_wire::write_gate::WriteGate {
+        self.inner.bounded_write_window(timeout).await
+    }
+
+    /// Test-only (`test-stub`, r9 item 4; r12 item 3): ordered publication
+    /// fence receiver, enqueued under a named bounded wait.
+    #[cfg(feature = "test-stub")]
+    pub async fn bounded_publication_fence(
+        &self,
+        timeout: std::time::Duration,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        self.inner.bounded_publication_fence(timeout).await
+    }
+
+    /// Test-only (`test-stub`, r10 item 1; r12 item 3): hold the publication
+    /// mutex under a named bounded wait.
+    #[cfg(feature = "test-stub")]
+    pub async fn bounded_hold_publish_mutex_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> crate::claude_print::PublishMutexHold {
+        self.inner
+            .bounded_hold_publish_mutex_for_test(timeout)
+            .await
+    }
+
+    /// Test-only (`test-stub`, r10 item 3; r12 item 3): hold the `write_seq`
+    /// lock under a named bounded wait.
+    #[cfg(feature = "test-stub")]
+    pub async fn bounded_hold_write_seq_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> crate::claude_print::WriteSeqHold<'_> {
+        self.inner.bounded_hold_write_seq_for_test(timeout).await
+    }
+
+    /// Test-only (`test-stub`, r10 item 3): wait for mapped results via the
+    /// armed barrier slot, without owning the barrier handle.
+    #[cfg(feature = "test-stub")]
+    pub async fn test_wait_results_mapped(&self, n: usize, timeout: std::time::Duration) {
+        self.inner.test_wait_results_mapped(n, timeout).await;
+    }
+
+    /// Test-only (`test-stub`, r11 item 3): force the next Reserve ticket send
+    /// to fail while the publisher stays open (drives fail_without_ticket).
+    #[cfg(feature = "test-stub")]
+    pub fn force_reserve_send_failure_for_test(&self) {
+        self.inner.force_reserve_send_failure_for_test();
+    }
+
+    /// Test-only (`test-stub`, r11 item 3; r12 item 3): hold the mapper lock
+    /// under a named bounded wait.
+    #[cfg(feature = "test-stub")]
+    pub async fn bounded_hold_mapper_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> crate::claude_print::MapperMutexHold<'_> {
+        self.inner.bounded_hold_mapper_for_test(timeout).await
+    }
+
+    /// Test-only (`test-stub`, r11 item 3; r12 item 3): outstanding turn seqs
+    /// in the book, read under a named bounded wait.
+    #[cfg(feature = "test-stub")]
+    pub async fn bounded_outstanding_turn_seqs_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Vec<u64> {
+        self.inner
+            .bounded_outstanding_turn_seqs_for_test(timeout)
+            .await
+    }
+
+    /// Test-only (`test-stub`, r13 item 3): hold the `live` process handle
+    /// lock under a named bounded wait, so an overflow kill provably contends
+    /// with a holder and still lands.
+    #[cfg(feature = "test-stub")]
+    pub async fn bounded_hold_live_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> crate::claude_print::LiveMutexHold<'_> {
+        self.inner.bounded_hold_live_for_test(timeout).await
+    }
+
+    /// Test-only (`test-stub`, r12 item 1): shrink the publication backlog
+    /// caps so a regression can flood past the bound deterministically.
+    #[cfg(feature = "test-stub")]
+    pub fn set_publication_backlog_limits_for_test(&self, items: usize, bytes: usize) {
+        self.inner
+            .set_publication_backlog_limits_for_test(items, bytes);
+    }
+
+    /// Test-only (`test-stub`, r12 item 1): current/high-water backlog
+    /// occupancy and active caps.
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub fn publication_backlog_for_test(&self) -> crate::claude_print::BacklogSnapshot {
+        self.inner.publication_backlog_for_test()
+    }
+
+    /// Test-only (`test-stub`, r14 item 1): identity of the active launch's
+    /// backlog budget; a relaunch must show a fresh id.
+    #[cfg(feature = "test-stub")]
+    #[must_use]
+    pub fn active_backlog_id_for_test(&self) -> usize {
+        self.inner.active_backlog_id_for_test()
+    }
 }
 
 #[async_trait]
@@ -115,6 +264,15 @@ impl Driver for ClaudeSdkDriver {
 
     async fn close(&self) -> DriverResult<DriverAck> {
         self.inner.close().await
+    }
+
+    /// Forward the inner claude-print driver's own process-end evidence
+    /// (ma-sdk-state r5 item 4): without this the trait default always answers
+    /// false, so the Node treated a failed write against a live-but-gone child
+    /// as a control error rather than task loss and the claude_print override
+    /// was unreachable through the SDK carrier.
+    async fn process_gone(&self) -> bool {
+        self.inner.process_gone().await
     }
 
     /// Resume is a **new** process with `--resume <id>` ([D-026]); the exited

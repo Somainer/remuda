@@ -51,6 +51,14 @@ export type Instance = EntityMeta & {
   durableSeq: U64;
   exit: Knowledge<{ code: number | null; signal: string | null; observedAt: Timestamp }>;
   lastError?: string | null;
+  /**
+   * D-057 OA6 (ma-sdk-state): additive display marker for the most recent
+   * settled root-turn failure (e.g. an API 429 on the turn result) while the
+   * process stayed running. Never a lifecycle — the instance keeps running and
+   * the composer retries in place; the next turn start clears the marker.
+   * Status chrome may render `text`, never new controls.
+   */
+  lastTurnError?: { at: string; text: string };
   activityEvidenceEventIds?: Id[];
   cwd?: string | null;
   name?: string | null;

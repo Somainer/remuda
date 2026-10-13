@@ -286,6 +286,61 @@ pub fn routes() -> Router<AppState> {
 /// Test-only apply_result pre-read barrier. Every arrival parks AFTER its
 /// state/generation pre-read (while the row is still live) until the test
 /// releases it, so two real arrivals can be forced to both observe Running.
+/// r18 item 7 test-only arm/wait barrier between evidence persist and the
+/// settlement mutate.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-faults"))]
+pub struct SimpleBarrier {
+    armed: std::sync::atomic::AtomicBool,
+    parked: std::sync::atomic::AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+impl SimpleBarrier {
+    pub(crate) fn new() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            parked: std::sync::atomic::AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+    pub fn arm(&self) {
+        self.parked.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub(crate) async fn wait(&self) {
+        if !self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        self.parked
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
+        while self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            self.notify.notified().await;
+        }
+    }
+    pub async fn wait_parked(&self, n: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if self.parked.load(std::sync::atomic::Ordering::SeqCst) >= n {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "only {} arrivals parked (wanted {})",
+                self.parked.load(std::sync::atomic::Ordering::SeqCst),
+                n
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    pub fn release(&self) {
+        self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+}
+
 /// Latching Notify: a release before the park is not lost; every wait is
 /// bounded.
 #[doc(hidden)]
@@ -948,7 +1003,7 @@ async fn resolve_project_job(
     let expected_merge = request.expected_merge_sha.clone();
     let outcome = state
         .store
-        .mutate_gate_job(&job_id, move |row| {
+        .mutate_gate_job(&job_id, move |row, _conn| {
             if row.state != GateJobState::Landing || !row.landing_outcome_unknown {
                 return None;
             }
@@ -1161,7 +1216,7 @@ async fn finish_expired_cancels(state: &AppState) {
         }
         let finished = state
             .store
-            .mutate_gate_job(job.id.as_id().as_str(), |row| {
+            .mutate_gate_job(job.id.as_id().as_str(), |row, _conn| {
                 if row.state != GateJobState::Canceling || row.home_land_in_flight {
                     return None;
                 }
@@ -1495,7 +1550,7 @@ async fn fail_rpc_inner(state: &AppState, job_id: &str, expected_generation: u32
         .to_owned();
     let updated = state
         .store
-        .mutate_gate_job(job_id, move |row| {
+        .mutate_gate_job(job_id, move |row, _conn| {
             // Landing is an in-flight state: the grant already authorized the
             // push and the lane child may be mid-push. A gate.run RPC error or
             // timeout here cannot say the push failed (it may still complete),
@@ -1576,7 +1631,7 @@ pub(crate) async fn on_event(
         Kind::Step { step } => {
             let _ = state
                 .store
-                .mutate_gate_job(&job_id, move |row| {
+                .mutate_gate_job(&job_id, move |row, _conn| {
                     if row.state != GateJobState::Running && row.state != GateJobState::Canceling {
                         return None;
                     }
@@ -1815,6 +1870,11 @@ pub(crate) async fn apply_result(
             );
         }
     }
+    // r18 item 7 TEST-ONLY seam: park AFTER evidence persist but BEFORE the
+    // settlement mutate, so a concurrent writer can replace the linked log
+    // object to deterministically exercise the verdict↔evidence digest bind.
+    #[cfg(any(test, feature = "test-faults"))]
+    state.store.gate_after_persist_barrier().wait().await;
     // A `pushFrom: home` land verifies on the lane and is pushed by the home
     // host. The lane therefore reports `passed` for a land job; the job stays
     // `running` across the handoff so `remuda land` keeps waiting instead of
@@ -1849,7 +1909,7 @@ pub(crate) async fn apply_result(
     let non_authoritative_landing_writer = non_authoritative_landing.clone();
     let outcome = state
         .store
-        .mutate_gate_job(job_id, move |row| {
+        .mutate_gate_job(job_id, move |row, conn| {
             // The LIVE row is the authority. Running and Canceling are the
             // pre-grant states; Landing is the granted in-flight push whose
             // verdict (landed / failed / base-moved) settles the row below.
@@ -1979,6 +2039,42 @@ pub(crate) async fn apply_result(
                 row.finished_at = Some(now_ts());
                 match result.status.as_str() {
                     "landed" => {
+                        // r18 item 7: bind the winning landed verdict to ITS OWN
+                        // evidence, checked INSIDE this write transaction (so a
+                        // concurrent same-grant result that replaced the object
+                        // after this result persisted is observed). When this
+                        // verdict carries a run_log, the linked log object must
+                        // still hold that log's digest; otherwise the row stays
+                        // Landing. An identical dual delivery shares the digest.
+                        if let Some(object_id) = row
+                            .log_object_id
+                            .as_deref()
+                            .filter(|_| result.run_log.is_some())
+                        {
+                            let own_digest = crate::config::sha256_hex(
+                                &serde_json::to_vec(result.run_log.as_ref().expect("checked"))
+                                    .unwrap_or_default(),
+                            );
+                            let linked: Option<String> = conn
+                                .query_row(
+                                    "SELECT digest FROM gate_log_objects WHERE id = ?1",
+                                    params![object_id],
+                                    |r| r.get(0),
+                                )
+                                .optional()
+                                .unwrap_or(None)
+                                .flatten();
+                            if linked.as_deref() != Some(own_digest.as_str()) {
+                                tracing::info!(
+                                    object_id,
+                                    own_digest,
+                                    ?linked,
+                                    "dropping landed verdict: linked evidence is another result's \
+                                     log"
+                                );
+                                return None;
+                            }
+                        }
                         row.state = GateJobState::Landed;
                         row.error = None;
                     }
@@ -2336,7 +2432,7 @@ async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
     // finished (canceled or otherwise); never push it.
     let claimed = state
         .store
-        .mutate_gate_job(job_id, |row| {
+        .mutate_gate_job(job_id, |row, _conn| {
             if row.state != GateJobState::Running {
                 return None;
             }
@@ -2410,7 +2506,7 @@ async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
     let status = landed.status.clone();
     let outcome = state
         .store
-        .mutate_gate_job(job_id, move |row| {
+        .mutate_gate_job(job_id, move |row, _conn| {
             // Only a job the push still owns may be written here. Once it is
             // already terminal, nothing to do (its flag is already clear).
             if !matches!(row.state, GateJobState::Running | GateJobState::Canceling) {
@@ -2552,7 +2648,7 @@ async fn drop_job_refs(state: &AppState, job: &GateJob) {
     .await;
     let _ = state
         .store
-        .mutate_gate_job(job.id.as_id().as_str(), |row| {
+        .mutate_gate_job(job.id.as_id().as_str(), |row, _conn| {
             row.merge_ref = None;
             Some(())
         })
@@ -2703,7 +2799,7 @@ async fn run_then_hook(state: &AppState, job: &GateJob) {
     };
     if let Ok(Some(updated)) = state
         .store
-        .mutate_gate_job(job.id.as_id().as_str(), move |row| {
+        .mutate_gate_job(job.id.as_id().as_str(), move |row, _conn| {
             row.then_output = Some(output);
             Some(())
         })
@@ -2725,7 +2821,7 @@ pub(crate) async fn reconcile(state: &AppState) {
     {
         let _ = state
             .store
-            .mutate_gate_job(job.id.as_id().as_str(), |row| {
+            .mutate_gate_job(job.id.as_id().as_str(), |row, _conn| {
                 // The home push (if any) did not survive the restart: no task
                 // is holding it, so clear the marker or it would wedge the
                 // cancel grace forever on a re-queued or re-cancelable job.
@@ -3015,7 +3111,7 @@ async fn mark_landing_unknown(state: &AppState, job: &GateJob, note: &str) {
     let expected_attempts = job.attempts;
     let outcome = state
         .store
-        .mutate_gate_job(job.id.as_id().as_str(), move |row| {
+        .mutate_gate_job(job.id.as_id().as_str(), move |row, _conn| {
             if row.state != GateJobState::Landing || row.attempts != expected_attempts {
                 return None;
             }
@@ -3382,7 +3478,7 @@ impl Store {
         mutate: F,
     ) -> Result<Option<GateJob>, crate::store::StoreError>
     where
-        F: FnOnce(&mut GateJob) -> Option<()> + Send + 'static,
+        F: FnOnce(&mut GateJob, &rusqlite::Connection) -> Option<()> + Send + 'static,
     {
         let id = id.to_owned();
         // Test-only seam: a cancel request commits Running -> Canceling
@@ -3483,7 +3579,7 @@ impl Store {
             else {
                 return Ok(None);
             };
-            if mutate(&mut job).is_none() {
+            if mutate(&mut job, conn).is_none() {
                 return Ok(None);
             }
             let doc = serde_json::to_string(&job)?;

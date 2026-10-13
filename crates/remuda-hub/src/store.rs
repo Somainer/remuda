@@ -328,6 +328,9 @@ pub struct Store {
     /// Test-only barriers at the apply_result boundaries (r10 item 5).
     #[cfg(any(test, feature = "test-faults"))]
     gate_apply_barrier: Arc<crate::gatequeue::GateApplyBarrier>,
+    /// r18 item 7 test-only: park after evidence persist, before settlement.
+    #[cfg(any(test, feature = "test-faults"))]
+    gate_after_persist_barrier: Arc<crate::gatequeue::SimpleBarrier>,
     /// Per-Store test fault flags (`test-faults` feature only). Shared via
     /// [`Arc`] so every clone of the store arms the SAME flags.
     #[cfg(any(test, feature = "test-faults"))]
@@ -2425,6 +2428,8 @@ impl Store {
             #[cfg(any(test, feature = "test-faults"))]
             gate_apply_barrier: Arc::new(crate::gatequeue::GateApplyBarrier::new()),
             #[cfg(any(test, feature = "test-faults"))]
+            gate_after_persist_barrier: Arc::new(crate::gatequeue::SimpleBarrier::new()),
+            #[cfg(any(test, feature = "test-faults"))]
             faults: Arc::new(test_faults::FaultFlags::default()),
         })
     }
@@ -2659,6 +2664,12 @@ impl Store {
     #[cfg(any(test, feature = "test-faults"))]
     pub fn gate_apply_barrier(&self) -> &crate::gatequeue::GateApplyBarrier {
         &self.gate_apply_barrier
+    }
+
+    /// r18 item 7: post-evidence-persist barrier (test-only).
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn gate_after_persist_barrier(&self) -> &crate::gatequeue::SimpleBarrier {
+        &self.gate_after_persist_barrier
     }
 
     /// Test-only: consume (and clear) the armed insert fault.

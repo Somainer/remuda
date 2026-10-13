@@ -205,6 +205,10 @@ pub mod store_test_support {
     #[cfg(any(test, feature = "test-faults"))]
     pub use crate::gatequeue::GateApplyBarrier;
 
+    /// r18 item 7 test-only: post-evidence-persist barrier.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub use crate::gatequeue::SimpleBarrier;
+
     /// Test-only fault guard: arm failures on ONE store (per-Store flags,
     /// `test-faults` feature only) and clear them on drop, so a failed
     /// assertion can never leave a fault armed and other Stores are never
@@ -488,6 +492,37 @@ impl RunningHub {
         self.store.as_ref()
     }
 
+    /// Test helper: the live AppState (drives production handlers directly).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    #[must_use]
+    pub fn test_state(&self) -> &AppState {
+        &self.state
+    }
+
+    /// Test helper: apply a gate verdict straight through the production
+    /// `apply_result` handler on a borrowed AppState (for 'static spawn tasks).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn test_apply_gate_result_static(
+        state: &AppState,
+        job_id: &str,
+        result: serde_json::Value,
+    ) {
+        let result: remuda_protocol::GateRunResult =
+            serde_json::from_value(result).expect("valid GateRunResult");
+        // Same session resolution as test_apply_gate_result: present the
+        // verdict on the session the live dispatch rode.
+        let session = state
+            .store
+            .gate_job_dispatch_session(job_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| u64::try_from(v).ok());
+        crate::gatequeue::apply_result(state, job_id, result, session).await;
+    }
+
     /// Test helper: the boot epoch this Hub process allocated.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-faults"))]
@@ -657,7 +692,7 @@ impl RunningHub {
             .store()
             .ok_or_else(|| anyhow::anyhow!("hub store already closed"))?;
         let updated = store
-            .mutate_gate_job(job_id, move |row| {
+            .mutate_gate_job(job_id, move |row, _conn| {
                 if row.state != GateJobState::Landing {
                     return None;
                 }

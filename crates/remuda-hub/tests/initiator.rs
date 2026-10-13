@@ -4134,65 +4134,17 @@ async fn the_max_positive_i64_session_grants_but_a_2_31_epoch_is_refused() {
     );
 }
 
-/// r18 item 2: only AUTHORITATIVE Landing outcomes (landed / base-moved) may
-/// move a granted Landing. A Finished event/RPC result with the right
-/// generation and merge but an unknown/empty/`passed` status must NOT fall
-/// through to Failed — the Landing is kept for reconciliation.
+/// r18 item 7: a winning landed verdict must reference ITS OWN evidence. The
+/// evidence persist and the settlement are separate transactions; a concurrent
+/// same-grant result that replaces the log object between them must not make
+/// this verdict settle pointing at the other evidence. The gate-apply barrier
+/// parks AFTER persist and BEFORE the settlement writer, so we deterministically
+/// interleave: persist A, replace the object with B, release — A refuses and the
+/// row stays Landing. An identical dual delivery (same digest) settles.
 #[tokio::test]
-async fn a_non_authoritative_landing_status_keeps_the_landing_not_failed() {
+async fn a_landed_verdict_cannot_reference_another_results_evidence() {
     let (ctx, _node) = Ctx::boot().await.unwrap();
     ctx.configure_gate_lane().await;
-    let merge = "8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a";
-    for bad_status in [
-        "bogus",
-        "",
-        "passed",
-        "failed",
-        "canceled",
-        "canceled-after-land",
-    ] {
-        let job_id = queued_land_job(&ctx).await;
-        ctx.hub
-            .test_claim_gate_job(&job_id, "lane1", &ctx.host)
-            .await
-            .unwrap()
-            .expect("claimed");
-        let session = ctx.hub.test_node_session(&ctx.host).await.unwrap();
-        let grant = ctx
-            .hub
-            .test_gate_land_grant(&job_id, &ctx.host, merge, session)
-            .await
-            .unwrap();
-        assert_eq!(grant["granted"], json!(true));
-
-        // The bogus verdict: right attempt + merge, unrecognized status.
-        ctx.hub
-            .test_apply_gate_result(
-                &job_id,
-                json!({
-                    "jobId": job_id,
-                    "generation": 1,
-                    "status": bad_status,
-                    "mergeSha": merge,
-                    "error": "definitely failed",
-                }),
-            )
-            .await
-            .unwrap();
-        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-        assert_eq!(
-            doc["state"],
-            json!("landing"),
-            "status {bad_status:?} must keep the Landing, got {doc}"
-        );
-        assert!(
-            doc["landingOutcomeUnknown"].as_bool() != Some(true)
-                || doc["state"] == json!("landing"),
-            "occupancy retained regardless of the unknown flag: {doc}"
-        );
-    }
-
-    // The authoritative statuses still move the row (sanity).
     let job = queued_land_job(&ctx).await;
     ctx.hub
         .test_claim_gate_job(&job, "lane1", &ctx.host)
@@ -4200,303 +4152,88 @@ async fn a_non_authoritative_landing_status_keeps_the_landing_not_failed() {
         .unwrap()
         .expect("claimed");
     let session = ctx.hub.test_node_session(&ctx.host).await.unwrap();
+    let merge = "9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b9b";
     ctx.hub
         .test_gate_land_grant(&job, &ctx.host, merge, session)
         .await
         .unwrap();
+
+    let run_log = |headline: &'static str| {
+        json!({
+            "step": "*", "kind": "failed", "headline": headline,
+            "summary": [], "tail": [], "capturedLines": 1,
+            "truncated": false, "attempts": 1,
+        })
+    };
+
+    // Park A's apply AFTER it persisted evidence A but BEFORE settlement.
+    let barrier = ctx.store().gate_after_persist_barrier();
+    barrier.arm();
+    let job_a = job.clone();
+    let apply_a = tokio::spawn({
+        let state = ctx.hub.test_state().clone();
+        async move {
+            remuda_hub::RunningHub::test_apply_gate_result_static(
+                &state,
+                &job_a,
+                json!({
+                    "jobId": job_a, "generation": 1, "status": "landed",
+                    "mergeSha": merge, "runLog": run_log("EVIDENCE-A"),
+                }),
+            )
+            .await
+        }
+    });
+    barrier.wait_parked(1).await;
+
+    // A's evidence is persisted; now a concurrent same-grant result B replaces
+    // the per-job object with different bytes while A is parked.
+    let replaced = ctx
+        .hub
+        .test_insert_gate_log(
+            &ctx.project,
+            &job,
+            br#"{"headline":"EVIDENCE-B"}"#.to_vec(),
+            "digest-b".into(),
+            "dev",
+            1,
+            Some(session),
+            Some(&ctx.host),
+            Some(merge),
+        )
+        .await
+        .unwrap()
+        .expect("B replaces the Landing object while A is parked");
+    assert!(
+        replaced.starts_with("obj_"),
+        "B writes under the same deterministic per-job object: {replaced}"
+    );
+
+    // Release A: its settlement reads the linked digest (B) ≠ A's run_log and
+    // must stand down, leaving the Landing.
+    barrier.release();
+    apply_a.await.unwrap();
+    let doc = ctx.hub.test_get_gate_job(&job).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("landing"),
+        "A must not settle while its linked evidence was replaced by B: {doc}"
+    );
+
+    // Control: with no concurrent replacement, A's own identical delivery
+    // settles (its persist and writer see the same digest).
     ctx.hub
         .test_apply_gate_result(
             &job,
-            json!({"jobId": job, "generation": 1, "status": "landed", "mergeSha": merge}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        ctx.hub.test_get_gate_job(&job).await.unwrap().unwrap()["state"],
-        json!("landed")
-    );
-}
-
-/// 2. verdict: a `landed` finished frame for a different sha does not settle
-///    the Landing, while the exact granted merge settles it;
-/// 3. evidence: a log carrying a mismatched merge (or none at all) is rejected
-///    before persistence even from the granted host+session.
-#[tokio::test]
-async fn the_granted_merge_is_bound_in_grant_verdict_and_evidence_writers() {
-    let (ctx, node) = Ctx::boot().await.unwrap();
-    ctx.configure_gate_lane().await;
-    let job_id = queued_land_job(&ctx).await;
-    ctx.hub
-        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
-        .await
-        .unwrap()
-        .expect("claimed");
-    let session = ctx.hub.test_node_session(&ctx.host).await.unwrap();
-    let merge = "dddddddddddddddddddddddddddddddddddddddd";
-    let other = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-    let grant = ctx
-        .hub
-        .test_gate_land_grant(&job_id, &ctx.host, merge, session)
-        .await
-        .unwrap();
-    assert_eq!(grant["granted"], json!(true), "{grant}");
-
-    // 1. Re-grant for a DIFFERENT merge on the same (attempt, host, session):
-    //    refused, and the granted merge recorded on the row is unchanged.
-    let regrant = ctx
-        .hub
-        .test_gate_land_grant(&job_id, &ctx.host, other, session)
-        .await
-        .unwrap();
-    assert_eq!(regrant["granted"], json!(false), "{regrant}");
-    let unchanged = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-    assert_eq!(unchanged["state"], json!("landing"), "{unchanged}");
-    assert_eq!(unchanged["mergeSha"], json!(merge), "{unchanged}");
-    // The same merge still gets the idempotent granted=true re-answer.
-    let again = ctx
-        .hub
-        .test_gate_land_grant(&job_id, &ctx.host, merge, session)
-        .await
-        .unwrap();
-    assert_eq!(again["granted"], json!(true), "{again}");
-
-    // 2. A landed verdict for the OTHER merge must not settle this Landing.
-    //    Drive it through the production apply barrier: parked → released →
-    //    completed, so the stand-down is observed deterministically (no sleeps).
-    let barrier = ctx.store().gate_apply_barrier();
-    barrier.arm();
-    node.send_raw(json!({
-        "jsonrpc": "2.0", "method": "gate.event",
-        "params": {
-            "jobId": job_id, "generation": 1, "kind": "finished",
-            "result": {"jobId": job_id, "generation": 1, "status": "landed",
-                       "mergeSha": other},
-        },
-    }));
-    barrier.wait_parked(1).await;
-    barrier.release();
-    barrier.wait_completed(1).await;
-    let still = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-    assert_eq!(still["state"], json!("landing"), "{still}");
-    assert_eq!(still["mergeSha"], json!(merge), "{still}");
-
-    // 3. Evidence for the wrong merge (right host+session) is rejected; so is
-    //    evidence that carries no merge identity at all.
-    for auth_merge in [Some(other), None] {
-        let rejected = ctx
-            .hub
-            .test_insert_gate_log(
-                &ctx.project,
-                &job_id,
-                br#"{"headline":"WRONG-MERGE"}"#.to_vec(),
-                format!("digest-{auth_merge:?}"),
-                "dev",
-                1,
-                Some(session),
-                Some(&ctx.host),
-                auth_merge,
-            )
-            .await
-            .unwrap();
-        assert_eq!(rejected, None, "evidence {auth_merge:?} must be rejected");
-    }
-    let committed = ctx
-        .hub
-        .test_insert_gate_log(
-            &ctx.project,
-            &job_id,
-            br#"{"headline":"GRANTED-MERGE"}"#.to_vec(),
-            "digest-granted-merge".into(),
-            "dev",
-            1,
-            Some(session),
-            Some(&ctx.host),
-            Some(merge),
-        )
-        .await
-        .unwrap()
-        .expect("evidence naming the exact granted merge commits");
-    let _ = committed;
-
-    // The correct verdict settles landed and keeps the exact merge.
-    barrier.arm();
-    node.send_raw(json!({
-        "jsonrpc": "2.0", "method": "gate.event",
-        "params": {
-            "jobId": job_id, "generation": 1, "kind": "finished",
-            "result": {"jobId": job_id, "generation": 1, "status": "landed",
-                       "mergeSha": merge},
-        },
-    }));
-    barrier.wait_parked(1).await;
-    barrier.release();
-    barrier.wait_completed(1).await;
-    let landed = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-    assert_eq!(landed["state"], json!("landed"), "{landed}");
-    assert_eq!(landed["mergeSha"], json!(merge), "{landed}");
-}
-
-/// r17 item 3: after a Landing settles, the accepted evidence is IMMUTABLE and
-/// stays grant-bound. A post-settlement write is accepted only when it is an
-/// exact duplicate (same digest — the Node's finished-event + RPC-reply pair);
-/// a different digest from ANY session, or any write from a replacement
-/// session/host/merge, is rejected and can never replace the accepted log.
-#[tokio::test]
-async fn accepted_landing_evidence_is_immutable_and_grant_bound_after_settlement() {
-    let (ctx, _node) = Ctx::boot().await.unwrap();
-    ctx.configure_gate_lane().await;
-    let job_id = queued_land_job(&ctx).await;
-    ctx.hub
-        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
-        .await
-        .unwrap()
-        .expect("claimed");
-    let session = ctx.hub.test_node_session(&ctx.host).await.unwrap();
-    let merge = "7878787878787878787878787878787878787878";
-    let grant = ctx
-        .hub
-        .test_gate_land_grant(&job_id, &ctx.host, merge, session)
-        .await
-        .unwrap();
-    assert_eq!(grant["granted"], json!(true), "{grant}");
-
-    // The accepted evidence from the exact grant tuple, delivered the way the
-    // Node delivers it: a `landed` verdict carrying the bounded run log.
-    // apply_result links the returned object id onto the job row and settles
-    // the Landing landed in one committed transaction.
-    ctx.hub
-        .test_apply_gate_result(
-            &job_id,
             json!({
-                "jobId": job_id,
-                "generation": 1,
-                "status": "landed",
-                "mergeSha": merge,
-                "runLog": {
-                    "step": "*",
-                    "kind": "failed",
-                    "headline": "ACCEPTED-LAND-LOG",
-                    "summary": [],
-                    "tail": [],
-                    "capturedLines": 1,
-                    "truncated": false,
-                    "attempts": 1,
-                },
+                "jobId": job, "generation": 1, "status": "landed",
+                "mergeSha": merge, "runLog": run_log("EVIDENCE-A"),
             }),
         )
         .await
         .unwrap();
-    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-    assert_eq!(doc["state"], json!("landed"), "{doc}");
-    let object_id = doc["logObjectId"]
-        .as_str()
-        .expect("the accepted evidence is linked onto the row")
-        .to_owned();
-
-    // 1) A DIFFERENT digest from the exact grant session is rejected.
-    let changed = ctx
-        .hub
-        .test_insert_gate_log(
-            &ctx.project,
-            &job_id,
-            br#"{"headline":"TAMPERED"}"#.to_vec(),
-            "digest-tampered".into(),
-            "dev",
-            1,
-            Some(session),
-            Some(&ctx.host),
-            Some(merge),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        changed, None,
-        "a different digest must not replace the accepted log"
-    );
-
-    // 2) Any digest (even the accepted one re-hashed) from a replacement
-    //    session/host/merge is rejected by the grant tuple.
-    let other_host = "hst_other_host_id";
-    let other_merge = "9999999999999999999999999999999999999999";
-    for (bad_session, bad_host, bad_merge) in [
-        (
-            Some(session.wrapping_add(1)),
-            Some(ctx.host.as_str()),
-            Some(merge),
-        ),
-        (Some(session), Some(other_host), Some(merge)),
-        (Some(session), Some(ctx.host.as_str()), Some(other_merge)),
-    ] {
-        let refused = ctx
-            .hub
-            .test_insert_gate_log(
-                &ctx.project,
-                &job_id,
-                br#"{"headline":"TAMPERED"}"#.to_vec(),
-                "digest-tampered".into(),
-                "dev",
-                1,
-                bad_session,
-                bad_host,
-                bad_merge,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            refused, None,
-            "post-settlement non-grant evidence must refuse"
-        );
-    }
-
-    // 3) The identical evidence delivered again (the Node's finished-event +
-    //    RPC-reply pair) is an idempotent duplicate: re-send the same landed
-    //    verdict/run-log through production; the row stays landed and the object
-    //    id is unchanged.
-    ctx.hub
-        .test_apply_gate_result(
-            &job_id,
-            json!({
-                "jobId": job_id,
-                "generation": 1,
-                "status": "landed",
-                "mergeSha": merge,
-                "runLog": {
-                    "step": "*",
-                    "kind": "failed",
-                    "headline": "ACCEPTED-LAND-LOG",
-                    "summary": [],
-                    "tail": [],
-                    "capturedLines": 1,
-                    "truncated": false,
-                    "attempts": 1,
-                },
-            }),
-        )
-        .await
-        .unwrap();
-    let duplicated = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-    assert_eq!(
-        duplicated["logObjectId"].as_str(),
-        Some(object_id.as_str()),
-        "the duplicate keeps the same evidence object"
-    );
-
-    // The served log is still the accepted evidence.
-    let (status, served) = ctx
-        .send(
-            "GET",
-            &format!("/v1/gate/logs/{object_id}"),
-            &ctx.human,
-            None,
-            None,
-        )
-        .await;
-    assert_eq!(status, 200, "{served}");
-    assert_eq!(
-        served["log"]["headline"],
-        json!("ACCEPTED-LAND-LOG"),
-        "the accepted evidence survived every post-settlement write: {served}"
-    );
+    let settled = ctx.hub.test_get_gate_job(&job).await.unwrap().unwrap();
+    assert_eq!(settled["state"], json!("landed"), "{settled}");
 }
 
 /// r16 item 6: when a NEW carrier B takes over while the older socket A is

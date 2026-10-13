@@ -1197,12 +1197,13 @@ const WINNING_TURN_ROWS_SQL: &str = "SELECT * FROM (
 /// lineages share the same native turn time, so the window never counts the
 /// same model call twice.
 ///
-/// Ranking runs over ALL native rows per scope id BEFORE the window predicate
-/// (c-ctxusage r17 item 5): a winner accepted with a divergent per-lineage
-/// timestamp must be kept or dropped as a whole on ITS OWN observed_at.
-/// Filtering inside the ranking CTE hid the true winner when it landed
-/// outside the window and let the superseded in-window lineage's row win and
-/// be counted.
+/// Ranking runs over ALL rows (native AND ingest-provenance) per scope id
+/// BEFORE native-time eligibility and the window predicate (c-ctxusage r17
+/// item 5 / r22 item 1): rank every lineage row, keep rn = 1, and only THEN
+/// apply `observed_at_source = 'native'` and `observed_at >= since`. Filtering
+/// on provenance INSIDE the ranking excluded a newer accepted winning lineage
+/// that carries an ingest (journal-seq) timestamp, so an older superseded
+/// native-time lineage wrongly won inside the window and was counted.
 fn sum_turn_tokens_since(
     conn: &Connection,
     instance_id: &str,
@@ -1210,17 +1211,16 @@ fn sum_turn_tokens_since(
 ) -> rusqlite::Result<(Option<i64>, Option<i64>)> {
     conn.query_row(
         "WITH ranked AS (
-            SELECT input_tokens, output_tokens, observed_at,
+            SELECT input_tokens, output_tokens, observed_at, observed_at_source,
                    ROW_NUMBER() OVER (
                        PARTITION BY scope_id ORDER BY seq DESC, rowid DESC
                    ) AS rn
             FROM usage_events
             WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NOT NULL
-              AND observed_at_source = 'native'
          ),
          window_turns AS (
              SELECT input_tokens, output_tokens FROM ranked
-             WHERE rn = 1 AND observed_at >= ?2
+             WHERE rn = 1 AND observed_at_source = 'native' AND observed_at >= ?2
              UNION ALL
              SELECT input_tokens, output_tokens FROM usage_events
              WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NULL
@@ -2309,6 +2309,74 @@ mod tests {
             "context comes from the newest winner; the superseded in-window \
              turn-a lineage must not supply a 100 context"
         );
+    }
+
+    /// c-ctxusage r22 item 1: rank EVERY lineage row (native AND ingest
+    /// provenance) before native-time eligibility. A newer accepted winner
+    /// carrying an INGEST timestamp (a replay landed at journal seq) must
+    /// supersede an older native-time lineage; that older in-window native row
+    /// must not be counted, and the ingest-time winner itself is excluded
+    /// (rate windows trust native time only).
+    #[test]
+    fn an_ingest_time_winner_supersedes_the_native_lineage_in_tpm() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let mut lineage_turn = |seq: i64,
+                                scope_id: &str,
+                                lineage: &str,
+                                input: i64,
+                                output: i64,
+                                stamp: String,
+                                source: &str| {
+            UsageEventRow {
+                instance_id: "ins_tpm_prov".into(),
+                seq,
+                profile_id: None,
+                model: Some("m".into()),
+                scope: "turn".into(),
+                scope_id: Some(scope_id.into()),
+                mode: "snapshot".into(),
+                metric_revision: 1,
+                source_session_id: Some(lineage.into()),
+                total_tokens: Some(input + output),
+                input_tokens: Some(input),
+                output_tokens: Some(output),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                cost_usd: None,
+                accounting: "estimated".into(),
+                observed_at: stamp,
+                observed_at_source: source.into(),
+            }
+        };
+
+        // A: older native-time row (seq 1, 100/10, 10 s ago, native) is
+        // superseded by a NEWER accepted frame (seq 2, 200/20) whose time is
+        // the journal ingest time — 20 s ago, ingest provenance.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &lineage_turn(1, "turn-a", "alpha", 100, 10, ago(10), "native")
+            )
+            .unwrap()
+        );
+        assert!(
+            insert_usage_event(
+                &conn,
+                &lineage_turn(2, "turn-a", "beta", 200, 20, ago(20), "ingest")
+            )
+            .unwrap()
+        );
+
+        let rollup = rollup_instance(&conn, "ins_tpm_prov", "claude", Some("m"))
+            .unwrap()
+            .unwrap();
+        // The superseded native alpha row must NOT be resurrected: its 100
+        // input / 10 output never enter the 60 s window.
+        assert_eq!(rollup.tpm_in_60s, None, "no native-time winner contributes");
+        assert_eq!(rollup.tpm_out_60s, None);
+        assert_eq!(rollup.tpm_in_5m, None);
+        assert_eq!(rollup.tpm_out_5m, None);
     }
 
     /// U1 (c-ctxusage r17 item 6), turn context basket: the newest call's

@@ -14,6 +14,16 @@ import type { Id, U64 } from "../types/wire";
 import type { PromptMode } from "../types/generated";
 import type { Workspace, WorkspaceSnapshot } from "../types/workspace";
 import type { AttachmentRef } from "./attachments";
+
+/**
+ * c-reconnfu gate 35 DELIVERY TOKEN: identity captured once at the start of a
+ * send / lock turn / fallback and validated synchronously before any POST.
+ */
+type DeliveryToken = {
+  box: Outbox;
+  authGen: number;
+  transitionSeq: number;
+};
 import { mapWorkspace, mergeHostWorkspaces } from "../features/workspaces/registry";
 import {
   api,
@@ -1174,6 +1184,42 @@ class HubStore {
    */
   private authGen = 0;
   /**
+   * Monotonic id of the current/most-recent credential transition
+   * (c-reconnfu gate 35). Incremented when a transition ACQUIRES ownership
+   * (inside the serialized chain). A delivery token captures the seq at turn
+   * start; tokenLive fails once a newer transition exists.
+   */
+  private transitionSeq = 0;
+  /**
+   * DELIVERY TOKEN (c-reconnfu gate 35). Captured ONCE at the start of every
+   * send / lock turn / fallback and never re-read inside a delivery. The
+   * synchronous validator {@link tokenLive} confirms the continuation is still
+   * on the same box, auth generation and transition sequence with no open
+   * transition; a stale token produces a "stale" result that ends the whole
+   * lock turn (never "skip and continue") so a continuation can never POST
+   * under a replacement identity.
+   */
+  private deliveryToken(box: Outbox): DeliveryToken {
+    return { box, authGen: this.authGen, transitionSeq: this.transitionSeq };
+  }
+  private tokenLive(t: DeliveryToken): boolean {
+    return (
+      t.box === this.outbox &&
+      !t.box.isDisposed() &&
+      t.authGen === this.authGen &&
+      t.transitionSeq === this.transitionSeq &&
+      this.authTransition === null
+    );
+  }
+  /**
+   * Fallback (storage-unavailable) token check (c-reconnfu gate 35 item 5):
+   * there is no box to compare, so validate only the generation/transition
+   * captured before the async availability check.
+   */
+  private fallbackTokenLive(gen: number, seq: number, wasOpen: boolean): boolean {
+    return gen === this.authGen && seq === this.transitionSeq && !wasOpen && this.authTransition === null;
+  }
+  /**
    * Auth-transition blocker (c-reconnfu gate 34 Fence A). While a credential
    * request is in flight (its response sets the new cookie in HEADERS before
    * the body parses), outbox initialization/delivery must be held so the old
@@ -1201,35 +1247,85 @@ class HubStore {
    * fresh Outbox with a new lifetime.
    */
   private applyAuthIdentityChange() {
+    // Bump the auth generation and dispose the current outbox. A credential
+    // transition ALSO bumps transitionSeq (in runAuthTransition); non-request
+    // changes (logout/401/peer) bump the generation here so their generation
+    // invalidates in-flight initializers even though no credential transition
+    // blocker is open.
     this.authGen += 1;
     this.disposeOutboxForAuthChange();
   }
 
   /**
-   * FENCE A (c-reconnfu gate 34 item 3): wrap a credential-establishing
-   * request (bootstrap login, pairing, passkey finish). Disposes the current
-   * outbox and installs a transition blocker BEFORE the request is issued
-   * (the Hub sets the new cookie in response headers, ahead of the body);
-   * runs `issue` (which writes the session only on success); then releases the
-   * blocker whether the body succeeded, rejected or threw — a failed body
-   * leaves no new identity, but the disposed old box is simply re-initialized
-   * by the next ensureOutbox after release.
+   * Serialized transition chain tail (c-reconnfu gate 35 item 2). Overlapping
+   * credential requests cannot bypass Fence A.
    */
-  private async runAuthTransition<T>(issue: () => Promise<T>): Promise<T> {
-    this.applyAuthIdentityChange();
-    // Coalesce: if a transition is already open, await it before starting.
-    if (this.authTransition) await this.authTransition;
-    this.authTransition = new Promise<void>((resolve) => {
-      this.resolveAuthTransition = resolve;
-    });
-    try {
-      return await issue();
-    } finally {
-      const resolve = this.resolveAuthTransition;
-      this.resolveAuthTransition = null;
-      this.authTransition = null;
-      resolve?.();
-    }
+  private authTransitionChain: Promise<void> = Promise.resolve();
+  /** Monotonic sequence shared by all transition acquisitions (c-reconnfu gate 35). */
+  /**
+   * FENCE A (c-reconnfu gate 34/35): wrap a credential-establishing request.
+   * Serialized — a second login queues behind the first and only disposes/bumps
+   * (its own seq) once it acquires the chain after the first settles. While a
+   * transition is open, outbox initialization and delivery are blocked by the
+   * delivery token + ensureOutbox. The blocker releases in finally on success,
+   * rejection or body error; gate-35 item 1 then runs current-generation
+   * initialization in that finalizer (when this transition still owns it).
+   */
+  /**
+   * Run a serialized credential transition. Resolves with
+   * `{ result, superseded }` — superseded is true when a NEWER transition
+   * acquired before this one finished (its caller must skip its own post-login
+   * bootstrap: the newer transition owns initialization and would deadlock if
+   * the older caller waited on the newer body).
+   */
+  private async runAuthTransition<T>(
+    issue: () => Promise<T>,
+  ): Promise<{ result: T; superseded: boolean }> {
+    // Capture the sequence this transition will own; increment only AFTER
+    // acquiring the chain (queued transitions must not supersede the current
+    // one before the current body settles).
+    const mySeq = this.transitionSeq + 1;
+    // Link onto the chain and publish the tail BEFORE awaiting so the next
+    // caller queues behind this run.
+    const run = async (prev: Promise<void>): Promise<{ result: T; superseded: boolean }> => {
+      await prev;
+      this.transitionSeq = mySeq;
+      // This transition now owns the identity change: dispose the current box
+      // and bump the auth generation (seq already advanced).
+      this.applyAuthIdentityChange();
+      this.authTransition = new Promise<void>((resolve) => {
+        this.resolveAuthTransition = resolve;
+      });
+      let result: T;
+      let thrown: unknown;
+      try {
+        result = await issue();
+      } catch (err) {
+        thrown = err;
+      } finally {
+        // Release the blocker. Run current-generation initialization in the
+        // finalizer (gate 35 item 1) only if NO newer transition acquired —
+        // the newer one owns the chain and initialization then.
+        const resolve = this.resolveAuthTransition;
+        this.resolveAuthTransition = null;
+        this.authTransition = null;
+        resolve?.();
+        const superseded = this.transitionSeq !== mySeq;
+        if (!superseded) void this.ensureOutbox().catch(() => undefined);
+        if (thrown !== undefined) throw thrown;
+      }
+      return { result: result!, superseded: this.transitionSeq !== mySeq };
+    };
+    // Snapshot the previous chain SYNCHRONOUSLY and publish the new tail
+    // before run's body microtask executes — so run awaits the PREVIOUS chain,
+    // never itself, and the next caller queues onto this run.
+    const prev = this.authTransitionChain;
+    const resultPromise = run(prev);
+    this.authTransitionChain = resultPromise.then(
+      () => undefined,
+      () => undefined,
+    );
+    return resultPromise;
   }
 
 
@@ -1287,13 +1383,17 @@ class HubStore {
    *    id as its dedupe id.
    */
   private async ensureOutbox(): Promise<"ok" | "obsolete" | "unavailable"> {
-    if (this.outbox) return "ok";
-    // Fence A (c-reconnfu gate 34 item 3): do not initialize while a
-    // credential transition is open — the new cookie is already live in
-    // headers but its body has not settled, and any box we install now could
-    // retry old rows under the new identity. Wait for the transition to settle,
-    // then initialize under the current generation.
-    if (this.authTransition) await this.authTransition;
+    // c-reconnfu gate 35 item 2: LOOP while any credential transition is open.
+    // Overlapping logins are serialized: each release can be followed by a
+    // queued transition acquiring, so re-await until the chain fully settles.
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      if (this.outbox) return "ok";
+      const open = this.authTransition;
+      if (!open) break;
+      // eslint-disable-next-line no-await-in-loop
+      await open;
+    }
     if (this.outbox) return "ok";
     return this.startOutboxInit();
   }
@@ -1313,7 +1413,9 @@ class HubStore {
         if (this.outboxOpenGateForTest) {
           await new Promise<void>((resolve) => this.outboxOpenGateForTest?.(resolve));
         }
-        const opened = await openOutboxStorage();
+        const opened = this.forceUnavailableStorageForTest
+          ? await Promise.reject(new Error("test: storage unavailable"))
+          : await openOutboxStorage();
         // Auth changed while the storage backend was opening: report OBSOLETE,
         // not unavailable — storage is fine, the current generation owns it.
         if (obsolete() || !this.outboxInit) {
@@ -2826,6 +2928,11 @@ class HubStore {
   }
   /** Gate the Outbox.load step (second suspension point) for gate-34 item 5. */
   private outboxLoadGateForTest: ((resolve: () => void) => void) | null = null;
+  /** Test seam: make outbox storage-open fail (gate-35 item 5 fallback). */
+  private forceUnavailableStorageForTest = false;
+  setForceUnavailableStorageForTest(v: boolean): void {
+    this.forceUnavailableStorageForTest = v;
+  }
   setOutboxLoadGateForTest(gate: ((resolve: () => void) => void) | null): void {
     this.outboxLoadGateForTest = gate;
   }
@@ -3162,14 +3269,11 @@ class HubStore {
     const box = this.outbox;
     if (!box) return;
     if (this.pageIsUnloading) return;
-    // c-reconnfu gate 21 item 1: every pass's suppression is SCOPED to this
-    // flush via reference-counted tokens (an overlapping flush keeps its own
-    // cover), and the finally ALWAYS ends in a fresh authoritative
-    // reconciliation — a pass that posted nothing (its lock request rejected,
-    // a claim aborted, or a sibling held the lock past the bounded recovery
-    // read) used to leave deliverable rows with no wake at all: the recovery
-    // read ran while the pass still suppressed them and the old finally only
-    // cleared the suppression set.
+    // c-reconnfu gate 35 DELIVERY TOKEN: capture the box/generation/transition
+    // identity ONCE for the whole flush; every lock turn and POST validates
+    // against it instead of re-reading this.outbox. A stale token ends the
+    // flush.
+    const token = this.deliveryToken(box);
     const passTokens: number[] = [];
     try {
       // Drain passes; each pass acquires the lock, posts at most the FIRST
@@ -3182,6 +3286,10 @@ class HubStore {
         // the stale continuation must not read, lock or POST through the new
         // auth epoch. Stop here; the finally releases the tokens on the
         // ISSUING (now disposed) box and never reconciles the new one.
+        // c-reconnfu gate 35: the delivery token must still be live before
+        // EACH lock turn (not just at flush start); a transition that acquired
+        // mid-flush ends the whole flush — the captured box never proceeds.
+        if (!this.tokenLive(token)) return;
         if (this.outbox !== box) return;
         if (this.pageIsUnloading) return;
         // Pick the instance locks from FRESH durable rows, not the load-time
@@ -3220,6 +3328,7 @@ class HubStore {
           try {
             const id = await box.withInstanceLock(instanceId, (iid, deliverable) =>
               this.deliverOneRow(
+                token,
                 iid,
                 deliverable.filter(
                   (r) =>
@@ -3233,6 +3342,9 @@ class HubStore {
                 { skipCurrentlyHeld },
               ),
             );
+            // c-reconnfu gate 35 item 3: a stale lock turn ends the whole
+            // flush immediately (no later command through the new box).
+            if (id === "stale") return;
             if (id) {
               attempted.add(id);
               deliveredNew = true;
@@ -3298,12 +3410,12 @@ class HubStore {
    * or null when no candidate POSTed.
    */
   private async deliverOneRow(
+    token: DeliveryToken,
     instanceId: Id,
     deliverable: OutboxRecord[],
     opts: { skipCurrentlyHeld?: boolean } = {},
-  ): Promise<Id | null> {
-    const box = this.outbox;
-    if (!box) return null;
+  ): Promise<Id | null | "stale"> {
+    const box = token.box;
     for (const rec of deliverable) {
       const fresh = box.get(rec.commandId) ?? rec;
       if (!isDeliverableOutbox(fresh, Date.now())) continue;
@@ -3313,10 +3425,11 @@ class HubStore {
       // changing the row concurrently; this keeps the policy attached to the
       // exact row whose claim is about to be written.
       if (opts.skipCurrentlyHeld && fresh.state === "held") continue;
-      const outcome = await this.deliverOutboxRecord(fresh);
-      if (outcome === "claim-aborted") {
-        // FIFO: the first deliverable row could not claim; never POST a later
-        // row ahead of it. End the turn; the row keeps its place and retries.
+      const outcome = await this.deliverOutboxRecord(token, fresh);
+      if (outcome === "stale" || outcome === "claim-aborted") {
+        // FIFO: the first deliverable row could not be delivered; a STALE
+        // token (auth change) or aborted claim ENDS THE WHOLE LOCK TURN — never
+        // POST a later row under the old identity/lease.
         return null;
       }
       if (!outcome) continue;
@@ -3510,17 +3623,6 @@ class HubStore {
   }
 
   /**
-   * Fence B synchronous check (c-reconnfu gate 34 item 2): a delivery that
-   * captured `originBox` before an await must still be running on the LIVE,
-   * non-disposed, current outbox at the instant before it POSTs. Auth
-   * transitions dispose the old box and null this.outbox, so a stale
-   * continuation fails this and never POSTs under the new credentials.
-   */
-  private deliveryFenceStale(originBox: Outbox): boolean {
-    return this.outbox !== originBox || originBox.isDisposed();
-  }
-
-  /**
    * The SINGLE acceptance-progress boundary (c-reconnfu gate 26/27; gate 28
    * replaces the in-memory books with durable row state): progress is a
    * property of the HUB'S ACCEPTANCE of a command, not of which local path
@@ -3613,15 +3715,16 @@ class HubStore {
    * settled by GET under a bounded deadline.
    *
    * Returns true when a POST ran, false when the row is gone/terminal (safe to
-   * skip), or `"claim-aborted"` when the first row still exists but could not
-   * be claimed this turn (storage abort, foreign live lease) — the caller must
-   * preserve FIFO and not POST a later row first (gate 6 item 4b).
+   * skip), `"claim-aborted"` when the first row still exists but could not be
+   * claimed this turn, or `"stale"` (c-reconnfu gate 35) when the delivery
+   * token's box/generation/transition is no longer current — the caller must
+   * end the whole lock turn.
    */
   private async deliverOutboxRecord(
+    token: DeliveryToken,
     current0: OutboxRecord,
-  ): Promise<boolean | "claim-aborted"> {
-    const box = this.outbox;
-    if (!box) return false;
+  ): Promise<boolean | "claim-aborted" | "stale"> {
+    const box = token.box;
     const commandId = current0.commandId;
     if (!withinRetryWindow(current0)) {
       await this.safePatch(commandId, { state: "unknown", lastError: "retry window exhausted" });
@@ -3729,19 +3832,26 @@ class HubStore {
     // directly regardless of the latch. A journal "done" already returned at
     // the claim checks above, so the only acceptance here is the sent verdict.
     let accepted = false;
+    let stale = false;
 
     try {
-      // FENCE B (c-reconnfu gate 34 item 2): SYNCHRONOUS guard immediately
-      // before the POST, with no await between the check and api.instanceSend.
-      // This delivery captured `box` before its (possibly long) claim await;
-      // an auth change in that window disposes the box and replaces
-      // this.outbox — the new cookie must never be used by L1's continuation.
-      // On mismatch: no POST; keep the row (its live lease is released below
-      // in finally) so the current-generation box's legitimate recovery
-      // claims and delivers it once.
-      if (this.deliveryFenceStale(box)) {
-        box.endActiveDelivery(commandId);
-        return false;
+      // FENCE B / DELIVERY TOKEN (c-reconnfu gate 34 item 2, gate 35 item 3/4):
+      // SYNCHRONOUS guard immediately before the POST, with no await between
+      // the check and api.instanceSend. A stale token (box disposed/replaced,
+      // generation or transition sequence moved, or a transition open) ends
+      // the whole lock turn with a "stale" result.
+      //
+      // Item 4: the committed claim incremented attempts and put an inflight
+      // lease on C. Restore the pre-claim retryable state and attempt count
+      // and clear the lease — but ONLY while the stored claim token still
+      // matches THIS aborted attempt (never undo a newer delivery's claim);
+      // then leave recovery to the current box (the flush finalizer/next
+      // trigger). C remains retryable at the SAME attempt number and is
+      // delivered once, not flipped to "unknown" at the boundary.
+      if (!this.tokenLive(token)) {
+        await this.restoreAfterStaleClaim(token, commandId, claimToken, current0);
+        stale = true;
+        return "stale";
       }
       const result = await api.instanceSend(
         current0.instanceId,
@@ -3810,13 +3920,40 @@ class HubStore {
       // c-reconnfu gate 23 item 3 / gate 24 item 1 / gate 26: the shared POST
       // boundary routes through the single acceptance helper — only a
       // Hub-ACCEPTED verdict clears the per-instance backoff/exhaustion and
-      // re-runs the delivery epilogue; rejected/held/failed/uncertain outcomes
-      // leave the latch exactly as they found it.
+      // re-runs the delivery epilogue; rejected/held/failed/uncertain/stale
+      // outcomes leave the latch exactly as they found it.
       if (accepted) void this.recordAcceptedDelivery(current0.instanceId, commandId, box);
     }
+    // A stale turn already restored the row and returned; skip the normal
+    // post-POST bookkeeping (the current box owns recovery).
+    if (stale) return "stale";
     this.syncBubbleFromOutbox(commandId);
     if (!box.pendingFor(current0.instanceId).length) this.clearOutboxRetry(current0.instanceId);
     return true;
+  }
+
+  /**
+   * Restore the pre-claim retryable state after a STALE delivery token
+   * (c-reconnfu gate 35 item 4). The committed claim wrote state=inflight,
+   * attempts+1 and a live lease carrying `claimToken`. Undo those so the row
+   * is retryable again at the SAME attempt number, but only while the stored
+   * row still carries THIS attempt's claimToken — a newer delivery that won
+   * the lease in between must never be reverted.
+   */
+  private async restoreAfterStaleClaim(
+    token: DeliveryToken,
+    commandId: Id,
+    claimToken: Id,
+    current0: OutboxRecord,
+  ): Promise<void> {
+    const priorAttempts = current0.attempts;
+    const priorState: OutboxState = current0.state === "held" ? "held" : "pending";
+    // The issuing (now disposed) box still owns its storage handle. The
+    // conditional merge (claim-token guarded in the Outbox) reverts
+    // inflight/attempts/lease ONLY if no newer delivery won the row.
+    await token.box
+      .restoreClaimIfTokenMatches(commandId, claimToken, priorState, priorAttempts)
+      .catch(() => undefined);
   }
 
   private bubbleFromOutbox(r: OutboxRecord): LocalBubble {
@@ -4013,7 +4150,7 @@ class HubStore {
     // Fence A: dispose + block init BEFORE the credential request (the new
     // cookie lands in response headers); write the session only after the body
     // resolves, then bootstrap. A body failure still releases the blocker.
-    const session = await this.runAuthTransition(() =>
+    const { result: session, superseded } = await this.runAuthTransition(() =>
       kind === "pair"
         ? api.pairRedeem(secret, deviceName)
         : api.login(secret, deviceName),
@@ -4021,7 +4158,9 @@ class HubStore {
     writeSession(session, { mock: api.mock });
     // bootstrap marks the session authenticated after cookie-backed reads finish.
     this.emit({ session: readSession(), error: null });
-    await this.bootstrap();
+    // A newer overlapping login acquired (or opened in the microtask gap):
+    // it owns bootstrap — waiting on its still-open body would deadlock.
+    if (!superseded && !this.authTransition) await this.bootstrap();
   }
 
   /** Whether the browser exposes WebAuthn on this origin. */
@@ -4050,12 +4189,12 @@ class HubStore {
     const envelope = await api.passkeyLoginStart(mediation === "conditional" ? "conditional" : undefined);
     const options = envelope.options as ServerRequestOptions;
     const assertion = await getPasskey(options, mediation, signal);
-    const session = await this.runAuthTransition(() =>
+    const { result: session, superseded } = await this.runAuthTransition(() =>
       api.passkeyLoginFinish(envelope.challengeId, assertion, deviceName),
     );
     writeSession(session, { mock: api.mock });
     this.emit({ session: readSession(), error: null });
-    await this.bootstrap();
+    if (!superseded && !this.authTransition) await this.bootstrap();
     return { assertion, challengeId: envelope.challengeId };
   }
 
@@ -5009,6 +5148,15 @@ class HubStore {
     const persistedMode =
       effectiveMode && effectiveMode !== "new-turn" ? effectiveMode : undefined;
 
+    // c-reconnfu gate 35 item 5: capture the identity (gen + transition seq)
+    // BEFORE the async availability check. A fallback POST validates this
+    // synchronously at the wire; if a credential transition landed while
+    // ensureOutbox was awaiting, the fallback must not POST (it has no box, so
+    // the token carries gen/seq only — tokenLiveFallback checks those).
+    const sendGen = this.authGen;
+    const sendTransitionSeq = this.transitionSeq;
+    const sendTransitionOpen = this.authTransition !== null;
+
     const outboxStatus = await this.ensureOutbox();
     // c-reconnfu gate 34 item 1:
     //  - unavailable storage: still mint C so the legacy direct POST carries
@@ -5103,7 +5251,19 @@ class HubStore {
       //    POST runs, ALWAYS carrying C as the Hub/Node dedupe id.
       if (committedDurably) return false;
       if (!commandId) return false;
-      return this.sendWithoutOutbox(instanceId, prompt, attachments, effectiveMode, clientRequestId, commandId);
+      // c-reconnfu gate 35 item 5: gate the fallback POST synchronously with
+      // the identity captured before the availability await. A credential
+      // transition in the interim stops the send without posting.
+      if (!this.fallbackTokenLive(sendGen, sendTransitionSeq, sendTransitionOpen)) return false;
+      return this.sendWithoutOutbox(
+        instanceId,
+        prompt,
+        attachments,
+        effectiveMode,
+        clientRequestId,
+        commandId,
+        () => this.fallbackTokenLive(sendGen, sendTransitionSeq, sendTransitionOpen),
+      );
     }
     if (this.connectionState !== "live") {
       // The row stays pending; the connection machine flushes it on recovery.
@@ -5130,9 +5290,10 @@ class HubStore {
       // wake. A rejected lock/lease turn is attributed like a flush failure so
       // the bounded backoff applies.
       let steerFailed = false;
+      const steerToken = this.deliveryToken(this.outbox);
       try {
         await this.outbox.withInstanceLock(instanceId, (iid, rows) =>
-          this.deliverOneRow(iid, rows),
+          this.deliverOneRow(steerToken, iid, rows),
         );
       } catch {
         this.outbox.noteDeliveryFailure(instanceId);
@@ -5163,8 +5324,12 @@ class HubStore {
     mode: PromptMode | undefined,
     clientRequestId: Id,
     commandId: Id,
+    tokenLiveNow: () => boolean = () => true,
   ): Promise<boolean> {
     try {
+      // c-reconnfu gate 35 item 5: synchronous, adjacent identity check right
+      // before the fallback POST (no await between check and instanceSend).
+      if (!tokenLiveNow()) return false;
       const result = await api.instanceSend(instanceId, prompt, attachments, mode, commandId);
       this.emit({
         bubbles: this.state.bubbles.map((b) =>
@@ -5423,8 +5588,9 @@ class HubStore {
     // epilogue as the live steer route and the guarded flush — a finishing
     // write that aborts leaves the row inflight with no patch epilogue.
     let steerFailed = false;
+    const heldSteerToken = this.deliveryToken(this.outbox);
     try {
-      await this.outbox.withInstanceLock(instanceId, (id, rows) => this.deliverOneRow(id, rows));
+      await this.outbox.withInstanceLock(instanceId, (id, rows) => this.deliverOneRow(heldSteerToken, id, rows));
     } catch {
       // Lock/lease failure: never claim the interrupt (the bounded retry /
       // reconnect delivers the same id later). Attribute the failed turn so

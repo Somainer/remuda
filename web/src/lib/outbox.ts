@@ -209,6 +209,19 @@ export interface OutboxStorage {
    */
   mergeUnlessDone(commandId: Id, patch: Partial<OutboxRecord>): Promise<OutboxRecord | null>;
   /**
+   * c-reconnfu gate 35 item 4: conditionally undo a committed claim. In ONE
+   * readwrite transaction read the row; if its lease claimToken still equals
+   * `claimToken`, write priorState/priorAttempts and clear the lease, return
+   * the restored row. If the token differs (a newer delivery won it), do
+   * nothing and return null.
+   */
+  restoreClaimIfTokenMatches(
+    commandId: Id,
+    claimToken: Id,
+    priorState: OutboxState,
+    priorAttempts: number,
+  ): Promise<OutboxRecord | null>;
+  /**
    * Durable compare-and-set for acceptance progress (c-reconnfu gate 28/32).
    * In ONE readwrite transaction the stored row is read and
    * `progressRecorded` is flipped false → true ONLY when the row exists AND
@@ -448,6 +461,33 @@ class IdbOutboxStorage implements OutboxStorage {
     });
   }
 
+  async restoreClaimIfTokenMatches(
+    commandId: Id,
+    claimToken: Id,
+    priorState: OutboxState,
+    priorAttempts: number,
+  ): Promise<OutboxRecord | null> {
+    return await new Promise<OutboxRecord | null>((resolve, reject) => {
+      const t = this.db.transaction(IDB_STORE, "readwrite");
+      const store = t.objectStore(IDB_STORE);
+      let restored: OutboxRecord | null = null;
+      const getReq = store.get(commandId);
+      getReq.onsuccess = () => {
+        const existing = getReq.result as OutboxRecord | undefined;
+        if (!existing) return;
+        if (existing.lease?.claimToken !== claimToken) return; // newer delivery owns it
+        const { lease: _lease, ...withoutLease } = existing;
+        void _lease;
+        restored = { ...withoutLease, state: priorState, attempts: priorAttempts };
+        store.put(restored);
+      };
+      getReq.onerror = () => reject(getReq.error);
+      t.oncomplete = () => resolve(restored);
+      t.onabort = () => reject(t.error ?? getReq.error ?? new Error("IndexedDB restore transaction aborted"));
+      t.onerror = () => reject(t.error ?? getReq.error);
+    });
+  }
+
   /**
    * Durable acceptance compare-and-set in ONE readwrite transaction (same
    * serialization as {@link mergeUnlessDone}): get, lifetime/flag check and
@@ -637,6 +677,22 @@ export class LocalStorageOutboxStorage implements OutboxStorage {
     const merged = { ...existing, ...patch };
     this.write([...recs.filter((r) => r.commandId !== commandId), merged]);
     return merged;
+  }
+
+  async restoreClaimIfTokenMatches(
+    commandId: Id,
+    claimToken: Id,
+    priorState: OutboxState,
+    priorAttempts: number,
+  ): Promise<OutboxRecord | null> {
+    const recs = this.read();
+    const existing = recs.find((r) => r.commandId === commandId);
+    if (!existing || existing.lease?.claimToken !== claimToken) return null;
+    const { lease: _lease, ...withoutLease } = existing;
+    void _lease;
+    const restored = { ...withoutLease, state: priorState, attempts: priorAttempts };
+    this.write([...recs.filter((r) => r.commandId !== commandId), restored]);
+    return restored;
   }
 
   /**
@@ -1166,6 +1222,34 @@ export class Outbox {
     this.cache.delete(commandId);
     this.emit();
     this.reconcileAfterCommittedWrite();
+  }
+
+  /**
+   * c-reconnfu gate 35 item 4: after a delivery whose claim committed but
+   * whose POST was blocked by a stale token, restore the pre-claim retryable
+   * state/attempt count and clear the lease — but only while the stored lease
+   * still carries THIS attempt's claimToken (never undo a newer delivery that
+   * won the lease meanwhile).
+   */
+  async restoreClaimIfTokenMatches(
+    commandId: Id,
+    claimToken: Id,
+    priorState: OutboxState,
+    priorAttempts: number,
+  ): Promise<OutboxRecord | null> {
+    const restored = await this.storage.restoreClaimIfTokenMatches(
+      commandId,
+      claimToken,
+      priorState,
+      priorAttempts,
+    );
+    if (restored) {
+      this.cache.set(commandId, restored);
+      this.emit();
+      // Do NOT run the post-write reconciliation here: this box is disposed;
+      // the current box's own next flush owns delivery/wakes.
+    }
+    return restored;
   }
 
   /**

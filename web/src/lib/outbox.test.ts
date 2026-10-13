@@ -104,6 +104,21 @@ class MemStorage implements OutboxStorage {
     this.writeChain = run.then(() => undefined, () => undefined);
     return await run;
   }
+  /** Conditional claim restore for gate-35 item 4 tests. */
+  async restoreClaimIfTokenMatches(
+    commandId: string,
+    claimToken: string,
+    priorState: OutboxRecord["state"],
+    priorAttempts: number,
+  ): Promise<OutboxRecord | null> {
+    const existing = this.map.get(commandId);
+    if (!existing || existing.lease?.claimToken !== claimToken) return null;
+    const { lease: _lease, ...withoutLease } = existing;
+    void _lease;
+    const restored: OutboxRecord = { ...withoutLease, state: priorState, attempts: priorAttempts };
+    this.map.set(commandId, restored);
+    return restored;
+  }
   /** Conditional reclaim on the same serialized critical section. */
   async reclaimInflight(
     commandId: string,
@@ -1918,6 +1933,9 @@ describe("Outbox", () => {
         throw new Error("IDB transaction aborted");
       },
       casProgressRecorded: async () => {
+        throw new Error("IDB transaction aborted");
+      },
+      restoreClaimIfTokenMatches: async () => {
         throw new Error("IDB transaction aborted");
       },
       reclaimInflight: async () => {

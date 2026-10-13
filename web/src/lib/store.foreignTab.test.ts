@@ -6697,3 +6697,390 @@ it("GATE34 item 5: an obsolete initializer (suspended at storage-open OR at Outb
     }
   }
 });
+
+it("GATE35 item 3: a delivery that reached its POST boundary under L1 is fenced off by a replacement login; L1 posts neither C1 nor C2 and L2 delivers both once in order", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_180_000);
+  const I = "ins_g35_3";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 3_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g35_3");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "instanceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+
+    // Park the FIRST instanceSend (C1's POST) so the L1 delivery is suspended
+    // exactly at the wire boundary AFTER its claim committed.
+    let releasePost: () => void = () => undefined;
+    let postParked = false;
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_iid: string, _prompt: string, _atts?: unknown, _mode?: unknown, commandId?: string) => {
+        if (!postParked) {
+          postParked = true;
+          await new Promise<void>((resolve) => { releasePost = resolve; });
+        }
+        return {
+          relatedCommandIds: [],
+          command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+        };
+      }) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await hubStore.follow(I);
+    hubStore.setConnectionStateForTest("live");
+
+    // Two pending rows C1 then C2.
+    const obx = (hubStore as unknown as { outbox: { enqueue: (r: unknown) => Promise<unknown> } }).outbox;
+    await obx.enqueue({ commandId: "cmd_g35_3_c1", clientRequestId: "local_c1", instanceId: I, prompt: "g35 3 C1", createdAt: 1 });
+    await obx.enqueue({ commandId: "cmd_g35_3_c2", clientRequestId: "local_c2", instanceId: I, prompt: "g35 3 C2", createdAt: 2 });
+
+    void (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    for (let i = 0; i < 3_000 && !postParked; i += 1) await Promise.resolve();
+    expect(postParked).toBe(true); // L1 claimed C1 and is parked INSIDE its POST
+    // Replacement login disposes L1 while C1's POST is suspended.
+    vi.spyOn(api, "login").mockResolvedValue({ deviceId: "dev_g35_3", token: "tok", name: "g35_3" });
+    const loginP = hubStore.login("bootstrap", "secret", "dev");
+    await pump(1_000);
+    // Release the parked L1 POST. It is already INSIDE api.instanceSend (the
+    // fence is before the call), so that one in-flight request resolves; but
+    // the token-fence makes the lock turn STALE on return — it must NOT walk on
+    // to C2. (C1's single in-flight POST is deduped by command id.)
+    releasePost();
+    await loginP;
+    await pump(2_000);
+    // L2 (replacement box) delivers; total C1 = 1 (the deduped in-flight),
+    // C2 = 1, and crucially C1 was never POSTed twice and C2 never by L1.
+    await pump(5_000);
+    expect(send.mock.calls.map((c) => c[4])).toEqual(["cmd_g35_3_c1", "cmd_g35_3_c2"]);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});;;
+
+it("GATE35 item 4: a STALE fence at the attempt boundary (attempts 19) restores the retryable state and attempt count without consuming the final retry — C is delivered once, not marked unknown", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_190_000);
+  const I = "ins_g35_4";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 3_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g35_4");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "instanceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    await hubStore.follow(I);
+    hubStore.setConnectionStateForTest("live");
+
+    // Seed C at attempts=19 (the claim below becomes 20 = CLAIM_WAKE_MAX_FAILURES).
+    const obx = (hubStore as unknown as { outbox: { storage: Record<string, unknown>; enqueue: (r: unknown) => Promise<unknown> } }).outbox;
+    await obx.enqueue({
+      commandId: "cmd_g35_4_c", clientRequestId: "local_g35_4_c", instanceId: I,
+      prompt: "g35 4 C", createdAt: Date.now(), attempts: 19, state: "pending",
+    });
+
+    // Block C's claim, dispose (replacement login) at the await, then release:
+    // without item 4 the committed claim leaves attempts=20 + an inflight
+    // lease; the stale fence must atomically restore pending/attempts=19 and
+    // clear the lease so C remains deliverable (not flipped unknown).
+    const storage = obx.storage as {
+      mergeUnlessDone: (id: string, p: unknown) => Promise<unknown>;
+      all: () => Promise<OutboxRecord[]>;
+    };
+    const realMerge = storage.mergeUnlessDone.bind(storage);
+    let releaseClaim: () => void = () => undefined;
+    let claimHeld = false;
+    storage.mergeUnlessDone = vi.fn(async (id: string, patch: unknown) => {
+      if (!claimHeld && (patch as { state?: string }).state === "inflight") {
+        claimHeld = true;
+        await new Promise<void>((resolve) => { releaseClaim = resolve; });
+      }
+      return realMerge(id, patch);
+    });
+
+    void (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+    for (let i = 0; i < 3_000 && !claimHeld; i += 1) await Promise.resolve();
+    expect(claimHeld).toBe(true);
+
+    vi.spyOn(api, "login").mockResolvedValue({ deviceId: "dev_g35_4", token: "tok", name: "g35_4" });
+    const loginP = hubStore.login("bootstrap", "secret", "dev");
+    await pump(500);
+    releaseClaim();
+    await loginP;
+    await pump(3_000);
+
+    // C is delivered once by the current box; not marked unknown, attempts
+    // consumed from the restored 19 (→20 on the successful delivery only).
+    await pump(5_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBe("cmd_g35_4_c");
+    const rows = () => JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as OutboxRecord[];
+    const c = rows().find((r) => r.commandId === "cmd_g35_4_c")!;
+    expect(c.state).toBe("sent");
+    expect(c.attempts).toBe(20);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE35 item 5: a send whose token captured an OPEN credential transition never takes the direct fallback POST even after storage proves unavailable", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_200_000);
+  const I = "ins_g35_5";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g35_5");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "instanceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    const sendApi = vi.spyOn(api, "instanceSend").mockResolvedValue({
+      relatedCommandIds: [],
+      command: { commandId: "cmd_fallback", id: "cmd_fallback", state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+    } as unknown as Awaited<ReturnType<Api["instanceSend"]>>);
+    await bootLive(api, hubStore);
+    hubStore.setConnectionStateForTest("live");
+    const h = hubStore as unknown as {
+      setForceUnavailableStorageForTest: (v: boolean) => void;
+      send: (i: string, p: string) => Promise<boolean>;
+      logout: () => void;
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      authTransitionOpenForTest: boolean;
+    };
+    h.setForceUnavailableStorageForTest(true);
+    h.logout(); // fresh gen, no box
+
+    // Hold a login BODY open (Fence A transition stays open); meanwhile start
+    // a send: its token captures an open transition, ensureOutbox blocks until
+    // the body settles, then storage is unavailable — the fallback must still
+    // refuse because the token was taken under an open transition.
+    let releaseBody: () => void = () => undefined;
+    vi.spyOn(api, "login").mockImplementation(
+      () => new Promise((resolve) => { releaseBody = () => resolve({ deviceId: "dev_g35_5", token: "tok", name: "g35_5" }); }),
+    );
+    const loginP = h.login("bootstrap", "secret", "dev");
+    await pump(200);
+    expect(h.authTransitionOpenForTest).toBe(true);
+
+    const sendP = h.send(I, "g35 5 F");
+    await pump(300); // ensureOutbox parked on the open transition
+    // Body settles; send resumes, storage fails → would fallback, but token
+    // was captured with a transition open.
+    releaseBody();
+    await loginP;
+    const result = await sendP;
+    expect(result).toBe(false);
+    expect(sendApi).not.toHaveBeenCalled();
+
+    // Control: fresh send with NO open transition and unavailable storage DOES
+    // fallback-post (carrying its command id).
+    const result2 = await h.send(I, "g35 5 F2");
+    expect(result2).toBe(true);
+    expect(sendApi).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});;;
+
+it("GATE35 item 2: overlapping credential requests are serialized — while login A's body is open a send waits; queued login B disposes only after A settles, and no outbox is installed/POSTing until B settles", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_210_000);
+  const I = "ins_g35_2";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 2_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g35_2");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "instanceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+    await bootLive(api, hubStore);
+    await hubStore.follow(I);
+    hubStore.setConnectionStateForTest("live");
+    const h = hubStore as unknown as {
+      send: (i: string, p: string) => Promise<boolean>;
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      outbox: { lifetime: string } | null;
+      authTransitionOpenForTest: boolean;
+      flushAllOutbox: () => Promise<void>;
+    };
+
+    // Login A with a parked body.
+    let releaseA: () => void = () => undefined;
+    let aStarted = false;
+    vi.spyOn(api, "login").mockImplementationOnce(
+      () => new Promise((resolve) => { aStarted = true; releaseA = () => resolve({ deviceId: "devA", token: "tokA", name: "A" }); }),
+    );
+    const loginA = h.login("bootstrap", "a", "devA")
+    await pump(200);
+    expect(aStarted).toBe(true);
+    expect(h.authTransitionOpenForTest).toBe(true);
+
+    // A send while A is open waits for the serialized transition chain.
+    const sendP = h.send(I, "g35 2 P")
+    await pump(300);
+    expect(send).not.toHaveBeenCalled();
+
+    // Login B queues behind A (its body does NOT start until A settles).
+    let bStarted = false;
+    vi.spyOn(api, "login").mockImplementationOnce(
+      () => new Promise((resolve) => { bStarted = true; releaseB = () => resolve({ deviceId: "devB", token: "tokB", name: "B" }); }),
+    );
+    let releaseB: () => void = () => undefined;
+    const loginB = h.login("bootstrap", "b", "devB")
+    await pump(200);
+    expect(bStarted).toBe(false); // B has not acquired the chain while A is open
+
+    // Release A: B acquires (disposes A's box), its body parks.
+    releaseA();
+    await loginA;
+    await pump(300);
+    expect(bStarted).toBe(true);
+    expect(h.authTransitionOpenForTest).toBe(true);
+    // Still no box installed / no POST while B is open (the finalizer hasn't run).
+    expect(send).not.toHaveBeenCalled();
+
+    // Release B: its finalizer initializes a current box; the waiting send and
+    // flush deliver P.
+    releaseB();
+    await loginB;
+    const sent = await sendP;
+    expect(sent).toBe(true);
+    await pump(3_000);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toBeTruthy();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE35 item 1: a credential request whose request AND whose body reject still runs the current-generation finalizer so pending rows are delivered automatically, with no private ensureOutbox call", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_220_000);
+  const I = "ins_g35_1x";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 3_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  for (const mode of ["request-rejects", "body-rejects"] as const) {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_220_000 + (mode === "body-rejects" ? 1 : 2));
+    Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+    const sessionStorageKey = `remuda-outbox-owner-g35-1x-${mode}`;
+    try {
+      sessionStorage.setItem(sessionStorageKey, "owner");
+      const { api, hubStore } = await fresh();
+      vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+      vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+      vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+      vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+      vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+      vi.spyOn(api, "instanceList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+      vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+      const send = vi.spyOn(api, "instanceSend").mockImplementation(
+        (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+          relatedCommandIds: [],
+          command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+        })) as unknown as Api["instanceSend"],
+      );
+      await bootLive(api, hubStore);
+      await hubStore.follow(I);
+      hubStore.setConnectionStateForTest("live");
+      // A pending durable row.
+      const obx = (hubStore as unknown as { outbox: { enqueue: (r: unknown) => Promise<unknown> } }).outbox;
+      await obx.enqueue({ commandId: `cmd_g35_1x_${mode}`, clientRequestId: `local_${mode}`, instanceId: I, prompt: `g35 1x ${mode} P`, createdAt: 1 });
+
+      hubStore.setConnectionStateForTest("offline");
+      // Both modes: the credential request rejects (request-level failure is
+      // the same thrown api.login here; the finalizer must still initialize).
+      const { HubHttpError: HE } = (await import("./httpError")) as typeof import("./httpError");
+vi.spyOn(api, "login").mockRejectedValue(new HE(503, "busy", "host busy"));
+      await expect(hubStore.login("bootstrap", "bad", "dev")).rejects.toThrow(/busy/);
+      await pump(3_000);
+      // The finalizer initialized a current box and the pending row is
+      // delivered automatically — no manual ensureOutbox / send / reload.
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0]?.[4]).toBe(`cmd_g35_1x_${mode}`);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+      sessionStorage.removeItem(sessionStorageKey);
+    }
+  }
+});

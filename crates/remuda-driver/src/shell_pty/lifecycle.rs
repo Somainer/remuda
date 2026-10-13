@@ -551,6 +551,83 @@ pub(crate) fn process_running(pid: i32) -> bool {
     }
 }
 
+/// One process captured in the pre-signal tree snapshot: its pid and process
+/// group (a setsid descendant has a group of its own).
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+pub(crate) struct TreeProc {
+    pub(crate) pid: i32,
+    pub(crate) pgrp: i32,
+}
+
+/// Snapshot the descendant process tree of `root_pid` BEFORE the stop ladder
+/// signals anything (c-usagefu r14 item 4).
+///
+/// A descendant that called `setsid` (a harness daemonising a child) is in its
+/// OWN process group and escapes the group kill; after the group is dead it
+/// would also be invisible to a ppid-rooted scan, because killing the leader
+/// reparents the orphan to init before the scan runs. Enumerating the tree
+/// BEFORE the signals makes every escaped descendant discoverable.
+///
+/// Transitive closure over `ppid` edges read in one `/proc` pass. The root
+/// itself is included.
+#[cfg(target_os = "linux")]
+pub(crate) fn snapshot_process_tree(root_pid: i32) -> Vec<TreeProc> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut rows: Vec<TreeProc> = Vec::new();
+    let mut parents: Vec<(i32, i32)> = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start()) else {
+            continue;
+        };
+        if let Some((ppid, pgrp)) = parse_proc_parent_group(after_comm) {
+            rows.push(TreeProc { pid, pgrp });
+            parents.push((pid, ppid));
+        }
+    }
+    // BFS over the ppid edges from the root.
+    let mut descendants = vec![TreeProc {
+        pid: root_pid,
+        pgrp: root_pid,
+    }];
+    let mut frontier = vec![root_pid];
+    while let Some(parent) = frontier.pop() {
+        for (pid, ppid) in &parents {
+            if *ppid == parent
+                && !descendants.iter().any(|member| member.pid == *pid)
+                && let Some(row) = rows.iter().find(|row| row.pid == *pid)
+            {
+                descendants.push(*row);
+                frontier.push(*pid);
+            }
+        }
+    }
+    descendants
+}
+
+/// Parse the `state ppid pgrp` fields of a `/proc/<pid>/stat` tail, returning
+/// `(ppid, pgrp)`.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn parse_proc_parent_group(after_comm: &str) -> Option<(i32, i32)> {
+    let mut fields = after_comm.split_whitespace();
+    let _state = fields.next()?;
+    let ppid: i32 = fields.next()?.parse().ok()?;
+    let pgrp: i32 = fields.next()?.parse().ok()?;
+    Some((ppid, pgrp))
+}
+
 /// Pids in `pgid` that are still running (not zombies), for a
 /// `stop-incomplete` diagnostic.
 ///

@@ -1661,6 +1661,13 @@ impl ShellPtyDriver {
                 }
             }
         };
+        // c-usagefu r14 item 4: snapshot the leader's WHOLE descendant tree
+        // BEFORE signalling. A descendant that called setsid escapes the
+        // group kill and — once the leader is dead — reparents to init, so a
+        // post-signal ppid scan could no longer find it. The snapshot makes
+        // such an escaped survivor discoverable after the group is gone.
+        #[cfg(target_os = "linux")]
+        let tree_snapshot = lifecycle::snapshot_process_tree(pgid);
         let outcome = lifecycle::stop_group(
             pgid,
             move || {
@@ -1670,6 +1677,30 @@ impl ShellPtyDriver {
             reaper,
         )
         .await?;
+        #[cfg(target_os = "linux")]
+        let outcome = {
+            let mut outcome = outcome;
+            if outcome.group_gone {
+                // Live descendants OUTSIDE the signalled group escaped it
+                // (e.g. a setsid daemonising child): the tree is not fully
+                // gone, so name them as stop-incomplete survivors the
+                // termination watcher/registry probes by pid.
+                let escaped: Vec<i32> = tree_snapshot
+                    .iter()
+                    .filter(|proc_info| {
+                        proc_info.pid != pgid
+                            && proc_info.pgrp != pgid
+                            && lifecycle::process_running(proc_info.pid)
+                    })
+                    .map(|proc_info| proc_info.pid)
+                    .collect();
+                if !escaped.is_empty() {
+                    outcome.group_gone = false;
+                    outcome.survivors = escaped;
+                }
+            }
+            outcome
+        };
         // The leader can be classified dead while the kernel has not made it
         // reapable yet: on macOS a SIGKILLed session leader sits in `E`
         // (exiting) before it becomes a zombie. `stop_group` correctly reports
@@ -5489,6 +5520,205 @@ mod tests {
         // unique test owners so they cannot touch another test's census.
         crate::adapters::codex_discovery::forget_lifetime(&cwd, native_owner);
         crate::adapters::codex_discovery::forget_lifetime(&cwd, promoted_owner);
+    }
+
+    #[tokio::test]
+    async fn a_real_setsid_descendant_is_named_stop_incomplete_through_the_production_ladder() {
+        // c-usagefu r14 item 4: rebuilds the item-3 regression through
+        // PRODUCTION registration and ownership acquisition — no hand-installed
+        // lifetime guards, no substituted stop outcome. A real codex-target
+        // launch (whose census cohort the spawn path registers itself) runs a
+        // child script that forks `setsid sleep`; that descendant calls
+        // setsid(2), so it escapes the process-group kill. The pre-signal tree
+        // snapshot in stop_tree must name it and make the REAL ladder report
+        // stop-incomplete; the guards move to the bounded watcher and the Node
+        // registry; a discovery recheck closes after confirmed exit and a later
+        // same-cwd launch discovers.
+        use crate::adapters::FileSignalAdapter as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _term_lock = crate::termination::termination_test_lock();
+        lifecycle::set_test_watch_bound(Some(std::time::Duration::from_millis(400)));
+        crate::termination::set_test_maintenance_interval(None);
+        crate::termination::shutdown_pending_terminations().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        // The agent child: ignores the codex argv, forks a setsid survivor
+        // (its own session and process group), and waits on it so the leader
+        // stays live through the launch and into the stop ladder.
+        let script = dir.path().join("fake-codex.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$1\" in --version|version) echo 'codex 0.154.0'; exit 0;; esac\n\
+             setsid sleep 77 &\nwait\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let instance_id = InstanceId::new();
+        let instance_dir = dir.path().join(instance_id.as_id().as_str());
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.kind = AgentKind::Codex;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+        spec.model_id = Some("gpt-5.4".into());
+
+        let mut options = ShellPtyOptions::agent(
+            dir.path().to_path_buf(),
+            AgentKind::Codex,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::OpenaiResponses,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["gpt-5.4".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: instance_dir.join("launch"),
+                native_home: dir.path().join("codex-native-home"),
+                binary: Some(script.clone()),
+                origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: true,
+                settings_overlay: None,
+            },
+        );
+        options.instance_id = Some(instance_id.clone());
+        options.hooks = Some(HookConfig {
+            instance_dir: instance_dir.clone(),
+            relay_binary: PathBuf::from("/bin/true"),
+            tui: crate::launch::TuiMode::Default,
+        });
+
+        let driver = ShellPtyDriver::new(options);
+        let mut run = driver.start(spec.clone()).await.expect("real codex spawn");
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), run.recv()).await;
+        let cwd: PathBuf = spec.cwd.clone().into();
+        let owner = instance_id.as_id().as_str();
+
+        // The production spawn path registered the native cohort itself.
+        assert!(
+            driver.codex_lifetime.lock().await.is_some(),
+            "the codex spawn path owns the census guard — nothing hand-installed"
+        );
+
+        // Locate the REAL setsid descendant through the production snapshot.
+        let root_pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        let escaped_pid = {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let tree = lifecycle::snapshot_process_tree(root_pgid);
+                if let Some(proc_info) = tree.iter().find(|proc_info| {
+                    proc_info.pid != root_pgid
+                        && proc_info.pgrp != root_pgid
+                        && lifecycle::process_running(proc_info.pid)
+                }) {
+                    break proc_info.pid;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the setsid descendant appears"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        };
+
+        // The REAL stop ladder — no test_stop_outcome. The group dies; the
+        // pre-signal snapshot makes the escaped sleep a stop-incomplete
+        // survivor and the production guard goes to the bounded watcher.
+        Driver::close(&driver).await.unwrap();
+        for _ in 0..10 {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+                "the real setsid survivor keeps the production-registered interval live"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        let transfer_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !crate::termination::test_has_pending_for(&cwd) {
+            assert!(tokio::time::Instant::now() < transfer_deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Confirmed exit: a real discovery recheck closes the interval.
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(escaped_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+            "only a registry recheck closes it, not the exit alone"
+        );
+        let recheck_home = tempfile::tempdir().unwrap();
+        let mut rechecker = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+            home: recheck_home.path().to_path_buf(),
+            cwd: cwd.clone(),
+            pid: None,
+            launched_at: Some(time::OffsetDateTime::now_utc()),
+        })
+        .with_instance_key(Some("r14-item4-rechecker".to_owned()));
+        assert!(rechecker.poll().unwrap().is_empty());
+        assert!(
+            !crate::termination::test_has_pending_for(&cwd),
+            "the discovery recheck resolves the entry"
+        );
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+            "confirmed exit closes the production cohort's interval"
+        );
+        drop(rechecker);
+
+        // A later same-cwd launch is then sole-live and discovers.
+        let next_home = tempfile::tempdir().unwrap();
+        let floor = time::OffsetDateTime::now_utc() + time::Duration::milliseconds(500);
+        let next_owner = "r14-item4-next";
+        let mut next = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+            home: next_home.path().to_path_buf(),
+            cwd: cwd.clone(),
+            pid: None,
+            launched_at: Some(floor),
+        })
+        .with_instance_key(Some(next_owner.to_owned()));
+        let prompt = "r14 item 4 later launch prompt";
+        crate::adapters::codex_discovery::record_input(&cwd, next_owner, prompt);
+        let started = floor + time::Duration::seconds(1);
+        let date_dir = format!(
+            "{:04}/{:02}/{:02}",
+            started.year(),
+            u8::from(started.month()),
+            started.day()
+        );
+        let month_dir = next_home.path().join("sessions").join(date_dir);
+        std::fs::create_dir_all(&month_dir).unwrap();
+        let started_rfc = started
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        std::fs::write(
+            month_dir.join("rollout-r14item4.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{started_rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"r14item4\",\"session_id\":\"r14item4\",\"cwd\":\"{}\",\"timestamp\":\"{started_rfc}\"}}}}\n\
+                 {{\"timestamp\":\"{started_rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let observed = next.poll().unwrap();
+        assert!(
+            next.binding().is_some(),
+            "the later same-cwd launch discovers after the natural stop-incomplete settled; \
+             emitted {observed:?}"
+        );
+        drop(next);
+
+        lifecycle::set_test_watch_bound(None);
+        crate::termination::set_test_maintenance_interval(None);
+        crate::termination::shutdown_pending_terminations().await;
+        crate::adapters::codex_discovery::forget_lifetime(&cwd, owner);
     }
 
     /// A driver whose PTY runs an inert process, carrying `kind` as its

@@ -6515,7 +6515,8 @@ it("GATE36 item 6(f) (replaces the GATE34 six-path test): an OUTSTANDING command
       vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
       vi.spyOn(api, "instanceList").mockResolvedValue({
         items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
-      });
+        nextCursor: null,
+        } as never);
       vi.spyOn(api, "passkeyLoginStart").mockResolvedValue({
         challengeId: `chal_g36_6f_${pi}`,
         options: { publicKey: { challenge: "Y2hhbA", allowCredentials: [] } } as never,
@@ -6659,7 +6660,8 @@ it("GATE36 item 6(d)+(g) (replaces the GATE34 obsolete-initializer test): old an
       vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
       vi.spyOn(api, "instanceList").mockResolvedValue({
         items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
-      });
+        nextCursor: null,
+        } as never);
       vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
       vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
       vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
@@ -6768,7 +6770,8 @@ it("GATE36 item 6(a) (replaces GATE35 item 3): C1's CLAIM parked before it resol
     vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
     vi.spyOn(api, "instanceList").mockResolvedValue({
       items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
-    });
+      nextCursor: null,
+      } as never);
     // Attribute each POST to the issuerLifetime stamped on the claimed row.
     const posted: Array<{ id: string; lifetime?: string }> = [];
     const send = vi.spyOn(api, "instanceSend").mockImplementation(
@@ -7290,7 +7293,8 @@ it("GATE36 item 4 (password): from a logged-out store, login A succeeds and queu
     vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
     vi.spyOn(api, "instanceList").mockResolvedValue({
       items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
-    });
+      nextCursor: null,
+      } as never);
 
     // Pending durable work left over from before the logins.
     const preStorage = new (await import("./outbox")).LocalStorageOutboxStorage();
@@ -7395,7 +7399,8 @@ it("GATE36 item 4 (passkey): from a logged-out store, passkey login A succeeds a
     vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
     vi.spyOn(api, "instanceList").mockResolvedValue({
       items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
-    });
+      nextCursor: null,
+      } as never);
     vi.spyOn(api, "passkeyLoginStart").mockResolvedValue({
       challengeId: "chal_g36_4p",
       options: { publicKey: { challenge: "Y2hhbA", allowCredentials: [] } } as never,
@@ -7470,7 +7475,8 @@ it("GATE36 item 5: a public steer whose claim resumes across a replacement login
     vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
     vi.spyOn(api, "instanceList").mockResolvedValue({
       items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
-    });
+      nextCursor: null,
+      } as never);
     const send = vi.spyOn(api, "instanceSend").mockImplementation(
       (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
         relatedCommandIds: [],

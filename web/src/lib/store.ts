@@ -2172,7 +2172,13 @@ class HubStore {
       // Journal evidence is authoritative acceptance (the Node ran the
       // command): the live/catch-up settleFromJournal already retired the row
       // to "done". Stop polling and never downgrade it with a GET verdict.
-      if (this.outbox?.get(commandId)?.state === "done") return;
+      // The done observation itself is an authoritative acceptance, so it
+      // records progress through the same helper as every other path
+      // (c-reconnfu gate 26).
+      if (this.outbox?.get(commandId)?.state === "done") {
+        this.recordAcceptedDelivery(instanceId, origin);
+        return;
+      }
       const verdict = await this.reconcileCommandViaGet(instanceId, commandId);
       // The follow frame may have retired the row to done WHILE this GET was
       // in flight (the top-of-loop check cannot see that): re-read before
@@ -2192,16 +2198,12 @@ class HubStore {
         return;
       }
       if (verdict === "sent") {
-        const wrote = await this.reconcilePatch(commandId, { state: "sent", gotResponse: true });
-        // c-reconnfu gate 25 item 1: the Hub/Node accepted a POST whose
-        // immediate answer was still uncertain (queued+forwarded+reconciling).
-        // While uncertain the outcome recorded NO progress (exhaustion stayed
-        // latched); the delayed acceptance now records it on the ORIGINATING
-        // outbox — only while it is still the current auth epoch — and runs
-        // its fresh delivery epilogue, so the central reconciliation re-arms
-        // the instance's stranded pending rows and the real timer delivers
-        // them. A dropped patch (row already terminal done) needs no epilogue.
-        if (wrote) await this.recordAcceptedReconciliation(instanceId, origin);
+        // The patch may be dropped as stale (a journal committed done while
+        // the GET was in flight): acceptance is a property of the HUB'S
+        // verdict, not of the local patch applying. Record progress regardless
+        // (c-reconnfu gate 26).
+        await this.reconcilePatch(commandId, { state: "sent", gotResponse: true });
+        this.recordAcceptedDelivery(instanceId, origin);
         return;
       }
       if (verdict === "held") {
@@ -2227,18 +2229,28 @@ class HubStore {
   }
 
   /**
-   * A delayed reconciling-GET acceptance landed (c-reconnfu gate 25 item 1).
-   * Record the successful delivery on the outbox that STARTED the GET loop
-   * only while it is still the current one: a logout/reinit while the GET was
-   * pending disposed the old epoch, whose stale continuation must never clear
-   * books or reconcile the new outbox (same rule as the gate 22 flush epilogue).
-   * The fresh delivery epilogue re-reads authoritatively and, exhaustion now
-   * cleared, re-arms every pending row of the instance.
+   * The SINGLE acceptance-progress boundary (c-reconnfu gate 26 coordinator
+   * ruling): progress is a property of the HUB'S ACCEPTANCE of a command, not
+   * of which local path observed it. Every authoritative acceptance
+   * observation routes through here once:
+   *  - the POST response classified sent (deliverOutboxRecord),
+   *  - the command-status GET confirming sent, and a done seen while polling,
+   *  - a journal message settling the row as accepted/done
+   *    (live onEvents and catch-up settleFromJournal).
+   *
+   * Idempotent: recording twice is harmless (noteDeliveryProgress just
+   * clears maps; the epilogue only re-reads/reconciles), and INDEPENDENT of
+   * whether the local row patch applied or was dropped as stale. Rejected,
+   * failed, held or never-resolving observations never call this. Only the
+   * ORIGINATING outbox — while still the current auth epoch — is touched, so
+   * a logout/reinit while an observation was pending can never clear the new
+   * epoch's books or reconcile it (same rule as the gate 22 flush epilogue).
    */
-  private async recordAcceptedReconciliation(instanceId: Id, origin: Outbox): Promise<void> {
-    if (this.pageIsUnloading || this.outbox !== origin) return;
-    origin.noteDeliveryProgress(instanceId);
-    await origin.deliveryEpilogue().catch(() => undefined);
+  private recordAcceptedDelivery(instanceId: Id, origin?: Outbox | null): void {
+    const box = origin ?? this.outbox;
+    if (this.pageIsUnloading || !box || this.outbox !== box) return;
+    box.noteDeliveryProgress(instanceId);
+    void box.deliveryEpilogue().catch(() => undefined);
   }
 
   /**
@@ -2454,13 +2466,12 @@ class HubStore {
       }
     } finally {
       box.endActiveDelivery(commandId);
-      // c-reconnfu gate 23 item 3 / gate 24 item 1 (exhaustion rulings): the
-      // shared POST boundary, but progress is recorded ONLY when the Hub
-      // accepted the POST. Gate 23 moved this from the flush loop so a direct
-      // steer could clear exhaustion; gate 24 narrowed it so a REJECTED (or
-      // otherwise unsuccessful) direct steer leaves the instance exhausted
-      // with no wakes re-armed, until a later accepted delivery clears it.
-      if (accepted) box.noteDeliveryProgress(current0.instanceId);
+      // c-reconnfu gate 23 item 3 / gate 24 item 1 / gate 26: the shared POST
+      // boundary routes through the single acceptance helper — only a
+      // Hub-ACCEPTED verdict clears the per-instance backoff/exhaustion and
+      // re-runs the delivery epilogue; rejected/held/failed/uncertain outcomes
+      // leave the latch exactly as they found it.
+      if (accepted) this.recordAcceptedDelivery(current0.instanceId, box);
     }
     this.syncBubbleFromOutbox(commandId);
     if (!box.pendingFor(current0.instanceId).length) this.clearOutboxRetry(current0.instanceId);
@@ -2520,14 +2531,22 @@ class HubStore {
   private settleFromJournal(instanceId: Id, events: Observation[]) {
     const next = settleBubbles(this.state.bubbles, instanceId, events);
     if (this.outbox) {
+      // c-reconnfu gate 26: a journal message settling a row as accepted/done
+      // is an authoritative ACCEPTANCE observation — record progress through
+      // the single helper (independent of whether the patch applies), so an
+      // exhausted instance's other rows get re-armed. Non-message events and
+      // already-terminal (done/rejected/unknown) rows record nothing.
+      let acceptedObservation = false;
       for (const ev of events) {
         if (ev.kind !== "message") continue;
         const commandId = (ev.payload as { commandId?: Id }).commandId;
         const rec = commandId ? this.outbox.get(commandId) : null;
         if (commandId && rec && rec.state !== "done" && rec.state !== "rejected" && rec.state !== "unknown") {
           void this.outbox.patch(commandId, { state: "done", serverState: "journal-settled" });
+          acceptedObservation = true;
         }
       }
+      if (acceptedObservation) this.recordAcceptedDelivery(instanceId, this.outbox);
     }
     this.emit({ bubbles: next });
   }
@@ -3238,14 +3257,22 @@ class HubStore {
           // row: retire the matching outbox rows so a later reconnect cannot
           // keep retrying a command that demonstrably executed.
           if (this.outbox) {
+            // c-reconnfu gate 26: each such journal-done retirement is an
+            // authoritative acceptance observation routed through the single
+            // progress helper. A row already rejected records nothing: a
+            // stray/late journal event after a Hub rejection must not clear
+            // the instance's exhaustion.
+            let acceptedObservation = false;
             for (const ev of next) {
               if (ev.kind !== "message") continue;
               const commandId = (ev.payload as { commandId?: Id }).commandId;
               const rec = commandId ? this.outbox.get(commandId) : null;
               if (commandId && rec && rec.state !== "done" && rec.state !== "rejected") {
                 void this.outbox.patch(commandId, { state: "done", serverState: "journal-settled" });
+                acceptedObservation = true;
               }
             }
+            if (acceptedObservation) this.recordAcceptedDelivery(instanceId, this.outbox);
           }
           this.emit({
             instances: applyInstanceActivity(this.state.instances, events),

@@ -1749,7 +1749,13 @@ export class Outbox {
     if (this.flushChain.has(instanceId)) {
       const queued = this.runAfterChain(instanceId, fn);
       this.queuedFlush.set(instanceId, queued);
-      void queued.finally(() => this.queuedFlush.delete(instanceId));
+      // The bookkeeping side-chain must not surface an unhandled rejection:
+      // finally() re-rejects when the queued lock turn rejects (a persistent
+      // navigator.locks failure), while the awaited caller owns the real
+      // rejection (c-reconnfu gate 26).
+      void queued
+        .finally(() => this.queuedFlush.delete(instanceId))
+        .catch(() => undefined);
       return (await queued) as T | null;
     }
     return (await this.runAfterChain(instanceId, fn)) as T | null;

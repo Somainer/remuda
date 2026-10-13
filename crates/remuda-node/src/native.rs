@@ -1635,10 +1635,6 @@ fn instance_spec(
 fn map_driver_error(error: remuda_driver::DriverError) -> DriverError {
     match error {
         remuda_driver::DriverError::ControlUnavailable => DriverError::ControlUnavailable,
-        // P1 (c-ctxusage r16 item 5): a promoted close that could not verify
-        // the writer is gone is retryable — nothing was retired, and the next
-        // close completes it.
-        remuda_driver::DriverError::WriterStillLive(_) => DriverError::ControlUnavailable,
         // Stays a `Failed` so the command settles, but keeps the wording the
         // carrier supervisor matches on: a lost session server is recoverable,
         // an agent that is merely busy is not.

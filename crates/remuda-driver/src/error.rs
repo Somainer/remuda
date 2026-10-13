@@ -71,15 +71,6 @@ pub enum DriverError {
     /// (c-ctxusage r15 item 1).
     #[error("Herdr close outcome uncertain: {0}")]
     CloseOutcomeUncertain(String),
-    /// A promoted close could not VERIFY the native writer's process group is
-    /// gone: the writer survived the whole stop ladder (or the ladder itself
-    /// failed). The close is deliberately INCOMPLETE and retryable — the
-    /// hydrator stays live, transcript monitoring continues, close ownership
-    /// is retained, and a later append is still delivered; a subsequent close
-    /// re-runs the verification once the writer has actually exited
-    /// (P1, c-ctxusage r16 item 5).
-    #[error("native writer still live after the stop ladder: {0}")]
-    WriterStillLive(String),
     /// Isolated settings could not be written.
     #[error("settings isolation unavailable: {0}")]
     SettingsIsolationUnavailable(String),
@@ -120,8 +111,6 @@ impl DriverError {
             // Uncertain is retryable: nothing was confirmed closed, and a fresh
             // close re-audits instead of replaying the destructive call.
             Self::CloseOutcomeUncertain(_) => ErrorCode::ControlUnavailable,
-            // Retryable: the writer is not verified gone, nothing was retired.
-            Self::WriterStillLive(_) => ErrorCode::ControlUnavailable,
             Self::SettingsIsolationUnavailable(_) => ErrorCode::SettingsIsolationUnavailable,
             Self::BinaryNotFound(_) => ErrorCode::InvalidLaunchSpec,
             Self::Io(_) | Self::Json(_) | Self::Protocol(_) => ErrorCode::NativeProtocolError,

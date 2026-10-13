@@ -93,6 +93,21 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     tx.commit()
 }
 
+/// Persisted marker table: records which ONE-TIME data migrations have
+/// completed, so a later start never repeats a step that would corrupt the
+/// final shape (c-usagefu r15 item 2).
+const META_DDL: &str = "CREATE TABLE IF NOT EXISTS usage_schema_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+     );";
+
+/// Marker for the scope-id journal backfill + duplicate consolidation
+/// (c-usagefu r13/r14). Once recorded, the disagreeing-bucket rows were
+/// intentionally cleared back to NULL and the unique indexes exist; running
+/// the journal backfill again would RE-CREATE those scope ids straight into
+/// the unique index and fail every restart.
+const MARKER_SCOPE_CONSOLIDATION: &str = "scope_consolidation_v1";
+
 /// Test-only sentinel table: while it exists, the usage migration fails AFTER
 /// its additive DDL, inside the migration transaction — a deterministic,
 /// per-database stand-in for an exhausted disk / SQL error that rolls the
@@ -107,6 +122,37 @@ fn test_failure_forced(conn: &Connection) -> rusqlite::Result<bool> {
         "SELECT COUNT(*) > 0 FROM sqlite_master
          WHERE type = 'table' AND name = ?1",
         [TEST_FORCE_FAILURE_TABLE],
+        |row| row.get(0),
+    )
+}
+
+fn meta_marker_present(conn: &Connection, key: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM usage_schema_meta WHERE key = ?1",
+        [key],
+        |row| row.get(0),
+    )
+}
+
+fn set_meta_marker(conn: &Connection, key: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO usage_schema_meta (key, value) VALUES (?1, 'applied')",
+        [key],
+    )?;
+    Ok(())
+}
+
+/// Whether the final r15 dedupe indexes already exist. Their creation was the
+/// LAST data step of the c-usagefu r14 migration, which was atomic: both
+/// present means that migration fully completed on an earlier build that did
+/// not persist [`MARKER_SCOPE_CONSOLIDATION`] yet, so its data is in the final
+/// shape and the one-time backfill must not run again (r15 item 2).
+fn final_dedupe_indexes_present(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) = 2 FROM sqlite_master
+         WHERE type = 'index'
+           AND name IN ('usage_events_turn_dedupe', 'usage_events_message_dedupe')",
+        [],
         |row| row.get(0),
     )
 }
@@ -195,6 +241,7 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     // c-usagefu (c): native per-model context window reported on the payload.
     crate::store::ensure_column(conn, "usage_events", "native_context_window", "INTEGER")?;
+    conn.execute_batch(META_DDL)?;
     // c-usagefu r15 item 1 test seam: a forced failure AFTER the additive DDL
     // rolls the columns back too, exercising the legacy-shape fallback. The
     // failing statement is a real SQL error inside the migration transaction.
@@ -202,6 +249,30 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     if test_failure_forced(conn)? {
         conn.execute_batch("SELECT remuda_test_force_usage_migration_failure();")?;
     }
+    // c-usagefu r15 item 2: the scope-id backfill and consolidation are
+    // ONE-TIME steps. A marker records their completion; databases an
+    // already-complete r14 migration left behind are recognised by the final
+    // unique indexes and get the marker. Re-running the backfill would
+    // re-create the scope ids the consolidation intentionally cleared, hit the
+    // already-existing unique index, and fail the migration on every restart.
+    if meta_marker_present(conn, MARKER_SCOPE_CONSOLIDATION)? || final_dedupe_indexes_present(conn)?
+    {
+        if !meta_marker_present(conn, MARKER_SCOPE_CONSOLIDATION)? {
+            set_meta_marker(conn, MARKER_SCOPE_CONSOLIDATION)?;
+        }
+        return Ok(());
+    }
+    // c-usagefu r13 item 2 (COORDINATOR RULING U1): origin/main's projection
+    // did not persist the payload's scopeId even though main's adapter sent it
+    // and the durable JOURNAL retains it verbatim. A main-shape codex Turn row
+    // therefore arrived here with scope_id NULL; after the upgrade a byte-zero
+    // replay emits the same calls as durable Messages keyed by their native
+    // turn id, and the coverage proof pairs Message.turn_id with the Turn's
+    // scope_id — a NULL there could never match, so the Turn AND its replayed
+    // Messages would both bill. Recover scope_id from the journal for every
+    // still-unscoped usage row (Turn AND Session: main dropped it on both).
+    // Rows this branch wrote already carry it and are untouched; when no
+    // journal table exists (unit fixtures) the guard makes this a no-op.
     backfill_scope_ids_from_journal(conn)?;
     // Now the columns exist on both a fresh CREATE and an upgraded DB.
     //
@@ -225,6 +296,7 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // highest seq, disagreeing ones return to the legacy NULL-scope path.
     reconcile_duplicate_turn_keys(conn)?;
     consolidate_message_duplicates(conn)?;
+    set_meta_marker(conn, MARKER_SCOPE_CONSOLIDATION)?;
     Ok(())
 }
 
@@ -4395,6 +4467,76 @@ mod tests {
             2,
             "the two recorded legacy NULL-scope turns fold again after recovery"
         );
+    }
+
+    #[test]
+    fn the_usage_migration_is_idempotent_across_restart_after_restart() {
+        // c-usagefu r15 item 2: after a SUCCESSFUL migration the next start
+        // must not re-run the journal backfill — it would re-create the
+        // scope ids the disagreeing-buckets collapse intentionally cleared to
+        // NULL while the unique partial index already exists, failing the
+        // migration on every restart. Migrate, restart, restart: no error, the
+        // NULL scope ids and the counted totals stay identical.
+        let home = tempfile::tempdir().unwrap();
+        let at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let one = real_codex_turn_counters(home.path(), "r15idem1", "ta", 1000, 100, &at);
+        let home2 = tempfile::tempdir().unwrap();
+        let two = real_codex_turn_counters(home2.path(), "r15idem2", "tb", 2000, 200, &at);
+        let expected_output = one.output_tokens.unwrap() + two.output_tokens.unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        create_main_shaped_usage_tables(&conn);
+        insert_main_turn_with_journal(&conn, "ins_r15idem", 1, "0", &one, &at);
+        insert_main_turn_with_journal(&conn, "ins_r15idem", 5, "0", &two, &at);
+
+        migrate(&conn).unwrap();
+        let scope_ids_after_first = |conn: &Connection| -> Vec<Option<String>> {
+            let mut stmt = conn
+                .prepare("SELECT scope_id FROM usage_events ORDER BY seq")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            scope_ids_after_first(&conn),
+            vec![None, None],
+            "disagreeing buckets intentionally cleared to NULL by the first migration"
+        );
+        let first_agg = aggregate_instance(&conn, "ins_r15idem").unwrap();
+
+        // Two full restarts: the marker skips the one-time backfill each time.
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            scope_ids_after_first(&conn),
+            vec![None, None],
+            "the cleared scope ids are never re-created into the unique index"
+        );
+        let marker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_schema_meta
+                 WHERE key='scope_consolidation_v1' AND value='applied'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, 1, "the completion marker is persisted");
+        let agg = aggregate_instance(&conn, "ins_r15idem").unwrap();
+        assert_eq!(
+            (agg.events, agg.input_tokens, agg.output_tokens),
+            (
+                first_agg.events,
+                first_agg.input_tokens,
+                first_agg.output_tokens
+            ),
+            "counts are identical after migrate -> restart -> restart"
+        );
+        assert_eq!(agg.output_tokens, expected_output);
     }
 
     #[tokio::test]

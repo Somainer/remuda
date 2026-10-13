@@ -3951,6 +3951,13 @@ class HubStore {
     // The issuing (now disposed) box still owns its storage handle. The
     // conditional merge (claim-token guarded in the Outbox) reverts
     // inflight/attempts/lease ONLY if no newer delivery won the row.
+    //
+    // Gate 36 item 2 (ACCEPTED RISK, coordinator ruling): if THIS rollback
+    // write itself fails, the obligation is deliberately NOT retried. The
+    // narrow corner is storage failure + auth change at the 20th attempt: the
+    // row can settle "unknown" at lease-expiry recovery instead of spending
+    // its last POST. That is an accepted, VISIBLE state — no machinery is
+    // added to chase an uncertain rollback commit.
     await token.box
       .restoreClaimIfTokenMatches(commandId, claimToken, priorState, priorAttempts)
       .catch(() => undefined);

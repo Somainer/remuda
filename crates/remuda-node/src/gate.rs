@@ -705,6 +705,12 @@ pub(crate) struct LandDrainSeams {
     /// original absolute deadline expire with both drains already finished and
     /// then require uncertainty (tokio's timeout polls the inner join first).
     pub(crate) final_accept_hold: Option<Arc<FinalDrainHold>>,
+    /// r22 item 5: one-shot hold taken by the survivor-cleanup blocking task
+    /// BEFORE it signals the group, modelling blocking-pool queueing/contention
+    /// so the response must stop waiting at the original deadline while the
+    /// SAME detached owner continuation still runs cleanup and the single
+    /// reap.
+    pub(crate) cleanup_hold: Option<Arc<CleanupHold>>,
 }
 
 /// r22 item 4 test-only hold at the granted-land owner's final drain
@@ -715,6 +721,17 @@ pub struct FinalDrainHold {
     pub(crate) entered: Arc<tokio::sync::Notify>,
     /// The owner parks on this until the test notifies release.
     pub(crate) release: Arc<tokio::sync::Notify>,
+}
+
+/// r22 item 5 test-only hold for the granted-land owner's survivor-cleanup
+/// blocking task. Uses std primitives because it parks a blocking-pool
+/// thread.
+#[cfg(any(test, feature = "test-faults"))]
+pub struct CleanupHold {
+    /// Set once the cleanup task has entered the hold (polled lock-free).
+    pub(crate) entered: Arc<std::sync::atomic::AtomicBool>,
+    /// Set true + notify to let the parked cleanup proceed.
+    pub(crate) release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
 /// Lane locks, running jobs and the per-Node event uplink.
@@ -929,6 +946,25 @@ impl GateRegistry {
         // block an async worker on a condvar.
         hold.release.notified().await;
         Some(hold)
+    }
+
+    /// r22 item 5 test-only: take the armed survivor-cleanup hold (one-shot).
+    #[cfg(any(test, feature = "test-faults"))]
+    fn take_cleanup_hold(&self) -> Option<Arc<CleanupHold>> {
+        self.land_drain_seams
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .cleanup_hold
+            .take()
+    }
+
+    /// r22 item 5 test-only: arm the survivor-cleanup blocking-task hold.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn arm_cleanup_hold(&self, hold: Arc<CleanupHold>) {
+        self.land_drain_seams
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .cleanup_hold = Some(hold);
     }
 
     #[cfg(any(test, feature = "test-faults"))]
@@ -1398,6 +1434,15 @@ impl DevNode {
     #[cfg(any(test, feature = "test-faults"))]
     pub async fn gate_test_arm_final_drain_accept_hold(&self, hold: Arc<FinalDrainHold>) {
         self.gate_registry().arm_final_drain_accept_hold(hold);
+    }
+
+    /// Test-only (r22 item 5): arm the one-shot survivor-cleanup blocking-task
+    /// hold so the response must stop waiting at the original deadline while
+    /// the same detached owner finishes cleanup and the single reap.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn gate_test_arm_cleanup_hold(&self, hold: Arc<CleanupHold>) {
+        self.gate_registry().arm_cleanup_hold(hold);
     }
 
     /// Dispatch one Hub→Node gate RPC by method name.
@@ -2509,31 +2554,83 @@ impl DevNode {
                     // begin this sequence until EOF.
                     let land_status = match observed {
                         ObservedExit::Unreaped => {
-                            #[cfg(unix)]
-                            if let Some(pgid) = land_pgid {
-                                // R8(b): THE OWNER CONTRACT's survivor-cleanup
-                                // step, shared with every recovery git
-                                // subprocess (remuda-unix).
-                                let deadline = land_deadline;
-                                tokio::task::spawn_blocking(move || {
-                                    remuda_unix::clean_surviving_group_until(pgid, deadline)
-                                })
-                                .await
-                                .ok();
-                            }
-                            // Reap the leader exactly once; its real status
-                            // drives the verdict. Bounded by the absolute land
-                            // deadline: a reap that does not complete is handed
-                            // to a detached owner task and the verdict is
-                            // uncertain (the push may have landed).
-                            let reaped =
-                                tokio::time::timeout(remaining(land_deadline), land_child.wait())
-                                    .await;
-                            match reaped {
-                                Ok(Ok(status)) => Some(status),
-                                _ => {
+                            // r22 item 5: cleanup AND the single leader reap are
+                            // ONE owner continuation, in that fixed order. The
+                            // response races the WHOLE continuation against the
+                            // ORIGINAL absolute deadline — this also bounds
+                            // blocking-pool QUEUEING time (the old code awaited
+                            // the cleanup JoinHandle with no timeout, so a
+                            // closure stuck behind a busy pool blocked the
+                            // response indefinitely).
+                            //
+                            // If the deadline expires, the SAME continuation is
+                            // detached to finish cleanup and the reap; the
+                            // response never reaps independently while a queued
+                            // cleanup could later run and signal a REUSED group,
+                            // and the corpse is still reaped exactly once.
+                            #[cfg(any(test, feature = "test-faults"))]
+                            let cleanup_hold = registry.take_cleanup_hold();
+                            let mut continuation: std::pin::Pin<
+                                Box<
+                                    dyn std::future::Future<
+                                            Output = Option<std::process::ExitStatus>,
+                                        > + Send,
+                                >,
+                            > = Box::pin(async move {
+                                #[cfg(unix)]
+                                if let Some(pgid) = land_pgid {
+                                    // R8(b): THE OWNER CONTRACT's survivor
+                                    // cleanup, shared with every recovery git
+                                    // subprocess (remuda-unix). It clamps its
+                                    // own waits to the absolute deadline.
+                                    let clean = tokio::task::spawn_blocking(move || {
+                                        #[cfg(any(test, feature = "test-faults"))]
+                                        if let Some(hold) = cleanup_hold {
+                                            // Signal entry (lock-free atomic),
+                                            // then park on release until the test
+                                            // lets cleanup proceed.
+                                            hold.entered
+                                                .store(true, std::sync::atomic::Ordering::Release);
+                                            let (rel_lock, rel_cvar) = &*hold.release;
+                                            let mut released = rel_lock
+                                                .lock()
+                                                .unwrap_or_else(|poison| poison.into_inner());
+                                            while !*released {
+                                                released = rel_cvar
+                                                    .wait(released)
+                                                    .unwrap_or_else(|poison| poison.into_inner());
+                                            }
+                                        }
+                                        remuda_unix::clean_surviving_group_until(
+                                            pgid,
+                                            land_deadline,
+                                        )
+                                    });
+                                    // Detach only the blocking handle when the
+                                    // whole continuation is handed off below;
+                                    // until then the response waits here.
+                                    let _ = clean.await;
+                                }
+                                // Reap the leader exactly once, AFTER cleanup
+                                // finished — this is the only place the child is
+                                // reaped on this arm.
+                                land_child.wait().await.ok()
+                            });
+                            match tokio::time::timeout(
+                                remaining(land_deadline),
+                                continuation.as_mut(),
+                            )
+                            .await
+                            {
+                                Ok(status) => status,
+                                Err(_) => {
+                                    // Deadline elapsed (queued/running cleanup or
+                                    // a blocked reap): hand the SAME ordered
+                                    // continuation to a detached owner and answer
+                                    // uncertain. No independent response-path
+                                    // reap.
                                     tokio::spawn(async move {
-                                        let _ = land_child.wait().await;
+                                        let _ = continuation.await;
                                     });
                                     None
                                 }
@@ -6148,6 +6245,91 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
             before_release.elapsed() < Duration::from_secs(2),
             "the latched owner must return promptly after release"
         );
+        assert_eq!(origin_main(&fixture), base_main, "push=false moves nothing");
+    }
+
+    /// r22 item 5: cleanup QUEUEING/running time is inside the original
+    /// deadline. The leader exits 0 with no surviving descendant; the
+    /// survivor-cleanup blocking task is held (modelling blocking-pool
+    /// contention) BEFORE it signals the group. The response must stop waiting
+    /// at the ORIGINAL absolute deadline and return uncertain WHILE the hold
+    /// is still engaged — the old code awaited the cleanup JoinHandle with no
+    /// timeout, so this run could not return at all until the hold released.
+    /// Releasing afterwards lets the SAME detached owner finish cleanup and
+    /// the single reap (no independent response-path reap).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_queued_cleanup_past_the_deadline_detaches_one_cleanup_reap_owner() {
+        let fixture = fixture(RAW_STDERR_LAND_SCRIPT);
+        let base_main = origin_main(&fixture);
+        let mut p = params(&fixture, "land");
+        p.push = false;
+        p.job_id = "gjb_queued_cleanup".into();
+        p.generation = 1;
+        // 0.5 s soft budget + 3.25 s owner allowance = 3.75 s absolute deadline.
+        fixture
+            .node
+            .gate_test_set_land_timeout(Duration::from_millis(500))
+            .await;
+
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        fixture
+            .node
+            .gate_test_arm_cleanup_hold(Arc::new(CleanupHold {
+                entered: entered.clone(),
+                release: release.clone(),
+            }));
+
+        let started = std::time::Instant::now();
+        let node = fixture.node.clone();
+        let run = tokio::spawn(async move { node.run_gate_typed(p).await });
+
+        // The blocking cleanup task queued, ran and parked before signalling.
+        // Poll the atomic flag ASYNCHRONOUSLY — never block a tokio worker on a
+        // std wait while the gate run needs it.
+        let entered_poll = async {
+            while !entered.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), entered_poll)
+            .await
+            .expect("the survivor-cleanup task never entered its hold");
+
+        // The response must return on its own, bounded by the absolute
+        // deadline, while the cleanup hold is STILL engaged (never released).
+        let result = tokio::time::timeout(Duration::from_secs(7), run)
+            .await
+            .expect("the response blocked on the queued cleanup past the deadline")
+            .expect("run task panicked")
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(5_500),
+            "the response waited on the held cleanup for {elapsed:?}, beyond the original deadline"
+        );
+        assert_eq!(
+            result.status, "uncertain",
+            "a deadline-expired cleanup/reap continuation yields uncertainty, got: {result:?}"
+        );
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|t| t.contains("uncertain")),
+            "the uncertainty is the owner-deadline outcome: {:?}",
+            result.reason
+        );
+
+        // Release the parked cleanup: the SAME detached owner runs group
+        // cleanup and the single reap to completion (it must not hang).
+        {
+            let (lock, cvar) = &*release;
+            let mut released_guard = lock.lock().unwrap();
+            *released_guard = true;
+            cvar.notify_all();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(origin_main(&fixture), base_main, "push=false moves nothing");
     }
 

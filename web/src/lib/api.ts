@@ -827,7 +827,7 @@ export class RestNetworkError extends Error {
   }
 }
 
-export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
+export async function rest<T>(path: string, req: RequestInit = {}, cancelSignal?: AbortSignal): Promise<T> {
   const session = readSession();
   const headers = {
     "content-type": "application/json",
@@ -838,8 +838,11 @@ export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
   const method = (req.method ?? "GET").toUpperCase();
   const isWrite = method !== "GET" && method !== "HEAD";
   const timeoutMs = isWrite ? REST_WRITE_TIMEOUT_MS : REST_READ_TIMEOUT_MS;
-  // A caller-supplied signal owns the timeout (e.g. the 65 s doctor probe);
-  // only attach our own when none was given.
+  // A caller-supplied req.signal owns the timeout (e.g. the 65 s doctor
+  // probe); only attach our own when none was given. cancelSignal (S3 logout
+  // retirement) is an ADDITIONAL abort source — it never suppresses the
+  // internal read/write deadline, so a retired credential request stays
+  // bounded by BOTH the logout abort and the usual timeout.
   const external = req.signal;
   const controller = new AbortController();
   // The deadline must cover BOTH receiving headers AND reading the body: a
@@ -856,13 +859,16 @@ export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
     if (timer) clearTimeout(timer);
   };
   external?.addEventListener("abort", () => controller.abort(external.reason), { once: true });
+  cancelSignal?.addEventListener("abort", () => controller.abort(cancelSignal!.reason), { once: true });
   let res: Response;
   try {
     res = await fetch(`${hubBase()}${path}`, {
       credentials: "include",
       ...req,
       headers,
-      signal: external ?? controller.signal,
+      // Always driven by the internal controller so BOTH the deadline and any
+      // caller/cancel signal can abort it (it forwards each above).
+      signal: controller.signal,
     });
   } catch (err) {
     clearTimer();
@@ -870,7 +876,8 @@ export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
     // retriable network error, never a business rejection (the outbox keeps
     // the same commandId and retries).
     if (err instanceof DOMException && err.name === "AbortError") {
-      throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+      const aborted = external?.aborted || cancelSignal?.aborted;
+      throw new RestNetworkError(aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
     }
     throw new RestNetworkError(err instanceof Error ? err.message : String(err));
   }
@@ -1468,19 +1475,19 @@ function createLiveApi(): HubApi {
   return {
     mock: false,
     async login(bootstrapToken, deviceName, signal) {
-      const body = await rest<HubJson<"/v1/login", "post">>("/v1/login", {
-        method: "POST",
-        body: JSON.stringify({ bootstrapToken, deviceName }),
+      const body = await rest<HubJson<"/v1/login", "post">>(
+        "/v1/login",
+        { method: "POST", body: JSON.stringify({ bootstrapToken, deviceName }) },
         signal,
-      });
+      );
       return body;
     },
     async pairRedeem(code, deviceName, signal) {
-      const body = await rest<HubJson<"/v1/devices/pair", "post">>("/v1/devices/pair", {
-        method: "POST",
-        body: JSON.stringify({ code, deviceName }),
+      const body = await rest<HubJson<"/v1/devices/pair", "post">>(
+        "/v1/devices/pair",
+        { method: "POST", body: JSON.stringify({ code, deviceName }) },
         signal,
-      });
+      );
       return body;
     },
     async pairCode() {
@@ -1515,10 +1522,12 @@ function createLiveApi(): HubApi {
       ) as Promise<PasskeyEnvelope>;
     },
     async passkeyLoginFinish(challengeId, assertion, deviceName, signal) {
-      return rest<HubJson<"/v1/auth/passkeys/login/finish", "post">>(
+      const body = await rest<HubJson<"/v1/auth/passkeys/login/finish", "post">>(
         "/v1/auth/passkeys/login/finish",
-        { method: "POST", body: JSON.stringify({ challengeId, assertion, deviceName }), signal },
+        { method: "POST", body: JSON.stringify({ challengeId, assertion, deviceName }) },
+        signal,
       );
+      return body;
     },
     async passkeyList() {
       return rest<HubJson<"/v1/auth/passkeys", "get">>("/v1/auth/passkeys");

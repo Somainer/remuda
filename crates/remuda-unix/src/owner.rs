@@ -88,36 +88,53 @@ fn remaining(deadline: Instant) -> Duration {
 
 /// Drain one child pipe to EOF on a reader thread that never reaps the leader
 /// (the owner is the sole reaper).
+///
+/// r22 item 3: drains RAW BYTES and reports the outcome explicitly — a read
+/// error is `Err`, never an empty/partial success, so the owner can fail
+/// closed (Unknown) instead of building a definitive result on a truncated
+/// drain. Decoding/interpretation is the caller's job and is lossy.
 fn drain_pipe<R: std::io::Read + Send + 'static>(
     pipe: Option<R>,
-) -> std::thread::JoinHandle<Vec<u8>> {
+) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut buf);
+        match pipe {
+            Some(mut pipe) => pipe.read_to_end(&mut buf).map(|_| buf),
+            None => Ok(buf),
         }
-        buf
     })
 }
 
-/// Join a draining reader ONLY while the ABSOLUTE deadline has time left: its
-/// bytes once EOF arrives, else `None` and the thread is ABANDONED (dropping
-/// the `JoinHandle` detaches it).
+/// Join a draining reader ONLY while the ABSOLUTE deadline has time left.
+///
+/// Returns:
+/// * `Some(Ok(bytes))` — the reader reached EOF before the deadline,
+/// * `Some(Err(_))` — it joined in time but reported a RAW read error, or the
+///   join itself failed (a panicked reader): a FAILED drain, which the owner
+///   treats as uncertainty (r22 item 3),
+/// * `None` — the deadline elapsed first; the thread is ABANDONED (dropping
+///   the `JoinHandle` detaches it) and any bytes it eventually produces are
+///   not accepted.
 ///
 /// r21 item 3: the deadline is checked BEFORE completion — a reader that
 /// finishes AFTER the deadline expired (while the owner was still inside an
 /// earlier cleanup/reap step) must not be accepted as an in-time drain.
 fn join_drained_until(
-    handle: std::thread::JoinHandle<Vec<u8>>,
-    deadline: Instant,
-) -> Option<Vec<u8>> {
+    handle: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    deadline: std::time::Instant,
+) -> Option<std::io::Result<Vec<u8>>> {
     loop {
-        if Instant::now() >= deadline {
+        if std::time::Instant::now() >= deadline {
             drop(handle);
             return None;
         }
         if handle.is_finished() {
-            return Some(handle.join().unwrap_or_default());
+            // A panicked reader is a FAILED drain, not empty successful bytes.
+            return Some(handle.join().unwrap_or_else(|_| {
+                Err(std::io::Error::other(
+                    "owned-process pipe reader thread panicked before EOF",
+                ))
+            }));
         }
         std::thread::sleep(OWNED_POLL_INTERVAL.min(remaining(deadline)));
     }
@@ -315,14 +332,17 @@ pub fn run_owned_process(
         }));
     }
 
-    // Step 5: join both drains with the remaining budget.
+    // Step 5: join both drains with the remaining budget. `Some(Ok)` is a
+    // complete EOF drain; `None` is an abandoned (deadline-blocked) reader and
+    // `Some(Err)` is a raw read/join failure — the last two are uncertainty
+    // (r22 item 3), never a Completed result.
     let stdout = join_drained_until(out_handle, deadline);
     let stderr = join_drained_until(err_handle, deadline);
-    let drains_done = stdout.is_some() && stderr.is_some();
+    let drains_done = matches!(stdout, Some(Ok(_))) && matches!(stderr, Some(Ok(_)));
     let output = Output {
         status,
-        stdout: stdout.unwrap_or_default(),
-        stderr: stderr.unwrap_or_default(),
+        stdout: stdout.and_then(|result| result.ok()).unwrap_or_default(),
+        stderr: stderr.and_then(|result| result.ok()).unwrap_or_default(),
     };
     if leader_exited && drains_done {
         Ok(OwnedRun::Completed(output))
@@ -376,7 +396,7 @@ mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::{OwnedRun, run_owned_process, test_support};
+    use super::{OwnedRun, drain_pipe, join_drained_until, run_owned_process, test_support};
     use std::process::Command;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -395,6 +415,61 @@ mod tests {
                 assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hi");
             }
             other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// A `Read` that yields one chunk of bytes and then fails, modelling a raw
+    /// pipe read error (r22 item 3).
+    struct PartialFailingReader {
+        chunk: Option<Vec<u8>>,
+    }
+
+    impl std::io::Read for PartialFailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(chunk) = self.chunk.take() {
+                let n = chunk.len().min(buf.len());
+                buf[..n].copy_from_slice(&chunk[..n]);
+                Ok(n)
+            } else {
+                Err(std::io::Error::other("synthetic pipe read failure"))
+            }
+        }
+    }
+
+    /// r22 item 3: a RAW read error is an explicit `Err` from the drain, not an
+    /// empty/partial successful drain.
+    #[test]
+    fn a_failing_pipe_reports_an_error_not_an_empty_drain() {
+        let reader = PartialFailingReader {
+            chunk: Some(b"partial".to_vec()),
+        };
+        let handle = drain_pipe(Some(reader));
+        let joined = handle.join().expect("reader thread panicked");
+        assert!(
+            joined.is_err(),
+            "a failed read must surface as an error, got {joined:?}"
+        );
+    }
+
+    /// r22 item 3: `join_drained_until` propagates a finished reader's error as
+    /// `Some(Err)` — the owner classifies that as an incomplete drain — while a
+    /// successful drain is `Some(Ok(bytes))`.
+    #[test]
+    fn a_finished_failed_drain_is_some_err_and_a_good_drain_is_some_ok() {
+        let failing = drain_pipe(Some(PartialFailingReader {
+            chunk: Some(b"x".to_vec()),
+        }));
+        let outcome = join_drained_until(failing, Instant::now() + Duration::from_secs(2));
+        match outcome {
+            Some(Err(_)) => {}
+            other => panic!("a failed drain must be Some(Err), got {other:?}"),
+        }
+
+        let good = drain_pipe(Some(std::io::Cursor::new(b"complete".as_slice())));
+        let outcome = join_drained_until(good, Instant::now() + Duration::from_secs(2));
+        match outcome {
+            Some(Ok(bytes)) => assert_eq!(bytes, b"complete"),
+            other => panic!("a full EOF drain must be Some(Ok), got {other:?}"),
         }
     }
 

@@ -690,6 +690,18 @@ pub struct LandFenceFault {
     pub(crate) fail: bool,
 }
 
+/// r22 items 3/4/6 test-only seams for the granted-land owner's pipe drains.
+/// Per-Node (held on the [`GateRegistry`], never process-global) so parallel
+/// tests each drive only their own fixture's seams. Defaults are all inert.
+#[cfg(any(test, feature = "test-faults"))]
+#[derive(Default)]
+pub(crate) struct LandDrainSeams {
+    /// r22 item 3: the stderr reader returns a synthetic read error after its
+    /// first non-empty read, exercising the "a failed drain is uncertainty"
+    /// arm without a real OS read failure.
+    pub(crate) stderr_read_fault: bool,
+}
+
 /// Lane locks, running jobs and the per-Node event uplink.
 pub(crate) struct GateRegistry {
     /// laneId → one slot; a held slot rejects a second run (`lane-busy`).
@@ -725,6 +737,11 @@ pub(crate) struct GateRegistry {
     /// so the "refuse to spawn, report uncertain" arm can be exercised.
     #[cfg(any(test, feature = "test-faults"))]
     force_barrier_fault: std::sync::Mutex<bool>,
+    /// r22 items 3/4/6 test-only seams for the granted-land owner's pipe
+    /// drains. Per-Node (NOT process-global), so parallel tests each drive
+    /// their own fixture's seams.
+    #[cfg(any(test, feature = "test-faults"))]
+    land_drain_seams: std::sync::Mutex<LandDrainSeams>,
     /// Durable ledger directory for granted LAND process groups (r14 R1). One
     /// record per granted land, written right after the land child spawns and
     /// removed only once the whole group is verified gone. At Node boot a
@@ -769,6 +786,8 @@ impl GateRegistry {
             land_fence_fault: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "test-faults"))]
             force_barrier_fault: std::sync::Mutex::new(false),
+            #[cfg(any(test, feature = "test-faults"))]
+            land_drain_seams: std::sync::Mutex::new(LandDrainSeams::default()),
             land_fence_dir,
             events,
         })
@@ -848,6 +867,26 @@ impl GateRegistry {
             .force_barrier_fault
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = on;
+    }
+
+    /// r22 item 3 test-only: arm/clear the synthetic stderr read fault for the
+    /// granted-land owner.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn set_land_stderr_read_fault(&self, on: bool) {
+        self.land_drain_seams
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .stderr_read_fault = on;
+    }
+
+    /// r22 item 3 test-only: whether the land stderr reader should fail after
+    /// its first non-empty read.
+    #[cfg(any(test, feature = "test-faults"))]
+    fn land_stderr_read_fault(&self) -> bool {
+        self.land_drain_seams
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .stderr_read_fault
     }
 
     #[cfg(any(test, feature = "test-faults"))]
@@ -1300,6 +1339,15 @@ impl DevNode {
     #[cfg(any(test, feature = "test-faults"))]
     pub async fn gate_test_set_force_barrier_fault(&self, on: bool) {
         self.gate_registry().set_force_barrier_fault(on);
+    }
+
+    /// Test-only (r22 item 3): make the granted-land owner's stderr reader
+    /// return a synthetic read error after its first non-empty read, so a
+    /// failed drain deterministically yields an uncertain verdict.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_set_land_stderr_read_fault(&self, on: bool) {
+        self.gate_registry().set_land_stderr_read_fault(on);
     }
 
     /// Dispatch one Hub→Node gate RPC by method name.
@@ -2199,9 +2247,16 @@ impl DevNode {
             let mut land_stdout_task = land_stdout.map(|mut stdout| {
                 tokio::spawn(async move {
                     use tokio::io::AsyncReadExt;
+                    // r22 item 3: drain RAW BYTES to EOF and report the
+                    // outcome explicitly. A read error is never swallowed into
+                    // a successful empty/partial drain — the owner treats it as
+                    // uncertainty rather than building a verdict on truncated
+                    // output.
                     let mut stdout_bytes = Vec::new();
-                    let _ = stdout.read_to_end(&mut stdout_bytes).await;
-                    stdout_bytes
+                    stdout
+                        .read_to_end(&mut stdout_bytes)
+                        .await
+                        .map(|_| stdout_bytes)
                 })
             });
             // r13 item 6: drain stderr CONCURRENTLY for the life of the child
@@ -2210,30 +2265,71 @@ impl DevNode {
             // land child forever (deadlock) — the exact failure the verify child
             // already guarded against with its own stderr pump.
             //
-            // r14 item 9: the drained lines are ALSO accumulated (the child's
+            // r14 item 9: the drained bytes are ALSO accumulated (the child's
             // stderr handle is consumed by this pump, so the waited Output's
             // stderr is always empty). A nonzero land exit then reports the
             // captured remote rejection/error text instead of a blank reason.
-            let captured_stderr: Arc<std::sync::Mutex<Vec<String>>> =
+            //
+            // r22 item 3: the pump drains RAW BYTES (never `BufReader::lines`,
+            // whose UTF-8 decoding error silently ends the loop and is reported
+            // as a successful drain). Decoding is lossy and happens ONLY for
+            // the live line presentation; the captured evidence keeps the raw
+            // bytes. A real read error is returned so the owner fails closed.
+            let captured_stderr: Arc<std::sync::Mutex<Vec<u8>>> =
                 Arc::new(std::sync::Mutex::new(Vec::new()));
-            let mut land_stderr_task = land_child.stderr.take().map(|stderr| {
+            let mut land_stderr_task = land_child.stderr.take().map(|mut stderr| {
                 let node = self.clone();
                 let job_id = request.job_id.clone();
                 let generation = request.generation;
                 let captured = captured_stderr.clone();
                 tokio::spawn(async move {
-                    use tokio::io::{AsyncBufReadExt, BufReader};
-                    let mut lines = BufReader::new(stderr).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        if let Ok(mut buffer) = captured.lock() {
-                            buffer.push(line.clone());
-                        }
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 4096];
+                    // Decoded-but-incomplete tail carried across reads, used
+                    // only to split the lossy presentation into lines.
+                    let mut pending = String::new();
+                    let emit = |node: &DevNode, message: String| {
                         let _ = node.gate_registry().events.send(GateEventParams {
                             job_id: job_id.clone(),
                             generation,
-                            kind: GateEventKind::Log { message: line },
+                            kind: GateEventKind::Log { message },
                         });
+                    };
+                    loop {
+                        match stderr.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if let Ok(mut raw) = captured.lock() {
+                                    raw.extend_from_slice(&buf[..n]);
+                                }
+                                pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+                                while let Some(idx) = pending.find('\n') {
+                                    let line = pending[..idx].trim_end_matches('\r').to_owned();
+                                    pending.replace_range(..=idx, "");
+                                    emit(&node, line);
+                                }
+                                // r22 item 3 deterministic seam: fail AFTER a
+                                // non-empty read so valid bytes exist but the
+                                // drain is explicitly unsuccessful.
+                                #[cfg(any(test, feature = "test-faults"))]
+                                if node.gate_registry().land_stderr_read_fault() {
+                                    return Err(std::io::Error::other(
+                                        "synthetic land stderr read fault (r22 item 3 test seam)",
+                                    ));
+                                }
+                            }
+                            // A signal interrupts one read; the drain continues.
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
+                    // Flush the final unterminated line for presentation.
+                    if !pending.is_empty() {
+                        emit(&node, std::mem::take(&mut pending));
+                    }
+                    std::io::Result::Ok(())
                 })
             });
             // Land runs to completion even if cancel fires (grant already
@@ -2395,24 +2491,28 @@ impl DevNode {
                         }
                         ObservedExit::Reaped(status) => Some(status),
                     };
-                    // r21 item 2 — THE OWNER CONTRACT's drain step: join BOTH
-                    // reader tasks here. They drained CONCURRENTLY with the exit
-                    // observation and were RETAINED through survivor cleanup and
-                    // the reap; each is now awaited with only the REMAINING
-                    // absolute budget. An incomplete OR failed drain of EITHER
-                    // pipe is UNCERTAINTY, never a definitive land: a descendant
-                    // in ANOTHER session (`setsid sleep … >/dev/null &` keeps
-                    // stderr in a session the group KILL cannot reach) can hold a
-                    // pipe long after the leader's reaping, and no verdict may
-                    // be built while a pipe is still open or its reader failed.
+                    // r21 item 2 / r22 item 3 — THE OWNER CONTRACT's drain
+                    // step: join BOTH reader tasks here. They drained
+                    // CONCURRENTLY with the exit observation and were RETAINED
+                    // through survivor cleanup and the reap; each is now awaited
+                    // with only the REMAINING absolute budget. An incomplete OR
+                    // failed drain of EITHER pipe is UNCERTAINTY, never a
+                    // definitive land: a descendant in ANOTHER session
+                    // (`setsid sleep … >/dev/null &` keeps stderr in a session
+                    // the group KILL cannot reach) can hold a pipe long after
+                    // the leader's reaping, and no verdict may be built while a
+                    // pipe is still open or its reader FAILED (join panic OR a
+                    // raw read error, not just an elapsed timeout).
                     let mut drain_ok = !remaining(land_deadline).is_zero();
                     let stdout_bytes = if !drain_ok {
                         None
                     } else if let Some(task) = land_stdout_task.take() {
                         match tokio::time::timeout(remaining(land_deadline), task).await {
-                            Ok(Ok(bytes)) => Some(bytes),
+                            // Joined, EOF reached, raw bytes in hand.
+                            Ok(Ok(Ok(bytes))) => Some(bytes),
+                            // Elapsed timeout, a panicked/aborted join, OR the
+                            // reader's explicit read error — all uncertainty.
                             _ => {
-                                // Blocked at the deadline OR a failed task.
                                 drain_ok = false;
                                 None
                             }
@@ -2420,16 +2520,15 @@ impl DevNode {
                     } else {
                         Some(Vec::new())
                     };
-                    if drain_ok
-                        && let Some(task) = land_stderr_task.take()
-                        && tokio::time::timeout(remaining(land_deadline), task)
-                            .await
-                            .is_err()
-                    {
-                        // The stderr pump did not reach EOF in the remaining
-                        // budget (or its join failed): its captured lines are
-                        // partial and the pipe is still held.
-                        drain_ok = false;
+                    if drain_ok && let Some(task) = land_stderr_task.take() {
+                        match tokio::time::timeout(remaining(land_deadline), task).await {
+                            // Joined and drained to EOF.
+                            Ok(Ok(Ok(()))) => {}
+                            // Deadline elapsed, the join failed, or the raw
+                            // reader reported a read error: the captured bytes
+                            // are partial or the pipe is still held.
+                            _ => drain_ok = false,
+                        }
                     }
                     let land_output = match (land_status, stdout_bytes, drain_ok) {
                         (Some(status), Some(stdout), true) => Some(std::process::Output {
@@ -2439,9 +2538,11 @@ impl DevNode {
                         }),
                         _ => None,
                     };
+                    // r22 item 3: decode the RAW captured bytes LOSSILY only
+                    // for presentation (a nonzero exit's reason / evidence).
                     let drained_stderr = captured_stderr
                         .lock()
-                        .map(|lines| lines.join("\n"))
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                         .unwrap_or_default();
                     match land_output {
                         Some(land_output) if land_output.status.success() => {
@@ -5291,6 +5392,35 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
 exit 0
 "#;
 
+    /// r22 item 3: the released land leader writes a line of INVALID UTF-8 to
+    /// stderr (a byte sequence `lines()` cannot decode), then a valid `landed`
+    /// report on stdout, and exits 0. Portable — no `setsid`, no descendant,
+    /// both pipes close at exit. Used two ways: with the injected stderr read
+    /// fault the failed drain must make the land UNCERTAIN; without it the raw
+    /// bytes drain to EOF (the decode error is presentation-only) and the
+    /// valid verdict still lands.
+    const RAW_STDERR_LAND_SCRIPT: &str = r#"
+dir=$(dirname "$0")
+echo "$*" >> "$dir/args.txt"
+base=$(git rev-parse main 2>/dev/null || echo "1111111111111111111111111111111111111111")
+head=$(git rev-parse wt/fake/task 2>/dev/null || echo "2222222222222222222222222222222222222222")
+if ! printf '%s\n' "$*" | grep -q -- '--land'; then
+  echo "{\"exitCode\":0,\"status\":\"verified\",\"base\":\"$base\",\"head\":\"$head\",\"merged\":\"$head\",\"steps\":[]}"
+  exit 0
+fi
+if [ "${REMUDA_START_BARRIER_FD-}" != "0" ]; then
+  exit 0
+fi
+byte=""
+IFS= read -r -n 1 -t 30 byte || exit 4
+[ -n "$byte" ] || exit 4
+# One line containing an invalid UTF-8 lead byte: a `lines()` decoder errors on
+# it, but the raw-byte drain must not.
+printf 'land-remote-note-\377-end\n' >&2
+echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\":\"$head\",\"steps\":[]}"
+exit 0
+"#;
+
     const BARRIER_LAND_SCRIPT: &str = r#"
 dir=$(dirname "$0")
 echo "$*" >> "$dir/args.txt"
@@ -5811,6 +5941,78 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
         let _ = std::process::Command::new("pkill")
             .args(["-f", "sleep 47.22"])
             .output();
+    }
+
+    /// r22 item 3: a FAILED stderr drain makes even a clean, valid land
+    /// UNCERTAIN. The child writes one stderr line (here with invalid UTF-8),
+    /// prints a valid `landed` report and exits 0; the injected reader seam
+    /// makes the raw stderr reader return a read ERROR after its first chunk.
+    /// The old `BufReader::lines()` loop swallowed both a UTF-8 decoding error
+    /// and any read error as a successful empty drain, so the join accepted
+    /// `landed`. Deterministic and portable (no descendant / `setsid`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_stderr_drain_after_a_clean_exit_makes_the_land_uncertain() {
+        let fixture = fixture(RAW_STDERR_LAND_SCRIPT);
+        let base_main = origin_main(&fixture);
+        let mut p = params(&fixture, "land");
+        p.push = false;
+        p.job_id = "gjb_raw_stderr_fault".into();
+        p.generation = 1;
+        fixture
+            .node
+            .gate_test_set_land_timeout(Duration::from_secs(2))
+            .await;
+        // Arm the synthetic raw-read failure AFTER the stderr reader's first
+        // non-empty read.
+        fixture
+            .node
+            .gate_test_set_land_stderr_read_fault(true)
+            .await;
+        let result = fixture.node.run_gate_typed(p).await.unwrap();
+        fixture
+            .node
+            .gate_test_set_land_stderr_read_fault(false)
+            .await;
+        assert_eq!(
+            result.status, "uncertain",
+            "a failed stderr drain is uncertainty even on a clean exit, got: {result:?}"
+        );
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|t| t.contains("drain")),
+            "the uncertainty names the failed pipe drain: {:?}",
+            result.reason
+        );
+        assert_eq!(origin_main(&fixture), base_main, "push=false moves nothing");
+    }
+
+    /// r22 item 3: invalid UTF-8 on stderr is a PRESENTATION concern only. The
+    /// readers drain raw bytes to EOF, so a clean exit with a decode-hostile
+    /// stderr line and both pipes closed still yields the valid `landed`
+    /// verdict (the old `lines()` decoder would have aborted the line stream,
+    /// but draining raw bytes does not). Portable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_utf8_on_stderr_drains_raw_and_still_lands() {
+        let fixture = fixture(RAW_STDERR_LAND_SCRIPT);
+        let base_main = origin_main(&fixture);
+        let mut p = params(&fixture, "land");
+        p.push = false;
+        p.job_id = "gjb_raw_stderr_utf8".into();
+        p.generation = 1;
+        fixture
+            .node
+            .gate_test_set_land_timeout(Duration::from_secs(2))
+            .await;
+        // No read fault: the invalid-UTF-8 line drains raw and EOF closes both
+        // pipes at the leader's exit.
+        let result = fixture.node.run_gate_typed(p).await.unwrap();
+        assert_eq!(
+            result.status, "landed",
+            "a full raw-byte drain tolerates invalid UTF-8 and keeps the verdict: {result:?}"
+        );
+        assert_eq!(origin_main(&fixture), base_main, "push=false moves nothing");
     }
 
     /// r18 item 10: the barrier fake must reject a ZERO-byte read (EOF), not

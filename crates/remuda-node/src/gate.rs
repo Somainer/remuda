@@ -722,22 +722,26 @@ pub(crate) struct GateRegistry {
     force_barrier_fault: std::sync::Mutex<bool>,
     /// Durable ledger directory for granted LAND process groups (r14 R1). One
     /// record per granted land, written right after the land child spawns and
-    /// removed only once the whole group is verified gone. A leftover record
-    /// at Node boot fences (kills + verifies) the possibly-orphaned group
-    /// before any carrier is served; a record present at runtime proves a push
-    /// may still land, so a read-only landing probe reports `unknown`.
+    /// removed only once the whole group is verified gone. At Node boot a
+    /// leftover record is reconciled read-only: the restarted Node never
+    /// signals a group it does not own (R8(a)); only a kernel-proven-dead
+    /// group releases the record, every other fence stays as Unknown for
+    /// operator resolution. A record present at runtime proves a push may
+    /// still land, so a read-only landing probe reports `unknown`.
     land_fence_dir: std::path::PathBuf,
     events: tokio::sync::broadcast::Sender<GateEventParams>,
 }
 
 impl GateRegistry {
-    /// Construct the registry rooted at a Node data dir, fencing any land
+    /// Construct the registry rooted at a Node data dir, reconciling any land
     /// groups orphaned by a previous Node process BEFORE returning. The land
     /// child runs in its own process group with kill_on_drop(false), so a Node
-    /// crash would otherwise leave it free to keep pushing while the Hub could
-    /// only guess the outcome. The startup fence makes "the land process group
-    /// is verified dead" provable across restarts (r14 R1). With no leftover
-    /// records — the normal boot — this is one directory read.
+    /// crash could leave it free to keep pushing while the Hub could only
+    /// guess the outcome. The startup scan makes "the land process group is
+    /// verified dead" provable across restarts (r14 R1); per R8(a) it NEVER
+    /// signals the orphaned groups — live/uncertain fences are kept and the
+    /// Landing goes to operator resolution. With no leftover records — the
+    /// normal boot — this is one directory read.
     pub(crate) fn open(land_fence_dir: std::path::PathBuf) -> Arc<Self> {
         #[cfg(unix)]
         fence_orphaned_land_groups(&land_fence_dir);
@@ -4118,21 +4122,27 @@ fn terminate_and_verify_group(pgid: i32, term_grace: Duration) -> bool {
     !land_group_exists(pgid)
 }
 
-/// r14 R1 / r15 R5 startup fence: every leftover record names a granted land
-/// group the PREVIOUS Node process may have orphaned mid-push. Every decision
-/// is Established or Unknown:
+/// r14 R1 / r15 R5, r20 item 2 / R8(a) startup fence: every leftover record
+/// names a granted land group the PREVIOUS Node process may have orphaned
+/// mid-push.
+///
+/// R8(a): after a restart the Node does NOT OWN the orphaned groups, so it
+/// NEVER signals them — no TERM, no KILL, no "sampled identity" pinning. Even
+/// an exact durable start-identity match is not an ownership pin: the original
+/// parent/PID1 may reap the leader between the sample and the signal, its pid
+/// can be recycled, and the unconditional post-ESRCH KILL would then strike an
+/// unrelated group. Every fence that names a possibly-live group is therefore
+/// KEPT; the Landing reads Unknown/uncertain and goes to operator resolution
+/// (R5 fail closed). The ONLY autonomous action is when death is established
+/// by the kernel for the WHOLE group:
 /// * record unreadable/unparseable/missing fields/missing identity → Unknown,
-///   KEEP the record (never delete the only proof, never signal);
-/// * leader pid ALIVE with the SAME durable start identity → positively ours;
-///   terminate the whole group (TERM → bounded wait → KILL → ESRCH) and remove
-///   the record only once death is authoritative;
-/// * leader pid alive with a DIFFERENT identity (pid reused by a stranger) →
-///   no signal; group ownership can no longer be positively established → KEEP
-///   the record (the Landing stays outcome-unknown and the remote resolves it);
-/// * leader pid ESRCH and the group ESRCH → established dead → remove;
+///   KEEP (never delete the only proof, never signal);
+/// * leader pid ALIVE (matched, mismatched, or unreadable identity) → KEEP
+///   without signalling;
+/// * leader pid ESRCH and the group ESRCH → established dead → certify+remove;
 /// * leader pid ESRCH but the group still exists (orphaned members, no leader)
-///   → Unknown without the leader identity → no signal, KEEP the record;
-/// * `kill(pid, 0)` EPERM/other → Unknown → keep, never signal.
+///   → Unknown → KEEP;
+/// * `kill(pid, 0)` EPERM/other → Unknown → keep.
 #[cfg(unix)]
 fn fence_orphaned_land_groups(dir: &std::path::Path) {
     use nix::sys::signal::kill;
@@ -4170,45 +4180,28 @@ fn fence_orphaned_land_groups(dir: &std::path::Path) {
         else {
             continue;
         };
-        let Some(recorded_identity) = LeaderIdentity::from_record(&record) else {
+        // The durable identity is required only to certify a proven-dead group;
+        // R8(a) removed the live-leader identity match that used to authorize a
+        // signal after restart.
+        if LeaderIdentity::from_record(&record).is_none() {
             continue;
-        };
-        let Some(_job) = record.get("jobId").and_then(Value::as_str) else {
+        }
+        if record.get("jobId").and_then(Value::as_str).is_none() {
             continue;
-        };
+        }
         match kill(Pid::from_raw(pgid), None) {
             Ok(()) => {
-                // A live process holds the leader pid. Signal ONLY on a
-                // positive identity match.
-                match sample_leader_identity(pgid) {
-                    Some(current) if current == recorded_identity => {
-                        if terminate_and_verify_group(pgid, LAND_GROUP_TERM_GRACE) {
-                            match certify_dead_and_remove_fence(dir, &record, pgid) {
-                                Ok(true) | Ok(false) => {}
-                                Err(error) => tracing::warn!(
-                                    %error,
-                                    pgid,
-                                    "certifying the terminated land group failed; keeping the fence"
-                                ),
-                            }
-                        }
-                        // Still not provably gone: keep for the next boot.
-                    }
-                    Some(_) => {
-                        tracing::warn!(
-                            pgid,
-                            "land fence leader pid was reused by an unrelated process; refusing \
-                             to signal the group and keeping the fence record"
-                        );
-                    }
-                    None => {
-                        tracing::warn!(
-                            pgid,
-                            "land fence leader is alive but its identity cannot be read; refusing \
-                             to signal the group and keeping the fence record"
-                        );
-                    }
-                }
+                // R8(a): a process holds the leader pid — matched identity,
+                // recycled pid, or unreadable sample. The restarted Node does
+                // not own this group: NEVER signal (TERM/KILL can strike a
+                // recycled group) and KEEP the fence so the Landing stays
+                // Unknown for operator resolution.
+                tracing::warn!(
+                    pgid,
+                    "orphaned land group leader is still alive after a Node restart; the Node \
+                     does not own it (no signal sent); keeping the fence record for operator \
+                     resolution"
+                );
             }
             Err(nix::errno::Errno::ESRCH) => {
                 // No process at the leader pid. With no leader, a still-present
@@ -6652,6 +6645,64 @@ Running 8 tests across 2 projects
         assert!(super::land_fence_path(fence, "job-x").is_file());
         let _ = stranger.kill();
         reap(stranger);
+    }
+
+    /// r20 item 2 / R8(a): after a restart the Node does NOT OWN an orphaned
+    /// land group even when the live leader's durable start identity EXACTLY
+    /// matches the fence record. It must send no TERM and no KILL (a signal
+    /// there could strike a recycled group after the leader is reaped), KEEP
+    /// the fence, and leave the Landing Unknown for operator resolution.
+    #[test]
+    fn startup_fence_never_signals_a_live_orphan_even_with_a_matching_identity() {
+        let _seq = proc_lock();
+        let mut child = spawn_grouped("sleep", &["47.31"]);
+        let pgid = child.id() as i32;
+        let identity = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Some(value) = super::sample_leader_identity(pgid) {
+                    break value;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "never sampled the leader"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let fence = dir.path();
+        let mut record = serde_json::json!({"jobId":"job-orphan-live","generation":1,"pgid":pgid});
+        identity.write(&mut record);
+        std::fs::write(
+            super::land_fence_path(fence, "job-orphan-live"),
+            record.to_string(),
+        )
+        .unwrap();
+
+        super::fence_orphaned_land_groups(fence);
+
+        // The orphan is alive AFTER the scan — the old code TERM/KILLed it on
+        // the exact identity match.
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a live orphan with a matching identity must never be signalled after a restart"
+        );
+        assert!(
+            super::land_group_exists(pgid),
+            "the group was signalled despite R8(a)"
+        );
+        // The fence is retained: the Landing stays Unknown for the operator.
+        assert!(
+            super::land_fence_path(fence, "job-orphan-live").is_file(),
+            "the live orphan's fence must be kept, never certified dead"
+        );
+        assert!(
+            super::read_land_group_dead_cert(fence, "job-orphan-live").is_none(),
+            "no death certificate may be written for a live group"
+        );
+        let _ = child.kill();
+        reap(child);
     }
 
     #[test]

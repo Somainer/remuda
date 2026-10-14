@@ -7860,3 +7860,82 @@ it("GATE38 item 1: an external logout (local and peer-tab) while login A's body 
     }
   }
 });
+
+it("GATE38 item 2: a peer logout while bootstrap's health request is parked invalidates the in-flight bootstrap — a transient health rejection recreates nothing and never republishes authed", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_300_000);
+  const I = "ins_g38_2";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 4_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g38_2");
+    localStorage.removeItem("runtime.device-session");
+    localStorage.setItem("runtime.logged-out", "1");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    const send = vi.spyOn(api, "instanceSend");
+    // The credential body resolves immediately; bootstrap's HEALTH is parked.
+    vi.spyOn(api, "login").mockResolvedValue({ deviceId: "dev_g38_2", token: "tok", name: "g38_2" });
+    let releaseHello: () => void = () => undefined;
+    let helloCalls = 0;
+    vi.spyOn(api, "hello").mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          helloCalls += 1;
+          // A non-401 failure: the offline/transient-health branch (not the
+          // explicit 401 clear path).
+          releaseHello = () => reject(new Error("transient health failure"));
+        }),
+    );
+    const h = hubStore as unknown as {
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      outbox: unknown;
+      connection: unknown;
+      state: { authed: boolean; session: unknown };
+    };
+    const loginP = h.login("bootstrap", "secret", "dev");
+    for (let i = 0; i < 4_000 && helloCalls < 1; i += 1) await Promise.resolve();
+    expect(helloCalls).toBe(1); // bootstrap is suspended at the health await
+
+    // A PEER TAB logs out while the health request is in flight.
+    localStorage.removeItem("runtime.device-session");
+    window.dispatchEvent(
+      new StorageEvent("storage", { key: "runtime.device-session", oldValue: "{}", newValue: null }),
+    );
+    await pump(300);
+    expect(h.outbox).toBeNull();
+
+    // The health request rejects TRANSIENTLY (not 401): the old code took the
+    // offline branch, recreated the connection/outbox and republished authed
+    // from A's cached session.
+    releaseHello();
+    await loginP; // the login promise settles, never hangs
+    await pump(4_000);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await pump(1_000);
+
+    expect(h.state.authed).toBe(false);
+    // The peer handler intentionally emits no new page state (the UI/next
+    // action decides re-auth); what matters is that the stale bootstrap never
+    // REPUBLISHes authed:true and that readSession()/hasDeviceSession() —
+    // cleared with the in-memory cache — cannot bring A back.
+    const { readSession } = await import("./session");
+    expect(readSession()).toBeNull();
+    expect(h.outbox).toBeNull();
+    expect(h.connection).toBeNull();
+    expect(send).not.toHaveBeenCalled();
+    // The stale bootstrap did not retry health after the peer logout.
+    expect(helloCalls).toBe(1);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

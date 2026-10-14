@@ -1608,8 +1608,12 @@ class HubStore {
     // Capture the auth generation this initializer starts under (gate 33
     // item 2). It may complete after an auth change bumped authGen; in that
     // case it must not install the box it built nor run its post-load flush.
+    // Gate 38: an EXTERNAL identity change (logout/401/peer) additionally
+    // moves extEpoch and retires the initializer even where the generation
+    // accounting alone would still match.
     const gen = this.authGen;
-    const obsolete = () => gen !== this.authGen;
+    const ext = this.extEpoch;
+    const obsolete = () => gen !== this.authGen || ext !== this.extEpoch;
     this.outboxInit = (async (): Promise<"ok" | "obsolete" | "unavailable"> => {
       try {
         // Test gate: hold the initializer mid-open so a test can change auth
@@ -4255,6 +4259,15 @@ class HubStore {
     // peer logout must be observable for its whole duration (the watch is
     // otherwise only registered lazily by outbox init).
     this.registerPeerAuthWatch();
+    // Gate 38 item 2: capture the external epoch at bootstrap start and
+    // revalidate SYNCHRONOUSLY after every await below, before installing a
+    // resource or publishing state. A peer logout / local logout / 401 while a
+    // health or list request is in flight makes this bootstrap stop silently —
+    // the external change already published logged-out and disposed the
+    // outbox; this stale run must not recreate a connection/outbox or
+    // republish authed from a cached session.
+    const extAtBoot = this.extEpoch;
+    const extLive = () => this.extEpoch === extAtBoot;
     const gen = ++this.bootGen;
     if (api.mock && readLoggedOut() && !readSession()) {
       this.emit({ ready: true, authed: false, session: null, devices: [], passkeys: [], connection: "offline" });
@@ -4262,6 +4275,7 @@ class HubStore {
     }
     if (api.mock && !readSession()) {
       const session = await api.login(MOCK_BOOTSTRAP_TOKEN, readDeviceSettings().deviceName);
+      if (gen !== this.bootGen || !extLive()) return;
       // First identity establishment: route through the same helper so the
       // initial Outbox initializer starts under a defined, current generation.
       this.applyAuthIdentityChange();
@@ -4270,7 +4284,7 @@ class HubStore {
     }
     try {
       await api.hello();
-      if (gen !== this.bootGen) return;
+      if (gen !== this.bootGen || !extLive()) return;
       if (!api.mock && !api.hasDeviceSession()) {
         this.emit({ ready: true, authed: false, error: null, connection: "live" });
         return;
@@ -4282,7 +4296,7 @@ class HubStore {
         api.deviceList().catch(() => ({ items: [] as PairedDevice[] })),
         api.passkeyList().catch(() => ({ items: [] as PasskeyView[] })),
       ]);
-      if (gen !== this.bootGen) return;
+      if (gen !== this.bootGen || !extLive()) return;
       const registeredHosts = mergeHostWorkspaces(hosts.items, this.state.hosts);
       this.emit({
         ready: true,
@@ -4330,11 +4344,17 @@ class HubStore {
           void this.refresh().catch(() => undefined);
         }, 300);
       });
+      // Re-validate immediately before installing the connection (and through
+      // it the outbox): an external change landing during this synchronous
+      // setup must not be followed by a stale machine/install, and again after
+      // the install settles before starting polls.
+      if (!extLive()) return;
       await this.initConnection();
+      if (!extLive()) return;
       this.startPoll();
       this.installDevHandle();
     } catch (err) {
-      if (gen !== this.bootGen) return;
+      if (gen !== this.bootGen || !extLive()) return;
       const unauth = isUnauthorized(err);
       if (unauth) {
         // c-reconnfu gate 33 item 1: a 401 means the current session is gone;
@@ -4346,12 +4366,16 @@ class HubStore {
         clearSession();
         dropDeviceCookie();
       }
+      // Gate 38: an external change observed WHILE this bootstrap was in
+      // flight retired the run above — publish/install nothing on it.
+      if (!extLive()) return;
       // A network failure WITH a device session still on disk is an offline
       // reload, not a logout: keep the (cached) authed UI, restore the outbox,
       // and let the connection machine reconnect. Only a real 401 logs out.
       const hasSession = api.hasDeviceSession();
       if (!unauth && hasSession) {
         await this.initConnection(true);
+        if (!extLive()) return;
         this.emit({
           ready: true,
           authed: true,

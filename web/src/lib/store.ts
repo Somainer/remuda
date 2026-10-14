@@ -1369,12 +1369,21 @@ class HubStore {
       // in-memory session in THIS tab so readSession()/hasDeviceSession()
       // cannot resurrect the old identity.
       clearCachedSession();
+      // Gate 40 item 2: dispose the OLD identity's connection machine
+      // coherently (socket/timers/follow bookkeeping). Retaining it while
+      // publishing "offline" would strand a false-offline field — its live
+      // frames suppress redundant publication and a healthy re-login's reuse
+      // branch would then never resync; a fresh login builds a new machine
+      // that publishes its own state. The logout/401 callers also dispose via
+      // their own teardown, so this is idempotent for them.
+      this.disposeConnectionForAuthChange();
       // Gate 39 R-c: leave the UI in a SETTLED state synchronously. A peer
       // logout observed while no entry point is running (or while one is
       // parked) must not strand protected pages on the loading screen waiting
       // on a bootstrap that will now return silently; the logout/401 callers
       // emit their own identical state right after this, so this is an
-      // idempotent publish.
+      // idempotent publish. With the machine just disposed, "offline" is the
+      // truthful machine-less state.
       this.emit({
         ready: true,
         authed: false,
@@ -1608,6 +1617,27 @@ class HubStore {
     this.outboxUnsubscribe = null;
     this.outboxInit = null;
     this.outboxDegraded = false;
+  }
+
+  /**
+   * Tear down the connection machine and its follow bookkeeping for an auth
+   * change (c-reconnfu gate 40 item 2). Disposing the machine coherently —
+   * rather than retaining a live machine while publishing "offline" — is what
+   * makes the R-c logged-out publication truthful: a subsequent healthy
+   * login's bootstrap builds a FRESH machine whose onState publishes
+   * recovering/live, so the banner can never stick on a stale false offline.
+   * Idempotent.
+   */
+  private disposeConnectionForAuthChange() {
+    this.connection?.dispose();
+    this.connection = null;
+    this.connectionBoundTo = null;
+    this.connectionBoundJournal = null;
+    this.connectionBindGen = 0;
+    this.reconcileOwed.clear();
+    this.owedReconcileRunning.clear();
+    this.followReadyState.clear();
+    this.followFrameAt.clear();
   }
 
   /**
@@ -4707,17 +4737,9 @@ class HubStore {
     ++this.bootGen;
     this.pinnedCreates.clear();
     this.polledEffort.clear();
-    // Tear down the connection machine and its browser listeners (init
+    // Tear down the connection machine and its follow bookkeeping (init
     // recreates them at the next bootstrap); the durable outbox itself stays.
-    this.connection?.dispose();
-    this.connection = null;
-    this.connectionBoundTo = null;
-    this.connectionBoundJournal = null;
-    this.connectionBindGen = 0;
-    this.reconcileOwed.clear();
-    this.owedReconcileRunning.clear();
-    this.followReadyState.clear();
-    this.followFrameAt.clear();
+    this.disposeConnectionForAuthChange();
     for (const [, t] of this.outboxRetryTimer) clearTimeout(t);
     this.outboxRetryTimer.clear();
     this.outboxRetryAttempt.clear();

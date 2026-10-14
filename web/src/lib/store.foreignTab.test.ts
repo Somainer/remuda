@@ -8362,3 +8362,63 @@ it("GATE40 item 1: a transition QUEUED behind a parked credential request is ret
     }
   }
 });
+
+it("GATE40 item 2: healthy re-login after a peer logout publishes the NEW machine's connection state — no stale false-offline UI on a retained machine", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_350_000);
+  const I = "ins_g40_2";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g40_2");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "login").mockResolvedValue({ deviceId: "dev_g40_2", token: "tok", name: "g40_2" });
+    const h = hubStore as unknown as {
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      state: { connection: string };
+    };
+
+    // Healthy login on /sessions: the machine reaches live.
+    await h.login("bootstrap", "secret", "dev");
+    await pump(3_000);
+    expect(h.state.connection).toBe("live");
+
+    // Peer logout: external change publishes offline.
+    localStorage.removeItem("runtime.device-session");
+    window.dispatchEvent(
+      new StorageEvent("storage", { key: "runtime.device-session", oldValue: "{}", newValue: null }),
+    );
+    await pump(300);
+    expect(h.state.connection).toBe("offline");
+
+    // Healthy local re-login: bootstrap builds a fresh machine whose live
+    // state must be published (the old bug kept the stale "offline" field).
+    await h.login("bootstrap", "secret2", "dev2");
+    await pump(5_000);
+    expect(h.state.connection).toBe("live");
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

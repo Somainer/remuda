@@ -2188,6 +2188,22 @@ impl DevNode {
                 }
             }
             let land_stdout = land_child.stdout.take();
+            // r21 item 1 (R8(b) owner contract): drain stdout on its OWN task
+            // CONCURRENTLY with the non-reaping exit observation. The old owner
+            // did `read_to_end` BEFORE its first waitid poll, so a descendant
+            // that inherited stdout hid the leader's exit: the valid verdict
+            // sat unread until the soft land timeout. This task keeps the bytes
+            // (the leader's final JSON) while the owner observes the exit, and
+            // it is JOINED only after survivor cleanup and the reap, inside the
+            // absolute deadline.
+            let mut land_stdout_task = land_stdout.map(|mut stdout| {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut stdout_bytes = Vec::new();
+                    let _ = stdout.read_to_end(&mut stdout_bytes).await;
+                    stdout_bytes
+                })
+            });
             // r13 item 6: drain stderr CONCURRENTLY for the life of the child
             // (and keep the handle for timeout/kill). A remote rejection can
             // print far more than one pipe buffer; never reading it blocked the
@@ -2244,7 +2260,7 @@ impl DevNode {
             // r19 item 3: a normal exit is observed WNOWAIT (leader UNREAPED)
             // so the owner cleans the group before reaping.
             let land_outcome: Result<Option<ObservedExit>, ()> = {
-                let wait = land_child.observe_exit_piped(land_stdout);
+                let wait = land_child.observe_leader_exit();
                 tokio::pin!(wait);
                 // Resolves if a latch was already set OR on a later send.
                 let land_abort_fired = async {
@@ -2341,8 +2357,17 @@ impl DevNode {
                     // descendant BEFORE reaping while the unreaped leader pins
                     // its pgid (r19 item 3). A detached-output runaway can no
                     // longer outlive the land and hold its fence.
-                    let land_output = match observed {
-                        ObservedExit::Unreaped(stdout_bytes) => {
+                    //
+                    // r21 item 1 — R8(b) owner sequence: the exit was observed
+                    // independently of the pipes, so after observing it the
+                    // owner cleans the group, reaps the leader, and ONLY then
+                    // joins the concurrent stdout reader, all bounded by the
+                    // absolute deadline. The survivor KILL is what closes the
+                    // last stdout write end a descendant inherited; without
+                    // the concurrent observation the owner could not even
+                    // begin this sequence until EOF.
+                    let land_status = match observed {
+                        ObservedExit::Unreaped => {
                             #[cfg(unix)]
                             if let Some(pgid) = land_pgid {
                                 // R8(b): same deadline-bounded survivor cleanup
@@ -2363,11 +2388,7 @@ impl DevNode {
                                 tokio::time::timeout(remaining(land_deadline), land_child.wait())
                                     .await;
                             match reaped {
-                                Ok(Ok(status)) => Some(std::process::Output {
-                                    status,
-                                    stdout: stdout_bytes,
-                                    stderr: Vec::new(),
-                                }),
+                                Ok(Ok(status)) => Some(status),
                                 _ => {
                                     tokio::spawn(async move {
                                         let _ = land_child.wait().await;
@@ -2376,7 +2397,31 @@ impl DevNode {
                                 }
                             }
                         }
-                        ObservedExit::Reaped(output) => Some(output),
+                        ObservedExit::Reaped(status) => Some(status),
+                    };
+                    // Join the concurrent stdout drain with the REMAINING
+                    // absolute budget. A reader still blocked at the deadline,
+                    // or a reader task that failed, leaves the final report
+                    // unreadable: the verdict is UNCERTAIN (the push may have
+                    // landed) rather than a parse failure or — worse — a
+                    // definitive land built on no report.
+                    let stdout_bytes = if remaining(land_deadline).is_zero() {
+                        None
+                    } else if let Some(task) = land_stdout_task.take() {
+                        match tokio::time::timeout(remaining(land_deadline), task).await {
+                            Ok(Ok(bytes)) => Some(bytes),
+                            _ => None,
+                        }
+                    } else {
+                        Some(Vec::new())
+                    };
+                    let land_output = match (land_status, stdout_bytes) {
+                        (Some(status), Some(stdout)) => Some(std::process::Output {
+                            status,
+                            stdout,
+                            stderr: Vec::new(),
+                        }),
+                        _ => None,
                     };
                     let drained_stderr = captured_stderr
                         .lock()
@@ -2498,11 +2543,20 @@ impl DevNode {
                         Some("land child produced no result; push outcome uncertain".into());
                 }
             }
-            // The child has exited (or been killed on timeout); let the stderr
-            // pump drain to EOF (bounded by the absolute land deadline — R8(b):
-            // a pump still blocked then is ABANDONED, never joined past it) so
-            // a large final rejection/error burst is fully read whenever time
-            // remains, and a wedged pipe never delays the verdict.
+            // The child has exited (or been killed on timeout); let the
+            // remaining reader tasks drain to EOF (bounded by the absolute land
+            // deadline — R8(b): a task still blocked then is ABANDONED, never
+            // joined past it) so a large final burst is fully read whenever
+            // time remains, and a wedged pipe never delays the verdict. The
+            // normal-exit arm already joined whichever task it needed; only a
+            // handle left here is awaited.
+            if let Some(task) = land_stdout_task.take() {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2).min(remaining(land_deadline)),
+                    task,
+                )
+                .await;
+            }
             if let Some(task) = land_stderr_task {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(2).min(remaining(land_deadline)),
@@ -2733,24 +2787,27 @@ trait WaitWithOutputPiped {
         stdout: Option<tokio::process::ChildStdout>,
     ) -> Option<std::process::Output>;
 
-    /// r19 item 3 / R6, r20 R8(b)/(c): wait until the leader EXITS. On unix
-    /// the exit is observed WITHOUT reaping
+    /// r19 item 3 / R6, r20 R8(b)/(c), r21 item 1: wait until the leader
+    /// EXITS, WITHOUT reading any pipe. stdout and stderr are drained by their
+    /// OWN tasks CONCURRENTLY with this observation, so a descendant that
+    /// inherits a pipe can no longer hide the leader's exit behind EOF. On
+    /// unix the exit is observed WITHOUT reaping
     /// (`waitid(WEXITED|WNOHANG|WNOWAIT)`, portable via libc) so the owner can
     /// clean surviving same-group members while the leader is still unreaped
     /// and only then reap; other platforms reap here and report `Reaped`.
-    async fn observe_exit_piped(
-        &mut self,
-        stdout: Option<tokio::process::ChildStdout>,
-    ) -> Option<ObservedExit>;
+    async fn observe_leader_exit(&mut self) -> Option<ObservedExit>;
 }
 
-/// How [`WaitWithOutputPiped::observe_exit_piped`] saw the leader leave.
+/// How [`WaitWithOutputPiped::observe_leader_exit`] saw the leader leave.
+/// r21 item 1: the bytes live on the concurrent stdout drain task, so neither
+/// variant carries them.
 enum ObservedExit {
-    /// unix: exit observed, leader still UNREAPED; carries drained stdout.
-    Unreaped(Vec<u8>),
-    /// non-unix fallback: the child was reaped the ordinary way.
+    /// unix: exit observed, leader still UNREAPED.
+    Unreaped,
+    /// non-unix fallback: the child was reaped the ordinary way; carries its
+    /// exit status.
     #[allow(dead_code)] // constructed only on non-unix
-    Reaped(std::process::Output),
+    Reaped(std::process::ExitStatus),
 }
 
 impl WaitWithOutputPiped for tokio::process::Child {
@@ -2772,15 +2829,7 @@ impl WaitWithOutputPiped for tokio::process::Child {
     }
 
     #[cfg(unix)]
-    async fn observe_exit_piped(
-        &mut self,
-        stdout: Option<tokio::process::ChildStdout>,
-    ) -> Option<ObservedExit> {
-        use tokio::io::AsyncReadExt;
-        let mut stdout_bytes = Vec::new();
-        if let Some(mut out) = stdout {
-            let _ = out.read_to_end(&mut stdout_bytes).await;
-        }
+    async fn observe_leader_exit(&mut self) -> Option<ObservedExit> {
         let leader_pid = self.id()? as i32;
         loop {
             // waitid must run off the async worker: spawn_blocking per poll.
@@ -2794,9 +2843,7 @@ impl WaitWithOutputPiped for tokio::process::Child {
                     .ok()
                     .flatten();
             match observed {
-                Some(LeaderExitObservation::Exited) => {
-                    return Some(ObservedExit::Unreaped(stdout_bytes));
-                }
+                Some(LeaderExitObservation::Exited) => return Some(ObservedExit::Unreaped),
                 Some(LeaderExitObservation::StillRunning) | None => {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -2805,13 +2852,8 @@ impl WaitWithOutputPiped for tokio::process::Child {
     }
 
     #[cfg(not(unix))]
-    async fn observe_exit_piped(
-        &mut self,
-        stdout: Option<tokio::process::ChildStdout>,
-    ) -> Option<ObservedExit> {
-        self.wait_with_output_piped(stdout)
-            .await
-            .map(ObservedExit::Reaped)
+    async fn observe_leader_exit(&mut self) -> Option<ObservedExit> {
+        self.wait().await.ok().map(ObservedExit::Reaped)
     }
 }
 
@@ -5394,6 +5436,36 @@ exec >/dev/null 2>&1
 sleep 47.37
 "#;
 
+    /// r21 item 1 / R8(b): the released land leader prints its valid final
+    /// JSON and exits 0 IMMEDIATELY, while a SAME-GROUP descendant it forked
+    /// keeps the captured STDOUT (and stderr) open. The old owner drained
+    /// stdout to EOF BEFORE its first waitid poll, so it never observed the
+    /// exit and discarded the valid verdict at the soft land timeout. The
+    /// concurrent owner observes the exit independently of the pipes, KILLs the
+    /// survivor while the leader is unreaped, then joins the stdout reader to
+    /// EOF and honors the landed verdict.
+    const STDOUT_RETAINED_LAND_SCRIPT: &str = r#"
+dir=$(dirname "$0")
+echo "$*" >> "$dir/args.txt"
+base=$(git rev-parse main 2>/dev/null || echo "1111111111111111111111111111111111111111")
+head=$(git rev-parse wt/fake/task 2>/dev/null || echo "2222222222222222222222222222222222222222")
+if ! printf '%s\n' "$*" | grep -q -- '--land'; then
+  echo "{\"exitCode\":0,\"status\":\"verified\",\"base\":\"$base\",\"head\":\"$head\",\"merged\":\"$head\",\"steps\":[]}"
+  exit 0
+fi
+if [ "${REMUDA_START_BARRIER_FD-}" != "0" ]; then
+  exit 0
+fi
+byte=""
+IFS= read -r -n 1 -t 30 byte || exit 4
+[ -n "$byte" ] || exit 4
+# Same-group grandchild INHERITS both captured pipes: stdout (and stderr) stay
+# open after the leader exits; the valid report above is already buffered.
+(sleep 47.21) &
+echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\":\"$head\",\"steps\":[]}"
+exit 0
+"#;
+
     const BARRIER_LAND_SCRIPT: &str = r#"
 dir=$(dirname "$0")
 echo "$*" >> "$dir/args.txt"
@@ -5804,6 +5876,60 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
             let left = live_marker_processes("sleep 47.37");
             if left == 0 || std::time::Instant::now() >= deadline {
                 assert_eq!(left, 0, "the budget-killed leader survived its owner");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// r21 item 1 / R8(b): the land leader EXITS FIRST with a valid landed
+    /// report while a same-group descendant still holds stdout (and stderr)
+    /// open. The owner drains the pipes CONCURRENTLY with its non-reaping exit
+    /// observation, so it observes the exit at once, KILLs the surviving
+    /// descendant while the leader is unreaped, joins the stdout reader to EOF
+    /// and returns `landed` — bounded by the owner cleanup allowance, never by
+    /// the descendant's sleep or the soft land timeout. The old owner blocked
+    /// in `read_to_end` before its first waitid poll and returned an uncertain
+    /// timeout instead of the valid verdict.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_land_leader_whose_descendant_keeps_stdout_is_observed_and_lands() {
+        let fixture = fixture(STDOUT_RETAINED_LAND_SCRIPT);
+        let base_main = origin_main(&fixture);
+        let mut p = params(&fixture, "land");
+        p.push = false;
+        p.job_id = "gjb_stdout_retained".into();
+        p.generation = 1;
+        let before = live_marker_processes("sleep 47.21");
+        // The soft budget is short; the owner must not need it.
+        fixture
+            .node
+            .gate_test_set_land_timeout(Duration::from_secs(2))
+            .await;
+        let started = std::time::Instant::now();
+        let result = fixture.node.run_gate_typed(p).await.unwrap();
+        assert_eq!(
+            result.status, "landed",
+            "the valid verdict emitted before the pipe closed is honored: {result:?}"
+        );
+        // Exit observation + survivor kill + reap + pipe join must fit inside
+        // the absolute deadline (budget + cleanup allowance), not the sleep.
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "owner cleanup is bounded by the absolute deadline, not the holder's sleep: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(origin_main(&fixture), base_main, "push=false moves nothing");
+        // The stdout-holding same-group descendant was KILLed during normal
+        // completion; no live marker outlives the owner (baseline for parallel
+        // runs; zombies do not count).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let left = live_marker_processes("sleep 47.21");
+            if left <= before || std::time::Instant::now() >= deadline {
+                assert_eq!(
+                    left, before,
+                    "a same-group stdout holder survived the owner's normal-completion cleanup"
+                );
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));

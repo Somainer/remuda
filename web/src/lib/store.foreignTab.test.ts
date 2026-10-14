@@ -7842,9 +7842,12 @@ it("GATE38 item 1: an external logout (local and peer-tab) while login A's body 
 
       // Release A successfully: its continuation must RESOLVE (never hang)
       // but write NO session and bootstrap nothing — the external epoch moved.
+      // Gate 40 item 1: queued B is retired BEFORE acquiring too, so its
+      // failing credential request is never issued; B settles (resolves) as
+      // obsolete rather than rejecting.
       releaseA();
       await loginA;
-      await expect(loginB).rejects.toThrow(/busy/);
+      await loginB;
       await pump(4_000);
 
       expect(h.state.authed).toBe(false);
@@ -8248,5 +8251,114 @@ it("GATE39 item 3: a peer logout during initial bootstrap (health parked) settle
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE40 item 1: a transition QUEUED behind a parked credential request is retired before its own request is issued when a peer logout happens during the wait (passkey finish and pair redeem)", async () => {
+  for (const kind of ["passkey", "pair"] as const) {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_340_000 + (kind === "pair" ? 1 : 0));
+    const I = `ins_g40_1_${kind}`;
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      writable: true,
+      value: {
+        locks: fifoWebLocks().locks,
+        credentials: {
+          get: () =>
+            Promise.resolve({
+              id: `cred_g40_1_${kind}`,
+              type: "public-key",
+              rawId: new ArrayBuffer(1),
+              response: {
+                authenticatorData: new ArrayBuffer(1),
+                clientDataJSON: new ArrayBuffer(1),
+                signature: new ArrayBuffer(1),
+                userHandle: new ArrayBuffer(1),
+              },
+            }),
+        },
+      },
+    });
+    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+    const pump = async (n = 4_000) => {
+      for (let i = 0; i < n; i += 1) await Promise.resolve();
+    };
+    const sessionKey = `remuda-outbox-owner-g40-1-${kind}`;
+    try {
+      sessionStorage.setItem(sessionKey, "owner");
+      localStorage.removeItem("runtime.device-session");
+      localStorage.setItem("runtime.logged-out", "1");
+      vi.stubGlobal("PublicKeyCredential", class { static isUserVerifyingPlatformAuthenticatorAvailable() { return Promise.resolve(true); } });
+      const { api, hubStore } = await fresh();
+      vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+      vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+      vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+      vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+      vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+      vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+      vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+      vi.spyOn(api, "instanceList").mockResolvedValue({ items: [], nextCursor: null } as never);
+      vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+      vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+
+      // Predecessor TOKEN login A with its body parked.
+      let releaseA: () => void = () => undefined;
+      const tokenLogins = vi.spyOn(api, "login").mockImplementation(
+        () => new Promise((resolve) => { releaseA = () => resolve({ deviceId: "devA_g40_1", token: "tokA", name: "A" }); }),
+      );
+      // B's own credential call — must NEVER fire.
+      const finish = vi.spyOn(api, "passkeyLoginFinish").mockResolvedValue({ deviceId: "devB_g40_1", token: "tokB", name: "B" });
+      const pair = vi.spyOn(api, "pairRedeem").mockResolvedValue({ deviceId: "devB_g40_1", token: "tokB", name: "B" });
+      vi.spyOn(api, "passkeyLoginStart").mockResolvedValue({
+        challengeId: `chal_g40_1_${kind}`,
+        options: { publicKey: { challenge: "Y2hhbA", allowCredentials: [] } } as never,
+      });
+
+      const h = hubStore as unknown as {
+        login: (k: "bootstrap" | "pair", s: string, d: string) => Promise<void>;
+        passkeyLogin: (m: "required", d?: string) => Promise<unknown>;
+        state: { authed: boolean };
+      };
+      const loginA = h.login("bootstrap", "a", "devA");
+      await pump(300); // A acquired, body parked
+
+      // B completes its preliminary phase and QUEUES behind A; its finish
+      // request is only issued when it acquires the chain.
+      const bSettled = kind === "passkey" ? h.passkeyLogin("required", "devB") : h.login("pair", "paircode", "devB");
+      await pump(300);
+      expect(finish).not.toHaveBeenCalled();
+      expect(pair).not.toHaveBeenCalled();
+
+      // PEER logout while B awaits the chain.
+      localStorage.removeItem("runtime.device-session");
+      window.dispatchEvent(
+        new StorageEvent("storage", { key: "runtime.device-session", oldValue: "{}", newValue: null }),
+      );
+      await pump(200);
+
+      // Release A: A settles (retired), B acquires its turn next but must
+      // return obsolete WITHOUT issuing its finish/redeem request.
+      releaseA();
+      await loginA;
+      await bSettled;
+      await pump(2_000);
+
+      // A's token login fired once (its parked body); B's credential request
+      // never reached the Hub, so no device session was created server-side.
+      expect(tokenLogins).toHaveBeenCalledTimes(1);
+      expect(finish).not.toHaveBeenCalled();
+      expect(pair).not.toHaveBeenCalled();
+      expect(h.state.authed).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+      sessionStorage.removeItem(sessionKey);
+    }
   }
 });

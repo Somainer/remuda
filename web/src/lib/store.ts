@@ -41,6 +41,29 @@ type AuthTransitionOwner = {
   seq: number;
   ext: number;
 };
+/**
+ * Outcome of a serialized credential transition run. `obsolete` (c-reconnfu
+ * gate 40 item 1) means an EXTERNAL identity change retired the transition
+ * WHILE IT WAS QUEUED (after it issued but before it acquired the chain): it
+ * never sent its credential request, never changed ownership, and the public
+ * caller settles silently (resolves, never throws — nothing was attempted).
+ */
+type AuthTransitionOutcome<T> =
+  | { obsolete: true }
+  | {
+      obsolete: false;
+      superseded: boolean;
+      ok: true;
+      result: T;
+      acquired: AuthTransitionOwner;
+    }
+  | {
+      obsolete: false;
+      superseded: boolean;
+      ok: false;
+      error: unknown;
+      acquired: AuthTransitionOwner;
+    };
 import { mapWorkspace, mergeHostWorkspaces } from "../features/workspaces/registry";
 import {
   api,
@@ -1398,10 +1421,7 @@ class HubStore {
     // transition even when the interruption happened during a PRELIMINARY
     // await (passkey challenge/ceremony) before this wrapper was entered.
     extAtEntry: number,
-  ): Promise<
-    | { superseded: boolean; ok: true; result: T; acquired: AuthTransitionOwner }
-    | { superseded: boolean; ok: false; error: unknown; acquired: AuthTransitionOwner }
-  > {
+  ): Promise<AuthTransitionOutcome<T>> {
     // Monotonic ISSUANCE order, assigned synchronously at call time: two
     // transitions issued back-to-back before either acquires still get
     // distinct ids, so the earlier one can tell at settle time that a newer
@@ -1422,11 +1442,21 @@ class HubStore {
     // caller queues behind this run.
     const run = async (
       prev: Promise<void>,
-    ): Promise<
-      | { superseded: boolean; ok: true; result: T; acquired: AuthTransitionOwner }
-      | { superseded: boolean; ok: false; error: unknown; acquired: AuthTransitionOwner }
-    > => {
+    ): Promise<AuthTransitionOutcome<T>> => {
       await prev;
+      // Gate 40 item 1: the FIRST thing after the chain opened is the epoch
+      // check. A transition QUEUED behind its predecessor may have been
+      // retired by an EXTERNAL logout/401/peer change while waiting. It must
+      // return obsolete BEFORE acquiring ownership (no seq/generation change,
+      // no disposal, no blocker) and, crucially, BEFORE invoking issue() — the
+      // credential request must never reach the Hub (a passkey finish / pair
+      // redeem would otherwise create a device session and Set-Cookie
+      // server-side after this identity logged out). The predecessor already
+      // released the blocker and nulled the obligation; the chain tail simply
+      // resolves so a later fresh transition can acquire.
+      if (this.extEpoch !== myExt) {
+        return { obsolete: true };
+      }
       this.transitionSeq = myIssuedSeq;
       // Gate 37 item 1: this transition's OWN acquisition routes through
       // applyAuthIdentityChange (which invalidates any obligation as an
@@ -1476,8 +1506,8 @@ class HubStore {
       // bootstrap — the final owner's continuation owns the chain's bootstrap
       // obligation (gate 36 item 4).
       const superseded = this.transitionIssuedSeq !== myIssuedSeq;
-      if (failed) return { ok: false, error, superseded, acquired };
-      return { ok: true, result: result!, superseded, acquired };
+      if (failed) return { obsolete: false, ok: false, error, superseded, acquired };
+      return { obsolete: false, ok: true, result: result!, superseded, acquired };
     };
     // Snapshot the previous chain SYNCHRONOUSLY and publish the new tail
     // before run's body microtask executes — so run awaits the PREVIOUS chain,
@@ -1529,9 +1559,11 @@ class HubStore {
    * supply the old identity.
    */
   private async settleAuthBootstrap(outcome:
-    | { ok: true; result: DeviceSession; superseded: boolean; acquired: AuthTransitionOwner }
-    | { ok: false; error: unknown; superseded: boolean; acquired: AuthTransitionOwner },
+    | AuthTransitionOutcome<DeviceSession>,
   ): Promise<void> {
+    // Gate 40 item 1: a transition retired while QUEUED sent no request and
+    // never acquired — the external change already nulled any obligation.
+    if (outcome.obsolete) return;
     const extLive = () => this.extEpoch === outcome.acquired.ext;
     const ownsNow = () =>
       this.authGen === outcome.acquired.gen && this.transitionSeq === outcome.acquired.seq;
@@ -4484,6 +4516,9 @@ class HubStore {
           : api.login(secret, deviceName),
       extAtEntry,
     );
+    // Gate 40 item 1: retired while QUEUED — the credential request was never
+    // sent; settle silently (resolve, never throw).
+    if (outcome.obsolete) return;
     if (!outcome.ok) {
       // A failed superseded caller transfers the obligation and settles on the
       // rejection WITHOUT awaiting its successor; the final owner owns it.
@@ -4550,6 +4585,9 @@ class HubStore {
       () => api.passkeyLoginFinish(envelope.challengeId, assertion, deviceName),
       extAtEntry,
     );
+    // Gate 40 item 1: retired while QUEUED — the finish request was never
+    // sent; settle silently (resolve void, never throw).
+    if (outcome.obsolete) return;
     if (!outcome.ok) {
       // A failed superseded caller transfers the obligation and settles on the
       // rejection WITHOUT awaiting its successor; the final owner owns it.

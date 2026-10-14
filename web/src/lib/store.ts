@@ -1724,7 +1724,11 @@ class HubStore {
         // Rows left inflight by a closed tab are due immediately — but never
         // from an initializer whose identity is already obsolete (it may have
         // been superseded by a newer one that owns the flush).
-        if (!obsolete() && this.outbox === box) void this.flushAllOutbox();
+        // Gate 48 item 3: this initializer runs INSIDE the auth turn's
+        // install — bound its lock so a sibling-held instance lock cannot park
+        // the turn (or poison the flushChain the turn drain joins).
+        if (!obsolete() && this.outbox === box)
+          void this.flushAllOutbox(new Set(), false, true);
         return "ok";
       } catch {
         if (obsolete()) return "obsolete";
@@ -3023,7 +3027,10 @@ class HubStore {
         if (this.connection !== machine) return;
         this.emit({ connection: state, outboxPending: box?.pendingCount() ?? 0 });
         // A socket-level recovery is also a moment to deliver the queue.
-        if (state === "live") void this.flushAllOutbox();
+        // Gate 48 item 3: the install's initial live transition fires inside
+        // the auth turn — use the bounded lock; later live transitions (post-
+        // install reconnects) call resumeConnection's unbounded flush.
+        if (state === "live") void this.flushAllOutbox(new Set(), false, true);
       },
       onAttemptFinish: (info) => {
         if (this.connection !== machine) return;
@@ -3083,8 +3090,11 @@ class HubStore {
     }
 
     // Send anything already due (e.g. rows left inflight when the tab closed).
-    // No-op without an outbox (ruling U).
-    if (box) void this.flushAllOutbox();
+    // No-op without an outbox (ruling U). Gate 48 item 3: BOUNDED lock — this
+    // runs inside the auth turn's install, so a sibling-held instance lock
+    // must not park it (an unbounded flush would also poison the per-instance
+    // flushChain the turn's own bounded drain later joins).
+    if (box) void this.flushAllOutbox(new Set(), false, true);
     // Ruling U: a machine installed with no outbox reports "unavailable" —
     // callers are fulfilled (machine + listeners own connection state), sends
     // use the keyed direct fallback and durable rows restore on next reload.
@@ -3623,7 +3633,11 @@ class HubStore {
    * flushes deliberately re-POST held rows (a host online→online resume
    * re-forwards them), so this is opt-in for the timer path only.
    */
-  private async flushAllOutbox(attempted: Set<Id> = new Set(), skipCurrentlyHeld = false) {
+  private async flushAllOutbox(
+    attempted: Set<Id> = new Set(),
+    skipCurrentlyHeld = false,
+    boundedLock = false,
+  ) {
     const box = this.outbox;
     if (!box) return;
     if (this.pageIsUnloading) return;
@@ -3684,25 +3698,35 @@ class HubStore {
         for (const instanceId of instances) {
           if (this.pageIsUnloading || this.outbox !== box) return;
           try {
-            const id = await box.withInstanceLock(instanceId, (iid, deliverable) =>
-              this.deliverOneRow(
-                token,
-                iid,
-                deliverable.filter(
-                  (r) =>
-                    !attempted.has(r.commandId) &&
-                    // Gate 19 item 2: the policy rides into the FRESH selection
-                    // built inside this lock turn — a row another tab finished
-                    // as held while we waited is excluded here even though the
-                    // pre-lock snapshot knew it as inflight.
-                    !(skipCurrentlyHeld && r.state === "held"),
+            const id = await box.withInstanceLock(
+              instanceId,
+              (iid, deliverable) =>
+                this.deliverOneRow(
+                  token,
+                  iid,
+                  deliverable.filter(
+                    (r) =>
+                      !attempted.has(r.commandId) &&
+                      // Gate 19 item 2: the policy rides into the FRESH selection
+                      // built inside this lock turn — a row another tab finished
+                      // as held while we waited is excluded here even though the
+                      // pre-lock snapshot knew it as inflight.
+                      !(skipCurrentlyHeld && r.state === "held"),
+                  ),
+                  { skipCurrentlyHeld },
                 ),
-                { skipCurrentlyHeld },
-              ),
+              // Gate 48 item 3: inside an auth turn use ifAvailable — never
+              // queue without a deadline behind a sibling-held lock.
+              boundedLock ? { ifAvailable: true } : {},
             );
             // c-reconnfu gate 35 item 3: a stale lock turn ends the whole
             // flush immediately (no later command through the new box).
             if (id === "stale") return;
+            // Gate 48 item 3: a sibling deliverer holds the lock. Its pass
+            // owns the rows; stop this bounded drain and leave everything it
+            // does not cover to normal recovery (claim wakes / later flushes),
+            // so the auth turn is not held here.
+            if (id === "lock-unavailable") return;
             if (id) {
               attempted.add(id);
               deliveredNew = true;
@@ -4547,13 +4571,14 @@ class HubStore {
       if (install === "obsolete") return "retired";
       this.startPoll();
       this.installDevHandle();
-      // S3: settle the install's initial delivery BEFORE this turn opens the
-      // queue gate. A queued successor (login B) acquires immediately after
-      // this turn and its Fence-A bump disposes this box; a fire-and-forget
-      // inflight POST could then leave its durable row stuck in "inflight".
-      // Draining here means successor failure/success never strands rows that
-      // this identity's install had already claimed.
-      if (this.outbox) await this.flushAllOutbox().catch(() => undefined);
+      // Gate 48 item 3: the install turn drains the box with a BOUNDED lock
+      // (ifAvailable): a sibling deliverer holding an instance lock never
+      // blocks this turn without a deadline, and a queued login starts as soon
+      // the delivery work this turn could actually START is dispatched. Rows
+      // under a sibling-held lock are left to the holder plus normal recovery
+      // (claim wakes / the next flush); an in-flight POST this drain started
+      // carries its existing claim recovery, so it is never stranded.
+      if (this.outbox) await this.flushAllOutbox(new Set(), false, true).catch(() => undefined);
       if (!extLive()) return "retired";
       return "settled";
     } catch (err) {

@@ -1718,7 +1718,17 @@ export class Outbox {
   private async runUnderInstanceLock<T>(instanceId: Id, fn: () => Promise<T>): Promise<T> {
     const locks = (globalThis as { navigator?: Navigator & { locks?: LockManager } }).navigator?.locks;
     if (locks?.request) {
-      return await locks.request(instanceDeliveryLockName(instanceId), { mode: "exclusive" }, fn);
+      const name = instanceDeliveryLockName(instanceId);
+      // Gate 48 item 3: record same-tab ownership so a bounded acquire knows a
+      // busy lock here is our own (safe to queue) rather than a sibling's.
+      return await locks.request(name, { mode: "exclusive" }, async () => {
+        Outbox.selfHeldLocks.add(name);
+        try {
+          return await fn();
+        } finally {
+          Outbox.selfHeldLocks.delete(name);
+        }
+      });
     }
     return await fn();
   }
@@ -2101,9 +2111,20 @@ export class Outbox {
   async withInstanceLock<T>(
     instanceId: Id,
     fn: (instanceId: Id, deliverable: OutboxRecord[]) => Promise<T>,
-  ): Promise<T | null> {
+    opts: { ifAvailable?: boolean } = {},
+  ): Promise<T | null | "lock-unavailable"> {
     if (this.queuedFlush.has(instanceId)) return (await this.queuedFlush.get(instanceId)!) as T | null;
     if (this.flushChain.has(instanceId)) {
+      if (opts.ifAvailable) {
+        // Gate 48 item 3: a bounded caller arriving while a same-tab chain
+        // run is ACTIVE coalesces onto THAT run instead of queueing a second
+        // lock turn: when the active run skipped a sibling-held lock this
+        // caller skips too (the sibling is the deliverer), and it never
+        // extends the auth turn behind the web-lock queue.
+        return (await this.flushChain.get(instanceId)!) as T | null | "lock-unavailable";
+      }
+      // An unbounded caller joins the chain and takes the lock in sequence
+      // (bounded by the same-tab predecessor's own REST timeouts).
       const queued = this.runAfterChain(instanceId, fn);
       this.queuedFlush.set(instanceId, queued);
       // The bookkeeping side-chain must not surface an unhandled rejection:
@@ -2115,21 +2136,22 @@ export class Outbox {
         .catch(() => undefined);
       return (await queued) as T | null;
     }
-    return (await this.runAfterChain(instanceId, fn)) as T | null;
+    return (await this.runAfterChain(instanceId, fn, opts)) as T | null;
   }
 
   private runAfterChain<T>(
     instanceId: Id,
     fn: (instanceId: Id, deliverable: OutboxRecord[]) => Promise<T>,
-  ): Promise<T | null> {
+    opts: { ifAvailable?: boolean } = {},
+  ): Promise<T | null | "lock-unavailable"> {
     const prev = this.flushChain.get(instanceId) ?? Promise.resolve();
     // A rejected predecessor must not poison the chain (its entry is cleared by
     // `clear`), but a rejected run must NEVER silently re-invoke fn: the
     // deliverer may already have POSTed once, and exactly-once is the property
     // this lock exists for. Callers retry from the outside under the same id.
     const run = prev.then(
-      () => this.acquireLock(instanceId, fn),
-      () => this.acquireLock(instanceId, fn),
+      () => this.acquireLock(instanceId, fn, opts),
+      () => this.acquireLock(instanceId, fn, opts),
     );
     const clear = () => {
       if (this.flushChain.get(instanceId) === run) this.flushChain.delete(instanceId);
@@ -2139,16 +2161,62 @@ export class Outbox {
     return run;
   }
 
+  /**
+   * Names of instance locks CURRENTLY held by an Outbox delivery in THIS
+   * document context (gate 48 item 3). The Web Locks ifAvailable callback
+   * reports a busy lock without saying WHO holds it: a holder recorded here
+   * is our own same-tab deliverer (whose request is bounded by the REST
+   * timeouts and safe to queue behind for a few ms), whereas any other holder
+   * is a sibling TAB that could block forever and must be skipped.
+   */
+  private static readonly selfHeldLocks = new Set<string>();
+
   private async acquireLock<T>(
     instanceId: Id,
     fn: (instanceId: Id, deliverable: OutboxRecord[]) => Promise<T>,
-  ): Promise<T | null> {
+    opts: { ifAvailable?: boolean } = {},
+  ): Promise<T | null | "lock-unavailable"> {
     const locks = (globalThis as { navigator?: Navigator & { locks?: LockManager } }).navigator?.locks;
     if (locks?.request) {
-      return await locks.request(instanceDeliveryLockName(instanceId), { mode: "exclusive" }, () =>
-        this.runDeliverer(instanceId, fn),
-      );
+      const name = instanceDeliveryLockName(instanceId);
+      const run = async (): Promise<T> => {
+        Outbox.selfHeldLocks.add(name);
+        try {
+          return await this.runDeliverer(instanceId, fn);
+        } finally {
+          Outbox.selfHeldLocks.delete(name);
+        }
+      };
+      // Gate 48 item 3: an AUTH TURN's drain passes ifAvailable:true so it can
+      // never queue without a deadline behind a SIBLING deliverer holding the
+      // lock. When it is not immediately free the callback receives `null`;
+      // if the holder is THIS context (a same-tab flush, bounded by REST
+      // timeouts) fall back to the normal queued request, otherwise skip.
+      if (opts.ifAvailable) {
+        // Decide same-tab vs sibling SYNCHRONOUSLY at entry: selfHeldLocks can
+        // mutate in the microtask gap before the ifAvailable callback runs.
+        const sameTabHolder = Outbox.selfHeldLocks.has(name);
+        let delivered: T | undefined;
+        const granted = await locks.request(
+          name,
+          { mode: "exclusive", ifAvailable: true },
+          async (lock) => {
+            if (!lock) return false;
+            delivered = await run();
+            return true;
+          },
+        );
+        if (granted) return delivered ?? null;
+        // Busy: same-tab holder → queue normally (bounded by REST timeouts);
+        // sibling tab → skip without touching the rows.
+        if (!sameTabHolder) {
+          return "lock-unavailable";
+        }
+      }
+      return await locks.request(name, { mode: "exclusive" }, run);
     }
+    // No Web Locks: the lease fallback cannot be ifAvailable-guarded, but it
+    // is already bounded (leases TTL-expire); auth-turn callers accept that.
     return await this.runWithLease(instanceId, fn);
   }
 

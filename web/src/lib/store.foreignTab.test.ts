@@ -344,12 +344,27 @@ function fifoWebLocks() {
   const pop = (name: string) => queues.get(name)?.shift()?.();
   const locks = {
     query: async () => ({ held: [...heldNow].map((name) => ({ name, mode: "exclusive" })) }),
-    request(name: string, _opts: unknown, cb: () => Promise<unknown>) {
+    request(
+      name: string,
+      opts: { ifAvailable?: boolean } | unknown,
+      cb: (lock: { name: string } | null) => Promise<unknown>,
+    ) {
       return new Promise((resolve, reject) => {
+        // Gate 48 item 3: honor the Web Locks ifAvailable option — a busy lock
+        // invokes the callback with null instead of queueing.
+        if (
+          (opts as { ifAvailable?: boolean })?.ifAvailable &&
+          (heldNow.has(name) || (queues.get(name)?.length ?? 0) > 0)
+        ) {
+          Promise.resolve()
+            .then(() => cb(null))
+            .then(resolve, reject);
+          return;
+        }
         const run = () => {
           heldNow.add(name);
           Promise.resolve()
-            .then(cb)
+            .then(() => cb({ name }))
             .then(
               (v) => {
                 heldNow.delete(name);
@@ -9546,5 +9561,91 @@ it("GATE48 item 2: logout retires the RUNNING credential op immediately — the 
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner-g48-2");
+  }
+});
+
+it("GATE48 item 3: a sibling-held instance lock cannot block the bootstrap auth turn — its drain skips the locked instance and a queued login starts within the bound", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_494_000);
+  const I = "ins_g48_3";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  let releaseSibling: () => void = () => {};
+  try {
+    sessionStorage.setItem("remuda-outbox-owner-g48-3", "owner");
+    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g48_3", name: "A" }));
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true } as never);
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] } as never);
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async () => ({
+        relatedCommandIds: [],
+        command: { commandId: "cmd_g48_3", id: "cmd_g48_3", state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+
+    // A durable pending row the install drain will want to deliver — guarded by
+    // an instance lock held by a SIBLING deliverer that never releases.
+    const seed = new (await import("./outbox")).LocalStorageOutboxStorage();
+    await seed.put({
+      commandId: "cmd_g48_3",
+      clientRequestId: "local_g48_3",
+      instanceId: I,
+      prompt: "stuck behind a sibling lock",
+      createdAt: 1,
+      attempts: 0,
+      state: "pending",
+    });
+    const siblingDone = new Promise<void>((resolve) => {
+      releaseSibling = resolve;
+    });
+    globalThis.navigator.locks.request(
+      `remuda-outbox-${I}`,
+      { mode: "exclusive" },
+      () => siblingDone.then(() => undefined),
+    );
+    await pump(200);
+
+    // Bootstrap's bounded drain must NOT queue on the sibling lock.
+    const boot = hubStore.bootstrap();
+    await pump(8_000);
+    // The bootstrap turn settles even though the sibling still holds the lock.
+    await expect(boot).resolves.toBeUndefined();
+    expect(send).not.toHaveBeenCalled(); // locked instance skipped, no POST
+
+    // A login issued AFTER bootstrap acquires immediately and sends its
+    // credential request — the held sibling lock never blocked the queue.
+    let bodyStarted = false;
+    vi.spyOn(api, "login").mockImplementation((() => {
+      bodyStarted = true;
+      return Promise.resolve({ deviceId: "devB_g48_3", token: "tokB", name: "B" });
+    }) as unknown as Api["login"]);
+    const pLogin = hubStore.login("bootstrap", "secret", "devB_g48_3");
+    await pump(8_000);
+    await expect(pLogin).resolves.toBeUndefined();
+    expect(bodyStarted).toBe(true);
+  } finally {
+    releaseSibling();
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner-g48-3");
   }
 });

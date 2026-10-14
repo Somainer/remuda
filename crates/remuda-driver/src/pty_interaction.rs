@@ -116,12 +116,23 @@ pub(crate) struct PtyInteractions {
     /// restarted carrier without receiving a queued keystroke.
     closing: Arc<AtomicBool>,
     auto_trust_registered_workspace: bool,
-    /// c-ctxusage r27 item 1 test seam: when armed, every interaction dispatch
-    /// parks on this gate AFTER the final (post-mutex) revocation check and
-    /// BEFORE the pinned transport write — the exact window in which a close
-    /// can revoke and the carrier restart/reuse the pane id.
+    /// c-ctxusage r27/r28 item 1 test seam: when armed, an interaction
+    /// dispatch signals `arrived` AFTER passing the final (post-mutex)
+    /// revocation check and then parks on `release` BEFORE the pinned
+    /// transport write — the exact window in which a close can revoke and
+    /// the carrier restart/reuse the pane id. The acknowledgement makes the
+    /// park point deterministic: no sleep-based race.
     #[cfg(any(test, feature = "test-stub"))]
-    pre_dispatch_gate: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
+    pre_dispatch_gate: std::sync::Mutex<Option<DispatchGate>>,
+}
+
+/// See [`PtyInteractions::arm_pre_dispatch_gate`].
+#[cfg(any(test, feature = "test-stub"))]
+pub(crate) struct DispatchGate {
+    /// Fired once, strictly after the final check passes.
+    arrived: tokio::sync::oneshot::Sender<()>,
+    /// The parked dispatch proceeds only once this is notified.
+    release: Arc<tokio::sync::Notify>,
 }
 
 impl PtyInteractions {
@@ -157,10 +168,10 @@ impl PtyInteractions {
         })
     }
 
-    /// Arm the post-check/pre-write park used by the r27 regression.
+    /// Arm the post-check/pre-write park used by the r27/r28 regressions.
     #[allow(dead_code)]
     #[cfg(any(test, feature = "test-stub"))]
-    pub(crate) fn arm_pre_dispatch_gate(&self, gate: Arc<tokio::sync::Notify>) {
+    pub(crate) fn arm_pre_dispatch_gate(&self, gate: DispatchGate) {
         *self.pre_dispatch_gate.lock().expect("gate lock") = Some(gate);
     }
 
@@ -588,17 +599,15 @@ impl PtyInteractions {
     ) -> DriverResult<DriverAck> {
         #[cfg(any(test, feature = "test-stub"))]
         {
-            // Scope the std MutexGuard so it is dropped BEFORE the await: it
-            // is not Send and must not live across the park point.
-            let gate = self
-                .pre_dispatch_gate
-                .lock()
-                .expect("gate lock")
-                .as_ref()
-                .cloned();
+            // Take the gate (one park per arm), dropping the std MutexGuard
+            // BEFORE any await (it is not Send).
+            let gate = self.pre_dispatch_gate.lock().expect("gate lock").take();
             if let Some(gate) = gate {
-                // Park AFTER the post-mutex check and BEFORE the pinned write.
-                gate.notified().await;
+                // Acknowledgement strictly AFTER the final check passed: the
+                // test waits on this before revoking, so it can never mistake
+                // an early ControlUnavailable for the post-check window.
+                let _ = gate.arrived.send(());
+                gate.release.notified().await;
             }
         }
         conn.agent_send_keys(&self.target, keys)
@@ -1177,23 +1186,32 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             false,
         );
-        // Park point: after check, before the pinned write.
-        let gate = Arc::new(tokio::sync::Notify::new());
-        interactions.arm_pre_dispatch_gate(gate.clone());
+        // Park point: after check, before the pinned write. The arrival
+        // acknowledgement is fired INSIDE the seam strictly after the final
+        // check, so waiting on it deterministically proves the request reached
+        // the race window (no sleep-based guess).
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        interactions.arm_pre_dispatch_gate(DispatchGate {
+            arrived: arrived_tx,
+            release: release.clone(),
+        });
 
         // The request: connects to the ORIGINAL carrier, passes the check,
         // then parks holding the state mutex.
         let request_interactions = interactions.clone();
         let request =
             tokio::spawn(async move { request_interactions.send_keys(vec!["enter".into()]).await });
-        // Wait deterministically until the pinned connection was established
-        // (the original carrier accepted it) and the request has run through
-        // connect + mutex + check into the gate park.
+        // Wait until the pinned connection was established AND the request has
+        // passed its final revocation check and is parked at the seam.
         tokio::time::timeout(Duration::from_secs(5), accepted_rx)
             .await
             .expect("pinned connection never established")
             .expect("accept oneshot");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(5), arrived_rx)
+            .await
+            .expect("dispatch never reached the post-check park point")
+            .expect("arrival oneshot");
 
         // Close revokes WHILE the request is parked.
         interactions.revoke();
@@ -1235,15 +1253,22 @@ mod tests {
         };
 
         // Release the parked request: its pinned connection is the dead
-        // original boot's, so the write must error instead of reconnecting.
-        gate.notify_waiters();
+        // original boot's, so the write must fail with a TRANSPORT error —
+        // never the local ControlUnavailable, which would mean it was revoked
+        // before the check and never exercised this window.
+        release.notify_waiters();
         let result = tokio::time::timeout(Duration::from_secs(10), request)
             .await
             .expect("dispatch resolves")
             .expect("dispatch task");
+        let err = match result {
+            Err(err) => err,
+            Ok(ack) => panic!("the broken pinned write must fail, got Ok({ack:?})"),
+        };
         assert!(
-            result.is_err(),
-            "the write on the broken pinned connection fails, got {result:?}"
+            !matches!(err, DriverError::ControlUnavailable),
+            "an early ControlUnavailable means the request never reached the \
+             post-check window; the failure must be a transport error, got {err:?}"
         );
 
         // Give a buggy (reconnecting) build a beat to dial the replacement.

@@ -1187,16 +1187,20 @@ class HubStore {
    */
   private connectionInstallEpoch: number | null = null;
   /**
-   * c-reconnfu gate 41 S1 — SINGLE-FLIGHT BOOTSTRAP. At most one bootstrap
-   * RUN per store. A second call in the SAME external epoch (React StrictMode
-   * effect replay; a login's bootstrap settlement arriving while the reload
-   * bootstrap is still in flight) returns the in-flight promise. A call in a
-   * NEWER epoch (after logout/401/peer) starts a fresh run immediately; the
-   * older run retires itself through its captured epoch and never gates the
-   * new identity. This replaces bootGen-based retirement (bootGen now only
-   * orders list polls).
+   * c-reconnfu gate 41 S1 / gate 42 — SINGLE-FLIGHT BOOTSTRAP. At most one
+   * bootstrap RUN per (external epoch, credential generation). A second call
+   * with the SAME epoch AND same authGen (React StrictMode effect replay; two
+   * identical reloads) returns the in-flight promise. A call in a NEWER
+   * credential generation — a successful login's transition acquires the chain
+   * and applyAuthIdentityChange bumps authGen while the external epoch is
+   * unchanged — must NOT join: the older run's outbox initialization was
+   * invalidated by that gen bump, so satisfying the newer caller with its
+   * promise would resolve the login with no machine/bubble restore. The newer
+   * caller runs its own fresh pass; the older run retires via the gen/epoch
+   * checks and never reports completion when its install went obsolete.
+   * A call in a newer EXTERNAL epoch (logout/401/peer) likewise runs fresh.
    */
-  private bootstrapInFlight: { ext: number; promise: Promise<void> } | null = null;
+  private bootstrapInFlight: { ext: number; gen: number; promise: Promise<boolean> } | null = null;
   private outbox: Outbox | null = null;
   private outboxUnsubscribe: (() => void) | null = null;
   private outboxDegraded = false;
@@ -2993,7 +2997,16 @@ class HubStore {
    * at offline instead of an optimistic live, so cached UI shows an honest
    * state and the outbox still restores/flushes on recovery.
    */
-  private async initConnection(offline: boolean, ext: number) {
+  /**
+   * @returns true when the caller's identity has a live current-epoch machine
+   * after this call (newly installed, or an existing one adopted); false when
+   * NO machine was installed — the caller's epoch retired, or its outbox
+   * initialization became obsolete (gate 42: a same-epoch credential
+   * transition bumped authGen while this was awaiting storage). A false result
+   * must never be treated as a completed bootstrap: the current generation is
+   * installed by a newer bootstrap run.
+   */
+  private async initConnection(offline: boolean, ext: number): Promise<boolean> {
     // Gate 39/40 R-b: the CALLER's external epoch (captured at its public
     // entry before its first await) is REQUIRED; this installer never reads a
     // fresh epoch for the caller.
@@ -3008,7 +3021,7 @@ class HubStore {
     // an open transition) stops this install entirely — never adopt the box the
     // NEW identity created.
     const status = await this.ensureOutbox(epoch);
-    if (status !== "ok" || !live() || !this.outbox) return;
+    if (status !== "ok" || !live() || !this.outbox) return false;
     // Gate 41 S1: a connection machine installed for THIS epoch is already
     // owned — either by a replacement login's reused machine or by a
     // concurrent same-epoch bootstrap that won the single-flight/reload race.
@@ -3016,14 +3029,14 @@ class HubStore {
     // machine (the second assignment would orphan the first, whose timers and
     // callbacks keep running).
     if (this.connection && this.connectionInstallEpoch === epoch) {
-      return;
+      return true;
     }
     const box = this.outbox;
 
     // Reload: restore unsent rows as bubbles, keyed to their stored instances.
     // Gate 39 R-b: identity-publishing/resource work — revalidate synchronously
     // before the restore emit and machine creation.
-    if (!live()) return;
+    if (!live()) return false;
     const restored = box.unresolved();
     if (restored.length) {
       // Offline reload never ran the instance list. Restore the LAST KNOWN
@@ -3059,7 +3072,7 @@ class HubStore {
     // stops the machine from being built or published.
     if (!live()) {
       box.dispose();
-      return;
+      return false;
     }
     const machine = new ConnectionMachine({
       resume: () => this.resumeConnection(),
@@ -3101,7 +3114,7 @@ class HubStore {
       machine.dispose();
       this.connection = null;
       this.connectionInstallEpoch = null;
-      return;
+      return false;
     }
     // A successful REST bootstrap proves reachability, but on the list/new
     // pages there is no follow socket to watchdog yet: start live WITHOUT a
@@ -3124,6 +3137,7 @@ class HubStore {
 
     // Send anything already due (e.g. rows left inflight when the tab closed).
     void this.flushAllOutbox();
+    return true;
   }
 
   private onConnOnline = () => this.connection?.dispatch({ type: "online" });
@@ -4435,32 +4449,41 @@ class HubStore {
     this.emit({ bubbles: next });
   }
 
-  async bootstrap() {
-    // Gate 41 S1 — SINGLE-FLIGHT BOOTSTRAP (see bootstrapInFlight).
+  async bootstrap(): Promise<void> {
+    // Gate 41 S1 / gate 42 — SINGLE-FLIGHT keyed on (extEpoch, authGen).
     this.registerPeerAuthWatch();
     const extAtBoot = this.extEpoch;
+    const genAtBoot = this.authGen;
     const inFlight = this.bootstrapInFlight;
-    if (inFlight && inFlight.ext === extAtBoot) {
-      // Same identity: StrictMode effect replay / reload + login — join the
+    if (inFlight && inFlight.ext === extAtBoot && inFlight.gen === genAtBoot) {
+      // Identical identity (StrictMode replay / duplicate reload): join the
       // run already in flight instead of running health/lists/install twice.
-      return inFlight.promise;
+      await inFlight.promise;
+      return;
     }
-    // First call, or a NEW external epoch after logout/401/peer: run fresh at
-    // once. We do NOT await the older (different-epoch) run: it may be parked
-    // on a dead request and retires itself through its own epoch checks; this
-    // new identity must not wait for it.
-    const promise = this.runBootstrap(extAtBoot);
-    this.bootstrapInFlight = { ext: extAtBoot, promise };
+    // First call, a NEW external epoch, OR a NEWER credential generation (a
+    // login that bumped authGen while a reload run was parked): run a FRESH
+    // pass for this identity. We do NOT await the older run — it may be parked
+    // on a dead request and retires itself via its captured gen/epoch checks.
+    const promise = this.runBootstrap(extAtBoot, genAtBoot);
+    this.bootstrapInFlight = { ext: extAtBoot, gen: genAtBoot, promise };
     try {
       await promise;
     } finally {
-      // Only the latest run clears the slot (a newer-epoch run may already
-      // have replaced it; joined same-epoch callers never reach here).
+      // Only the latest run clears the slot (a newer run may already have
+      // replaced it; joined same-identity callers never reach here).
       if (this.bootstrapInFlight?.promise === promise) this.bootstrapInFlight = null;
     }
   }
 
-  private async runBootstrap(extAtBoot: number) {
+  /**
+   * @returns true when this run reached a fully installed/settled state for
+   * its identity; false when it retired mid-install (external epoch moved, or
+   * a same-epoch credential transition superseded its generation) — in which
+   * case it reports NO completion: the current identity is owned by a newer
+   * bootstrap run (gate 42).
+   */
+  private async runBootstrap(extAtBoot: number, _genAtBoot: number): Promise<boolean> {
     // Gate 38 item 2: capture the external epoch at bootstrap start and
     // revalidate SYNCHRONOUSLY after every await below, before installing a
     // resource or publishing state. A peer logout / local logout / 401 while a
@@ -4476,13 +4499,13 @@ class HubStore {
     ++this.bootGen;
     if (api.mock && readLoggedOut() && !readSession()) {
       this.emit({ ready: true, authed: false, session: null, devices: [], passkeys: [], connection: "offline" });
-      return;
+      return true;
     }
     if (api.mock && !readSession()) {
       const session = await api.login(MOCK_BOOTSTRAP_TOKEN, readDeviceSettings().deviceName);
       // Gate 40: epoch is the only retirement gate (not bootGen — see the catch
       // block); an external change while this step was parked retires the run.
-      if (!extLive()) return;
+      if (!extLive()) return false;
       // First identity establishment: route through the same helper so the
       // initial Outbox initializer starts under a defined, current generation.
       this.applyAuthIdentityChange();
@@ -4493,10 +4516,10 @@ class HubStore {
       await api.hello();
       // Gate 40: epoch is the only retirement gate (not bootGen — see the catch
       // block); an external change while this step was parked retires the run.
-      if (!extLive()) return;
+      if (!extLive()) return false;
       if (!api.mock && !api.hasDeviceSession()) {
         this.emit({ ready: true, authed: false, error: null, connection: "live" });
-        return;
+        return true;
       }
       const [instances, hosts, interactions, devices, passkeys] = await Promise.all([
         api.instanceList(),
@@ -4507,7 +4530,7 @@ class HubStore {
       ]);
       // Gate 40: epoch is the only retirement gate (not bootGen — see the catch
       // block); an external change while this step was parked retires the run.
-      if (!extLive()) return;
+      if (!extLive()) return false;
       const registeredHosts = mergeHostWorkspaces(hosts.items, this.state.hosts);
       this.emit({
         ready: true,
@@ -4559,11 +4582,17 @@ class HubStore {
       // it the outbox): an external change landing during this synchronous
       // setup must not be followed by a stale machine/install, and again after
       // the install settles before starting polls.
-      if (!extLive()) return;
-      await this.initConnection(false, extAtBoot);
-      if (!extLive()) return;
+      if (!extLive()) return false;
+      // Gate 42: a false install means a same-epoch credential transition
+      // superseded this run's generation while it parked; do not start polls or
+      // report completion — the newer generation's own bootstrap owns the
+      // machine, restoration and completion of any joined caller.
+      const installed = await this.initConnection(false, extAtBoot);
+      if (!extLive()) return false;
+      if (!installed) return false;
       this.startPoll();
       this.installDevHandle();
+      return true;
     } catch (err) {
       // Gate 41 item 1: RETIREMENT FIRST. If an external change (logout/401/
       // peer) advanced the epoch while the health/list request was parked —
@@ -4574,7 +4603,7 @@ class HubStore {
       // external change already published the logged-out state and tore the
       // old resources down. A CURRENT-epoch bootstrap's OWN 401 still passes
       // this check (the epoch has not moved yet) and performs the logout below.
-      if (!extLive()) return;
+      if (!extLive()) return false;
       const unauth = isUnauthorized(err);
       if (unauth) {
         // c-reconnfu gate 33 item 1: a 401 means the current session is gone;
@@ -4591,8 +4620,11 @@ class HubStore {
       // and let the connection machine reconnect. Only a real 401 logs out.
       const hasSession = api.hasDeviceSession();
       if (!unauth && hasSession) {
-        await this.initConnection(true, extAtBoot);
-        if (!extLive()) return;
+        const installedOffline = await this.initConnection(true, extAtBoot);
+        if (!extLive()) return false;
+        // Gate 42: obsolete install (newer credential generation) — do not
+        // republish authed or poll from the retired run.
+        if (!installedOffline) return false;
         this.emit({
           ready: true,
           authed: true,
@@ -4600,7 +4632,7 @@ class HubStore {
           error: null,
         });
         this.startPoll();
-        return;
+        return true;
       }
       this.emit({
         ready: true,
@@ -4609,6 +4641,7 @@ class HubStore {
         error: err instanceof Error ? err.message : "bootstrap failed",
         connection: "offline",
       });
+      return true;
     }
   }
 

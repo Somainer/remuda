@@ -8698,16 +8698,7 @@ it("GATE41 item 3 (S1): overlapping bootstraps single-flight — one health run,
       nextCursor: null,
     } as never);
     vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
-    // Health parked: both bootstrap calls overlap while the single run waits.
-    let releaseHealth: (() => void) | null = null;
-    let healthCalls = 0;
-    const hello = vi.spyOn(api, "hello").mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          healthCalls += 1;
-          releaseHealth = () => resolve({} as Awaited<ReturnType<Api["hello"]>>);
-        }),
-    );
+    const hello = vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
 
     // One pending durable row: it must be restored EXACTLY once.
     const preStorage = new (await import("./outbox")).LocalStorageOutboxStorage();
@@ -8721,6 +8712,15 @@ it("GATE41 item 3 (S1): overlapping bootstraps single-flight — one health run,
       state: "pending",
     });
 
+    // Gate 42 review: park the STORAGE initializer (not the health request) —
+    // the single run suspends in initConnection, after hello/lists, right where
+    // a reload + login join would happen.
+    let releaseStorage: (() => void) | null = null;
+    const internals = hubStore as unknown as Record<string, unknown>;
+    (internals.setOutboxOpenGateForTest as (g: ((r: () => void) => void) | null) => void)((resolve) => {
+      releaseStorage = resolve;
+    });
+
     // Count per-machine browser-listener registrations (one machine = one set).
     const addSpy = vi.spyOn(window, "addEventListener");
 
@@ -8730,15 +8730,18 @@ it("GATE41 item 3 (S1): overlapping bootstraps single-flight — one health run,
       connection: unknown;
       state: { bubbles: Array<{ clientRequestId: string }> };
     };
-    // TWO overlapping bootstraps in the SAME epoch (StrictMode replay / reload
-    // + login) while the single run's health request is parked.
+    // TWO overlapping bootstraps in the SAME epoch+gen (StrictMode replay):
+    // the single run is parked inside the storage initializer; the second call
+    // joins its promise instead of running a second bootstrap.
     const b1 = h.bootstrap();
     const b2 = h.bootstrap();
     await pump(300);
-    // Both callers are waiting on the SAME in-flight run: health fired once.
-    expect(healthCalls).toBe(1);
+    // Parked after one health run; nothing installed yet.
+    expect(hello).toHaveBeenCalledTimes(1);
+    expect(releaseStorage).not.toBeNull();
+    expect(h.connection).toBeNull();
 
-    releaseHealth!();
+    releaseStorage!();
     await Promise.all([b1, b2]);
     await pump(6_000);
 
@@ -8754,5 +8757,129 @@ it("GATE41 item 3 (S1): overlapping bootstraps single-flight — one health run,
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});
+
+it("GATE42 item 1: a login that bumps authGen while a reload bootstrap is parked at storage open completes with exactly one machine and one bubble restore", async () => {
+  for (const gate of ["open", "load"] as const) {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_390_000 + (gate === "load" ? 1 : 0));
+    const I = `ins_g42_1_${gate}`;
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+    const pump = async (n = 5_000) => {
+      for (let i = 0; i < n; i += 1) await Promise.resolve();
+    };
+    try {
+      sessionStorage.setItem(`remuda-outbox-owner-g42-1-${gate}`, "owner");
+      // Reload: a cached session A exists plus one pending durable row.
+      localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g42_1", name: "A" }));
+      const { api, hubStore } = await fresh();
+      vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+      vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+      vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+      vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+      vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+      vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+      vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+      vi.spyOn(api, "instanceList").mockResolvedValue({
+        items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+        nextCursor: null,
+      } as never);
+      vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+      vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+      vi.spyOn(api, "login").mockResolvedValue({ deviceId: "devB_g42_1", token: "tokB", name: "B" });
+
+      // One durable row the CURRENT generation's machine must restore once.
+      const seed = new (await import("./outbox")).LocalStorageOutboxStorage();
+      await seed.put({
+        commandId: `cmd_g42_1_${gate}`,
+        clientRequestId: `local_g42_1_${gate}`,
+        instanceId: I,
+        prompt: "g42 1 restore once",
+        createdAt: 1,
+        attempts: 0,
+        state: "pending",
+      });
+
+      // Park A's storage step: the FIRST initializer parks; any later
+      // initializer (the login's current-generation one) proceeds at once.
+      let releaseA: (() => void) | null = null;
+      let parkArmed = false;
+      const internals = hubStore as unknown as Record<string, unknown>;
+      (internals.setOutboxOpenGateForTest as (g: ((r: () => void) => void) | null) => void)(
+        gate === "open"
+          ? (resolve) => {
+              if (!parkArmed) {
+                parkArmed = true;
+                releaseA = resolve;
+              } else {
+                resolve();
+              }
+            }
+          : null,
+      );
+      (internals.setOutboxLoadGateForTest as (g: ((r: () => void) => void) | null) => void)(
+        gate === "load"
+          ? (resolve) => {
+              if (!parkArmed) {
+                parkArmed = true;
+                releaseA = resolve;
+              } else {
+                resolve();
+              }
+            }
+          : null,
+      );
+
+      // Per-iteration listener spy (the two variants use separate stores).
+      const addSpy = vi.spyOn(window, "addEventListener");
+      const h = hubStore as unknown as {
+        bootstrap: () => Promise<void>;
+        login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+        connection: unknown;
+        outbox: unknown;
+        state: { connection: string; bubbles: Array<{ clientRequestId: string }>; authed: boolean };
+      };
+
+      // Reload bootstrap A parks at its storage open/load (no machine yet).
+      const bootA = h.bootstrap();
+      await pump(500);
+      expect(releaseA).not.toBeNull();
+      expect(h.connection).toBeNull();
+
+      // A REAL login B in the SAME external epoch: its transition bumps authGen
+      // and clears A's initializer; its settlement bootstrap must not join A's
+      // obsolete run but perform the current-generation install itself.
+      const loginB = h.login("bootstrap", "secret", "devB");
+      await pump(1_200);
+      // A is still parked at its storage gate; B's fresh initializer passed
+      // the gate (2nd call auto-resolves) and B has installed its own machine.
+      expect(releaseA).not.toBeNull();
+
+      // Release A: it resumes obsolete and installs nothing of its own. Login
+      // resolves only once B's machine is installed and bubbles restored.
+      releaseA!();
+      await Promise.all([bootA, loginB]);
+      await pump(6_000);
+
+      // Exactly one machine: one "online" listener set from initConnection.
+      expect(addSpy.mock.calls.filter((c) => c[0] === "online")).toHaveLength(1);
+      expect(h.connection).not.toBeNull();
+      expect(h.outbox).not.toBeNull();
+      // Exactly one bubble restoration for the seeded row.
+      expect(h.state.bubbles.filter((b) => b.clientRequestId === `local_g42_1_${gate}`)).toHaveLength(1);
+      // The published connection state is the installed machine's live state.
+      expect(h.state.connection).toBe("live");
+      expect(h.state.authed).toBe(true);
+      addSpy.mockRestore();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    }
   }
 });

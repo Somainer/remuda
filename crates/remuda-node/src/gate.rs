@@ -2224,8 +2224,10 @@ impl DevNode {
             let mut land_aborted = false;
             // Scope the waiting future so its borrow of `land_child` is
             // released before the timeout arm kills and reaps the child.
-            let land_outcome: Result<Option<std::process::Output>, ()> = {
-                let wait = land_child.wait_with_output_piped(land_stdout);
+            // r19 item 3: a normal exit is observed WNOWAIT (leader UNREAPED)
+            // so the owner cleans the group before reaping.
+            let land_outcome: Result<Option<ObservedExit>, ()> = {
+                let wait = land_child.observe_exit_piped(land_stdout);
                 tokio::pin!(wait);
                 // Resolves if a latch was already set OR on a later send.
                 let land_abort_fired = async {
@@ -2299,97 +2301,151 @@ impl DevNode {
                         ));
                     }
                 }
-                Ok(Some(land_output)) if land_output.status.success() => {
-                    // r17 item 4: a zero exit does NOT bypass validation. The
-                    // child must return a parseable, recognized `landed` report
-                    // whose `merged` sha is the EXACT granted/verified merge; a
-                    // malformed/missing report, an unknown status, or a merge
-                    // identity mismatch is uncertain regardless of the exit code
-                    // (the Hub reconciles rather than trust a bare success).
+                Ok(Some(observed)) => {
+                    // The leader EXITED. On unix that exit was observed
+                    // WNOWAIT, so the leader is still UNREAPED: THIS owner —
+                    // the only signaler — kills every surviving same-group
+                    // descendant BEFORE reaping while the unreaped leader pins
+                    // its pgid (r19 item 3). A detached-output runaway can no
+                    // longer outlive the land and hold its fence.
+                    let land_output = match observed {
+                        ObservedExit::Unreaped(stdout_bytes) => {
+                            #[cfg(unix)]
+                            if let Some(pgid) = land_pgid {
+                                tokio::task::spawn_blocking(move || {
+                                    clean_surviving_land_group(pgid)
+                                })
+                                .await
+                                .ok();
+                            }
+                            // Reap the leader exactly once; its real status
+                            // drives the verdict.
+                            land_child
+                                .wait()
+                                .await
+                                .map(|status| std::process::Output {
+                                    status,
+                                    stdout: stdout_bytes,
+                                    stderr: Vec::new(),
+                                })
+                                .ok()
+                        }
+                        ObservedExit::Reaped(output) => Some(output),
+                    };
                     let drained_stderr = captured_stderr
                         .lock()
                         .map(|lines| lines.join("\n"))
                         .unwrap_or_default();
-                    match classify_released_land_outcome(
-                        &land_output,
-                        &drained_stderr,
-                        result.merge_sha.as_deref(),
-                    ) {
-                        ReleasedLandOutcome::Landed(land_report) => {
-                            result.status = "landed".into();
-                            result.current_main_sha = string_field(&land_report, "currentMain");
-                            result.merge_sha =
-                                string_field(&land_report, "merged").or(result.merge_sha);
+                    match land_output {
+                        Some(land_output) if land_output.status.success() => {
+                            // r17 item 4: a zero exit does NOT bypass validation.
+                            // The child must return a parseable, recognized `landed`
+                            // report whose `merged` sha is the EXACT granted/verified
+                            // merge; a malformed/missing report, an unknown status,
+                            // or a merge identity mismatch is uncertain regardless
+                            // of the exit code (the Hub reconciles rather than
+                            // trust a bare success).
+                            match classify_released_land_outcome(
+                                &land_output,
+                                &drained_stderr,
+                                result.merge_sha.as_deref(),
+                            ) {
+                                ReleasedLandOutcome::Landed(land_report) => {
+                                    result.status = "landed".into();
+                                    result.current_main_sha =
+                                        string_field(&land_report, "currentMain");
+                                    result.merge_sha =
+                                        string_field(&land_report, "merged").or(result.merge_sha);
+                                }
+                                ReleasedLandOutcome::BaseMoved(land_report) => {
+                                    // A recognized CAS-loss verdict on a zero
+                                    // exit is honored (the CLI uses nonzero, but
+                                    // accept the structured verdict either way).
+                                    result.status = "base-moved".into();
+                                    result.current_main_sha =
+                                        string_field(&land_report, "currentMain");
+                                    result.error = string_field(&land_report, "error");
+                                    result.reason = None;
+                                }
+                                ReleasedLandOutcome::Uncertain { error, reason } => {
+                                    result.status = "uncertain".into();
+                                    result.error = Some(error);
+                                    result.reason = Some(reason);
+                                }
+                                ReleasedLandOutcome::Failed(error) => {
+                                    result.status = "failed".into();
+                                    result.error = Some(error);
+                                }
+                            }
                         }
-                        ReleasedLandOutcome::BaseMoved(land_report) => {
-                            // A recognized CAS-loss verdict on a zero exit is
-                            // honored (the CLI uses nonzero, but accept the
-                            // structured verdict either way).
-                            result.status = "base-moved".into();
-                            result.current_main_sha = string_field(&land_report, "currentMain");
-                            result.error = string_field(&land_report, "error");
-                            result.reason = None;
+                        Some(output) => {
+                            // r16 item 4 (R5): the child was RELEASED, so its
+                            // push may have reached the remote. Only a
+                            // RECOGNIZED structured verdict may settle the
+                            // Landing; a crash (signal), a
+                            // missing/malformed/unparseable report, or an
+                            // unrecognized status is UNCERTAIN — the Hub
+                            // reconciles against origin — never a definite
+                            // failure.
+                            match classify_released_land_outcome(
+                                &output,
+                                &drained_stderr,
+                                result.merge_sha.as_deref(),
+                            ) {
+                                ReleasedLandOutcome::Landed(land_report) => {
+                                    result.status = "landed".into();
+                                    result.current_main_sha =
+                                        string_field(&land_report, "currentMain");
+                                    result.merge_sha =
+                                        string_field(&land_report, "merged").or(result.merge_sha);
+                                }
+                                ReleasedLandOutcome::BaseMoved(land_report) => {
+                                    // `merge --land` exits nonzero when the
+                                    // compare-and-swap lost (base moved under
+                                    // the lease): keep the requeue verdict and
+                                    // currentMain.
+                                    result.status = "base-moved".into();
+                                    result.current_main_sha =
+                                        string_field(&land_report, "currentMain");
+                                    result.error = string_field(&land_report, "error");
+                                    result.reason = None;
+                                }
+                                ReleasedLandOutcome::Uncertain { error, reason } => {
+                                    result.status = "uncertain".into();
+                                    result.error = Some(error);
+                                    result.reason = Some(reason);
+                                }
+                                ReleasedLandOutcome::Failed(error) => {
+                                    result.status = "failed".into();
+                                    result.error = Some(error);
+                                }
+                            }
                         }
-                        ReleasedLandOutcome::Uncertain { error, reason } => {
+                        None => {
+                            // r16 item 4: no wait status after the release is
+                            // not an established failure: the push may have
+                            // landed.
                             result.status = "uncertain".into();
-                            result.error = Some(error);
-                            result.reason = Some(reason);
-                        }
-                        ReleasedLandOutcome::Failed(error) => {
-                            result.status = "failed".into();
-                            result.error = Some(error);
-                        }
-                    }
-                }
-                Ok(Some(output)) => {
-                    // r16 item 4 (R5): the child was RELEASED, so its push may
-                    // have reached the remote. Only a RECOGNIZED structured
-                    // verdict may settle the Landing; a crash (signal), a
-                    // missing/malformed/unparseable report, or an unrecognized
-                    // status is UNCERTAIN — the Hub reconciles against origin —
-                    // never a definite failure.
-                    let drained_stderr = captured_stderr
-                        .lock()
-                        .map(|lines| lines.join("\n"))
-                        .unwrap_or_default();
-                    match classify_released_land_outcome(
-                        &output,
-                        &drained_stderr,
-                        result.merge_sha.as_deref(),
-                    ) {
-                        ReleasedLandOutcome::Landed(land_report) => {
-                            result.status = "landed".into();
-                            result.current_main_sha = string_field(&land_report, "currentMain");
-                            result.merge_sha =
-                                string_field(&land_report, "merged").or(result.merge_sha);
-                        }
-                        ReleasedLandOutcome::BaseMoved(land_report) => {
-                            // `merge --land` exits nonzero when the
-                            // compare-and-swap lost (base moved under the
-                            // lease): keep the requeue verdict and currentMain.
-                            result.status = "base-moved".into();
-                            result.current_main_sha = string_field(&land_report, "currentMain");
-                            result.error = string_field(&land_report, "error");
-                            result.reason = None;
-                        }
-                        ReleasedLandOutcome::Uncertain { error, reason } => {
-                            result.status = "uncertain".into();
-                            result.error = Some(error);
-                            result.reason = Some(reason);
-                        }
-                        ReleasedLandOutcome::Failed(error) => {
-                            result.status = "failed".into();
-                            result.error = Some(error);
+                            result.error = Some(
+                                "the released land child ended without any result; the push may \
+                                 have reached the remote; the Hub reconciles against the exact \
+                                 granted merge"
+                                    .into(),
+                            );
+                            result.reason = Some(
+                                "land child produced no result; push outcome uncertain".into(),
+                            );
                         }
                     }
                 }
                 Ok(None) => {
-                    // r16 item 4: no wait status at all after the release is
-                    // not an established failure: the push may have landed.
+                    // The non-reaping observation could not even see the
+                    // leader; the push may have landed — uncertain.
                     result.status = "uncertain".into();
                     result.error = Some(
-                        "the released land child ended without any result; the push may have \
-                         reached the remote; the Hub reconciles against the exact granted merge"
+                        "the released land child could not be observed at exit; the push may \
+                         have reached the remote; the Hub reconciles against the exact granted \
+                         merge"
                             .into(),
                     );
                     result.reason =
@@ -2624,6 +2680,24 @@ trait WaitWithOutputPiped {
         &mut self,
         stdout: Option<tokio::process::ChildStdout>,
     ) -> Option<std::process::Output>;
+
+    /// r19 item 3 / R6: wait until the leader EXITS. On unix the exit is
+    /// observed WITHOUT reaping (`waitid(WNOHANG|WNOWAIT)`) so the owner can
+    /// clean surviving same-group members while the leader is still unreaped
+    /// and only then reap; other platforms reap here and report `Reaped`.
+    async fn observe_exit_piped(
+        &mut self,
+        stdout: Option<tokio::process::ChildStdout>,
+    ) -> Option<ObservedExit>;
+}
+
+/// How [`WaitWithOutputPiped::observe_exit_piped`] saw the leader leave.
+enum ObservedExit {
+    /// unix: exit observed, leader still UNREAPED; carries drained stdout.
+    Unreaped(Vec<u8>),
+    /// non-unix fallback: the child was reaped the ordinary way.
+    #[allow(dead_code)] // constructed only on non-unix
+    Reaped(std::process::Output),
 }
 
 impl WaitWithOutputPiped for tokio::process::Child {
@@ -2642,6 +2716,60 @@ impl WaitWithOutputPiped for tokio::process::Child {
             stdout: stdout_bytes,
             stderr: Vec::new(),
         })
+    }
+
+    #[cfg(unix)]
+    async fn observe_exit_piped(
+        &mut self,
+        stdout: Option<tokio::process::ChildStdout>,
+    ) -> Option<ObservedExit> {
+        use tokio::io::AsyncReadExt;
+        let mut stdout_bytes = Vec::new();
+        if let Some(mut out) = stdout {
+            let _ = out.read_to_end(&mut stdout_bytes).await;
+        }
+        let leader_pid = self.id()? as i32;
+        loop {
+            // waitid must run off the async worker: spawn_blocking per poll.
+            let observed =
+                tokio::task::spawn_blocking(move || leader_exit_observed_unreaped(leader_pid))
+                    .await
+                    .unwrap_or(true);
+            if observed {
+                return Some(ObservedExit::Unreaped(stdout_bytes));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn observe_exit_piped(
+        &mut self,
+        stdout: Option<tokio::process::ChildStdout>,
+    ) -> Option<ObservedExit> {
+        self.wait_with_output_piped(stdout)
+            .await
+            .map(ObservedExit::Reaped)
+    }
+}
+
+/// Non-reaping exit observation (r19 item 3): `waitid(WNOHANG|WNOWAIT)`
+/// reports the leader's exit without consuming the zombie. `StillAlive` means
+/// still running; any other status means it transitioned and is left unreaped
+/// so its unique owner can signal the group before reaping. ECHILD means it is
+/// already gone — the owner's later `wait` sorts that out.
+#[cfg(unix)]
+fn leader_exit_observed_unreaped(pid: i32) -> bool {
+    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+    use nix::unistd::Pid;
+    match waitid(
+        Id::Pid(Pid::from_raw(pid)),
+        WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+    ) {
+        Ok(WaitStatus::StillAlive) => false,
+        Ok(_) => true,
+        Err(nix::errno::Errno::EINTR) => false,
+        Err(_) => true,
     }
 }
 
@@ -4084,11 +4212,15 @@ fn fence_orphaned_land_groups(dir: &std::path::Path) {
 const LAND_GROUP_TERM_GRACE: Duration = Duration::from_millis(750);
 
 /// Pids currently alive (non-zombie) whose process group is `pgid` (Linux
-/// `/proc` enumeration). TEST/DIAGNOSTIC ONLY: it is never consulted to prove
-/// death or to skip a signal — production termination claims death only on the
-/// kernel's authoritative `killpg(pgid, 0)` ESRCH, so an empty scan (or a
-/// platform without `/proc`) can never be read as "cleared" (r15 R5).
-#[cfg(all(unix, any(test, feature = "test-faults")))]
+/// `/proc` enumeration). It is NEVER consulted to prove death or to skip a
+/// signal — production termination claims death only on the kernel's
+/// authoritative `killpg(pgid, 0)` ESRCH, so an empty scan (or a platform
+/// without `/proc`) can never be read as "cleared" (r15 R5). r19 item 3 adds
+/// one TIMING-only use: after a normally-exited but unreaped land leader
+/// signalled its group, the owner waits for the OTHER members to vanish before
+/// reaping; the zombie leader itself keeps `killpg` reporting "exists", so the
+/// post-reap ESRCH remains the authoritative proof.
+#[cfg(unix)]
 pub(crate) fn alive_pids_in_group(pgid: i32) -> Vec<i32> {
     let Ok(entries) = std::fs::read_dir(proc_root()) else {
         return Vec::new();
@@ -4138,6 +4270,48 @@ pub(crate) fn alive_pids_in_group(pgid: i32) -> Vec<i32> {
 #[cfg(unix)]
 fn terminate_group(pgid: i32) {
     let _ = terminate_and_verify_group(pgid, LAND_GROUP_TERM_GRACE);
+}
+
+/// r19 item 3: owner cleanup for a land leader that EXITED NORMALLY but is not
+/// yet reaped. A same-group descendant (e.g. a runaway git/ssh whose output
+/// the CLI detached) can survive the leader. Signal the WHOLE group with
+/// killpg (never a /proc-derived pid list), boundedly wait for every OTHER
+/// live member to disappear, then SIGKILL the stragglers and wait again.
+///
+/// The unreaped zombie leader keeps `killpg(pgid, 0)` reporting "exists", so
+/// the wait observes OTHER members through `/proc` for TIMING ONLY. The
+/// authoritative death claim is unchanged: the caller reaps the leader and
+/// `settle_land_group` certifies only on the kernel's ESRCH after that; if any
+/// member survives this cleanup the fence stays (Unknown).
+#[cfg(unix)]
+fn clean_surviving_land_group(leader_pgid: i32) {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+    let _ = killpg(Pid::from_raw(leader_pgid), Some(Signal::SIGTERM));
+    wait_until_other_members_gone(leader_pgid, LAND_GROUP_TERM_GRACE);
+    // Unconditional KILL, exactly like terminate_and_verify_group: never leave
+    // a SIGTERM-ignoring descendant free to keep pushing.
+    let _ = killpg(Pid::from_raw(leader_pgid), Some(Signal::SIGKILL));
+    wait_until_other_members_gone(leader_pgid, OWNED_KILL_GRACE);
+}
+
+/// Wait boundedly until the group's only remaining member is the (unreaped,
+/// possibly zombie) leader itself. `/proc` timing only — never a death proof.
+#[cfg(unix)]
+fn wait_until_other_members_gone(leader_pgid: i32, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    loop {
+        if alive_pids_in_group(leader_pgid)
+            .into_iter()
+            .all(|pid| pid == leader_pgid)
+        {
+            return;
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Test-only accessor for the process-group liveness scan (r13 item 5).
@@ -5044,6 +5218,33 @@ echo released > "$dir/abort-released.marker"
 sleep 30
 "#;
 
+    /// r19 item 3: the land leader (this script) exits 0 with a valid `landed`
+    /// report, but BEFORE exiting it forks a descendant in the SAME process
+    /// group whose output is DETACHED to /dev/null. The descendant outlives
+    /// the leader; the land owner must kill it BEFORE reaping, so the group
+    /// settles (death certificate written) and nothing survives.
+    const SURVIVOR_LAND_SCRIPT: &str = r#"
+dir=$(dirname "$0")
+echo "$*" >> "$dir/args.txt"
+base=$(git rev-parse main 2>/dev/null || echo "1111111111111111111111111111111111111111")
+head=$(git rev-parse wt/fake/task 2>/dev/null || echo "2222222222222222222222222222222222222222")
+if ! printf '%s\n' "$*" | grep -q -- '--land'; then
+  echo "{\"exitCode\":0,\"status\":\"verified\",\"base\":\"$base\",\"head\":\"$head\",\"merged\":\"$head\",\"steps\":[]}"
+  exit 0
+fi
+if [ "${REMUDA_START_BARRIER_FD-}" != "0" ]; then
+  exit 0
+fi
+byte=""
+IFS= read -r -n 1 -t 30 byte || exit 4
+[ -n "$byte" ] || exit 4
+# Same-group grandchild with fully detached output: stdout/stderr close in the
+# leader does NOT take it down, and nothing waits for it.
+(sleep 47.91 >/dev/null 2>&1 &)
+echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\":\"$head\",\"steps\":[]}"
+exit 0
+"#;
+
     const BARRIER_LAND_SCRIPT: &str = r#"
 dir=$(dirname "$0")
 echo "$*" >> "$dir/args.txt"
@@ -5310,6 +5511,66 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
                 .await
                 != LandPushLiveness::MayPush,
             "the aborted land group is not live afterwards"
+        );
+    }
+
+    /// r19 item 3 / R6 production-path regression: the land leader exits 0
+    /// (a valid landed report) while a SAME-GROUP child with detached output is
+    /// still running. The owner observes the exit WITHOUT reaping (waitid
+    /// WNOWAIT), kills the surviving group member BEFORE reaping the leader,
+    /// and the fence settles (authoritative post-reap ESRCH → death
+    /// certificate): the verdict is `landed`, no descendant survives, and a
+    /// later liveness probe attests VerifiedDead rather than keeping the fence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_surviving_same_group_child_is_killed_before_the_land_leader_is_reaped() {
+        let fixture = fixture(SURVIVOR_LAND_SCRIPT);
+        let base_main = origin_main(&fixture);
+        let mut p = params(&fixture, "land");
+        p.push = false;
+        p.job_id = "gjb_survivor".into();
+        p.generation = 1;
+        // Baseline box-wide count of the marker, so a concurrent run's sleep
+        // never masks this run's own surviving descendant.
+        let before = live_marker_processes("sleep 47.91");
+        let started = std::time::Instant::now();
+        let result = fixture.node.run_gate_typed(p).await.unwrap();
+        assert_eq!(
+            result.status, "landed",
+            "the leader's valid landed verdict is honored: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "owner cleanup is bounded, not the descendant's 47 s sleep: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(origin_main(&fixture), base_main, "push=false moves nothing");
+        // No live detached descendant lingers (a killed-and-reparented sleep
+        // may briefly be a zombie; only non-zombie marks count).
+        // Poll to the baseline, then assert: the owner's group cleanup kills
+        // exactly this run's forked descendant (zombies are excluded).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let left = live_marker_processes("sleep 47.91");
+            if left <= before || std::time::Instant::now() >= deadline {
+                assert_eq!(
+                    left, before,
+                    "a same-group descendant survived the land owner's pre-reap cleanup"
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The fence settled through the authoritative post-reap ESRCH: a later
+        // probe attests VerifiedDead, instead of keeping the fence (the old
+        // warn-only behavior while the descendant lived).
+        assert_eq!(
+            fixture
+                .node
+                .gate_registry()
+                .land_push_liveness("gjb_survivor")
+                .await,
+            LandPushLiveness::VerifiedDead,
+            "the land group must settle (death certificate) after pre-reap cleanup"
         );
     }
 
@@ -7052,7 +7313,8 @@ head -c 1 >/dev/null || exit 4
                             let Ok(cmd) = std::fs::read_to_string(base.join("cmdline")) else {
                                 return false;
                             };
-                            if !cmd.contains("sleep 47.73") {
+                            // /proc cmdline separates argv with NUL bytes.
+                            if !cmd.replace('\0', " ").contains("sleep 47.73") {
                                 return false;
                             }
                             // Exclude zombies (state field 2 after comm).
@@ -7232,7 +7494,8 @@ head -c 1 >/dev/null || exit 4
                         let Ok(cmd) = std::fs::read_to_string(base.join("cmdline")) else {
                             return false;
                         };
-                        if !cmd.contains(marker) {
+                        // /proc cmdline separates argv with NUL bytes.
+                        if !cmd.replace('\0', " ").contains(marker) {
                             return false;
                         }
                         if let Ok(stat) = std::fs::read_to_string(base.join("stat"))

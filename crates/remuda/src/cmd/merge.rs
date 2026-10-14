@@ -2240,7 +2240,8 @@ mod tests {
                         let Ok(cmd) = std::fs::read_to_string(base.join("cmdline")) else {
                             return false;
                         };
-                        if !cmd.contains(marker) {
+                        // /proc cmdline separates argv with NUL bytes.
+                        if !cmd.replace('\0', " ").contains(marker) {
                             return false;
                         }
                         if let Ok(stat) = std::fs::read_to_string(base.join("stat"))

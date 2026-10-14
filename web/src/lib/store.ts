@@ -1356,9 +1356,9 @@ class HubStore {
    * increments {@link extEpoch} and clears the in-memory session cache, so
    * auth work already suspended at an await (a login continuation, a running
    * bootstrap) can neither publish/install anything nor answer hasDeviceSession
-   * from a stale cached session. Ordinary credential succession
-   * (runAuthTransition acquisition, the mock first-login) passes nothing and
-   * leaves the external epoch alone.
+   * from a stale cached session. Ordinary credential succession (a queued
+   * credential op acquiring the S3 queue, including the mock first-login)
+   * passes nothing and leaves the external epoch alone.
    */
   private applyAuthIdentityChange(external = false) {
     // Bump the auth generation and dispose the current outbox. Credential ops

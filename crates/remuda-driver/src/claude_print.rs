@@ -10132,3 +10132,131 @@ mod emission_ordering_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod partial_usage_poll_boundary_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn mapper() -> TranscriptMapper {
+        TranscriptMapper::new(
+            DriverKind::ClaudePty,
+            InstanceId::new(),
+            RunId::new(),
+            Id::new("obj").expect("journal id"),
+            HostId::new(),
+            "partial-usage-session".into(),
+            "2.1.289".into(),
+        )
+    }
+
+    /// One same-message assistant frame: the first record reports every
+    /// counter, the later repeated record (Claude repeats stop_reason on each
+    /// content record) reports only output.
+    fn full_record() -> String {
+        json!({
+            "type": "assistant",
+            "uuid": "msg-partial-uuid-1",
+            "requestId": "req-partial",
+            "sessionId": "partial-usage-session",
+            "version": "2.1.289",
+            "timestamp": "2026-10-14T10:00:00.000Z",
+            "message": {
+                "id": "msg-partial",
+                "role": "assistant",
+                "type": "message",
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 3,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 1,
+                        "ephemeral_1h_input_tokens": 2
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn output_only_record() -> String {
+        json!({
+            "type": "assistant",
+            "uuid": "msg-partial-uuid-2",
+            "requestId": "req-partial",
+            "sessionId": "partial-usage-session",
+            "version": "2.1.289",
+            "timestamp": "2026-10-14T10:00:01.000Z",
+            "message": {
+                "id": "msg-partial",
+                "role": "assistant",
+                "type": "message",
+                "stop_reason": "end_turn",
+                "usage": { "output_tokens": 20 }
+            }
+        })
+        .to_string()
+    }
+
+    fn last_usage(observations: Vec<Observation>) -> Box<UsagePayload> {
+        observations
+            .into_iter()
+            .filter_map(|observation| match observation.body {
+                ObservationPayload::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .last()
+            .expect("the group published at least one usage observation")
+    }
+
+    /// c-ctxusage r26 item 3: the FINAL counters for a full-then-partial usage
+    /// sequence must be identical whether the two records land in ONE poll
+    /// (coalesced before the mapper flushes) or across a poll boundary. Before
+    /// the per-field group merge the coalesced ordering published output-only.
+    #[test]
+    fn coalesced_and_split_polls_produce_identical_final_counters() {
+        let coalesced = {
+            let mut mapper = mapper();
+            mapper.map_line(&full_record()).expect("map full");
+            mapper.map_line(&output_only_record()).expect("map partial");
+            last_usage(mapper.flush().expect("flush"))
+        };
+        let split = {
+            let mut mapper = mapper();
+            mapper.map_line(&full_record()).expect("map full");
+            let _provisional = mapper.flush().expect("first poll flush");
+            mapper.map_line(&output_only_record()).expect("map partial");
+            last_usage(mapper.flush().expect("second poll flush"))
+        };
+
+        for (label, payload) in [("coalesced", coalesced), ("split", split)] {
+            assert_eq!(
+                payload.input_tokens,
+                Knowledge::Known { value: U64(100) },
+                "{label}: partial later frame must not erase input"
+            );
+            assert_eq!(
+                payload.output_tokens,
+                Knowledge::Known { value: U64(20) },
+                "{label}: latest output wins"
+            );
+            assert_eq!(
+                payload.cache_read_tokens,
+                Knowledge::Known { value: U64(0) },
+                "{label}: earlier cache read retained"
+            );
+            assert_eq!(
+                payload.cache_write_tokens,
+                Knowledge::Known { value: U64(3) },
+                "{label}: earlier TTL-split cache write retained (1+2)"
+            );
+            assert_eq!(
+                payload.total_tokens,
+                Knowledge::Known { value: U64(123) },
+                "{label}: 100 + 20 + 0 + 3"
+            );
+        }
+    }
+}

@@ -165,6 +165,39 @@ impl GroupKey {
     }
 }
 
+/// Merge a newer PARTIAL `message.usage` object over the retained one for the
+/// same message group (c-ctxusage r26 item 3).
+///
+/// Counters are never summed: every field the newer object REPORTS replaces
+/// the retained value, fields it omits stay retained. A JSON null reports no
+/// bucket (mirrors the Hub's `merged_over`: unmerged is "not reported", never
+/// "zero"), so it keeps the earlier value. Nested objects merge recursively —
+/// the cache-write TTL split under `cache_creation.{ephemeral_5m,
+/// ephemeral_1h}_input_tokens` retains its siblings the same way. Arrays and
+/// other scalars are replaced wholesale when present.
+fn merge_usage_fields(previous: Value, incoming: Value) -> Value {
+    match (previous, incoming) {
+        (Value::Object(mut retained), Value::Object(fresh)) => {
+            for (key, value) in fresh {
+                if value.is_null() {
+                    continue;
+                }
+                let merged = match retained.remove(&key) {
+                    Some(older) if older.is_object() && value.is_object() => {
+                        merge_usage_fields(older, value)
+                    }
+                    _ => value,
+                };
+                retained.insert(key, merged);
+            }
+            Value::Object(retained)
+        }
+        // The newer frame reports the whole object (or the retained value was
+        // malformed): it is authoritative.
+        (_, incoming) => incoming,
+    }
+}
+
 /// Assistant records buffered under one `(requestId, message.id)`.
 ///
 /// Claude writes one content block per record and repeats the same
@@ -310,7 +343,18 @@ impl Group {
     /// and remember when and where it was reported.
     fn note_usage(&mut self, record: &Value, message: &Value, position: SourcePosition) {
         if let Some(usage) = message.get("usage").filter(|value| value.is_object()) {
-            self.last_usage = Some(usage.clone());
+            // c-ctxusage r26 item 3: a later same-message record can carry a
+            // PARTIAL usage object (Claude repeats stop_reason on every content
+            // record and some frames report only output_tokens). Replacing the
+            // retained object wholesale then drops the earlier input/cache
+            // counters — but only when the frames land in ONE poll; a poll
+            // boundary between them was saved by the Hub's merge. Merge per
+            // field instead so both orderings produce identical counters.
+            let merged = match self.last_usage.take() {
+                Some(previous) => merge_usage_fields(previous, usage.clone()),
+                None => usage.clone(),
+            };
+            self.last_usage = Some(merged);
             self.last_usage_at = record
                 .get("timestamp")
                 .and_then(Value::as_str)
@@ -394,6 +438,53 @@ mod tests {
     fn user(record: Value) -> MessageOrigin {
         let message = record.get("message").cloned().unwrap_or(Value::Null);
         classify_user_record(&record, &message)
+    }
+
+    #[test]
+    fn partial_usage_merge_keeps_earlier_fields_and_takes_latest_reported() {
+        let full = json!({
+            "input_tokens": 100,
+            "output_tokens": 1,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 3,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 1,
+                "ephemeral_1h_input_tokens": 2
+            }
+        });
+        let merged = merge_usage_fields(full, json!({ "output_tokens": 20 }));
+        assert_eq!(merged["input_tokens"], 100, "earlier input is retained");
+        assert_eq!(
+            merged["output_tokens"], 20,
+            "latest output wins, never summed"
+        );
+        assert_eq!(merged["cache_read_input_tokens"], 0);
+        assert_eq!(merged["cache_creation_input_tokens"], 3);
+        assert_eq!(
+            merged["cache_creation"]["ephemeral_5m_input_tokens"], 1,
+            "nested TTL siblings survive a partial frame"
+        );
+        assert_eq!(merged["cache_creation"]["ephemeral_1h_input_tokens"], 2);
+
+        // An explicit null reports no bucket: the earlier known value stands.
+        let merged = merge_usage_fields(
+            json!({ "input_tokens": 100, "output_tokens": 20 }),
+            json!({ "output_tokens": null }),
+        );
+        assert_eq!(merged["input_tokens"], 100);
+        assert_eq!(
+            merged["output_tokens"], 20,
+            "null never erases a reported value"
+        );
+
+        // A later nested scalar replaces just that field.
+        let merged = merge_usage_fields(
+            json!({"cache_creation": {"ephemeral_5m_input_tokens": 1,
+                                       "ephemeral_1h_input_tokens": 2}}),
+            json!({"cache_creation": {"ephemeral_1h_input_tokens": 5}}),
+        );
+        assert_eq!(merged["cache_creation"]["ephemeral_5m_input_tokens"], 1);
+        assert_eq!(merged["cache_creation"]["ephemeral_1h_input_tokens"], 5);
     }
 
     /// The plain case: text the human typed is the only thing that renders as

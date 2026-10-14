@@ -6843,4 +6843,57 @@ mod tests {
             }
         }
     }
+
+    /// c-ctxusage r29 item 2: NULL-scope session rows are cumulative growth
+    /// points, so every fold keeps only the NEWEST one. Two monotone stocks
+    /// (100/10 then 150/15) agree as 150/15 across rollup, instance and
+    /// supply — never summed to 250/25.
+    #[test]
+    fn two_null_scope_stocks_fold_to_the_newest_in_every_fold() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let profile = "pvp_null2";
+        let model = "m-null2";
+        let row = |seq: i64, input: i64, output: i64| UsageEventRow {
+            instance_id: "ins_null2".into(),
+            seq,
+            profile_id: Some(profile.into()),
+            model: Some(model.into()),
+            scope: "session".into(),
+            scope_id: None,
+            mode: "snapshot".into(),
+            metric_revision: 1,
+            source_session_id: None,
+            total_tokens: Some(input + output),
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: None,
+            accounting: "estimated".into(),
+            observed_at: format!("2026-10-13T00:00:0{seq}.000Z"),
+            observed_at_source: "ingest".into(),
+        };
+        assert!(insert_usage_event(&conn, &row(1, 100, 10)).unwrap());
+        // Monotone growth: the second cumulative point is accepted.
+        assert!(insert_usage_event(&conn, &row(2, 150, 15)).unwrap());
+
+        let rollup = rollup_instance(&conn, "ins_null2", "codex", Some(model))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_input_tokens, Some(150), "newest stock");
+        assert_eq!(rollup.session_output_tokens, Some(15));
+
+        let agg = aggregate_instance(&conn, "ins_null2").unwrap();
+        assert_eq!(agg.events, 1, "one cumulative chain = one event");
+        assert_eq!(agg.total_tokens, Some(165));
+        assert_eq!(agg.input_tokens, Some(150));
+        assert_eq!(agg.output_tokens, Some(15));
+
+        let supply = aggregate_supply(&conn, profile, model).unwrap();
+        assert_eq!(supply.events, 1);
+        assert_eq!(supply.total_tokens, Some(165));
+        assert_eq!(supply.input_tokens, Some(150));
+        assert_eq!(supply.output_tokens, Some(15));
+    }
 }

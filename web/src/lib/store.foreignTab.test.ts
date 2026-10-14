@@ -8992,10 +8992,10 @@ it("GATE43 item 1 (i): obsolete reload bootstrap and its joined caller wait for 
   }
 });
 
-it("GATE44 item 3: successful login A parked at its own install, later successor B fails — A fulfils only when the current-generation install completes", async () => {
+it("GATE45 item 3: failed successor with obsolete A parked isolates A's completion until the current-gen install releases", async () => {
   vi.useFakeTimers();
-  vi.setSystemTime(1_410_000);
-  const I = "ins_g44_3";
+  vi.setSystemTime(1_460_000);
+  const I = "ins_g45_3";
   const originalNavigator = globalThis.navigator;
   Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
   localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
@@ -9004,7 +9004,7 @@ it("GATE44 item 3: successful login A parked at its own install, later successor
   };
   let seams: Record<string, unknown> | null = null;
   try {
-    sessionStorage.setItem("remuda-outbox-owner", "owner_g44_3");
+    sessionStorage.setItem("remeda-outbox-owner", "owner_g45_3");
     localStorage.setItem("runtime.logged-out", "1");
     const { api, hubStore } = await fresh();
     vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
@@ -9024,17 +9024,16 @@ it("GATE44 item 3: successful login A parked at its own install, later successor
     vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
     vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
 
-    // Login A succeeds; login B's credential request rejects.
     let releaseA: () => void = () => undefined;
     const { HubHttpError } = await import("./httpError");
     vi.spyOn(api, "login").mockImplementationOnce(
-      () => new Promise((resolve) => { releaseA = () => resolve({ deviceId: "devA_g44_3", token: "tokA", name: "A" }); }),
+      () => new Promise((resolve) => { releaseA = () => resolve({ deviceId: "devA_g45_3", token: "tokA", name: "A" }); }),
     ).mockImplementationOnce(
       () => Promise.reject(new HubHttpError(503, "busy", "host busy")),
     );
 
-    // EVERY storage initializer parks with its own release (A's own install,
-    // the successor finalizer install, any current-gen recovery install).
+    // Gate EVERY storage initializer: gate #0 is A's own, gate #1 is the
+    // current-gen recovery install driven after B fails.
     const storageReleases: Array<() => void> = [];
     const internals = hubStore as unknown as Record<string, unknown>;
     seams = internals;
@@ -9049,68 +9048,73 @@ it("GATE44 item 3: successful login A parked at its own install, later successor
       state: { ready: boolean; authed: boolean; bubbles: Array<{ clientRequestId: string }> };
     };
 
-    // 1) Complete A's credentials. A acquires; its continuation clears the
-    // bootstrap obligation and its own bootstrap parks inside the STORAGE
-    // initializer (the installation is parked, nothing built yet).
+    // 1) Complete A's credentials and wait until A's OWN bootstrap install is
+    // PARKED (obligation already cleared by A's successful continuation).
     const loginAP = h.login("bootstrap", "a", "devA");
-    await pump(200); // A's credential body is parked.
+    await pump(200);
     releaseA!();
     await pump(800);
     expect(storageReleases.length).toBeGreaterThanOrEqual(1);
     let aFulfilled = false;
-    void loginAP.then(() => { aFulfilled = true; });
+    const aFulfilPromise = loginAP.then(() => { aFulfilled = true; });
     await pump(200);
     expect(aFulfilled).toBe(false);
     expect(h.connection).toBeNull();
 
-    // 2) Successor B starts and FAILS (503): its acquisition invalidates A's
-    // parked initializer; the surviving obligation drives a current-gen
-    // install, which parks behind the next storage gate.
+    // 2) Successor B starts and FAILS; its acquisition invalidates A and the
+    // surviving obligation parks a current-gen recovery install.
     const loginBP = h.login("bootstrap", "b", "devB");
     await expect(loginBP).rejects.toThrow(/busy/);
     await pump(600);
     expect(storageReleases.length).toBeGreaterThanOrEqual(2);
-    // The current-gen replacement install is still parked and A has not
-    // fulfilled even though A's own (obsolete) initializer is now releasable.
-    expect(aFulfilled).toBe(false);
     expect(h.connection).toBeNull();
 
-    // 3) Seed a durable row NOW, so only the current-generation machine can
-    // restore it (A's obsolete run must never restore/build).
+    // 3) Release ONLY A's obsolete initializer and drain its continuation:
+    // A must STILL be pending with no machine — the replacement gate (#1)
+    // stays closed and owns A's fulfilment.
+    storageReleases[0]!();
+    await pump(800);
+    expect(aFulfilled).toBe(false);
+    expect(h.connection).toBeNull();
+    // No machine listener from A's drained-but-obsolete continuation.
+    expect(addSpy.mock.calls.filter((c: unknown[]) => c[0] === "online")).toHaveLength(0);
+
+    // 4) Seed a durable row while the replacement install is parked.
     const seed = new (await import("./outbox")).LocalStorageOutboxStorage();
     await seed.put({
-      commandId: "cmd_g44_3", clientRequestId: "local_g44_3", instanceId: I,
-      prompt: "g44 3", createdAt: 1, attempts: 0, state: "pending",
+      commandId: "cmd_g45_3", clientRequestId: "local_g45_3", instanceId: I,
+      prompt: "g45 3", createdAt: 1, attempts: 0, state: "pending",
     });
 
-    // 4) Release ALL parked initializers. A fulfils ONLY once the
-    // current-generation install finishes; assert the complete settled state
-    // INSIDE A's fulfilment callback.
+    // 5) Release the CURRENT-GEN replacement gate (#1); A fulfils on that
+    // install. Assert readiness, machine, restored row and listener set INSIDE
+    // the awaited fulfilment callback (no detached promise).
     let assertedInFulfilment = false;
-    void loginAP.then(() => {
+    const asserted = aFulfilPromise.then(() => {
       expect(h.state.ready).toBe(true);
       expect(h.state.authed).toBe(true);
       expect(h.connection).not.toBeNull();
-      expect(h.state.bubbles.filter((b) => b.clientRequestId === "local_g44_3")).toHaveLength(1);
-      expect(addSpy.mock.calls.filter((c) => c[0] === "online")).toHaveLength(1);
+      expect(h.state.bubbles.filter((b) => b.clientRequestId === "local_g45_3")).toHaveLength(1);
+      expect(addSpy.mock.calls.filter((c: unknown[]) => c[0] === "online")).toHaveLength(1);
       assertedInFulfilment = true;
     });
-    for (const r of storageReleases) r!();
+    storageReleases[1]!();
+    await asserted;
     await loginAP;
-    await pump(6_000);
+    await pump(4_000);
     expect(aFulfilled).toBe(true);
     expect(assertedInFulfilment).toBe(true);
-    // Exactly one machine from the current-generation install.
-    expect(addSpy.mock.calls.filter((c) => c[0] === "online")).toHaveLength(1);
+    expect(addSpy.mock.calls.filter((c: unknown[]) => c[0] === "online")).toHaveLength(1);
   } finally {
     if (seams) {
       (seams.setOutboxOpenGateForTest as (g: ((r: () => void) => void) | null) => void)(null);
     }
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
-    sessionStorage.removeItem("remuda-outbox-owner");
+    sessionStorage.removeItem("remeda-outbox-owner");
   }
-});;
+});
+;
 
 it("GATE44 item 2 (ruling U): unavailable outbox storage still installs the connection machine; it recovers live and a degraded send uses the keyed fallback", async () => {
   vi.useFakeTimers();
@@ -9122,6 +9126,8 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage still installs the conn
   const pump = async (n = 5_000) => {
     for (let i = 0; i < n; i += 1) await Promise.resolve();
   };
+  let g: { indexedDB?: IDBFactory } | null = null;
+  let origIndexeddb: IDBFactory | undefined;
   try {
     sessionStorage.setItem("remuda-outbox-owner", "owner_g44_2");
     localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "dev_g44_2", name: "X" }));
@@ -9146,10 +9152,93 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage still installs the conn
     const { RestNetworkError } = await import("./api");
     vi.spyOn(api, "hello").mockRejectedValue(new RestNetworkError("offline"));
 
-    // IndexedDB opens and the write probe succeeds, but the initial getAll at
-    // storage.all() rejects (seam lives AT the read call).
-    const outboxMod = await import("./outbox");
-    outboxMod.__setOutboxLoadAllFailsForTest(true);
+    // Real IndexedDB backend (not the localStorage fallback): open and the
+    // write probe (put+delete) succeed, but the initial readonly getAll
+    // TRANSACTION rejects — a genuine post-open read failure injected INSIDE
+    // the storage operation (gate 45 item 2). Assert the operation sequence.
+    const seq: string[] = [];
+    const failGetAll = true;
+    g = globalThis as unknown as { indexedDB?: IDBFactory };
+    origIndexeddb = g.indexedDB;
+    const installFailingIndexeddb = () => {
+      const makeRequest = (): IDBRequest => {
+        const req = {
+          onsuccess: null as ((e: unknown) => void) | null,
+          onerror: null as ((e: unknown) => void) | null,
+          result: undefined as unknown,
+          error: null as Error | null,
+        };
+        queueMicrotask(() => {
+          if (req.error) req.onerror?.({ target: req });
+          else req.onsuccess?.({ target: req });
+        });
+        return req as unknown as IDBRequest;
+      };
+      const makeStore = (mode: IDBTransactionMode): IDBObjectStore => ({
+        put: () => {
+          seq.push("put");
+          return makeRequest();
+        },
+        delete: () => {
+          seq.push("delete");
+          return makeRequest();
+        },
+        getAll: () => {
+          seq.push("getAll");
+          const req = makeRequest() as IDBRequest & {
+            error: Error | null; result: unknown;
+          };
+          if (failGetAll && mode === "readonly") {
+            req.error = new Error("getAll rejected") as IDBRequest['error'];
+          } else {
+            req.result = [];
+          }
+          return req;
+        },
+        add: () => makeRequest(),
+        get: () => makeRequest(),
+        clear: () => makeRequest(),
+        count: () => makeRequest(),
+      } as unknown as IDBObjectStore);
+      const makeTx = (mode: IDBTransactionMode): IDBTransaction => {
+        const tx = {
+          objectStore: () => makeStore(mode),
+          oncomplete: null as ((e: unknown) => void) | null,
+          onabort: null as ((e: unknown) => void) | null,
+          onerror: null as ((e: unknown) => void) | null,
+          abort: () => undefined,
+          error: null as Error | null,
+        };
+        // Transaction completes a microtask after the store's request settles.
+        queueMicrotask(() => queueMicrotask(() => tx.oncomplete?.({ target: tx })));
+        return tx as unknown as IDBTransaction;
+      };
+      const db = {
+        objectStoreNames: { contains: () => true },
+        createObjectStore: () => undefined,
+        transaction: (name: string, mode: IDBTransactionMode) => {
+          seq.push(`tx:${mode}`);
+          void name;
+          return makeTx(mode);
+        },
+        close: () => undefined,
+      } as unknown as IDBDatabase;
+      g!.indexedDB = {
+        open: () => {
+          seq.push("open");
+          const openReq = {
+            onupgradeneeded: null as ((e: unknown) => void) | null,
+            onsuccess: null as ((e: unknown) => void) | null,
+            onerror: null as ((e: unknown) => void) | null,
+            result: db,
+            error: null as Error | null,
+          } as unknown as IDBOpenDBRequest;
+          queueMicrotask(() => openReq.onsuccess?.({ target: openReq } as unknown as Event));
+          return openReq;
+        },
+      } as unknown as IDBFactory;
+    };
+    installFailingIndexeddb();
 
     const addSpy = vi.spyOn(window, "addEventListener");
     const send = vi.spyOn(api, "instanceSend").mockImplementation(
@@ -9175,8 +9264,15 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage still installs the conn
     // The machine published the offline connection state itself.
     expect(h.state.connection).toBe("offline");
     // Listeners for the machine's real recovery are installed.
-    expect(addSpy.mock.calls.filter((c) => c[0] === "online")).toHaveLength(1);
-    expect(addSpy.mock.calls.filter((c) => c[0] === "offline")).toHaveLength(1);
+    expect(addSpy.mock.calls.filter((c: unknown[]) => c[0] === "online")).toHaveLength(1);
+    expect(addSpy.mock.calls.filter((c: unknown[]) => c[0] === "offline")).toHaveLength(1);
+
+    // Operation sequence: open ok, write probe (put + delete committed), then
+    // the initial getAll read rejected — injected INSIDE the storage op, not
+    // by replacing storage.all() outright.
+    expect(seq.slice(0, 3)).toEqual(["open", "tx:readwrite", "put"]);
+    expect(seq).toContain("delete");
+    expect(seq).toContain("getAll");
 
     // A send while degraded carries a command id through the keyed DIRECT
     // fallback (no outbox) — never an id-less POST.
@@ -9192,8 +9288,10 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage still installs the conn
     await pump(4_000);
     expect(h.state.connection).toBe("live");
   } finally {
-    const outboxMod2 = await import("./outbox");
-    outboxMod2.__setOutboxLoadAllFailsForTest(false);
+    if (g) {
+      if (origIndexeddb) g.indexedDB = origIndexeddb;
+      else delete g.indexedDB;
+    }
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner");
@@ -9308,3 +9406,131 @@ it("GATE44 item 1: a credential generation superseding a parked storage install 
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });;
+
+it("GATE45 item 1: a real login acquiring in the machine-construction window supersedes A's settled outcome (healthy and unavailable)", async () => {
+  let internalsGlobal: Record<string, unknown> | null = null;
+  let addSpy: ReturnType<typeof vi.spyOn> | null = null;
+  for (const variant of ["healthy", "unavailable"] as const) {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_450_000 + (variant === "unavailable" ? 1 : 0));
+    const I = `ins_g45_1_${variant}`;
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+    const pump = async (n = 5_000) => {
+      for (let i = 0; i < n; i += 1) await Promise.resolve();
+    };
+    try {
+      sessionStorage.setItem(`remuda-outbox-owner-g45-1-${variant}`, "owner");
+      localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g45_1", name: "A" }));
+      const { api, hubStore } = await fresh();
+      vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+      vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+      vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+      vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+      vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+      vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+      vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+      vi.spyOn(api, "instanceList").mockResolvedValue({
+        items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+        nextCursor: null,
+      } as never);
+      vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+      vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+      let releaseB: () => void = () => undefined;
+      vi.spyOn(api, "login")
+.mockImplementationOnce(() => Promise.resolve({ deviceId: "devA_g45_1", token: "tokA", name: "A" }))
+        .mockImplementationOnce(() => {
+          // B holds here until releaseB() — even after its transition acquired.
+          return new Promise((resolve) => {
+            releaseB = () => resolve({ deviceId: "devB_g45_1", token: "tokB", name: "B" });
+          });
+        })
+        .mockImplementation(() => Promise.resolve({ deviceId: "devC_g45_1", token: "tokC", name: "C" }));
+
+      const h2 = hubStore as unknown as {
+        bootstrap: () => Promise<void>;
+        login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+        outbox: unknown;
+        connection: unknown;
+        state: { authed: boolean; connection: string };
+      };
+      // The machine-construction gate starts a REAL login B synchronously while
+      // A's initConnection is suspended at machine construction. A's credential
+      // transition has long released, so B acquires immediately and bumps
+      // authGen (and, for healthy, disposes A's just-installed outbox); B then
+      // parks on its held credential body.
+      // Gate EVERY machine construction: the FIRST starts B (B queues behind
+      // A's reload), and every construction waits for its release — so B's own
+      // current-gen machine is never built until the test releases them after
+      // B's body settles.
+      const gateReleases: Array<() => void> = [];
+      const internals = hubStore as unknown as Record<string, unknown>;
+      internalsGlobal = internals;
+      (internals.setMachineConstructGateForTest as (g: ((release: () => void) => void) | null) => void)((release) => {
+        gateReleases.push(release);
+        if (gateReleases.length === 1) {
+          void h2.login("bootstrap", "secret", "devB");
+        }
+      });
+      addSpy = vi.spyOn(window, "addEventListener");
+      // A (+ StrictMode duplicate A2) run; their installs park at the gate.
+      const bootA = h2.bootstrap();
+      const bootA2 = h2.bootstrap();
+      await pump(600);
+      expect(gateReleases.length).toBeGreaterThanOrEqual(1);
+      let aFulfilled = false;
+      let a2Fulfilled = false;
+      void bootA.then(() => { aFulfilled = true; });
+      void bootA2.then(() => { a2Fulfilled = true; });
+
+      // B (started from A's gate) acquires and parks on its held body BEFORE
+      // A's gate is released: pump until B holds the chain.
+      for (let i = 0; i < 100; i += 1) {
+        await pump(50);
+        if ((hubStore as unknown as { authTransitionOpenForTest: boolean }).authTransitionOpenForTest) break;
+      }
+      // Release A's single-flight gate (A2 joins the same run; it does not gate
+      // separately). A's continuation now sees the moved generation post-gate:
+      // it does NOT build/publish its own stale machine. It is handed to the
+      // current generation, which only completes once B's credential body
+      // settles (B holds the chain), so A cannot fulfil yet.
+      const addSpyCountBefore = (addSpy as ReturnType<typeof vi.spyOn>).mock.calls.filter((c: unknown[]) => c[0] === "online").length;
+      gateReleases[0]!();
+      await pump(400);
+      // A built NO machine while B holds the chain.
+      expect((addSpy as ReturnType<typeof vi.spyOn>).mock.calls.filter((c: unknown[]) => c[0] === "online")).toHaveLength(addSpyCountBefore);
+      expect(aFulfilled).toBe(false);
+      expect(a2Fulfilled).toBe(false);
+
+      // B's body resolves; B's finalizer bootstrap reaches ITS machine gate.
+      // Release every parked gate so B's current-gen machine builds; A/A2
+      // fulfil on it.
+      releaseB!();
+      for (let i = 0; i < 100; i += 1) {
+        await pump(50);
+        if (gateReleases.length > 1) break;
+      }
+      for (const r of gateReleases) r!();
+      await Promise.all([bootA, bootA2]);
+      await pump(6_000);
+      expect(aFulfilled).toBe(true);
+      expect(a2Fulfilled).toBe(true);
+      expect(h2.state.authed).toBe(true);
+      expect(h2.connection).not.toBeNull();
+      // Exactly ONE machine set — A never published/polled its stale build.
+      expect((addSpy as ReturnType<typeof vi.spyOn>).mock.calls.filter((c: unknown[]) => c[0] === "online")).toHaveLength(1);
+
+    } finally {
+      addSpy.mockRestore();
+      (internalsGlobal as unknown as { setMachineConstructGateForTest?: (g: null) => void }).setMachineConstructGateForTest?.(null);
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+      sessionStorage.removeItem(`remuda-outbox-owner-g45-1-${variant}`);
+    }
+  }
+});
+;

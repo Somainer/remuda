@@ -327,6 +327,12 @@ pub struct Store {
     /// exercising the deferred-settlement retry without a third delivery.
     #[cfg(any(test, feature = "test-faults"))]
     gate_log_insert_fault: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only cumulative count of failed `insert_gate_log` writes actually
+    /// consumed since the last arming (r22 item 8): distinguishes "n deliveries
+    /// each failed" from "fewer failures + later successes" — the remaining
+    /// budget alone reads zero in both cases.
+    #[cfg(any(test, feature = "test-faults"))]
+    gate_log_insert_faults_consumed: Arc<std::sync::atomic::AtomicUsize>,
     /// Test-only barriers at the apply_result boundaries (r10 item 5).
     #[cfg(any(test, feature = "test-faults"))]
     gate_apply_barrier: Arc<crate::gatequeue::GateApplyBarrier>,
@@ -2428,6 +2434,8 @@ impl Store {
             #[cfg(any(test, feature = "test-faults"))]
             gate_log_insert_fault: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-faults"))]
+            gate_log_insert_faults_consumed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-faults"))]
             gate_apply_barrier: Arc::new(crate::gatequeue::GateApplyBarrier::new()),
             #[cfg(any(test, feature = "test-faults"))]
             gate_after_persist_barrier: Arc::new(crate::gatequeue::SimpleBarrier::new()),
@@ -2657,27 +2665,33 @@ impl Store {
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-faults"))]
     pub fn test_arm_gate_log_insert_fault(&self) {
+        self.gate_log_insert_faults_consumed
+            .store(0, std::sync::atomic::Ordering::Release);
         self.gate_log_insert_fault
             .store(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Test-only: fail the next `n` `insert_gate_log` writes, then recover —
     /// r21 item 5 (the finished notification AND the RPC reply both hit a
-    /// transient failure; settlement must be retried, not consumed).
+    /// transient failure; under R9 the unconsumed verdict is re-supplied, not
+    /// retried by the Hub). Resets the cumulative failed-write counter.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-faults"))]
     pub fn test_arm_gate_log_insert_faults(&self, n: usize) {
+        self.gate_log_insert_faults_consumed
+            .store(0, std::sync::atomic::Ordering::Release);
         self.gate_log_insert_fault
             .store(n, std::sync::atomic::Ordering::Release);
     }
 
     /// Test-only: fail EVERY `insert_gate_log` write until
     /// [`Self::test_clear_gate_log_insert_fault`] — holds the evidence
-    /// deferral open so a test can assert the standing-down state despite the
-    /// r21 item 5 automatic retry (r21 item 4).
+    /// deferral open so a test can assert the standing-down state.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-faults"))]
     pub fn test_arm_gate_log_insert_fault_sticky(&self) {
+        self.gate_log_insert_faults_consumed
+            .store(0, std::sync::atomic::Ordering::Release);
         self.gate_log_insert_fault
             .store(usize::MAX, std::sync::atomic::Ordering::Release);
     }
@@ -2688,6 +2702,26 @@ impl Store {
     pub fn test_clear_gate_log_insert_fault(&self) {
         self.gate_log_insert_fault
             .store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only: how many armed `insert_gate_log` failures remain (`usize::MAX`
+    /// is a sticky fault).
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_gate_log_insert_faults_remaining(&self) -> usize {
+        self.gate_log_insert_fault
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Test-only: cumulative number of FAILED `insert_gate_log` writes consumed
+    /// since the last arming (r22 item 8) — proves each of the two dual
+    /// deliveries reached and failed its OWN insert rather than a later success
+    /// masking a missing failure.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn test_gate_log_insert_faults_consumed(&self) -> usize {
+        self.gate_log_insert_faults_consumed
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Test-only access to the apply_result boundary barrier.
@@ -2727,6 +2761,9 @@ impl Store {
                 )
                 .is_ok()
             {
+                // One failed write was actually consumed (r22 item 8).
+                self.gate_log_insert_faults_consumed
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 return true;
             }
         }

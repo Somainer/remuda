@@ -3138,16 +3138,23 @@ async fn the_finished_event_and_the_gate_run_reply_both_feed_the_real_log_path()
     );
 }
 
-/// r21 item 5 / r22 item 1 / R9: a TRANSIENT evidence-store failure hits BOTH
-/// real deliveries — the `gate.event` finished NOTIFICATION and the gate.run
-/// RPC REPLY. Both verdicts supply identical run logs, both inserts fail (a
-/// two-shot fault), so both settlements DEFER and the job stays Running. R9
-/// removed the Hub-side retry scheduler: once storage recovers the Hub still
-/// does NOT settle — the result was never acknowledged/consumed, so the
-/// existing delivery path must RE-SUPPLY the verdict. (r22 item 8 rewrites
-/// this into the final redelivery form.)
+/// r22 item 8 (was r21 item 5 / review row 7): the two REAL deliveries of one
+/// verdict — the `gate.event` finished NOTIFICATION and the gate.run RPC
+/// REPLY — BOTH fail evidence persistence, and then the verdict settles via a
+/// RE-SUPPLY from the existing delivery path, exactly once.
+///
+/// The r21 test could pass WITHOUT both original deliveries failing: its
+/// completion counter also counted Hub-side retries, so A's retry (not the
+/// original RPC reply) could consume the second insert failure. R9 removed
+/// that retry scheduler entirely, which makes the masquerade impossible; this
+/// regression now asserts it directly — after the two separately-identified
+/// arrivals complete, the armed TWO-shot insert fault is fully SPENT (both
+/// original applications reached and failed their own insert), the job is
+/// Running with no bound object, it stays Running after storage recovers (no
+/// Hub self-retry), and a single re-supplied notification settles Failed bound
+/// to its own object; a duplicate re-supply changes nothing.
 #[tokio::test]
-async fn both_evidence_deliveries_fail_then_the_hub_retries_without_a_third_delivery() {
+async fn both_original_evidence_deliveries_fail_persistence_then_redelivery_settles_once() {
     let (ctx, node) = Ctx::boot().await.unwrap();
     ctx.configure_gate_lane().await;
     let barrier = ctx.store().gate_apply_barrier();
@@ -3172,7 +3179,9 @@ async fn both_evidence_deliveries_fail_then_the_hub_retries_without_a_third_deli
     );
 
     // Hold BOTH arrivals after their live-row pre-read and before either
-    // persists, then make the next TWO inserts fail.
+    // persists. Arrival 1 is the finished NOTIFICATION we inject; arrival 2 is
+    // the gate.run RPC REPLY released from the armed hook — two separately
+    // identified real deliveries, parked simultaneously.
     barrier.arm();
     node.send_raw(json!({
         "jsonrpc": "2.0",
@@ -3186,35 +3195,63 @@ async fn both_evidence_deliveries_fail_then_the_hub_retries_without_a_third_deli
     }));
     hook.release_and_wait_proceeded().await;
     barrier.wait_parked(2).await;
+    // Fail EXACTLY the next two inserts — one per original delivery.
     ctx.store().test_arm_gate_log_insert_faults(2);
     barrier.release();
     barrier.wait_completed(2).await;
 
-    // BOTH real deliveries failed to persist: nothing settled, and the only
-    // evidence path that ran was the two deliveries themselves.
+    // AIRTIGHT both-failures proof (r22 item 8): the cumulative FAILED-write
+    // counter reads 2, so BOTH separately identified original deliveries
+    // reached and failed their OWN persist — not one failure plus a later
+    // success (which also leaves the budget at zero). With R9 there is no Hub
+    // retry whose completion could masquerade as the second delivery.
+    assert_eq!(
+        ctx.store().test_gate_log_insert_faults_consumed(),
+        2,
+        "both original deliveries must each consume one failed insert"
+    );
+    assert_eq!(
+        ctx.store().test_gate_log_insert_faults_remaining(),
+        0,
+        "the two-shot transient fault must be fully spent"
+    );
+    // Nothing settled and nothing was persisted: Running, no bound object, and
+    // the by-job evidence lookup is a 404.
     let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
     assert_eq!(
         doc["state"],
         json!("running"),
         "two failed evidence persists keep the job Running: {doc}"
     );
+    assert!(doc["logObjectId"].is_null(), "{doc}");
+    let (status, _) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{job_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 404,
+        "no evidence object exists after both failed inserts"
+    );
 
-    // Storage recovers, but R9 gives the Hub no persistence-retry scheduler:
-    // both verdicts were left UNCONSUMED and the job must stay Running until
-    // the existing delivery path re-supplies one. Wait well beyond the old
-    // scheduler's first 75 ms retry to prove it is gone.
+    // Storage has recovered (the two-shot fault is spent), but R9 gives the
+    // Hub NO persistence-retry scheduler: the unconsumed verdicts do not
+    // self-settle. Wait well beyond the old scheduler's first 75 ms retry.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
     assert_eq!(
         doc["state"],
         json!("running"),
         "the Hub must not self-retry after recovery: the result awaits \
-         redelivery by the existing path: {doc}"
+         re-supply by the existing delivery path: {doc}"
     );
 
-    // Redelivery of the exact verdict through the real notification path
-    // persists its own object and settles Failed, exactly once; a duplicate
-    // redelivery keeps the same bound object.
+    // The existing delivery path RE-SUPPLIES the exact verdict (the
+    // notification): it persists its OWN object and settles Failed.
     node.send_raw(json!({
         "jsonrpc": "2.0",
         "method": "gate.event",
@@ -3239,9 +3276,11 @@ async fn both_evidence_deliveries_fail_then_the_hub_retries_without_a_third_deli
     };
     let object_id = settled["logObjectId"]
         .as_str()
-        .expect("the redelivery binds the persisted object")
+        .expect("the re-supplied verdict binds the persisted object")
         .to_owned();
     assert!(object_id.starts_with("obj_"), "{object_id}");
+
+    // A DUPLICATE re-supply settles no second time and keeps the same object.
     node.send_raw(json!({
         "jsonrpc": "2.0",
         "method": "gate.event",
@@ -3258,7 +3297,7 @@ async fn both_evidence_deliveries_fail_then_the_hub_retries_without_a_third_deli
     assert_eq!(
         final_doc["logObjectId"],
         json!(object_id),
-        "the duplicate redelivery settled a second time: {final_doc}"
+        "the duplicate re-supply rebound the evidence: {final_doc}"
     );
     let (status, by_job) = ctx
         .send(
@@ -3274,7 +3313,7 @@ async fn both_evidence_deliveries_fail_then_the_hub_retries_without_a_third_deli
     assert_eq!(
         by_job["log"]["headline"],
         json!("the two-path evidence"),
-        "the re-supplied verdict settled under its own bytes: {by_job}"
+        "the settlement binds the re-supplied result's own bytes: {by_job}"
     );
 }
 

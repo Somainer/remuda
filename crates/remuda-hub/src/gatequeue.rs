@@ -1001,11 +1001,37 @@ async fn resolve_project_job(
     let expected_attempts = request.expected_attempts;
     let expected_epoch = request.expected_session_epoch.clone();
     let expected_merge = request.expected_merge_sha.clone();
-    // r19 item 1 / R6: stop the granted land group — and wait for the Node's
-    // unique owner to kill/reap/release the lane — BEFORE the terminal/requeue
-    // state becomes visible. Otherwise a periodic scheduler tick could hand the
-    // still-held lane to the next dispatch between the row commit and the abort.
-    abort_landing_run(&state, &job).await;
+    // r20 item 6: validate the COMPLETE requested tuple (attempt, epoch,
+    // merge) against a FRESH read BEFORE any abort side effect. A delayed frame
+    // for attempt N while the job has advanced to an outcome-unknown attempt
+    // N+1 used to call abort_landing_run with the CURRENT row first, so the
+    // Node aborted/tombstoned N+1 and only afterwards received its 409. A stale
+    // resolution now leaves with a 409 and sends NOTHING.
+    let current = state
+        .store
+        .get_gate_job(&job_id)
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    if current.state != GateJobState::Landing || !current.landing_outcome_unknown {
+        return Err(HubError::NotFound);
+    }
+    if current.attempts != expected_attempts
+        || current.landing_session_epoch.as_deref() != Some(expected_epoch.as_str())
+        || current.merge_sha.as_deref() != Some(expected_merge.as_str())
+    {
+        return Err(HubError::Conflict(
+            "the live Landing is no longer the granted attempt/epoch/merge this resolution named; \
+             refresh and resolve the current attempt"
+                .to_string(),
+        ));
+    }
+    // r19 item 1 / R6 + r20 item 6: stop the granted land group — carrying the
+    // VALIDATED generation — and wait for the Node's unique owner to
+    // kill/reap/release the lane BEFORE the terminal/requeue state becomes
+    // visible, so a scheduler tick cannot hand the still-held lane to the next
+    // dispatch between the row commit and the abort.
+    abort_landing_run(&state, &current).await;
     let outcome = state
         .store
         .mutate_gate_job(&job_id, move |row, _conn| {

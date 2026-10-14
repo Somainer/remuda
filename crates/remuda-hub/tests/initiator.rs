@@ -4736,6 +4736,139 @@ async fn an_operator_resolution_validates_its_expected_tuple_and_rationale() {
     );
 }
 
+/// r20 item 6: a stale operator resolution naming attempt N while the job is on
+/// an outcome-unknown attempt N+1 must be refused 409 WITHOUT sending
+/// gate.abortLanding for the current (newer) attempt. The validation of the
+/// full (attempt, epoch, merge) tuple happens before any abort side effect.
+#[tokio::test]
+async fn a_stale_operator_resolution_is_refused_409_without_aborting_the_newer_attempt() {
+    let (ctx, mut node) = Ctx::boot().await.unwrap();
+    ctx.configure_gate_lane().await;
+    let (job_id, merge_1, session, epoch_1) = unknown_landing_fixture(&ctx, &node).await;
+    let path = format!("/v1/projects/{}/gate/jobs/{job_id}/resolve", ctx.project);
+
+    // The operator genuinely requeues attempt 1: the abort for generation 1 is
+    // sent and the row re-enters the queue.
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "requeue",
+                "expectedAttempts": 1,
+                "expectedSessionEpoch": epoch_1,
+                "expectedMergeSha": merge_1,
+                "rationale": "operator requeues attempt 1 for real",
+            })),
+        )
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    // Drain the frames the valid requeue sent (it probes first, then aborts):
+    // the abort must name generation 1.
+    let mut drained = 0;
+    let mut saw_generation_one_abort = false;
+    let drain_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < drain_deadline {
+        match tokio::time::timeout(Duration::from_millis(200), node.next_frame()).await {
+            Ok((method, params)) => {
+                drained += 1;
+                if method == "gate.abortLanding" {
+                    assert_eq!(
+                        params["generation"],
+                        json!(1),
+                        "the valid abort named attempt 1"
+                    );
+                    saw_generation_one_abort = true;
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw_generation_one_abort,
+        "the valid requeue sent its generation-1 abort ({drained} frames)"
+    );
+
+    // A real attempt 2 is claimed, granted (different merge/epoch) and parks
+    // outcome-unknown — the job is NOW on the newer attempt.
+    ctx.hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("scheduler claims attempt 2");
+    let merge_2 = "dddddddddddddddddddddddddddddddddddddddd";
+    ctx.hub
+        .test_gate_land_grant(&job_id, &ctx.host, merge_2, session)
+        .await
+        .unwrap();
+    ctx.hub
+        .test_mark_landing_unknown(&job_id, "attempt 2 also unconfirmed ...")
+        .await
+        .unwrap();
+    let current = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(current["attempts"], json!(2), "{current}");
+    // The test grant seam stamps a constant epoch for both attempts, but the
+    // tuple diverges on attempts AND merge, which is enough to bind the abort
+    // to the validated generation.
+
+    // The DELAYED stale frame from attempt 1 arrives: it names the OLD tuple
+    // (older attempt and older merge).
+    let (status, reply) = ctx
+        .send(
+            "POST",
+            &path,
+            &ctx.human,
+            None,
+            Some(json!({
+                "resolution": "failed",
+                "expectedAttempts": 1,
+                "expectedSessionEpoch": epoch_1,
+                "expectedMergeSha": merge_1,
+                "rationale": "stale paused frame for attempt 1",
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, 409,
+        "the stale tuple is refused before any side effect: {reply}"
+    );
+
+    // After the 409: the only node RPC the stale call makes is the read-only
+    // resolveLanding probe. A gate.abortLanding for generation 2 must never
+    // appear. Drain frames well past the response (any abort would have been
+    // queued BEFORE the HTTP response returned).
+    let mut saw_resolve_probe = false;
+    let drain_deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < drain_deadline {
+        match tokio::time::timeout(Duration::from_millis(100), node.next_frame()).await {
+            Ok((method, params)) => {
+                assert_ne!(
+                    method, "gate.abortLanding",
+                    "the stale resolution aborted the newer attempt: {params}"
+                );
+                if method == "gate.resolveLanding" {
+                    saw_resolve_probe = true;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw_resolve_probe,
+        "the stale call still made its read-only probe"
+    );
+
+    // The current Landing is untouched: attempt 2, still outcome-unknown.
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("landing"), "{doc}");
+    assert_eq!(doc["attempts"], json!(2), "{doc}");
+    assert_eq!(doc["landingOutcomeUnknown"], json!(true), "{doc}");
+    assert_eq!(doc["mergeSha"], json!(merge_2), "{doc}");
+}
+
 /// r15 item 4: a final read-only probe that ESTABLISHES the exact granted merge
 /// on the remote wins over the operator's "failed" resolution: the response is
 /// `landed`, never failed, and no operator failure is recorded.

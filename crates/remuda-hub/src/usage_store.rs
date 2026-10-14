@@ -1149,7 +1149,9 @@ pub fn aggregate_instance(
                  FROM usage_events
                  WHERE instance_id = ?1 AND scope NOT IN ('turn', 'session')
              )",
-            fold_ctes = FOLD_CTES_SQL.replace("{domain}", "instance_id = ?1")
+            fold_ctes = FOLD_CTES_SQL
+                .replace("{domain_l}", "l.instance_id = ?1")
+                .replace("{domain}", "instance_id = ?1")
         ),
         params![instance_id],
         |row| {
@@ -1216,7 +1218,9 @@ pub fn aggregate_supply(
                  WHERE profile_id = ?1 AND model = ?2
                    AND scope NOT IN ('turn', 'session')
              )",
-            fold_ctes = FOLD_CTES_SQL.replace("{domain}", "profile_id = ?1 AND model = ?2")
+            fold_ctes = FOLD_CTES_SQL
+                .replace("{domain_l}", "l.profile_id = ?1 AND l.model = ?2")
+                .replace("{domain}", "profile_id = ?1 AND model = ?2")
         ),
         params![profile_id, model],
         |row| {
@@ -1334,17 +1338,38 @@ const WINNING_TURN_ROWS_SQL: &str = "SELECT * FROM (
      WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NULL";
 
 /// Shared stock-vs-flow fold for instance/rollup/supply totals
-/// (c-ctxusage r29 items 1–2).
+/// (c-ctxusage r29 items 1–2, r33 item 1).
 ///
-/// `{domain}` restricts raw `usage_events` rows to the aggregation domain —
-/// `instance_id = ?1` for the instance folds, or `profile_id = ?1 AND model =
-/// ?2` for the provider supply. It is substituted by the callers.
+/// `{domain}` restricts raw `usage_events` CONTRIBUTIONS to the aggregation
+/// domain — `instance_id = ?1` for the instance folds, or `profile_id = ?1
+/// AND model = ?2` for the provider supply. It is substituted by the callers.
+///
+/// c-ctxusage r33 item 1: the winning stocks and their COVERAGE identities
+/// are resolved GLOBALLY — per `(instance, native session)`, across every
+/// profile/model — BEFORE the domain filter is applied. A cumulative session
+/// stock spans one native session even when the instance was reconfigured to
+/// a new model mid-session: the adapter emits one stock row per turn end
+/// (each projected under the then-current model), and the winning row for S
+/// contains the whole session's usage. Filtering stocks by model before the
+/// coverage check used to resurrect an earlier model's turn as an
+/// "uncovered" flow, so per-model supplies summed to more than the instance
+/// (250/$3 reported as 350/$4). Coverage therefore keys off global winners;
+/// the domain predicate then filters only the CONTRIBUTIONS:
+/// - a scoped stock is attributed to the profile/model ON ITS WINNING ROW
+///   (the model current when the cumulative point was emitted) — one winner
+///   per `(instance, session)` carries one domain, so the per-model rows
+///   partition the scoped contribution exactly and their sum equals the
+///   instance total;
+/// - a turn whose native session has a winning stock (of ANY model in the
+///   same instance) is covered everywhere and contributes to no supply;
+/// - an uncovered winning turn is attributed to its own row's domain.
 ///
 /// Exposed CTEs:
 /// - `scoped_sessions`: latest accepted cumulative stock per native session
-///   (acceptance order);
+///   (acceptance order), domain-filtered for CONTRIBUTION;
 /// - `legacy_stock`: the NEWEST accepted NULL-scope cumulative point of an
-///   instance that has NO scoped stock. NULL-scope session rows are cumulative
+///   instance that has NO scoped stock (global identity check),
+///   domain-filtered for contribution. NULL-scope session rows are cumulative
 ///   growth points (see `insert_legacy_session_point`): summing every legacy
 ///   snapshot would double-count a cumulative series (100/10 → 150/15 must be
 ///   150/15, never 250/25). The rule must therefore be "newest point", not
@@ -1353,47 +1378,38 @@ const WINNING_TURN_ROWS_SQL: &str = "SELECT * FROM (
 ///   separate session nor the scoped session's predecessor — c-ctxusage r8
 ///   item 8);
 /// - `winning_turns`: one winning turn per `(instance, scope_id)` plus every
-///   unqualified (NULL-lineage) turn;
-/// - `proven_turns`: flows not covered by a stock — qualified turns whose
-///   native session has no matching scoped stock, and NULL-lineage turns only
-///   when the instance has neither scoped nor legacy stock (the pure-Claude
-///   legacy world);
-/// - `ambiguous_turns`: NULL-lineage turns in an instance that HAS scoped
-///   stock. Their session cannot be proven from retained evidence, so they
-///   are neither a proven extra flow nor safely covered: every bucket they
-///   report stays Unknown (U1). A NULL bucket they omit is unaffected.
-const FOLD_CTES_SQL: &str = "scoped_sessions AS (
-            SELECT instance_id, total_tokens, input_tokens, output_tokens,
-                   cost_usd, cache_read_tokens, cache_write_tokens, scope_id
-            FROM (
+///   unqualified (NULL-lineage) turn, chosen globally then domain-filtered
+///   for contribution (c-ctxusage r18 item 2);
+/// - `proven_turns`: flows not covered by a GLOBAL stock — qualified turns
+///   whose native session has no matching winning stock, and NULL-lineage
+///   turns only when the instance has neither scoped nor legacy stock (the
+///   pure-Claude legacy world);
+/// - `ambiguous_turns`: domain turns with NULL lineage in an instance that
+///   HAS global scoped stock. Their session cannot be proven from retained
+///   evidence, so they are neither a proven extra flow nor safely covered:
+///   every bucket they report stays Unknown (U1). A NULL bucket they omit is
+///   unaffected.
+const FOLD_CTES_SQL: &str = "global_scoped_sessions AS (
+            SELECT * FROM (
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY instance_id, scope_id ORDER BY rowid DESC
                 ) AS stock_rn
                 FROM usage_events
                 WHERE scope = 'session' AND scope_id IS NOT NULL
             )
-            -- Rank across EVERY profile/model FIRST (c-ctxusage r18 item 2):
-            -- a stock of this domain superseded within its scope by a newer
-            -- row of another domain must not resurrect as a winner here.
-            WHERE stock_rn = 1 AND {domain}
+            WHERE stock_rn = 1
          ),
-         legacy_stock AS (
-            SELECT instance_id, total_tokens, input_tokens, output_tokens,
-                   cost_usd, cache_read_tokens, cache_write_tokens
-            FROM (
+         global_legacy_stock AS (
+            SELECT * FROM (
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY instance_id ORDER BY rowid DESC
                 ) AS legacy_rn
                 FROM usage_events
                 WHERE scope = 'session' AND scope_id IS NULL
-            ) legacy_rows
-            WHERE legacy_rn = 1 AND {domain}
-              AND NOT EXISTS (
-                  SELECT 1 FROM scoped_sessions s
-                  WHERE s.instance_id = legacy_rows.instance_id
-              )
+            )
+            WHERE legacy_rn = 1
          ),
-         winning_turns AS (
+         global_winning_turns AS (
             SELECT * FROM (
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY instance_id, scope_id ORDER BY seq DESC, rowid DESC
@@ -1401,30 +1417,49 @@ const FOLD_CTES_SQL: &str = "scoped_sessions AS (
                 FROM usage_events
                 WHERE scope = 'turn' AND scope_id IS NOT NULL
             )
-            -- Global rank BEFORE the domain filter (c-ctxusage r18 item 2).
-            WHERE turn_rn = 1 AND {domain}
+            WHERE turn_rn = 1
             UNION ALL
             SELECT *, NULL AS turn_rn
             FROM usage_events
-            WHERE scope = 'turn' AND scope_id IS NULL AND {domain}
+            WHERE scope = 'turn' AND scope_id IS NULL
+         ),
+         scoped_sessions AS (
+            SELECT instance_id, total_tokens, input_tokens, output_tokens,
+                   cost_usd, cache_read_tokens, cache_write_tokens, scope_id,
+                   profile_id, model
+            FROM global_scoped_sessions
+            WHERE {domain}
+         ),
+         legacy_stock AS (
+            SELECT l.instance_id, l.total_tokens, l.input_tokens, l.output_tokens,
+                   l.cost_usd, l.cache_read_tokens, l.cache_write_tokens
+            FROM global_legacy_stock l
+            WHERE {domain_l}
+              AND NOT EXISTS (
+                  SELECT 1 FROM global_scoped_sessions s
+                  WHERE s.instance_id = l.instance_id
+              )
+         ),
+         winning_turns AS (
+            SELECT * FROM global_winning_turns WHERE {domain}
          ),
          proven_turns AS (
             SELECT * FROM winning_turns t
             WHERE (
                 t.source_session_id IS NOT NULL
                 AND NOT EXISTS (
-                    SELECT 1 FROM scoped_sessions s
+                    SELECT 1 FROM global_scoped_sessions s
                     WHERE s.instance_id = t.instance_id
                       AND s.scope_id = t.source_session_id
                 )
             ) OR (
                 t.source_session_id IS NULL
                 AND NOT EXISTS (
-                    SELECT 1 FROM scoped_sessions s
+                    SELECT 1 FROM global_scoped_sessions s
                     WHERE s.instance_id = t.instance_id
                 )
                 AND NOT EXISTS (
-                    SELECT 1 FROM legacy_stock l
+                    SELECT 1 FROM global_legacy_stock l
                     WHERE l.instance_id = t.instance_id
                 )
             )
@@ -1433,7 +1468,7 @@ const FOLD_CTES_SQL: &str = "scoped_sessions AS (
             SELECT * FROM winning_turns t
             WHERE t.source_session_id IS NULL
               AND EXISTS (
-                  SELECT 1 FROM scoped_sessions s
+                  SELECT 1 FROM global_scoped_sessions s
                   WHERE s.instance_id = t.instance_id
               )
          )";
@@ -1900,7 +1935,9 @@ fn session_rollup_totals(
                         cache_read_tokens, cache_write_tokens
                  FROM proven_turns
              )",
-            fold_ctes = FOLD_CTES_SQL.replace("{domain}", "instance_id = ?1")
+            fold_ctes = FOLD_CTES_SQL
+                .replace("{domain_l}", "l.instance_id = ?1")
+                .replace("{domain}", "instance_id = ?1")
         ),
         params![instance_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -7138,5 +7175,119 @@ mod tests {
             .unwrap();
         assert_eq!(rollup.session_input_tokens, Some(100));
         assert_eq!(rollup.session_output_tokens, Some(10));
+    }
+
+    /// c-ctxusage r33 item 1: one Codex native session whose model changes
+    /// mid-session. The adapter emits a per-turn flow AND a cumulative stock
+    /// at every turn end, with the stock projected under the then-current
+    /// model. Coverage is per (instance, native session) GLOBALLY across
+    /// models: model A's turn is already inside model B's winning cumulative
+    /// stock and must not be resurrected by supply(A)'s model filter.
+    #[test]
+    fn same_session_stock_covers_turns_after_a_model_change_in_supply() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let profile = "pvp_codemodel";
+        let model_a = "model-a";
+        let model_b = "model-b";
+        let instance = "ins_codemodel";
+        let session = "sess-codex-same";
+
+        // Turn 1 under model A: 100 tokens / $1, qualified to session S.
+        let turn_a = UsageEventRow {
+            instance_id: instance.into(),
+            seq: 1,
+            profile_id: Some(profile.into()),
+            model: Some(model_a.into()),
+            scope: "turn".into(),
+            scope_id: Some("turn-1".into()),
+            mode: "snapshot".into(),
+            metric_revision: 1,
+            source_session_id: Some(session.into()),
+            total_tokens: Some(110),
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: Some("1.00".into()),
+            accounting: "estimated".into(),
+            observed_at: "2026-10-14T00:00:00.000Z".into(),
+            observed_at_source: "native".into(),
+        };
+        // Cumulative stock after turn 1, emitted under the then-current A.
+        let stock_a = UsageEventRow {
+            seq: 2,
+            scope: "session".into(),
+            scope_id: Some(session.into()),
+            ..turn_a.clone()
+        };
+        assert!(insert_usage_event(&conn, &turn_a).unwrap());
+        assert!(insert_usage_event(&conn, &stock_a).unwrap());
+
+        // Reconfigure to model B; turn 2: 150 / $2 cumulative. The new stock
+        // is 250 / $3 (contains the model-A turn), projected under B.
+        let turn_b = UsageEventRow {
+            seq: 3,
+            model: Some(model_b.into()),
+            scope: "turn".into(),
+            scope_id: Some("turn-2".into()),
+            metric_revision: 1,
+            total_tokens: Some(170),
+            input_tokens: Some(150),
+            output_tokens: Some(20),
+            cost_usd: Some("2.00".into()),
+            observed_at: "2026-10-14T00:00:05.000Z".into(),
+            ..turn_a.clone()
+        };
+        let stock_b = UsageEventRow {
+            seq: 4,
+            model: Some(model_b.into()),
+            scope: "session".into(),
+            scope_id: Some(session.into()),
+            total_tokens: Some(280),
+            input_tokens: Some(250),
+            output_tokens: Some(30),
+            cost_usd: Some("3.00".into()),
+            observed_at: "2026-10-14T00:00:05.000Z".into(),
+            ..turn_b.clone()
+        };
+        assert!(insert_usage_event(&conn, &turn_b).unwrap());
+        assert!(insert_usage_event(&conn, &stock_b).unwrap());
+
+        // The instance fold: one winning stock = 250 / $3, both turns covered.
+        let instance_agg = aggregate_instance(&conn, instance).unwrap();
+        assert_eq!(instance_agg.events, 1, "only the winning stock contributes");
+        assert_eq!(instance_agg.total_tokens, Some(280));
+        assert_eq!(instance_agg.input_tokens, Some(250));
+        assert_eq!(instance_agg.output_tokens, Some(30));
+        assert_eq!(instance_agg.cost_usd, Some(3.0));
+
+        // Supply(A): the model-A turn is GLOBALLY covered by the session's
+        // winning (model-B) stock, and the older A stock is not a winner —
+        // nothing for A.
+        let supply_a = aggregate_supply(&conn, profile, model_a).unwrap();
+        assert_eq!(
+            supply_a.events, 0,
+            "A's turn is inside B's cumulative stock"
+        );
+        assert_eq!(supply_a.input_tokens, None);
+        assert_eq!(supply_a.cost_usd, None);
+
+        // Supply(B): the winning stock for S, 250 / $3.
+        let supply_b = aggregate_supply(&conn, profile, model_b).unwrap();
+        assert_eq!(supply_b.events, 1);
+        assert_eq!(supply_b.total_tokens, Some(280));
+        assert_eq!(supply_b.input_tokens, Some(250));
+        assert_eq!(supply_b.output_tokens, Some(30));
+        assert_eq!(supply_b.cost_usd, Some(3.0));
+
+        // The invariant: per-model rows partition the instance total exactly.
+        assert_eq!(
+            supply_a.events + supply_b.events,
+            instance_agg.events,
+            "per-model supply sums equal the instance fold"
+        );
+        assert_eq!(supply_b.input_tokens, instance_agg.input_tokens);
+        assert_eq!(supply_b.cost_usd, instance_agg.cost_usd);
     }
 }

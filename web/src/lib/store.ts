@@ -24,6 +24,17 @@ type DeliveryToken = {
   authGen: number;
   transitionSeq: number;
 };
+/**
+ * c-reconnfu gate 37 item 1: the auth generation + transition sequence a
+ * credential transition captured when it ACQUIRED the chain. Carried in the
+ * transition outcome so the PUBLIC continuation can re-validate synchronous
+ * current ownership before bootstrapping (a peer logout bumps the generation
+ * without touching the sequence).
+ */
+type AuthTransitionOwner = {
+  gen: number;
+  seq: number;
+};
 import { mapWorkspace, mergeHostWorkspaces } from "../features/workspaces/registry";
 import {
   api,
@@ -1206,8 +1217,15 @@ class HubStore {
    * earlier transition's valid session is on disk and would otherwise never
    * reach the authenticated UI/connection (a failed queued login exits before
    * bootstrap).
+   *
+   * Gate 37 item 1: the obligation is bound to the auth GENERATION that owns
+   * it (re-bound on every credential-transition acquisition = explicit
+   * transfer along the chain) and is invalidated by applyAuthIdentityChange,
+   * so an EXTERNAL identity change (logout, bootstrap 401, peer-tab logout)
+   * between acquisition and settlement makes a stale continuation discharge
+   * nothing — even though readSession() may still return a cached session.
    */
-  private authBootstrapOwed = false;
+  private authBootstrapOwed: { gen: number } | null = null;
   /**
    * DELIVERY TOKEN (c-reconnfu gate 35). Captured ONCE at the start of every
    * send / lock turn / fallback and never re-read inside a delivery. The
@@ -1271,6 +1289,12 @@ class HubStore {
     // invalidates in-flight initializers even though no credential transition
     // blocker is open.
     this.authGen += 1;
+    // Gate 37 item 1: an EXTERNAL identity change invalidates any pending
+    // bootstrap obligation. A credential transition's own acquisition routes
+    // through here too but RE-TRANSFERS a predecessor obligation explicitly
+    // afterwards (see runAuthTransition), so this only kills obligations whose
+    // identity is gone.
+    this.authBootstrapOwed = null;
     this.disposeOutboxForAuthChange();
   }
 
@@ -1303,7 +1327,10 @@ class HubStore {
    */
   private async runAuthTransition<T>(
     issue: () => Promise<T>,
-  ): Promise<{ superseded: boolean; ok: true; result: T } | { superseded: boolean; ok: false; error: unknown }> {
+  ): Promise<
+    | { superseded: boolean; ok: true; result: T; acquired: AuthTransitionOwner }
+    | { superseded: boolean; ok: false; error: unknown; acquired: AuthTransitionOwner }
+  > {
     // Monotonic ISSUANCE order, assigned synchronously at call time: two
     // transitions issued back-to-back before either acquires still get
     // distinct ids, so the earlier one can tell at settle time that a newer
@@ -1316,11 +1343,18 @@ class HubStore {
     // caller queues behind this run.
     const run = async (
       prev: Promise<void>,
-    ): Promise<{ superseded: boolean; ok: true; result: T } | { superseded: boolean; ok: false; error: unknown }> => {
+    ): Promise<
+      | { superseded: boolean; ok: true; result: T; acquired: AuthTransitionOwner }
+      | { superseded: boolean; ok: false; error: unknown; acquired: AuthTransitionOwner }
+    > => {
       await prev;
       this.transitionSeq = myIssuedSeq;
-      // This transition now owns the identity change: dispose the current box
-      // and bump the auth generation (seq already advanced).
+      // Gate 37 item 1: this transition's OWN acquisition routes through
+      // applyAuthIdentityChange (which invalidates any obligation as an
+      // external change would). A predecessor's obligation is explicitly
+      // TRANSFERRED to this chain owner and re-bound to the new generation —
+      // the only way an obligation survives an identity bump.
+      const carriedObligation = this.authBootstrapOwed;
       this.applyAuthIdentityChange();
       // Gate 36 item 3: capture the auth generation THIS transition owns at
       // ACQUISITION. A non-transition identity change (logout, bootstrap 401,
@@ -1328,6 +1362,8 @@ class HubStore {
       // credential request is still open, WITHOUT advancing transitionSeq;
       // that generation must invalidate this transition's recovery finalizer.
       const myGen = this.authGen;
+      const acquired: AuthTransitionOwner = { gen: myGen, seq: myIssuedSeq };
+      if (carriedObligation) this.authBootstrapOwed = { gen: myGen };
       this.authTransition = new Promise<void>((resolve) => {
         this.resolveAuthTransition = resolve;
       });
@@ -1356,8 +1392,8 @@ class HubStore {
       // bootstrap — the final owner's continuation owns the chain's bootstrap
       // obligation (gate 36 item 4).
       const superseded = this.transitionIssuedSeq !== myIssuedSeq;
-      if (failed) return { ok: false, error, superseded };
-      return { ok: true, result: result!, superseded };
+      if (failed) return { ok: false, error, superseded, acquired };
+      return { ok: true, result: result!, superseded, acquired };
     };
     // Snapshot the previous chain SYNCHRONOUSLY and publish the new tail
     // before run's body microtask executes — so run awaits the PREVIOUS chain,
@@ -1384,24 +1420,47 @@ class HubStore {
    *    still unbootstrapped, bootstrap THAT session (a queued login failing
    *    after an earlier one succeeded must not leave the app logged out);
    *  - failed superseded transition: nothing — the newer owner is responsible.
-   * Logout/401/peer changes leave no session, so the obligation naturally does
-   * not discharge there.
+   *
+   * Gate 37 item 1: every discharge SYNCHRONOUSLY re-validates that this
+   * continuation still owns the auth generation AND transition sequence it
+   * captured at acquisition, and that the obligation itself is bound to the
+   * current generation. An EXTERNAL change between acquisition and settlement
+   * (logout, bootstrap 401, a peer-tab logout that bumps authGen without
+   * touching transitionSeq) nulls the obligation and moves the generation, so
+   * a stale continuation never bootstraps — readSession()'s cached in-memory
+   * session is consulted only AFTER those checks and cannot outlive the peer
+   * logout for this decision.
    */
   private settleAuthBootstrap(outcome:
-    | { ok: true; result: DeviceSession; superseded: boolean }
-    | { ok: false; error: unknown; superseded: boolean },
+    | { ok: true; result: DeviceSession; superseded: boolean; acquired: AuthTransitionOwner }
+    | { ok: false; error: unknown; superseded: boolean; acquired: AuthTransitionOwner },
   ): void {
+    const ownsNow = () =>
+      this.authGen === outcome.acquired.gen && this.transitionSeq === outcome.acquired.seq;
     if (outcome.ok) {
       if (outcome.superseded) {
-        this.authBootstrapOwed = true;
+        // Explicit transfer to the chain's final owner. This continuation can
+        // resume AFTER the successor already acquired (so this.authGen is the
+        // successor's generation): bind the obligation to the generation that
+        // is current NOW. An external change after this nulls it again.
+        this.authBootstrapOwed = { gen: this.authGen };
         return;
       }
-      this.authBootstrapOwed = false;
+      this.authBootstrapOwed = null;
+      if (!ownsNow()) return; // external change after settlement preparation
       void this.bootstrap().catch(() => undefined);
       return;
     }
-    if (!outcome.superseded && this.authBootstrapOwed && readSession()) {
-      this.authBootstrapOwed = false;
+    // Failed final owner: discharge a predecessor's obligation ONLY while this
+    // continuation is the current owner, the obligation is bound to THIS
+    // generation (an external change nulls it), and a session really exists.
+    if (
+      !outcome.superseded &&
+      ownsNow() &&
+      this.authBootstrapOwed?.gen === this.authGen &&
+      readSession()
+    ) {
+      this.authBootstrapOwed = null;
       void this.bootstrap().catch(() => undefined);
     }
   }
@@ -4419,8 +4478,8 @@ class HubStore {
     // c-reconnfu gate 33 item 1: logout goes through the single
     // identity-change helper — bumps authGen and disposes the outbox (and any
     // in-flight initializer) BEFORE the logged-out identity can be used; the
-    // next bootstrap loads a fresh Outbox with a new lifetime.
-    this.authBootstrapOwed = false;
+    // next bootstrap loads a fresh Outbox with a new lifetime. The helper also
+    // nulls the pending bootstrap obligation (gate 37 item 1).
     this.applyAuthIdentityChange();
     if (this.unloadClearTimer) {
       clearTimeout(this.unloadClearTimer);

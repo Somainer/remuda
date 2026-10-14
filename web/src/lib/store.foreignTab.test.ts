@@ -7608,3 +7608,104 @@ it("GATE36 item 6(e): bootstrap 401 disposes the box; a later public login with 
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE37 item 1: a PEER logout between login A's success and queued login B's rejection invalidates B's bootstrap obligation — no bootstrap, no box, authed stays false (plain and transient-health-failure variants)", async () => {
+  for (const variant of ["plain", "transient-health-failure"] as const) {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_270_000 + (variant === "transient-health-failure" ? 1 : 0));
+    const I = `ins_g37_1_${variant}`;
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+    const pump = async (n = 4_000) => {
+      for (let i = 0; i < n; i += 1) await Promise.resolve();
+    };
+    const sessionKey = `remuda-outbox-owner-g37-1-${variant}`;
+    try {
+      sessionStorage.setItem(sessionKey, "owner");
+      // Start LOGGED OUT in THIS tab.
+      localStorage.removeItem("runtime.device-session");
+      localStorage.setItem("runtime.logged-out", "1");
+      const { api, hubStore } = await fresh();
+      vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+      vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+      vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+      vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+      vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+      vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+      vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+      vi.spyOn(api, "instanceList").mockResolvedValue({
+        items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+        nextCursor: null,
+      } as never);
+      const send = vi.spyOn(api, "instanceSend").mockImplementation(
+        (async (_i: string, _p: string, _x?: unknown, _m?: string, commandId?: string) => ({
+          relatedCommandIds: [],
+          command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+        })) as unknown as Api["instanceSend"],
+      );
+      const hello = vi.spyOn(api, "hello");
+      if (variant === "transient-health-failure") {
+        // Even if a stale continuation DID bootstrap and its health request
+        // failed transiently, the cached device session must not republish
+        // the authed UI after the peer logout.
+        const { RestNetworkError } = await import("./api");
+        hello.mockRejectedValue(new RestNetworkError("transient health failure"));
+        vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+      } else {
+        hello.mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+        vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+      }
+
+      const h = hubStore as unknown as {
+        login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+        outbox: unknown;
+        state: { authed: boolean };
+      };
+      const { HubHttpError: HE } = await import("./httpError");
+
+      // A succeeds (body resolves immediately); B queues behind A with its
+      // body parked.
+      let releaseB: () => void = () => undefined;
+      vi.spyOn(api, "login")
+        .mockImplementationOnce(() => Promise.resolve({ deviceId: "devA_g37_1", token: "tokA", name: "A" }))
+        .mockImplementationOnce(() => new Promise((_resolve, reject) => {
+          releaseB = () => reject(new HE(503, "busy", "host busy"));
+        }));
+      const loginA = h.login("bootstrap", "a", "devA");
+      const loginB = h.login("bootstrap", "b", "devB");
+      await pump(400); // A settles, B acquires and parks
+      await loginA;
+      expect(h.outbox).toBeNull(); // B's transition is open; no box yet
+
+      // ANOTHER TAB logs out: the peer storage event bumps this tab's auth
+      // generation. Simulate the peer's storage removal too — readSession()
+      // still returns the cached in-memory A session, exactly the trap.
+      localStorage.removeItem("runtime.device-session");
+      window.dispatchEvent(
+        new StorageEvent("storage", { key: "runtime.device-session", oldValue: "{}", newValue: null }),
+      );
+      await pump(200);
+
+      // B's credential request rejects. Its stale continuation must NOT
+      // bootstrap A's cached session under the post-peer-logout generation.
+      releaseB();
+      await expect(loginB).rejects.toThrow(/busy/);
+      await pump(4_000);
+
+      expect(h.state.authed).toBe(false);
+      expect(h.outbox).toBeNull();
+      expect(send).not.toHaveBeenCalled();
+      // No bootstrap health request was ever issued (A skipped bootstrap as
+      // superseded; stale B must not run one either).
+      expect(hello).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+      sessionStorage.removeItem(sessionKey);
+    }
+  }
+});

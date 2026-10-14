@@ -16,7 +16,8 @@ import type { Workspace, WorkspaceSnapshot } from "../types/workspace";
 import type { AttachmentRef } from "./attachments";
 
 /**
- * c-reconnfu gate 47 RULING S3 — ONE AUTH OPERATION AT A TIME.
+ * c-reconnfu gate 47 RULING S3 (coordinator ruling; owner may override) —
+ * ONE AUTH OPERATION AT A TIME.
  *
  * bootstrap(), login()/pair login, passkeyLogin()'s finish (and any other
  * credential-establishing operation) run through ONE serialized queue

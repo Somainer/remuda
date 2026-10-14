@@ -84,13 +84,15 @@ fn relay_bin() -> PathBuf {
     remuda_testing::workspace_root().join("target/debug/remuda")
 }
 
-fn compose_native(root: &Path, workspace: PathBuf) -> DevNode {
+/// Compose a native Node. When `hooks` is false the fixture codex must NOT
+/// fire SessionStart and the real shell-pty path skips hook materialization,
+/// so file attribution can only occur through the prompt tier.
+fn compose_native_with(root: &Path, workspace: PathBuf, hooks: bool) -> DevNode {
     let mut native = NativeDriverConfig::new(root.join("node-data"));
-    // Hooks on with a no-op relay so the real shell-pty codex path runs its
-    // confirmed-launch registration and file-adapter spawn; the relay binary
-    // itself is never executed by the fixture.
-    native.pty_hooks = true;
-    native.relay_binary = Some(Box::new(relay_bin()));
+    native.pty_hooks = hooks;
+    if hooks {
+        native.relay_binary = Some(Box::new(relay_bin()));
+    }
     let mut http = DevServerConfig::loopback(0);
     http.workspace_root = workspace.clone();
     http.workspace_roots = Some(remuda_testing::test_workspace_roots!());
@@ -101,6 +103,10 @@ fn compose_native(root: &Path, workspace: PathBuf) -> DevNode {
         drivers: LocalDrivers::Native(native),
     })
     .expect("compose native Node")
+}
+
+fn compose_native(root: &Path, workspace: PathBuf) -> DevNode {
+    compose_native_with(root, workspace, true)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -233,43 +239,60 @@ fn shadow_home(root: &Path, id: &remuda_protocol::InstanceId) -> PathBuf {
 }
 
 /// Write an otherwise-eligible rollout (matching session/cwd/prompt) into a
-/// shadow codex home under `session`.
-fn write_rollout_into(shadow_home: &Path, cwd: &Path, prompt_owner: &str, session: &str) {
+/// shadow codex home under `session`, timestamped at `created_at`. Records
+/// the matching prompt under `prompt_owner`.
+///
+/// c-usagefu r21 items 1/2: callers create the owner's census lifetime and
+/// sample its launch floor BEFORE calling this, and pass `created_at >=
+/// floor`, so the file passes the strict floor / prompt / claim tiers.
+fn write_rollout_into(
+    shadow_home: &Path,
+    cwd: &Path,
+    prompt_owner: &str,
+    session: &str,
+    created_at: time::OffsetDateTime,
+) {
     remuda_driver::adapters::codex_discovery::record_input(cwd, prompt_owner, PROMPT);
-    let started = time::OffsetDateTime::now_utc();
     let month_dir = shadow_home.join("sessions").join(format!(
         "{:04}/{:02}/{:02}",
-        started.year(),
-        u8::from(started.month()),
-        started.day()
+        created_at.year(),
+        u8::from(created_at.month()),
+        created_at.day()
     ));
     std::fs::create_dir_all(&month_dir).unwrap();
-    let rfc = started
+    let rfc = created_at
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
+    let path = month_dir.join(format!("rollout-{session}.jsonl"));
     std::fs::write(
-        month_dir.join(format!("rollout-{session}.jsonl")),
+        &path,
         format!(
-            "{{\"timestamp\":\"{rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session}\",\"session_id\":\"{session}\",\"cwd\":\"{}\",\"timestamp\":\"{rfc}\"}}}}\n\
-             {{\"timestamp\":\"{rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{PROMPT}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
+            "{{\"timestamp\":\"{rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session}\",\"session_id\":\"{session}\",\"cwd\":\"{}\",\"timestamp\":\"{rfc}\"}}}}\n             {{\"timestamp\":\"{rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{PROMPT}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
             cwd.display()
         ),
     )
     .unwrap();
+    // Backdate mtime to created_at so per-file mtime pre-filters agree.
+    let secs = created_at.unix_timestamp().max(0);
+    let nsecs = created_at.nanosecond();
+    let atime = std::time::UNIX_EPOCH + std::time::Duration::new(secs as u64, nsecs);
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let _ = file.set_times(
+        std::fs::FileTimes::new()
+            .set_accessed(atime)
+            .set_modified(atime),
+    );
 }
 
-/// A fresh prompt-only discoverer with its OWN owner and a launch floor
-/// sampled AFTER the rollout was written: the strict floor and owner-prompt
-/// checks pass, so the ONLY thing that can refuse it is the census overlap.
-fn prompt_only_binds(shadow_home: &Path, cwd: &Path) -> bool {
-    // Owner and rollout are created FIRST (owner's prompt evidence + a fresh,
-    // unclaimed rollout); the discoverer is constructed AFTER with a floor in
-    // the tiny window between creation and now, so the ONLY possible rejection
-    // is the census sole-live overlap — never the launch floor, owner prompt,
-    // stale claim or index tier.
-    let owner = format!("probe-{}", std::process::id());
-    write_rollout_into(shadow_home, cwd, &owner, SESSION);
-    let floor = time::OffsetDateTime::now_utc() + time::Duration::milliseconds(100);
+/// Prompt-only discoverer with an explicit owner (used for B's positive
+/// control: the owner is B's real instance id, so the census finds B's
+/// registered interval). The rollout is written AT `floor` (which is after
+/// B's launch), so the strict floor, prompt-fingerprint and stale-claim
+/// tiers all pass; only the census overlap can refuse.
+fn prompt_only_binds_with_owner(shadow_home: &Path, cwd: &Path, owner: &str) -> bool {
+    let floor = time::OffsetDateTime::now_utc();
+    let session = format!("{SESSION}-probe-{}", std::process::id());
+    write_rollout_into(shadow_home, cwd, owner, &session, floor);
     let mut adapter = remuda_driver::adapters::codex_adapter::CodexAdapter::new(AdapterHome {
         home: shadow_home.to_path_buf(),
         cwd: cwd.to_path_buf(),
@@ -277,12 +300,17 @@ fn prompt_only_binds(shadow_home: &Path, cwd: &Path) -> bool {
         launched_at: Some(floor),
         resume_session_id: None,
     })
-    .with_instance_key(Some(owner));
-    // Wait past the floor so the rollout (created just before it) is eligible
-    // on every check EXCEPT the census overlap.
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    .with_instance_key(Some(owner.to_owned()));
     let _ = adapter.poll();
     adapter.binding().is_some()
+}
+
+/// Negative-control discoverer with its own fresh owner (no registered
+/// lifetime): used while A is still live — the ONLY refusal is A's census
+/// overlap.
+fn prompt_only_binds(shadow_home: &Path, cwd: &Path) -> bool {
+    let owner = format!("probe-{}", std::process::id());
+    prompt_only_binds_with_owner(shadow_home, cwd, &owner)
 }
 
 async fn launch_real_codex(
@@ -373,7 +401,8 @@ async fn shared_native_epoch_retirement_unblocks_recomposed_native_discovery() {
             .expect("re-exec native-carrier child");
         assert!(
             output.status.success(),
-            "re-exec child failed: {}",
+            "re-exec child failed ({}): {}",
+            output.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&output.stderr)
         );
         return;
@@ -386,7 +415,13 @@ async fn shared_native_epoch_retirement_unblocks_recomposed_native_discovery() {
     let id_a = created_a.instance.meta.id.clone();
     // The driver registers before its file adapter can bind; write the
     // eligible rollout into the shadow home FIRST, then wait for the bind.
-    write_rollout_into(&home_a, &cwd_a, id_a.as_id().as_str(), SESSION);
+    write_rollout_into(
+        &home_a,
+        &cwd_a,
+        id_a.as_id().as_str(),
+        SESSION,
+        time::OffsetDateTime::now_utc(),
+    );
     wait_driver_bound(&node_a, &id_a, "Node A").await;
 
     // Forced incomplete close on the real driver.
@@ -412,7 +447,13 @@ async fn shared_native_epoch_retirement_unblocks_recomposed_native_discovery() {
     let node_c = compose_native(root_c.path(), workspace_c.clone());
     let (created_c, cwd_c, home_c) = launch_real_codex(&node_c, root_c.path(), &workspace_c).await;
     let id_c = created_c.instance.meta.id.clone();
-    write_rollout_into(&home_c, &cwd_c, id_c.as_id().as_str(), SESSION);
+    write_rollout_into(
+        &home_c,
+        &cwd_c,
+        id_c.as_id().as_str(),
+        SESSION,
+        time::OffsetDateTime::now_utc(),
+    );
     wait_driver_bound(&node_c, &id_c, "Node C").await;
     live_driver(&node_c, &id_c)
         .await
@@ -431,27 +472,39 @@ async fn shared_native_epoch_retirement_unblocks_recomposed_native_discovery() {
         "a second live Node's block is unaffected by A's shutdown"
     );
 
-    // ---- In-process recompose Node B in A's SAME cwd. ----
+    // ---- In-process recompose Node B in A's SAME cwd (c-usagefu r21 item 2).
     //
-    // B is composed from a fresh registry (fresh epoch) but its workspace is
-    // A's directory. B builds its OWN codex driver; the rollout is otherwise
-    // eligible and A's stale interval is gone, so B's own file adapter must
-    // bind — proving the unblock through B's driver, not a hand-built probe.
+    // B is composed with hooks DISABLED and a fixture that never sends
+    // SessionStart, so the hook-confirmed tier cannot bind. B builds its OWN
+    // real codex driver (which registers a real confirmed lifetime through
+    // register_confirmed_launch independent of hooks). Attribution is
+    // verified ONLY through the prompt tier: a fresh discoverer with B's
+    // owner id.
     let root_b = tempfile::tempdir().unwrap();
-    let node_b = compose_native(root_b.path(), workspace_a.clone());
+    let node_b = compose_native_with(root_b.path(), workspace_a.clone(), false);
     let (created_b, _cwd_b, home_b) = launch_real_codex(&node_b, root_b.path(), &workspace_a).await;
     let id_b = created_b.instance.meta.id.clone();
-    // B's own launch floor was sampled before the rollout; write the eligible
-    // rollout into B's fresh shadow home and let B's OWN adapter poll it.
-    write_rollout_into(&home_b, &cwd_a, id_b.as_id().as_str(), SESSION);
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Wait for B's driver (its register_confirmed_launch ran during spawn);
+    // confirm B never hook-binds (no SessionStart is ever sent).
     let driver_b = live_driver(&node_b, &id_b).await;
-    while !driver_b.test_codex_bound() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
     assert!(
-        driver_b.test_codex_bound(),
-        "the replacement Node's OWN driver binds in A's cwd after A retired"
+        !driver_b.test_codex_bound(),
+        "B must not bind through hooks: the fixture never sends SessionStart"
+    );
+    // Fresh, unique rollout in B's shadow home with B's owner prompt
+    // recorded; timestamp AFTER B's launch floor (B launched seconds ago) so
+    // the prompt tier is satisfied once A's interval is retired.
+    write_rollout_into(
+        &home_b,
+        &cwd_a,
+        id_b.as_id().as_str(),
+        SESSION,
+        time::OffsetDateTime::now_utc(),
+    );
+    assert!(
+        prompt_only_binds_with_owner(&home_b, &cwd_a, id_b.as_id().as_str()),
+        "B's cwd attributes through the prompt-only tier after A retired (no SessionStart)"
     );
     node_b.shutdown().await.expect("B shuts down");
 

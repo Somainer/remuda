@@ -1242,6 +1242,11 @@ impl Driver for ClaudePtyDriver {
         // is pending.
         if !live.controls_disabled {
             live.controls_disabled = true;
+            // r26 item 1: revoke controls INSIDE the interaction layer before
+            // any awaited shutdown, so a request already queued on its state
+            // mutex behind a stalled RPC is refused even when the bounded
+            // interactions.close() cleanup below times out.
+            live.interactions.revoke();
             live.interaction_task.abort();
             live.effort_queue.close();
             if let Some(task) = live.effort_worker.take() {

@@ -8,7 +8,7 @@ use remuda_herdr::{AgentReadParams, AgentStatus, Client, ReadFormat, ReadSource}
 use remuda_protocol::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -105,13 +105,21 @@ pub(crate) struct PtyInteractions {
     tx: mpsc::Sender<Observation>,
     seq: Arc<AtomicU64>,
     state: Mutex<State>,
+    /// Per-run revocation latch (c-ctxusage r26 item 1). A control that passed
+    /// the driver entry gate can still be QUEUED on `state` behind another
+    /// request holding the mutex across a stalled Herdr RPC. `close` sets this
+    /// synchronously — before any awaited shutdown work — so the queued control
+    /// is refused after acquiring the mutex even when the bounded `close`
+    /// cleanup never reaches `state.closed`. The pane can then be reused by a
+    /// restarted carrier without receiving a queued keystroke.
+    closing: Arc<AtomicBool>,
     auto_trust_registered_workspace: bool,
 }
 
 impl PtyInteractions {
     pub(crate) async fn observe(&self) -> DriverResult<()> {
         let mut state = self.state.lock().await;
-        if state.closed {
+        if state.closed || self.revoked() {
             return Ok(());
         }
         self.refresh(&mut state).await
@@ -131,8 +139,25 @@ impl PtyInteractions {
             tx,
             seq,
             state: Mutex::new(State::default()),
+            closing: Arc::new(AtomicBool::new(false)),
             auto_trust_registered_workspace,
         })
+    }
+
+    /// Revoke every queued/future control SYNCHRONOUSLY. Called the moment a
+    /// run's close begins, before any awaited shutdown: unlike `state.closed`,
+    /// setting this never waits on the interaction mutex, so a request stalled
+    /// mid-RPC while holding that mutex cannot shield a queued control past a
+    /// carrier restart and pane reuse.
+    pub(crate) fn revoke(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+    }
+
+    /// True after [`Self::revoke`]. Callers MUST be holding `state`; the check
+    /// sits between mutex acquisition and the dispatch so a control queued
+    /// behind a stalled request is refused once it reaches the front.
+    fn revoked(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
     }
 
     pub(crate) fn spawn(self: &Arc<Self>) -> JoinHandle<()> {
@@ -143,7 +168,7 @@ impl PtyInteractions {
             loop {
                 tick.tick().await;
                 let mut state = this.state.lock().await;
-                if state.closed || this.tx.is_closed() {
+                if state.closed || this.revoked() || this.tx.is_closed() {
                     break;
                 }
                 if let Err(error) = this.refresh(&mut state).await {
@@ -385,6 +410,11 @@ impl PtyInteractions {
         // screen per carrier, even if an ACK is lost.
         let answerable = !truncated && !state.onboarding_attempted.contains(dialog.name);
         if let Some(keys) = dialog.keys.filter(|_| answerable) {
+            // Close began while this refresh waited for the screen: never
+            // auto-answer onto a pane the carrier may be about to reuse.
+            if self.revoked() {
+                return Ok(());
+            }
             // Mark before I/O: a lost ACK must never replay Enter.
             state.onboarding_attempted.insert(dialog.name);
             let (status, severity) = match self.write(keys).await {
@@ -493,9 +523,11 @@ impl PtyInteractions {
     /// Both `tty.write` and interaction replies use this exact key transport.
     pub(crate) async fn send_keys(&self, keys: Vec<String>) -> DriverResult<DriverAck> {
         let state = self.state.lock().await;
-        if state.closed {
+        if state.closed || self.revoked() {
             return Err(DriverError::ControlUnavailable);
         }
+        // The guard stays held across the dispatch: a concurrent close can
+        // revoke after this check only while the RPC is already in flight.
         self.write(keys).await
     }
 
@@ -513,7 +545,7 @@ impl PtyInteractions {
         answer: InteractionAnswer,
     ) -> DriverResult<DriverAck> {
         let mut state = self.state.lock().await;
-        if state.closed {
+        if state.closed || self.revoked() {
             return Err(DriverError::ControlUnavailable);
         }
         self.refresh(&mut state).await?;
@@ -537,6 +569,12 @@ impl PtyInteractions {
         pending: &mut Pending,
         keys: Vec<String>,
     ) -> DriverResult<DriverAck> {
+        // Reachable only through `respond`, which already checked under the
+        // same lock acquisition; re-check immediately before the dispatch so a
+        // refresh-await in that critical section cannot be the last gate.
+        if self.revoked() {
+            return Err(DriverError::ControlUnavailable);
+        }
         // Mark before I/O: even a lost RPC ACK must never replay Enter.
         pending.attempted = true;
         let result = self.write(keys).await;
@@ -570,6 +608,10 @@ impl PtyInteractions {
     }
 
     pub(crate) async fn close(&self) -> DriverResult<()> {
+        // Revoke controls FIRST, synchronously: a queued request must be
+        // refused even when the state mutex is held by a stalled RPC and the
+        // bounded cleanup below times out.
+        self.revoke();
         let closing = async {
             let mut state = self.state.lock().await;
             state.closed = true;
@@ -581,7 +623,9 @@ impl PtyInteractions {
             .await
         };
         // Match carrier shutdown: a detached/stalled optional observer cannot
-        // prevent reclamation of the owned Herdr resources.
+        // prevent reclamation of the owned Herdr resources. The timeout only
+        // bounds the OPTIONAL invalidation emission now — control revocation
+        // already happened above and never waits on this lock.
         match tokio::time::timeout(Duration::from_millis(250), closing).await {
             Ok(result) if !self.tx.is_closed() => result,
             _ => Ok(()),
@@ -908,5 +952,109 @@ mod tests {
             )]),
         }));
         assert!(answer_keys(&pending, &answer).is_err());
+    }
+
+    /// c-ctxusage r26 item 1: a control that passed the driver entry gate can
+    /// still be QUEUED on the interaction state mutex behind request A, which
+    /// holds that mutex across a stalled Herdr RPC. Close begins (carrier
+    /// restart + pane reuse follow); its bounded cleanup cannot acquire the
+    /// mutex within 250 ms. The queued control must nevertheless be revoked
+    /// synchronously and reach ZERO dispatch — never dial the Herdr the
+    /// restarted carrier reuses the pane under.
+    #[tokio::test]
+    async fn close_revokes_a_queued_key_control_behind_a_stalled_rpc() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::UnixListener;
+
+        // Witness "Herdr": accepts connections, counts every byte received,
+        // never replies — a permanently stalled RPC, exactly like the carrier
+        // that is restarting.
+        let dir = tempfile::Builder::new()
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("in-crate temp dir");
+        let socket = dir.path().join("parked-herdr.sock");
+        let listener = UnixListener::bind(&socket).expect("bind parked herdr");
+        let observed_bytes = Arc::new(AtomicU64::new(0));
+        let server = {
+            let observed_bytes = observed_bytes.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut conn, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let observed_bytes = observed_bytes.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match conn.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    observed_bytes.fetch_add(n as u64, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    });
+                }
+            })
+        };
+
+        let (tx, _rx) = mpsc::channel(4);
+        let interactions: Arc<PtyInteractions> = PtyInteractions::new(
+            // 2 s RPC timeout keeps the RED run bounded when the queued
+            // control wrongly dials this listener.
+            Client::connect(&socket).with_timeout(Duration::from_secs(2)),
+            "pane-reused-after-restart".into(),
+            ctx(),
+            tx,
+            Arc::new(AtomicU64::new(0)),
+            false,
+        );
+
+        // Request A: holds the interaction state lock across its stalled RPC.
+        let release_a = Arc::new(tokio::sync::Notify::new());
+        let a_release = release_a.clone();
+        let a_interactions = interactions.clone();
+        let a = tokio::spawn(async move {
+            let _guard = a_interactions.state.lock().await;
+            a_release.notified().await;
+        });
+
+        // Request B: already past the driver entry gate, now queued on the
+        // same mutex behind A.
+        let b_interactions = interactions.clone();
+        let b = tokio::spawn(async move { b_interactions.send_keys(vec!["enter".into()]).await });
+        // Let B park on the mutex before close begins.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Close starts WHILE A still holds the lock: revocation must not wait.
+        tokio::time::timeout(Duration::from_secs(5), interactions.close())
+            .await
+            .expect("close itself stays bounded")
+            .expect("close reports ok");
+        assert!(
+            interactions.closing.load(Ordering::SeqCst),
+            "the synchronous per-run closing latch is set even with the mutex held"
+        );
+
+        // A's RPC fails (carrier restart); release the mutex so B reaches the
+        // front of the queue.
+        release_a.notify_waiters();
+        a.await.expect("stalled request task");
+        let result = tokio::time::timeout(Duration::from_secs(10), b)
+            .await
+            .expect("queued control resolves")
+            .expect("queued control task");
+        assert!(
+            matches!(result, Err(DriverError::ControlUnavailable)),
+            "the queued control is refused, got {result:?}"
+        );
+        // Give a buggy build a beat to have dialled after acquiring the mutex.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            observed_bytes.load(Ordering::SeqCst),
+            0,
+            "zero agent.send_keys dispatch reaches the reused pane"
+        );
+        server.abort();
     }
 }

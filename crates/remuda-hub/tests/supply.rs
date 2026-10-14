@@ -875,3 +875,211 @@ async fn usage_events_flow_through_journal_into_aggregation() -> Result<()> {
     hub.shutdown().await;
     Ok(())
 }
+
+/// c-ctxusage r34/r35 item 1: the unprovable-lineage migration shape combined
+/// with a mid-session model change must keep model A visible on the PROVIDER
+/// endpoint. The database starts at the OLD (identity-column) schema with
+/// retained rows; the hub's own startup migration upgrades it. Removing the
+/// production `agg.ambiguous` row filter must drop A and fail this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ambiguous_only_model_survives_upgrade_and_shows_on_provider_usage() -> Result<()> {
+    use rusqlite::Connection;
+
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir)?;
+
+    // Seed the OLD-SCHEMA usage table directly (no scope_id /
+    // source_session_id / observed_at_source / metric_revision columns),
+    // exactly what an upgraded origin/main database carries.
+    let conn = Connection::open(data_dir.join("hub.sqlite"))?;
+    conn.execute_batch(
+        "CREATE TABLE usage_events (
+            instance_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            profile_id TEXT,
+            model TEXT,
+            scope TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            total_tokens INTEGER,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER,
+            cost_usd TEXT,
+            accounting TEXT NOT NULL DEFAULT 'estimated',
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY (instance_id, seq)
+         );",
+    )?;
+    let profile_id = "pvp_ambig_e2e";
+    let model_a = "gw/ambig_a";
+    let model_b = "gw/ambig_b";
+    let instance = "ins_ambig_e2e";
+    // Retained model-A turn with NULL lineage: 100 / $1.
+    conn.execute(
+        "INSERT INTO usage_events
+            (instance_id, seq, profile_id, model, scope, mode, total_tokens,
+             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+             cost_usd, accounting, observed_at)
+         VALUES (?1, 1, ?2, ?3, 'turn', 'snapshot', 110, 100, 10, 0, 0,
+                 '1.00', 'estimated', '2020-01-01T00:00:00.000Z')",
+        rusqlite::params![instance, profile_id, model_a],
+    )?;
+    // Scoped model-B cumulative stock: 250 input / 30 output / $3.
+    conn.execute(
+        "INSERT INTO usage_events
+            (instance_id, seq, profile_id, model, scope, mode, total_tokens,
+             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+             cost_usd, accounting, observed_at)
+         VALUES (?1, 2, ?2, ?3, 'session', 'snapshot', 280, 250, 30, 0, 0,
+                 '3.00', 'estimated', '2020-01-01T00:00:05.000Z')",
+        rusqlite::params![instance, profile_id, model_b],
+    )?;
+    // Retained journal proves the SESSION stock identity (scope S with a
+    // known-session envelope) so migration backfills the stock to scoped;
+    // deliberately no turn evidence, so the model-A turn stays unprovable
+    // (ambiguous) — the exact upgraded-database contract.
+    conn.execute_batch(
+        "CREATE TABLE journal (
+            instance_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            event_id TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY (instance_id, seq)
+        );",
+    )?;
+    let stock_event = serde_json::json!({
+        "kind": "usage",
+        "payload": {
+            "scope": "session",
+            "scopeId": "sess-b-scoped",
+            "mode": "snapshot"
+        },
+        "source": {
+            "nativeSessionId": { "state": "known", "value": "sess-b-scoped" },
+            "nativeTurnId": {
+                "state": "unknown",
+                "reason": "not-emitted",
+                "evidenceEventIds": []
+            }
+        }
+    });
+    conn.execute(
+        "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+         VALUES (?1, 2, 'evt-stock', ?2, '2020-01-01T00:00:05.000Z')",
+        rusqlite::params![instance, stock_event.to_string()],
+    )?;
+    drop(conn);
+
+    // Boot the hub: Store::open runs the migration on the old database.
+    let hub = remuda_hub::spawn(remuda_hub::HubConfig::for_test(data_dir.clone())).await?;
+    let bootstrap = hub.bootstrap_token.clone();
+    let cookie = login(hub.addr, &bootstrap).await?;
+
+    // Register the provider with BOTH models plus a genuinely unused one.
+    let body = json!({
+        "name": "relay-ambig",
+        "kind": "gateway",
+        "baseUrl": "http://127.0.0.1:1",
+        "authToken": "sk-supply-test-secret-bbbb",
+        "defaultGateway": true,
+        "models": [
+            { "id": model_a, "family": "ambig_a", "role": "workhorse", "priority": 20 },
+            { "id": model_b, "family": "ambig_b", "role": "workhorse", "priority": 20 },
+            { "id": "gw/ambig_unused", "family": "ambig_c", "role": "workhorse",
+              "priority": 20 }
+        ]
+    })
+    .to_string();
+    let (status, rest) = http(
+        hub.addr,
+        "POST",
+        "/v1/providers",
+        &[("Cookie", &cookie)],
+        Some(&body),
+    )
+    .await?;
+    assert_eq!(status, 200, "create provider {status} {rest}");
+    assert_eq!(status, 200, "create provider {status} {rest}");
+    let created_provider: Value = serde_json::from_str(rest.trim())?;
+    let profile_id = created_provider["id"]
+        .as_str()
+        .context("created provider id")?
+        .to_string();
+    // The old-schema rows were migrated on boot (their identity columns
+    // stay NULL — that is the ambiguous fixture); bind them to the created
+    // provider's generated id, the way a resumed session re-keys rows.
+    {
+        use rusqlite::Connection;
+        let c = Connection::open(data_dir.join("hub.sqlite"))?;
+        c.execute(
+            "UPDATE usage_events SET profile_id = ?1
+             WHERE instance_id = 'ins_ambig_e2e'",
+            rusqlite::params![profile_id],
+        )?;
+        let stock_scoped: Option<String> = c.query_row(
+            "SELECT scope_id FROM usage_events
+             WHERE instance_id = 'ins_ambig_e2e' AND scope='session'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(stock_scoped.as_deref(), Some("sess-b-scoped"));
+        let turn_lineage: Option<String> = c.query_row(
+            "SELECT source_session_id FROM usage_events
+             WHERE instance_id = 'ins_ambig_e2e' AND scope='turn'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(turn_lineage, None, "the A turn stays unprovable/ambiguous");
+    }
+
+    let (_, body) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/providers/{profile_id}/usage?budgetMaxUsd=10"),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+
+    let usage: Value = serde_json::from_str(body.trim())?;
+    let models = usage["models"]
+        .as_array()
+        .unwrap_or_else(|| panic!("models array; body={body}"));
+    let model_row = |id: &str| models.iter().find(|m| m["model"] == id);
+
+    // Model A: ambiguous-only, still present with Unknown wire fields.
+    let a = model_row(model_a).context("ambiguous model A must be reported")?;
+    assert_eq!(a["events"], 0, "A has no proven contribution");
+    assert_eq!(a["ambiguousEvents"], 1, "A's turn is flagged ambiguous");
+    assert_eq!(a["ambiguous"], true);
+    assert!(a["totalTokens"].is_null(), "token buckets stay Unknown");
+    assert!(a["inputTokens"].is_null());
+    assert!(a["outputTokens"].is_null());
+    assert!(a["estimatedUsd"].is_null(), "the ambiguous bill is Unknown");
+    assert_eq!(
+        a["budgetStatus"], "unknown",
+        "an ambiguous bill is never certified under budget"
+    );
+
+    // Model B: the proven cumulative stock.
+    let b = model_row(model_b).context("model B must be reported")?;
+    assert_eq!(b["events"], 1);
+    assert_eq!(b["ambiguousEvents"], 0);
+    assert_eq!(b["ambiguous"], false);
+    assert_eq!(b["inputTokens"], 250);
+    assert_eq!(b["outputTokens"], 30);
+    assert_eq!(b["estimatedUsd"], 3.0);
+    assert_eq!(b["budgetStatus"], "ok");
+
+    // A genuinely unused configured model produces no row.
+    assert!(
+        model_row("gw/ambig_unused").is_none(),
+        "no-usage models stay absent"
+    );
+
+    hub.shutdown().await;
+    Ok(())
+}

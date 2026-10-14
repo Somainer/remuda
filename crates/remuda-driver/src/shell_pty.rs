@@ -3743,15 +3743,15 @@ mod tests {
         // Install a `codex` wrapper around the deterministic fake-harness.
         // The production argv carries no dialect selector (the real binary's
         // name IS the dialect), so the wrapper supplies `--kind codex`.
+        // c-ctxusage r26 item 5: the executable path is POSIX-quoted — the
+        // checkout/target dir may contain spaces or apostrophes.
         let install = root.join("opt/bin");
         let harness = remuda_testing::ensure_workspace_bin("fake-harness");
+        let quoted_harness = posix_single_quote(&harness.to_string_lossy());
         let codex_bin = remuda_testing::install_executable(
             &install,
             "codex",
-            format!(
-                "#!/bin/sh\nexec {} --kind codex \"$@\"\n",
-                harness.display()
-            ),
+            format!("#!/bin/sh\nexec {quoted_harness} --kind codex \"$@\"\n"),
         );
 
         // Real relay the codex hook overlay invokes.
@@ -3875,6 +3875,25 @@ mod tests {
         r25_expect_turn_usage(&mut resumed_events, "r25-post-turn", 4242).await;
 
         Driver::close(&driver).await.expect("clean close");
+    }
+
+    /// POSIX single-quote a path for interpolation into a `/bin/sh` script:
+    /// the whole value is wrapped in single quotes and every embedded
+    /// apostrophe closes the quote, inserts an escaped quote, and reopens
+    /// (`…'…` -> `'…'\''…'`). Safe for spaces, apostrophes and any byte
+    /// except NUL.
+    fn posix_single_quote(value: &str) -> String {
+        let mut quoted = String::with_capacity(value.len() + 2);
+        quoted.push('\'');
+        for ch in value.chars() {
+            if ch == '\'' {
+                quoted.push_str("'\\''");
+            } else {
+                quoted.push(ch);
+            }
+        }
+        quoted.push('\'');
+        quoted
     }
 
     /// Recursively locate the codex rollout the fake-harness created.

@@ -2433,11 +2433,11 @@ async fn a_late_runlog_never_overwrites_the_jobs_legacy_log_object() {
 /// the definitive settlement also STANDS DOWN — the job stays Running and
 /// keeps its prior reference because the new result supplied a log that was
 /// never persisted; it may not fail the job under another result's old bytes.
-/// r21 item 5 changed the retry: the HUB now re-drives the deferred result
-/// itself, so a STICKY fault holds the deferral open for the stand-down
-/// assertions; once storage recovers the automatic retry persists the new
-/// evidence and settles Failed bound to its OWN object, with no second
-/// delivery from this test.
+/// r22 item 1 / R9 removed the Hub-side retry scheduler: the stand-down does
+/// NOT consume the verdict. After storage recovers the job is STILL Running
+/// (nothing retries on the Hub); the existing delivery path then RE-SUPPLIES
+/// the exact verdict, which settles Failed bound to its OWN object, exactly
+/// once — a duplicate redelivery keeps that same object.
 #[tokio::test]
 async fn a_failed_log_insert_keeps_the_previous_object_served() {
     let (ctx, _node) = Ctx::boot().await.unwrap();
@@ -2500,30 +2500,52 @@ async fn a_failed_log_insert_keeps_the_previous_object_served() {
     // The old headline already proves the original bytes survived.
     let _ = old_bytes;
 
-    // Storage recovers: the HUB's own deferred-settlement retry (r21 item 5 —
-    // no manual re-delivery here) persists its OWN object and commits Failed
-    // bound to it (never to the legacy bytes).
+    // r22 R9: storage recovers, but the Hub runs NO persistence retry of its
+    // own — the unconsumed verdict must be RE-SUPPLIED by the existing
+    // delivery path (Node redelivery / reconciliation / operator). Wait well
+    // past where the old r21 scheduler retried (75 ms …) to prove it is gone.
     ctx.store().test_clear_gate_log_insert_fault();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    let settled = loop {
-        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-        if doc["state"] == json!("failed") {
-            break doc;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "deferred Failed never retried: {doc}"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    };
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("running"),
+        "the Hub must not self-retry persistence: the job awaits redelivery: {doc}"
+    );
+
+    // The existing delivery path re-supplies the exact verdict. It now
+    // persists its OWN object and commits Failed bound to it (never to the
+    // legacy bytes).
+    let redelivered = failed_result_with_log(&job_id, "never stored");
+    ctx.hub
+        .test_apply_gate_result(&job_id, redelivered.clone())
+        .await
+        .unwrap();
+    let settled = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(settled["state"], json!("failed"), "{settled}");
     let new_id = settled["logObjectId"]
         .as_str()
-        .expect("the retry binds its persisted object")
+        .expect("the redelivery binds its persisted object")
         .to_owned();
     assert_ne!(
         new_id, legacy_id,
         "the settled evidence is not the legacy log"
     );
+
+    // A further redelivery of the same verdict settles NO second time: same
+    // terminal state, same bound object.
+    ctx.hub
+        .test_apply_gate_result(&job_id, redelivered)
+        .await
+        .unwrap();
+    let again = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(again["state"], json!("failed"), "{again}");
+    assert_eq!(
+        again["logObjectId"],
+        json!(new_id),
+        "the duplicate redelivery must not rebind the evidence: {again}"
+    );
+
     let (status, served) = ctx
         .send(
             "GET",
@@ -2537,7 +2559,7 @@ async fn a_failed_log_insert_keeps_the_previous_object_served() {
     assert_eq!(
         served["log"]["headline"],
         json!("never stored"),
-        "the Failed settlement is bound to the retried result's own bytes: {served}"
+        "the Failed settlement is bound to the re-supplied result's own bytes: {served}"
     );
 }
 
@@ -2545,9 +2567,10 @@ async fn a_failed_log_insert_keeps_the_previous_object_served() {
 /// fails must stand down exactly like the Failed case — the job stays Running
 /// and keeps the prior reference; Passed must never commit with missing
 /// evidence or under another result's old bytes (successful Node runs supply
-/// such logs with keepLogs). A STICKY fault holds the deferral open against
-/// the r21 item 5 automatic retry; once storage recovers the Hub's own retry
-/// persists the verdict's OWN object and settles Passed bound to it.
+/// such logs with keepLogs). r22 item 1 / R9: with the Hub-side retry
+/// scheduler gone, the job remains Running even AFTER storage recovers until
+/// the existing delivery path re-supplies the verdict; the redelivery then
+/// settles Passed bound to its OWN object, exactly once.
 #[tokio::test]
 async fn a_failed_log_insert_makes_a_passed_verification_stand_down() {
     let (ctx, _node) = Ctx::boot().await.unwrap();
@@ -2605,21 +2628,25 @@ async fn a_failed_log_insert_makes_a_passed_verification_stand_down() {
     assert_eq!(status, 200, "{by_job}");
     assert_eq!(by_job["objectId"], json!(legacy_id), "{by_job}");
 
-    // Storage recovers: the automatic retry (no second delivery from this
-    // test) persists its own object and settles Passed bound to it.
+    // Storage recovers, but R9 gives the Hub no self-retry: the job must stay
+    // Running until the verdict is RE-SUPPLIED by the existing delivery path.
     ctx.store().test_clear_gate_log_insert_fault();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    let settled = loop {
-        let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
-        if doc["state"] == json!("passed") {
-            break doc;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "deferred Passed never retried: {doc}"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    };
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("running"),
+        "Passed must not settle via a Hub-side retry after recovery: {doc}"
+    );
+
+    // Redelivery of the same passed verdict persists its own object and
+    // settles Passed bound to it; a second redelivery keeps that object.
+    ctx.hub
+        .test_apply_gate_result(&job_id, passed_result.clone())
+        .await
+        .unwrap();
+    let settled = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(settled["state"], json!("passed"), "{settled}");
     let new_id = settled["logObjectId"]
         .as_str()
         .expect("the Passed job binds its persisted object")
@@ -2627,6 +2654,16 @@ async fn a_failed_log_insert_makes_a_passed_verification_stand_down() {
     assert_ne!(
         new_id, legacy_id,
         "the settled evidence is not the legacy log"
+    );
+    ctx.hub
+        .test_apply_gate_result(&job_id, passed_result)
+        .await
+        .unwrap();
+    let again = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        again["logObjectId"],
+        json!(new_id),
+        "the duplicate redelivery must not rebind the evidence: {again}"
     );
     let (status, served) = ctx
         .send(
@@ -2641,7 +2678,115 @@ async fn a_failed_log_insert_makes_a_passed_verification_stand_down() {
     assert_eq!(
         served["log"]["headline"],
         json!("green but never stored"),
-        "the Passed settlement binds the retried result's own bytes: {served}"
+        "the Passed settlement binds the re-supplied result's own bytes: {served}"
+    );
+}
+
+/// r22 item 1 / R9: a supplied run log LARGER than the evidence cap is NOT a
+/// transient failure — a redelivery would carry the same oversized bytes
+/// forever, so deferral could never heal. The Hub persists a truncated copy
+/// carrying an explicit marker, binds the settlement to the digest of EXACTLY
+/// the bytes stored, and settles normally (no stand-down, no redelivery
+/// required).
+#[tokio::test]
+async fn an_oversized_run_log_is_persisted_truncated_and_settles_normally() {
+    // Mirrors GATE_LOG_MAX_BYTES in gatequeue.rs.
+    const EVIDENCE_CAP: usize = 512 * 1024;
+
+    let (ctx, _node) = Ctx::boot().await.unwrap();
+    let (status, body) = ctx
+        .agent_post(
+            &format!("/v1/projects/{}/gate", ctx.project),
+            json!({"branch":"wt/gate/oversized-log","mode":"verify"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let job_id = body["id"].as_str().unwrap().to_owned();
+    let claimed = ctx
+        .hub
+        .test_claim_gate_job(&job_id, "lane1", &ctx.host)
+        .await
+        .unwrap()
+        .expect("the queued verify job claims to running");
+    assert_eq!(claimed["state"], json!("running"), "{claimed}");
+
+    // One tail line well over the cap on its own.
+    let huge_line = "x".repeat(EVIDENCE_CAP + 128 * 1024);
+    let failed_result = json!({
+        "jobId": job_id,
+        "generation": 1,
+        "status": "failed",
+        "failedStep": "cargo-test",
+        "error": "cargo-test failed: 1 test",
+        "reason": "1 test failed",
+        "runLog": {
+            "step": "cargo-test",
+            "kind": "failed",
+            "attempts": 1,
+            "headline": "too much evidence",
+            "summary": ["test it_huge ... FAILED"],
+            "tail": [huge_line],
+            "capturedLines": 1,
+            "truncated": false
+        }
+    });
+
+    ctx.hub
+        .test_apply_gate_result(&job_id, failed_result)
+        .await
+        .unwrap();
+
+    // The oversized verdict SETTLES (it is not deferred) and binds an object.
+    let settled = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        settled["state"],
+        json!("failed"),
+        "an oversized log is truncated, not deferred: {settled}"
+    );
+    let object_id = settled["logObjectId"]
+        .as_str()
+        .expect("the truncated settlement still binds its stored object")
+        .to_owned();
+    assert!(object_id.starts_with("obj_"), "{object_id}");
+
+    let (status, served) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{object_id}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{served}");
+    let log = &served["log"];
+    assert_eq!(
+        log["headline"],
+        json!("too much evidence"),
+        "the truncation keeps the log's identity fields: {log}"
+    );
+    assert_eq!(
+        log["truncated"],
+        json!(true),
+        "the stored object must carry the explicit truncated flag: {log}"
+    );
+    let tail = log["tail"].as_array().expect("tail array: {log}");
+    assert!(
+        tail.iter()
+            .any(|line| line.as_str().is_some_and(|text| text.contains("truncated"))),
+        "the stored tail must carry an explicit truncation marker: {log}"
+    );
+    // The object is exactly the bounded bytes the digest was computed over.
+    let stored_bytes = serde_json::to_vec(log).unwrap();
+    assert!(
+        stored_bytes.len() <= EVIDENCE_CAP,
+        "the persisted object is {} bytes, over the {EVIDENCE_CAP} cap",
+        stored_bytes.len()
+    );
+    assert_ne!(
+        stored_bytes.len(),
+        0,
+        "the truncated object still carries the bounded log"
     );
 }
 
@@ -2778,14 +2923,14 @@ async fn the_finished_event_and_the_gate_run_reply_both_feed_the_real_log_path()
     );
 }
 
-/// r21 item 5: a TRANSIENT evidence-store failure hits BOTH real deliveries —
-/// the `gate.event` finished NOTIFICATION and the gate.run RPC REPLY. Both
-/// verdicts supply identical run logs, both inserts fail (a two-shot fault),
-/// so both settlements defer and the job stays Running. The Hub must RETAIN
-/// the exact result + authority tuple and retry persistence-plus-settlement
-/// itself: after storage recovers the job settles Failed bound to its own
-/// object, with NO third delivery (no test_apply_gate_result call) and no
-/// manually replayed result.
+/// r21 item 5 / r22 item 1 / R9: a TRANSIENT evidence-store failure hits BOTH
+/// real deliveries — the `gate.event` finished NOTIFICATION and the gate.run
+/// RPC REPLY. Both verdicts supply identical run logs, both inserts fail (a
+/// two-shot fault), so both settlements DEFER and the job stays Running. R9
+/// removed the Hub-side retry scheduler: once storage recovers the Hub still
+/// does NOT settle — the result was never acknowledged/consumed, so the
+/// existing delivery path must RE-SUPPLY the verdict. (r22 item 8 rewrites
+/// this into the final redelivery form.)
 #[tokio::test]
 async fn both_evidence_deliveries_fail_then_the_hub_retries_without_a_third_delivery() {
     let (ctx, node) = Ctx::boot().await.unwrap();
@@ -2839,9 +2984,33 @@ async fn both_evidence_deliveries_fail_then_the_hub_retries_without_a_third_deli
         "two failed evidence persists keep the job Running: {doc}"
     );
 
-    // NO third delivery is injected: the deferred chains must re-persist and
-    // settle on their own once storage recovers (the two-shot fault is spent).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    // Storage recovers, but R9 gives the Hub no persistence-retry scheduler:
+    // both verdicts were left UNCONSUMED and the job must stay Running until
+    // the existing delivery path re-supplies one. Wait well beyond the old
+    // scheduler's first 75 ms retry to prove it is gone.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("running"),
+        "the Hub must not self-retry after recovery: the result awaits \
+         redelivery by the existing path: {doc}"
+    );
+
+    // Redelivery of the exact verdict through the real notification path
+    // persists its own object and settles Failed, exactly once; a duplicate
+    // redelivery keeps the same bound object.
+    node.send_raw(json!({
+        "jsonrpc": "2.0",
+        "method": "gate.event",
+        "params": {
+            "jobId": job_id,
+            "generation": 1,
+            "kind": "finished",
+            "result": failed_gate_result(&job_id, job_seed),
+        }
+    }));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let settled = loop {
         let doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
         if doc["state"] == json!("failed") {
@@ -2849,15 +3018,33 @@ async fn both_evidence_deliveries_fail_then_the_hub_retries_without_a_third_deli
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the deferred settlement was not retried: {doc}"
+            "the re-supplied verdict never settled: {doc}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
     let object_id = settled["logObjectId"]
         .as_str()
-        .expect("the retried settlement binds the persisted object")
+        .expect("the redelivery binds the persisted object")
         .to_owned();
     assert!(object_id.starts_with("obj_"), "{object_id}");
+    node.send_raw(json!({
+        "jsonrpc": "2.0",
+        "method": "gate.event",
+        "params": {
+            "jobId": job_id,
+            "generation": 1,
+            "kind": "finished",
+            "result": failed_gate_result(&job_id, job_seed),
+        }
+    }));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let final_doc = ctx.hub.test_get_gate_job(&job_id).await.unwrap().unwrap();
+    assert_eq!(final_doc["state"], json!("failed"), "{final_doc}");
+    assert_eq!(
+        final_doc["logObjectId"],
+        json!(object_id),
+        "the duplicate redelivery settled a second time: {final_doc}"
+    );
     let (status, by_job) = ctx
         .send(
             "GET",
@@ -2872,7 +3059,7 @@ async fn both_evidence_deliveries_fail_then_the_hub_retries_without_a_third_deli
     assert_eq!(
         by_job["log"]["headline"],
         json!("the two-path evidence"),
-        "the automatic retry settled under the retained result's own bytes: {by_job}"
+        "the re-supplied verdict settled under its own bytes: {by_job}"
     );
 }
 

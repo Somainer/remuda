@@ -115,9 +115,22 @@ function contextPctOf(
   rollups: Record<string, UsageRollup>,
 ): number | null {
   const id = instance?.id;
-  const pct =
-    (id ? rollups[id]?.contextPct : null) ?? instance?.usageRollup?.contextPct ?? null;
+  const rollup = (id ? rollups[id] : undefined) ?? instance?.usageRollup ?? undefined;
+  // c-usagefu r16 item 7: an Unavailable rollup paints no ring/percentage.
+  if (rollup?.unavailable) return null;
+  const pct = rollup?.contextPct ?? null;
   return typeof pct === "number" && Number.isFinite(pct) ? pct : null;
+}
+
+/** Whether the resolved rollup window is only a kind-fallback guess. */
+function contextApproxOf(
+  instance: Instance | undefined,
+  rollups: Record<string, UsageRollup>,
+): boolean {
+  const id = instance?.id;
+  const rollup = (id ? rollups[id] : undefined) ?? instance?.usageRollup ?? undefined;
+  if (rollup?.unavailable) return false;
+  return rollup?.contextPctApproximate ?? false;
 }
 
 /**
@@ -148,6 +161,8 @@ export type InboxInteractionRow = {
   timeLabel: string;
   /** 0..100; null renders neither ring nor number. */
   contextPct: number | null;
+  /** Kind-fallback window guess (render ≈). */
+  contextPctApproximate: boolean;
   uiState: Extract<InteractionUiState, "pending" | "answering" | "paused">;
   answerable: boolean;
   /** One-tap options for approval / plan-review rows. */
@@ -177,6 +192,7 @@ export type InboxInstanceRow = {
   harness: string;
   timeLabel: string;
   contextPct: number | null;
+  contextPctApproximate: boolean;
   status: UiStatus;
   updatedAt: string;
   /** Deep-equality signature for the memoized recent-row card. */
@@ -336,6 +352,7 @@ export function deriveRecentInstances(
     const subtitle = latestEventText(instance, source.phrases[instance.id]);
     const timeLabel = formatListTime(instance.updatedAt, nowMs);
     const contextPct = contextPctOf(instance, source.rollups);
+    const contextPctApproximate = contextApproxOf(instance, source.rollups);
     const row: InboxInstanceRow = {
       rowType: "instance",
       rowId: instance.id,
@@ -348,6 +365,7 @@ export function deriveRecentInstances(
       harness: instance.kind,
       timeLabel,
       contextPct,
+      contextPctApproximate,
       status,
       updatedAt: instance.updatedAt,
       sig: JSON.stringify({
@@ -363,7 +381,7 @@ export function deriveRecentInstances(
           instance.exit,
         ],
         // contextPct also reads source.rollups (a separate store slice).
-        v: [hostLabel, workspaceLabel, title, subtitle, timeLabel, contextPct, status],
+        v: [hostLabel, workspaceLabel, title, subtitle, timeLabel, contextPct, contextPctApproximate, status],
       }),
     };
     recent.push(row);
@@ -417,6 +435,7 @@ export function deriveInboxRows(
     const timeLabel = formatListTime(item.updatedAt || item.createdAt, nowMs);
     const subtitle = latestEventText(instance, source.phrases[item.instanceId], item);
     const contextPct = contextPctOf(instance, source.rollups);
+    const contextPctApproximate = contextApproxOf(instance, source.rollups);
     const focused = focus === item.id;
     pending.push({
       rowType: "interaction",
@@ -433,6 +452,7 @@ export function deriveInboxRows(
       harness: instance?.kind ?? "—",
       timeLabel,
       contextPct,
+      contextPctApproximate,
       uiState,
       answerable: item.answerable,
       options,
@@ -464,7 +484,7 @@ export function deriveInboxRows(
             ]
           : null,
         // contextPct also reads source.rollups (a separate store slice).
-        v: [hostLabel, workspaceLabel, subtitle, timeLabel, contextPct, focused ? 1 : 0, uiState],
+        v: [hostLabel, workspaceLabel, subtitle, timeLabel, contextPct, contextPctApproximate, focused ? 1 : 0, uiState],
       }),
     });
   }

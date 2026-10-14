@@ -173,8 +173,13 @@ fn node_herdr_session(data_dir: &Path, configured: Option<String>) -> String {
     })
 }
 
-/// Register `claude-print`, `claude-sdk`, `claude-pty`, and `claude-bg` as
-/// per-instance factories.
+/// Register the native per-instance factories.
+///
+/// The registry MINTS and OWNS the Node census epoch shared by every driver
+/// it builds (c-usagefu r19 item 1): construct the Node from THIS registry
+/// (`DevNode::with_parts*`) and its shutdown retires exactly these drivers'
+/// stop-incomplete blocks. There is no production path that builds a native
+/// driver with a detached epoch.
 pub fn native_driver_registry(config: NativeDriverConfig) -> Result<DriverRegistry, NodeError> {
     if config
         .claude_native_home
@@ -191,6 +196,7 @@ pub fn native_driver_registry(config: NativeDriverConfig) -> Result<DriverRegist
         ));
     }
     let registry = DriverRegistry::default();
+    let epoch = registry.census_epoch();
     for kind in [
         DriverKind::ClaudePrint,
         // Registering the factory is what makes `--driver claude-sdk` work. It
@@ -205,6 +211,7 @@ pub fn native_driver_registry(config: NativeDriverConfig) -> Result<DriverRegist
         registry.register_factory(Arc::new(NativeClaudeFactory {
             kind,
             config: config.clone(),
+            epoch: epoch.clone(),
         }))?;
     }
     Ok(registry)
@@ -213,6 +220,9 @@ pub fn native_driver_registry(config: NativeDriverConfig) -> Result<DriverRegist
 struct NativeClaudeFactory {
     kind: DriverKind,
     config: NativeDriverConfig,
+    /// Census epoch shared with the registry (and Node) that owns this
+    /// factory.
+    epoch: remuda_driver::NodeEpoch,
 }
 
 impl NativeClaudeFactory {
@@ -429,6 +439,10 @@ impl DriverFactory for NativeClaudeFactory {
                 options.session_name = self.config.herdr_session.clone();
                 options.socket_dir = self.config.herdr_socket_dir.clone();
                 options.herdr_binary = self.config.herdr_binary.clone();
+                // c-usagefu (d): stamp the codex/grok file-tail adapter
+                // observations with the real Hub-issued instance id.
+                options.instance_id = Some(launch.instance.meta.id.clone());
+                options.node_epoch = Some(self.epoch.clone());
                 Arc::new(GenericPtyDriver::new(options))
             }
             DriverKind::ShellPty => {
@@ -516,6 +530,10 @@ impl DriverFactory for NativeClaudeFactory {
                     &launch.request.extra_env,
                 ));
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
+                // c-usagefu r18 items 2/3: scope this driver's
+                // stop-incomplete census blocks (and its shutdown-warning
+                // behaviour) to the Node that built it.
+                options.node_epoch = Some(self.epoch.clone());
                 // Unconditional, and deliberately not inside the `pty_hooks`
                 // block below: a promoted shell with hooks off would otherwise
                 // keep a random scope, and every id it derives (transcript
@@ -897,6 +915,30 @@ impl Driver for NativeAdapter {
         >,
     > {
         Box::pin(async move { self.native.screen_read().await.map_err(map_driver_error) })
+    }
+
+    #[cfg(feature = "test-stub")]
+    fn test_force_stop_incomplete(&self) {
+        let outcome = match self.native.test_pgid() {
+            Some(pgid) => remuda_driver::TestStopOutcome {
+                rung: remuda_driver::shell_pty::StopRung::Kill,
+                group_gone: false,
+                pgid: Some(pgid),
+                survivors: vec![pgid],
+            },
+            None => remuda_driver::TestStopOutcome {
+                rung: remuda_driver::shell_pty::StopRung::Kill,
+                group_gone: false,
+                pgid: None,
+                survivors: Vec::new(),
+            },
+        };
+        self.native.test_force_stop_outcome(outcome);
+    }
+
+    #[cfg(feature = "test-stub")]
+    fn test_codex_bound(&self) -> bool {
+        self.native.test_codex_bound()
     }
 
     fn execute(&self, request: DriverRequest) -> DriverFuture<'_> {

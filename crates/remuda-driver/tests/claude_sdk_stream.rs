@@ -5,8 +5,8 @@
 //! The properties under test are `print-replacement.md` §1.7 and §2.5 plus
 //! D-028a item 3: one message node across every delta, `Partial` completeness
 //! while a block is open and `Structured` once the final block closes it,
-//! thought / tool_call / tool_result ordering, and usage from the terminal
-//! `result`.
+//! thought / tool_call / tool_result ordering, and per-call usage from the
+//! model stream (cost from the terminal `result`).
 
 use remuda_driver::StdoutMapper;
 use remuda_protocol::{
@@ -265,28 +265,57 @@ fn session_identity_comes_from_system_init() {
     }
 }
 
-/// Usage rides the terminal `result` (§2.5, `usage_from_result`); the usage page
-/// regresses if this stops arriving on the new carrier (§2.8).
+/// c-usagefu r2 item 3: the SDK carrier takes per-call tokens from the
+/// assistant `message.usage` / `message_delta` stream (the provisional
+/// assistant frame revised to the final delta), NOT a cumulative Session stock
+/// summed from `result.usage`. The result still contributes the reported cost.
+/// The usage page regresses if either channel stops arriving.
 #[test]
-fn usage_comes_from_the_terminal_result() {
+fn usage_tokens_ride_per_call_frames_and_cost_rides_the_result() {
     let (_mapper, obs) = partial_then_final();
-    let usage = obs
+
+    // Per-call Turn usage: provisional output 3 on the assistant frame, revised
+    // to the final 7 on message_delta; input 11 is constant.
+    let turn: Vec<&remuda_protocol::UsagePayload> = obs
         .iter()
-        .find_map(|o| match &o.body {
-            ObservationPayload::Usage(p) => Some(p.as_ref()),
+        .filter_map(|o| match &o.body {
+            ObservationPayload::Usage(p) if p.scope == remuda_protocol::UsageScope::Turn => {
+                Some(p.as_ref())
+            }
             _ => None,
         })
-        .expect("usage observation");
-    assert_eq!(usage.input_tokens, Knowledge::Known { value: U64(11) });
-    assert_eq!(usage.output_tokens, Knowledge::Known { value: U64(7) });
-    assert_eq!(usage.total_tokens, Knowledge::Known { value: U64(18) });
-    match &usage.cost {
+        .collect();
+    assert_eq!(turn.len(), 2, "provisional rev 1 + final rev 2");
+    assert_eq!(turn[0].output_tokens, Knowledge::Known { value: U64(3) });
+    let final_turn = turn[1];
+    assert_eq!(final_turn.input_tokens, Knowledge::Known { value: U64(11) });
+    assert_eq!(final_turn.output_tokens, Knowledge::Known { value: U64(7) });
+    assert_eq!(final_turn.total_tokens, Knowledge::Known { value: U64(18) });
+
+    // The result Session snapshot carries cost but NO token stock.
+    let session = obs
+        .iter()
+        .find_map(|o| match &o.body {
+            ObservationPayload::Usage(p) if p.scope == remuda_protocol::UsageScope::Session => {
+                Some(p.as_ref())
+            }
+            _ => None,
+        })
+        .expect("result session usage");
+    assert!(
+        matches!(session.input_tokens, Knowledge::Unknown { .. }),
+        "result.usage must not become a cumulative session stock: {:?}",
+        session.input_tokens
+    );
+    assert!(matches!(session.output_tokens, Knowledge::Unknown { .. }));
+    match &session.cost {
         Knowledge::Known { value } => assert_eq!(value.currency, "USD"),
         other => panic!("expected a reported cost, got {other:?}"),
     }
 
-    // The turn lifecycle precedes its usage, and a terminal result affects
-    // completion (`map_result`).
+    // The per-call tokens are known while the model is still streaming, so the
+    // Turn usage precedes the terminal turn_done; the cost-bearing Session
+    // snapshot follows its result (which flips completion).
     let turn_done = obs
         .iter()
         .position(|o| match &o.body {
@@ -303,8 +332,32 @@ fn usage_comes_from_the_terminal_result() {
             _ => false,
         })
         .expect("terminal turn_done");
-    let usage_at = first_index(&obs, "usage");
-    assert!(turn_done < usage_at, "usage must follow its result");
+    let turn_usage_at = obs
+        .iter()
+        .position(|o| {
+            matches!(
+                &o.body,
+                ObservationPayload::Usage(p) if p.scope == remuda_protocol::UsageScope::Turn
+            )
+        })
+        .expect("per-call turn usage");
+    let session_usage_at = obs
+        .iter()
+        .position(|o| {
+            matches!(
+                &o.body,
+                ObservationPayload::Usage(p) if p.scope == remuda_protocol::UsageScope::Session
+            )
+        })
+        .expect("result session usage");
+    assert!(
+        turn_usage_at < turn_done,
+        "per-call tokens ride the model message, before the terminal result"
+    );
+    assert!(
+        turn_done < session_usage_at,
+        "the cost-bearing result usage must follow its result"
+    );
 }
 
 /// The recorded print fixture still assembles on the sdk carrier: the two

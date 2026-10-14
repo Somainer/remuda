@@ -5716,52 +5716,191 @@ fn map_result(mapper: &mut Mapper, result: &ResultMessage) -> DriverResult<Vec<O
     Ok(out)
 }
 
+/// Per-call usage from one stream-json `assistant` frame's `message.usage`.
+///
+/// c-usagefu (a): the authoritative per-call counters live on the assistant
+/// message, not on the `result` frame (whose usage is summed over every call
+/// in the turn). One Turn-scoped payload per top-level model message, keyed by
+/// message id so the Hub durably dedupes the repeated content-block frames.
+/// Sub-agent (nested) frames are skipped, matching transcript sidechains.
+/// All-zero usage yields nothing.
+fn usage_from_assistant_message(
+    mapper: &mut Mapper,
+    msg: &AssistantMessage,
+) -> DriverResult<Option<Observation>> {
+    let Some(message_id) = msg
+        .message
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(None);
+    };
+    if !mapper.stream.usage_messages.insert(message_id.to_owned()) {
+        return Ok(None);
+    };
+    let Some(usage) = msg.message.get("usage") else {
+        return Ok(None);
+    };
+    let model = msg.message.get("model").and_then(Value::as_str);
+    turn_usage_observation(mapper, message_id, model, usage, 1)
+}
+
+/// Build one Turn-scoped per-call usage observation for an assistant message
+/// from a native stream-json `usage` blob.
+///
+/// Revision 1 is the PROVISIONAL blob riding the assistant / `message_start`
+/// frame: with `--include-partial-messages` its `output_tokens` is whatever
+/// had been produced at that instant. Revision 2 is the FINAL blob riding
+/// `message_delta`, which carries the message's full final usage (identical
+/// input/cache buckets, true output count — c-usagefu r2 item 2). The Hub
+/// revision-replaces the row when counters grow.
+fn turn_usage_observation(
+    mapper: &mut Mapper,
+    message_id: &str,
+    model: Option<&str>,
+    usage: &Value,
+    revision: u64,
+) -> DriverResult<Option<Observation>> {
+    // Remember the revision-1 blob so a sparse message_delta PATCH (output
+    // tokens only, common behind Bedrock/Vertex/gateway profiles) overlays
+    // onto it instead of zeroing the omitted input/cache buckets
+    // (c-usagefu r3 item 2). First frame wins, matching the rev-1 dedupe.
+    if revision == 1 && usage.is_object() && !mapper.stream.message_usage.contains_key(message_id) {
+        mapper
+            .stream
+            .message_usage
+            .insert(message_id.to_owned(), usage.clone());
+    }
+    let Some(event) =
+        crate::usage::claude::usage_from_message_usage(Some(message_id), None, model, usage)
+    else {
+        return Ok(None);
+    };
+    // Skip an all-zero call (no fresh input, no output, no cache buckets).
+    let counters = &event.tokens;
+    if counters.uncached_input == 0
+        && counters.output == 0
+        && counters.cache_read == 0
+        && counters.cache_write() == 0
+    {
+        return Ok(None);
+    }
+    let mut totals = crate::usage::UsageTotals::default();
+    totals.add(&event);
+    let mut payload =
+        crate::usage::to_usage_payload(UsageScope::Turn, message_id.to_owned(), revision, &totals);
+    payload.usage_id = Id::derive(
+        "obj",
+        mapper.instance_id.as_id().as_str(),
+        &format!("usage:turn:{message_id}"),
+    )?;
+    if let Some(model) = model
+        && let Some(&window) = mapper.stream.model_windows.get(model)
+    {
+        payload.context_window = Some(U64(window));
+    }
+    Ok(Some(mapper.observation(
+        Completeness::Structured,
+        NativeRequestKey::None,
+        ObservationPayload::Usage(Box::new(payload)),
+    )?))
+}
+
+/// Session-level evidence from one stream-json `result` frame.
+///
+/// c-usagefu (a): token counters are NOT read here — `result.usage` is summed
+/// over every call in the turn and double counts cache buckets once per-call
+/// assistant usage is emitted (`usage_from_assistant_message`). The result is
+/// still authoritative for the cumulative reported cost and carries the
+/// per-model `modelUsage.contextWindow`, so this emits a token-less
+/// Session-scoped snapshot the Hub revision-replaces in place. Results with no
+/// cost and no modelUsage (including all-zero results) produce nothing.
 fn usage_from_result(
     mapper: &mut Mapper,
     result: &ResultMessage,
 ) -> DriverResult<Option<Observation>> {
-    let usage = result.usage.clone().unwrap_or(Value::Null);
-    let input = usage.get("input_tokens").and_then(Value::as_u64);
-    let output = usage.get("output_tokens").and_then(Value::as_u64);
-    if input.is_none() && output.is_none() && result.total_cost_usd.is_none() {
-        return Ok(None);
+    // Learn native per-model windows from modelUsage for later calls.
+    if let Some(model_usage) = result.model_usage.as_ref().and_then(Value::as_object) {
+        for (model, blob) in model_usage {
+            if let Some(window) = blob
+                .get("contextWindow")
+                .and_then(Value::as_u64)
+                .filter(|window| *window > 0)
+            {
+                mapper.stream.model_windows.insert(model.clone(), window);
+            }
+        }
     }
     let cost = result.total_cost_usd.map(|amount| Cost {
         amount: amount.to_string(),
         currency: "USD".into(),
     });
-    Ok(Some(
-        mapper.observation(
-            Completeness::Structured,
-            NativeRequestKey::None,
-            ObservationPayload::Usage(Box::new(UsagePayload {
-                usage_id: Id::new("obj")?,
-                scope: UsageScope::Turn,
-                scope_id: result
-                    .result_index
-                    .map(|index| index.to_string())
-                    .unwrap_or_else(|| "0".into()),
-                mode: UsageMode::Snapshot,
-                metric_revision: U64(result.result_index.unwrap_or(0) + 1),
-                input_tokens: opt_u64(input),
-                input_accounting: InputAccounting::Unknown,
-                output_tokens: opt_u64(output),
-                reasoning_tokens: unknown("not-emitted"),
-                cache_read_tokens: unknown("not-emitted"),
-                cache_write_tokens: unknown("not-emitted"),
-                total_tokens: match (input, output) {
-                    (Some(a), Some(b)) => Knowledge::Known { value: U64(a + b) },
-                    _ => unknown("partial"),
-                },
-                cost: match cost {
-                    Some(cost) => Knowledge::Known { value: cost },
-                    None => unknown("not-emitted"),
-                },
-                accounting: remuda_protocol::Accounting::Reported,
-                native_fields_ref: None,
-            })),
-        )?,
-    ))
+    // A single reported window only when the result named exactly one model;
+    // a multi-model session total cannot be pinned to one window.
+    let window = result
+        .model_usage
+        .as_ref()
+        .and_then(Value::as_object)
+        .filter(|models| models.len() == 1)
+        .and_then(|models| {
+            models
+                .values()
+                .next()
+                .and_then(|blob| blob.get("contextWindow"))
+                .and_then(Value::as_u64)
+                .filter(|window| *window > 0)
+        });
+    // Both print and SDK take per-call counters from the assistant /
+    // message_delta frames (item (a) and c-usagefu r2 item 3). The result
+    // frame's summed usage is NEVER emitted as a cumulative Session stock:
+    // doing so summed every call's context (the exit-plan fixture showed
+    // 134,448 = 67% of 200k instead of the real last-call 33,718 = 17%) and
+    // then froze/replaced per-turn buckets. The SDK uses the identical
+    // stream-json argv apart from `-p`, so it has the same per-call channel —
+    // the old "SDK has no per-call assistant channel" reason was wrong. The
+    // result contributes ONLY the cumulative reported cost and the native
+    // modelUsage window.
+    if cost.is_none() && window.is_none() {
+        return Ok(None);
+    }
+    // Monotonic across turns and the two Workflow sub-results.
+    let revision = result
+        .num_turns
+        .unwrap_or(1)
+        .saturating_mul(1000)
+        .saturating_add(result.result_index.map(|index| index + 1).unwrap_or(1));
+    let session_id = mapper.session_id.clone();
+    let mut payload = UsagePayload {
+        usage_id: Id::new("obj")?,
+        scope: UsageScope::Session,
+        scope_id: session_id.clone(),
+        mode: UsageMode::Snapshot,
+        metric_revision: U64(revision),
+        input_tokens: unknown("not-emitted-on-result"),
+        input_accounting: InputAccounting::Unknown,
+        output_tokens: unknown("not-emitted-on-result"),
+        reasoning_tokens: unknown("not-emitted-on-result"),
+        cache_read_tokens: unknown("not-emitted-on-result"),
+        cache_write_tokens: unknown("not-emitted-on-result"),
+        total_tokens: unknown("not-emitted-on-result"),
+        cost: unknown("not-emitted"),
+        accounting: remuda_protocol::Accounting::Estimated,
+        native_fields_ref: None,
+        context_window: None,
+    };
+    // The result frame is the source of truth for reported cost; the native
+    // modelUsage window rides along. Both carriers keep these.
+    if let Some(cost) = cost {
+        payload.cost = Knowledge::Known { value: cost };
+        payload.accounting = remuda_protocol::Accounting::Reported;
+    }
+    payload.context_window = window.map(U64);
+    Ok(Some(mapper.observation(
+        Completeness::Structured,
+        NativeRequestKey::None,
+        ObservationPayload::Usage(Box::new(payload)),
+    )?))
 }
 
 fn map_task_started(mapper: &mut Mapper, task: &TaskStarted) -> DriverResult<Vec<Observation>> {
@@ -6731,6 +6870,27 @@ fn now() -> DriverResult<Timestamp> {
     Timestamp::try_from(text).map_err(DriverError::Protocol)
 }
 
+/// Parse a transcript record's RFC3339 `timestamp` (variable fractional digits
+/// and a possible non-UTC offset) into the protocol's canonical millisecond-Z
+/// clock. Returns `None` for an unparseable value rather than guessing, so the
+/// observation falls back to ingest time (c-ctxusage r3 item 5).
+fn native_timestamp(text: &str) -> Option<Timestamp> {
+    use time::format_description::well_known::Rfc3339;
+    let t = time::OffsetDateTime::parse(text, &Rfc3339).ok()?;
+    let t = t.to_offset(time::UtcOffset::UTC);
+    let canonical = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.millisecond(),
+    );
+    Timestamp::try_from(canonical).ok()
+}
+
 fn dummy_digest() -> Digest {
     Digest::try_from(format!("sha256:{:0>64}", "0")).expect("digest")
 }
@@ -6758,13 +6918,6 @@ fn unknown<T>(reason: &str) -> Knowledge<T> {
     Knowledge::Unknown {
         reason: reason.into(),
         evidence_event_ids: Vec::<EventId>::new(),
-    }
-}
-
-fn opt_u64(value: Option<u64>) -> Knowledge<U64> {
-    match value {
-        Some(value) => Knowledge::Known { value: U64(value) },
-        None => unknown("not-emitted"),
     }
 }
 
@@ -6922,6 +7075,14 @@ impl StdoutMapper {
     pub fn session_id(&self) -> &str {
         &self.mapper.session_id
     }
+}
+
+/// Whether a group drain happens mid-stream (a poll boundary) or at a hard
+/// boundary (a superseding message / user record / end of stream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupDrain {
+    Poll,
+    Supersede,
 }
 
 /// One slot in the slash → verdict FIFO (c-effortread r16 item 2).
@@ -7346,25 +7507,44 @@ impl TranscriptMapper {
         self.map_record_at(value, position)
     }
 
-    /// Flush whatever assistant run is still buffered.
-    ///
-    /// A run is normally closed by the record that supersedes it, so the last
-    /// message of a transcript would otherwise sit in the buffer forever. The
-    /// tailer calls this when it reaches the end of the available input.
+    /// Poll-boundary drain (called at the end of every pump batch): publish
+    /// any new content blocks, and — only for a run that has seen its
+    /// stop_reason and carries fresh counters — a provisional, replaceable
+    /// usage snapshot. The group is retained, so a later same-message-id record
+    /// publishes a higher revision instead of reopening a fresh group.
     pub fn flush(&mut self) -> DriverResult<Vec<Observation>> {
-        self.flush_group()
+        self.drain_group(GroupDrain::Poll)
     }
 
-    /// Emit the buffered assistant run, if there is one.
-    fn flush_group(&mut self) -> DriverResult<Vec<Observation>> {
-        let Some(record) = self.group.flush() else {
-            return Ok(Vec::new());
+    /// Explicit end-of-stream / supersede: publish any new content and FINALISE
+    /// the retained run's usage even without a stop_reason (an interrupted or
+    /// killed last turn must not lose its counters). The caller starts the next
+    /// group afterwards.
+    pub fn finish(&mut self) -> DriverResult<Vec<Observation>> {
+        self.drain_group(GroupDrain::Supersede)
+    }
+
+    /// Drain content and (depending on the trigger) finalise usage without ever
+    /// clearing the retained group's identity/counters here — `start` for the
+    /// next message is what resets it. Emits only conversation + the run's
+    /// usage (never effort/model extras, which map_record/group-extras computed
+    /// once — c-effortread r9 item 5).
+    fn drain_group(&mut self, trigger: GroupDrain) -> DriverResult<Vec<Observation>> {
+        let mut out = Vec::new();
+        if let Some(content) = self.group.drain_content() {
+            out.extend(self.emit_conversation(content.record)?);
+        }
+        let publishable = match trigger {
+            GroupDrain::Poll => self.group.usage_publishable_at_poll(),
+            GroupDrain::Supersede => self.group.usage_publishable_on_supersede(),
         };
-        // c-effortread r9 item 5: emit ONLY conversation records here. The
-        // run's effort/model extras were already computed exactly once at
-        // map_record (native order); they must not be recomputed against
-        // tracker state a later slash may have advanced.
-        self.emit_conversation(record)
+        if publishable
+            && let Some(pending) = self.group.take_usage()
+            && let Some(obs) = self.usage_from_pending(&pending)?
+        {
+            out.push(obs);
+        }
+        Ok(out)
     }
 
     /// Hand one already-assembled record to the stdout mapper.
@@ -7421,7 +7601,83 @@ impl TranscriptMapper {
                 }
             }
         }
+        // Usage is emitted by flush_group only when the group finalises (a
+        // stop_reason was seen or the run was superseded), never on a poll
+        // boundary mid-message (c-ctxusage r2 item 3).
         Ok(out)
+    }
+
+    /// Emit one [`ObservationPayload::Usage`] for a finalised assistant
+    /// message group from the group's last `message.usage`.
+    ///
+    /// D-056/context-usage: native TUI usage lives only in transcript records.
+    /// Scope is `Turn`; scope_id is the bare assistant `message.id` — the same
+    /// key round one (f890028e) persisted — so a re-hydration replays fold onto
+    /// the existing row instead of minting a second turn. `requestId` is NOT
+    /// namespaced into the key: within one instance a Claude message id is
+    /// already unique, and prefixing it made round-one rows unmergeable
+    /// (c-ctxusage r3 item 4). Counters come from the LAST block (never a sum);
+    /// `revision` lets a later same-message record replace a provisional row.
+    fn usage_from_usage_object(
+        &mut self,
+        message_id: &str,
+        request_id: Option<&str>,
+        model: Option<&str>,
+        usage: &Value,
+        revision: u64,
+        native_at: Option<Timestamp>,
+    ) -> DriverResult<Option<Observation>> {
+        if message_id.is_empty() {
+            return Ok(None);
+        }
+        let scope_id = message_id.to_owned();
+        let event = match crate::usage::claude::usage_from_message_usage(
+            Some(message_id),
+            request_id,
+            model,
+            usage,
+        ) {
+            Some(event) => event,
+            None => return Ok(None),
+        };
+        let mut totals = crate::usage::UsageTotals::default();
+        totals.add(&event);
+        let mut payload =
+            crate::usage::to_usage_payload(UsageScope::Turn, scope_id.clone(), revision, &totals);
+        payload.usage_id = remuda_protocol::Id::derive(
+            "obj",
+            self.mapper.instance_id.as_id().as_str(),
+            &format!("usage:turn:{scope_id}"),
+        )?;
+        let mut obs = self.mapper.observation(
+            Completeness::Structured,
+            remuda_protocol::NativeRequestKey::None,
+            ObservationPayload::Usage(Box::new(payload)),
+        )?;
+        // c-ctxusage r3 item 5: carry the record's own timestamp so a historical
+        // replay stays out of the TPM/lastTurnAt windows (the pump builders
+        // preserve it rather than rebuilding the envelope as unknown).
+        if let Some(at) = native_at {
+            obs.native_at = Knowledge::Known { value: at };
+        }
+        Ok(Some(obs))
+    }
+
+    /// Build the usage observation for a group's pending snapshot, parsing its
+    /// record timestamp into the protocol millisecond clock.
+    fn usage_from_pending(
+        &mut self,
+        pending: &records::PendingUsage,
+    ) -> DriverResult<Option<Observation>> {
+        let native_at = pending.native_at.as_deref().and_then(native_timestamp);
+        self.usage_from_usage_object(
+            &pending.message_id,
+            pending.request_id.as_deref(),
+            pending.model.as_deref(),
+            &pending.usage,
+            pending.revision,
+            native_at,
+        )
     }
 
     /// Map one decoded transcript record.
@@ -7477,8 +7733,8 @@ impl TranscriptMapper {
         let mut mapped = match kind {
             "assistant" => self.map_assistant_record(value),
             "user" => {
-                // Any user record ends the assistant run before it.
-                let mut out = self.flush_group()?;
+                // Any user record ends (supersedes) the assistant run before it.
+                let mut out = self.finish()?;
                 out.extend(self.map_user_record(value)?);
                 Ok(out)
             }
@@ -8267,7 +8523,7 @@ impl TranscriptMapper {
         let Some(key) = records::GroupKey::of(&value, &message) else {
             // No `message.id` to group on — replay it on its own rather than
             // dropping a real assistant turn.
-            let mut out = self.flush_group()?;
+            let mut out = self.finish()?;
             out.extend(self.emit_conversation(value)?);
             return Ok(out);
         };
@@ -8275,7 +8531,7 @@ impl TranscriptMapper {
             self.group.push(&value, &message);
             return Ok(Vec::new());
         }
-        let out = self.flush_group()?;
+        let out = self.finish()?;
         self.group.start(key, value.clone());
         self.group.push(&value, &message);
         Ok(out)
@@ -8518,6 +8774,16 @@ pub mod review {
         /// Map one stdout frame, carrying identity forward.
         pub fn map(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
             map_outbound(&mut self.mapper, &Outbound::from_value(value))
+        }
+
+        /// Like [`Self::new`] but stamping a specific carrier (e.g.
+        /// `DriverKind::ClaudeSdk`, which drives this same engine without
+        /// `-p`). Session id is fixed for review determinism.
+        #[must_use]
+        pub fn with_driver(driver: DriverKind) -> Self {
+            let mut mapper = Self::new();
+            mapper.mapper.driver_kind = driver;
+            mapper
         }
     }
 

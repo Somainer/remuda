@@ -1402,6 +1402,9 @@ async fn instance_usage_http(
         "outputTokens": agg.output_tokens,
         "estimatedUsd": agg.cost_usd,
         "estimated": true,
+        // c-usagefu r16 item 7: on the rolled-back usage shape the numbers are
+        // placeholders, not evidence; the client renders Unknown, never $0.00.
+        "unavailable": agg.unavailable,
     })))
 }
 

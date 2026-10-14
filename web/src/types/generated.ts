@@ -4484,6 +4484,7 @@ export type UsagePayload = ({
   "accounting": Accounting;
   "cacheReadTokens": Knowledge3;
   "cacheWriteTokens": Knowledge3;
+  "contextWindow"?: (U64 | (null));
   "cost": Knowledge25;
   "inputAccounting": InputAccounting;
   "inputTokens": Knowledge3;

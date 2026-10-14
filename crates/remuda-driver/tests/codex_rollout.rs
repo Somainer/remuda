@@ -392,7 +392,11 @@ fn tail_appends_complete_records_and_preserves_utf8_across_polls() {
     std::fs::write(&path, b"{\"type\":\"compacted\"}\r\n\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"\xe4").unwrap();
     let mut tail = RolloutTail::new(path.clone());
     let records = tail.poll().unwrap();
-    assert_eq!(records, [r#"{"type":"compacted"}"#]);
+    assert_eq!(
+        records,
+        [(0u64, r#"{"type":"compacted"}"#.to_owned())],
+        "each record carries its first-byte offset in the file"
+    );
     assert!(tail.poll().unwrap().is_empty());
     let mut file = std::fs::OpenOptions::new()
         .append(true)
@@ -401,18 +405,26 @@ fn tail_appends_complete_records_and_preserves_utf8_across_polls() {
     file.write_all(b"\xb8\xad\"}}\n").unwrap();
     let records = tail.poll().unwrap();
     assert_eq!(records.len(), 1);
+    let (offset, line) = &records[0];
     assert_eq!(
-        parse_rollout_line(&records[0]).unwrap().event,
+        parse_rollout_line(line).unwrap().event,
         Event::Message {
             role: "user".into(),
             text: "中".into()
         }
     );
+    // The second record follows the 22-byte CRLF line plus the skipped blank
+    // line (1 byte): offset 23, replay-stable.
+    assert_eq!(*offset, 23);
     assert_eq!(tail.path(), path);
     assert_eq!(tail.offset(), std::fs::metadata(&path).unwrap().len());
     assert!(tail.poll().unwrap().is_empty());
     std::fs::write(&path, b"{\"type\":\"compacted\"}\n").unwrap();
-    assert_eq!(tail.poll().unwrap(), [r#"{"type":"compacted"}"#]);
+    assert_eq!(
+        tail.poll().unwrap(),
+        [(0u64, r#"{"type":"compacted"}"#.to_owned())],
+        "a shrunken file restarts the tail at byte zero"
+    );
 }
 
 fn write_meta(path: &Path, id: &str, root: &str) {
@@ -498,4 +510,172 @@ fn discovery_does_not_follow_file_or_directory_symlinks() {
     std::fs::remove_dir_all(&sessions).unwrap();
     std::os::unix::fs::symlink(outside.path(), sessions).unwrap();
     assert_eq!(locate_rollout_in(tmp.path(), "thread-a"), None);
+}
+
+#[test]
+fn locate_by_cwd_skips_a_fresh_file_when_its_date_directory_predates_the_floor() {
+    // Isolates the DATE-LEAF directory prune: the file mtime is set AFTER the
+    // floor (so the per-file filter passes), the content timestamp is also
+    // after the floor (so parsing WOULD return Found), but the YYYY/MM/DD date
+    // directory's own mtime predates the floor -> the whole subtree is
+    // skipped without opening the file.
+    use remuda_driver::codex_rollout::{CandidateTier, CwdRollout, locate_rollout_by_cwd};
+    use std::fs::File;
+    use std::time::SystemTime;
+
+    let home = tempfile::tempdir().unwrap();
+    let cwd = Path::new("/projects/prune-dir");
+    let session_dir = home.path().join("sessions/2026/09/14");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    // Content starts in the FUTURE relative to the floor: the content check
+    // accepts it. Only the mtime/dir pruning may reject.
+    let started = (time::OffsetDateTime::now_utc() + time::Duration::seconds(61))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let rollout = session_dir.join("rollout-prune-dir.jsonl");
+    {
+        let mut file = File::create(&rollout).unwrap();
+        writeln!(
+            file,
+            "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"prune-dir\",\"session_id\":\"prune-dir\",\"cwd\":\"/projects/prune-dir\",\"timestamp\":\"{started}\"}}}}"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{{\"timestamp\":\"{started}\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"prune prompt\"}}]}}}}"
+        )
+        .unwrap();
+        // The FILE is newer than the floor ...
+        file.set_modified(SystemTime::now() + std::time::Duration::from_secs(120))
+            .unwrap();
+    }
+    // ... but the date directory keeps its (older) creation mtime.
+    File::open(&session_dir)
+        .unwrap()
+        .set_modified(SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+
+    let floor = time::OffsetDateTime::now_utc() + time::Duration::seconds(60);
+    let found = locate_rollout_by_cwd(home.path(), cwd, floor, &|_| false, &|_, _, _, _| {
+        Some(CandidateTier::Prompt)
+    });
+    assert!(
+        matches!(found, CwdRollout::NotYet),
+        "the stale date directory prunes a fresh, content-matching file: {found:?}"
+    );
+
+    // A floor older than the forced directory mtime finds the same file
+    // normally (its mtime is stale by construction for this test).
+    let past = time::OffsetDateTime::now_utc() - time::Duration::seconds(4000);
+    let found = locate_rollout_by_cwd(home.path(), cwd, past, &|_| false, &|_, _, _, _| {
+        Some(CandidateTier::Prompt)
+    });
+    assert!(
+        matches!(found, CwdRollout::Found { .. }),
+        "past floor binds"
+    );
+}
+
+#[test]
+fn locate_by_cwd_skips_an_old_file_even_under_a_fresh_non_date_directory() {
+    // Isolates the per-FILE mtime filter: inside a non-date directory (which
+    // the directory prune never touches), a content-matching file whose mtime
+    // predates the floor is skipped without parsing. Content timestamp is set
+    // after the floor, so removing the file filter would return Found.
+    use remuda_driver::codex_rollout::{CandidateTier, CwdRollout, locate_rollout_by_cwd};
+    use std::fs::File;
+    use std::time::SystemTime;
+
+    let home = tempfile::tempdir().unwrap();
+    let cwd = Path::new("/projects/prune-file");
+    let dir = home.path().join("sessions/custom-layout/sub");
+    std::fs::create_dir_all(&dir).unwrap();
+    let started = (time::OffsetDateTime::now_utc() + time::Duration::seconds(61))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let rollout = dir.join("rollout.jsonl");
+    {
+        let mut file = File::create(&rollout).unwrap();
+        writeln!(
+            file,
+            "{{\"timestamp\":\"{started}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"prune-file\",\"session_id\":\"prune-file\",\"cwd\":\"/projects/prune-file\",\"timestamp\":\"{started}\"}}}}"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{{\"timestamp\":\"{started}\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"prune prompt\"}}]}}}}"
+        )
+        .unwrap();
+    }
+    // The non-date directory is fresh; the FILE itself predates the floor.
+    File::open(&dir)
+        .unwrap()
+        .set_modified(SystemTime::now() + std::time::Duration::from_secs(120))
+        .unwrap();
+    File::open(&rollout)
+        .unwrap()
+        .set_modified(SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+
+    let floor = time::OffsetDateTime::now_utc() + time::Duration::seconds(60);
+    let found = locate_rollout_by_cwd(home.path(), cwd, floor, &|_| false, &|_, _, _, _| {
+        Some(CandidateTier::Prompt)
+    });
+    assert!(
+        matches!(found, CwdRollout::NotYet),
+        "the per-file mtime filter skips a content-matching file: {found:?}"
+    );
+
+    let past = time::OffsetDateTime::now_utc() - time::Duration::seconds(4000);
+    let found = locate_rollout_by_cwd(home.path(), cwd, past, &|_| false, &|_, _, _, _| {
+        Some(CandidateTier::Prompt)
+    });
+    assert!(
+        matches!(found, CwdRollout::Found { .. }),
+        "past floor binds"
+    );
+}
+
+#[test]
+fn first_user_text_keeps_literal_environment_marker_in_a_genuine_prompt() {
+    // r6 item 4: a real operator prompt can contain the literal
+    // "<environment_context>" string. It is the injected item only when the
+    // record carries the environments.environment_context content-item kind;
+    // text-content sniffing wrongly rejected the genuine prompt.
+    use remuda_driver::codex_rollout::first_user_text;
+    use std::io::Write;
+
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("sessions/2026/09/14");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rollout-literal-marker.jsonl");
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let mut file = std::fs::File::create(&path).unwrap();
+    // session_meta
+    writeln!(
+        file,
+        "{{\"timestamp\":\"{now}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"lit\",\"session_id\":\"lit\",\"cwd\":\"/x\",\"timestamp\":\"{now}\"}}}}"
+    )
+    .unwrap();
+    // injected context (metadata-marked)
+    writeln!(
+        file,
+        "{{\"timestamp\":\"{now}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_env\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"<environment_context>real injected block</environment_context>\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"environments.environment_context\"]}}}}}}"
+    )
+    .unwrap();
+    // genuine user prompt whose text mentions the marker but has NO env kind
+    writeln!(
+        file,
+        "{{\"timestamp\":\"{now}\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"why does my <environment_context> tag fail?\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}"
+    )
+    .unwrap();
+    drop(file);
+
+    assert_eq!(
+        first_user_text(&path).as_deref(),
+        Some("why does my <environment_context> tag fail?"),
+        "literal marker text in a genuine user.text item must be kept"
+    );
 }

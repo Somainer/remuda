@@ -2,7 +2,7 @@
 
 use crate::{
     DevNode, DevServerConfig, DriverRegistry, MemoryStore, NativeDriverConfig, NodeError,
-    dev_router, native_driver_registry,
+    dev_router,
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -134,9 +134,11 @@ pub fn compose(config: &ServeConfig) -> Result<DevNode, NodeError> {
         &config.data_dir,
         config.http.follow_buffer_capacity,
     )?);
+    // c-usagefu r19 item 1: the native registry owns the shared census epoch;
+    // with_parts_on_host adopts that same epoch from it.
     let drivers = match &config.drivers {
         LocalDrivers::Fake => DriverRegistry::with_fake()?,
-        LocalDrivers::Native(native) => native_driver_registry(native.clone())?,
+        LocalDrivers::Native(native) => crate::native_driver_registry(native.clone())?,
     };
     let host_id = crate::enroll::load_or_create(&config.data_dir)?.host_id;
     let http = config

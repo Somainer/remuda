@@ -54,6 +54,61 @@ describe("coerceUsageRollup", () => {
     expect(coerceUsageRollup(undefined)).toBeNull();
     expect(coerceUsageRollup("nope")).toBeNull();
   });
+
+  it("carries the explicit unavailable flag (r16 item 7), defaulting to false", () => {
+    const unavailable = coerceUsageRollup({ unavailable: true, turns: 0 });
+    expect(unavailable?.unavailable).toBe(true);
+    const present = coerceUsageRollup({ unavailable: false, turns: 1 });
+    expect(present?.unavailable).toBe(false);
+    const missing = coerceUsageRollup({ turns: 1 });
+    expect(missing?.unavailable).toBe(false);
+    // Only an exact boolean true arms it.
+    expect(coerceUsageRollup({ unavailable: "true" })?.unavailable).toBe(false);
+    expect(coerceUsageRollup({ unavailable: 1 })?.unavailable).toBe(false);
+  });
+});
+
+describe("unavailable usage rollup (c-usagefu r16 item 7)", () => {
+  // Even if the wire carried numbers/a percentage, the unavailable flag makes
+  // the chip render Unknown — never a value or a guess.
+  const unavailableRollup: UsageRollup = {
+    unavailable: true,
+    contextUsedTokens: 1234,
+    contextWindowTokens: 200000,
+    contextPct: 42,
+    contextPctApproximate: true,
+    sessionInputTokens: 10,
+    sessionOutputTokens: 20,
+    cacheReadTokens: null,
+    cacheCreationTokens: null,
+    turns: 7,
+    tpmIn60s: 1,
+    tpmOut60s: 2,
+    tpmIn5m: 3,
+    tpmOut5m: 4,
+    lastTurnAt: "2026-10-13T00:00:00.000Z",
+  };
+
+  it("renders an Unknown headline, never the carried percentage", () => {
+    const head = contextHeadline(unavailableRollup);
+    expect(head.text).toBe("—/— (—%)");
+    expect(head.approximate).toBe(false);
+    expect(head.missing).not.toBeNull();
+  });
+
+  it("coerces the legacy-shape wire payload to an Unknown rollup", () => {
+    // Mirrors the Hub's InstanceUsageRollup { unavailable:true, all null }.
+    const rollup = coerceUsageRollup({ unavailable: true, turns: 0 });
+    expect(rollup?.unavailable).toBe(true);
+    expect(rollup?.contextPct).toBeNull();
+    expect(contextHeadline(rollup as UsageRollup).text).toBe("—/— (—%)");
+  });
+
+  it("still renders concrete values when the rollup is available", () => {
+    const head = contextHeadline({ ...unavailableRollup, unavailable: false });
+    expect(head.text).not.toContain("—");
+    expect(head.missing).toBeNull();
+  });
 });
 
 describe("formatTokenCount", () => {
@@ -92,6 +147,24 @@ describe("contextHeadline", () => {
     } as UsageRollup);
     expect(head.text).toBe("—/200.0k (—%)");
     expect(head.missing).toMatch(/usage 观察/);
+  });
+
+  it("prefixes an approximate (kind-fallback window) percentage with ≈", () => {
+    const head = contextHeadline({
+      contextUsedTokens: 900,
+      contextWindowTokens: 200_000,
+      contextPct: 1,
+      contextPctApproximate: true,
+    } as UsageRollup);
+    expect(head.text).toBe("900/200.0k (≈1%)");
+    expect(head.approximate).toBe(true);
+  });
+
+  it("coerces contextPctApproximate only on an explicit boolean true", () => {
+    expect(coerceUsageRollup({ contextPctApproximate: true })?.contextPctApproximate).toBe(true);
+    expect(coerceUsageRollup({ contextPctApproximate: false })?.contextPctApproximate).toBe(false);
+    expect(coerceUsageRollup({ contextPctApproximate: 1 })?.contextPctApproximate).toBe(false);
+    expect(coerceUsageRollup({})?.contextPctApproximate).toBe(false);
   });
 });
 

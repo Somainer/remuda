@@ -1102,6 +1102,15 @@ class HubStore {
    * the row when it lands late (the 会话不存在 race after navigation).
    */
   private listReqSeq = 0;
+  /**
+   * c-usagefu r18 item 4: monotonic read generation for EVERY instance-list
+   * snapshot that may hydrate usage rollups (polls and the bootstrap read).
+   * `usageAppliedGen` records the newest generation actually folded, so a
+   * response that arrives out of order — including an older Unavailable page
+   * after a newer positive one — is dropped before it touches the map.
+   */
+  private usageReadGen = 0;
+  private usageAppliedGen = 0;
   private listOutstanding = new Set<number>();
   private pinnedCreates = new Map<Id, { seq: number; confirmedByNewer: boolean }>();
   /**
@@ -1515,18 +1524,43 @@ class HubStore {
   /** context-usage-1: fold Hub-computed usage rollups from polled instances
    *  into the live map. The polled projection is always fresher than the
    *  retained one (its TPM windows are recomputed server-side at read
-   *  time), so a rollup with at least as many turns wins. */
-  private hydrateUsageRollups(instances: Instance[]) {
+   *  time), so a rollup with at least as many turns wins.
+   *
+   *  c-usagefu r17 item 4: an AUTHORITATIVE AVAILABILITY transition wins
+   *  regardless of turn count. The explicit Unavailable rollup (the Hub
+   *  opened on the rolled-back usage shape) carries turns 0, so the
+   *  at-least-as-many-turns rule alone let a positive cached rollup mask it
+   *  forever and the chip kept painting the old percentage. Any change of
+   *  the `unavailable` flag — positive -> Unavailable or Unavailable ->
+   *  positive after a successful migration/restart — therefore replaces the
+   *  cached rollup. Response ordering is unchanged: rows fold in poll order.
+   *
+   *  c-usagefu r18 item 4: responses are also ordered by their READ
+   *  GENERATION (`gen`, stamped at fetch start for both polls and
+   *  bootstrap). A snapshot from an older request is dropped wholesale
+   *  BEFORE the availability/turn rules run, so a late older Unavailable
+   *  page can never overwrite a newer positive rollup (or vice versa).
+   */
+  private hydrateUsageRollups(instances: Instance[], gen?: number) {
+    // With a known generation, only the newest read so far may hydrate. A
+    // bootstrap with no passed gen (older callers) hydrates unconditionally.
+    if (gen != null && gen < this.usageAppliedGen) return;
     let updated = false;
     const next = { ...this.state.usageRollup };
     for (const instance of instances) {
       const rollup = instance.usageRollup;
       if (!rollup) continue;
       const current = next[instance.id];
+      // An authoritative availability transition (positive <-> Unavailable)
+      // wins over the cached rollup regardless of the turn count.
+      const availabilityChanged =
+        current != null &&
+        (rollup.unavailable === true) !== (current.unavailable === true);
       // Equal turn count with equal content is not a change; the server
       // rebuilds the rollup object on every read.
       if (
         !current ||
+        availabilityChanged ||
         rollup.turns > current.turns ||
         (rollup.turns === current.turns && !structuralEqual(current, rollup))
       ) {
@@ -1534,7 +1568,15 @@ class HubStore {
         updated = true;
       }
     }
-    if (updated) this.emit({ usageRollup: next });
+    if (updated) {
+      if (gen != null && gen > this.usageAppliedGen) this.usageAppliedGen = gen;
+      this.emit({ usageRollup: next });
+    } else if (gen != null && gen > this.usageAppliedGen) {
+      // The read was current even though it changed nothing: still advance
+      // the watermark so an older in-flight snapshot arriving afterwards is
+      // correctly recognized as stale.
+      this.usageAppliedGen = gen;
+    }
   }
 
   /** §9.1: fold Hub-record modelEffective + modelCatalog into the live maps. */
@@ -2990,6 +3032,9 @@ class HubStore {
         this.emit({ ready: true, authed: false, error: null, connection: "live" });
         return;
       }
+      // c-usagefu r18 item 4: stamp the read generation at fetch START so the
+      // snapshot's order against overlapping polls is its start order.
+      const usageGen = ++this.usageReadGen;
       const [instances, hosts, interactions, devices, passkeys] = await Promise.all([
         api.instanceList(),
         api.hostList(),
@@ -3019,7 +3064,7 @@ class HubStore {
       });
       profileRegion("store.pollHydrate", () => {
         this.hydrateEffortEffective(instances.items);
-        this.hydrateUsageRollups(instances.items);
+        this.hydrateUsageRollups(instances.items, usageGen);
         this.hydrateModels(instances.items);
         this.hydratePermissionEffective(instances.items);
       });
@@ -3342,6 +3387,9 @@ class HubStore {
     // lands while the request is in flight must survive this response and be
     // released only by a response newer than the create once this one is in.
     const reqSeq = ++this.listReqSeq;
+    // c-usagefu r18 item 4: order this read against the bootstrap and every
+    // other poll for usage-rollup hydration.
+    const usageGen = ++this.usageReadGen;
     // Bind the response to the auth epoch captured at fetch START. A logout
     // (or a new bootstrap) while the request is in flight invalidates it: its
     // body belongs to the old session and must not merge or touch pins.
@@ -3405,9 +3453,12 @@ class HubStore {
         const row = interactions.find((candidate) => candidate.id === id);
         if (!row || row.state !== "pending") pin.confirmedByNewer = true;
       }
+      // c-usagefu r18 item 4: the bootstrap read participates in usage
+      // ordering, so a poll that resolves around it cannot be undone by a
+      // late bootstrap snapshot (or vice versa).
       profileRegion("store.pollHydrate", () => {
         this.hydrateEffortEffective(instances.items);
-        this.hydrateUsageRollups(instances.items);
+        this.hydrateUsageRollups(instances.items, usageGen);
         this.hydrateModels(instances.items);
         this.hydratePermissionEffective(instances.items);
       });

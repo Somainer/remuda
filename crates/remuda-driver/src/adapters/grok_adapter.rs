@@ -233,7 +233,15 @@ impl GrokAdapter {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
-        for line in tail.poll()? {
+        // c-usagefu (d): a `turn_completed` update carries authoritative
+        // per-turn counters (usage-adapter §3.3 form 2). Real Grok TUI sessions
+        // leave updates.jsonl WITHOUT a sibling usage.json, so folding these
+        // events only into the totals was not enough — no Usage observation was
+        // ever emitted for them. Emit a cumulative Session snapshot whenever an
+        // update frame added counters (snapshot overwrite semantics;
+        // metricRevision advances for Hub revision replacement).
+        let mut usage_added = false;
+        for line in tail_lines(tail)? {
             let Ok(record) = parse_update_line(&line) else {
                 continue;
             };
@@ -414,9 +422,29 @@ impl GrokAdapter {
             }
             if let Some(event) = usage_from_update_frame(&record.frame) {
                 self.usage_totals.push(&event);
+                usage_added = true;
             }
         }
+        if usage_added {
+            self.emit_usage_snapshot(&mut out);
+        }
         Ok(out)
+    }
+
+    /// Append a cumulative Session-scoped usage snapshot built from the current
+    /// totals. Snapshot overwrite semantics (protocol §5.5): the Hub replaces
+    /// the same `(scope, scope_id)` at the bumped `metricRevision`.
+    fn emit_usage_snapshot(&mut self, out: &mut Vec<AdapterObservation>) {
+        self.session_usage_revision += 1;
+        let payload = to_usage_payload(
+            UsageScope::Session,
+            self.session_id(),
+            self.session_usage_revision,
+            self.usage_totals.session(),
+        );
+        out.push(AdapterObservation::structured(ObservationPayload::Usage(
+            Box::new(payload),
+        )));
     }
 
     /// Emit close snapshots for one finished prompt.
@@ -596,7 +624,7 @@ impl GrokAdapter {
         };
         let mut out = Vec::new();
         let mut ended_turn = false;
-        for line in tail.poll()? {
+        for line in tail_lines(tail)? {
             let Ok(record) = parse_event_line(&line) else {
                 continue;
             };
@@ -696,16 +724,7 @@ impl GrokAdapter {
         for event in usage_from_usage_json(&doc) {
             self.usage_totals.push(&event);
         }
-        self.session_usage_revision += 1;
-        let payload = to_usage_payload(
-            UsageScope::Session,
-            self.session_id(),
-            self.session_usage_revision,
-            self.usage_totals.session(),
-        );
-        out.push(AdapterObservation::structured(ObservationPayload::Usage(
-            Box::new(payload),
-        )));
+        self.emit_usage_snapshot(out);
     }
 }
 
@@ -731,6 +750,22 @@ impl FileSignalAdapter for GrokAdapter {
         let mut out = self.poll_updates()?;
         out.extend(self.poll_events()?);
         Ok(out)
+    }
+}
+
+/// Poll one session tail, treating a not-yet-created file as "no lines yet".
+///
+/// A Grok session registers in `active_sessions.json` before either
+/// `updates.jsonl` / `events.jsonl` exists, and a session that only ever
+/// streams updates has no `events.jsonl` at all. A missing sibling file must
+/// not make `poll()` error and discard the OTHER tail's observations (which
+/// include usage); the file is retried from byte 0 on the next tick once it
+/// appears. Genuine IO errors still propagate to the supervisor.
+fn tail_lines(tail: &mut SessionTail) -> DriverResult<Vec<String>> {
+    match tail.poll() {
+        Ok(lines) => Ok(lines),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
     }
 }
 

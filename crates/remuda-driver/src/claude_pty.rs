@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -198,6 +198,10 @@ struct PtyLive {
     interaction_task: JoinHandle<()>,
     hook_task: Option<JoinHandle<()>>,
     transcript_task: Option<JoinHandle<()>>,
+    /// Cooperative shutdown for the transcript pump; closing sets it so the
+    /// pump reads the final append and publishes a finalised last turn
+    /// (c-ctxusage r4 item 2) before the task ends.
+    transcript_shutdown: Option<watch::Sender<bool>>,
     tty_task: Option<JoinHandle<()>>,
     /// Current alt-screen mode seen by the attach relay's byte scanner.
     alt_screen: Arc<AtomicBool>,
@@ -598,11 +602,13 @@ impl ClaudePtyDriver {
         let permission_queue = Arc::new(crate::permission::PermissionQueue::new());
         // The TUI's tool calls exist only in the native transcript; follow it as
         // soon as the hook names the file (D-025's mapper, claude-pty's carrier).
+        let (transcript_shutdown, transcript_shutdown_rx) = watch::channel(false);
         let transcript_task = spawn_transcript_pump(
             Arc::clone(&transcript_path),
             tx.clone(),
             ctx.clone(),
             Arc::clone(&self.seq),
+            transcript_shutdown_rx,
             Some(Arc::clone(&effort_bridge)),
             spec.effort,
             Some(TranscriptModelSync {
@@ -728,6 +734,7 @@ impl ClaudePtyDriver {
             interaction_task,
             hook_task: Some(hook_task),
             transcript_task: Some(transcript_task),
+            transcript_shutdown: Some(transcript_shutdown),
             tty_task: None,
             alt_screen: Arc::new(AtomicBool::new(false)),
             closed: false,
@@ -1226,8 +1233,22 @@ impl Driver for ClaudePtyDriver {
         if let Some(task) = live.hook_task.take() {
             task.abort();
         }
+        // c-ctxusage r4 item 2: cooperative transcript shutdown — signal, let
+        // the pump read the final append and publish a finalised last turn,
+        // then wait one poll window before forcing the issue.
+        if let Some(shutdown) = live.transcript_shutdown.take() {
+            let _ = shutdown.send(true);
+        }
         if let Some(task) = live.transcript_task.take() {
-            task.abort();
+            const TRANSCRIPT_SHUTDOWN_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(2);
+            let mut task = task;
+            if tokio::time::timeout(TRANSCRIPT_SHUTDOWN_TIMEOUT, &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
         }
         if let Some(task) = live.tty_task.take() {
             task.abort();
@@ -1435,6 +1456,7 @@ fn spawn_transcript_pump(
     tx: mpsc::Sender<Observation>,
     ctx: ObsCtx,
     seq: Arc<AtomicU64>,
+    mut shutdown: watch::Receiver<bool>,
     effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
     launch_effort: Option<EffortSelection>,
     model: Option<TranscriptModelSync>,
@@ -1593,6 +1615,8 @@ fn spawn_transcript_pump(
                         }
                     };
                     for observation in mapped {
+                        // Preserve the mapper's envelope: deterministic event id
+                        // (§9.1), historical native_at and replay evidence.
                         if emit_mapped_obs(&tx, &seq, &ctx, SourceChannel::Transcript, observation)
                             .await
                             .is_err()
@@ -1602,7 +1626,68 @@ fn spawn_transcript_pump(
                     }
                 }
             }
-            tokio::time::sleep(TRANSCRIPT_POLL).await;
+            // c-ctxusage r4 item 2: cooperative shutdown. On close, read the
+            // final append and `finish()` the buffered assistant run so its
+            // usage reaches usage_events even with no stop_reason and no
+            // superseding record, instead of being aborted mid-run.
+            let shutdown_fired = *shutdown.borrow_and_update();
+            tokio::select! {
+                () = tokio::time::sleep(TRANSCRIPT_POLL), if !shutdown_fired => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        if let Some((tail, mapper)) = hydrator.take() {
+                            // Owned move through the blocking task, mirroring
+                            // the regular poll batch.
+                            let (_tail, _mapper, batches) =
+                                tokio::task::spawn_blocking(move || -> (
+                                    crate::claude_transcript::TranscriptTail,
+                                    TranscriptMapper,
+                                    Vec<Result<Vec<Observation>, DriverError>>,
+                                ) {
+                                    let (mut tail, mut mapper) = (tail, mapper);
+                                    let mut batches: Vec<_> =
+                                        if let Ok(read) = tail.poll() {
+                                            read.lines
+                                                .iter()
+                                                .zip(read.positions.iter().copied())
+                                                .map(|(line, position)| {
+                                                    mapper.map_line_at(line, Some(position))
+                                                })
+                                                .collect()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                    batches.push(mapper.finish());
+                                    (tail, mapper, batches)
+                                })
+                                .await
+                                .unwrap_or_else(|error| {
+                                    panic!("transcript mapping task panicked: {error}")
+                                });
+                            for batch in batches {
+                                let Ok(mapped) = batch else {
+                                    continue;
+                                };
+                                for observation in mapped {
+                                    if emit_mapped_obs(
+                                        &tx,
+                                        &seq,
+                                        &ctx,
+                                        SourceChannel::Transcript,
+                                        observation,
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
         }
     })
 }
@@ -1730,22 +1815,31 @@ async fn emit_obs(
     payload: ObservationPayload,
 ) -> DriverResult<()> {
     let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
-    tx.send(build_observation(ctx, n, channel, completeness, payload)?)
-        .await
-        .map_err(|_| DriverError::ControlUnavailable)?;
+    tx.send(build_observation(
+        ctx,
+        n,
+        channel,
+        completeness,
+        payload,
+        Knowledge::Unknown {
+            reason: "herdr-clock".into(),
+            evidence_event_ids: vec![],
+        },
+    )?)
+    .await
+    .map_err(|_| DriverError::ControlUnavailable)?;
     Ok(())
 }
 
-/// Emit a mapper-produced observation while PRESERVING the deterministic
-/// `event_id` the transcript mapper minted.
+/// Emit a mapper-produced observation while PRESERVING its envelope:
 ///
-/// §9.1: an effort edge's id is derived from the native record (assistant
-/// message id or the verdict/attachment record uuid), and the journal tailer
-/// derives the same id for the same native edge. The TUI pump rebuilds every
-/// other field with this run's identity, but rebuilding the event id with a
-/// fresh random [`EventId::new`] — as [`emit_obs`] does — would publish a
-/// different id live than the one the journal later derives, breaking live/
-/// journal parity.
+/// * the deterministic `event_id` the transcript mapper minted (§9.1: an
+///   effort edge's id and the journal tailer's id for the same native edge are
+///   derived identically; rebuilding it with a fresh [`EventId::new`] would
+///   publish a different live id and break live/journal parity);
+/// * the historical `native_at` (c-ctxusage r3 item 5 — a replayed usage
+///   record keeps its own timestamp so the Hub rate windows exclude it);
+/// * the replay completeness/evidence the mapper computed.
 async fn emit_mapped_obs(
     tx: &mpsc::Sender<Observation>,
     seq: &AtomicU64,
@@ -1755,8 +1849,12 @@ async fn emit_mapped_obs(
 ) -> DriverResult<()> {
     let n = seq.fetch_add(1, Ordering::SeqCst) + 1;
     let event_id = mapped.event_id;
-    let mut observation = build_observation(ctx, n, channel, mapped.completeness, mapped.body)?;
+    let native_at = mapped.native_at.clone();
+    let evidence = mapped.evidence_event_ids.clone();
+    let mut observation =
+        build_observation(ctx, n, channel, mapped.completeness, mapped.body, native_at)?;
     observation.event_id = event_id;
+    observation.evidence_event_ids = evidence;
     tx.send(observation)
         .await
         .map_err(|_| DriverError::ControlUnavailable)?;
@@ -1769,6 +1867,7 @@ pub(crate) fn build_observation(
     channel: SourceChannel,
     completeness: Completeness,
     payload: ObservationPayload,
+    native_at: Knowledge<Timestamp>,
 ) -> DriverResult<Observation> {
     Ok(Observation {
         schema_version: SchemaVersion,
@@ -1781,10 +1880,7 @@ pub(crate) fn build_observation(
         run_generation: Some(U64(1)),
         seq: U64(seq),
         observed_at: now_ts()?,
-        native_at: Knowledge::Unknown {
-            reason: "herdr-clock".into(),
-            evidence_event_ids: vec![],
-        },
+        native_at,
         source: ObservationSource {
             driver_kind: ctx.driver,
             driver_version: ctx.pin_version.clone(),
@@ -5463,11 +5559,13 @@ mod tests {
             transcript.to_string_lossy().into_owned(),
         )));
         // A live (new-session) boundary: the pump reads from byte 0 as current.
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task = spawn_transcript_pump(
             slot,
             tx,
             ctx,
             seq,
+            shutdown_rx,
             None,
             None,
             None,
@@ -5537,11 +5635,13 @@ mod tests {
         let slot: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(Some(
             transcript.to_string_lossy().into_owned(),
         )));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task = spawn_transcript_pump(
             slot,
             tx,
             ctx,
             seq,
+            shutdown_rx,
             Some(Arc::clone(&bridge)),
             None,
             None,

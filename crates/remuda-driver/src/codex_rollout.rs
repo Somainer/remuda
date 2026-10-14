@@ -283,6 +283,77 @@ pub struct RolloutTail {
     partial: Vec<u8>,
 }
 
+/// Read the rollout's first REAL user message (the operator's prompt),
+/// skipping codex's injected `environment_context` block. A genuine prompt is
+/// a `response_item/message` with role `user` whose content has an
+/// `input_text` block; the injected environment block is the first such item
+/// in real 0.154 sessions and carries metadata
+/// `content_item_kinds: ["environments.environment_context"]`. Scans at most
+/// the first megabyte of the file (the prompt is in the opening turn).
+/// Read the rollout's first REAL user message (the operator's prompt),
+/// skipping codex's injected `environment_context` block. Injected context is
+/// identified structurally by
+/// `internal_chat_message_metadata_passthrough.content_item_kinds` containing
+/// `environments.environment_context` (c-usagefu r6 item 4): a genuine prompt
+/// that merely LITERALLY contains the text `<environment_context>` is kept.
+/// Scans at most the first megabyte (the prompt is in the opening turn).
+pub fn first_user_text(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file).take(1024 * 1024);
+    let mut buf = String::new();
+    std::io::Read::read_to_string(&mut reader, &mut buf).ok()?;
+    for line in buf.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let payload = &value["payload"];
+        if value["type"].as_str() != Some("response_item")
+            || payload["type"].as_str() != Some("message")
+            || payload["role"].as_str() != Some("user")
+        {
+            continue;
+        }
+        if is_environment_context_item(payload) {
+            continue;
+        }
+        let text = message_item_text(payload);
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// Whether a `response_item/message` user payload is codex's injected
+/// environment-context item (identified by its metadata kinds, r6 item 4).
+fn is_environment_context_item(payload: &Value) -> bool {
+    payload
+        .get("internal_chat_message_metadata_passthrough")
+        .and_then(|meta| meta.get("content_item_kinds"))
+        .and_then(Value::as_array)
+        .is_some_and(|kinds| {
+            kinds
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|kind| kind.contains("environment_context"))
+        })
+}
+
+/// Concatenated text of a message item's `input_text`/`text` blocks.
+fn message_item_text(payload: &Value) -> String {
+    payload["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| {
+            (block["type"].as_str() == Some("input_text") || block["type"].as_str() == Some("text"))
+                .then(|| block["text"].as_str())
+                .flatten()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 impl RolloutTail {
     /// Start following a rollout at byte zero.
     #[must_use]
@@ -292,6 +363,25 @@ impl RolloutTail {
             offset: 0,
             partial: Vec::new(),
         }
+    }
+
+    /// Start following a rollout at its CURRENT END.
+    ///
+    /// A launch-discovery bind must not replay a rollout from byte zero: a
+    /// crash-loop relaunch whose previous session started inside the clock
+    /// slack can match the same file, and reading it from the start would
+    /// re-journal that whole transcript, usage and cost. Beginning at the
+    /// current length reads only content appended after the bind. The cost is
+    /// deliberately bounded: a 0.154 rollout is created LAZILY with its
+    /// `session_meta` on the first turn, so the file a poll first sees is
+    /// normally header-only (the header maps to no observations anyway).
+    pub fn new_at_end(path: PathBuf) -> std::io::Result<Self> {
+        let offset = std::fs::metadata(&path)?.len();
+        Ok(Self {
+            path,
+            offset,
+            partial: Vec::new(),
+        })
     }
 
     /// File being followed.
@@ -308,7 +398,15 @@ impl RolloutTail {
 
     /// Read appended whole lines, omitting empty lines and trimming CRLF.
     /// Invalid UTF-8 in a complete line is replaced with the replacement char.
-    pub fn poll(&mut self) -> std::io::Result<Vec<String>> {
+    ///
+    /// Each returned pair is `(byte offset, line)` where the offset is the
+    /// position of the line's FIRST byte in the file. Byte offsets are
+    /// replay-stable: re-tailing the same append-only file from byte zero
+    /// yields the same offset for the same record, which is why they — never a
+    /// per-poll running counter — are the durable record identity
+    /// (c-usagefu r11 item 7, Ruling B2). Empty lines advance the offset like
+    /// every other byte but produce no entry.
+    pub fn poll(&mut self) -> std::io::Result<Vec<(u64, String)>> {
         let mut file = std::fs::File::open(&self.path)?;
         if file.metadata()?.len() < self.offset {
             self.offset = 0;
@@ -318,6 +416,8 @@ impl RolloutTail {
         let mut appended = Vec::new();
         self.offset += file.read_to_end(&mut appended)? as u64;
         self.partial.extend_from_slice(&appended);
+        // File offset of the first byte currently buffered in `partial`.
+        let partial_base = self.offset - self.partial.len() as u64;
         let mut lines = Vec::new();
         let mut consumed = 0;
         for (index, byte) in self.partial.iter().enumerate() {
@@ -325,7 +425,7 @@ impl RolloutTail {
                 let line = String::from_utf8_lossy(&self.partial[consumed..index]);
                 let line = line.trim_end_matches('\r');
                 if !line.is_empty() {
-                    lines.push(line.to_owned());
+                    lines.push((partial_base + consumed as u64, line.to_owned()));
                 }
                 consumed = index + 1;
             }
@@ -410,4 +510,285 @@ pub fn locate_rollout_in(codex_home: &Path, session_id: &str) -> Option<PathBuf>
         }
     }
     None
+}
+
+/// Whether the rollout `path`'s `session_meta.cwd` matches `launch_cwd`.
+///
+/// c-usagefu r15 item 3: an explicit `codex resume <id>` binds the located
+/// rollout BY ID regardless of its original start timestamp, but it must still
+/// belong to the launch cwd — a name-index/homedir collision must never bind a
+/// foreign-cwd session under the resume instruction. Only the bounded first
+/// (session_meta) line is read.
+#[must_use]
+pub fn rollout_cwd_matches(path: &Path, launch_cwd: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut first = String::new();
+    if std::io::BufReader::new(file)
+        .take(1024 * 1024)
+        .read_line(&mut first)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(CodexRolloutRecord {
+        event: CodexRolloutEvent::SessionMeta { metadata, .. },
+        ..
+    }) = parse_rollout_line(&first)
+    else {
+        return false;
+    };
+    cwd_matches(metadata["cwd"].as_str(), launch_cwd)
+}
+
+/// Discovery result for a driver-launched (generic-pty) codex session that has
+/// no hook channel and no child pid: matching by cwd + launch time is the only
+/// ownership evidence available.
+#[derive(Debug)]
+pub enum CwdRollout {
+    /// Nothing matches yet; the launched session may simply not have
+    /// registered. The caller should keep polling until its discovery
+    /// deadline.
+    NotYet,
+    /// Exactly one rollout matches: its thread id, file, and whether the
+    /// session began at/after the STRICT launch floor (vs inside the clock
+    /// slack — a possible crash-looped previous instance).
+    Found {
+        /// `session_meta.id` of the matching rollout.
+        id: String,
+        /// Rollout JSONL file.
+        path: PathBuf,
+        /// True when `session_meta.timestamp >= launched_at`: the session
+        /// cannot predate this launch, so byte-0 hydration is safe and the
+        /// first turn (created lazily together with session_meta) is ours.
+        strict: bool,
+    },
+    /// More than one rollout matches cwd + launch window. Never guess which is
+    /// ours: the caller must stop discovering rather than bind one.
+    Ambiguous,
+}
+
+/// Ownership evidence a candidate rollout carries, strongest first
+/// (c-usagefu r9 item 2). The locator resolves candidates GLOBALLY by tier
+/// instead of pooling them: a unique hook/process candidate binds even while
+/// a weaker prompt-only candidate also happens to match, so the two never
+/// make each other ambiguous.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateTier {
+    /// Hook-confirmed native session, or re-recognition by id of a session
+    /// this instance already claimed.
+    Hook,
+    /// The rollout file is held open by the candidate's own process tree.
+    Process,
+    /// Only prompt-text + sole-live-window evidence (weakest).
+    Prompt,
+}
+
+/// Clock slack between "we dispatched the launch" and codex writing the
+/// session's first `session_meta` line. The two clocks are the same host, but
+/// the dispatch RPC can return a hair after the pane's process started.
+pub const LAUNCH_TIME_SLACK: time::Duration = time::Duration::seconds(5);
+
+/// Locate the rollout of the codex session WE launched in `cwd` at/after
+/// `launched_at`. Only the active `sessions/` tree is scanned (a fresh session
+/// is never archived), symlinks are not followed, and each file's identity is
+/// its first-line `session_meta` (id + cwd + timestamp). Zero matches is
+/// [`CwdRollout::NotYet`] (the TUI has not registered yet); two or more is
+/// [`CwdRollout::Ambiguous`] (fail closed).
+#[must_use]
+pub fn locate_rollout_by_cwd(
+    codex_home: &Path,
+    cwd: &Path,
+    launched_at: time::OffsetDateTime,
+    exclude: &dyn Fn(&Path) -> bool,
+    // Ownership gate beyond cwd + timestamp: returns the evidence tier the
+    // candidate carries for THIS instance, or None to reject it. The driver
+    // answers hook/process/prompt (r9 items 1-2); tests pass accept-all.
+    input_gate: &dyn Fn(&Path, time::OffsetDateTime, &str, &Value) -> Option<CandidateTier>,
+) -> CwdRollout {
+    let floor = launched_at - LAUNCH_TIME_SLACK;
+    // Wall-clock form of the floor for mtime comparisons.
+    let floor_system = std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_secs(floor.unix_timestamp().max(0) as u64);
+    let mut matches: Vec<(String, PathBuf, bool, CandidateTier)> = Vec::new();
+    let mut pending = vec![codex_home.join("sessions")];
+    while let Some(dir) = pending.pop() {
+        let Ok(dir_meta) = std::fs::symlink_metadata(&dir) else {
+            continue;
+        };
+        if !dir_meta.is_dir() {
+            continue;
+        }
+        // Cheap pre-filter (r4 item 6): a date directory whose own mtime
+        // predates the floor cannot contain a post-floor session — codex
+        // creates `sessions/YYYY/MM/DD` when it creates the rollout, and a
+        // post-launch session appended inside an older, existing date dir is
+        // still caught by the per-file mtime filter below.
+        let is_date_dir = match dir
+            .strip_prefix(codex_home.join("sessions"))
+            .ok()
+            .and_then(|relative| relative.to_str())
+        {
+            Some(relative) => is_yyyy_mm_dd(relative),
+            None => false,
+        };
+        if is_date_dir
+            && let Ok(modified) = dir_meta.modified()
+            && modified < floor_system
+        {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut paths = entries.flatten().collect::<Vec<_>>();
+        paths.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in paths {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                pending.push(entry.path());
+            }
+            if !kind.is_file()
+                || entry
+                    .path()
+                    .extension()
+                    .is_none_or(|value| value != "jsonl")
+                || exclude(entry.path().as_path())
+            {
+                continue;
+            }
+            // Per-file cheap pre-filter: a rollout untouched since before the
+            // floor cannot have gained a post-floor session on this tick; its
+            // (tens-of-KB) header is never opened or parsed. A genuinely new
+            // session bumps the file mtime, so this never skips a candidate.
+            if let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified())
+                && modified < floor_system
+            {
+                continue;
+            }
+            let Ok(file) = std::fs::File::open(entry.path()) else {
+                continue;
+            };
+            let mut first = String::new();
+            if std::io::BufReader::new(file)
+                .take(1024 * 1024)
+                .read_line(&mut first)
+                .is_err()
+            {
+                continue;
+            }
+            let Ok(CodexRolloutRecord {
+                event: CodexRolloutEvent::SessionMeta { metadata, .. },
+                ..
+            }) = parse_rollout_line(&first)
+            else {
+                continue;
+            };
+            let Some(id) = metadata["id"].as_str().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            if !cwd_matches(metadata["cwd"].as_str(), cwd) {
+                continue;
+            }
+            // The session must have started at/after our launch. A missing or
+            // unparseable timestamp never qualifies: ownership would then be
+            // unprovable.
+            let Some(started) = metadata["timestamp"].as_str().and_then(|raw| {
+                time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+                    .ok()
+            }) else {
+                continue;
+            };
+            if started >= floor {
+                // Ownership proof (r5 item 5): once the rollout carries its
+                // first REAL user prompt, that prompt must be an input THIS
+                // driver dispatched — a hand-run codex in the same cwd fails
+                // and is left alone. A header-only file (lazy 0.154 creation
+                // before the prompt lands) yields None and simply waits: it
+                // can match later once its real prompt appears.
+                let Some(first_prompt) = first_user_text(entry.path().as_path()) else {
+                    // Header-only lazy file — wait for its real prompt.
+                    continue;
+                };
+                let Some(tier) =
+                    input_gate(entry.path().as_path(), started, &first_prompt, &metadata)
+                else {
+                    continue;
+                };
+                // Distinguish a strictly post-launch session (safe to
+                // hydrate from byte zero) from an in-slack candidate (a
+                // possible relaunch — tail from EOF).
+                let strict = started >= launched_at;
+                matches.push((id.to_owned(), entry.path(), strict, tier));
+            }
+        }
+    }
+    // r9 item 2: resolve GLOBALLY by tier rather than pooling. A unique
+    // hook candidate wins over everything; else a unique process-held
+    // candidate; prompt-only candidates are considered only when no
+    // stronger evidence exists. Two at the winning tier stay Ambiguous; a
+    // weak prompt candidate can never make a uniquely process-owned
+    // rollout ambiguous.
+    for tier in [
+        CandidateTier::Hook,
+        CandidateTier::Process,
+        CandidateTier::Prompt,
+    ] {
+        let mut at_tier = matches.iter().filter(|candidate| candidate.3 == tier);
+        let first = at_tier.next();
+        let second = at_tier.next();
+        match (first, second) {
+            (Some(candidate), None) => {
+                return CwdRollout::Found {
+                    id: candidate.0.clone(),
+                    path: candidate.1.clone(),
+                    strict: candidate.2,
+                };
+            }
+            (Some(_), Some(_)) => return CwdRollout::Ambiguous,
+            (None, _) => continue,
+        }
+    }
+    CwdRollout::NotYet
+}
+
+/// Compare a rollout's `session_meta.cwd` with the launch cwd. A literal match
+/// wins; when both paths exist, compare canonical forms so filesystem aliases
+/// (symlink prefixes, `/tmp` vs `/private/tmp`) agree. Failure to canonicalize
+/// never upgrades a non-matching string into a match.
+/// Whether a sessions-relative path component is a `YYYY/MM/DD` date leaf.
+/// Used to decide which directories carry a session-creation mtime (r4 item 6).
+fn is_yyyy_mm_dd(relative: &str) -> bool {
+    let mut parts = relative.split('/');
+    let (Some(year), Some(month), Some(day), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    year.len() == 4
+        && month.len() == 2
+        && day.len() == 2
+        && year.bytes().all(|b| b.is_ascii_digit())
+        && month.bytes().all(|b| b.is_ascii_digit())
+        && day.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn cwd_matches(rollout_cwd: Option<&str>, launch_cwd: &Path) -> bool {
+    let Some(rollout_cwd) = rollout_cwd.filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let rollout_path = Path::new(rollout_cwd);
+    if rollout_path == launch_cwd {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(rollout_path),
+        std::fs::canonicalize(launch_cwd),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }

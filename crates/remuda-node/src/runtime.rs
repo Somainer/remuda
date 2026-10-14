@@ -109,6 +109,10 @@ pub(crate) struct DevNodeInner {
     /// Root for materialized attachments. Set by `compose` from the Node data
     /// dir; `None` on an in-memory Node, where attachments are refused.
     pub(crate) attachment_root: std::sync::RwLock<Option<std::path::PathBuf>>,
+    /// Identity used to scope this Node's stop-incomplete census blocks
+    /// (c-usagefu r18 items 2/3). Minted per composed Node, handed to the
+    /// driver factories, and retired on shutdown.
+    pub(crate) census_epoch: remuda_driver::NodeEpoch,
     queue_capacity: usize,
     host: Host,
     workspace: Workspace,
@@ -134,6 +138,22 @@ pub(crate) struct DevNodeInner {
 #[derive(Clone)]
 pub struct DevNode {
     pub(crate) inner: Arc<DevNodeInner>,
+}
+
+impl DevNode {
+    /// This Node's census epoch (c-usagefu r18 items 2/3): drivers built by
+    /// the Node register their codex census intervals under it, and shutdown
+    /// retires only its own retained blocks.
+    #[must_use]
+    pub fn census_epoch(&self) -> remuda_driver::NodeEpoch {
+        self.inner.census_epoch.clone()
+    }
+
+    /// Test seam (c-usagefu r19 item 1): the live instance-local driver.
+    #[cfg(feature = "test-stub")]
+    pub async fn test_instance_driver(&self, id: &InstanceId) -> Option<Arc<dyn Driver>> {
+        self.inner.instance_drivers.read().await.get(id).cloned()
+    }
 }
 
 /// Last-clone teardown.
@@ -204,6 +224,12 @@ impl DevNode {
     }
 
     /// Build a Node around supplied parts and a persisted Host identity.
+    ///
+    /// The Node adopts the registry's census epoch — the same epoch every
+    /// driver built from that registry carries (c-usagefu r19 item 1). One
+    /// registry backs at most one Node: adopting the same registry (or a clone
+    /// of it) twice is rejected so two Nodes can never share shutdown/retire
+    /// ownership (c-usagefu r20 item 3).
     pub fn with_parts_on_host(
         config: &crate::DevServerConfig,
         store: Arc<dyn LocalStore>,
@@ -215,6 +241,11 @@ impl DevNode {
                 "instance queue capacity must be positive".to_owned(),
             ));
         }
+        // Reserve before ANY Node state exists; the reservation rolls back on
+        // the `?` paths below and commits only when the completed Node is
+        // returned (c-usagefu r21 item 4).
+        let adoption = drivers.claim_adoption()?;
+        let census_epoch = drivers.census_epoch();
         let host = fixture_host(host_id.clone())?;
         let workspace_registry = crate::workspace::WorkspaceRegistry::open(config, host_id)?;
         let workspace = workspace_registry
@@ -225,7 +256,7 @@ impl DevNode {
                 NodeError::InvalidConfig("initial workspace registry is empty".into())
             })?;
         let interactions = InteractionRuntime::spawn(Arc::clone(&store))?;
-        Ok(Self {
+        let node = Self {
             inner: Arc::new(DevNodeInner {
                 store,
                 drivers,
@@ -250,10 +281,13 @@ impl DevNode {
                 gate: crate::gate::GateRegistry::new(),
                 api_relay: crate::api_relay::ApiRelayState::new(),
                 diagnostics: std::sync::RwLock::new(crate::DoctorContext::default()),
+                census_epoch,
                 #[cfg(test)]
                 create_reservation_barrier: tokio::sync::RwLock::new(None),
             }),
-        })
+        };
+        adoption.commit();
+        Ok(node)
     }
 
     /// Install the create reservation test barrier (c-dirpicker round 4

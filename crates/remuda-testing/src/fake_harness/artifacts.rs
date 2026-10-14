@@ -400,14 +400,24 @@ pub fn claude_effort_slash_records(
 }
 
 fn claude_usage(usage: &UsageSpec) -> Value {
-    json!({
+    let mut value = json!({
         "input_tokens": usage.input_tokens.unwrap_or(42),
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": usage.cached_tokens.unwrap_or(0),
         "output_tokens": usage.output_tokens.unwrap_or(17),
         "output_tokens_details": { "thinking_tokens": usage.reasoning_tokens.unwrap_or(0) },
         "service_tier": "standard"
-    })
+    });
+    // 2.1.289 dialect: non-zero split cache-creation buckets.
+    if let Some(write_5m) = usage.cache_creation_5m {
+        let write_1h = usage.cache_creation_1h.unwrap_or(0);
+        value["cache_creation_input_tokens"] = json!(write_5m + write_1h);
+        value["cache_creation"] = json!({
+            "ephemeral_5m_input_tokens": write_5m,
+            "ephemeral_1h_input_tokens": write_1h
+        });
+    }
+    value
 }
 
 /// A claude `queue-operation` line.

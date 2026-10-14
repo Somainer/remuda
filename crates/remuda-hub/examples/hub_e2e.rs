@@ -1704,7 +1704,7 @@ async fn fake_node(
                     // same way, after one usage observation so its home row has
                     // a known 50% context ring (100k of the 200k Claude window).
                     if prompt.contains("mhome-blocked") {
-                        if let Some(usage) = scripted_usage("usage:40000,500,60000,0") {
+                        if let Some(usage) = scripted_usage("usage:40000,500,60000,0", append_n) {
                             append_n = append_event(
                                 &mut ws,
                                 &mut frame_queue,
@@ -1945,7 +1945,7 @@ async fn fake_node(
                     // prompt appends one full protocol usage observation (each
                     // position `-` = the channel was not reported, exercising the
                     // Hub rollup's unknown-not-zero rule), then ends the turn.
-                    if let Some(usage) = scripted_usage(prompt) {
+                    if let Some(mut usage) = scripted_usage(prompt, append_n) {
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         append_n = append_command_user(
                             &mut ws,
@@ -1956,15 +1956,32 @@ async fn fake_node(
                             command_id,
                         )
                         .await?;
-                        append_n = append_event(
-                            &mut ws,
-                            &mut frame_queue,
-                            &instance_id,
-                            append_n,
-                            "usage",
-                            usage,
-                        )
-                        .await?;
+                        // c-ctxusage r5 item 7: the Hub projection reads
+                        // nativeAt at the EVENT level (event.nativeAt), not
+                        // inside payload. Lift it so the sentinel is a live
+                        // observation that enters the rate window.
+                        let native_at =
+                            usage.as_object_mut().and_then(|obj| obj.remove("nativeAt"));
+                        if let Some(native_at) = native_at {
+                            append_n = append_full_event(
+                                &mut ws,
+                                &mut frame_queue,
+                                &instance_id,
+                                append_n,
+                                json!({ "kind": "usage", "payload": usage, "nativeAt": native_at }),
+                            )
+                            .await?;
+                        } else {
+                            append_n = append_event(
+                                &mut ws,
+                                &mut frame_queue,
+                                &instance_id,
+                                append_n,
+                                "usage",
+                                usage,
+                            )
+                            .await?;
+                        }
                         append_n = append_journal(
                             &mut ws,
                             &instance_id,
@@ -5060,7 +5077,13 @@ fn wf_timestamp(offset_ms: i128) -> Value {
 /// `usage:<input>,<output>,<cacheRead>,<cacheWrite>`; each field is a
 /// non-negative integer or `-` for a channel the harness never reported.
 /// Returns the full protocol UsagePayload the driver would have appended.
-fn scripted_usage(prompt: &str) -> Option<Value> {
+///
+/// `turn` is a per-turn discriminator for `scopeId`: every real assistant
+/// message has a distinct message id, so distinct scripted turns must not
+/// share a scope id (the Hub durably dedupes on
+/// `(instance_id, scope, scope_id)` and would otherwise fold later turns into
+/// the first).
+fn scripted_usage(prompt: &str, turn: u64) -> Option<Value> {
     let body = prompt.strip_prefix("usage:")?;
     let parts: Vec<Option<u64>> = body
         .split(',')
@@ -5089,7 +5112,7 @@ fn scripted_usage(prompt: &str) -> Option<Value> {
     Some(json!({
         "usageId": "obj_e2e_usage",
         "scope": "turn",
-        "scopeId": "obj_e2e_run",
+        "scopeId": format!("obj_e2e_run_{turn}"),
         "mode": "snapshot",
         "metricRevision": "1",
         "inputTokens": knowledge(input),
@@ -5101,6 +5124,16 @@ fn scripted_usage(prompt: &str) -> Option<Value> {
         "totalTokens": knowledge(total),
         "cost": { "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] },
         "accounting": "estimated",
+        // The fake session's model id is not in the Hub's static catalog and
+        // the e2e profile has no declared window, so the rollup would use the
+        // approximate kind-fallback. A real driver reports the per-model
+        // window on usage observations (c-usagefu (c)); mirror that (a bare
+        // protocol U64 scalar, like to_usage_payload encodes it) so the
+        // ux-usage chip shows an EXACT percentage (200k window → 17%).
+        "contextWindow": "200000",
+        // c-ctxusage r5 item 7: the sentinel's usage is a live observation, so
+        // it carries a current nativeAt and enters the rate window.
+        "nativeAt": { "state": "known", "value": monotonic_effort_observed_at() },
         "nativeFieldsRef": null
     }))
 }

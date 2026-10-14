@@ -1043,6 +1043,17 @@ pub(crate) fn lane_target_dir(repo: &Path, target_dir: Option<&Path>, lane: usiz
 
 /// `--land`: publish a previously verified merge without touching the gate.
 fn execute_land(args: &MergeArgs, report: &mut MergeReport) -> Result<()> {
+    // r19 item 5: initialise report.merged from the PINNED land argument BEFORE
+    // any fallible preflight. Every refusal on the granted land path (the
+    // branch moved since verification, a stale/unsupported report, a missing
+    // merge parent) then reports a `gate_failed` that NAMES the attempted merge
+    // M, instead of omitting it (the verified report's merged was only stamped
+    // after the whole preflight succeeded). The pinned load below proves the
+    // report is immutable for exactly M, so the later stamp is the same sha;
+    // the unpinned path leaves this None until the report loads.
+    if let Some(pinned) = args.report.as_deref() {
+        report.merged = Some(pinned.to_owned());
+    }
     let (repo, reference) = record(report, "repository", || {
         let cwd = args.repo.clone().unwrap_or(std::env::current_dir()?);
         let repo = PathBuf::from(git(&cwd, &["rev-parse", "--show-toplevel"])?);

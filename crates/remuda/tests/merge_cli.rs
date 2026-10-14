@@ -1662,3 +1662,50 @@ fn a_local_main_move_between_verify_and_land_is_base_moved_with_both_shas() {
     // Local main is untouched; the merge was not forced through.
     assert_eq!(repo.main(), newer);
 }
+
+/// r19 item 5: a PREFLIGHT refusal on a granted, pinned land — the source
+/// branch advanced after verification without a re-verify — must still emit a
+/// `gate_failed` (exit 1) that NAMES the attempted merge M. Previously
+/// report.merged was only stamped after the whole preflight succeeded, so the
+/// Node validated the refusal as Unknown (a gate_failed with no merge).
+#[test]
+fn a_branch_moved_preflight_refusal_names_the_attempted_merge() {
+    let repo = Repo::new();
+    // Verify onto current main (no push) and pin the captured merge M.
+    let (verified_out, verified) = repo.merge(&["--gate", "--onto", "main", "--no-push"], &[]);
+    assert_exit(&verified_out, &verified, 0);
+    let merged = verified["merged"].as_str().unwrap().to_owned();
+    assert!(!merged.is_empty());
+    let recorded_head = verified["head"].as_str().unwrap().to_owned();
+
+    // The source branch advances AFTER verification (a real `--report` pin,
+    // no re-verify): the preflight's branch snapshot check must refuse.
+    let new_tip = commit_file(
+        &repo.source,
+        "post-verify branch move.txt",
+        "the branch moved after the gate ran\n",
+    );
+    assert_ne!(new_tip, recorded_head);
+
+    let (output, report) = repo.merge(&["--land", "--onto", "main", "--report", &merged], &[]);
+    assert_exit(&output, &report, 1);
+    assert_eq!(report["status"], json!("gate_failed"), "{report}");
+    assert_eq!(
+        report["merged"],
+        json!(merged),
+        "the refusal must name the attempted merge M: {report}"
+    );
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("branch moved since verification"),
+        "the error names the branch-moved preflight refusal: {report}"
+    );
+    // Nothing landed or was pushed.
+    assert_eq!(
+        report["pushed"], false,
+        "a preflight refusal never pushes: {report}"
+    );
+    assert_eq!(repo.main(), repo.base);
+}

@@ -4572,16 +4572,15 @@ async fn a_landed_verdict_cannot_reference_another_results_evidence() {
     assert_eq!(settled["logObjectId"], json!(a_id), "{settled}");
 }
 
-/// r20 item 8 (was r19 item 4): the ATTEMPT-CAP base-moved Failed settlement
-/// binds ITS OWN result's evidence — exercised with TWO REAL result handlers,
-/// not a direct store insertion. Both same-grant attempt-3 base-moved results
-/// (A and B, different logs) enter through the real apply path; the
-/// post-persist barrier parks each handler AFTER its own immutable object is
-/// persisted and BEFORE the settlement writer. Once BOTH are parked they are
-/// released together: one handler commits the cap Failed bound to its own
-/// object, the other stands down at the terminal guard. The test verifies each
-/// persisted object's bytes independently and asserts the final by-job
-/// reference serves the winning result's own log and never the loser's.
+/// r20 item 8; r21 item 6: the ATTEMPT-CAP base-moved Failed settlement binds
+/// ITS OWN result's evidence — TWO REAL result handlers with INDEPENDENT
+/// post-persistence release gates. Both same-grant attempt-3 base-moved
+/// results (A and B, different logs) enter through the real apply path and
+/// park after persisting their own immutable objects. A is released ALONE and
+/// must commit the cap Failed bound to A's object; the expected winner is A by
+/// test construction (read from A's persisted object), NEVER inferred from the
+/// row under test. Only then is B released, and the reference must remain A's.
+/// Both objects' bytes are checked independently, before and after B.
 #[tokio::test]
 async fn an_attempt_cap_base_moved_failure_binds_its_own_results_evidence() {
     let (ctx, _node) = Ctx::boot().await.unwrap();
@@ -4650,8 +4649,8 @@ async fn an_attempt_cap_base_moved_failure_binds_its_own_results_evidence() {
     assert_eq!(pre["attempts"], json!(3), "{pre}");
     assert_eq!(pre["state"], json!("landing"), "{pre}");
 
-    // Start BOTH REAL handlers; the barrier parks each AFTER persisting its
-    // own evidence and before either settlement runs.
+    // Start BOTH REAL handlers; each parks AFTER persisting its own evidence
+    // and before the settlement writer, under a key = its own object id.
     let barrier = ctx.store().gate_after_persist_barrier();
     barrier.arm();
     let spawn_handler = |headline: &'static str| {
@@ -4674,68 +4673,85 @@ async fn an_attempt_cap_base_moved_failure_binds_its_own_results_evidence() {
     let apply_b = spawn_handler("EVIDENCE-B");
     barrier.wait_parked(2).await;
 
-    // Release BOTH real handlers into the settlement writers: one wins the
-    // immediate transaction, the other must stand down at the terminal guard.
-    barrier.release();
-    apply_a.await.unwrap();
-    apply_b.await.unwrap();
-
-    let doc = ctx.hub.test_get_gate_job(&job).await.unwrap().unwrap();
-    assert_eq!(
-        doc["state"],
-        json!("failed"),
-        "the cap attempt fails: {doc}"
-    );
-    let winner_id = doc["logObjectId"]
-        .as_str()
-        .expect("the Failed job references its winner's object")
-        .to_owned();
-
-    // Each handler persisted its OWN immutable object (distinct ids/bytes);
-    // read both straight from the object table rather than fabricating either.
-    let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
-    let mut objects: std::collections::HashMap<String, String> = db
-        .prepare("SELECT id, bytes FROM gate_log_objects WHERE job_id = ?1")
-        .unwrap()
-        .query_map(rusqlite::params![job], |row| {
-            let id: String = row.get(0)?;
-            let bytes: Vec<u8> = row.get(1)?;
-            Ok((id, bytes))
-        })
-        .unwrap()
-        .map(|r| r.unwrap())
-        .map(|(id, bytes)| {
-            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            (id, value["headline"].as_str().unwrap().to_owned())
-        })
-        .collect();
+    // Resolve each handler's OWN persisted object from the immutable table
+    // (keyed by its distinct headline) BEFORE any settlement. A is the
+    // expected winner by construction — not by reading the row under test.
+    let objects: std::collections::HashMap<String, String> = {
+        let db = rusqlite::Connection::open(ctx.db_path()).unwrap();
+        db.prepare("SELECT id, bytes FROM gate_log_objects WHERE job_id = ?1")
+            .unwrap()
+            .query_map(rusqlite::params![job], |row| {
+                let id: String = row.get(0)?;
+                let bytes: Vec<u8> = row.get(1)?;
+                Ok((id, bytes))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .map(|(id, bytes)| {
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                (value["headline"].as_str().unwrap().to_owned(), id)
+            })
+            .collect()
+    };
     assert_eq!(
         objects.len(),
         2,
         "both real handlers persisted their own object"
     );
-    let winner_headline = objects
-        .remove(&winner_id)
-        .expect("the bound object was persisted by a real handler");
-    let (loser_id, loser_headline) = objects.into_iter().next().unwrap();
-    assert_ne!(
-        winner_id, loser_id,
-        "A and B own distinct content-addressed objects"
+    let a_id = objects
+        .get("EVIDENCE-A")
+        .expect("A persisted its object")
+        .clone();
+    let b_id = objects
+        .get("EVIDENCE-B")
+        .expect("B persisted its object")
+        .clone();
+    assert_ne!(a_id, b_id, "A and B own distinct content-addressed objects");
+
+    // Release A ALONE; B stays parked and cannot settle or rebind anything.
+    barrier.release_key(&a_id).await;
+    apply_a.await.unwrap();
+    let doc = ctx.hub.test_get_gate_job(&job).await.unwrap().unwrap();
+    assert_eq!(
+        doc["state"],
+        json!("failed"),
+        "A commits the cap Failed: {doc}"
     );
-    assert_ne!(
-        winner_headline, loser_headline,
-        "the two objects carry the two distinct logs"
+    assert_eq!(
+        doc["logObjectId"],
+        json!(a_id),
+        "A settles bound to A's OWN object while B is still parked: {doc}"
     );
-    assert!(
-        winner_headline == "EVIDENCE-A" || winner_headline == "EVIDENCE-B",
-        "unexpected winner evidence: {winner_headline}"
+    let (status, by_job) = ctx
+        .send(
+            "GET",
+            &format!("/v1/gate/logs/{job}"),
+            &ctx.human,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{by_job}");
+    assert_eq!(
+        by_job["log"]["headline"],
+        json!("EVIDENCE-A"),
+        "by-job serves A's evidence before B is released: {by_job}"
     );
 
-    // By object id: each object serves exactly its own bytes.
-    for (id, headline) in [
-        (winner_id.clone(), winner_headline.clone()),
-        (loser_id.clone(), loser_headline.clone()),
-    ] {
+    // Now release B: it reaches the terminal guard and must stand down; the
+    // reference stays A's.
+    barrier.release_key(&b_id).await;
+    apply_b.await.unwrap();
+    let doc = ctx.hub.test_get_gate_job(&job).await.unwrap().unwrap();
+    assert_eq!(doc["state"], json!("failed"), "{doc}");
+    assert_eq!(
+        doc["logObjectId"],
+        json!(a_id),
+        "B must not replace A's binding: {doc}"
+    );
+
+    // Each object serves exactly its OWN bytes, by object id.
+    for (id, headline) in [(&a_id, "EVIDENCE-A"), (&b_id, "EVIDENCE-B")] {
         let (status, served) = ctx
             .send(
                 "GET",
@@ -4754,7 +4770,7 @@ async fn an_attempt_cap_base_moved_failure_binds_its_own_results_evidence() {
         );
     }
 
-    // By job id: the final reference serves ONLY the winner's evidence.
+    // By job id: the final reference serves ONLY A's evidence.
     let (status, by_job) = ctx
         .send(
             "GET",
@@ -4765,11 +4781,11 @@ async fn an_attempt_cap_base_moved_failure_binds_its_own_results_evidence() {
         )
         .await;
     assert_eq!(status, 200, "{by_job}");
-    assert_eq!(by_job["objectId"], json!(winner_id), "{by_job}");
+    assert_eq!(by_job["objectId"], json!(a_id), "{by_job}");
     assert_eq!(
         by_job["log"]["headline"],
-        json!(winner_headline),
-        "the by-job reference binds the winner's own evidence: {by_job}"
+        json!("EVIDENCE-A"),
+        "the by-job reference stays bound to A's own evidence after B: {by_job}"
     );
 }
 

@@ -283,16 +283,29 @@ pub fn routes() -> Router<AppState> {
 
 // ── request shapes ─────────────────────────────────────────────────────────
 
-/// Test-only apply_result pre-read barrier. Every arrival parks AFTER its
-/// state/generation pre-read (while the row is still live) until the test
-/// releases it, so two real arrivals can be forced to both observe Running.
-/// r18 item 7 test-only arm/wait barrier between evidence persist and the
-/// settlement mutate.
+/// Test-only barrier between evidence persist and the settlement mutate.
+/// Two modes:
+/// * a GLOBAL release frees every parked arrival ([`SimpleBarrier::release`]);
+/// * an INDEPENDENT per-key gate
+///   ([`SimpleBarrier::release_key`]) frees exactly one arrival parked under
+///   that key — r21 item 6 lets a race test release handler A, verify A's
+///   settlement with B still parked, then release B.
+///
+/// The production wait site keys by THIS arrival's persisted object id (empty
+/// key when it supplied no log); distinct results have distinct
+/// content-addressed keys.
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-faults"))]
 pub struct SimpleBarrier {
     armed: std::sync::atomic::AtomicBool,
     parked: std::sync::atomic::AtomicUsize,
+    notify: tokio::sync::Notify,
+    slots: tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<BarrierSlot>>>,
+}
+
+#[cfg(any(test, feature = "test-faults"))]
+struct BarrierSlot {
+    released: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
 }
 
@@ -303,21 +316,51 @@ impl SimpleBarrier {
             armed: std::sync::atomic::AtomicBool::new(false),
             parked: std::sync::atomic::AtomicUsize::new(0),
             notify: tokio::sync::Notify::new(),
+            slots: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
     pub fn arm(&self) {
         self.parked.store(0, std::sync::atomic::Ordering::SeqCst);
         self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // arm() precedes every arrival, so no waiter holds the map: drop any
+        // slots from the previous arm without going async.
+        if let Ok(mut slots) = self.slots.try_lock() {
+            slots.clear();
+        }
     }
-    pub(crate) async fn wait(&self) {
+    /// Park THIS arrival, keyed by its persisted object id, until either the
+    /// global release or its own [`SimpleBarrier::release_key`].
+    pub(crate) async fn wait_key(&self, key: &str) {
         if !self.armed.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
+        let slot = {
+            let mut slots = self.slots.lock().await;
+            slots
+                .entry(key.to_owned())
+                .or_insert_with(|| {
+                    std::sync::Arc::new(BarrierSlot {
+                        released: std::sync::atomic::AtomicBool::new(false),
+                        notify: tokio::sync::Notify::new(),
+                    })
+                })
+                .clone()
+        };
         self.parked
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.notify.notify_waiters();
-        while self.armed.load(std::sync::atomic::Ordering::SeqCst) {
-            self.notify.notified().await;
+        loop {
+            if !self.armed.load(std::sync::atomic::Ordering::SeqCst)
+                || slot.released.load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            let released = slot.notify.notified();
+            let global = self.notify.notified();
+            tokio::pin!(released, global);
+            tokio::select! {
+                _ = released => {}
+                _ = global => {}
+            }
         }
     }
     pub async fn wait_parked(&self, n: usize) {
@@ -335,9 +378,20 @@ impl SimpleBarrier {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+    /// Release every parked arrival.
     pub fn release(&self) {
         self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
         self.notify.notify_waiters();
+    }
+    /// Release exactly the arrival parked under `key`; other arrivals stay
+    /// parked.
+    pub async fn release_key(&self, key: &str) {
+        let slot = self.slots.lock().await.get(key).cloned();
+        if let Some(slot) = slot {
+            slot.released
+                .store(true, std::sync::atomic::Ordering::Release);
+            slot.notify.notify_waiters();
+        }
     }
 }
 
@@ -1900,8 +1954,14 @@ pub(crate) async fn apply_result(
     // r18 item 7 TEST-ONLY seam: park AFTER evidence persist but BEFORE the
     // settlement mutate, so a concurrent writer can replace the linked log
     // object to deterministically exercise the verdict↔evidence digest bind.
+    // r21 item 6: keyed by this arrival's OWN persisted object id so a test
+    // can release the two handlers independently.
     #[cfg(any(test, feature = "test-faults"))]
-    state.store.gate_after_persist_barrier().wait().await;
+    state
+        .store
+        .gate_after_persist_barrier()
+        .wait_key(log_object_id.as_deref().unwrap_or(""))
+        .await;
     // A `pushFrom: home` land verifies on the lane and is pushed by the home
     // host. The lane therefore reports `passed` for a land job; the job stays
     // `running` across the handoff so `remuda land` keeps waiting instead of

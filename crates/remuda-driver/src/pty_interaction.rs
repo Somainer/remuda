@@ -4,7 +4,9 @@
 use crate::binary::hash_bytes;
 use crate::claude_pty::{ObsCtx, emit_on, map_herdr, now_ts};
 use crate::{DriverAck, DriverError, DriverResult};
-use remuda_herdr::{AgentReadParams, AgentStatus, Client, ReadFormat, ReadSource};
+use remuda_herdr::{
+    AgentReadParams, AgentStatus, Client, PersistentClient, ReadFormat, ReadSource,
+};
 use remuda_protocol::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -114,15 +116,24 @@ pub(crate) struct PtyInteractions {
     /// restarted carrier without receiving a queued keystroke.
     closing: Arc<AtomicBool>,
     auto_trust_registered_workspace: bool,
+    /// c-ctxusage r27 item 1 test seam: when armed, every interaction dispatch
+    /// parks on this gate AFTER the final (post-mutex) revocation check and
+    /// BEFORE the pinned transport write — the exact window in which a close
+    /// can revoke and the carrier restart/reuse the pane id.
+    #[cfg(any(test, feature = "test-stub"))]
+    pre_dispatch_gate: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl PtyInteractions {
     pub(crate) async fn observe(&self) -> DriverResult<()> {
+        // One pinned connection for the whole refresh, including any
+        // auto-answer dispatch it reaches (r27 item 1).
+        let mut conn = self.pinned().await?;
         let mut state = self.state.lock().await;
         if state.closed || self.revoked() {
             return Ok(());
         }
-        self.refresh(&mut state).await
+        self.refresh(&mut state, &mut conn).await
     }
     pub(crate) fn new(
         client: Client,
@@ -141,7 +152,25 @@ impl PtyInteractions {
             state: Mutex::new(State::default()),
             closing: Arc::new(AtomicBool::new(false)),
             auto_trust_registered_workspace,
+            #[cfg(any(test, feature = "test-stub"))]
+            pre_dispatch_gate: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Arm the post-check/pre-write park used by the r27 regression.
+    #[allow(dead_code)]
+    #[cfg(any(test, feature = "test-stub"))]
+    pub(crate) fn arm_pre_dispatch_gate(&self, gate: Arc<tokio::sync::Notify>) {
+        *self.pre_dispatch_gate.lock().expect("gate lock") = Some(gate);
+    }
+
+    /// Open the held-open connection a control/refresh cycle runs on. It is
+    /// established BEFORE the revocation check: a carrier restart that lands
+    /// after the check breaks this connection rather than letting the dispatch
+    /// dial a fresh socket onto the replacement boot that reused the pane id
+    /// (c-ctxusage r27 item 1, F1' held-connection pattern).
+    async fn pinned(&self) -> DriverResult<PersistentClient> {
+        self.client.persistent().await.map_err(map_herdr)
     }
 
     /// Revoke every queued/future control SYNCHRONOUSLY. Called the moment a
@@ -167,11 +196,20 @@ impl PtyInteractions {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
+                // Pin the carrier boot for this tick's refresh and any
+                // auto-answer dispatch it reaches.
+                let mut conn = match this.pinned().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        tracing::debug!(%error, "PTY interaction connection unavailable");
+                        continue;
+                    }
+                };
                 let mut state = this.state.lock().await;
                 if state.closed || this.revoked() || this.tx.is_closed() {
                     break;
                 }
-                if let Err(error) = this.refresh(&mut state).await {
+                if let Err(error) = this.refresh(&mut state, &mut conn).await {
                     tracing::debug!(%error, "PTY interaction observation unavailable");
                 }
             }
@@ -190,9 +228,8 @@ impl PtyInteractions {
         .await
     }
 
-    async fn screen(&self) -> DriverResult<(String, bool)> {
-        let read = self
-            .client
+    async fn screen(&self, conn: &mut PersistentClient) -> DriverResult<(String, bool)> {
+        let read = conn
             .agent_read(AgentReadParams {
                 target: self.target.clone(),
                 source: ReadSource::Visible,
@@ -211,7 +248,12 @@ impl PtyInteractions {
     /// reading has yet to clear). Herdr's own `agent_status` is the working
     /// authority here — the pane text alone lost the hint phrase in 2.1.270
     /// (D-2) — so it is handed to the latch as the known-working override.
-    async fn observe_live(&self, state: &mut State, status: AgentStatus) -> DriverResult<()> {
+    async fn observe_live(
+        &self,
+        state: &mut State,
+        status: AgentStatus,
+        conn: &mut PersistentClient,
+    ) -> DriverResult<()> {
         if status != AgentStatus::Working && !state.live_active {
             return Ok(());
         }
@@ -220,7 +262,7 @@ impl PtyInteractions {
             AgentStatus::Idle | AgentStatus::Done | AgentStatus::Blocked => Some(false),
             AgentStatus::Unknown => None,
         };
-        let (screen, _) = self.screen().await?;
+        let (screen, _) = self.screen(conn).await?;
         let grid = ScreenGrid::from_raw(&screen);
         let Some(change) = state.live.observe_with(&grid, known_working) else {
             return Ok(());
@@ -241,13 +283,8 @@ impl PtyInteractions {
         Ok(())
     }
 
-    async fn refresh(&self, state: &mut State) -> DriverResult<()> {
-        let info = self
-            .client
-            .agent_get(&self.target)
-            .await
-            .map_err(map_herdr)?
-            .agent;
+    async fn refresh(&self, state: &mut State, conn: &mut PersistentClient) -> DriverResult<()> {
+        let info = conn.agent_get(&self.target).await.map_err(map_herdr)?.agent;
         let status = info.agent_status;
         if state.status != Some(status) {
             let label = match status {
@@ -275,7 +312,7 @@ impl PtyInteractions {
             .await?;
             state.status = Some(status);
         }
-        self.observe_live(state, status).await?;
+        self.observe_live(state, status, conn).await?;
         if status != AgentStatus::Blocked {
             if status != AgentStatus::Unknown {
                 self.clear(state, InteractionState::Resolved, "native-cleared")
@@ -284,17 +321,12 @@ impl PtyInteractions {
             // Herdr calls a first-run wizard idle: it is a TUI at a menu, not a
             // blocked agent. Only a viewport read tells the two apart, and
             // without this the D-022 queue would type a prompt into the wizard.
-            self.watch_startup(state, status).await?;
+            self.watch_startup(state, status, conn).await?;
             return Ok(());
         }
-        let (screen, screen_truncated) = self.screen().await?;
+        let (screen, screen_truncated) = self.screen(conn).await?;
         // Check again after reading: never associate an old viewport with a new status epoch.
-        let after = self
-            .client
-            .agent_get(&self.target)
-            .await
-            .map_err(map_herdr)?
-            .agent;
+        let after = conn.agent_get(&self.target).await.map_err(map_herdr)?.agent;
         if after.agent_status != status || after.state_change_seq != info.state_change_seq {
             return Ok(());
         }
@@ -334,7 +366,7 @@ impl PtyInteractions {
             // One automatic attempt per carrier, even if an ACK is lost and the
             // screen changes. Only observed native clearing resolves the dialog.
             state.trust_attempted = true;
-            let result = self.commit_answer(pending, keys).await;
+            let result = self.commit_answer(conn, pending, keys).await;
             self.emit(ObservationPayload::Lifecycle(Box::new(
                 LifecyclePayload::Native(Box::new(NativeLifecycle {
                     topic: LifecycleTopic::Diagnostic,
@@ -390,7 +422,12 @@ impl PtyInteractions {
     /// screen exactly once. Screens that carry a real decision (login, the
     /// bypass disclaimer) are only reported: Remuda never accepts those for a
     /// human.
-    async fn watch_startup(&self, state: &mut State, status: AgentStatus) -> DriverResult<()> {
+    async fn watch_startup(
+        &self,
+        state: &mut State,
+        status: AgentStatus,
+        conn: &mut PersistentClient,
+    ) -> DriverResult<()> {
         if self.ctx.driver != DriverKind::ClaudePty || state.startup_polls_left == 0 {
             return Ok(());
         }
@@ -400,7 +437,7 @@ impl PtyInteractions {
         if status == AgentStatus::Unknown {
             return Ok(());
         }
-        let (screen, truncated) = self.screen().await?;
+        let (screen, truncated) = self.screen(conn).await?;
         let Some(dialog) = crate::claude_onboarding::startup_dialog(&screen) else {
             return Ok(());
         };
@@ -417,7 +454,7 @@ impl PtyInteractions {
             }
             // Mark before I/O: a lost ACK must never replay Enter.
             state.onboarding_attempted.insert(dialog.name);
-            let (status, severity) = match self.write(keys).await {
+            let (status, severity) = match self.write(conn, keys).await {
                 Ok(_) => (
                     format!("{} auto-answered (default)", dialog.name),
                     Severity::Info,
@@ -521,19 +558,50 @@ impl PtyInteractions {
     }
 
     /// Both `tty.write` and interaction replies use this exact key transport.
+    ///
+    /// c-ctxusage r27 item 1: the carrier connection is established FIRST and
+    /// only then is revocation re-checked under the state mutex. The dispatch
+    /// runs on that SAME held connection with no reconnect, so a close that
+    /// revokes and a carrier restart that reuses this pane id while the request
+    /// is parked between check and write can only make the pinned write fail
+    /// (broken connection) — the keystroke is never dialled fresh onto the
+    /// replacement foreign carrier.
     pub(crate) async fn send_keys(&self, keys: Vec<String>) -> DriverResult<DriverAck> {
+        let mut conn = self.pinned().await?;
         let state = self.state.lock().await;
         if state.closed || self.revoked() {
             return Err(DriverError::ControlUnavailable);
         }
-        // The guard stays held across the dispatch: a concurrent close can
-        // revoke after this check only while the RPC is already in flight.
-        self.write(keys).await
+        // The guard stays held across the dispatch and `conn` was pinned
+        // before this check: a concurrent close can only break the write,
+        // never make it reach a new carrier.
+        self.write(&mut conn, keys).await
     }
 
-    async fn write(&self, keys: Vec<String>) -> DriverResult<DriverAck> {
-        self.client
-            .agent_send_keys(&self.target, keys)
+    /// Send keys on a connection the caller pinned before its revocation
+    /// check. Never dials a fresh socket: a dropped pinned connection is a
+    /// failed dispatch, not a transparent retry.
+    async fn write(
+        &self,
+        conn: &mut PersistentClient,
+        keys: Vec<String>,
+    ) -> DriverResult<DriverAck> {
+        #[cfg(any(test, feature = "test-stub"))]
+        {
+            // Scope the std MutexGuard so it is dropped BEFORE the await: it
+            // is not Send and must not live across the park point.
+            let gate = self
+                .pre_dispatch_gate
+                .lock()
+                .expect("gate lock")
+                .as_ref()
+                .cloned();
+            if let Some(gate) = gate {
+                // Park AFTER the post-mutex check and BEFORE the pinned write.
+                gate.notified().await;
+            }
+        }
+        conn.agent_send_keys(&self.target, keys)
             .await
             .map_err(map_herdr)?;
         Ok(DriverAck::transport_written())
@@ -544,11 +612,14 @@ impl PtyInteractions {
         id: InteractionId,
         answer: InteractionAnswer,
     ) -> DriverResult<DriverAck> {
+        // Pin the carrier boot before the mutex/check; the whole refresh and
+        // the final answer dispatch ride this one connection.
+        let mut conn = self.pinned().await?;
         let mut state = self.state.lock().await;
         if state.closed || self.revoked() {
             return Err(DriverError::ControlUnavailable);
         }
-        self.refresh(&mut state).await?;
+        self.refresh(&mut state, &mut conn).await?;
         let pending = state
             .pending
             .as_mut()
@@ -561,23 +632,26 @@ impl PtyInteractions {
             return Err(invalid("PTY screen unavailable or truncated"));
         }
         let keys = answer_keys(pending, &answer)?;
-        self.commit_answer(pending, keys).await
+        self.commit_answer(&mut conn, pending, keys).await
     }
 
     async fn commit_answer(
         &self,
+        conn: &mut PersistentClient,
         pending: &mut Pending,
         keys: Vec<String>,
     ) -> DriverResult<DriverAck> {
-        // Reachable only through `respond`, which already checked under the
-        // same lock acquisition; re-check immediately before the dispatch so a
-        // refresh-await in that critical section cannot be the last gate.
+        // Reachable only through `respond`, which pinned `conn` and checked
+        // under the same lock acquisition before its refresh; re-check
+        // immediately before the dispatch so a refresh-await in that critical
+        // section cannot be the last gate. A restart in that window breaks the
+        // pinned conn; the write then fails instead of reaching a reused pane.
         if self.revoked() {
             return Err(DriverError::ControlUnavailable);
         }
         // Mark before I/O: even a lost RPC ACK must never replay Enter.
         pending.attempted = true;
-        let result = self.write(keys).await;
+        let result = self.write(conn, keys).await;
         pending.interaction.delivery = if result.is_ok() {
             DeliveryState::Written
         } else {
@@ -1056,5 +1130,129 @@ mod tests {
             "zero agent.send_keys dispatch reaches the reused pane"
         );
         server.abort();
+    }
+
+    /// c-ctxusage r27 item 1: the r26 window the mutex test cannot reach. A
+    /// request passes the post-mutex revocation check and is parked BEFORE the
+    /// transport write while holding the state mutex. Close revokes, the
+    /// carrier RESTARTS on the same socket path and reuses the pane id, and
+    /// the request resumes. The dispatch is pinned to the ORIGINAL carrier's
+    /// connection (established before the check), so the write must fail on
+    /// the broken connection — zero bytes may reach the replacement carrier.
+    #[tokio::test]
+    async fn a_revoked_request_parked_after_check_cannot_reach_a_reused_carrier() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::Builder::new()
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("in-crate temp dir");
+        let socket = dir.path().join("restarted-herdr.sock");
+
+        // Original carrier: accept exactly the pinned connection and HOLD it
+        // until the test orders the shutdown (the restart moment).
+        let old_listener = UnixListener::bind(&socket).expect("bind original carrier");
+        let old_shutdown = Arc::new(tokio::sync::Notify::new());
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let old_shutdown_task = {
+            let old_shutdown = old_shutdown.clone();
+            tokio::spawn(async move {
+                let (mut stream, _) = old_listener.accept().await.expect("pinned connect");
+                accepted_tx.send(()).expect("witness waits");
+                // Drain nothing; just keep the pinned connection alive until
+                // the simulated restart, then drop it (and the listener).
+                old_shutdown.notified().await;
+                let mut buf = [0u8; 4096];
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(100), stream.read(&mut buf)).await;
+            })
+        };
+
+        let (tx, _rx) = mpsc::channel(4);
+        let interactions: Arc<PtyInteractions> = PtyInteractions::new(
+            Client::connect(&socket).with_timeout(Duration::from_secs(2)),
+            "pane-id-reused-after-restart".into(),
+            ctx(),
+            tx,
+            Arc::new(AtomicU64::new(0)),
+            false,
+        );
+        // Park point: after check, before the pinned write.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        interactions.arm_pre_dispatch_gate(gate.clone());
+
+        // The request: connects to the ORIGINAL carrier, passes the check,
+        // then parks holding the state mutex.
+        let request_interactions = interactions.clone();
+        let request =
+            tokio::spawn(async move { request_interactions.send_keys(vec!["enter".into()]).await });
+        // Wait deterministically until the pinned connection was established
+        // (the original carrier accepted it) and the request has run through
+        // connect + mutex + check into the gate park.
+        tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+            .await
+            .expect("pinned connection never established")
+            .expect("accept oneshot");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Close revokes WHILE the request is parked.
+        interactions.revoke();
+
+        // Carrier restart: kill the original boot (drops listener + pinned
+        // connection), then serve the SAME socket path as the replacement,
+        // counting every byte it receives. The pane id it reuses is the one
+        // in the request target.
+        old_shutdown.notify_waiters();
+        old_shutdown_task
+            .await
+            .expect("original carrier shutdown task");
+        // A dead Unix listener leaves its socket path behind; the replacement
+        // boot (like a fresh herdr) removes the stale path before rebinding.
+        let _ = std::fs::remove_file(&socket);
+        let replacement = UnixListener::bind(&socket).expect("replacement carrier rebinds");
+        let replacement_bytes = Arc::new(AtomicU64::new(0));
+        let replacement_task = {
+            let replacement_bytes = replacement_bytes.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut conn, _)) = replacement.accept().await else {
+                        break;
+                    };
+                    let replacement_bytes = replacement_bytes.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match conn.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    replacement_bytes.fetch_add(n as u64, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    });
+                }
+            })
+        };
+
+        // Release the parked request: its pinned connection is the dead
+        // original boot's, so the write must error instead of reconnecting.
+        gate.notify_waiters();
+        let result = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .expect("dispatch resolves")
+            .expect("dispatch task");
+        assert!(
+            result.is_err(),
+            "the write on the broken pinned connection fails, got {result:?}"
+        );
+
+        // Give a buggy (reconnecting) build a beat to dial the replacement.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            replacement_bytes.load(Ordering::SeqCst),
+            0,
+            "zero bytes reach the replacement carrier's reused pane"
+        );
+        replacement_task.abort();
     }
 }

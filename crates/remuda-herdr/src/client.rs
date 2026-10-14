@@ -570,6 +570,48 @@ impl PersistentClient {
         )
         .await
     }
+
+    /// `agent.get` on the held connection. Used by interaction refreshes that
+    /// must share their pinned connection with a possible auto-answer
+    /// dispatch.
+    pub async fn agent_get(&mut self, target: impl Into<String>) -> Result<AgentInfoResult, Error> {
+        self.typed(
+            "agent.get",
+            serde_json::to_value(AgentTarget {
+                target: target.into(),
+            })?,
+            "agent_info",
+        )
+        .await
+    }
+
+    /// `agent.read` on the held connection.
+    pub async fn agent_read(&mut self, params: AgentReadParams) -> Result<PaneReadResult, Error> {
+        self.typed("agent.read", serde_json::to_value(params)?, "*")
+            .await
+    }
+
+    /// `agent.send_keys` on the held connection (c-ctxusage r27 item 1). This
+    /// is the interaction dispatch transport: it MUST run on a connection
+    /// pinned to the carrier boot that was verified before the final
+    /// revocation check. A restart that reuses the pane id breaks this
+    /// connection, so the keystroke fails as `Disconnected` instead of being
+    /// dialled fresh onto the replacement foreign carrier.
+    pub async fn agent_send_keys(
+        &mut self,
+        target: impl Into<String>,
+        keys: Vec<String>,
+    ) -> Result<OkResult, Error> {
+        self.typed(
+            "agent.send_keys",
+            serde_json::to_value(AgentSendKeysParams {
+                target: target.into(),
+                keys,
+            })?,
+            "ok",
+        )
+        .await
+    }
 }
 
 async fn read_events(

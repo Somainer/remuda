@@ -8467,3 +8467,94 @@ it("GATE40 item 2: healthy re-login after a peer logout publishes the NEW machin
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE41 item 1: a retired bootstrap's delayed 401 does not log out the successful replacement", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_360_000);
+  const I = "ins_g41_1";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g41_1");
+    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g41_1", name: "A" }));
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+
+    // A's bootstrap health is parked; later health calls (B's) succeed.
+    let rejectAHello: ((e: unknown) => void) | null = null;
+    let helloCalls = 0;
+    vi.spyOn(api, "hello").mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          helloCalls += 1;
+          if (helloCalls === 1) {
+            rejectAHello = (e: unknown) => reject(e);
+          } else {
+            _resolve({} as Awaited<ReturnType<Api["hello"]>>);
+          }
+        }),
+    );
+    vi.spyOn(api, "login").mockResolvedValue({ deviceId: "devB_g41_1", token: "tokB", name: "B" });
+
+    const h = hubStore as unknown as {
+      bootstrap: () => Promise<void>;
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      logout: () => void;
+      outbox: unknown;
+      connection: unknown;
+      state: { authed: boolean; session: { deviceId: string } | null };
+    };
+    const bootA = h.bootstrap();
+    for (let i = 0; i < 4_000 && helloCalls < 1; i += 1) await Promise.resolve();
+    expect(helloCalls).toBe(1);
+
+    // LOCAL logout while A's health is parked: advances the external epoch.
+    h.logout();
+    await pump(200);
+    expect(h.state.authed).toBe(false);
+    expect(h.outbox).toBeNull();
+
+    // Replacement login B succeeds and completes its own bootstrap.
+    await h.login("bootstrap", "secret", "devB");
+    await pump(6_000);
+    expect(h.state.authed).toBe(true);
+    expect(h.state.session?.deviceId).toBe("devB_g41_1");
+    expect(h.outbox).not.toBeNull();
+    expect(h.connection).not.toBeNull();
+
+    // A's parked health request NOW rejects with 401. The old code processed
+    // this stale 401 and destroyed B's session/outbox/connection.
+    const { HubHttpError } = await import("./httpError");
+    rejectAHello!(new HubHttpError(401, "unauthorized", "Unauthorized"));
+    await bootA;
+    await pump(3_000);
+
+    // B is intact.
+    expect(h.state.authed).toBe(true);
+    expect(h.state.session?.deviceId).toBe("devB_g41_1");
+    expect(h.outbox).not.toBeNull();
+    expect(h.connection).not.toBeNull();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

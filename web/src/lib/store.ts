@@ -4510,13 +4510,16 @@ class HubStore {
       this.startPoll();
       this.installDevHandle();
     } catch (err) {
-      // Gate 40: the external epoch is the ONLY silent-retirement gate here;
-      // no bootGen check (that generation is bumped by ordinary logout and by
-      // an overlapping bootstrap on a page reload — a stale-generation
-      // transient failure used to bail without publishing, stranding AuthGate
-      // on the loading screen). An explicit 401 moves the epoch itself below
-      // and still emits; a CURRENT-identity transient/network failure always
-      // settles the UI (offline/authed as appropriate).
+      // Gate 41 item 1: RETIREMENT FIRST. If an external change (logout/401/
+      // peer) advanced the epoch while the health/list request was parked —
+      // possibly AFTER a replacement login had already completed its own
+      // bootstrap — this stale run must not even classify the error: its late
+      // 401 would otherwise applyAuthIdentityChange(true) + clearSession/drop
+      // the cookie and destroy the replacement's session/outbox/connection. The
+      // external change already published the logged-out state and tore the
+      // old resources down. A CURRENT-epoch bootstrap's OWN 401 still passes
+      // this check (the epoch has not moved yet) and performs the logout below.
+      if (!extLive()) return;
       const unauth = isUnauthorized(err);
       if (unauth) {
         // c-reconnfu gate 33 item 1: a 401 means the current session is gone;
@@ -4528,11 +4531,6 @@ class HubStore {
         clearSession();
         dropDeviceCookie();
       }
-      // Gate 38: an external change observed WHILE this bootstrap was in
-      // flight retires the run. The explicit 401 branch above is THIS run's
-      // own logout signal and still emits logged-out below; a transient/network
-      // failure that landed stale (peer/local logout) publishes nothing.
-      if (!unauth && !extLive()) return;
       // A network failure WITH a device session still on disk is an offline
       // reload, not a logout: keep the (cached) authed UI, restore the outbox,
       // and let the connection machine reconnect. Only a real 401 logs out.

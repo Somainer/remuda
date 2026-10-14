@@ -8128,11 +8128,16 @@ it("GATE39 item 2: bootstrap parked INSIDE connection initialization across a pe
     for (let i = 0; i < 4_000 && helloCalls < 1; i += 1) await Promise.resolve();
     expect(helloCalls).toBe(1); // A's bootstrap is suspended at the health await
 
-    // While health is parked, login B starts and its transition opens.
+    // While health is parked, login B starts, acquires and parks on its
+    // credential body holding the chain (A's offline retry waits on B's
+    // blocker). The 1st login call is B's parked response; the 2nd is the
+    // replacement C's healthy response (consumed only after B releases).
     let releaseB: () => void = () => undefined;
-    vi.spyOn(api, "login").mockImplementationOnce(
-      () => new Promise((resolve) => { releaseB = () => resolve({ deviceId: "devB_g39_2", token: "tokB", name: "B" }); }),
-    );
+    vi.spyOn(api, "login")
+      .mockImplementationOnce(
+        () => new Promise((resolve) => { releaseB = () => resolve({ deviceId: "devB_g39_2", token: "tokB", name: "B" }); }),
+      )
+      .mockImplementation(() => Promise.resolve({ deviceId: "devC_g39_2", token: "tokC", name: "C" }));
     const loginB = h.login("bootstrap", "b", "devB");
     await pump(400);
 
@@ -8182,39 +8187,46 @@ it("GATE39 item 2: bootstrap parked INSIDE connection initialization across a pe
       state: "pending",
     });
 
-    // B (issued BEFORE the peer logout) settles successfully but is itself
-    // retired; it releases A's wait without installing anything.
-    releaseB();
-    await loginB;
-    await pump(2_000);
+    // Track A settling: it must STILL be parked when the replacement starts.
+    let bootASettled = false;
+    void bootA.then(() => {
+      bootASettled = true;
+    });
+
+    // Gate 41 item 4: the SUCCESSFUL replacement C is issued NOW — BEFORE B is
+    // released — queued behind B on the serialized transition chain while A is
+    // still suspended inside connection initialization.
+    const loginC = h.login("bootstrap", "c", "devC");
+    await pump(300);
+    // A is unsettled and nothing is installed/sent while B holds the chain.
+    expect(bootASettled).toBe(false);
     expect(h.state.authed).toBe(false);
     expect(h.outbox).toBeNull();
-    expect(h.connection).toBeNull();
-    // Nothing delivered while no current-identity box exists.
     expect(posted).toEqual([]);
 
-    // Gate 40 item 4: the SUCCESSFUL replacement starts AFTER the logout and
-    // is issued WITHOUT awaiting A's parked completion (bootA is still settling
-    // in the background). The replacement's OWN fresh outbox/connection install
-    // and deliver the seeded row; A installs nothing.
-    vi.mocked(api.login).mockImplementationOnce(() => Promise.resolve({ deviceId: "devC_g39_2", token: "tokC", name: "C" }));
-    const loginC = h.login("bootstrap", "c", "devC");
-    // Do NOT await bootA here: the replacement starts while A is still alive.
+    // Release B's queued turn: B's body resolves, but B already owns a STALE
+    // epoch (it acquired before the peer logout), so it writes nothing; its
+    // blocker release lets C acquire and run its healthy credential request,
+    // while A's wait resumes against its stale epoch and installs nothing.
+    releaseB();
+    await loginB;
+    await pump(400);
+
+    // C's healthy credential request released the chain: its bootstrap builds
+    // its OWN outbox/connection and delivers the seed.
     await loginC;
     await pump(8_000);
+    expect(bootASettled).toBe(true);
     expect(h.state.authed).toBe(true);
     expect(h.outbox).not.toBeNull();
     expect(h.connection).not.toBeNull();
     // The replacement's OWN fresh box delivered the seeded row exactly once —
-    // not a rogue box the retired A installed when its wait resumed (on the
-    // buggy code A captured the post-logout epoch inside ensureOutbox and its
-    // box flushed the row before/under C).
+    // not a rogue box the retired A installed when its wait resumed.
     const lifeC = h.outbox?.lifetime;
     expect(posted).toEqual([{ id: "cmd_g39_2_seed", lifetime: lifeC }]);
     expect(send).toHaveBeenCalledTimes(1);
 
-    // The retired A now settles too — still having installed nothing and no
-    // second delivery.
+    // The retired A settles without a second delivery.
     await bootA;
     await pump(1_000);
     expect(send).toHaveBeenCalledTimes(1);

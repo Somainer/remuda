@@ -8655,3 +8655,92 @@ it("GATE41 item 2 (S2): a disposed machine's late probe cannot overwrite the rep
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 });
+
+it("GATE41 item 3 (S1): overlapping bootstraps single-flight — one health run, one bubble restoration, one machine", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_380_000);
+  const I = "ins_g41_3";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g41_3");
+    // Reload scenario: a cached session exists.
+    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "dev_g41_3", name: "X" }));
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    // Health parked: both bootstrap calls overlap while the single run waits.
+    let releaseHealth: (() => void) | null = null;
+    let healthCalls = 0;
+    const hello = vi.spyOn(api, "hello").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          healthCalls += 1;
+          releaseHealth = () => resolve({} as Awaited<ReturnType<Api["hello"]>>);
+        }),
+    );
+
+    // One pending durable row: it must be restored EXACTLY once.
+    const preStorage = new (await import("./outbox")).LocalStorageOutboxStorage();
+    await preStorage.put({
+      commandId: "cmd_g41_3_restored",
+      clientRequestId: "local_g41_3_restored",
+      instanceId: I,
+      prompt: "g41 3 restored once",
+      createdAt: 1,
+      attempts: 0,
+      state: "pending",
+    });
+
+    // Count per-machine browser-listener registrations (one machine = one set).
+    const addSpy = vi.spyOn(window, "addEventListener");
+
+    const h = hubStore as unknown as {
+      bootstrap: () => Promise<void>;
+      outbox: { lifetime: string } | null;
+      connection: unknown;
+      state: { bubbles: Array<{ clientRequestId: string }> };
+    };
+    // TWO overlapping bootstraps in the SAME epoch (StrictMode replay / reload
+    // + login) while the single run's health request is parked.
+    const b1 = h.bootstrap();
+    const b2 = h.bootstrap();
+    await pump(300);
+    // Both callers are waiting on the SAME in-flight run: health fired once.
+    expect(healthCalls).toBe(1);
+
+    releaseHealth!();
+    await Promise.all([b1, b2]);
+    await pump(6_000);
+
+    // Exactly one health run (the second bootstrap joined, it did not run).
+    expect(hello).toHaveBeenCalledTimes(1);
+    // The durable row was restored to the UI exactly once.
+    expect(h.state.bubbles.filter((x) => x.clientRequestId === "local_g41_3_restored")).toHaveLength(1);
+    // Exactly one connection machine installed: one "online" listener set.
+    expect(addSpy.mock.calls.filter((c) => c[0] === "online")).toHaveLength(1);
+    expect(h.connection).not.toBeNull();
+    expect(h.outbox).not.toBeNull();
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner");
+  }
+});

@@ -54,7 +54,11 @@ import { useCodeQuotes } from "./useCodeQuotes";
 import { ContextUsagePopover } from "./ContextUsagePopover";
 import { ComposerConfirmDialog, ComposerOptionsSheet } from "./ComposerOptions";
 import type { UsageRollup } from "./contextUsage";
-import { EMPTY_USAGE_ROLLUP, EMPTY_USAGE_NOTE } from "./contextUsage";
+import {
+  EMPTY_USAGE_ROLLUP,
+  EMPTY_USAGE_NOTE,
+  USAGE_UNAVAILABLE_NOTE,
+} from "./contextUsage";
 import type { AttachmentRef, Attachment } from "../../lib/attachments";
 // UO-4: import the base popover styles before composer.module.css so its
 // .popover/.popoverCard rules precede composer/contextUsage overrides at the
@@ -501,17 +505,35 @@ export function Composer({
   // never fall through to the client-side last-event estimate and paint 0%).
   // The legacy contextLabel prop only drives mock-harness sessions with no
   // rollup channel.
-  const contextPct = usageRollup
-    ? (usageRollup.contextPct ?? null)
-    : contextLabel?.endsWith("%")
-      ? Number(contextLabel.slice(0, -1))
-      : null;
-  const contextChipLabel = contextPct == null || !Number.isFinite(contextPct) ? "—" : `${contextPct}%`;
+  // c-usagefu r16 item 7: an explicit Unavailable rollup (legacy usage shape)
+  // paints Unknown too — never 0% or a kind-guessed percentage.
+  const usageUnavailable = usageRollup?.unavailable === true;
+  const contextPct =
+    usageRollup && !usageUnavailable
+      ? (usageRollup.contextPct ?? null)
+      : usageRollup
+        ? null
+        : contextLabel?.endsWith("%")
+          ? Number(contextLabel.slice(0, -1))
+          : null;
+  // An approximate percentage (Hub kind-fallback window for an unknown model)
+  // is shown with a leading ≈; exact native/catalog/profile windows are not
+  // (c-usagefu r2 item 4, re-applied on top of main's RC3 chip). Never
+  // approximate while Unavailable.
+  const contextApprox = !usageUnavailable && usageRollup?.contextPctApproximate === true;
+  const contextChipLabel =
+    contextPct == null || !Number.isFinite(contextPct)
+      ? "—"
+      : `${contextApprox ? "≈" : ""}${contextPct}%`;
   // RC3: the chip is never dead — with no rollup it opens a card explaining
   // that the harness has not reported usage yet.
   const hasRollup = Boolean(usageRollup);
   const displayRollup: UsageRollup = usageRollup ?? EMPTY_USAGE_ROLLUP;
-  const usageEmptyNote = hasRollup ? null : EMPTY_USAGE_NOTE;
+  const usageEmptyNote = usageUnavailable
+    ? USAGE_UNAVAILABLE_NOTE
+    : hasRollup
+      ? null
+      : EMPTY_USAGE_NOTE;
   const hoverCapable = () =>
     typeof window !== "undefined" &&
     typeof window.matchMedia === "function" &&
@@ -1163,9 +1185,10 @@ export function Composer({
       className={`${css.chip} ${opt.sheetTouch}`}
       data-testid="context-chip"
       data-has-popover="1"
+      data-approximate={contextApprox ? "1" : "0"}
       aria-haspopup="dialog"
       aria-expanded={menu === "usage"}
-      aria-label={`上下文用量 ${contextChipLabel}，查看明细`}
+      aria-label={`上下文用量 ${contextApprox ? "约 " : ""}${contextChipLabel}，查看明细`}
       title={hasRollup ? undefined : EMPTY_USAGE_NOTE}
       onClick={() => {
         usagePinned.current = true;
@@ -1184,9 +1207,10 @@ export function Composer({
       className={css.chip}
       data-testid="context-chip"
       data-has-popover="1"
+      data-approximate={contextApprox ? "1" : "0"}
       aria-haspopup="dialog"
       aria-expanded={menu === "usage"}
-      aria-label={`上下文用量 ${contextChipLabel}，查看明细`}
+      aria-label={`上下文用量 ${contextApprox ? "约 " : ""}${contextChipLabel}，查看明细`}
       title={hasRollup ? undefined : EMPTY_USAGE_NOTE}
       onClick={() => {
         // Idempotent, click-pinned open: mouseenter may already have opened

@@ -296,7 +296,7 @@ test("native transcript usage drives the context chip through the real promoted 
     node.stderr?.on("data", (chunk) => process.stderr.write(chunk));
 
     let hostId = "";
-    await expect
+  await expect
       .poll(
         async () => {
           if (node && node.exitCode !== null) {
@@ -349,14 +349,17 @@ test("native transcript usage drives the context chip through the real promoted 
     ).toBe(true);
 
     const id = instanceId!;
+
+    // The context chip lives in the structured-view Composer (not the TTY
+    // dock), so drive the session from /s/:id and use the Hub command API for
+    // tty bytes (the same shape the working ux-usage sentinel spec uses).
     await page.goto(`/s/${id}`);
     await expect(page.getByTestId("session-page")).toHaveAttribute(
       "data-lifecycle",
       "running",
       { timeout: 20_000 },
     );
-
-    // Launch the harness as a promoted Claude session: launch command first,
+   // Launch the harness as a promoted Claude session: launch command first,
     // wait for data-mode=promoted, then prompt body and CR as separate writes
     // (the harness treats one read with body+CR as paste).
     await rawKeys(
@@ -425,5 +428,7 @@ test("native transcript usage drives the context chip through the real promoted 
     if (node) await stopNode(node);
     dataHandle?.close();
     await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await context.close().catch(() => {});
   }
-});
+  });
+}

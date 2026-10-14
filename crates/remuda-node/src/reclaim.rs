@@ -517,6 +517,13 @@ impl DevNode {
                 .api_relay
                 .revoke_instance(instance.meta.id.as_id().as_str());
         }
+        // c-usagefu r18 Ruling W0': every instance close below is performed AS
+        // PART OF this Node's shutdown — workers and pumps are already stopped
+        // above, so an incomplete stop emits only the driver's tracing::warn!
+        // (no operator lifecycle/Warning, no reordering of shutdown, no pumps
+        // kept alive), and this Node's retained census intervals are retired
+        // once the closes finish.
+        self.inner.census_epoch.begin_shutdown();
         let mut tasks = tokio::task::JoinSet::new();
         for instance in self.inner.store.list_instances()? {
             let node = self.clone();
@@ -533,6 +540,15 @@ impl DevNode {
                 Err(error) => failure = Some(node_error(error)),
             }
         }
+        // c-usagefu r17 Ruling W0 + r18 items 2/3: every instance is closed
+        // above, so own the driver side for the last time — retire THIS Node's
+        // retained stop-incomplete census blocks. The guards drop WITHOUT a
+        // recorded close and their still-open census SEGMENTS are removed (not
+        // closed), so an in-process recompose (a fresh Node epoch in this same
+        // process) can attribute a same-cwd prompt-only discovery again;
+        // another still-live Node's epoch is left alone. There are no watcher
+        // tasks to await.
+        remuda_driver::shutdown_unconfirmed_guards(Some(&self.inner.census_epoch));
         // Includes partial launches which never yielded a driver handle.
         for resource in self.inner.store.pty_resources()? {
             match resource.close().await {

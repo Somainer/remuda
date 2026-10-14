@@ -245,6 +245,19 @@ pub trait Driver: Send + Sync {
     > {
         Box::pin(async { Ok(None) })
     }
+
+    /// Test seam: force the NEXT close's stop ladder verdict to stop-incomplete
+    /// naming the driver's own pgid (the real ladder still runs). Used by Node
+    /// integration tests for census-epoch retirement (c-usagefu r19 item 1).
+    #[cfg(feature = "test-stub")]
+    fn test_force_stop_incomplete(&self) {}
+
+    /// Test seam: whether this driver's spawned codex file adapter has bound a
+    /// session (c-usagefu r19 item 1).
+    #[cfg(feature = "test-stub")]
+    fn test_codex_bound(&self) -> bool {
+        false
+    }
 }
 
 /// Creates one stateful driver object for each Instance.
@@ -449,12 +462,88 @@ enum Registration {
 }
 
 /// Thread-safe registry of local driver implementations.
-#[derive(Clone, Default)]
+///
+/// c-usagefu r19 item 1: the registry OWNS the Node's census epoch. Every
+/// factory registered here builds drivers stamped with this one epoch, and
+/// the [`DevNode`](crate::DevNode) constructed from the registry adopts the
+/// same clone — so on every native construction path (compose, with_parts*,
+/// `remuda dev`) the drivers and their Node can never disagree.
+#[derive(Clone)]
 pub struct DriverRegistry {
     drivers: Arc<RwLock<BTreeMap<DriverKind, Registration>>>,
+    census_epoch: remuda_driver::NodeEpoch,
+    /// Whether this registry object graph has already been adopted by a Node.
+    /// Clones share the flag (cloning a registry does NOT mint a new graph),
+    /// so the same registry — including a `registry.clone()` — cannot back two
+    /// independent Nodes: the second [`DevNode`] construction is rejected
+    /// (c-usagefu r20 item 3). Independent Nodes get independent registries
+    /// (`native_driver_registry` / `with_fake`), hence distinct epochs.
+    adopted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Default for DriverRegistry {
+    fn default() -> Self {
+        Self {
+            drivers: Arc::new(RwLock::new(BTreeMap::new())),
+            census_epoch: remuda_driver::NodeEpoch::mint(),
+            adopted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+/// Reservation on a registry's single-adoption slot
+/// (c-usagefu r21 item 4). On construction failure the constructor calls
+/// [`AdoptionGuard::rollback`]-by-drop and the registry stays adoptable; on
+/// success the Node commits and the flag stays set when the guard is dropped.
+pub(crate) struct AdoptionGuard {
+    adopted: Arc<std::sync::atomic::AtomicBool>,
+    committed: bool,
+}
+
+impl Drop for AdoptionGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.adopted
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl AdoptionGuard {
+    /// Commit the adoption: the Node was fully constructed and owns the
+    /// registry.
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
 }
 
 impl DriverRegistry {
+    /// Reserve this registry for exactly one Node. Returns an error if it (or a
+    /// clone of it) was already committed — two Nodes sharing one registry
+    /// would share shutdown ownership and census-retirement buckets. The
+    /// reservation is rolled back automatically if the returned guard is
+    /// dropped without [`AdoptionGuard::commit`] (c-usagefu r20 item 3, r21
+    /// item 4).
+    pub(crate) fn claim_adoption(&self) -> Result<AdoptionGuard, NodeError> {
+        if self.adopted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(NodeError::InvalidConfig(
+                "driver registry already adopted by another Node; build a fresh registry per Node"
+                    .to_owned(),
+            ));
+        }
+        Ok(AdoptionGuard {
+            adopted: Arc::clone(&self.adopted),
+            committed: false,
+        })
+    }
+
+    /// The census epoch shared by every driver this registry builds and the
+    /// Node it is installed into (c-usagefu r19 item 1).
+    #[must_use]
+    pub fn census_epoch(&self) -> remuda_driver::NodeEpoch {
+        self.census_epoch.clone()
+    }
+
     /// Register or replace the adapter for its advertised kind.
     pub fn register(&self, driver: Arc<dyn Driver>) -> Result<(), NodeError> {
         self.drivers
@@ -513,12 +602,20 @@ impl DriverRegistry {
     pub fn with_fake() -> Result<Self, NodeError> {
         let registry = Self::default();
         registry.register_factory(Arc::new(FakeDriverFactory))?;
-        registry.register_factory(Arc::new(ShellPtyFactory))?;
+        // The fallback shell-pty factory shares the registry's own epoch: even
+        // a Fake-drivers Node builds real shell-pty login sessions, and no
+        // production driver may end up in the detached None bucket.
+        registry.register_factory(Arc::new(ShellPtyFactory {
+            epoch: registry.census_epoch(),
+        }))?;
         Ok(registry)
     }
 }
 
-struct ShellPtyFactory;
+struct ShellPtyFactory {
+    /// Census epoch shared with the registry/Node this factory belongs to.
+    epoch: remuda_driver::NodeEpoch,
+}
 
 impl DriverFactory for ShellPtyFactory {
     fn kind(&self) -> DriverKind {
@@ -528,6 +625,7 @@ impl DriverFactory for ShellPtyFactory {
     fn build(&self, launch: DriverLaunch) -> Result<Arc<dyn Driver>, DriverError> {
         let mut options = remuda_driver::ShellPtyOptions::login(launch.workspace_root);
         options.args = launch.request.args;
+        options.node_epoch = Some(self.epoch.clone());
         Ok(Arc::new(NativeShellAdapter {
             inner: remuda_driver::ShellPtyDriver::new(options),
         }))
@@ -633,6 +731,23 @@ impl Driver for NativeShellAdapter {
                 .await
                 .map_err(|error| DriverError::Failed(error.to_string()))
         })
+    }
+
+    #[cfg(feature = "test-stub")]
+    fn test_force_stop_incomplete(&self) {
+        let pgid = self.inner.test_pgid().unwrap_or(0);
+        self.inner
+            .test_force_stop_outcome(remuda_driver::TestStopOutcome {
+                rung: remuda_driver::shell_pty::StopRung::Kill,
+                group_gone: false,
+                pgid: Some(pgid),
+                survivors: vec![pgid],
+            });
+    }
+
+    #[cfg(feature = "test-stub")]
+    fn test_codex_bound(&self) -> bool {
+        self.inner.test_codex_bound()
     }
 }
 

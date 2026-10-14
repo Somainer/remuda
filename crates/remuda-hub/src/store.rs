@@ -7270,7 +7270,16 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     crate::supply::migrate(&conn)?;
     crate::workers::migrate(&conn)?;
     crate::gatequeue::migrate(&conn)?;
-    crate::usage_store::migrate(&conn)?;
+    // c-usagefu r14 item 1 (Ruling M1): a failed usage migration must never
+    // brick Hub startup. The migration is one transaction and rolls back to
+    // the previously-openable shape on any error; log it and open. Usage
+    // accounting degrades until a successful migration, but the Hub serves.
+    if let Err(error) = crate::usage_store::migrate(&conn) {
+        tracing::error!(
+            %error,
+            "usage_events migration failed and rolled back; opening on the legacy usage shape"
+        );
+    }
     migrate_provider_models(&conn)?;
     crate::store_tickets::migrate(&conn)?;
     dedup_duplicate_hosts(&conn)?;
@@ -14562,11 +14571,22 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .and_then(|raw| serde_json::from_str(&raw).ok());
             // Additive context-usage rollup (context-usage-1), folded from the
             // durable usage_events table so it is never stored redundantly.
+            // c-usagefu (c): resolve the window against the transcript-observed
+            // effective model (a `/model` switch) before the launch model, so a
+            // switch to `[1m]` refreshes the percentage on the next read.
+            let effective_model_id = model_effective
+                .as_ref()
+                .and_then(|value| value.get("id"))
+                .and_then(Value::as_str);
             let usage_rollup = crate::usage_store::rollup_instance(
                 conn,
-                id,
-                &row.get::<_, String>(3)?,
-                model.as_deref(),
+                &crate::usage_store::RollupRequest {
+                    instance_id: id,
+                    kind: &row.get::<_, String>(3)?,
+                    spec_model: model.as_deref(),
+                    effective_model: effective_model_id,
+                    profile_id: provider_profile_id.as_deref(),
+                },
             )?;
             Ok(InstanceRecord {
                 instance_id: row.get(0)?,

@@ -113,8 +113,9 @@ export function ContextUsagePopover({
             aria-label={
               rollup.contextPct == null
                 ? "上下文占用未知"
-                : `上下文占用 ${rollup.contextPct}%`
+                : `上下文占用 ${head.approximate ? "约 " : ""}${rollup.contextPct}%`
             }
+            data-approximate={head.approximate ? "1" : "0"}
           >
             <span style={{ width: `${pct}%` }} />
           </div>
@@ -132,7 +133,9 @@ export function ContextUsagePopover({
         <div className={css.usageSection}>
           <span className={css.usageInline}>
             <span className={css.usageLabel}>回合数</span>
-            <span data-testid="context-usage-turns">{rollup.turns}</span>
+            <span data-testid="context-usage-turns">
+              {rollup.unavailable ? "—" : rollup.turns}
+            </span>
           </span>
         </div>
 

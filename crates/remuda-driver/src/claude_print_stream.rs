@@ -14,6 +14,27 @@ pub(super) struct StreamState {
     active: HashMap<Option<String>, String>,
     blocks: HashMap<(Option<String>, String), BTreeMap<u32, Block>>,
     snapshots: HashSet<String>,
+    /// Message ids whose per-call `message.usage` has already been emitted.
+    /// Successive content-block frames repeat one message id with an identical
+    /// usage blob (usage-adapter §3.1); only the first frame is a call.
+    pub(super) usage_messages: HashSet<String>,
+    /// Native context window per model learned from `result.modelUsage`
+    /// (`modelUsage.<model>.contextWindow`), stamped onto later per-call
+    /// usage payloads for that model.
+    pub(super) model_windows: std::collections::BTreeMap<String, u64>,
+    /// Model label per active native message id, captured on `message_start`
+    /// (`message.model`). `message_delta` carries the final usage but no model,
+    /// so the revision-2 per-call payload reads it from here (c-usagefu r2
+    /// item 2).
+    pub(super) message_models: HashMap<String, String>,
+    /// Raw revision-1 `message.usage` blob per native message id (the
+    /// provisional usage on the first assistant / `message_start` frame).
+    /// Some gateway profiles (Bedrock/Vertex Anthropic-Messages gateways)
+    /// send `message_delta.usage` as a PATCH carrying only changed keys,
+    /// commonly `{"output_tokens": n}` alone; revision 2 is that delta
+    /// overlaid on this revision-1 blob, so omitted input/cache buckets are
+    /// not read as zero and rejected as a decrease (c-usagefu r3 item 2).
+    pub(super) message_usage: HashMap<String, Value>,
     /// Mapped ids of TOP-LEVEL (`parent_tool_use_id == null`) ExitPlanMode
     /// tool_use blocks seen on assistant messages. D-051 (6a): only such a
     /// call is minted as a PlanReview; sub-agent (nested) ExitPlanMode calls
@@ -156,6 +177,11 @@ pub(super) fn map_stream(
                 .stream
                 .active
                 .insert(frame.parent_tool_use_id.clone(), id.into());
+            // Keep the model beside the id so message_delta (which carries the
+            // final usage but no model field) can stamp it.
+            if let Some(model) = event.pointer("/message/model").and_then(Value::as_str) {
+                mapper.stream.message_models.insert(id.into(), model.into());
+            }
         }
         return Ok(Vec::new());
     }
@@ -163,6 +189,39 @@ pub(super) fn map_stream(
         // Missing native identity cannot be repaired using a per-event UUID.
         return mapper.opaque(kind, OpaqueReason::UnmappedFields, event);
     };
+    // c-usagefu r2 item 2: `message_delta` closes one assistant message with
+    // its FINAL usage blob (with `--include-partial-messages` the usage on the
+    // assistant/message_start frames is the provisional in-flight count).
+    // Re-emit the same Turn payload at revision 2; the Hub growth-replaces the
+    // provisional row. Top-level only, matching the revision-1 emission —
+    // sub-agent deltas are sidechains.
+    if kind == "message_delta" {
+        if frame.parent_tool_use_id.is_none()
+            && let Some(delta_usage) = event.get("usage")
+        {
+            // Clone out before the mutable helper borrows the mapper.
+            let model = mapper.stream.message_models.get(&native).cloned();
+            // Revision 2 is the delta overlaid on the revision-1 blob: a
+            // Bedrock/Vertex/gateway delta may carry only output_tokens, and
+            // building the revision from the delta alone would zero the input
+            // and cache buckets, a "decrease" the Hub rejects — leaving the
+            // per-call output count stuck at its provisional value. No
+            // revision-1 blob (ungated pty hydration, sparse stream) falls
+            // back to the delta exactly as before.
+            let final_usage = mapper
+                .stream
+                .message_usage
+                .get(&native)
+                .map(|base_usage| overlay_usage_patch(base_usage, delta_usage))
+                .unwrap_or_else(|| delta_usage.clone());
+            if let Some(usage_obs) =
+                super::turn_usage_observation(mapper, &native, model.as_deref(), &final_usage, 2)?
+            {
+                return Ok(vec![usage_obs]);
+            }
+        }
+        return Ok(Vec::new());
+    }
     let parent = parent_id(mapper, frame.parent_tool_use_id.as_deref())?;
     let key = (frame.parent_tool_use_id.clone(), native.clone());
     let mut blocks = mapper.stream.blocks.remove(&key).unwrap_or_default();
@@ -262,10 +321,44 @@ pub(super) fn map_stream(
         }
         if kind == "message_stop" {
             mapper.stream.active.remove(&frame.parent_tool_use_id);
+            mapper.stream.message_models.remove(&native);
+            mapper.stream.message_usage.remove(&native);
         }
     }
     mapper.stream.blocks.insert(key, blocks);
     Ok(out)
+}
+
+/// Merge a `message_delta.usage` PATCH onto the revision-1 usage blob.
+///
+/// Only keys present on the delta change the blob; buckets the provider
+/// omits keep their revision-1 values (the Anthropic documented
+/// `message_delta` shape carries just the output count on many
+/// Bedrock/Vertex/gateway profiles). Nested objects merge key-by-key under
+/// the same rule; scalars and arrays are replaced.
+fn overlay_usage_patch(base: &Value, patch: &Value) -> Value {
+    match (base, patch) {
+        (Value::Object(base_map), Value::Object(patch_map)) => {
+            let mut merged = base_map.clone();
+            for (key, patch_value) in patch_map {
+                merged
+                    .entry(key.clone())
+                    .and_modify(|base_value| {
+                        *base_value = overlay_usage_patch(base_value, patch_value)
+                    })
+                    .or_insert_with(|| patch_value.clone());
+            }
+            Value::Object(merged)
+        }
+        // An explicit JSON null at the scalar/root level is the gateway
+        // spelling of "field absent in this delta" (e.g. Bedrock serializes
+        // None as {"input_tokens":null,...,"output_tokens":30}). Overlaying it
+        // would turn the revision-1 bucket into zero and get revision 2
+        // rejected as a decrease; treat null as "no change", like an omitted
+        // key (c-usagefu r4 item 5).
+        (base, Value::Null) => base.clone(),
+        _ => patch.clone(),
+    }
 }
 
 pub(super) fn map_assistant(
@@ -358,8 +451,37 @@ pub(super) fn map_assistant(
         }
     }
     mapper.stream.blocks.insert(key, blocks);
+    // Per-call usage (c-usagefu (a), r2 items 3 & 5a): one Turn usage payload
+    // per top-level model message, from `message.usage` — never the summed
+    // `result.usage`. Sub-agent frames carry a parent and are dropped the same
+    // way transcript sidechain records are. Repeated block frames for one
+    // message id dedupe.
+    //
+    // This stream emission is the SOLE per-call channel only for the stdout
+    // carriers (claude-print / claude-sdk), whose argv produces stream-json.
+    // The interactive pty carriers (shell-pty and claude-pty) hydrate from the
+    // native transcript through this same mapper: `emit_conversation` rebuilds
+    // each record into a stream frame that reaches here, while a later
+    // group-gated `flush`/`finish` is their authoritative usage source (it
+    // waits for stop_reason / supersede / finish). Emitting on the ungated
+    // first frame would double-count every pty transcript — shell-pty was
+    // already excluded; r2 item 5a closes the same hole for claude-pty.
+    if msg.parent_tool_use_id.is_none()
+        && stream_usage_carrier(mapper.driver_kind)
+        && let Some(usage_obs) = super::usage_from_assistant_message(mapper, msg)?
+    {
+        out.push(usage_obs);
+    }
     if let Some(id) = &msg.uuid {
         mapper.stream.snapshots.insert(id.clone());
     }
     Ok(out)
+}
+
+/// Whether this carrier reads stream-json as its authoritative output channel
+/// (and therefore takes per-call usage straight off the assistant / delta
+/// frames). The interactive pty carriers instead hydrate a native transcript
+/// and emit usage through the group-gated flush (r2 item 5a).
+fn stream_usage_carrier(kind: DriverKind) -> bool {
+    matches!(kind, DriverKind::ClaudePrint | DriverKind::ClaudeSdk)
 }

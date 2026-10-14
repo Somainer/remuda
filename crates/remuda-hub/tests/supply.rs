@@ -876,6 +876,217 @@ async fn usage_events_flow_through_journal_into_aggregation() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "test-faults")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rolled_back_usage_shape_is_explicitly_unavailable_over_http() -> Result<()> {
+    use rusqlite::Connection;
+
+    // Pre-seed hub.sqlite with origin/main's usage_events shape (no scope_id /
+    // turn_id / observed_at_source) plus the per-database force-failure
+    // sentinel, BEFORE the Hub boots and migrates.
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir)?;
+    {
+        let conn = Connection::open(data_dir.join("hub.sqlite"))?;
+        conn.execute_batch(
+            "CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (instance_id, seq)
+             );
+             CREATE TABLE remuda_test_force_usage_migration_failure (x);",
+        )?;
+        // A real legacy spend row exists on disk; the placeholder zero must not
+        // be mistaken for it.
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, mode, input_tokens, output_tokens,
+                 accounting, observed_at)
+             VALUES ('ins_legacy_http', 1, 'turn', 'snapshot', 40, 30,
+                     'estimated', '2026-10-13T00:00:00.000Z')",
+            [],
+        )?;
+    }
+
+    // The Hub opens despite the failed, rolled-back usage migration.
+    let hub = spawn(HubConfig::for_test(data_dir)).await?;
+    let cookie = login(hub.addr, hub.bootstrap_token.as_str()).await?;
+    let host = HostId::new().as_id().to_string();
+    let node = enroll_fake_node(&hub, &host, 8).await?;
+    let relay = create_relay(hub.addr, &cookie).await?;
+    let profile_id = relay["id"].as_str().unwrap();
+    let instance_id = seed_live_instance(&hub, &node, &host, profile_id, "gw/model_x[1m]").await?;
+
+    // Instance aggregate: explicit Unavailable, placeholder zeros, no error.
+    let (status, body) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}/usage"),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "the instance usage endpoint stays usable");
+    let inst: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(
+        inst["unavailable"], true,
+        "instance aggregate is Unavailable"
+    );
+    assert_eq!(inst["events"], 0, "placeholder zeros, not the legacy spend");
+
+    // Provider aggregate: one top-level Unavailable flag.
+    let (_, body) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/providers/{profile_id}/usage"),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    let prov: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(
+        prov["usageUnavailable"], true,
+        "provider usage reports Unavailable, not an empty/zero spend report"
+    );
+
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// c-usagefu r2 item 5(c): the transcript-observed `modelEffective` (a `/model`
+/// switch) drives the context-window rollup served on the instance API, and the
+/// rollup is refreshed on the next read after the switch. No prior test
+/// exercised the store.rs rollup wiring against a live model observation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_effective_switch_refreshes_the_instance_context_window() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    let host = HostId::new().as_id().to_string();
+    let node = enroll_fake_node(&hub, &host, 8).await?;
+    let relay = create_relay(hub.addr, &cookie).await?;
+    let profile_id = relay["id"].as_str().unwrap();
+    // Launch model: claude-haiku-4-5 = 200k in the static catalog.
+    let instance_id =
+        seed_live_instance(&hub, &node, &host, profile_id, "claude-haiku-4-5").await?;
+
+    // 100,000 uncached input tokens: 50% of the launch model's 200k window.
+    let usage = json!({
+        "instanceId": instance_id,
+        "event": {
+            "schemaVersion": 1,
+            "eventId": "evt_r2c-usage-1",
+            "journalId": "obj_r2c-1",
+            "instanceId": instance_id,
+            "hostId": host,
+            "processGeneration": "1",
+            "seq": "1",
+            "observedAt": "2026-10-09T10:00:00.000Z",
+            "kind": "usage",
+            "completeness": "structured",
+            "payload": {
+                "usageId": "obj_r2c-turn-1",
+                "scope": "turn",
+                "scopeId": "msg_r2c_1",
+                "mode": "snapshot",
+                "metricRevision": "2",
+                "inputAccounting": "uncached",
+                "accounting": "estimated",
+                "inputTokens": { "state": "known", "value": "100000" },
+                "outputTokens": { "state": "known", "value": "1000" },
+                "reasoningTokens": { "state": "known", "value": "0" },
+                "cacheReadTokens": { "state": "known", "value": "0" },
+                "cacheWriteTokens": { "state": "not-applicable" },
+                "totalTokens": { "state": "known", "value": "101000" }
+            }
+        }
+    });
+    node.append.lock().await(usage).await?;
+
+    let rollup = get_instance_rollup(hub.addr, &cookie, &instance_id).await?;
+    assert_eq!(
+        rollup["contextWindowTokens"], 200_000,
+        "launch catalog window"
+    );
+    assert_eq!(rollup["contextUsedTokens"], 100_000);
+    assert_eq!(rollup["contextPct"], 50);
+    assert_eq!(
+        rollup["contextPctApproximate"], false,
+        "catalog evidence is exact"
+    );
+
+    // A `/model` switch to a [1m] id refreshes the window to 1m: the same
+    // 100k used is now 10%, still exact (explicit tag).
+    let switch_long = json!({
+        "instanceId": instance_id,
+        "event": {
+            "kind": "model",
+            "payload": {
+                "requested": "claude-haiku-4-5[1m]",
+                "effective": {
+                    "id": "claude-haiku-4-5[1m]",
+                    "source": "slash",
+                    "observedAt": "2026-10-09T10:01:00.000Z"
+                },
+                "raw": "claude-haiku-4-5[1m]"
+            }
+        }
+    });
+    node.append.lock().await(switch_long).await?;
+
+    let rollup = get_instance_rollup(hub.addr, &cookie, &instance_id).await?;
+    assert_eq!(
+        rollup["contextWindowTokens"], 1_000_000,
+        "the switched-to effective model's [1m] window is used"
+    );
+    assert_eq!(rollup["contextPct"], 10, "100k / 1m = 10%");
+    assert_eq!(rollup["contextPctApproximate"], false);
+
+    // A switch to an UNKNOWN id drops to the harness-kind fallback and is
+    // marked approximate (never an exact window).
+    let switch_unknown = json!({
+        "instanceId": instance_id,
+        "event": {
+            "kind": "model",
+            "payload": {
+                "requested": "gateway/renamed-model",
+                "effective": {
+                    "id": "gateway/renamed-model",
+                    "source": "slash",
+                    "observedAt": "2026-10-09T10:02:00.000Z"
+                },
+                "raw": "gateway/renamed-model"
+            }
+        }
+    });
+    node.append.lock().await(switch_unknown).await?;
+
+    let rollup = get_instance_rollup(hub.addr, &cookie, &instance_id).await?;
+    assert_eq!(
+        rollup["contextWindowTokens"], 200_000,
+        "unknown effective model -> claude kind fallback"
+    );
+    assert_eq!(
+        rollup["contextPctApproximate"], true,
+        "the fallback percentage is an estimate"
+    );
+
+    hub.shutdown().await;
+    Ok(())
+}
+
 /// c-ctxusage r34/r35 item 1: the unprovable-lineage migration shape combined
 /// with a mid-session model change must keep model A visible on the PROVIDER
 /// endpoint. The database starts at the OLD (identity-column) schema with
@@ -1043,7 +1254,6 @@ async fn ambiguous_only_model_survives_upgrade_and_shows_on_provider_usage() -> 
         None,
     )
     .await?;
-
     let usage: Value = serde_json::from_str(body.trim())?;
     let models = usage["models"]
         .as_array()
@@ -1082,4 +1292,21 @@ async fn ambiguous_only_model_survives_upgrade_and_shows_on_provider_usage() -> 
 
     hub.shutdown().await;
     Ok(())
+}
+
+async fn get_instance_rollup(
+    addr: std::net::SocketAddr,
+    cookie: &str,
+    instance_id: &str,
+) -> Result<Value> {
+    let (_, body) = http(
+        addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}"),
+        &[("Cookie", cookie)],
+        None,
+    )
+    .await?;
+    let record: Value = serde_json::from_str(body.trim())?;
+    Ok(record["usageRollup"].clone())
 }

@@ -32,11 +32,14 @@ pub struct UsageEventRow {
     pub model: Option<String>,
     /// Usage scope (`turn` / `session` / …).
     pub scope: String,
-    /// Native scope id (the assistant message id for a turn snapshot). Drives
-    /// durable re-hydration dedupe: the same transcript re-mapped after a
-    /// rebind re-emits the same `(scope, scope_id)`, and INSERT OR IGNORE on
-    /// the partial unique index drops the duplicate projection.
+    /// Native scope id (the assistant message id for a turn snapshot; the
+    /// per-response id for a codex Message row). Drives durable re-hydration
+    /// dedupe and the context basket.
     pub scope_id: Option<String>,
+    /// Native turn id this row belongs to (codex Message rows carry it on the
+    /// stamped observation; r6 item 5). `None` for legacy rows and scope
+    /// kinds that already key on the turn (Claude Turn scope_id).
+    pub turn_id: Option<String>,
     /// Snapshot revision for a given `(scope, scope_id)`. Turn observations
     /// are immutable (always 1); Grok/Codex Session snapshots keep a stable
     /// session id and re-emit with an increasing revision, so a newer
@@ -72,13 +75,97 @@ pub struct UsageEventRow {
     /// native timestamp may authoritatively repair the stored time; ingest
     /// fallbacks never overwrite one (c-ctxusage r4 item 5).
     pub observed_at_source: String,
+    /// Native per-model context window the harness reported (`result`/
+    /// `modelUsage.contextWindow`, via `UsagePayload.contextWindow`). The
+    /// newest reported window wins (c-usagefu (c)).
+    pub native_context_window: Option<i64>,
 }
 
 /// Create the `usage_events` table. Idempotent and safe against every prior
 /// schema: the `scope_id` partial unique index is created only AFTER the
 /// column is guaranteed to exist, so a pre-delivery database (no scope_id
 /// column) upgrades instead of failing to open.
+///
+/// c-usagefu r14 item 1 (Ruling M1): a usage migration must NEVER make the
+/// Hub unable to start. The ENTIRE migration — table/column DDL, the
+/// scope-id journal backfill, duplicate consolidation and every unique
+/// index — runs in ONE transaction; any error rolls ALL of it back to the
+/// previously-openable shape. SQLite DDL is transactional, so an
+/// `ALTER TABLE`/`CREATE INDEX` that never committed is gone too. The
+/// caller (the store opener) logs a migration error and opens on the old
+/// shape instead of propagating it.
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    run_migrations(&tx)?;
+    tx.commit()
+}
+
+/// Persisted marker table: records which ONE-TIME data migrations have
+/// completed, so a later start never repeats a step that would corrupt the
+/// final shape (c-usagefu r15 item 2).
+const META_DDL: &str = "CREATE TABLE IF NOT EXISTS usage_schema_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+     );";
+
+/// Marker for the scope-id journal backfill + duplicate consolidation
+/// (c-usagefu r13/r14). Once recorded, the disagreeing-bucket rows were
+/// intentionally cleared back to NULL and the unique indexes exist; running
+/// the journal backfill again would RE-CREATE those scope ids straight into
+/// the unique index and fail every restart.
+const MARKER_SCOPE_CONSOLIDATION: &str = "scope_consolidation_v1";
+
+/// Test-only sentinel table: while it exists, the usage migration fails AFTER
+/// its additive DDL, inside the migration transaction — a deterministic,
+/// per-database stand-in for an exhausted disk / SQL error that rolls the
+/// whole migration back (c-usagefu r15 item 1). Not a global flag, so parallel
+/// tests opening their own stores are unaffected.
+#[cfg(any(test, feature = "test-faults"))]
+const TEST_FORCE_FAILURE_TABLE: &str = "remuda_test_force_usage_migration_failure";
+
+#[cfg(any(test, feature = "test-faults"))]
+fn test_failure_forced(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master
+         WHERE type = 'table' AND name = ?1",
+        [TEST_FORCE_FAILURE_TABLE],
+        |row| row.get(0),
+    )
+}
+
+fn set_meta_marker(conn: &Connection, key: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO usage_schema_meta (key, value) VALUES (?1, 'applied')",
+        [key],
+    )?;
+    Ok(())
+}
+
+/// Whether the OPEN database carries the final usage schema. The migration is
+/// ONE atomic transaction (Ruling M1), so every post-main column exists iff a
+/// migration committed; `scope_id` is the first such column the origin/main
+/// shape lacks. A failed migration rolls the DDL back too, leaving the main
+/// shape — reads must then degrade to Unknown instead of issuing SQL that
+/// references missing columns (c-usagefu r15 item 1). A missing
+/// `usage_events` table (nothing ever ingested, migration rolled back) is the
+/// same legacy shape.
+pub(crate) fn usage_schema_is_current(conn: &Connection) -> rusqlite::Result<bool> {
+    let table_exists: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM sqlite_master
+         WHERE type = 'table' AND name = 'usage_events'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(false);
+    }
+    crate::store::column_exists(conn, "usage_events", "scope_id")
+}
+
+/// All usage migration steps, in order. Runs inside [`migrate`]'s single
+/// transaction: every helper here must do its work on `conn` WITHOUT opening
+/// a nested transaction.
+fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS usage_events (
             instance_id TEXT NOT NULL,
@@ -87,6 +174,7 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             model TEXT,
             scope TEXT NOT NULL,
             scope_id TEXT,
+            turn_id TEXT,
             mode TEXT NOT NULL,
             total_tokens INTEGER,
             input_tokens INTEGER,
@@ -97,6 +185,7 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             accounting TEXT NOT NULL DEFAULT 'estimated',
             observed_at TEXT NOT NULL,
             observed_at_source TEXT NOT NULL DEFAULT 'ingest',
+            native_context_window INTEGER,
             metric_revision INTEGER NOT NULL DEFAULT 1,
             source_session_id TEXT,
             PRIMARY KEY (instance_id, seq)
@@ -112,6 +201,9 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // Context-window rollup (c-ctxusage RC1): durable per-turn dedupe key.
     // MUST be added before the partial unique index that references it.
     crate::store::ensure_column(conn, "usage_events", "scope_id", "TEXT")?;
+    // c-usagefu r6 item 5: native turn id for codex Message rows, so the
+    // rollup can count distinct turns after the Turn emission was removed.
+    crate::store::ensure_column(conn, "usage_events", "turn_id", "TEXT")?;
     // r2: snapshot revision for revision-aware scoped upserts. Added as a
     // nullable column for upgrade compatibility, then backfilled: rows written
     // at the f890028e schema got NULL here, and a NULL on the right-hand side of
@@ -138,55 +230,55 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
          WHERE observed_at_source IS NULL OR observed_at_source = ''",
         [],
     )?;
-    // c-ctxusage r10 item 2: the obsolete shared unique index
-    // (`instance_id, scope, scope_id` WHERE scope_id IS NOT NULL) MUST be
-    // dropped BEFORE the retained-journal backfill stamps NULL-scope rows —
-    // two legacy rows proving one session would otherwise violate it mid-
-    // migration and the Hub database could never open (every retry failed at
-    // this statement). Drop → backfill → collapse identical rows that the
-    // stamp makes duplicates → create the scope-specific index, all in ONE
-    // transaction so an interruption never leaves the schema half-migrated.
+    // c-usagefu (c): native per-model context window reported on the payload.
+    crate::store::ensure_column(conn, "usage_events", "native_context_window", "INTEGER")?;
+    conn.execute_batch(META_DDL)?;
+    // c-ctxusage r10/r29-r31 + c-usagefu r13-r16 identity recovery: the whole
+    // scope/lineage consolidation and the fallback-field reconstruction run in
+    // ONE migration transaction so an interruption never leaves the schema or
+    // the data half-migrated. The r29-r31 lineage collapse is the superset of
+    // usagefu's marker-guarded scope block (it is idempotent itself and covers
+    // the already-complete-r14/r28 shapes directly), but the usagefu fallback
+    // projection (turn_id / native time / revision / context window for rows
+    // written while an earlier migration window was rolled back) still runs.
     let tx = conn.unchecked_transaction()?;
+    // c-usagefu r15 item 1 test seam: a forced failure AFTER the additive DDL
+    // rolls the columns back too, exercising the legacy-shape fallback.
+    #[cfg(any(test, feature = "test-faults"))]
+    if test_failure_forced(&tx)? {
+        tx.execute_batch("SELECT remuda_test_force_usage_migration_failure();")?;
+    }
+    // c-usagefu r13/r16: recover scope_id and the fallback-only projection
+    // fields (native turn id, native time, revision, context window) from the
+    // retained journal BEFORE the lineage collapse below.
+    backfill_scope_ids_from_journal(&tx)?;
+    reconstruct_fallback_projection_from_journal(&tx)?;
+    // c-ctxusage r10 item 2: the obsolete shared unique index MUST be dropped
+    // BEFORE the retained-journal backfill stamps NULL-scope rows.
     tx.execute_batch("DROP INDEX IF EXISTS usage_events_scope_dedupe;")?;
-    // c-ctxusage r30 item 1: the r16 turn index MUST be dropped BEFORE the
-    // turn-identity backfill. An already-r28 database can hold a legacy turn
-    // (NULL identity) proven by the journal as (T, S) alongside a later
-    // qualified replay (T, S): backfilling the legacy row while the unique
-    // index still exists violates it and rolls back the whole migration
-    // (Hub cannot start). Multiple NULL rows restoring to the same (T, S)
-    // collide during the first UPDATE too. Recreated below after the
-    // duplicate collapse.
+    // c-ctxusage r30 item 1: drop the per-scope turn index before the lineage
+    // backfill (already-r28 DBs hold legacy + qualified rows for one lineage).
     tx.execute_batch("DROP INDEX IF EXISTS usage_events_turn_dedupe;")?;
-    // c-ctxusage r9 item 5: rows written in the pre-scopeId world have a NULL
-    // scope_id, but the matching retained journal payload (keyed by
-    // (instance_id, seq)) can still PROVE which session the cumulative stock
-    // belonged to. Provenance comes ONLY from our own journal — never guessed.
+    // c-ctxusage r9/r29: session-scope then turn-scope identity/lineage from
+    // retained evidence (the scope backfill above is the same idempotent
+    // update for scope ids; these also stamp session scope_id and the
+    // turn→native-session lineage).
     backfill_legacy_scope_ids(&tx)?;
-    // c-ctxusage r29 item 1: restore turn identity and native-session lineage
-    // from the SAME retained evidence, so a pre-scopeId Codex turn is covered
-    // by its (now scoped) cumulative stock instead of double-counting.
     backfill_legacy_turn_identity(&tx)?;
-    // Collapse turn-lineage duplicates IMMEDIATELY after the backfill (r30
-    // item 1): the identity UPDATE can merge a legacy row with a later
-    // qualified replay of the same turn, and the surviving frame must be the
-    // fold winner (newest accepted seq) before the identical-counters
-    // consolidation below — which keeps the oldest row for session stocks —
-    // ever sees the pair.
+    // c-usagefu r14 (M1): make same-key turn rows index-safe before any unique
+    // index is created.
+    reconcile_duplicate_turn_keys(&tx)?;
+    // r30: identity UPDATE can merge a legacy turn with a later qualified
+    // replay; collapse to the fold winner BEFORE identical-counter
+    // consolidation (which keeps the oldest row for stocks).
     collapse_duplicate_turn_lineage_rows(&tx)?;
+    // c-usagefu: identical Message duplicates collapse to highest seq.
+    consolidate_message_duplicates(&tx)?;
     consolidate_identical_scoped_rows(&tx)?;
-    // c-ctxusage r11 item 1: rows imported by the backfill (and any scoped
-    // chains last written by pre-acceptance-rule code) were never run through
-    // the cumulative-growth rule, so a stale historical replay can sit at a
-    // HIGHER rowid than the valid high-water stock. Replay the same rule live
-    // inserts use, in acceptance (rowid) order, before rowid order is allowed
-    // to mean "accepted history" for current-stock selection and floors.
+    // r11 item 1: replay the cumulative-growth acceptance rule for imported /
+    // pre-acceptance chains before rowid order means accepted history.
     normalise_scoped_session_chains(&tx)?;
-    // c-ctxusage r16 item 3 (T1'): recreate the unique index over the
-    // PER-LINEAGE turn key `(scope_id, COALESCE(source_session_id, ''))` —
-    // NULL (the unqualified legacy lineage) and every qualified native
-    // session id each hold their own mark. The old index was dropped above
-    // (r30 item 1: before the turn backfill) and the lineage collapse
-    // already ran.
+    // r16 item 3 (T1'): recreate the per-LINEAGE turn unique index.
     tx.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
              ON usage_events(
@@ -196,173 +288,8 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
              WHERE scope = 'turn' AND scope_id IS NOT NULL;",
     )?;
     tx.commit()?;
-    Ok(())
-}
-
-/// Within one turn lineage `(instance, scope_id, COALESCE(source_session_id,
-/// '')) keep the same WINNER the read folds pick — the newest accepted frame
-/// (`seq DESC, rowid DESC`, matching `WINNING_TURN_ROWS_SQL`); rows in
-/// DIFFERENT native-session lineages for the same scope id are retained —
-/// each lineage keeps its own revision-replaced row (c-ctxusage r16 item 3).
-///
-/// The newest frame is the authority: a resume replay (r30 item 1) is how a
-/// pre-scopeId legacy turn and its later qualified frame become one lineage,
-/// and the replay carries the native timestamp/revision the read model uses;
-/// keeping the older durable row would silently change the fold and the
-/// native-time windows.
-fn collapse_duplicate_turn_lineage_rows(conn: &Connection) -> rusqlite::Result<usize> {
-    conn.execute(
-        "DELETE FROM usage_events
-         WHERE scope = 'turn'
-           AND scope_id IS NOT NULL
-           AND rowid NOT IN (
-               SELECT rowid FROM (
-                   SELECT rowid, ROW_NUMBER() OVER (
-                       PARTITION BY instance_id, scope_id,
-                                    COALESCE(source_session_id, '')
-                       ORDER BY seq DESC, rowid DESC
-                   ) AS lineage_winner
-                   FROM usage_events
-                   WHERE scope = 'turn' AND scope_id IS NOT NULL
-               )
-               WHERE lineage_winner = 1
-           )",
-        [],
-    )
-}
-
-/// Collapse rows that became exact duplicates after the retained-journal
-/// scope-id backfill: same `(instance_id, scope, scope_id)` AND identical
-/// counters in every bucket are the same cumulative point replayed at another
-/// journal seq, so keeping both would double-count a stock. Turn rows in
-/// DIFFERENT native-session lineages are never duplicates even with matching
-/// counters — each lineage keeps its own row (c-ctxusage r16 item 3). The
-/// oldest durable identity (smallest rowid) wins; its `observed_at` is
-/// retained. Runs inside [`migrate`]'s transaction (c-ctxusage r10 item 2).
-fn consolidate_identical_scoped_rows(conn: &Connection) -> rusqlite::Result<usize> {
-    conn.execute(
-        "DELETE FROM usage_events
-         WHERE scope_id IS NOT NULL
-           AND rowid NOT IN (
-               SELECT MIN(rowid)
-               FROM usage_events
-               WHERE scope_id IS NOT NULL
-               GROUP BY instance_id, scope, scope_id,
-                        CASE WHEN scope = 'turn'
-                             THEN COALESCE(source_session_id, '')
-                             ELSE '' END,
-                        COALESCE(total_tokens, -1),
-                        COALESCE(input_tokens, -1),
-                        COALESCE(output_tokens, -1),
-                        COALESCE(cache_read_tokens, -1),
-                        COALESCE(cache_write_tokens, -1)
-           )",
-        [],
-    )
-}
-
-/// Replay the cumulative-growth acceptance rule over every proven scoped
-/// session chain and drop points the rule would have rejected at insert.
-///
-/// Imported legacy rows (and rows written before the content-ordered rule
-/// existed) can land out of cumulative order: a high-water 200/20 row at a
-/// small rowid followed by a stale historical replay 100/10 at a larger one
-/// leaves raw rowid order disagreeing with the floors — current-stock
-/// selection would show 100/10 while the retained 200/20 still freezes later
-/// points. Walking each `(instance_id, scope_id)` chain in rowid order with
-/// the live [`freezes_against`] rule removes exactly those points, so rowid
-/// order is once more a true accepted-history order. Idempotent: an already
-/// normalised chain deletes nothing (c-ctxusage r11 item 1).
-fn normalise_scoped_session_chains(conn: &Connection) -> rusqlite::Result<usize> {
-    let mut stmt = conn.prepare(
-        "SELECT rowid, instance_id, scope_id, total_tokens, input_tokens,
-                output_tokens, cache_read_tokens, cache_write_tokens
-         FROM usage_events
-         WHERE scope = 'session' AND scope_id IS NOT NULL
-         ORDER BY instance_id ASC, scope_id ASC, rowid ASC",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        let rowid: i64 = r.get(0)?;
-        let instance_id: String = r.get(1)?;
-        let scope_id: String = r.get(2)?;
-        let counters = SnapshotCounters {
-            total: r.get(3)?,
-            input: r.get(4)?,
-            output: r.get(5)?,
-            cache_read: r.get(6)?,
-            cache_write: r.get(7)?,
-        };
-        Ok((rowid, instance_id, scope_id, counters))
-    })?;
-    let mut current_key: Option<(String, String)> = None;
-    let mut accepted: Vec<SnapshotCounters> = Vec::new();
-    let mut stale_rowids: Vec<i64> = Vec::new();
-    for entry in rows {
-        let (rowid, instance_id, scope_id, counters) = entry?;
-        let key = Some((instance_id, scope_id));
-        if key != current_key {
-            current_key = key;
-            accepted.clear();
-        }
-        if freezes_against(&counters, &accepted) {
-            stale_rowids.push(rowid);
-        } else {
-            accepted.push(counters);
-        }
-    }
-    drop(stmt);
-    let mut removed = 0;
-    for rowid in stale_rowids {
-        removed += conn.execute("DELETE FROM usage_events WHERE rowid = ?1", params![rowid])?;
-    }
-    Ok(removed)
-}
-
-/// Backfill pre-`scopeId` NULL-scope session rows from the matching retained
-/// journal payloads (c-ctxusage r9 item 5). A legacy row's identity is
-/// provable when the journal's `(instance_id, seq)` event is a usage event
-/// whose `payload.scopeId` is a non-empty string; that id is stamped onto the
-/// row so the stock joins the scoped totals instead of vanishing on the first
-/// scoped point. No-op when the database has no `journal` table (standalone
-/// usage-store migrations).
-fn backfill_legacy_scope_ids(conn: &Connection) -> rusqlite::Result<()> {
-    let has_journal: bool = conn.query_row(
-        "SELECT EXISTS (
-            SELECT 1 FROM sqlite_master
-            WHERE type = 'table' AND name = 'journal'
-        )",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_journal {
-        return Ok(());
-    }
-    conn.execute(
-        "UPDATE usage_events AS u
-         SET scope_id = (
-             SELECT json_extract(j.payload_json, '$.payload.scopeId')
-             FROM journal AS j
-             WHERE j.instance_id = u.instance_id
-               AND j.seq = u.seq
-               AND json_valid(j.payload_json)
-               AND json_extract(j.payload_json, '$.kind') = 'usage'
-               AND json_extract(j.payload_json, '$.payload.scope') = 'session'
-               AND json_type(j.payload_json, '$.payload.scopeId') = 'text'
-               AND length(json_extract(j.payload_json, '$.payload.scopeId')) > 0
-         )
-         WHERE u.scope = 'session' AND u.scope_id IS NULL
-           AND EXISTS (
-             SELECT 1 FROM journal AS j
-             WHERE j.instance_id = u.instance_id
-               AND j.seq = u.seq
-               AND json_valid(j.payload_json)
-               AND json_extract(j.payload_json, '$.kind') = 'usage'
-               AND json_extract(j.payload_json, '$.payload.scope') = 'session'
-               AND json_type(j.payload_json, '$.payload.scopeId') = 'text'
-               AND length(json_extract(j.payload_json, '$.payload.scopeId')) > 0
-         )",
-        [],
-    )?;
+    // Record completion for usagefu r15's one-time marker (no-op on older paths).
+    set_meta_marker(conn, MARKER_SCOPE_CONSOLIDATION)?;
     Ok(())
 }
 
@@ -461,6 +388,546 @@ fn backfill_legacy_turn_identity(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Make backfilled `turn` rows safe for the
+/// `(instance_id, scope, scope_id)` unique index (c-usagefu r14 item 1,
+/// Ruling M1).
+///
+/// origin/main wrote codex Turn rows without persisting `scope_id`, and the
+/// backfill above recovers it from the durable journal. Two distinct writes
+/// can recover the SAME key on a real main-shaped database:
+///
+/// * a promoted instance re-tailed after a demotion/resume re-emits the
+///   SAME native turn snapshot at a new journal seq: every token bucket is
+///   identical, and the call must be counted exactly once. Such a group is
+///   collapsed to the HIGHEST seq (the latest tail), the other rows deleted;
+/// * two genuinely different result frames recover the same scope id while
+///   reporting DIFFERENT counters (degenerate ids, e.g. both mapped to
+///   `"0"`). They are different calls: nothing is merged. Every row of such
+///   a group has its `scope_id` cleared back to NULL, so the rows stay on
+///   the legacy NULL-scope path — each keeps counting once, and they never
+///   collide with the unique index.
+///
+/// Agreement is on the five TOKEN buckets only, compared NULL-safely with
+/// `IS` (a byte-zero re-tail carries the identical sparse bucket set). Cost
+/// is a priced projection, never a call identity. Runs inside the migration
+/// transaction; idempotent — a second migration finds neither a disagreeing
+/// sibling nor a non-keeper duplicate.
+fn backfill_legacy_scope_ids(conn: &Connection) -> rusqlite::Result<()> {
+    let has_journal: bool = conn.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'journal'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_journal {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE usage_events AS u
+         SET scope_id = (
+             SELECT json_extract(j.payload_json, '$.payload.scopeId')
+             FROM journal AS j
+             WHERE j.instance_id = u.instance_id
+               AND j.seq = u.seq
+               AND json_valid(j.payload_json)
+               AND json_extract(j.payload_json, '$.kind') = 'usage'
+               AND json_extract(j.payload_json, '$.payload.scope') = 'session'
+               AND json_type(j.payload_json, '$.payload.scopeId') = 'text'
+               AND length(json_extract(j.payload_json, '$.payload.scopeId')) > 0
+         )
+         WHERE u.scope = 'session' AND u.scope_id IS NULL
+           AND EXISTS (
+             SELECT 1 FROM journal AS j
+             WHERE j.instance_id = u.instance_id
+               AND j.seq = u.seq
+               AND json_valid(j.payload_json)
+               AND json_extract(j.payload_json, '$.kind') = 'usage'
+               AND json_extract(j.payload_json, '$.payload.scope') = 'session'
+               AND json_type(j.payload_json, '$.payload.scopeId') = 'text'
+               AND length(json_extract(j.payload_json, '$.payload.scopeId')) > 0
+         )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn reconcile_duplicate_turn_keys(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "UPDATE usage_events
+         SET scope_id = NULL
+         WHERE scope = 'turn' AND scope_id IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM usage_events d
+               WHERE d.instance_id = usage_events.instance_id
+                 AND d.scope = 'turn'
+                 AND d.scope_id = usage_events.scope_id
+                 AND d.rowid <> usage_events.rowid
+                 AND (d.total_tokens     IS NOT usage_events.total_tokens
+                   OR d.input_tokens     IS NOT usage_events.input_tokens
+                   OR d.output_tokens    IS NOT usage_events.output_tokens
+                   OR d.cache_read_tokens  IS NOT usage_events.cache_read_tokens
+                   OR d.cache_write_tokens IS NOT usage_events.cache_write_tokens));
+
+         DELETE FROM usage_events
+         WHERE scope = 'turn' AND scope_id IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM usage_events s
+               WHERE s.instance_id = usage_events.instance_id
+                 AND s.scope = 'turn'
+                 AND s.scope_id = usage_events.scope_id
+                 AND s.rowid <> usage_events.rowid)
+           AND seq <> (
+               SELECT MAX(h.seq) FROM usage_events h
+               WHERE h.instance_id = usage_events.instance_id
+                 AND h.scope = 'turn'
+                 AND h.scope_id = usage_events.scope_id);",
+    )?;
+    Ok(())
+}
+
+/// Collapse pre-r9 duplicate Message rows (same instance_id, scope,
+/// scope_id) into a single survivor each, then create the dedupe indexes.
+///
+/// Runs inside [`migrate`]'s single transaction (c-usagefu r14 item 1,
+/// Ruling M1): it opens no transaction of its own and a failure anywhere
+/// (including the unique-index creates) rolls the WHOLE migration back.
+///
+/// The survivor is the FIRST write (lowest rowid, preserving ingest
+/// ordering). Ruling C1 (c-usagefu r10 item 3; r11 item 8), made EXACT by
+/// c-usagefu r12 item 5 (Ruling C1'):
+/// - the highest metric_revision is determined FIRST. Counters/cost
+///   (total/input/output/cache buckets, cost_usd) AND the `accounting`
+///   authority come ONLY from rows AT that revision; among same-revision
+///   rows, the newest rowid reporting the bucket wins. A rev-1 row reporting
+///   input 7 / cost 0.10 / estimated and a rev-2 row reporting NULL input /
+///   NULL cost / reported leave the survivor at rev 2 with input and cost
+///   STILL NULL — the older revision's known values never fill the newer
+///   revision's gaps (the first-write 10/0.01/estimated never returns). A
+///   NULL bucket is repaired ONLY from another non-NULL row at the SAME
+///   highest revision;
+/// - revision: the maximum;
+/// - profile/model/turn id/native context window/observed time are
+///   ATTRIBUTION and merge best-known (any non-NULL sibling, at ANY
+///   revision; native time over ingest time), independent of which revision
+///   owned the accounting.
+///
+/// A second run changes nothing: one row per key makes the UPDATE/DELETE
+/// no-ops and the index creates are `IF NOT EXISTS`.
+fn collapse_duplicate_turn_lineage_rows(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM usage_events
+         WHERE scope = 'turn'
+           AND scope_id IS NOT NULL
+           AND rowid NOT IN (
+               SELECT rowid FROM (
+                   SELECT rowid, ROW_NUMBER() OVER (
+                       PARTITION BY instance_id, scope_id,
+                                    COALESCE(source_session_id, '')
+                       ORDER BY seq DESC, rowid DESC
+                   ) AS lineage_winner
+                   FROM usage_events
+                   WHERE scope = 'turn' AND scope_id IS NOT NULL
+               )
+               WHERE lineage_winner = 1
+           )",
+        [],
+    )
+}
+
+/// Collapse rows that became exact duplicates after the retained-journal
+/// scope-id backfill: same `(instance_id, scope, scope_id)` AND identical
+/// counters in every bucket are the same cumulative point replayed at another
+/// journal seq, so keeping both would double-count a stock. Turn rows in
+/// DIFFERENT native-session lineages are never duplicates even with matching
+/// counters — each lineage keeps its own row (c-ctxusage r16 item 3). The
+/// oldest durable identity (smallest rowid) wins; its `observed_at` is
+/// retained. Runs inside [`migrate`]'s transaction (c-ctxusage r10 item 2).
+fn consolidate_identical_scoped_rows(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM usage_events
+         WHERE scope_id IS NOT NULL
+           AND rowid NOT IN (
+               SELECT MIN(rowid)
+               FROM usage_events
+               WHERE scope_id IS NOT NULL
+               GROUP BY instance_id, scope, scope_id,
+                        CASE WHEN scope = 'turn'
+                             THEN COALESCE(source_session_id, '')
+                             ELSE '' END,
+                        COALESCE(total_tokens, -1),
+                        COALESCE(input_tokens, -1),
+                        COALESCE(output_tokens, -1),
+                        COALESCE(cache_read_tokens, -1),
+                        COALESCE(cache_write_tokens, -1)
+           )",
+        [],
+    )
+}
+
+/// Replay the cumulative-growth acceptance rule over every proven scoped
+/// session chain and drop points the rule would have rejected at insert.
+///
+/// Imported legacy rows (and rows written before the content-ordered rule
+/// existed) can land out of cumulative order: a high-water 200/20 row at a
+/// small rowid followed by a stale historical replay 100/10 at a larger one
+/// leaves raw rowid order disagreeing with the floors — current-stock
+/// selection would show 100/10 while the retained 200/20 still freezes later
+/// points. Walking each `(instance_id, scope_id)` chain in rowid order with
+/// the live [`freezes_against`] rule removes exactly those points, so rowid
+/// order is once more a true accepted-history order. Idempotent: an already
+/// normalised chain deletes nothing (c-ctxusage r11 item 1).
+fn normalise_scoped_session_chains(conn: &Connection) -> rusqlite::Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT rowid, instance_id, scope_id, total_tokens, input_tokens,
+                output_tokens, cache_read_tokens, cache_write_tokens, cost_usd
+         FROM usage_events
+         WHERE scope = 'session' AND scope_id IS NOT NULL
+         ORDER BY instance_id ASC, scope_id ASC, rowid ASC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let rowid: i64 = r.get(0)?;
+        let instance_id: String = r.get(1)?;
+        let scope_id: String = r.get(2)?;
+        let point = SessionStockPoint {
+            counters: SnapshotCounters {
+                total: r.get(3)?,
+                input: r.get(4)?,
+                output: r.get(5)?,
+                cache_read: r.get(6)?,
+                cache_write: r.get(7)?,
+            },
+            cost: parse_cost(r.get::<_, Option<String>>(8)?),
+        };
+        Ok((rowid, instance_id, scope_id, point))
+    })?;
+    let mut current_key: Option<(String, String)> = None;
+    let mut accepted: Vec<SessionStockPoint> = Vec::new();
+    let mut stale_rowids: Vec<i64> = Vec::new();
+    for entry in rows {
+        let (rowid, instance_id, scope_id, point) = entry?;
+        let key = Some((instance_id, scope_id));
+        if key != current_key {
+            current_key = key;
+            accepted.clear();
+        }
+        if freezes_against(&point, &accepted) {
+            stale_rowids.push(rowid);
+        } else {
+            accepted.push(point);
+        }
+    }
+    drop(stmt);
+    let mut removed = 0;
+    for rowid in stale_rowids {
+        removed += conn.execute("DELETE FROM usage_events WHERE rowid = ?1", params![rowid])?;
+    }
+    Ok(removed)
+}
+
+fn backfill_scope_ids_from_journal(conn: &Connection) -> rusqlite::Result<()> {
+    // The migration runs on the store connection; unit-test fixtures create the
+    // usage_events table alone, so the update is gated on the journal table
+    // actually existing.
+    let journal_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'journal'",
+        [],
+        |row| row.get(0),
+    )?;
+    if journal_exists == 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE usage_events
+         SET scope_id = (
+             SELECT json_extract(j.payload_json, '$.payload.scopeId')
+             FROM journal j
+             WHERE j.instance_id = usage_events.instance_id
+               AND j.seq = usage_events.seq
+               AND json_valid(j.payload_json)
+               AND json_extract(j.payload_json, '$.kind') = 'usage'
+         )
+         WHERE scope_id IS NULL
+           AND EXISTS (
+               SELECT 1 FROM journal j2
+               WHERE j2.instance_id = usage_events.instance_id
+                 AND j2.seq = usage_events.seq
+                 AND json_valid(j2.payload_json)
+                 AND json_extract(j2.payload_json, '$.kind') = 'usage'
+                 AND json_extract(j2.payload_json, '$.payload.scopeId') IS NOT NULL
+           )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Recover the projection fields origin/main's — and the rolled-back
+/// migration-window's — insert path did NOT persist, from the durable journal
+/// (c-usagefu r16 item 8).
+///
+/// While a usage migration stayed rolled back, [`insert_legacy_row`] recorded
+/// every usage event (codex Turn AND the new Message/Session frames) with only
+/// the fourteen legacy columns: the additive columns the migration adds were
+/// absent at write time and default to NULL/`'ingest'`/revision 1 afterward.
+/// The scope-id backfill above only recovered `scope_id`; without the native
+/// turn id the rollup's `COUNT(DISTINCT turn_id)` dropped every fallback
+/// Message call, and the `'ingest'` source excluded them from the native TPM
+/// windows and the eligible-flow relation — so fallback-period usage vanished
+/// from totals, rates and attribution.
+///
+/// This re-projects the missing fields from the matching journal row
+/// `(instance_id, seq)` the same way [`project_usage_event`] reads the live
+/// event, filling ONLY missing/authoritative-default values (never overwriting
+/// a value a native projection already supplied), and runs BEFORE
+/// [`reconcile_duplicate_turn_keys`] / [`consolidate_message_duplicates`] and
+/// before the completion marker, so the consolidation COALESCE actually has
+/// native siblings to merge. Idempotent: every assignment is COALESCE/guarded,
+/// and the step only ever runs before the one-time marker is set.
+fn reconstruct_fallback_projection_from_journal(conn: &Connection) -> rusqlite::Result<()> {
+    // Same existence gate as the scope-id backfill (unit fixtures have no
+    // journal table).
+    let journal_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'journal'",
+        [],
+        |row| row.get(0),
+    )?;
+    if journal_exists == 0 {
+        return Ok(());
+    }
+    // The correlated subqueries return NULL unless a valid kind='usage'
+    // journal row carries the field; bare U64 scalars arrive as decimal
+    // strings and are CAST to integers (guarded > 0 so garbage never zeroes a
+    // stored positive value).
+    conn.execute(
+        "UPDATE usage_events
+         SET turn_id = COALESCE(turn_id, (
+                 SELECT json_extract(j.payload_json, '$.source.nativeTurnId.value')
+                 FROM journal j
+                 WHERE j.instance_id = usage_events.instance_id
+                   AND j.seq = usage_events.seq
+                   AND json_valid(j.payload_json)
+                   AND json_extract(j.payload_json, '$.kind') = 'usage'
+                   AND json_extract(j.payload_json, '$.source.nativeTurnId.value') IS NOT NULL
+             )),
+             native_context_window = COALESCE(native_context_window, (
+                 SELECT CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER)
+                 FROM journal j
+                 WHERE j.instance_id = usage_events.instance_id
+                   AND j.seq = usage_events.seq
+                   AND json_valid(j.payload_json)
+                   AND json_extract(j.payload_json, '$.kind') = 'usage'
+                   AND CAST(json_extract(j.payload_json, '$.payload.contextWindow') AS INTEGER) > 0
+             )),
+             metric_revision = CASE
+                 WHEN CAST((
+                     SELECT json_extract(j.payload_json, '$.payload.metricRevision')
+                     FROM journal j
+                     WHERE j.instance_id = usage_events.instance_id
+                       AND j.seq = usage_events.seq
+                       AND json_valid(j.payload_json)
+                       AND json_extract(j.payload_json, '$.kind') = 'usage'
+                 ) AS INTEGER) > 0
+                 THEN CAST((
+                     SELECT json_extract(j2.payload_json, '$.payload.metricRevision')
+                     FROM journal j2
+                     WHERE j2.instance_id = usage_events.instance_id
+                       AND j2.seq = usage_events.seq
+                       AND json_valid(j2.payload_json)
+                       AND json_extract(j2.payload_json, '$.kind') = 'usage'
+                 ) AS INTEGER)
+                 ELSE metric_revision
+             END,
+             observed_at = CASE
+                 WHEN observed_at_source = 'native' THEN observed_at
+                 ELSE COALESCE((
+                     SELECT json_extract(j.payload_json, '$.nativeAt.value')
+                     FROM journal j
+                     WHERE j.instance_id = usage_events.instance_id
+                       AND j.seq = usage_events.seq
+                       AND json_valid(j.payload_json)
+                       AND json_extract(j.payload_json, '$.kind') = 'usage'
+                       AND json_extract(j.payload_json, '$.nativeAt.value') IS NOT NULL
+                 ), observed_at)
+             END,
+             observed_at_source = CASE
+                 WHEN observed_at_source = 'native' THEN 'native'
+                 WHEN EXISTS (
+                     SELECT 1 FROM journal j
+                     WHERE j.instance_id = usage_events.instance_id
+                       AND j.seq = usage_events.seq
+                       AND json_valid(j.payload_json)
+                       AND json_extract(j.payload_json, '$.kind') = 'usage'
+                       AND json_extract(j.payload_json, '$.nativeAt.value') IS NOT NULL
+                 ) THEN 'native'
+                 ELSE observed_at_source
+             END
+         WHERE EXISTS (
+             SELECT 1 FROM journal j
+             WHERE j.instance_id = usage_events.instance_id
+               AND j.seq = usage_events.seq
+               AND json_valid(j.payload_json)
+               AND json_extract(j.payload_json, '$.kind') = 'usage'
+         )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Make backfilled `turn` rows safe for the
+/// `(instance_id, scope, scope_id)` unique index (c-usagefu r14 item 1,
+/// Ruling M1).
+///
+/// origin/main wrote codex Turn rows without persisting `scope_id`, and the
+/// backfill above recovers it from the durable journal. Two distinct writes
+/// can recover the SAME key on a real main-shaped database:
+///
+/// * a promoted instance re-tailed after a demotion/resume re-emits the
+///   SAME native turn snapshot at a new journal seq: every token bucket is
+///   identical, and the call must be counted exactly once. Such a group is
+///   collapsed to the HIGHEST seq (the latest tail), the other rows deleted;
+/// * two genuinely different result frames recover the same scope id while
+///   reporting DIFFERENT counters (degenerate ids, e.g. both mapped to
+///   `"0"`). They are different calls: nothing is merged. Every row of such
+///   a group has its `scope_id` cleared back to NULL, so the rows stay on
+///   the legacy NULL-scope path — each keeps counting once, and they never
+///   collide with the unique index.
+///
+/// Agreement is on the five TOKEN buckets only, compared NULL-safely with
+/// `IS` (a byte-zero re-tail carries the identical sparse bucket set). Cost
+/// is a priced projection, never a call identity. Runs inside the migration
+/// transaction; idempotent — a second migration finds neither a disagreeing
+/// sibling nor a non-keeper duplicate.
+///
+/// Backfill pre-`scopeId` NULL-scope session rows from the matching retained
+/// journal payloads (c-ctxusage r9 item 5). A legacy row's identity is
+/// provable when the journal's `(instance_id, seq)` event is a usage event
+/// whose `payload.scopeId` is a non-empty string; that id is stamped onto the
+/// row so the stock joins the scoped totals instead of vanishing on the first
+/// scoped point. No-op when the database has no `journal` table (standalone
+/// usage-store migrations).
+fn consolidate_message_duplicates(conn: &Connection) -> rusqlite::Result<()> {
+    // C1' (r12 item 5): the accounting assignments are generated from one
+    // shared "highest revision first" fragment. The top revision is resolved
+    // FIRST; every counter/cost column and the accounting authority come only
+    // from rows AT that revision (newest rowid among them), and a NULL is
+    // repaired only by a non-NULL sibling at the SAME revision — an older
+    // revision's known value never fills it.
+    let top_revision = "(
+                 SELECT MAX(m3.metric_revision) FROM usage_events m3
+                 WHERE m3.instance_id = usage_events.instance_id
+                   AND m3.scope = 'message' AND m3.scope_id = usage_events.scope_id)";
+    let mut accounting_sets = String::new();
+    for column in [
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "cost_usd",
+    ] {
+        accounting_sets.push_str(&format!(
+            ",{column} = (
+                 SELECT m2.{column} FROM usage_events m2
+                 WHERE m2.instance_id = usage_events.instance_id
+                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                   AND m2.metric_revision = {top_revision}
+                   AND m2.{column} IS NOT NULL
+                 ORDER BY m2.rowid DESC LIMIT 1)"
+        ));
+    }
+    // accounting is NOT NULL on every row, so no IS NOT NULL filter: the
+    // newest row at the top revision is the authority.
+    accounting_sets.push_str(&format!(
+        ",accounting = (
+                 SELECT m2.accounting FROM usage_events m2
+                 WHERE m2.instance_id = usage_events.instance_id
+                   AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                   AND m2.metric_revision = {top_revision}
+                 ORDER BY m2.rowid DESC LIMIT 1)"
+    ));
+    let batch = format!(
+        "UPDATE usage_events
+         SET profile_id = COALESCE(profile_id,
+             (SELECT m2.profile_id FROM usage_events m2
+              WHERE m2.instance_id = usage_events.instance_id
+                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                AND m2.profile_id IS NOT NULL LIMIT 1)),
+             model = COALESCE(model,
+             (SELECT m2.model FROM usage_events m2
+              WHERE m2.instance_id = usage_events.instance_id
+                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                AND m2.model IS NOT NULL LIMIT 1)),
+             turn_id = COALESCE(turn_id,
+             (SELECT m2.turn_id FROM usage_events m2
+              WHERE m2.instance_id = usage_events.instance_id
+                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                AND m2.turn_id IS NOT NULL LIMIT 1)),
+             metric_revision = {top_revision}
+             {accounting_sets},
+             native_context_window = COALESCE(native_context_window,
+             (SELECT m2.native_context_window FROM usage_events m2
+              WHERE m2.instance_id = usage_events.instance_id
+                AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                AND m2.native_context_window IS NOT NULL LIMIT 1)),
+             observed_at = CASE
+                 WHEN observed_at_source = 'native' THEN observed_at
+                 WHEN EXISTS (
+                     SELECT 1 FROM usage_events m2
+                     WHERE m2.instance_id = usage_events.instance_id
+                       AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                       AND m2.observed_at_source = 'native')
+                 THEN (
+                     SELECT m2.observed_at FROM usage_events m2
+                     WHERE m2.instance_id = usage_events.instance_id
+                       AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                       AND m2.observed_at_source = 'native'
+                     LIMIT 1)
+                 ELSE observed_at END,
+             observed_at_source = CASE
+                 WHEN observed_at_source = 'native' THEN 'native'
+                 WHEN EXISTS (
+                     SELECT 1 FROM usage_events m2
+                     WHERE m2.instance_id = usage_events.instance_id
+                       AND m2.scope = 'message' AND m2.scope_id = usage_events.scope_id
+                       AND m2.observed_at_source = 'native')
+                 THEN 'native'
+                 ELSE observed_at_source END
+         WHERE scope = 'message' AND scope_id IS NOT NULL
+           AND rowid IN (
+               SELECT MIN(rowid) FROM usage_events
+               WHERE scope = 'message' AND scope_id IS NOT NULL
+               GROUP BY instance_id, scope, scope_id)
+           AND EXISTS (
+               SELECT 1 FROM usage_events m3
+               WHERE m3.instance_id = usage_events.instance_id
+                 AND m3.scope = 'message' AND m3.scope_id = usage_events.scope_id
+                 AND m3.rowid != usage_events.rowid);
+
+         DELETE FROM usage_events
+         WHERE scope = 'message' AND scope_id IS NOT NULL
+           AND rowid NOT IN (
+               SELECT MIN(rowid) FROM usage_events
+               WHERE scope = 'message' AND scope_id IS NOT NULL
+               GROUP BY instance_id, scope, scope_id);
+
+         DROP INDEX IF EXISTS usage_events_scope_dedupe;
+         CREATE UNIQUE INDEX IF NOT EXISTS usage_events_turn_dedupe
+             ON usage_events(instance_id, scope, scope_id)
+             WHERE scope = 'turn' AND scope_id IS NOT NULL;
+         -- c-usagefu r7 item 5: codex Message rows are keyed on the durable
+         -- per-response id; re-promoting/replaying a rollout byte-0 re-emits
+         -- the same response and must not double the Message totals.
+         CREATE UNIQUE INDEX IF NOT EXISTS usage_events_message_dedupe
+             ON usage_events(instance_id, scope, scope_id)
+             WHERE scope = 'message' AND scope_id IS NOT NULL;"
+    );
+    conn.execute_batch(&batch)?;
+    Ok(())
+}
+
 /// Inserts a usage projection.
 ///
 /// Dedupe semantics by whether the row carries a durable `scope_id`:
@@ -479,6 +946,14 @@ fn backfill_legacy_turn_identity(conn: &Connection) -> rusqlite::Result<()> {
 /// at one poll and then a later same-message-id record with different counters
 /// (c-ctxusage r3 item 1) replaces the provisional row with the final one.
 pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+    // c-usagefu r15 item 1: on a database whose usage migration never
+    // committed (the legacy origin/main shape), record the event through
+    // main's plain insert path so usage keeps landing durably — a later
+    // successful migration's journal backfill recovers the scope ids. The
+    // scoped upsert paths reference columns the legacy table does not have.
+    if !usage_schema_is_current(conn)? {
+        return insert_legacy_row(conn, row);
+    }
     match (row.scope.as_str(), row.scope_id.as_deref()) {
         ("turn", Some(_)) => upsert_turn_snapshot(conn, row),
         ("session", Some(_)) => insert_session_growth_point(conn, row),
@@ -486,6 +961,37 @@ pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::R
         (_, None) => insert_row(conn, row),
         _ => insert_row(conn, row),
     }
+}
+
+/// origin/main's projection insert: 14 columns, append-only `INSERT OR
+/// IGNORE` on `(instance_id, seq)`. Used ONLY while the database is still on
+/// the legacy shape (a rolled-back migration); the journal retains the full
+/// event, so the post-migration backfill loses nothing.
+fn insert_legacy_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO usage_events
+            (instance_id, seq, profile_id, model, scope, mode, total_tokens,
+             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+             cost_usd, accounting, observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            row.instance_id,
+            row.seq,
+            row.profile_id,
+            row.model,
+            row.scope,
+            row.mode,
+            row.total_tokens,
+            row.input_tokens,
+            row.output_tokens,
+            row.cache_read_tokens,
+            row.cache_write_tokens,
+            row.cost_usd,
+            row.accounting,
+            row.observed_at,
+        ],
+    )?;
+    Ok(inserted > 0)
 }
 
 /// Query every cumulative session stock a new scoped point must not move
@@ -501,98 +1007,198 @@ pub fn insert_usage_event(conn: &Connection, row: &UsageEventRow) -> rusqlite::R
 fn existing_session_floors(
     conn: &Connection,
     row: &UsageEventRow,
-) -> rusqlite::Result<Vec<SnapshotCounters>> {
+) -> rusqlite::Result<Vec<SessionStockPoint>> {
     let mut stmt = conn.prepare(
-        "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+        "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                cost_usd
          FROM usage_events
          WHERE instance_id = ?1 AND scope = 'session'
            AND scope_id = ?2",
     )?;
     let floors = stmt
         .query_map(params![row.instance_id, row.scope_id], |r| {
-            Ok(SnapshotCounters {
-                total: r.get(0)?,
-                input: r.get(1)?,
-                output: r.get(2)?,
-                cache_read: r.get(3)?,
-                cache_write: r.get(4)?,
+            Ok(SessionStockPoint {
+                counters: SnapshotCounters {
+                    total: r.get(0)?,
+                    input: r.get(1)?,
+                    output: r.get(2)?,
+                    cache_read: r.get(3)?,
+                    cache_write: r.get(4)?,
+                },
+                cost: parse_cost(r.get::<_, Option<String>>(5)?),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(floors)
 }
 
+/// One cumulative session stock: token buckets plus the reported cumulative
+/// cost. Both are cumulative monotonic quantities, so both participate in the
+/// growth/freeze decision (c-usagefu r3 item 3: the result frame carries no
+/// tokens, so a token-only comparison froze every later result at the turn-1
+/// cumulative cost).
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct SessionStockPoint {
+    counters: SnapshotCounters,
+    cost: Option<f64>,
+}
+
+impl SessionStockPoint {
+    fn of(row: &UsageEventRow) -> Self {
+        Self {
+            counters: SnapshotCounters::of(row),
+            cost: parse_cost(row.cost_usd.clone()),
+        }
+    }
+
+    /// Equality of every reported bucket INCLUDING cost.
+    fn eq_stock(&self, other: &Self) -> bool {
+        self.counters == other.counters && self.cost == other.cost
+    }
+
+    /// Whether a reported TOKEN bucket grew against the stored stock.
+    fn tokens_grew_against(&self, stored: &Self) -> bool {
+        self.counters.growth_against(&stored.counters).0
+    }
+
+    /// A smaller reported COST is a freeze only on a token-LESS point: that is
+    /// the result frame's cumulative cost channel, whose currency is
+    /// monotonic. On a point whose token counters grew, a lower cost is a
+    /// driver-priced estimate reset (an unpriced model turn followed by a
+    /// priced one restarted the running total); freezing it would stall the
+    /// context chip until the running total catches up (c-usagefu r4 item 4).
+    /// The stale cost is dropped on insert instead (see
+    /// [`with_reset_cost_stripped`]).
+    fn cost_decrease_blocks(&self, stored: &Self) -> bool {
+        let cost_went_down = matches!(
+            (self.cost, stored.cost),
+            (Some(incoming), Some(previous)) if incoming < previous
+        );
+        cost_went_down && !self.tokens_grew_against(stored)
+    }
+}
+
+/// Parse a stored decimal cost; a malformed value behaves as "not reported".
+fn parse_cost(cost: Option<String>) -> Option<f64> {
+    cost.and_then(|raw| raw.parse::<f64>().ok())
+}
+
 /// Content-ordered acceptance against a set of existing stocks.
-fn freezes_against(incoming: &SnapshotCounters, existing: &[SnapshotCounters]) -> bool {
+fn freezes_against(incoming: &SessionStockPoint, existing: &[SessionStockPoint]) -> bool {
     for stored in existing {
-        if incoming == stored {
+        if incoming.eq_stock(stored) {
             return true;
         }
-        let (_grew, decreased) = incoming.growth_against(stored);
-        if decreased {
+        let (token_grew, token_decreased) = incoming.counters.growth_against(&stored.counters);
+        if token_decreased {
+            return true;
+        }
+        // Cost monotonicity is enforced only for the result channel
+        // (token-less cumulative points); on a token-growing point the cost is
+        // a driver estimate that may reset (r4 item 4).
+        if !token_grew && incoming.cost_decrease_blocks(stored) {
             return true;
         }
     }
     false
 }
 
+/// When a token-growing point carries a lower cost than the stored stock, the
+/// driver's running estimate has reset (unpriced turn → priced turn). Drop
+/// that point's cost rather than persist a smaller cumulative value; its
+/// token counters remain the real content. Token-LESS points keep their cost
+/// (the result channel is monotonic and is frozen on a decrease).
+fn with_reset_cost_stripped(
+    mut row: UsageEventRow,
+    incoming: &SessionStockPoint,
+    floors: &[SessionStockPoint],
+) -> UsageEventRow {
+    let tokens_grew = floors
+        .iter()
+        .any(|stored| incoming.tokens_grew_against(stored));
+    let cost_reset = floors
+        .iter()
+        .any(|stored| matches!((incoming.cost, stored.cost), (Some(new), Some(old)) if new < old));
+    if tokens_grew && cost_reset {
+        row.cost_usd = None;
+    }
+    row
+}
+
 /// Append a new scoped cumulative-session growth point, freezing
 /// historical/duplicate replays (c-ctxusage r4 item 3, refined in r8 item 8).
 ///
-/// The cumulative stock is monotonic by contract WITHIN a session, so
-/// acceptance is content-based against the point's own `scope_id` chain only:
-/// - identical counters already recorded for THIS session -> frozen;
-/// - any reported bucket smaller than this session's current stock -> frozen;
+/// The cumulative stock is monotonic by contract, so acceptance is content-
+/// based and independent of the restart-unsafe producer revision and ingest
+/// seq:
+/// - identical counters AND cost already recorded for this session (or for a
+///   legacy NULL-scope row) -> frozen;
+/// - any reported TOKEN bucket smaller than the current stock -> frozen;
+/// - a smaller cumulative COST on a token-LESS point (the result channel)
+///   -> frozen; the same lower cost on a token-growing point is a driver
+///   estimate reset: the point appends with its cost dropped (r4 item 4);
 /// - otherwise the point is appended.
 ///
 /// Legacy NULL-scope rows carry no session identity and therefore never floor
 /// a scoped point (r8 item 8).
 fn insert_session_growth_point(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
-    let incoming = SnapshotCounters::of(row);
+    let incoming = SessionStockPoint::of(row);
     let floors = existing_session_floors(conn, row)?;
     if freezes_against(&incoming, &floors) {
         return Ok(false);
     }
-    insert_row(conn, row)
+    let row = with_reset_cost_stripped(row.clone(), &incoming, &floors);
+    insert_row(conn, &row)
 }
 
 /// Legacy (pre-`scopeId`) session row: content-ordered against other legacy
 /// rows only. Scoped points are the newer world and are summed separately in
 /// the rollup; legacy totals are read at all only while no scoped rows exist.
 fn insert_legacy_session_point(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
-    let incoming = SnapshotCounters::of(row);
+    let incoming = SessionStockPoint::of(row);
     let mut stmt = conn.prepare(
-        "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+        "SELECT total_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                cost_usd
          FROM usage_events
          WHERE instance_id = ?1 AND scope = 'session' AND scope_id IS NULL",
     )?;
-    let existing: Vec<SnapshotCounters> = stmt
+    let existing: Vec<SessionStockPoint> = stmt
         .query_map(params![row.instance_id], |r| {
-            Ok(SnapshotCounters {
-                total: r.get(0)?,
-                input: r.get(1)?,
-                output: r.get(2)?,
-                cache_read: r.get(3)?,
-                cache_write: r.get(4)?,
+            Ok(SessionStockPoint {
+                counters: SnapshotCounters {
+                    total: r.get(0)?,
+                    input: r.get(1)?,
+                    output: r.get(2)?,
+                    cache_read: r.get(3)?,
+                    cache_write: r.get(4)?,
+                },
+                cost: parse_cost(r.get::<_, Option<String>>(5)?),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if freezes_against(&incoming, &existing) {
         return Ok(false);
     }
-    insert_row(conn, row)
+    let row = with_reset_cost_stripped(row.clone(), &incoming, &existing);
+    insert_row(conn, &row)
 }
 
 /// Generic append (`INSERT OR IGNORE` on the `(instance_id, seq)` PK).
+/// Message rows take the upsert path (c-usagefu r8 item 5): a replayed
+/// response with the SAME durable (instance, scope, scope_id) updates the
+/// stored row when it carries better attribution (a turn_id / native
+/// timestamp the first write lacked) rather than being silently dropped.
 fn insert_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+    if row.scope == "message" && row.scope_id.is_some() {
+        return upsert_message_row(conn, row);
+    }
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO usage_events
-            (instance_id, seq, profile_id, model, scope, scope_id, mode,
-             metric_revision, source_session_id, total_tokens, input_tokens,
-             output_tokens, cache_read_tokens, cache_write_tokens, cost_usd,
-             accounting, observed_at, observed_at_source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?15, ?16, ?17, ?18)",
+            (instance_id, seq, profile_id, model, scope, scope_id, turn_id, mode,
+             metric_revision, total_tokens, input_tokens, output_tokens,
+             cache_read_tokens, cache_write_tokens, cost_usd, accounting,
+             observed_at, observed_at_source, native_context_window)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             row.instance_id,
             row.seq,
@@ -600,6 +1206,7 @@ fn insert_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> 
             row.model,
             row.scope,
             row.scope_id,
+            row.turn_id,
             row.mode,
             row.metric_revision,
             row.source_session_id,
@@ -612,9 +1219,129 @@ fn insert_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> 
             row.accounting,
             row.observed_at,
             row.observed_at_source,
+            row.native_context_window,
         ],
     )?;
     Ok(inserted > 0)
+}
+
+/// Insert or improve a durable Message row keyed on
+/// (instance_id, scope='message', scope_id).
+///
+/// c-usagefu r11 item 9 (Ruling C1, EXACT) — live duplicate updates are
+/// REVISION-AUTHORITATIVE for accounting:
+/// - a newer revision (`metric_revision`) replaces present counters/cost and
+///   the `accounting` authority outright, and raises the stored revision; its
+///   NULL buckets impose nothing;
+/// - an OLDER revision never replaces anything; its known buckets do not even
+///   fill NULLs — a NULL->known repair is allowed only at the SAME or a NEWER
+///   revision;
+/// - attribution (turn_id, native timestamp/source) still repairs best-known
+///   independent of revision.
+///
+/// Returns true when a row was inserted OR at least one value changed.
+fn upsert_message_row(conn: &Connection, row: &UsageEventRow) -> rusqlite::Result<bool> {
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO usage_events
+            (instance_id, seq, profile_id, model, scope, scope_id, turn_id, mode,
+             metric_revision, total_tokens, input_tokens, output_tokens,
+             cache_read_tokens, cache_write_tokens, cost_usd, accounting,
+             observed_at, observed_at_source, native_context_window)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 ?15, ?16, ?17, ?18, ?19)",
+        params![
+            row.instance_id,
+            row.seq,
+            row.profile_id,
+            row.model,
+            row.scope,
+            row.scope_id,
+            row.turn_id,
+            row.mode,
+            row.metric_revision,
+            row.total_tokens,
+            row.input_tokens,
+            row.output_tokens,
+            row.cache_read_tokens,
+            row.cache_write_tokens,
+            row.cost_usd,
+            row.accounting,
+            row.observed_at,
+            row.observed_at_source,
+            row.native_context_window,
+        ],
+    )?;
+    if inserted > 0 {
+        return Ok(true);
+    }
+    // Duplicate durable key. Every accounting RHS compares the incoming
+    // revision against the stored one (the RHS sees the pre-update row), so an
+    // older revision is inert even while the revision column advances.
+    let updated = conn.execute(
+        "UPDATE usage_events SET
+             metric_revision = CASE
+                 WHEN ?12 > metric_revision THEN ?12
+                 ELSE metric_revision END,
+             turn_id = COALESCE(turn_id, ?3),
+             total_tokens = CASE
+                 WHEN ?4 IS NOT NULL AND ?12 >= metric_revision THEN ?4
+                 ELSE total_tokens END,
+             input_tokens = CASE
+                 WHEN ?5 IS NOT NULL AND ?12 >= metric_revision THEN ?5
+                 ELSE input_tokens END,
+             output_tokens = CASE
+                 WHEN ?6 IS NOT NULL AND ?12 >= metric_revision THEN ?6
+                 ELSE output_tokens END,
+             cache_read_tokens = CASE
+                 WHEN ?7 IS NOT NULL AND ?12 >= metric_revision THEN ?7
+                 ELSE cache_read_tokens END,
+             cache_write_tokens = CASE
+                 WHEN ?8 IS NOT NULL AND ?12 >= metric_revision THEN ?8
+                 ELSE cache_write_tokens END,
+             cost_usd = CASE
+                 WHEN ?9 IS NOT NULL AND ?12 >= metric_revision THEN ?9
+                 ELSE cost_usd END,
+             accounting = CASE
+                 WHEN ?12 >= metric_revision THEN ?13
+                 ELSE accounting END,
+             observed_at = CASE
+                 WHEN observed_at_source = 'native' THEN observed_at
+                 WHEN ?11 = 'native' THEN ?10
+                 ELSE observed_at END,
+             observed_at_source = CASE
+                 WHEN observed_at_source = 'native' THEN 'native'
+                 ELSE ?11 END
+         WHERE instance_id = ?1 AND scope = 'message' AND scope_id = ?2
+           AND (
+                metric_revision < ?12
+                OR (turn_id IS NULL AND ?3 IS NOT NULL)
+                OR (observed_at_source != 'native' AND ?11 = 'native')
+                OR (?12 >= metric_revision AND (
+                        (?4 IS NOT NULL AND total_tokens IS NOT ?4)
+                     OR (?5 IS NOT NULL AND input_tokens IS NOT ?5)
+                     OR (?6 IS NOT NULL AND output_tokens IS NOT ?6)
+                     OR (?7 IS NOT NULL AND cache_read_tokens IS NOT ?7)
+                     OR (?8 IS NOT NULL AND cache_write_tokens IS NOT ?8)
+                     OR (?9 IS NOT NULL AND cost_usd IS NOT ?9)
+                     OR (accounting IS NOT ?13)))
+           )",
+        params![
+            row.instance_id,        // ?1
+            row.scope_id,           // ?2
+            row.turn_id,            // ?3
+            row.total_tokens,       // ?4
+            row.input_tokens,       // ?5
+            row.output_tokens,      // ?6
+            row.cache_read_tokens,  // ?7
+            row.cache_write_tokens, // ?8
+            row.cost_usd,           // ?9
+            row.observed_at,        // ?10
+            row.observed_at_source, // ?11
+            row.metric_revision,    // ?12
+            row.accounting,         // ?13
+        ],
+    )?;
+    Ok(updated > 0)
 }
 
 /// Counters carried by one scoped snapshot, in fold order.
@@ -849,18 +1576,44 @@ fn upsert_turn_snapshot(conn: &Connection, row: &UsageEventRow) -> rusqlite::Res
     // NULL, and can never inherit a retained qualified id).
     if !reports_counters {
         conn.execute(
-            "UPDATE usage_events
-             SET seq = ?1,
-                 metric_revision = ?2,
-                 source_session_id = ?3,
-                 cost_usd = COALESCE(?4, cost_usd)
-             WHERE rowid = ?5",
+            "UPDATE usage_events SET
+                seq = ?1,
+                profile_id = ?2,
+                model = ?3,
+                mode = ?4,
+                metric_revision = ?5,
+                total_tokens = ?6,
+                input_tokens = ?7,
+                output_tokens = ?8,
+                cache_read_tokens = ?9,
+                cache_write_tokens = ?10,
+                cost_usd = ?11,
+                accounting = ?12,
+                observed_at = ?13,
+                observed_at_source = ?14,
+                native_context_window = ?15
+             WHERE instance_id = ?16 AND scope = 'turn' AND scope_id = ?17",
             params![
                 row.seq,
                 row.metric_revision,
                 row.source_session_id,
                 row.cost_usd,
-                stored.rowid,
+                row.accounting,
+                // The clock follows the newer frame: an ingest fallback never
+                // overwrites a native time (c-ctxusage r4 item 5).
+                if row.observed_at_source == "native" || stored.observed_at_source != "native" {
+                    row.observed_at.clone()
+                } else {
+                    stored.observed_at.clone()
+                },
+                if row.observed_at_source == "native" || stored.observed_at_source != "native" {
+                    row.observed_at_source.clone()
+                } else {
+                    stored.observed_at_source.clone()
+                },
+                row.native_context_window,
+                row.instance_id,
+                row.scope_id,
             ],
         )?;
         return Ok(true);
@@ -939,19 +1692,15 @@ fn knowledge_u64(value: &Value) -> Option<i64> {
 /// tolerating a bare JSON number from non-Rust producers — as an `i64`.
 /// Distinct from [`knowledge_u64`], which unwraps a `Knowledge<U64>` enum's
 /// `{state,value}` object (c-ctxusage r3 item 2).
-fn scalar_revision(value: Option<&Value>) -> Option<i64> {
-    let value = value?;
+/// Decode a bare JSON number or decimal string as an `i64` (a protocol
+/// `U64` payload may arrive either way).
+fn scalar_u64(value: &Value) -> Option<i64> {
     if let Some(text) = value.as_str() {
         return text.parse().ok();
     }
     value.as_i64()
 }
 
-/// Project one journal record into a usage row when it is `kind:"usage"`.
-///
-/// `profile_id`/`model` come from the instance row (the payload itself has no
-/// model field — the driver priced against the model before sending).
-#[must_use]
 pub fn project_usage_event(
     record: &JournalRecord,
     profile_id: Option<&str>,
@@ -966,6 +1715,8 @@ pub fn project_usage_event(
     let output_tokens = payload.get("outputTokens").and_then(knowledge_u64);
     let cache_read_tokens = payload.get("cacheReadTokens").and_then(knowledge_u64);
     let cache_write_tokens = payload.get("cacheWriteTokens").and_then(knowledge_u64);
+    // c-usagefu (c): native per-model context window, additively optional.
+    let native_context_window = payload.get("contextWindow").and_then(scalar_u64);
     let cost_usd = payload
         .get("cost")
         .and_then(|cost| cost.get("value"))
@@ -1001,14 +1752,21 @@ pub fn project_usage_event(
             .get("scopeId")
             .and_then(Value::as_str)
             .map(str::to_string),
+        // r6 item 5: the stamped envelope's native turn id lives under
+        // `source.nativeTurnId` (camelCased ObservationSource).
+        turn_id: record
+            .event
+            .get("source")
+            .and_then(|source| source.get("nativeTurnId"))
+            .and_then(|value| value.get("value"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
         // c-ctxusage r3 item 2: `metricRevision` is a bare protocol `U64`,
         // serialized as a DECIMAL STRING (`"2"`), not a `Knowledge<U64>` object
         // — reading it through `knowledge_u64` (which dives into `.value`)
         // yielded None and silently pinned every snapshot at revision 1.
         metric_revision: scalar_revision(payload.get("metricRevision")).unwrap_or(1),
-        // c-ctxusage r15 item 4: session-qualified turn positions. A missing
-        // field (older producers) is the unqualified lineage; an explicit
-        // empty string is normalised away.
+        // c-ctxusage r15 item 4: session-qualified turn positions.
         source_session_id: payload
             .get("sourceSessionId")
             .and_then(Value::as_str)
@@ -1032,7 +1790,16 @@ pub fn project_usage_event(
             .to_string(),
         observed_at,
         observed_at_source,
+        native_context_window,
     })
+}
+
+fn scalar_revision(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        return text.parse().ok();
+    }
+    value.as_i64()
 }
 
 /// Aggregated usage for one `(profile, model)` or instance.
@@ -1058,27 +1825,44 @@ pub struct UsageAggregate {
     /// Whether any ambiguous turn exists anywhere in this fold's instances —
     /// used by the per-instance totals, which sum across models.
     pub ambiguous: bool,
-    /// Summed total tokens; Unknown when any contributing row omitted it.
+    /// Summed total tokens; Unknown when any contributing row omitted it
+    /// (U1), or on the legacy pre-migration shape (see `unavailable`).
     pub total_tokens: Option<i64>,
     /// Summed input tokens; Unknown when any contributing row omitted it.
     pub input_tokens: Option<i64>,
     /// Summed output tokens; Unknown when any contributing row omitted it.
     pub output_tokens: Option<i64>,
     /// Summed cost (decimal, estimated). `None` when ANY folded contributing
-    /// row is unpriced — the bill is then Unknown, never a partial sum shown
-    /// as the complete spend (U1, c-ctxusage r16 item 4).
+    /// row is unpriced (U1), or on the legacy pre-migration shape.
     pub cost_usd: Option<f64>,
+    /// c-usagefu r16 item 7: true on the rolled-back/legacy shape — the numeric
+    /// fields are NOT evidence (placeholders, not real spend). Distinct from a
+    /// real zero (a migrated instance with no spend yet), which leaves this
+    /// false.
+    pub unavailable: bool,
 }
 
 impl UsageAggregate {
+    /// The explicit Unavailable state for a store the usage migration did not
+    /// upgrade (c-usagefu r16 item 7).
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            unavailable: true,
+            ..Self::default()
+        }
+    }
+
     /// Budget status against a cap. `Unknown` when the bill itself is Unknown
-    /// — either because at least one contributing turn could not be priced (U1,
-    /// c-ctxusage r16 item 4) or because unprovable (ambiguous-lineage) usage
-    /// exists and can neither be included nor certified absent (c-ctxusage r34
-    /// item 1). An unknown bill can never be certified under budget, so it is
-    /// never Ok.
+    /// — an unpriced contributing turn (U1, c-ctxusage r16 item 4) OR
+    /// unprovable ambiguous-lineage usage (c-ctxusage r34 item 1); an unknown
+    /// bill can never be certified under budget. On the legacy shape the
+    /// provider surface reports "ok" with the Unavailable flag rather than
+    /// grading a band off the placeholder (c-usagefu r16 item 7).
     #[must_use]
     pub fn budget_status(&self, max_usd: Option<f64>) -> BudgetStatus {
+        if self.unavailable {
+            return BudgetStatus::Ok;
+        }
         let Some(cost) = self.cost_usd else {
             return BudgetStatus::Unknown;
         };
@@ -1113,309 +1897,167 @@ pub enum BudgetStatus {
     Unknown,
 }
 
-/// Aggregate all persisted events for one instance.
+/// c-usagefu r13 COORDINATOR RULING U1: ONE shared eligible-FLOW relation by
+/// CALL identity, used by the rollup, both aggregates and the TPM windows.
 ///
-/// Turn rows are folded to one winner per scope id before summing so that
-/// several native-session lineages proving one message id never double-count
-/// the turn (c-ctxusage r16 item 3); every other row (session growth points,
-/// legacy NULL-scope events) is summed as before.
-/// Aggregate all persisted events for one instance.
+/// U1 bounds the upgrade: usagefu never landed, so the only databases in the
+/// field are (a) those written by origin/main's schema and codex insert path
+/// (turn- and session-scope rows only, NO codex Message rows) and (b) those
+/// written by the final schema (every Message carries the durable
+/// (rollout file, byte offset) identity and its turn id). Shapes produced only
+/// by intermediate unlanded rounds are out of scope and need no reconciliation.
 ///
-/// Turn rows fold to one winner per scope id; cumulative SESSION snapshots
-/// fold to their LATEST accepted stock per session (c-ctxusage r22 item 2),
-/// never a sum of snapshots. A per-turn flow is included only when no session
-/// stock covers its native session — emitters like Codex send BOTH per turn and
-/// a cumulative session snapshot that already contains the turn's totals, so
-/// adding the turn on top would double count.
-pub fn aggregate_instance(
-    conn: &Connection,
-    instance_id: &str,
-) -> rusqlite::Result<UsageAggregate> {
-    let fold = FOLD_CTES_SQL
-        .replace("{domain_l}", "l.instance_id = ?1")
-        .replace("{domain}", "instance_id = ?1");
-    conn.query_row(
-        &format!(
-            "WITH {fold},
-             contributions AS (
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM scoped_sessions
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM legacy_stock
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM proven_turns
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM usage_events
-                 WHERE instance_id = ?1 AND scope NOT IN ('turn', 'session')
-             )
-             SELECT
-                 (SELECT COUNT(*) FROM contributions),
-                 (SELECT COUNT(*) FROM ambiguous_turns),
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE total_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(total_tokens)
-                      THEN SUM(total_tokens) END,
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE input_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(input_tokens)
-                      THEN SUM(input_tokens) END,
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE output_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(output_tokens)
-                      THEN SUM(output_tokens) END,
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE cost_usd IS NOT NULL
-                      ) AND COUNT(*) = COUNT(cost_usd)
-                      THEN SUM(CAST(cost_usd AS REAL)) END
-             FROM contributions",
-            fold = fold
-        ),
-        params![instance_id],
-        |row| {
-            Ok(UsageAggregate {
-                events: row.get(0)?,
-                ambiguous_events: row.get(1)?,
-                ambiguous: row.get::<_, i64>(1)? != 0,
-                total_tokens: row.get(2)?,
-                input_tokens: row.get(3)?,
-                output_tokens: row.get(4)?,
-                cost_usd: row.get(5)?,
-            })
-        },
-    )
-}
-
-/// Aggregate persisted events for one `(profile, model)`. Same per-scope
-/// turn-lineage fold as [`aggregate_instance`] (c-ctxusage r16 item 3).
+/// Each native turn is counted EITHER from its Turn row OR from its Message
+/// rows, never both:
 ///
-/// c-ctxusage r18 item 2: scoped turns are ranked across ALL profiles and
-/// models BEFORE the supply filter. Filtering first used to rank within one
-/// model, so a row superseded by a newer accepted frame for the same message
-/// id under ANOTHER model/profile still won inside its own filtered set and
-/// kept contributing to that model's provider totals. The winner of the
-/// logical turn is chosen globally per `(instance_id, scope_id)`; the
-/// profile/model predicate then decides whether that WINNING row belongs to
-/// this supply (its model/profile columns are carried through the CTE).
-pub fn aggregate_supply(
-    conn: &Connection,
-    profile_id: &str,
-    model: &str,
-) -> rusqlite::Result<UsageAggregate> {
-    let fold = FOLD_CTES_SQL
-        .replace("{domain_l}", "l.profile_id = ?1 AND l.model = ?2")
-        .replace("{domain}", "profile_id = ?1 AND model = ?2");
-    conn.query_row(
-        &format!(
-            "WITH {fold},
-             contributions AS (
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM scoped_sessions
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM legacy_stock
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM proven_turns
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM usage_events
-                 WHERE profile_id = ?1 AND model = ?2
-                   AND scope NOT IN ('turn', 'session')
-             )
-             SELECT
-                 (SELECT COUNT(*) FROM contributions),
-                 (SELECT COUNT(*) FROM ambiguous_turns),
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE total_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(total_tokens)
-                      THEN SUM(total_tokens) END,
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE input_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(input_tokens)
-                      THEN SUM(input_tokens) END,
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE output_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(output_tokens)
-                      THEN SUM(output_tokens) END,
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE cost_usd IS NOT NULL
-                      ) AND COUNT(*) = COUNT(cost_usd)
-                      THEN SUM(CAST(cost_usd AS REAL)) END
-             FROM contributions",
-            fold = fold
-        ),
-        params![profile_id, model],
-        |row| {
-            Ok(UsageAggregate {
-                events: row.get(0)?,
-                ambiguous_events: row.get(1)?,
-                ambiguous: row.get::<_, i64>(1)? != 0,
-                total_tokens: row.get(2)?,
-                input_tokens: row.get(3)?,
-                output_tokens: row.get(4)?,
-                cost_usd: row.get(5)?,
-            })
-        },
-    )
-}
-
-/// Per-session token/context rollup backing the composer's context chip
-/// popover (context-usage-1).
-///
-/// An additive projection of `usage_events`, recomputed on read, so the TPM
-/// windows never go stale. Every counter is `None` until at least one usage
-/// observation has reported it: adapters that do not emit a channel (Codex
-/// cache fields, Grok uncached breakdown) leave it unknown — the client
-/// renders `—`, never a fabricated zero.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InstanceUsageRollup {
-    /// Tokens the next request will carry: the last turn's fresh input +
-    /// cache read + cache creation. `None` when no component was reported.
-    pub context_used_tokens: Option<i64>,
-    /// Context window size in tokens (model catalog / `[1m]` tag / kind).
-    pub context_window_tokens: Option<i64>,
-    /// `context_used / context_window`, rounded and clamped to 0..=100.
-    pub context_pct: Option<i64>,
-    /// Sum of fresh (uncached) input tokens across the session.
-    pub session_input_tokens: Option<i64>,
-    /// Sum of output tokens across the session.
-    pub session_output_tokens: Option<i64>,
-    /// Sum of prompt-cache reads across the session.
-    pub cache_read_tokens: Option<i64>,
-    /// Sum of prompt-cache creations (writes) across the session.
-    pub cache_creation_tokens: Option<i64>,
-    /// Number of usage observations folded (one per turn for Claude).
-    pub turns: i64,
-    /// Fresh input tokens observed during the last 60 seconds.
-    pub tpm_in_60s: Option<i64>,
-    /// Output tokens observed during the last 60 seconds.
-    pub tpm_out_60s: Option<i64>,
-    /// Average per-minute input rate over the last 5 minutes.
-    pub tpm_in_5m: Option<i64>,
-    /// Average per-minute output rate over the last 5 minutes.
-    pub tpm_out_5m: Option<i64>,
-    /// Observed-at of the most recent usage event.
-    pub last_turn_at: Option<String>,
-}
-
-/// Kind-level fallback context windows, matching the web's own table before
-/// the model catalog was available. Generic/terminal kinds report nothing.
-fn kind_context_window(kind: &str) -> Option<i64> {
-    match kind {
-        "claude" | "codex" | "agy" => Some(200_000),
-        "grok" => Some(128_000),
-        _ => None,
-    }
-}
-
-/// Resolve a session's context window: explicit `[1m]` long-context tag,
-/// then the static model catalog, then the harness-kind fallback.
-#[must_use]
-pub fn context_window_tokens(kind: &str, model: Option<&str>) -> Option<i64> {
-    if let Some(model) = model {
-        let trimmed = model.trim();
-        if trimmed.to_ascii_lowercase().ends_with("[1m]") {
-            return Some(1_000_000);
-        }
-        if let Some(row) = crate::model_catalog::lookup(trimmed) {
-            return Some(row.context_window as i64);
-        }
-    }
-    kind_context_window(kind)
-}
-
-/// RFC3339 UTC millisecond timestamp `seconds` in the past, byte-comparable
-/// with the stamps `Store::append_journal` writes (both are fixed-width
-/// `…Z`), so the TPM window predicates are plain string comparisons.
-fn threshold_rfc3339(seconds: i64) -> String {
-    let t = time::OffsetDateTime::now_utc() - time::Duration::seconds(seconds);
+/// * A linked Message (`turn_id` present) is counted when either:
+///   * its turn has NO Turn row — a final-shape turn without a Turn row counts
+///     its durable linked Messages (a zero-token record contributes nothing);
+///     or
+///   * the Turn row EXISTS and the durable linked Messages match it on every
+///     token bucket it reports ([`turn_fully_covered_sql`]) — bucket-sum
+///     equality IS the completeness proof. A mismatch counts the Turn and drops
+///     the linked Messages.
+/// * A Message WITHOUT `turn_id` is the pre-r6 attribution-less Message: B1
+///   needs no clocks — when the instance has ANY Turn row at all every such
+///   Message is dropped; an instance with no Turn rows whatsoever counts all
+///   of them.
+/// * A Turn row is counted only when its durable linked Messages do NOT match
+///   it bucket-for-bucket. A main-shape Turn row (which main projected without
+///   a scope_id) has its scope_id backfilled from the journal at migration, so
+///   a post-upgrade byte-0 replay's durable Messages pair with it and suppress
+///   it once the sums match.
+fn eligible_flow_predicate(outer: &str) -> String {
+    let cover_linked =
+        turn_fully_covered_sql(&format!("{outer}.instance_id"), &format!("{outer}.turn_id"));
+    let cover_linked_turn = turn_fully_covered_sql(
+        &format!("{outer}.instance_id"),
+        &format!("{outer}.scope_id"),
+    );
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        t.year(),
-        u8::from(t.month()),
-        t.day(),
-        t.hour(),
-        t.minute(),
-        t.second(),
-        t.millisecond()
+        "(({outer}.scope = 'message' AND {outer}.turn_id IS NOT NULL
+            AND (
+                NOT EXISTS (
+                    SELECT 1 FROM usage_events _ef_t
+                    WHERE _ef_t.instance_id = {outer}.instance_id
+                      AND _ef_t.scope = 'turn'
+                      AND _ef_t.scope_id = {outer}.turn_id
+                 )
+                OR ({cover_linked})
+            )
+         )
+         OR ({outer}.scope = 'message' AND {outer}.turn_id IS NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM usage_events _ef_lt
+                 WHERE _ef_lt.instance_id = {outer}.instance_id
+                   AND _ef_lt.scope = 'turn'
+             )
+         )
+         OR ({outer}.scope = 'turn' AND NOT ({cover_linked_turn})))"
     )
 }
 
-/// Winning revision-replaced turn row per scope id after folding every
-/// native-session lineage: the most recently ACCEPTED frame for the message
-/// id (highest ingest `seq`, deterministic `rowid` tiebreak). One assistant
-/// message id may carry a separate revision-replaced row per lineage
-/// (`source_session_id`, NULL the unqualified legacy lineage), but every
-/// additive read model must count the logical turn ONCE
-/// (c-ctxusage r16 item 3). Binds `?1` to the instance id.
-const WINNING_TURN_ROWS_SQL: &str = "SELECT * FROM (
-        SELECT *, ROW_NUMBER() OVER (
-            PARTITION BY scope_id ORDER BY seq DESC, rowid DESC
-        ) AS turn_lineage_rn
-        FROM usage_events
-        WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NOT NULL
-     ) WHERE turn_lineage_rn = 1
-     UNION ALL
-     SELECT *, NULL AS turn_lineage_rn
-     FROM usage_events
-     WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NULL";
+/// SQL boolean: at least one linked Message of `(inst, tid)` carries the
+/// persisted durable identity marker the final codex adapter mints for every
+/// counted record. `alias` must be unique per use inside one enclosing
+/// statement (SQLite forbids duplicate correlation aliases).
+fn turn_has_durable_message_sql(inst: &str, tid: &str, alias: &str) -> String {
+    let marker = remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX;
+    format!(
+        "EXISTS (
+            SELECT 1 FROM usage_events {alias}
+            WHERE {alias}.instance_id = {inst}
+              AND {alias}.scope = 'message'
+              AND {alias}.turn_id = {tid}
+              AND substr({alias}.scope_id, 1, {len}) = '{marker}'
+        )",
+        len = marker.len(),
+    )
+}
 
-/// Shared stock-vs-flow fold for instance/rollup/supply totals
-/// (c-ctxusage r29 items 1–2, r33 item 1).
+/// True when the DURABLE linked Messages of turn `(inst, tid)` match its Turn
+/// row on every token bucket the Turn row actually reports
+/// (COORDINATOR RULING U1, c-usagefu r13 item 2).
 ///
-/// `{domain}` restricts raw `usage_events` CONTRIBUTIONS to the aggregation
-/// domain — `instance_id = ?1` for the instance folds, or `profile_id = ?1
-/// AND model = ?2` for the provider supply. It is substituted by the callers.
+/// Bucket-sum equality between a Turn row and its durable linked Messages IS
+/// the completeness proof:
 ///
-/// c-ctxusage r33 item 1: the winning stocks and their COVERAGE identities
-/// are resolved GLOBALLY — per `(instance, native session)`, across every
-/// profile/model — BEFORE the domain filter is applied. A cumulative session
-/// stock spans one native session even when the instance was reconfigured to
-/// a new model mid-session: the adapter emits one stock row per turn end
-/// (each projected under the then-current model), and the winning row for S
-/// contains the whole session's usage. Filtering stocks by model before the
-/// coverage check used to resurrect an earlier model's turn as an
-/// "uncovered" flow, so per-model supplies summed to more than the instance
-/// (250/$3 reported as 350/$4). Coverage therefore keys off global winners;
-/// the domain predicate then filters only the CONTRIBUTIONS:
-/// - a scoped stock is attributed to the profile/model ON ITS WINNING ROW
-///   (the model current when the cumulative point was emitted) — one winner
-///   per `(instance, session)` carries one domain, so the per-model rows
-///   partition the scoped contribution exactly and their sum equals the
-///   instance total;
-/// - a turn whose native session has a winning stock (of ANY model in the
-///   same instance) is covered everywhere and contributes to no supply;
-/// - an uncovered winning turn is attributed to its own row's domain.
+/// - at least one linked Message carries the persisted durable (rollout file
+///   identity, byte offset) identity the final adapter mints for EVERY
+///   token_usage_record, and every bucket SUM runs over DURABLE linked
+///   Messages only. Main wrote no codex Message rows at all and the final
+///   schema writes none without the durable marker, so no per-record identity
+///   mix can occur in an in-scope database;
+/// - for every TOKEN bucket the Turn row reports, the durable Messages' sum
+///   EQUALS it. A bucket the Turn leaves NULL (a sparse historical Turn never
+///   carried total/cache-write) cannot disprove coverage and is not compared;
+///   the Messages may additionally report buckets the Turn omitted. A
+///   zero-token record contributes nothing (it adds zero to the sums), so it
+///   neither creates nor breaks equality;
+/// - when the durable sums fall short of the Turn on any reported bucket the
+///   turn is NOT covered: the Turn is billed and its linked Messages are
+///   dropped — never both.
 ///
-/// Exposed CTEs:
-/// - `scoped_sessions`: latest accepted cumulative stock per native session
-///   (acceptance order), domain-filtered for CONTRIBUTION;
-/// - `legacy_stock`: the NEWEST accepted NULL-scope cumulative point of an
-///   instance that has NO scoped stock (global identity check),
-///   domain-filtered for contribution. NULL-scope session rows are cumulative
-///   growth points (see `insert_legacy_session_point`): summing every legacy
-///   snapshot would double-count a cumulative series (100/10 → 150/15 must be
-///   150/15, never 250/25). The rule must therefore be "newest point", not
-///   "every row", in every fold. An unproven NULL point in an instance that
-///   DOES have scoped stock contributes nothing (it cannot be proven to be a
-///   separate session nor the scoped session's predecessor — c-ctxusage r8
-///   item 8);
-/// - `winning_turns`: one winning turn per `(instance, scope_id)` plus every
-///   unqualified (NULL-lineage) turn, chosen globally then domain-filtered
-///   for contribution (c-ctxusage r18 item 2);
-/// - `proven_turns`: flows not covered by a GLOBAL stock — qualified turns
-///   whose native session has no matching winning stock, and NULL-lineage
-///   turns only when the instance has neither scoped nor legacy stock (the
-///   pure-Claude legacy world);
-/// - `ambiguous_turns`: domain turns with NULL lineage in an instance that
-///   HAS global scoped stock. Their session cannot be proven from retained
-///   evidence, so they are neither a proven extra flow nor safely covered:
-///   every bucket they report stays Unknown (U1). A NULL bucket they omit is
-///   unaffected.
+/// Cost is deliberately NOT part of the proof: it is a priced projection that
+/// may legitimately differ from a historical Turn.
+fn turn_fully_covered_sql(inst: &str, tid: &str) -> String {
+    let buckets = [
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+    ];
+    // At least one durable linked Message.
+    let mut conds = vec![turn_has_durable_message_sql(inst, tid, "_fc_d")];
+    for bucket in buckets {
+        // Each condition is a full OR and MUST be parenthesized: the list is
+        // joined with AND, and a bare `A IS NULL OR B = C` would let AND bind
+        // tighter and silently flatten the coverage proof across buckets. The
+        // sum is scoped to DURABLE linked Messages (the marker prefix).
+        let marker = remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX;
+        conds.push(format!(
+            "((SELECT _fc_t.{bucket} FROM usage_events _fc_t
+              WHERE _fc_t.instance_id = {inst}
+                AND _fc_t.scope = 'turn' AND _fc_t.scope_id = {tid}) IS NULL
+             OR COALESCE((
+                SELECT SUM(_fc_s.{bucket}) FROM usage_events _fc_s
+                WHERE _fc_s.instance_id = {inst}
+                  AND _fc_s.scope = 'message' AND _fc_s.turn_id = {tid}
+                  AND substr(_fc_s.scope_id, 1, {len}) = '{marker}'
+             ), 0)
+             = (SELECT _fc_t2.{bucket} FROM usage_events _fc_t2
+                WHERE _fc_t2.instance_id = {inst}
+                  AND _fc_t2.scope = 'turn' AND _fc_t2.scope_id = {tid}))",
+            len = marker.len(),
+        ));
+    }
+    conds.join(" AND ")
+}
+
+/// True when instance `instance_expr` has at least one eligible flow row
+/// (see [`eligible_flow_predicate`]). Legacy NULL-scope Turn rows count.
+fn has_eligible_flow_sql(instance_expr: &str) -> String {
+    format!(
+        "EXISTS (
+            SELECT 1 FROM usage_events _ef_e
+            WHERE _ef_e.instance_id = {instance_expr}
+              AND {}
+        )",
+        eligible_flow_predicate("_ef_e")
+    )
+}
+
+/// Token-sum CASE arm for the shared flow relation (`column` is one token
+/// bucket on the outer `usage_events` row): a `WHEN … THEN …` fragment to
+/// embed inside an outer CASE.
+fn flow_case_arm(column: &str) -> String {
+    format!(
+        "WHEN {} THEN {column}",
+        eligible_flow_predicate("usage_events")
+    )
+}
+
 const FOLD_CTES_SQL: &str = "global_scoped_sessions AS (
             SELECT * FROM (
                 SELECT *, ROW_NUMBER() OVER (
@@ -1500,51 +2142,259 @@ const FOLD_CTES_SQL: &str = "global_scoped_sessions AS (
               )
          )";
 
-/// Sum the per-call (scope='turn') token flow within a rate window. Session
-/// snapshots are a CUMULATIVE STOCK replaced in place, never a per-window flow,
-/// so they are excluded here; the caller substitutes timestamped stock
-/// increments only when the harness emits no turn rows at all (Grok) —
-/// c-ctxusage r3 item 6 / r4 item 6.
+/// Aggregate all persisted events for one instance.
 ///
-/// Turn rows are folded to one WINNER per scope id first (c-ctxusage r16
-/// item 3): frames of one message id replayed under different native-session
-/// lineages share the same native turn time, so the window never counts the
-/// same model call twice.
+/// Turn rows are folded to one winner per scope id before summing so that
+/// several native-session lineages proving one message id never double-count
+/// the turn (c-ctxusage r16 item 3); every other row (session growth points,
+/// legacy NULL-scope events) is summed as before.
+/// Aggregate all persisted events for one instance.
 ///
-/// Ranking runs over ALL rows (native AND ingest-provenance) per scope id
-/// BEFORE native-time eligibility and the window predicate (c-ctxusage r17
-/// item 5 / r22 item 1): rank every lineage row, keep rn = 1, and only THEN
-/// apply `observed_at_source = 'native'` and `observed_at >= since`. Filtering
-/// on provenance INSIDE the ranking excluded a newer accepted winning lineage
-/// that carries an ingest (journal-seq) timestamp, so an older superseded
-/// native-time lineage wrongly won inside the window and was counted.
+/// Turn rows fold to one winner per scope id; cumulative SESSION snapshots
+/// fold to their LATEST accepted stock per session (c-ctxusage r22 item 2),
+/// never a sum of snapshots. A per-turn flow is included only when no session
+/// stock covers its native session — emitters like Codex send BOTH per turn and
+/// a cumulative session snapshot that already contains the turn's totals, so
+/// adding the turn on top would double count.
+pub fn aggregate_instance(
+    conn: &Connection,
+    instance_id: &str,
+) -> rusqlite::Result<UsageAggregate> {
+    // c-usagefu r15 item 1: a rolled-back migration leaves a shape the
+    // new-schema aggregate SQL cannot run against. c-usagefu r16 item 7: carry
+    // an explicit Unavailable state (never a zero that the client reads as
+    // real spend) while keeping the endpoint usable.
+    if !usage_schema_is_current(conn)? {
+        return Ok(UsageAggregate::unavailable());
+    }
+    let fold = FOLD_CTES_SQL
+        .replace("{domain_l}", "l.instance_id = ?1")
+        .replace("{domain}", "instance_id = ?1");
+    conn.query_row(
+        &format!(
+            "WITH {fold},
+             contributions AS (
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM scoped_sessions
+                 UNION ALL
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM legacy_stock
+                 UNION ALL
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM proven_turns
+                 UNION ALL
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM usage_events
+                 WHERE instance_id = ?1 AND scope NOT IN ('turn', 'session')
+             )
+             SELECT
+                 (SELECT COUNT(*) FROM contributions),
+                 (SELECT COUNT(*) FROM ambiguous_turns),
+                 CASE WHEN NOT EXISTS (
+                          SELECT 1 FROM ambiguous_turns WHERE total_tokens IS NOT NULL
+                      ) AND COUNT(*) = COUNT(total_tokens)
+                      THEN SUM(total_tokens) END,
+                 CASE WHEN NOT EXISTS (
+                          SELECT 1 FROM ambiguous_turns WHERE input_tokens IS NOT NULL
+                      ) AND COUNT(*) = COUNT(input_tokens)
+                      THEN SUM(input_tokens) END,
+                 CASE WHEN NOT EXISTS (
+                          SELECT 1 FROM ambiguous_turns WHERE output_tokens IS NOT NULL
+                      ) AND COUNT(*) = COUNT(output_tokens)
+                      THEN SUM(output_tokens) END,
+                 CASE WHEN NOT EXISTS (
+                          SELECT 1 FROM ambiguous_turns WHERE cost_usd IS NOT NULL
+                      ) AND COUNT(*) = COUNT(cost_usd)
+                      THEN SUM(CAST(cost_usd AS REAL)) END
+             FROM contributions",
+            fold = fold
+        ),
+        params![instance_id],
+        |row| {
+            Ok(UsageAggregate {
+                events: row.get(0)?,
+                ambiguous_events: row.get(1)?,
+                ambiguous: row.get::<_, i64>(1)? != 0,
+                total_tokens: row.get(2)?,
+                input_tokens: row.get(3)?,
+                output_tokens: row.get(4)?,
+                cost_usd: row.get(5)?,
+                unavailable: false,
+            })
+        },
+    )
+}
+
+/// Aggregate persisted events for one `(profile, model)`. Same per-scope
+/// turn-lineage fold as [`aggregate_instance`] (c-ctxusage r16 item 3).
+///
+/// c-ctxusage r18 item 2: scoped turns are ranked across ALL profiles and
+/// models BEFORE the supply filter. Filtering first used to rank within one
+/// model, so a row superseded by a newer accepted frame for the same message
+/// id under ANOTHER model/profile still won inside its own filtered set and
+/// kept contributing to that model's provider totals. The winner of the
+/// logical turn is chosen globally per `(instance_id, scope_id)`; the
+/// profile/model predicate then decides whether that WINNING row belongs to
+/// this supply (its model/profile columns are carried through the CTE).
+pub fn aggregate_supply(
+    conn: &Connection,
+    profile_id: &str,
+    model: &str,
+) -> rusqlite::Result<UsageAggregate> {
+    // c-usagefu r15 item 1: legacy-shape fallback; c-usagefu r16 item 7 reports
+    // the explicit Unavailable state instead of a zero spend.
+    if !usage_schema_is_current(conn)? {
+        return Ok(UsageAggregate::unavailable());
+    }
+    let fold = FOLD_CTES_SQL
+        .replace("{domain_l}", "l.profile_id = ?1 AND l.model = ?2")
+        .replace("{domain}", "profile_id = ?1 AND model = ?2");
+    conn.query_row(
+        &format!(
+            "WITH {fold},
+             contributions AS (
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM scoped_sessions
+                 UNION ALL
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM legacy_stock
+                 UNION ALL
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM proven_turns
+                 UNION ALL
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM usage_events
+                 WHERE profile_id = ?1 AND model = ?2
+                   AND scope NOT IN ('turn', 'session')
+             )
+             SELECT
+                 (SELECT COUNT(*) FROM contributions),
+                 (SELECT COUNT(*) FROM ambiguous_turns),
+                 CASE WHEN NOT EXISTS (
+                          SELECT 1 FROM ambiguous_turns WHERE total_tokens IS NOT NULL
+                      ) AND COUNT(*) = COUNT(total_tokens)
+                      THEN SUM(total_tokens) END,
+                 CASE WHEN NOT EXISTS (
+                          SELECT 1 FROM ambiguous_turns WHERE input_tokens IS NOT NULL
+                      ) AND COUNT(*) = COUNT(input_tokens)
+                      THEN SUM(input_tokens) END,
+                 CASE WHEN NOT EXISTS (
+                          SELECT 1 FROM ambiguous_turns WHERE output_tokens IS NOT NULL
+                      ) AND COUNT(*) = COUNT(output_tokens)
+                      THEN SUM(output_tokens) END,
+                 CASE WHEN NOT EXISTS (
+                          SELECT 1 FROM ambiguous_turns WHERE cost_usd IS NOT NULL
+                      ) AND COUNT(*) = COUNT(cost_usd)
+                      THEN SUM(CAST(cost_usd AS REAL)) END
+             FROM contributions",
+            fold = fold
+        ),
+        params![profile_id, model],
+        |row| {
+            Ok(UsageAggregate {
+                events: row.get(0)?,
+                ambiguous_events: row.get(1)?,
+                ambiguous: row.get::<_, i64>(1)? != 0,
+                total_tokens: row.get(2)?,
+                input_tokens: row.get(3)?,
+                output_tokens: row.get(4)?,
+                cost_usd: row.get(5)?,
+                unavailable: false,
+            })
+        },
+    )
+}
+
+/// Per-session token/context rollup backing the composer's context chip
+/// popover (context-usage-1).
+///
+/// An additive projection of `usage_events`, recomputed on read, so the TPM
+/// windows never go stale. Every counter is `None` until at least one usage
+/// observation has reported it: adapters that do not emit a channel (Codex
+/// cache fields, Grok uncached breakdown) leave it unknown — the client
+/// renders `—`, never a fabricated zero.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceUsageRollup {
+    /// c-usagefu r16 item 7: the store is on the rolled-back/legacy shape, so
+    /// none of the counters below could be projected. The client renders this
+    /// as Unknown (never 0 and never a kind-guessed percentage). Distinct from
+    /// `rollup_instance` returning `None`, which means there is NO rollup
+    /// channel / no usage at all.
+    pub unavailable: bool,
+    /// Tokens the next request will carry: the last turn's fresh input +
+    /// cache read + cache creation. `None` when no component was reported.
+    pub context_used_tokens: Option<i64>,
+    /// Context window size in tokens (model catalog / `[1m]` tag / kind).
+    pub context_window_tokens: Option<i64>,
+    /// `context_used / context_window`, rounded and clamped to 0..=100.
+    pub context_pct: Option<i64>,
+    /// True when `context_window_tokens` came only from the harness-kind
+    /// fallback (unknown model): the percentage is then an estimate and the
+    /// UI marks it `≈`. False for native/profile/catalog evidence.
+    pub context_pct_approximate: bool,
+    /// Sum of fresh (uncached) input tokens across the session.
+    pub session_input_tokens: Option<i64>,
+    /// Sum of output tokens across the session.
+    pub session_output_tokens: Option<i64>,
+    /// Sum of prompt-cache reads across the session.
+    pub cache_read_tokens: Option<i64>,
+    /// Sum of prompt-cache creations (writes) across the session.
+    pub cache_creation_tokens: Option<i64>,
+    /// Number of usage observations folded (one per turn for Claude).
+    pub turns: i64,
+    /// Fresh input tokens observed during the last 60 seconds.
+    pub tpm_in_60s: Option<i64>,
+    /// Output tokens observed during the last 60 seconds.
+    pub tpm_out_60s: Option<i64>,
+    /// Average per-minute input rate over the last 5 minutes.
+    pub tpm_in_5m: Option<i64>,
+    /// Average per-minute output rate over the last 5 minutes.
+    pub tpm_out_5m: Option<i64>,
+    /// Observed-at of the most recent usage event.
+    pub last_turn_at: Option<String>,
+}
+
+/// RFC3339 UTC millisecond timestamp `seconds` in the past, byte-comparable
+/// with the stamps `Store::append_journal` writes (both are fixed-width
+/// `…Z`), so the TPM window predicates are plain string comparisons.
+fn threshold_rfc3339(seconds: i64) -> String {
+    let t = time::OffsetDateTime::now_utc() - time::Duration::seconds(seconds);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.millisecond()
+    )
+}
+
+/// Sum the per-call token FLOW within a rate window (r9 item 4: the shared
+/// call-identity relation — every Message plus unmatched Turns, legacy
+/// NULL-scope Turns included). Session snapshots are a CUMULATIVE STOCK
+/// replaced in place, never a per-window flow, so they are excluded here; the
+/// caller substitutes timestamped stock increments only when the harness
+/// emits no native flow (Grok) — c-ctxusage r3 item 6 / r4 item 6.
 fn sum_turn_tokens_since(
     conn: &Connection,
     instance_id: &str,
     since: &str,
 ) -> rusqlite::Result<(Option<i64>, Option<i64>)> {
     conn.query_row(
-        "WITH ranked AS (
-            SELECT input_tokens, output_tokens, observed_at, observed_at_source,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY scope_id ORDER BY seq DESC, rowid DESC
-                   ) AS rn
-            FROM usage_events
-            WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NOT NULL
-         ),
-         window_turns AS (
-             SELECT input_tokens, output_tokens FROM ranked
-             WHERE rn = 1 AND observed_at_source = 'native' AND observed_at >= ?2
-             UNION ALL
-             SELECT input_tokens, output_tokens FROM usage_events
-             WHERE instance_id = ?1 AND scope = 'turn' AND scope_id IS NULL
-               AND observed_at >= ?2 AND observed_at_source = 'native'
-         )
-         SELECT CASE WHEN COUNT(*) = COUNT(input_tokens)
-                     THEN SUM(input_tokens) END,
-                CASE WHEN COUNT(*) = COUNT(output_tokens)
-                     THEN SUM(output_tokens) END
-         FROM window_turns",
+        &format!(
+            "SELECT CASE WHEN COUNT(*) = COUNT(input_tokens)
+                        THEN SUM(input_tokens) END,
+                   CASE WHEN COUNT(*) = COUNT(output_tokens)
+                        THEN SUM(output_tokens) END
+             FROM usage_events
+             WHERE instance_id = ?1 AND observed_at >= ?2
+               AND observed_at_source = 'native'
+               AND {eligible}",
+            eligible = eligible_flow_predicate("usage_events")
+        ),
         params![instance_id, since],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
@@ -1857,58 +2707,200 @@ fn add_optional(a: Option<i64>, b: Option<i64>) -> Option<i64> {
     }
 }
 
-/// Sum a fixed set of context baskets under U1: Known only when EVERY bucket
-/// is Known (the source reporting no explicit total). `input 100` with an
-/// unknown cache bucket is Unknown context, not 100 (c-ctxusage r17 item 6).
-fn known_context_total(buckets: [Option<i64>; 3]) -> Option<i64> {
-    buckets.into_iter().try_fold(0_i64, |total, bucket| {
-        bucket.map(|value| total.saturating_add(value))
-    })
+/// The newest per-call basket: fresh input plus every cached bucket of the
+/// most recent model call — what the NEXT request will carry.
+///
+/// Scope preference (c-usagefu (b)): a per-REQUEST `message` row (one model
+/// response, Codex) is the most precise; a per-`turn` snapshot (Claude
+/// message id, and Codex's end-of-turn snapshot) is the fallback. A cumulative
+/// session row never feeds the context figure (it spans the whole session).
+///
+/// c-ctxusage r4 item 4: "newest" is the NATIVE time, tie-broken by ingest
+/// seq — a late historical correction at a high seq never becomes current.
+fn latest_call_basket(conn: &Connection, instance_id: &str) -> rusqlite::Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT input_tokens, cache_read_tokens, cache_write_tokens
+         FROM usage_events
+         WHERE instance_id = ?1 AND scope IN ('message', 'turn')
+         ORDER BY CASE scope WHEN 'message' THEN 0 ELSE 1 END,
+                  observed_at DESC, seq DESC LIMIT 1",
+            params![instance_id],
+            |row| {
+                let input: Option<i64> = row.get(0)?;
+                let cache_read: Option<i64> = row.get(1)?;
+                let cache_write: Option<i64> = row.get(2)?;
+                Ok([input, cache_read, cache_write]
+                    .into_iter()
+                    .flatten()
+                    .reduce(i64::saturating_add))
+            },
+        )
+        .ok()
+        .flatten())
 }
 
-/// The newest per-call (scope='turn') basket: fresh input plus every cached
-/// bucket of the most recent model call — what the NEXT request will carry. A
-/// cumulative session snapshot is the wrong source here (it spans the whole
-/// session), so turn rows take precedence even when the session row is the
-/// newest by seq.
+/// The newest native per-model context window reported on a usage row.
+fn latest_native_window(conn: &Connection, instance_id: &str) -> rusqlite::Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT native_context_window FROM usage_events
+         WHERE instance_id = ?1 AND native_context_window IS NOT NULL
+         ORDER BY observed_at DESC, seq DESC LIMIT 1",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten())
+}
+
+/// Inputs to [`rollup_instance`] beyond the connection: what it knows about
+/// the session's model so it can resolve a context window.
+pub struct RollupRequest<'a> {
+    pub instance_id: &'a str,
+    pub kind: &'a str,
+    /// Launch model (`instances.model`).
+    pub spec_model: Option<&'a str>,
+    /// Transcript-observed effective model id (`spec.modelEffective.id`,
+    /// i.e. after a `/model` switch).
+    pub effective_model: Option<&'a str>,
+    pub profile_id: Option<&'a str>,
+}
+
+/// Kind-level fallback context windows. Generic/terminal kinds report nothing.
+fn kind_context_window(kind: &str) -> Option<i64> {
+    match kind {
+        "claude" | "codex" | "agy" => Some(200_000),
+        "grok" => Some(128_000),
+        _ => None,
+    }
+}
+
+fn is_one_million_tag(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().ends_with("[1m]")
+}
+
+/// The static catalog's window for a model id. The explicit `[1m]` tag is
+/// resolved separately and earlier (it outranks the profile); this is only the
+/// catalog lookup (c-usagefu r2 item 4).
+fn catalog_window(model: &str) -> Option<i64> {
+    crate::model_catalog::lookup(model.trim()).map(|row| row.context_window as i64)
+}
+
+/// A context window declared on the provider profile's `models_json`.
+fn profile_context_window(
+    conn: &Connection,
+    profile_id: &str,
+    model_id: &str,
+) -> rusqlite::Result<Option<i64>> {
+    let raw: Option<String> = conn.query_row(
+        "SELECT models_json FROM provider_profiles WHERE id = ?1",
+        params![profile_id],
+        |row| row.get(0),
+    )?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let models = crate::provider_models::parse_models_json(&raw);
+    let wanted = model_id.trim();
+    // A `[1m]` spelling on the profile wins on exact match or the untagged id.
+    let entry = models
+        .iter()
+        .filter(|entry| entry.enabled)
+        .find(|entry| entry.id == wanted || entry.id.trim_end_matches("[1m]").trim() == wanted)
+        .map(std::borrow::ToOwned::to_owned)
+        .or_else(|| {
+            models
+                .iter()
+                .filter(|entry| entry.enabled)
+                .find(|entry| {
+                    window::tag_matches(entry.id.as_str(), wanted)
+                        || entry.id.trim_end_matches("[1m]").trim() == wanted
+                })
+                .cloned()
+        });
+    Ok(entry
+        .and_then(|entry| entry.context_window)
+        .map(|window| window as i64))
+}
+
+mod window {
+    /// True when a gateway-renamed id (`gw/model[1m]`) declares the long-context
+    /// tag for `wanted`, allowing exact profile match semantics against the
+    /// profile's own id spelling.
+    pub(super) fn tag_matches(entry_id: &str, wanted: &str) -> bool {
+        let no_tag = wanted.trim_end_matches("[1m]").trim();
+        super::is_one_million_tag(entry_id)
+            && (entry_id == wanted
+                || entry_id.ends_with(&format!("/{wanted}"))
+                || entry_id.ends_with(&format!("/{no_tag}")))
+    }
+}
+
+/// Resolve a session's context window and whether the number is an estimate.
 ///
-/// c-ctxusage r4 item 4: "newest" is the NATIVE time, not the ingest seq — a
-/// late historical correction (replay of an older message at a high seq) must
-/// not become the current context. Ties break deterministically on seq.
+/// Native harness report (payload `contextWindow`, e.g. stream-json
+/// `modelUsage`) wins. Otherwise the model candidate and its sources resolve,
+/// in this order per candidate:
 ///
-/// c-ctxusage r18 item 1: the candidate rows are the lineage WINNERS first
-/// ([`WINNING_TURN_ROWS_SQL`]). Ordering the raw table picked the newest
-/// timestamp of ANY lineage, so a superseded in-window lineage (a revision-
-/// replaced row for the same message id) could supply the context even though
-/// a newer accepted frame in another lineage was the logical turn's current
-/// state. Fold to one winner per scope id, then order the winners by native
-/// timestamp and seq.
-fn latest_turn_basket(conn: &Connection, instance_id: &str) -> rusqlite::Result<Option<i64>> {
-    conn.query_row(
-        &format!(
-            "SELECT input_tokens, cache_read_tokens, cache_write_tokens
-             FROM ({WINNING_TURN_ROWS_SQL})
-             ORDER BY observed_at DESC, seq DESC LIMIT 1"
-        ),
-        params![instance_id],
-        |row| {
-            let input: Option<i64> = row.get(0)?;
-            let cache_read: Option<i64> = row.get(1)?;
-            let cache_write: Option<i64> = row.get(2)?;
-            // U1 (c-ctxusage r17 item 6): the next request's context is Known
-            // only when the newest call reported input AND both cache buckets;
-            // flatten() here used to read input 100 with an unknown cache as
-            // a known 100.
-            Ok(known_context_total([input, cache_read, cache_write]))
-        },
-    )
+/// 1. the explicit `[1m]` long-context tag on the id (exact `1_000_000`);
+/// 2. the provider profile's declared `models_json` `contextWindow` — a
+///    gateway serving a model at its own window must not be overridden by the
+///    static catalog (c-usagefu r2 item 4);
+/// 3. the static catalog row.
+///
+/// The candidate itself is the transcript-observed effective id
+/// (`modelEffective`, i.e. after a `/model` switch) when one is known; the
+/// launch `spec.model` is consulted ONLY when no effective model exists. An
+/// effective model that resolves to nothing must not fall back to the launch
+/// model's window marked exact — it goes to the harness-kind fallback, which is
+/// the single approximate step (a guess at an unknown gateway model's window).
+fn resolve_context_window(
+    conn: &Connection,
+    req: &RollupRequest<'_>,
+    native_window: Option<i64>,
+) -> (Option<i64>, bool) {
+    if let Some(window) = native_window {
+        return (Some(window), false);
+    }
+    let Some(model) = req.effective_model.or(req.spec_model) else {
+        return kind_fallback(req.kind);
+    };
+    // 1. explicit [1m] tag.
+    if is_one_million_tag(model) {
+        return (Some(1_000_000), false);
+    }
+    // 2. the provider profile's declared window.
+    if let Some(profile_id) = req.profile_id
+        && let Ok(Some(window)) = profile_context_window(conn, profile_id, model)
+    {
+        return (Some(window), false);
+    }
+    // 3. the static catalog (the [1m] tag inside it was handled first).
+    if let Some(window) = catalog_window(model) {
+        return (Some(window), false);
+    }
+    kind_fallback(req.kind)
+}
+
+/// The harness-kind fallback window, always approximate.
+fn kind_fallback(kind: &str) -> (Option<i64>, bool) {
+    match kind_context_window(kind) {
+        Some(window) => (Some(window), true),
+        None => (None, false),
+    }
 }
 
 /// Session-wide totals of one rollup query.
 struct RollupTotals {
     turns: i64,
-    /// Whether the instance has any winning turn / session rows at all.
-    has_turn: bool,
+    /// Additive sums over the ELIGIBLE flow rows (r9 items 4/5): every
+    /// Message plus Turn rows no matching Message represents. Used for
+    /// totals whenever the instance has any eligible flow.
+    turn_input: Option<i64>,
+    turn_output: Option<i64>,
+    turn_cache_read: Option<i64>,
+    turn_cache_write: Option<i64>,
     has_session: bool,
     last_turn_at: Option<String>,
 }
@@ -1921,128 +2913,105 @@ struct RollupTotals {
 /// uncovered turns, and Unknown poisoning when an unprovable turn sits beside
 /// scoped stock. U1 COUNT(col)=COUNT(*) gating keeps an omitted bucket
 /// Unknown.
-/// The four additive session rollup buckets, each Unknown until every
-/// constituent reports it (U1).
-type SessionRollupBuckets = (Option<i64>, Option<i64>, Option<i64>, Option<i64>);
-
-fn session_rollup_totals(
-    conn: &Connection,
-    instance_id: &str,
-) -> rusqlite::Result<SessionRollupBuckets> {
-    conn.query_row(
-        &format!(
-            "WITH {fold_ctes}
-             SELECT
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE input_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(input_tokens)
-                      THEN SUM(input_tokens) END,
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE output_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(output_tokens)
-                      THEN SUM(output_tokens) END,
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE cache_read_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(cache_read_tokens)
-                      THEN SUM(cache_read_tokens) END,
-                 CASE WHEN NOT EXISTS (
-                          SELECT 1 FROM ambiguous_turns WHERE cache_write_tokens IS NOT NULL
-                      ) AND COUNT(*) = COUNT(cache_write_tokens)
-                      THEN SUM(cache_write_tokens) END
-             FROM (
-                 SELECT input_tokens, output_tokens,
-                        cache_read_tokens, cache_write_tokens
-                 FROM scoped_sessions
-                 UNION ALL
-                 SELECT input_tokens, output_tokens,
-                        cache_read_tokens, cache_write_tokens
-                 FROM legacy_stock
-                 UNION ALL
-                 SELECT input_tokens, output_tokens,
-                        cache_read_tokens, cache_write_tokens
-                 FROM proven_turns
-             )",
-            fold_ctes = FOLD_CTES_SQL
-                .replace("{domain_l}", "l.instance_id = ?1")
-                .replace("{domain}", "instance_id = ?1")
-        ),
-        params![instance_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-    )
-}
-
+///
 /// Fold every persisted usage event of one instance into
 /// [`InstanceUsageRollup`]. Returns `None` when the session has no usage
 /// observations yet, so the field stays off the instance record entirely.
 ///
-/// ONE stock-vs-flow rule (c-ctxusage r3 item 6), applied identically to the
-/// totals, the context basket and the rate windows:
-/// - A **Session** row is a cumulative STOCK replaced in place by revision
-///   (Grok emits only that; Codex emits it alongside per-turn rows).
-/// - A **Turn** row is a per-call FLOW (Claude emits only turns; Codex emits
-///   both).
+/// Stock vs flow (c-usagefu r9 items 4/5):
+/// - A **Session** row is an append-only cumulative STOCK growth point
+///   (Grok/Codex); the latest accepted point per instance/session is the
+///   current stock.
+/// - **Message** rows are per-call flow (Codex) and **Turn** rows are
+///   per-call flow (Claude; legacy codex too): ONE shared eligible-flow
+///   relation by call identity keeps every Message and drops only Turns a
+///   matching Message already represents.
 ///
-/// Session totals come from the latest cumulative session snapshot whenever one
-/// exists — correct even when Turn coverage is partial — otherwise from the sum
-/// of turn flows. The context basket is the latest turn basket (never the
-/// cumulative session total), falling back to the stock. The rate windows sum
-/// turn flows; the stock is substituted only when no turn flows exist. This
-/// keeps the session snapshot from vanishing when a turn row is present and
-/// from being summed on top of the turns (the Codex inflated context / double
-/// TPM count).
+/// Totals are the eligible flow sums whenever ANY eligible flow exists; the
+/// latest cumulative stock is used ONLY when no eligible flow exists — stock
+/// is never added to flow and never used as a smaller-flow fallback. The
+/// context basket is the newest message/turn call, falling back to the
+/// stock. Rate windows sum native flow; a stock-only harness contributes
+/// timestamped increments between successive growth points (never the whole
+/// stock).
 pub fn rollup_instance(
     conn: &Connection,
-    instance_id: &str,
-    kind: &str,
-    model: Option<&str>,
+    req: &RollupRequest<'_>,
 ) -> rusqlite::Result<Option<InstanceUsageRollup>> {
-    // Turn totals come from the WINNING row per scope id: one logical turn
-    // even when several native-session lineages hold revision-replaced rows
-    // for the same assistant message id (c-ctxusage r16 item 3). Session
-    // growth points are counted separately (only their presence matters here;
-    // their stock is read via latest_session_stock). U1 (c-ctxusage r16
-    // item 4): a bucket omitted by ANY winning turn makes the folded sum
-    // Unknown — SUM ignores NULLs, so gate on COUNT(col) = COUNT(*).
-    // Turn count / newest native turn time come from the WINNING row per scope
-    // id (one logical turn even when several native-session lineages hold
-    // revision-replaced rows for the same assistant message id). The token
-    // SUMS are folded per native session in session_rollup_totals instead:
-    // counting them here used to replace uncovered sessions' turns whenever
-    // any session stock existed (c-ctxusage r28 item 1).
+    // c-usagefu r15 item 1: the rollup SQL references final-schema columns
+    // (scope_id/turn_id/observed_at_source). c-usagefu r16 item 7: on a
+    // database the usage migration could not upgrade it returns an explicit
+    // Unavailable rollup (`Some` with `unavailable: true`, every counter None)
+    // instead of the `None` "no channel" state — the instance list/detail load
+    // succeeds and the client renders Unknown rather than a guessed percentage.
+    if !usage_schema_is_current(conn)? {
+        return Ok(Some(InstanceUsageRollup::unavailable()));
+    }
+    let instance_id = req.instance_id;
+    // Turn count over the ELIGIBLE flow rows: distinct turn id of every
+    // Message, distinct scope_id of every unmatched modern Turn, plus one
+    // per legacy NULL-scope_id Turn (r7 item 8). Legacy pre-scopeId Turns
+    // counted by seq fallback so upgraded instances do not report zero.
+    //
+    // Token sums use the same relation: a native Turn-only call and a
+    // Message-represented call both contribute exactly once.
+    let flow_input = format!("SUM(CASE {} END)", flow_case_arm("input_tokens"));
+    let flow_output = format!("SUM(CASE {} END)", flow_case_arm("output_tokens"));
+    let flow_cache_read = format!("SUM(CASE {} END)", flow_case_arm("cache_read_tokens"));
+    let flow_cache_write = format!("SUM(CASE {} END)", flow_case_arm("cache_write_tokens"));
     let totals = conn.query_row(
         &format!(
-            "WITH winning_turns AS ({WINNING_TURN_ROWS_SQL})
-             SELECT
-                 (SELECT COUNT(*) FROM winning_turns),
-                 (SELECT MAX(observed_at) FROM winning_turns
-                  WHERE observed_at_source = 'native')"
+            "SELECT
+            COUNT(DISTINCT CASE
+                WHEN scope='message' THEN turn_id
+                WHEN scope='turn' AND scope_id IS NOT NULL AND NOT {matched} THEN scope_id
+                WHEN scope='workflow-member' THEN scope_id END)
+            + COUNT(CASE WHEN scope='turn' AND scope_id IS NULL THEN 1 END),
+            {flow_input},
+            {flow_output},
+            {flow_cache_read},
+            {flow_cache_write},
+            COUNT(CASE WHEN scope='session' THEN 1 END),
+            COUNT(*),
+            MAX(CASE WHEN scope IN ('turn','message') AND observed_at_source='native' THEN observed_at END)
+         FROM usage_events WHERE instance_id = ?1",
+            matched = "EXISTS (SELECT 1 FROM usage_events _ef_n
+                              WHERE _ef_n.instance_id = usage_events.instance_id
+                                AND _ef_n.scope = 'message'
+                                AND _ef_n.turn_id = usage_events.scope_id)",
         ),
         params![instance_id],
         |row| {
             let turns: i64 = row.get(0)?;
             Ok(RollupTotals {
                 turns,
-                has_turn: turns > 0,
-                has_session: false,
-                last_turn_at: row.get(1)?,
+                turn_input: row.get(1)?,
+                turn_output: row.get(2)?,
+                turn_cache_read: row.get(3)?,
+                turn_cache_write: row.get(4)?,
+                has_session: row.get::<_, i64>(5)? > 0,
+                last_turn_at: row.get(7)?,
             })
         },
     )?;
-    let has_session: bool = conn.query_row(
-        "SELECT EXISTS (
-            SELECT 1 FROM usage_events
-            WHERE instance_id = ?1 AND scope = 'session'
-        )",
+    // A row exists if there is any flow (turn/message with a distinct turn
+    // identity) OR any other row (legacy pre-scopeId turn / session).
+    let total_rows: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM usage_events WHERE instance_id = ?1",
         params![instance_id],
         |row| row.get(0),
     )?;
-    let totals = RollupTotals {
-        has_session,
-        ..totals
-    };
-    if !totals.has_turn && !totals.has_session {
+    if totals.turns == 0 && !totals.has_session && total_rows == 0 {
         return Ok(None);
     }
+
+    // r9 item 5: does the instance have ANY eligible flow row? The decision
+    // includes legacy NULL-scope Turns.
+    let has_eligible_flow: bool = conn.query_row(
+        &format!("SELECT {}", has_eligible_flow_sql("?1")),
+        params![instance_id],
+        |row| row.get(0),
+    )?;
 
     // The cumulative stock exists only for session-emitting harnesses.
     let (stock, _stock_scoped) = if totals.has_session {
@@ -2051,28 +3020,38 @@ pub fn rollup_instance(
         (SessionStock::default(), false)
     };
 
-    // Session totals use the SAME per-native-session stock-vs-flow rule as
-    // aggregate_instance (c-ctxusage r28 item 1): the latest accepted stock of
-    // each native session PLUS the winning turns of sessions that have no
-    // covering stock. Stock never covers another session's turns: a Codex
-    // session A stock of 100/10 plus an uncovered Claude session B turn of
-    // 7/1 totals 107/11, not 100/10. U1: any constituent row omitting a
-    // bucket makes that bucket Unknown for the whole fold.
-    let (session_input, session_output, cache_read, cache_creation) =
-        session_rollup_totals(conn, instance_id)?;
-
-    // Context basket: the newest turn call; for a stock-only harness the
-    // stock's current counters.
-    let context_used_tokens = if totals.has_turn {
-        latest_turn_basket(conn, instance_id)?
+    // Totals: eligible flow whenever any exists; the latest stock ONLY when
+    // the instance/session is flow-less. Never flow + stock, never a
+    // smaller-flow stock fallback (r9 items 4/5).
+    let use_flow = !totals.has_session || has_eligible_flow;
+    let (session_input, session_output, cache_read, cache_creation) = if use_flow {
+        (
+            totals.turn_input,
+            totals.turn_output,
+            totals.turn_cache_read,
+            totals.turn_cache_write,
+        )
     } else {
-        // U1: a stock-only harness reports a known context only when the
-        // current stock knows input and both cache buckets (c-ctxusage
-        // r17 item 6).
-        known_context_total([stock.input, stock.cache_read, stock.cache_write])
+        (
+            stock.input,
+            stock.output,
+            stock.cache_read,
+            stock.cache_write,
+        )
     };
 
-    let context_window_tokens = context_window_tokens(kind, model);
+    // Context basket: the newest per-request/turn call; for a stock-only
+    // harness (or when no call rows exist) the current stock counters.
+    let context_used_tokens = latest_call_basket(conn, instance_id)?.or_else(|| {
+        [stock.input, stock.cache_read, stock.cache_write]
+            .into_iter()
+            .flatten()
+            .reduce(i64::saturating_add)
+    });
+
+    let native_window = latest_native_window(conn, instance_id)?;
+    let (context_window_tokens, window_approximate) =
+        resolve_context_window(conn, req, native_window);
     let context_pct = context_used_tokens
         .zip(context_window_tokens)
         .map(|(used, window)| {
@@ -2080,13 +3059,30 @@ pub fn rollup_instance(
                 .round()
                 .clamp(0.0, 100.0) as i64
         });
+    let context_pct_approximate = context_pct.is_some() && window_approximate;
+
+    // Rate windows are summed from NATIVE-timestamped flow rows only (an
+    // ingest-stamped replay must not read as a burst). The route therefore
+    // depends on whether a native flow row EXISTS, not on has_turn: legacy
+    // NULL-scope Turn rows (upgraded pre-delivery DBs, source backfilled to
+    // 'ingest') make has_turn true, but the native-only flow query would
+    // return NULL for them, blanking TPM on an instance whose cumulative
+    // Session growth points can still supply increments (r8 item 5).
+    let has_native_flow: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM usage_events
+                       WHERE instance_id = ?1
+                         AND scope IN ('turn', 'message')
+                         AND observed_at_source = 'native')",
+        params![instance_id],
+        |row| row.get(0),
+    )?;
 
     // Rate windows: per-turn flows for harnesses that emit them; otherwise
     // timestamped increments between cumulative session snapshots (r4 item 6).
     // A single stock with no predecessor yields no trustworthy rate.
     let window = |seconds: i64| -> rusqlite::Result<(Option<i64>, Option<i64>)> {
         let since = threshold_rfc3339(seconds);
-        if totals.has_turn {
+        if has_native_flow {
             sum_turn_tokens_since(conn, instance_id, &since)
         } else {
             sum_session_increments_since(conn, instance_id, &since)
@@ -2103,9 +3099,11 @@ pub fn rollup_instance(
     let last_turn_at = totals.last_turn_at.or(stock.native_observed_at);
 
     Ok(Some(InstanceUsageRollup {
+        unavailable: false,
         context_used_tokens,
         context_window_tokens,
         context_pct,
+        context_pct_approximate,
         session_input_tokens: session_input,
         session_output_tokens: session_output,
         cache_read_tokens: cache_read,
@@ -2117,6 +3115,31 @@ pub fn rollup_instance(
         tpm_out_5m: per_minute_5m(out_5m),
         last_turn_at,
     }))
+}
+
+impl InstanceUsageRollup {
+    /// The explicit Unavailable rollup for a store the usage migration did not
+    /// upgrade (c-usagefu r16 item 7). Every counter is unknown; the client
+    /// renders Unknown rather than zero or a kind-fallback percentage.
+    fn unavailable() -> Self {
+        Self {
+            unavailable: true,
+            context_used_tokens: None,
+            context_window_tokens: None,
+            context_pct: None,
+            context_pct_approximate: false,
+            session_input_tokens: None,
+            session_output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            turns: 0,
+            tpm_in_60s: None,
+            tpm_out_60s: None,
+            tpm_in_5m: None,
+            tpm_out_5m: None,
+            last_turn_at: None,
+        }
+    }
 }
 
 /// Observe a fresh journal append: project + persist usage events. Called from
@@ -2154,6 +3177,7 @@ pub async fn observe_journal(state: &AppState, record: &JournalRecord) {
 mod tests {
     use super::*;
     use crate::store::JournalRecord;
+    use remuda_driver::adapters::FileSignalAdapter;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -2165,8 +3189,10 @@ mod tests {
             event_id: format!("evt_{seq}"),
             event: json!({
                 "kind": "usage",
+                "nativeTurnId": { "state": "known", "value": format!("turn-{seq}") },
                 "payload": {
                     "scope": "turn",
+                    "scopeId": format!("turn-{seq}"),
                     "mode": "snapshot",
                     "totalTokens": { "state": "known", "value": total.to_string() },
                     "inputTokens": { "state": "known", "value": (total / 2).to_string() },
@@ -2183,6 +3209,884 @@ mod tests {
             }),
             observed_at: "2026-09-15T00:00:00.000Z".into(),
         }
+    }
+
+    fn row(
+        seq: i64,
+        observed_at: &str,
+        input: Option<i64>,
+        output: Option<i64>,
+        cache_read: Option<i64>,
+        cache_write: Option<i64>,
+    ) -> UsageEventRow {
+        UsageEventRow {
+            instance_id: "ins_test".into(),
+            seq,
+            profile_id: None,
+            model: None,
+            scope: "turn".into(),
+            scope_id: None,
+            turn_id: None,
+            native_context_window: None,
+            mode: "snapshot".into(),
+            metric_revision: 1,
+            source_session_id: None,
+            total_tokens: None,
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
+            cost_usd: None,
+            accounting: "estimated".into(),
+            observed_at: observed_at.into(),
+            observed_at_source: "native".into(),
+        }
+    }
+
+    fn scope_id_at(conn: &Connection, seq: i64) -> Option<String> {
+        conn.query_row(
+            "SELECT scope_id FROM usage_events WHERE seq = ?1 AND scope = 'session'",
+            params![seq],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn legacy_session_row(
+        seq: i64,
+        instance: &str,
+        input: i64,
+        output: i64,
+        at: &str,
+    ) -> UsageEventRow {
+        UsageEventRow {
+            instance_id: instance.into(),
+            seq,
+            profile_id: None,
+            model: Some("codex".into()),
+            scope: "session".into(),
+            scope_id: None,
+            turn_id: None,
+            native_context_window: None,
+            mode: "snapshot".into(),
+            metric_revision: 1,
+            source_session_id: None,
+            total_tokens: Some(input + output),
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: None,
+            accounting: "estimated".into(),
+            observed_at: at.into(),
+            observed_at_source: "native".into(),
+        }
+    }
+
+    #[test]
+    fn migration_consolidates_duplicate_message_rows_idempotently() {
+        // c-usagefu r9 item 3: a pre-r9 DB holds duplicate Message rows from
+        // byte-0 replays. The FIRST write is an ingest-time row with unknown
+        // counters/cost and no turn id; a LATER replay carries the native
+        // time, turn id and known counters/cost. migrate() must consolidate
+        // the durable key to ONE survivor with every best attribute, delete
+        // the rest and create the unique index in a single transaction.
+        let conn = Connection::open_in_memory().unwrap();
+        // Minimal table that already has scope_id + turn_id + source columns
+        // (the duplicate problem arose after r7 added them but before r9's
+        // consolidation); no unique index yet.
+        conn.execute_batch(
+            "CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                scope_id TEXT,
+                turn_id TEXT,
+                mode TEXT NOT NULL,
+                metric_revision INTEGER NOT NULL DEFAULT 1,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                observed_at_source TEXT NOT NULL DEFAULT 'ingest',
+                native_context_window INTEGER,
+                PRIMARY KEY (instance_id, seq)
+             );",
+        )
+        .unwrap();
+        // r1: seq 1 first (ingest time, everything unknown); seq 2 the later
+        // replay (native time, turn id, known counters/cost). r2 single row.
+        conn.execute_batch(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode,
+                 total_tokens, input_tokens, output_tokens,
+                 cache_read_tokens, cache_write_tokens, cost_usd,
+                 observed_at, observed_at_source, profile_id, model)
+             VALUES
+                ('ins_dup', 1, 'message', 'r1', NULL, 'snapshot',
+                 NULL, NULL, NULL, NULL, NULL, NULL,
+                 '2026-09-15T00:00:00.000Z', 'ingest', NULL, NULL),
+                ('ins_dup', 2, 'message', 'r1', 't1', 'snapshot',
+                 155, 40, 10, 100, 5, '0.10',
+                 '2026-09-15T00:00:05.000Z', 'native', 'pvp_dup', 'gpt-5.4'),
+                ('ins_dup', 3, 'message', 'r2', 't2', 'snapshot',
+                 210, 60, 20, 150, 7, '0.20',
+                 '2026-09-15T00:00:10.000Z', 'native', 'pvp_dup', 'gpt-5.4');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "r1 and r2 each survive once (was 3)");
+        // The COMPLETE surviving r1 row: first write's seq, later replay's
+        // every attribute.
+        #[derive(Debug, PartialEq)]
+        struct R1Survivor {
+            seq: i64,
+            profile_id: Option<String>,
+            model: Option<String>,
+            turn_id: Option<String>,
+            total: Option<i64>,
+            input: Option<i64>,
+            output: Option<i64>,
+            cache_read: Option<i64>,
+            cache_write: Option<i64>,
+            cost: Option<String>,
+            observed_at: String,
+            source: String,
+        }
+        let r1 = conn
+            .query_row(
+                "SELECT seq, profile_id, model, turn_id,
+                        total_tokens, input_tokens, output_tokens,
+                        cache_read_tokens, cache_write_tokens, cost_usd,
+                        observed_at, observed_at_source
+                 FROM usage_events WHERE scope_id='r1'",
+                [],
+                |r| {
+                    Ok(R1Survivor {
+                        seq: r.get(0)?,
+                        profile_id: r.get(1)?,
+                        model: r.get(2)?,
+                        turn_id: r.get(3)?,
+                        total: r.get(4)?,
+                        input: r.get(5)?,
+                        output: r.get(6)?,
+                        cache_read: r.get(7)?,
+                        cache_write: r.get(8)?,
+                        cost: r.get(9)?,
+                        observed_at: r.get(10)?,
+                        source: r.get(11)?,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(r1.seq, 1, "the first write's row is the survivor");
+        assert_eq!(r1.profile_id.as_deref(), Some("pvp_dup"));
+        assert_eq!(r1.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(r1.turn_id.as_deref(), Some("t1"), "best turn_id");
+        assert_eq!(r1.total, Some(155), "known total from the later replay");
+        assert_eq!(r1.input, Some(40));
+        assert_eq!(r1.output, Some(10));
+        assert_eq!(r1.cache_read, Some(100));
+        assert_eq!(r1.cache_write, Some(5));
+        assert_eq!(r1.cost.as_deref(), Some("0.10"), "known cost not lost");
+        assert_eq!(
+            r1.observed_at, "2026-09-15T00:00:05.000Z",
+            "native time replaces the ingest time"
+        );
+        assert_eq!(r1.source, "native");
+        // r2 untouched.
+        let (r2_out, r2_cost): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT output_tokens, cost_usd FROM usage_events WHERE scope_id='r2'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(r2_out, Some(20));
+        assert_eq!(r2_cost.as_deref(), Some("0.20"));
+
+        // Idempotent: a second migrate changes nothing (count + r1 values).
+        migrate(&conn).unwrap();
+        let n2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n2, 2);
+        let r1_recheck: (Option<String>, Option<i64>, String) = conn
+            .query_row(
+                "SELECT turn_id, total_tokens, observed_at FROM usage_events WHERE scope_id='r1'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(
+            r1_recheck,
+            (
+                Some("t1".to_string()),
+                Some(155),
+                "2026-09-15T00:00:05.000Z".to_string()
+            )
+        );
+
+        // The unique index exists and rejects a new duplicate.
+        let dup_insert = conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode, observed_at)
+             VALUES ('ins_dup', 99, 'message', 'r1', 't1', 'snapshot', 'x')",
+            [],
+        );
+        assert!(
+            dup_insert.is_err(),
+            "unique message index blocks duplicates"
+        );
+    }
+
+    #[test]
+    fn migration_accounting_comes_from_the_highest_revision_survivor() {
+        // c-usagefu r10 item 3 (Ruling C), made exact by r12 item 5 (C1'):
+        // BOTH duplicates carry known accounting at DIFFERENT revisions —
+        // rev 1 reports total 10 / input 7 / output 10 / cost 0.01 /
+        // estimated, a rev-2 replay reports total 20 / input NULL / output
+        // 20 / cost 0.02 / reported. Counters/cost/accounting come ONLY from
+        // the highest revision, so the survivor takes rev-2 values and its
+        // input stays NULL — rev-1's 7 never fills a rev-2 gap. Attribution
+        // (turn id, native time, profile, model, mode, context window) merges
+        // best-known from either revision. A second migration is a no-op.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                scope_id TEXT,
+                turn_id TEXT,
+                mode TEXT NOT NULL,
+                metric_revision INTEGER NOT NULL DEFAULT 1,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                observed_at_source TEXT NOT NULL DEFAULT 'ingest',
+                native_context_window INTEGER,
+                PRIMARY KEY (instance_id, seq)
+             );",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode, metric_revision,
+                 total_tokens, input_tokens, output_tokens,
+                 cache_read_tokens, cache_write_tokens, cost_usd,
+                 observed_at, observed_at_source, profile_id, model,
+                 native_context_window, accounting)
+             VALUES
+                ('ins_rev', 1, 'message', 'r1', NULL, 'snapshot', 1,
+                 10, 7, 10, NULL, NULL, '0.01',
+                 '2026-09-15T00:00:00.000Z', 'ingest', NULL, NULL, NULL,
+                 'estimated'),
+                ('ins_rev', 2, 'message', 'r1', 't1', 'snapshot', 2,
+                 20, NULL, 20, 50, 3, '0.02',
+                 '2026-09-15T00:00:05.000Z', 'native', 'pvp_rev', 'gpt-5.4',
+                 200000, 'reported');",
+        )
+        .unwrap();
+
+        #[derive(Debug, PartialEq)]
+        struct Survivor {
+            seq: i64,
+            revision: i64,
+            mode: String,
+            total: Option<i64>,
+            input: Option<i64>,
+            output: Option<i64>,
+            cache_read: Option<i64>,
+            cache_write: Option<i64>,
+            cost: Option<String>,
+            accounting: String,
+            turn_id: Option<String>,
+            profile: Option<String>,
+            model: Option<String>,
+            context_window: Option<i64>,
+            observed_at: String,
+            source: String,
+        }
+        let read_survivor = |conn: &Connection| -> Survivor {
+            conn.query_row(
+                "SELECT seq, metric_revision, mode,
+                        total_tokens, input_tokens, output_tokens,
+                        cache_read_tokens, cache_write_tokens, cost_usd,
+                        accounting,
+                        turn_id, profile_id, model, native_context_window,
+                        observed_at, observed_at_source
+                 FROM usage_events WHERE scope_id='r1'",
+                [],
+                |r| {
+                    Ok(Survivor {
+                        seq: r.get(0)?,
+                        revision: r.get(1)?,
+                        mode: r.get(2)?,
+                        total: r.get(3)?,
+                        input: r.get(4)?,
+                        output: r.get(5)?,
+                        cache_read: r.get(6)?,
+                        cache_write: r.get(7)?,
+                        cost: r.get(8)?,
+                        accounting: r.get(9)?,
+                        turn_id: r.get(10)?,
+                        profile: r.get(11)?,
+                        model: r.get(12)?,
+                        context_window: r.get(13)?,
+                        observed_at: r.get(14)?,
+                        source: r.get(15)?,
+                    })
+                },
+            )
+            .unwrap()
+        };
+
+        migrate(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "the two revisions consolidate to one survivor");
+        let first = read_survivor(&conn);
+        assert_eq!(first.seq, 1, "the first write's row remains the survivor");
+        assert_eq!(first.revision, 2, "revision is the authoritative max");
+        assert_eq!(first.total, Some(20), "rev-2 total wins over rev-1 10");
+        assert_eq!(
+            first.input, None,
+            "C1': rev-2 leaves input NULL and rev-1's known 7 never fills it"
+        );
+        assert_eq!(first.output, Some(20), "rev-2 output 20 wins over rev-1 10");
+        assert_eq!(first.cache_read, Some(50));
+        assert_eq!(first.cache_write, Some(3));
+        assert_eq!(
+            first.cost.as_deref(),
+            Some("0.02"),
+            "cost is accounting: rev-2 0.02 wins, never the first non-NULL 0.01"
+        );
+        assert_eq!(
+            first.accounting, "reported",
+            "accounting is accounting: rev-2 'reported' wins over rev-1 'estimated'"
+        );
+        // Attribution merges best-known from either revision.
+        assert_eq!(first.turn_id.as_deref(), Some("t1"));
+        assert_eq!(first.profile.as_deref(), Some("pvp_rev"));
+        assert_eq!(first.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(first.context_window, Some(200000));
+        assert_eq!(first.mode, "snapshot");
+        assert_eq!(first.observed_at, "2026-09-15T00:00:05.000Z");
+        assert_eq!(first.source, "native");
+
+        // A second migration is a no-op: the COMPLETE survivor is unchanged.
+        migrate(&conn).unwrap();
+        let count2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count2, 1);
+        assert_eq!(read_survivor(&conn), first, "re-migrating changes nothing");
+    }
+
+    #[test]
+    fn migration_keeps_a_top_revision_null_even_when_an_older_revision_was_known() {
+        // c-usagefu r12 item 5 (Ruling C1' exact): determine the highest
+        // revision FIRST; counters, cost and accounting come ONLY from that
+        // revision. A rev-1 input 7 / cost 0.10 / estimated and a rev-2
+        // NULL input / NULL cost / reported leave the survivor at rev 2 with
+        // input and cost STILL NULL — the older revision's values never fill
+        // them. NULL repair happens only among rows AT the top revision:
+        // a second rev-2 row carrying input 9 repairs the input to 9, while
+        // the rev-1 7 is ignored. Actual old-schema database, migrated.
+        let conn = open_old_dual_schema();
+        conn.execute_batch(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode,
+                 metric_revision, total_tokens, input_tokens, output_tokens,
+                 cost_usd, accounting, observed_at, observed_at_source)
+             VALUES
+                -- key 'c1p': rev 1 fully known; rev 2 NULL input/cost,
+                -- with a same-revision sibling repairing input but not cost.
+                ('ins_c1p', 1, 'message', 'c1p', 't', 'snapshot', 1,
+                 100, 7, 93, '0.10', 'estimated',
+                 '2026-09-15T00:00:00.000Z', 'native'),
+                ('ins_c1p', 2, 'message', 'c1p', 't', 'snapshot', 2,
+                 120, NULL, NULL, NULL, 'reported',
+                 '2026-09-15T00:00:05.000Z', 'native'),
+                ('ins_c1p', 3, 'message', 'c1p', 't', 'snapshot', 2,
+                 NULL, 9, 111, NULL, 'reported',
+                 '2026-09-15T00:00:06.000Z', 'native'),
+                -- key 'c1n': rev 2 NULL cost with NO same-revision repair,
+                -- and an OLDER revision carrying a STRONGER accounting
+                -- authority ('reported') which must not win at rev 2. The
+                -- rev-1 row arrives OUT OF ORDER (highest rowid) so a
+                -- newest-rowid tiebreak without the revision filter would
+                -- wrongly take 'reported'.
+                ('ins_c1n', 4, 'message', 'c1n', 't', 'snapshot', 2,
+                 60, 6, 54, NULL, 'estimated',
+                 '2026-09-15T00:00:05.000Z', 'native'),
+                ('ins_c1n', 5, 'message', 'c1n', 't', 'snapshot', 1,
+                 50, 5, 45, '0.05', 'reported',
+                 '2026-09-15T00:00:00.000Z', 'native');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        let (revision, total, input, output, cost, accounting): (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT metric_revision, total_tokens, input_tokens,
+                        output_tokens, cost_usd, accounting
+                 FROM usage_events WHERE instance_id='ins_c1p'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(revision, 2, "the highest revision is taken first");
+        assert_eq!(total, Some(120), "total comes from rev 2 only");
+        assert_eq!(
+            input,
+            Some(9),
+            "NULL input is repaired ONLY from another rev-2 row, never rev-1 7"
+        );
+        assert_eq!(output, Some(111), "output comes from the rev-2 sibling");
+        assert_eq!(
+            cost, None,
+            "rev-2 NULL cost stays NULL; rev-1 0.10 never fills it"
+        );
+        assert_eq!(accounting, "reported", "accounting is the rev-2 authority");
+
+        let cost_n: Option<String> = conn
+            .query_row(
+                "SELECT cost_usd FROM usage_events WHERE instance_id='ins_c1n'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cost_n, None,
+            "a NULL cost with no same-revision repair stays NULL"
+        );
+        // Accounting follows the SAME at-top-revision rule: the top revision
+        // is 2 ('estimated'); the older rev-1 'reported' never overrides it.
+        let accounting_n: String = conn
+            .query_row(
+                "SELECT accounting FROM usage_events WHERE instance_id='ins_c1n'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            accounting_n, "estimated",
+            "accounting comes from the top revision only, not a stronger rev 1"
+        );
+
+        // Idempotent: a second migration does not discover rev 1.
+        migrate(&conn).unwrap();
+        let cost_still_null: Option<String> = conn
+            .query_row(
+                "SELECT cost_usd FROM usage_events WHERE instance_id='ins_c1p'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cost_still_null, None);
+    }
+
+    /// Create a real pre-r6-schema usage_events table (all modern columns, no
+    /// dedupe indexes) so Ruling B regressions migrate an ACTUAL historical
+    /// database rather than inserting into an already-migrated one.
+    fn open_old_dual_schema() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                scope_id TEXT,
+                turn_id TEXT,
+                mode TEXT NOT NULL,
+                metric_revision INTEGER NOT NULL DEFAULT 1,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                observed_at_source TEXT NOT NULL DEFAULT 'ingest',
+                native_context_window INTEGER,
+                PRIMARY KEY (instance_id, seq)
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn legacy_message_without_turn_id_bills_the_covering_turn_once() {
+        // c-usagefu r10 item 4 (Ruling B): a pre-r6 codex call wrote a Message
+        // r1 = 100 with NO turn_id AND a Turn t1 = 100 covering its time
+        // window (the message is recorded 3 s before the end-of-turn snapshot).
+        // The call must count 100, not 200: the link-less legacy Message is
+        // dropped in favour of the covering Turn. A separate Turn-only call t2
+        // = 50 with no Message still counts, proving turn rows are not broadly
+        // suppressed.
+        let conn = open_old_dual_schema();
+        conn.execute_batch(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode,
+                 output_tokens, cost_usd, observed_at, observed_at_source,
+                 profile_id, model)
+             VALUES
+                ('ins_legacy', 1, 'message', 'r1', NULL, 'snapshot',
+                 100, '0.10', '2030-01-01T00:00:00.000Z', 'native',
+                 'pvp_legacy', 'gpt-5.4'),
+                ('ins_legacy', 2, 'turn', 't1', 't1', 'snapshot',
+                 100, '0.10', '2030-01-01T00:00:03.000Z', 'native',
+                 'pvp_legacy', 'gpt-5.4'),
+                ('ins_legacy', 3, 'turn', 't2', 't2', 'snapshot',
+                 50, '0.05', '2030-01-01T00:00:07.000Z', 'native',
+                 'pvp_legacy', 'gpt-5.4');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        let agg = aggregate_instance(&conn, "ins_legacy").unwrap();
+        assert_eq!(
+            agg.output_tokens,
+            Some(150),
+            "covering Turn 100 (legacy Message dropped) + Turn-only 50"
+        );
+        assert!(
+            (agg.cost_usd.unwrap() - 0.15).abs() < 1e-9,
+            "0.10 + 0.05, not 0.25"
+        );
+        let supply = aggregate_supply(&conn, "pvp_legacy", "gpt-5.4").unwrap();
+        assert_eq!(supply.output_tokens, Some(150));
+        assert!((supply.cost_usd.unwrap() - 0.15).abs() < 1e-9);
+        let rollup = rollup_fold(&conn, "ins_legacy", "codex", Some("gpt-5.4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_output_tokens, Some(150));
+    }
+
+    #[test]
+    fn legacy_messages_are_dropped_when_the_instance_has_any_turn_even_hours_away() {
+        // c-usagefu r11 item 6 (Ruling B1, no clocks): pre-r6 codex emitted a
+        // Turn for EVERY call alongside its attribution-less Message, so for an
+        // instance that has ANY Turn row a Message without turn_id is NEVER
+        // counted — no matter how far its timestamp sits from a Turn. The r10
+        // rule kept a legacy Message when no Turn fell inside its ±10 min
+        // window, which let an "unrelated"-looking legacy Message on a
+        // turn-bearing instance bill a second time.
+        //
+        // Actual old-schema database, migrated: one Turn at noon and a legacy
+        // Message the same evening (five hours later, far outside the old
+        // window). Only the Turn counts.
+        let conn = open_old_dual_schema();
+        conn.execute_batch(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode,
+                 output_tokens, cost_usd, observed_at, observed_at_source,
+                 profile_id, model)
+             VALUES
+                ('ins_b1_turns', 1, 'turn', 't1', 't1', 'snapshot',
+                 100, '0.10', '2030-01-01T12:00:00.000Z', 'native',
+                 'pvp_b1', 'gpt-5.4'),
+                ('ins_b1_turns', 2, 'message', 'r-late', NULL, 'snapshot',
+                 70, '0.07', '2030-01-01T17:00:00.000Z', 'native',
+                 'pvp_b1', 'gpt-5.4');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        let agg = aggregate_instance(&conn, "ins_b1_turns").unwrap();
+        assert_eq!(
+            agg.output_tokens,
+            Some(100),
+            "Turns only: the five-hours-away legacy Message is NOT billed"
+        );
+        assert!(
+            (agg.cost_usd.unwrap() - 0.10).abs() < 1e-9,
+            "the Message cost is dropped too"
+        );
+        let rollup = rollup_fold(&conn, "ins_b1_turns", "codex", Some("gpt-5.4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_output_tokens, Some(100));
+    }
+
+    #[test]
+    fn an_instance_with_no_turns_at_all_counts_every_legacy_message() {
+        // c-usagefu r11 item 6 (Ruling B1): the other side of the rule. An
+        // instance whose old-schema database holds ONLY link-less legacy
+        // Messages (no Turn rows whatsoever) counts ALL of them, whatever their
+        // timestamps — there is no time window that could drop one. Two
+        // Messages a day apart both bill.
+        let conn = open_old_dual_schema();
+        conn.execute_batch(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode,
+                 output_tokens, cost_usd, observed_at, observed_at_source,
+                 profile_id, model)
+             VALUES
+                ('ins_b1_msgs', 1, 'message', 'r1', NULL, 'snapshot',
+                 40, '0.04', '2030-01-01T08:00:00.000Z', 'native',
+                 'pvp_b1m', 'gpt-5.4'),
+                ('ins_b1_msgs', 2, 'message', 'r2', NULL, 'snapshot',
+                 60, '0.06', '2030-01-02T08:00:00.000Z', 'native',
+                 'pvp_b1m', 'gpt-5.4');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        let agg = aggregate_instance(&conn, "ins_b1_msgs").unwrap();
+        assert_eq!(
+            agg.output_tokens,
+            Some(100),
+            "a turn-less instance counts both legacy Messages, a day apart"
+        );
+        assert!((agg.cost_usd.unwrap() - 0.10).abs() < 1e-9);
+        let supply = aggregate_supply(&conn, "pvp_b1m", "gpt-5.4").unwrap();
+        assert_eq!(supply.output_tokens, Some(100));
+        let rollup = rollup_fold(&conn, "ins_b1_msgs", "codex", Some("gpt-5.4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_output_tokens, Some(100));
+    }
+
+    #[test]
+    fn partially_covered_turn_bills_the_turn_and_a_fully_covered_one_bills_messages() {
+        // c-usagefu r13 item 2 (Ruling U1): a Turn is suppressed in favour of
+        // its Messages only when its DURABLE linked Messages match it on every
+        // token bucket (bucket-sum equality).
+        //   t1: Turn 120 / $0.12 with ONE linked Message r1 = 100 / $0.10
+        //       under a non-durable identity (the other accepted 20 record was
+        //       never emitted as a Message) -> the durable sum is 0, not 120:
+        //       mismatch, count the Turn 120 and drop r1 (never 100, never 220).
+        //   t2: Turn 120 / $0.12 fully covered by r2a = 100 plus r2b = 20,
+        //       BOTH durable -> bill the two Messages, drop the Turn.
+        // Both turns contribute 120 -> 240 output, $0.24.
+        use remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX as M;
+        let r2a = format!("{M}100:rollout-partial");
+        let r2b = format!("{M}260:rollout-partial");
+        let conn = open_old_dual_schema();
+        conn.execute_batch(&format!(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode,
+                 output_tokens, cost_usd, observed_at, observed_at_source,
+                 profile_id, model)
+             VALUES
+                ('ins_partial', 1, 'message', 'r1', 't1', 'snapshot',
+                 100, '0.10', '2030-01-01T00:00:00.000Z', 'native',
+                 'pvp_partial', 'gpt-5.4'),
+                ('ins_partial', 2, 'turn', 't1', 't1', 'snapshot',
+                 120, '0.12', '2030-01-01T00:00:01.000Z', 'native',
+                 'pvp_partial', 'gpt-5.4'),
+                ('ins_partial', 3, 'message', '{r2a}', 't2', 'snapshot',
+                 100, '0.10', '2030-01-01T00:00:04.000Z', 'native',
+                 'pvp_partial', 'gpt-5.4'),
+                ('ins_partial', 4, 'message', '{r2b}', 't2', 'snapshot',
+                 20, '0.02', '2030-01-01T00:00:04.500Z', 'native',
+                 'pvp_partial', 'gpt-5.4'),
+                ('ins_partial', 5, 'turn', 't2', 't2', 'snapshot',
+                 120, '0.12', '2030-01-01T00:00:05.000Z', 'native',
+                 'pvp_partial', 'gpt-5.4');",
+        ))
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        // Per-row eligibility — the totals alone cannot tell a covered Turn
+        // from a billed one (120 == 100 + 20 either way): t1's Turn counts
+        // and its legacy Message drops; t2's Turn drops and BOTH durable
+        // Messages count.
+        let eligible = |scope: &str, scope_id: &str| -> bool {
+            conn.query_row(
+                &format!(
+                    "SELECT ({pred}) FROM usage_events
+                     WHERE instance_id='ins_partial' AND scope=?1 AND scope_id=?2",
+                    pred = eligible_flow_predicate("usage_events")
+                ),
+                params![scope, scope_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                == 1
+        };
+        assert!(eligible("turn", "t1"), "t1 Turn is billed");
+        assert!(!eligible("message", "r1"), "t1's legacy Message is dropped");
+        assert!(!eligible("turn", "t2"), "t2 Turn is suppressed");
+        assert!(eligible("message", &r2a), "t2 durable Message a counts");
+        assert!(eligible("message", &r2b), "t2 durable Message b counts");
+
+        let agg = aggregate_instance(&conn, "ins_partial").unwrap();
+        assert_eq!(
+            agg.output_tokens,
+            Some(240),
+            "partial t1 counts its Turn 120; fully covered t2 counts 100+20"
+        );
+        assert!((agg.cost_usd.unwrap() - 0.24).abs() < 1e-9, "0.12 + 0.12");
+        let supply = aggregate_supply(&conn, "pvp_partial", "gpt-5.4").unwrap();
+        assert_eq!(supply.output_tokens, Some(240));
+        assert!((supply.cost_usd.unwrap() - 0.24).abs() < 1e-9);
+        let rollup = rollup_fold(&conn, "ins_partial", "codex", Some("gpt-5.4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_output_tokens, Some(240));
+    }
+
+    #[test]
+    fn bucket_sum_equality_decides_turn_suppression_and_a_no_turn_turn_counts_its_messages() {
+        // c-usagefu r13 item 2 (COORDINATOR RULING U1): the r12 identity-MIX
+        // predicate reconciled only shapes the intermediate unlanded rounds
+        // could produce, and U1 puts those out of scope. Within in-scope data
+        // bucket-sum equality between a Turn row and its DURABLE linked
+        // Messages IS the completeness proof; a mismatch counts the Turn and
+        // drops the Messages, and a turn with no Turn row counts its linked
+        // Messages. Actual old-schema database, migrated, five turns:
+        //
+        //  t1 Turn 120 + linked Messages: a non-durable record 100 (stale-priced
+        //     0.99) and a DURABLE record 20 (0.02) -> the DURABLE sum (20) does
+        //     not match the Turn (120): bill the Turn 120 / 0.12, drop both
+        //     Messages (never the stale 0.99, never 140).
+        //  t2 Turn 120 + two DURABLE Messages 100+20 (0.10+0.02) -> sums match
+        //     bucket-for-bucket: suppress the Turn, bill the Messages.
+        //  t3 NO Turn row: a non-durable 50 and a DURABLE 50 -> U1 deletes the
+        //     mixed-identity drop; a turn without a Turn row counts its linked
+        //     Messages, so both bill (100). (The r12 assertion of a ZERO
+        //     contribution for this mixed no-Turn turn is removed by U1.)
+        //  t4 NO Turn row, one non-durable Message 30 -> counts as before.
+        //  t5 NO Turn row, one DURABLE Message 70 -> final-shape turn counts.
+        //
+        // Output: 120 + 120 + 100 + 30 + 70 = 440.
+        use remuda_driver::adapters::codex_adapter::CODEX_DURABLE_RESPONSE_SCOPE_PREFIX as M;
+        let d = |off: u64| format!("{M}{off}:rollout-r12-item4");
+        let conn = open_old_dual_schema();
+        conn.execute_batch(&format!(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, scope_id, turn_id, mode,
+                 output_tokens, cost_usd, observed_at, observed_at_source,
+                 profile_id, model)
+             VALUES
+                ('ins_durable', 1, 'message', 'legacy-r1', 't1', 'snapshot',
+                 100, '0.99', '2030-01-01T00:00:00.000Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 2, 'message', '{d1b}', 't1', 'snapshot',
+                 20, '0.02', '2030-01-01T00:00:00.200Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 3, 'turn', 't1', 't1', 'snapshot',
+                 120, '0.12', '2030-01-01T00:00:01.000Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 4, 'message', '{d2a}', 't2', 'snapshot',
+                 100, '0.10', '2030-01-01T00:00:02.000Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 5, 'message', '{d2b}', 't2', 'snapshot',
+                 20, '0.02', '2030-01-01T00:00:02.200Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 6, 'turn', 't2', 't2', 'snapshot',
+                 120, '0.12', '2030-01-01T00:00:03.000Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 7, 'message', 'legacy-r3', 't3', 'snapshot',
+                 50, '0.05', '2030-01-01T00:00:04.000Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 8, 'message', '{d3b}', 't3', 'snapshot',
+                 50, '0.05', '2030-01-01T00:00:04.200Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 9, 'message', 'legacy-r4', 't4', 'snapshot',
+                 30, '0.03', '2030-01-01T00:00:05.000Z', 'native',
+                 'pvp_d', 'gpt-5.4'),
+                ('ins_durable', 10, 'message', '{d5}', 't5', 'snapshot',
+                 70, '0.07', '2030-01-01T00:00:06.000Z', 'native',
+                 'pvp_d', 'gpt-5.4');",
+            d1b = d(300),
+            d2a = d(400),
+            d2b = d(520),
+            d3b = d(640),
+            d5 = d(760),
+        ))
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        let eligible = |scope: &str, scope_id: &str| -> bool {
+            conn.query_row(
+                &format!(
+                    "SELECT ({pred}) FROM usage_events
+                     WHERE instance_id='ins_durable' AND scope=?1 AND scope_id=?2",
+                    pred = eligible_flow_predicate("usage_events")
+                ),
+                params![scope, scope_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                == 1
+        };
+        // t1: the durable sum mismatches the Turn -> the Turn bills and both
+        // linked Messages drop.
+        assert!(eligible("turn", "t1"), "mismatched t1 bills the Turn");
+        assert!(!eligible("message", "legacy-r1"));
+        assert!(!eligible("message", &d(300)));
+        // t2: durable sums match -> Messages bill, Turn suppresses.
+        assert!(!eligible("turn", "t2"), "fully covered t2 suppresses Turn");
+        assert!(eligible("message", &d(400)));
+        assert!(eligible("message", &d(520)));
+        // t3: no Turn row -> every linked Message counts (U1; the r12 mixed
+        // no-Turn zero contribution is gone).
+        assert!(
+            eligible("message", "legacy-r3"),
+            "no-Turn t3 counts its Messages"
+        );
+        assert!(eligible("message", &d(640)));
+        // t4/t5: no-Turn turns count.
+        assert!(
+            eligible("message", "legacy-r4"),
+            "non-durable no-Turn turn counts"
+        );
+        assert!(eligible("message", &d(760)), "durable no-Turn turn counts");
+
+        let agg = aggregate_instance(&conn, "ins_durable").unwrap();
+        assert_eq!(
+            agg.output_tokens,
+            Some(440),
+            "120 t1 Turn + 120 t2 Messages + 100 t3 Messages + 30 + 70"
+        );
+        assert!(
+            (agg.cost_usd.unwrap() - 0.44).abs() < 1e-9,
+            "0.12 + 0.12 + 0.10 + 0.03 + 0.07"
+        );
     }
 
     #[test]
@@ -2207,6 +4111,30 @@ mod tests {
                 observed_at TEXT NOT NULL,
                 PRIMARY KEY (instance_id, seq)
              );",
+        )
+        .unwrap();
+        // r8 item 5: a second, pre-`scopeId` CODEX-style instance — its old
+        // rows are NULL-scope Turn flow AND cumulative Session growth points
+        // (the pre-r6 codex shape). After migration every row's source is
+        // backfilled to 'ingest'; TPM must still come from the session-stock
+        // increments, not be blanked by a native-only turn query that has_turn
+        // routes to. Points: 100/60 twenty seconds ago, 160/84 two seconds ago
+        // (increment 60/24 inside both windows); a legacy turn row at 30s.
+        let at_30s = threshold_rfc3339(30);
+        let at_20s = threshold_rfc3339(20);
+        let at_2s = threshold_rfc3339(2);
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, mode, input_tokens, output_tokens,
+                 accounting, observed_at)
+             VALUES
+                ('ins_old_cx', 1, 'turn', 'snapshot', 40, 30,
+                 'estimated', ?1),
+                ('ins_old_cx', 2, 'session', 'snapshot', 100, 60,
+                 'estimated', ?2),
+                ('ins_old_cx', 3, 'session', 'snapshot', 160, 84,
+                 'estimated', ?3)",
+            params![at_30s, at_20s, at_2s],
         )
         .unwrap();
         conn.execute(
@@ -2245,12 +4173,35 @@ mod tests {
             scope_id.is_none(),
             "old row has no scope_id, so is not deduped"
         );
-        // Rollup still works after upgrade.
-        assert!(
-            rollup_instance(&conn, "ins_old", "claude", Some("fake"))
-                .unwrap()
-                .is_some()
+        // Rollup works after upgrade AND counts the legacy NULL-scope_id Turn
+        // row correctly (r7 item 8): one turn, its tokens in totals.
+        let upgraded = rollup_fold(&conn, "ins_old", "claude", Some("fake"))
+            .unwrap()
+            .expect("legacy row rolls up");
+        assert_eq!(upgraded.turns, 1, "legacy NULL-scope_id turn is counted");
+        assert_eq!(upgraded.session_input_tokens, Some(500));
+        assert_eq!(upgraded.session_output_tokens, Some(500));
+        // Legacy rows were written before the native/ingest source split;
+        // they default to observed_at_source='ingest', so lastTurnAt is not
+        // driven from them (r7 item 8 asserts the COUNT fix, not source repair
+        // of pre-split rows). This lone row is also outside every rate window.
+
+        // r8 item 5: on the legacy codex-shaped instance the NULL-scope Turn
+        // row makes has_turn true, but no flow row is native; rates must still
+        // come from the cumulative Session increments (60/24), never be
+        // blanked to NULL by the native-only turn query.
+        let upgraded_cx = rollup_fold(&conn, "ins_old_cx", "codex", None)
+            .unwrap()
+            .expect("legacy mixed-shape rows roll up");
+        assert_eq!(upgraded_cx.turns, 1, "legacy NULL-scope turn is counted");
+        assert_eq!(
+            upgraded_cx.tpm_in_60s,
+            Some(60),
+            "session increment supplies the rate despite has_turn"
         );
+        assert_eq!(upgraded_cx.tpm_out_60s, Some(24));
+        assert_eq!(upgraded_cx.tpm_in_5m, Some(12), "60 tokens / 5 minutes");
+        assert_eq!(upgraded_cx.tpm_out_5m, Some(5), "24 tokens / 5 rounds to 5");
     }
 
     #[test]
@@ -2336,6 +4287,2812 @@ mod tests {
     }
 
     #[test]
+    fn reported_session_cost_replaces_the_per_call_estimates_and_keeps_growing() {
+        // c-usagefu r3 item 3: a two-turn SDK session on a priced model.
+        //  - each per-call Turn row carries the driver's independently PRICED
+        //    estimate (0.01, 0.02);
+        //  - each result frame emits a token-LESS Session snapshot carrying
+        //    the reported CUMULATIVE cost (0.01, then 0.03).
+        // estimatedUsd must be the latest reported cumulative (0.03), not
+        // Sigma per-call + the frozen turn-1 session cost (0.04).
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        // Turn 1: per-call estimate + the result's cumulative session point.
+        let t1 = usage_record(1, 1000, Some("0.01"));
+        insert(&conn, &t1);
+        let s1 = tokenless_session_record(2, "sdk-session-1", 1, Some("0.01"));
+        assert!(insert(&conn, &s1), "first result appends");
+
+        let after_one = aggregate_instance(&conn, "ins_test").unwrap();
+        assert!(
+            (after_one.cost_usd.unwrap() - 0.01).abs() < 1e-9,
+            "the reported session stock, not the 0.01 turn estimate + 0.01 stock"
+        );
+
+        // Turn 2: another per-call estimate and the cumulative result.
+        let t2 = usage_record(3, 2000, Some("0.02"));
+        insert(&conn, &t2);
+        let s2 = tokenless_session_record(4, "sdk-session-1", 2, Some("0.03"));
+        assert!(
+            insert(&conn, &s2),
+            "a token-less snapshot whose cumulative COST grew must append"
+        );
+
+        let after_two = aggregate_instance(&conn, "ins_test").unwrap();
+        assert!(
+            (after_two.cost_usd.unwrap() - 0.03).abs() < 1e-9,
+            "latest cumulative reported cost, not 0.01+0.02+0.01 (2x/frozen)"
+        );
+
+        // A re-delivered turn-2 result (identical counters AND cost) freezes.
+        let s2_again = tokenless_session_record(5, "sdk-session-1", 2, Some("0.03"));
+        assert!(!insert(&conn, &s2_again), "identical cost+counters frozen");
+    }
+
+    #[test]
+    fn without_session_cost_the_per_call_estimates_still_sum() {
+        // Harnesses that emit only per-call rows (no reported session cost)
+        // keep the priced flow sum as the estimate.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        insert(&conn, &usage_record(1, 1000, Some("0.01")));
+        insert(&conn, &usage_record(2, 500, Some("0.02")));
+        let agg = aggregate_instance(&conn, "ins_test").unwrap();
+        assert!((agg.cost_usd.unwrap() - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_session_point_whose_cost_shrinks_is_frozen() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(insert(
+            &conn,
+            &tokenless_session_record(1, "s", 1, Some("0.03"))
+        ));
+        assert!(
+            !insert(&conn, &tokenless_session_record(2, "s", 2, Some("0.01"))),
+            "cumulative cost is monotonic like the token stock"
+        );
+        let agg = aggregate_instance(&conn, "ins_test").unwrap();
+        assert!((agg.cost_usd.unwrap() - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn real_codex_adapter_priced_unpriced_priced_bills_0_30_not_0_60() {
+        // c-usagefu r6 item 5: drive a REAL CodexAdapter over a rollout file
+        // (one Message usage per priced call + cumulative Session snapshots,
+        // NO Turn rows since r6 item 5), project every usage observation, then
+        // assert both aggregates report the Message flow sum 0.10 + 0.20 =
+        // 0.30 — not the r4 double-stream 0.60 (Message+Turn), nor frozen 0.10.
+        use remuda_driver::adapters::{AdapterHome, CodexAdapter};
+        use remuda_protocol::ObservationPayload;
+        use std::io::Write;
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let session_dir = home_dir.path().join(".codex/sessions/2026/09/15");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let rollout = session_dir.join("rollout-codex-e2e.jsonl");
+        // Header first.
+        std::fs::write(
+            &rollout,
+            r#"{"ordinal":0,"type":"session_meta","payload":{"id":"codex-e2e","session_id":"codex-e2e","cwd":"/w","timestamp":"2026-09-15T00:00:00.000Z"}}
+"#,
+        )
+        .unwrap();
+
+        let mut adapter = CodexAdapter::new(AdapterHome {
+            home: home_dir.path().join(".codex"),
+            cwd: "/w".into(),
+            pid: None,
+            launched_at: None,
+            resume_session_id: None,
+        });
+        adapter.bind_rollout("codex-e2e", rollout.clone());
+
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let mut seq = 0i64;
+        let drain = |adapter: &mut CodexAdapter, conn: &Connection, seq: &mut i64| {
+            for observed in adapter.poll().unwrap() {
+                let ObservationPayload::Usage(payload) = observed.payload else {
+                    continue;
+                };
+                let rec = JournalRecord {
+                    instance_id: "ins_codex_e2e".into(),
+                    seq: *seq,
+                    event_id: format!("evt_codex_e2e_{}", *seq),
+                    event: json!({
+                        "kind": "usage",
+                        "payload": serde_json::to_value(&payload).unwrap(),
+                    }),
+                    observed_at: "2026-09-15T00:00:00.000Z".into(),
+                };
+                let row = project_usage_event(&rec, Some("pvp_codex"), Some("gpt-5.4")).unwrap();
+                insert_row(conn, &row).expect("codex usage row projects");
+                *seq += 1;
+            }
+        };
+
+        let append_turn = |turn: &str,
+                           response: &str,
+                           model: &str,
+                           tokens: (u64, u64, u64, u64),
+                           at: &str| {
+            let (input, cached, write, output) = tokens;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&rollout)
+                .unwrap();
+            writeln!(
+                file,
+                "{{\"ordinal\":1,\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"{turn}\",\"model\":\"{model}\"}}}}"
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "{{\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"{turn}\"}}}}"
+            )
+            .unwrap();
+            {
+                let total = input + cached + write + output;
+                writeln!(
+                    file,
+                    "{{\"ordinal\":3,\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"{turn}\",\"response_id\":\"{response}\",\"usage\":{{\"input_tokens\":{input},\"cached_input_tokens\":{cached},\"cache_write_input_tokens\":{write},\"output_tokens\":{output},\"reasoning_output_tokens\":0,\"total_tokens\":{total}}}}}}}"
+                )
+                .unwrap();
+            }
+            writeln!(
+                file,
+                "{{\"ordinal\":4,\"timestamp\":\"{at}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"{turn}\"}}}}"
+            )
+            .unwrap();
+        };
+
+        // Turn 1: priced gpt-5.4 (1000 in / 100 out).
+        append_turn(
+            "t1",
+            "r1",
+            "gpt-5.4",
+            (0, 0, 0, 10_000),
+            "2026-09-15T00:00:01.000Z",
+        );
+        drain(&mut adapter, &conn, &mut seq);
+
+        // Turn 2: unknown model -> sticky-Unknown priced cost.
+        append_turn(
+            "t2",
+            "r2",
+            "some-internal-model",
+            (1000, 0, 0, 100),
+            "2026-09-15T00:00:02.000Z",
+        );
+        drain(&mut adapter, &conn, &mut seq);
+
+        // Turn 3: priced again (2000 in / 200 out).
+        append_turn(
+            "t3",
+            "r3",
+            "gpt-5.4",
+            (0, 0, 0, 20_000),
+            "2026-09-15T00:00:03.000Z",
+        );
+        drain(&mut adapter, &conn, &mut seq);
+
+        let instance = aggregate_instance(&conn, "ins_codex_e2e").unwrap();
+        assert!(
+            (instance.cost_usd.unwrap() - 0.30).abs() < 1e-9,
+            "real codex Message-stream sequence: 0.10 + 0.20 = 0.30, got {}",
+            instance.cost_usd.unwrap()
+        );
+        let supply = aggregate_supply(&conn, "pvp_codex", "gpt-5.4").unwrap();
+        assert!(
+            (supply.cost_usd.unwrap() - 0.30).abs() < 1e-9,
+            "supply matches the flow bill, got {}",
+            supply.cost_usd.unwrap()
+        );
+    }
+
+    #[test]
+    fn a_main_shape_database_migrates_and_counts_once_after_two_real_byte_zero_replays() {
+        // c-usagefu r13 item 2 (COORDINATOR RULING U1), regression (a): the
+        // upgrade case that actually exists in the field. A database written by
+        // origin/main's REAL usage_events schema and codex insert path holds
+        // turn- and session-scope rows ONLY (main's projection persisted no
+        // scope_id, though the durable journal retained payload.scopeId).
+        // Migrate recovers the Turn scope_ids from the journal; then a REAL
+        // CodexAdapter byte-zero replay re-tails the rollout TWICE, re-emitting
+        // each call as a durable Message. Totals, cost and the TPM windows must
+        // count every call EXACTLY ONCE and omit nothing: bucket-sum equality
+        // suppresses the backfilled Turn rows in favour of the durable
+        // Messages, and the durable unique index makes the second replay a
+        // no-op.
+        use remuda_driver::adapters::{
+            AdapterHome, CodexAdapter, FileSignalAdapter, StampCtx, stamp,
+        };
+        use remuda_protocol::{InstanceId, ObservationPayload};
+        use std::io::Write;
+
+        let profile = "pvp_r13main";
+        let model = "gpt-5.4";
+        let session_id = "r13main";
+        let instance_id = "ins_r13main";
+
+        // Native model-call timestamps, recent enough for BOTH TPM windows.
+        let rfc = |secs: i64| {
+            let t = time::OffsetDateTime::now_utc() - time::Duration::seconds(secs);
+            t.format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let at1 = rfc(10);
+        let at2 = rfc(20);
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let codex_home = home_dir.path().join(".codex");
+        let date_dir = codex_home.join("sessions/2026/10/13");
+        std::fs::create_dir_all(&date_dir).unwrap();
+        let rollout = date_dir.join(format!("rollout-{session_id}.jsonl"));
+        std::fs::write(
+            &rollout,
+            format!(
+                "{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"session_id\":\"{session_id}\",\"cwd\":\"/w\",\"timestamp\":\"2026-10-13T00:00:00.000Z\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let append_turn = |turn: &str, input: u64, output: u64, at: &str| {
+            let total = input + output;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&rollout)
+                .unwrap();
+            writeln!(
+                file,
+                "{{\"ordinal\":1,\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"{turn}\",\"model\":\"{model}\"}}}}"
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "{{\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"{turn}\"}}}}"
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "{{\"ordinal\":3,\"timestamp\":\"{at}\",\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"{turn}\",\"response_id\":\"{turn}-r\",\"usage\":{{\"input_tokens\":{input},\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":{output},\"reasoning_output_tokens\":0,\"total_tokens\":{total}}}}}}}"
+            )
+            .unwrap();
+            writeln!(
+                file,
+                "{{\"ordinal\":4,\"timestamp\":\"{at}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"{turn}\"}}}}"
+            )
+            .unwrap();
+        };
+        append_turn("t1", 1000, 100, &at1);
+        append_turn("t2", 500, 20, &at2);
+
+        // Learn the counters/session stock the SAME rollout yields through the
+        // real adapter — these are exactly the per-turn Turn snapshot and the
+        // cumulative Session snapshots main's codex path wrote.
+        let mut probe = CodexAdapter::new(AdapterHome {
+            home: codex_home.clone(),
+            cwd: "/w".into(),
+            pid: None,
+            launched_at: None,
+            resume_session_id: None,
+        });
+        probe.bind_rollout(session_id, rollout.clone());
+        let observed = probe.poll().unwrap();
+        let stamp_ctx = StampCtx {
+            instance_id: InstanceId::new(),
+            host_id: remuda_protocol::HostId::new(),
+            journal_id: remuda_protocol::Id::new("obj").unwrap(),
+            run_id: remuda_protocol::RunId::new(),
+            session_id: session_id.into(),
+        };
+        let mut projected: Vec<(String, Option<String>, UsageEventRow)> = Vec::new();
+        for (i, obs) in observed.iter().enumerate() {
+            let ObservationPayload::Usage(_) = &obs.payload else {
+                continue;
+            };
+            let stamped = stamp(&stamp_ctx, i as u64 + 1, obs).unwrap();
+            let event = serde_json::to_value(&stamped).unwrap();
+            let rec = JournalRecord {
+                instance_id: instance_id.into(),
+                seq: i as i64 + 1,
+                event_id: stamped.event_id.as_id().as_str().to_owned(),
+                event,
+                observed_at: at1.clone(),
+            };
+            let row = project_usage_event(&rec, Some(profile), Some(model)).unwrap();
+            let scope = row.scope.clone();
+            let turn = row.turn_id.clone();
+            projected.push((scope, turn, row));
+        }
+        let messages: Vec<&UsageEventRow> = projected
+            .iter()
+            .filter(|(scope, _, _)| scope == "message")
+            .map(|(_, _, row)| row)
+            .collect();
+        let sessions: Vec<&UsageEventRow> = projected
+            .iter()
+            .filter(|(scope, _, _)| scope == "session")
+            .map(|(_, _, row)| row)
+            .collect();
+        assert_eq!(messages.len(), 2, "one Message per call");
+        assert_eq!(
+            sessions.len(),
+            2,
+            "one cumulative Session snapshot per call"
+        );
+        let t1_msg = messages[0];
+        let t2_msg = messages[1];
+        let sess1 = sessions[0];
+        let sess2 = sessions[1];
+        let expected_output = t1_msg.output_tokens.unwrap() + t2_msg.output_tokens.unwrap();
+        let expected_input = t1_msg.input_tokens.unwrap() + t2_msg.input_tokens.unwrap();
+        let expected_cost: f64 = messages
+            .iter()
+            .map(|row| {
+                row.cost_usd
+                    .as_deref()
+                    .unwrap_or("0")
+                    .parse::<f64>()
+                    .unwrap()
+            })
+            .sum();
+
+        // --- The FIELD database: origin/main's REAL schema ------------------
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE journal (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (instance_id, seq)
+             );
+             CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (instance_id, seq)
+             );",
+        )
+        .unwrap();
+
+        // Main's journal retained the WHOLE event, including the scopeId main's
+        // projection then dropped. Only payload.scopeId matters to the
+        // migration, so the fixture journal rows carry just that envelope.
+        conn.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, 1, 'je1', ?2, ?3), (?1, 2, 'je2', ?4, ?3),
+                    (?1, 3, 'je3', ?5, ?6), (?1, 4, 'je4', ?7, ?6)",
+            params![
+                instance_id,
+                json!({"kind":"usage","payload":{"scope":"turn","scopeId":"t1"}}).to_string(),
+                at1,
+                json!({"kind":"usage","payload":{"scope":"session","scopeId":session_id}})
+                    .to_string(),
+                json!({"kind":"usage","payload":{"scope":"turn","scopeId":"t2"}}).to_string(),
+                at2,
+                json!({"kind":"usage","payload":{"scope":"session","scopeId":session_id}})
+                    .to_string(),
+            ],
+        )
+        .unwrap();
+
+        // Main's insert path: one Turn row per call (NO scope_id/turn_id
+        // columns persisted) and one cumulative Session snapshot per call,
+        // counters equal to the real per-turn totals / cumulative stock.
+        let insert_main_row = |seq: i64, scope: &str, r: &UsageEventRow| {
+            conn.execute(
+                "INSERT INTO usage_events
+                    (instance_id, seq, profile_id, model, scope, mode,
+                     total_tokens, input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens, cost_usd,
+                     accounting, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'snapshot', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    instance_id,
+                    seq,
+                    profile,
+                    model,
+                    scope,
+                    r.total_tokens,
+                    r.input_tokens,
+                    r.output_tokens,
+                    r.cache_read_tokens,
+                    r.cache_write_tokens,
+                    r.cost_usd,
+                    r.accounting,
+                    r.observed_at,
+                ],
+            )
+            .unwrap();
+        };
+        insert_main_row(1, "turn", t1_msg);
+        insert_main_row(2, "session", sess1);
+        insert_main_row(3, "turn", t2_msg);
+        insert_main_row(4, "session", sess2);
+
+        // --- Upgrade: the migration under test ------------------------------
+        migrate(&conn).unwrap();
+        let backfilled: Vec<(String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare("SELECT scope, scope_id FROM usage_events ORDER BY seq")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            backfilled,
+            vec![
+                ("turn".to_string(), Some("t1".to_string())),
+                ("session".to_string(), Some(session_id.to_string())),
+                ("turn".to_string(), Some("t2".to_string())),
+                ("session".to_string(), Some(session_id.to_string())),
+            ],
+            "main's dropped scopeId is recovered from the journal"
+        );
+
+        // The probe held the process-wide rollout claim; release it before the
+        // byte-zero replay adapters bind (exactly the restart/reclaim handoff).
+        drop(probe);
+        // --- Two real byte-zero replays through the PUBLIC ingest path ------
+        let mut seq = 100i64;
+        for replay in 1..=2 {
+            let mut adapter = CodexAdapter::new(AdapterHome {
+                home: codex_home.clone(),
+                cwd: "/w".into(),
+                pid: None,
+                launched_at: None,
+                resume_session_id: None,
+            });
+            adapter.bind_rollout(session_id, rollout.clone());
+            let polled = adapter.poll().unwrap();
+            for obs in polled {
+                let ObservationPayload::Usage(_) = &obs.payload else {
+                    continue;
+                };
+                let stamped = stamp(&stamp_ctx, seq as u64 + 1, &obs).unwrap();
+                let event = serde_json::to_value(&stamped).unwrap();
+                let rec = JournalRecord {
+                    instance_id: instance_id.into(),
+                    seq,
+                    event_id: format!("je_replay_{replay}_{seq}"),
+                    event,
+                    observed_at: "2026-10-13T01:00:00.000Z".into(),
+                };
+                let row = project_usage_event(&rec, Some(profile), Some(model)).unwrap();
+                insert_usage_event(&conn, &row).unwrap();
+                seq += 1;
+            }
+        }
+
+        let durable_messages: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events
+                 WHERE instance_id = ?1 AND scope = 'message'",
+                [instance_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            durable_messages, 2,
+            "two replays persist the same two Messages"
+        );
+        let eligible_turns: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM usage_events
+                     WHERE instance_id = ?1 AND scope = 'turn' AND {p}",
+                    p = eligible_flow_predicate("usage_events")
+                ),
+                [instance_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            eligible_turns, 0,
+            "bucket-sum equality suppresses both Turns"
+        );
+        let eligible_messages: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM usage_events
+                     WHERE instance_id = ?1 AND scope = 'message' AND {p}",
+                    p = eligible_flow_predicate("usage_events")
+                ),
+                [instance_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(eligible_messages, 2, "each call's durable Message counts");
+
+        let agg = aggregate_instance(&conn, instance_id).unwrap();
+        assert_eq!(
+            agg.input_tokens,
+            Some(expected_input),
+            "both calls' input, once"
+        );
+        assert_eq!(
+            agg.output_tokens,
+            Some(expected_output),
+            "100 + 20 counted once: no Turn+Message pair, no replay duplicate"
+        );
+        assert!(
+            (agg.cost_usd.unwrap() - expected_cost).abs() < 1e-9,
+            "cost is the two Messages' priced sum once, got {} want {expected_cost}",
+            agg.cost_usd.unwrap()
+        );
+        let supply = aggregate_supply(&conn, profile, model).unwrap();
+        assert_eq!(supply.output_tokens, Some(expected_output));
+        assert!((supply.cost_usd.unwrap() - expected_cost).abs() < 1e-9);
+
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id,
+                kind: "codex",
+                spec_model: Some(model),
+                effective_model: None,
+                profile_id: Some(profile),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rollup.turns, 2, "TPM turn count: each call once");
+        assert_eq!(
+            rollup.session_output_tokens,
+            Some(expected_output),
+            "totals are the Message flow, never the Turn rows on top"
+        );
+        assert_eq!(
+            rollup.tpm_out_60s,
+            Some(expected_output),
+            "native Messages inside the 60 s window count each call once"
+        );
+        assert_eq!(
+            rollup.tpm_out_5m,
+            Some((expected_output as f64 / 5.0).round() as i64),
+            "5 m per-minute average likewise counts each call once"
+        );
+        assert_eq!(rollup.tpm_in_60s, Some(expected_input));
+    }
+
+    /// Create main's REAL `usage_events` + `journal` tables (origin/main
+    /// schema: no scope_id/turn_id/metric_revision columns) in `conn`.
+    fn create_main_shaped_usage_tables(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE journal (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (instance_id, seq)
+             );
+             CREATE TABLE usage_events (
+                instance_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                profile_id TEXT,
+                model TEXT,
+                scope TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                total_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                cost_usd TEXT,
+                accounting TEXT NOT NULL DEFAULT 'estimated',
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (instance_id, seq)
+             );",
+        )
+        .unwrap();
+    }
+
+    /// Insert a Turn row EXACTLY as origin/main's codex insert path wrote it
+    /// (no scope_id/turn_id persisted) plus the durable journal row whose
+    /// payload retains the scopeId main dropped.
+    fn insert_main_turn_with_journal(
+        conn: &Connection,
+        instance_id: &str,
+        seq: i64,
+        scope_id_in_journal: &str,
+        r: &UsageEventRow,
+        at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                instance_id,
+                seq,
+                format!("je-{seq}"),
+                json!({"kind":"usage","payload":{"scope":"turn","scopeId":scope_id_in_journal}})
+                    .to_string(),
+                at,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, profile_id, model, scope, mode,
+                 total_tokens, input_tokens, output_tokens,
+                 cache_read_tokens, cache_write_tokens, cost_usd,
+                 accounting, observed_at)
+             VALUES (?1, ?2, ?3, ?4, 'turn', 'snapshot', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                instance_id,
+                seq,
+                r.profile_id,
+                r.model,
+                r.total_tokens,
+                r.input_tokens,
+                r.output_tokens,
+                r.cache_read_tokens,
+                r.cache_write_tokens,
+                r.cost_usd,
+                r.accounting,
+                at,
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Project one codex turn's real per-call counters through the REAL
+    /// adapter, exactly as the r13 main-shape regression does: main's Turn
+    /// snapshot counters equal the per-turn token_usage_record totals.
+    fn real_codex_turn_counters(
+        home: &Path,
+        session_id: &str,
+        turn: &str,
+        input: u64,
+        output: u64,
+        at: &str,
+    ) -> UsageEventRow {
+        use remuda_driver::adapters::{
+            AdapterHome, CodexAdapter, FileSignalAdapter, StampCtx, stamp,
+        };
+        use remuda_protocol::ObservationPayload;
+        use std::io::Write;
+        let codex_home = home.join(".codex");
+        let date_dir = codex_home.join("sessions/2026/10/13");
+        std::fs::create_dir_all(&date_dir).unwrap();
+        let rollout = date_dir.join(format!("rollout-{session_id}.jsonl"));
+        let total = input + output;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&rollout)
+            .unwrap();
+        writeln!(
+            file,
+            "{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"session_id\":\"{session_id}\",\"cwd\":\"/w\",\"timestamp\":\"2026-10-13T00:00:00.000Z\"}}}}"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{{\"ordinal\":1,\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"{turn}\",\"model\":\"gpt-5.4\"}}}}"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{{\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"{turn}\"}}}}"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{{\"ordinal\":3,\"timestamp\":\"{at}\",\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"{turn}\",\"response_id\":\"{turn}-r\",\"usage\":{{\"input_tokens\":{input},\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":{output},\"reasoning_output_tokens\":0,\"total_tokens\":{total}}}}}}}"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{{\"ordinal\":4,\"timestamp\":\"{at}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"{turn}\"}}}}"
+        )
+        .unwrap();
+        let mut probe = CodexAdapter::new(AdapterHome {
+            home: codex_home,
+            cwd: "/w".into(),
+            pid: None,
+            launched_at: None,
+            resume_session_id: None,
+        });
+        probe.bind_rollout(session_id, rollout);
+        let observed = probe.poll().unwrap();
+        let stamp_ctx = StampCtx {
+            instance_id: remuda_protocol::InstanceId::new(),
+            host_id: remuda_protocol::HostId::new(),
+            journal_id: remuda_protocol::Id::new("obj").unwrap(),
+            run_id: remuda_protocol::RunId::new(),
+            session_id: session_id.into(),
+        };
+        observed
+            .iter()
+            .enumerate()
+            .find_map(|(i, obs)| match &obs.payload {
+                ObservationPayload::Usage(_) => {
+                    let stamped = stamp(&stamp_ctx, i as u64 + 1, obs).unwrap();
+                    let rec = JournalRecord {
+                        instance_id: "probe".into(),
+                        seq: i as i64 + 1,
+                        event_id: stamped.event_id.as_id().as_str().to_owned(),
+                        event: serde_json::to_value(&stamped).unwrap(),
+                        observed_at: at.to_owned(),
+                    };
+                    let row = project_usage_event(&rec, Some("pvp_r14"), Some("gpt-5.4")).unwrap();
+                    (row.scope == "message").then_some(row)
+                }
+                _ => None,
+            })
+            .expect("the turn emits one durable Message observation")
+    }
+
+    #[test]
+    fn main_shaped_identically_bucketed_retail_turn_rows_collapse_to_the_highest_seq() {
+        // c-usagefu r14 item 1 (Ruling M1), regression (a): a promoted
+        // instance re-tailed after a demotion/resume makes origin/main write
+        // TWO Turn rows for the SAME codex turn id at different journal
+        // seqs — the same call, every token bucket identical. Main persisted
+        // no scope_id; the journal backfill recovers the same scopeId for
+        // both, which made the new unique index creation fail and brick the
+        // Hub open. The migration must instead collapse them to the HIGHEST
+        // seq and count the call exactly once.
+        let home = tempfile::tempdir().unwrap();
+        let at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let row = real_codex_turn_counters(home.path(), "r14m1a", "t1", 1000, 100, &at);
+        let expected_output = row.output_tokens.unwrap();
+        let expected_input = row.input_tokens.unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        create_main_shaped_usage_tables(&conn);
+        // The same call projected twice — main's promoted re-tail at seq 5.
+        insert_main_turn_with_journal(&conn, "ins_r14m1a", 1, "t1", &row, &at);
+        insert_main_turn_with_journal(&conn, "ins_r14m1a", 5, "t1", &row, &at);
+
+        migrate(&conn).unwrap();
+
+        let survivors: Vec<(i64, Option<String>)> = {
+            let mut stmt = conn
+                .prepare("SELECT seq, scope_id FROM usage_events ORDER BY seq")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            survivors,
+            vec![(5, Some("t1".to_string()))],
+            "identical buckets collapse to one survivor at the highest seq"
+        );
+        let agg = aggregate_instance(&conn, "ins_r14m1a").unwrap();
+        assert_eq!(agg.input_tokens, Some(expected_input));
+        assert_eq!(
+            agg.output_tokens,
+            Some(expected_output),
+            "the re-tailed call is counted exactly once"
+        );
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r14m1a",
+                kind: "codex",
+                spec_model: Some("gpt-5.4"),
+                effective_model: None,
+                profile_id: Some("pvp_r14"),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rollup.turns, 1, "one turn, counted once");
+    }
+
+    #[test]
+    fn main_shaped_turn_rows_sharing_a_scope_id_with_different_buckets_return_to_null_scope() {
+        // c-usagefu r14 item 1 (Ruling M1), regression (b): two genuinely
+        // DIFFERENT result frames recover the SAME scopeId (a degenerate id,
+        // both mapped to "0") while reporting different token buckets. They
+        // are two calls and must NOT be merged: every row of the group has
+        // its scope_id cleared back to NULL, so both stay on the legacy
+        // NULL-scope path, the unique index creates, and each call counts
+        // exactly once.
+        let home = tempfile::tempdir().unwrap();
+        let at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let one = real_codex_turn_counters(home.path(), "r14m1b1", "ta", 1000, 100, &at);
+        // A separate home/rollout for the second call: same degenerate
+        // scopeId in the JOURNAL, different real counters.
+        let home2 = tempfile::tempdir().unwrap();
+        let two = real_codex_turn_counters(home2.path(), "r14m1b2", "tb", 2000, 200, &at);
+        let expected_output = one.output_tokens.unwrap() + two.output_tokens.unwrap();
+        let expected_input = one.input_tokens.unwrap() + two.input_tokens.unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        create_main_shaped_usage_tables(&conn);
+        insert_main_turn_with_journal(&conn, "ins_r14m1b", 1, "0", &one, &at);
+        insert_main_turn_with_journal(&conn, "ins_r14m1b", 5, "0", &two, &at);
+
+        migrate(&conn).unwrap();
+
+        let rows: Vec<(i64, Option<String>)> = {
+            let mut stmt = conn
+                .prepare("SELECT seq, scope_id FROM usage_events ORDER BY seq")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            rows,
+            vec![(1, None), (5, None)],
+            "disagreeing buckets are never merged; both rows return to legacy NULL scope"
+        );
+        let agg = aggregate_instance(&conn, "ins_r14m1b").unwrap();
+        assert_eq!(agg.input_tokens, Some(expected_input));
+        assert_eq!(
+            agg.output_tokens,
+            Some(expected_output),
+            "two different calls each counted once, nothing merged or doubled"
+        );
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r14m1b",
+                kind: "codex",
+                spec_model: Some("gpt-5.4"),
+                effective_model: None,
+                profile_id: Some("pvp_r14"),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rollup.turns, 2, "each NULL-scope turn counts as one call");
+    }
+
+    #[test]
+    fn a_failed_usage_migration_rolls_back_and_the_hub_store_still_opens() {
+        // c-usagefu r14 item 1 (Ruling M1), regression (c): a failure late in
+        // the migration (here the unique-index name collides with an object
+        // already in the database, so CREATE UNIQUE INDEX errors AFTER the
+        // backfill and collapse ran) must roll the WHOLE migration back —
+        // including the ALTER TABLE-added columns — and the Hub store must
+        // still open, repeatedly, on the old shape. The collision is a
+        // committed pre-existing table, so it reproduces on every reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hub.sqlite");
+        let at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        {
+            let pre = Connection::open(&db_path).unwrap();
+            create_main_shaped_usage_tables(&pre);
+            let row = real_codex_turn_counters(
+                tempfile::tempdir().unwrap().path(),
+                "r14m1c",
+                "t1",
+                1000,
+                100,
+                &at,
+            );
+            insert_main_turn_with_journal(&pre, "ins_r14m1c", 1, "t1", &row, &at);
+            insert_main_turn_with_journal(&pre, "ins_r14m1c", 5, "t1", &row, &at);
+            // Sabotage the unique-index create that runs LAST in the
+            // migration batch.
+            pre.execute_batch("CREATE TABLE usage_events_turn_dedupe(x TEXT NOT NULL);")
+                .unwrap();
+        }
+
+        // The opener logs the failure and opens anyway — twice, since the
+        // collision persists across reopens.
+        let store = crate::store::Store::open(dir.path())
+            .expect("Hub store opens despite the failed, rolled-back migration");
+        drop(store);
+        let _store2 = crate::store::Store::open(dir.path())
+            .expect("a reopen opens on the legacy shape as well");
+        drop(_store2);
+
+        // Full rollback: the old shape is untouched — no scope_id column was
+        // added (the ALTER TABLE rolled back with the failed transaction),
+        // neither dedupe index exists, and both original rows survive.
+        let check = Connection::open(&db_path).unwrap();
+        let columns: i64 = check
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('usage_events')
+                 WHERE name IN ('scope_id','turn_id','metric_revision')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            columns, 0,
+            "the schema-changing migration fully rolled back"
+        );
+        let dedupe_indexes: i64 = check
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index'
+                   AND name IN ('usage_events_turn_dedupe','usage_events_message_dedupe')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dedupe_indexes, 0, "no unique index was committed");
+        let row_count: i64 = check
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE instance_id='ins_r14m1c'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            row_count, 2,
+            "neither original row was collapsed or deleted"
+        );
+    }
+
+    #[test]
+    fn a_rolled_back_usage_migration_degrades_reads_to_unknown_and_keeps_recording() {
+        // c-usagefu r15 item 1: after a migration that fails and rolls back
+        // (here the deterministic test sentinel), every usage READ must be
+        // routed by the actual schema shape: the rollup is Unknown and the
+        // aggregates are empty — never a SQL error against the missing
+        // columns. Writes keep landing on the legacy insert path, and a later
+        // successful migration recovers the data.
+        let conn = Connection::open_in_memory().unwrap();
+        create_main_shaped_usage_tables(&conn);
+        let at = "2026-10-13T00:00:00.000Z";
+        conn.execute(
+            "INSERT INTO usage_events
+                (instance_id, seq, scope, mode, input_tokens, output_tokens,
+                 accounting, observed_at)
+             VALUES ('ins_r15legacy', 1, 'turn', 'snapshot', 40, 30,
+                     'estimated', ?1)",
+            params![at],
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TABLE remuda_test_force_usage_migration_failure (x);")
+            .unwrap();
+
+        let failed = migrate(&conn);
+        assert!(
+            failed.is_err(),
+            "the sentinel forces a real failing statement inside the migration tx"
+        );
+        assert!(
+            !crate::store::column_exists(&conn, "usage_events", "scope_id").unwrap(),
+            "the additive DDL rolled back with the failed transaction"
+        );
+
+        // Every read degrades; no "no such column" error. c-usagefu r16 item 7:
+        // the legacy shape is an explicit Unavailable state, distinct from the
+        // None "no channel" state — Some(rollup) with unavailable=true, and
+        // aggregates carrying unavailable=true rather than a zero that reads as
+        // real spend.
+        let req = RollupRequest {
+            instance_id: "ins_r15legacy",
+            kind: "codex",
+            spec_model: Some("gpt-5.4"),
+            effective_model: None,
+            profile_id: Some("pvp_r15"),
+        };
+        let legacy_rollup = rollup_instance(&conn, &req).unwrap();
+        assert!(
+            legacy_rollup
+                .as_ref()
+                .is_some_and(|rollup| rollup.unavailable),
+            "legacy shape reports an explicit Unavailable rollup, not None"
+        );
+        assert_eq!(
+            legacy_rollup.as_ref().unwrap().context_pct,
+            None,
+            "an Unavailable rollup never carries a guessed percentage"
+        );
+        let inst_agg = aggregate_instance(&conn, "ins_r15legacy").unwrap();
+        assert!(inst_agg.unavailable, "instance aggregate is Unavailable");
+        assert_eq!(inst_agg.events, 0);
+        let supply_agg = aggregate_supply(&conn, "pvp_r15", "gpt-5.4").unwrap();
+        assert!(supply_agg.unavailable, "supply aggregate is Unavailable");
+        assert_eq!(supply_agg.events, 0);
+
+        // Writes keep recording through main's insert path (seq 2).
+        let legacy_row = UsageEventRow {
+            turn_id: None,
+            native_context_window: None,
+            instance_id: "ins_r15legacy".into(),
+            seq: 2,
+            profile_id: Some("pvp_r15".into()),
+            model: Some("gpt-5.4".into()),
+            scope: "turn".into(),
+            scope_id: Some("must-not-be-persisted".into()),
+            source_session_id: None,
+            mode: "snapshot".into(),
+            total_tokens: Some(70),
+            input_tokens: Some(40),
+            output_tokens: Some(30),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: Some("0.07".into()),
+            accounting: "estimated".into(),
+            observed_at: at.into(),
+            observed_at_source: "native".into(),
+            metric_revision: 1,
+        };
+        assert!(insert_usage_event(&conn, &legacy_row).unwrap());
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE instance_id='ins_r15legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "the event was recorded on the legacy shape");
+
+        // Once the failure condition is gone the migration commits and the
+        // rollup reads the recovered rows again.
+        conn.execute_batch("DROP TABLE remuda_test_force_usage_migration_failure;")
+            .unwrap();
+        migrate(&conn).unwrap();
+        assert!(crate::store::column_exists(&conn, "usage_events", "scope_id").unwrap());
+        assert_eq!(
+            rollup_instance(&conn, &req).unwrap().unwrap().turns,
+            2,
+            "the two recorded legacy NULL-scope turns fold again after recovery"
+        );
+    }
+
+    /// A codex Message/Session usage frame carrying full attribution, exactly as
+    /// the durable journal retains it; its projected row is written through the
+    /// LEGACY insert while the migration is rolled back (14 columns only).
+    #[allow(clippy::too_many_arguments)]
+    fn fallback_journal_record(
+        seq: i64,
+        scope: &str,
+        scope_id: &str,
+        native_turn: Option<&str>,
+        revision: i64,
+        input: i64,
+        output: i64,
+        native_at: &str,
+    ) -> JournalRecord {
+        let total = input + output;
+        let mut event = json!({
+            "kind": "usage",
+            "nativeAt": { "state": "known", "value": native_at },
+            "payload": {
+                "scope": scope,
+                "scopeId": scope_id,
+                "mode": "snapshot",
+                "metricRevision": revision.to_string(),
+                "contextWindow": "200000",
+                "totalTokens": { "state": "known", "value": total.to_string() },
+                "inputTokens": { "state": "known", "value": input.to_string() },
+                "outputTokens": { "state": "known", "value": output.to_string() },
+                "cacheReadTokens": { "state": "unknown", "reason": "x", "evidenceEventIds": [] },
+                "cacheWriteTokens": { "state": "unknown", "reason": "x", "evidenceEventIds": [] },
+                "cost": { "state": "known",
+                          "value": { "amount": "0.05", "currency": "USD" } },
+                "accounting": "estimated"
+            }
+        });
+        if let Some(turn) = native_turn {
+            event["source"] = json!({ "nativeTurnId": { "state": "known", "value": turn } });
+        }
+        JournalRecord {
+            instance_id: "ins_r16item8".into(),
+            seq,
+            event_id: format!("je8-{seq}"),
+            event,
+            observed_at: "2026-10-13T00:00:09.000Z".into(),
+        }
+    }
+
+    #[test]
+    fn a_later_migration_reconstructs_fallback_period_codex_message_and_session_usage() {
+        // c-usagefu r16 item 8: usage recorded WHILE the migration stayed rolled
+        // back went through the 14-column legacy insert, so codex Message/Session
+        // frames lost turn_id / native time / context window / revision even
+        // though the durable journal retained them. A later successful migration
+        // reconstructs those fields BEFORE consolidation so the call and its
+        // attribution/tokens fold exactly once.
+        let conn = Connection::open_in_memory().unwrap();
+        create_main_shaped_usage_tables(&conn);
+        let at = "2026-10-13T00:00:00.000Z";
+
+        // (1) An origin/main-era Turn (seq 1), with its journal scopeId.
+        let one = UsageEventRow {
+            turn_id: None,
+            native_context_window: None,
+            instance_id: "ins_r16item8".into(),
+            seq: 1,
+            profile_id: None,
+            model: Some("gpt-5.4".into()),
+            scope: "turn".into(),
+            scope_id: Some("ta".into()),
+            source_session_id: None,
+            mode: "snapshot".into(),
+            total_tokens: Some(100),
+            input_tokens: Some(60),
+            output_tokens: Some(40),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: Some("0.01".into()),
+            accounting: "estimated".into(),
+            observed_at: at.into(),
+            observed_at_source: "ingest".into(),
+            metric_revision: 1,
+        };
+        insert_main_turn_with_journal(&conn, "ins_r16item8", 1, "ta", &one, at);
+
+        // (2) Force the migration to fail/roll back, then record fallback usage.
+        conn.execute_batch("CREATE TABLE remuda_test_force_usage_migration_failure (x);")
+            .unwrap();
+        assert!(migrate(&conn).is_err());
+        assert!(
+            !crate::store::column_exists(&conn, "usage_events", "turn_id").unwrap(),
+            "the additive projection column never committed during fallback"
+        );
+
+        // A fallback codex Message (seq 2): a DIFFERENT call, full attribution.
+        let msg = fallback_journal_record(
+            2,
+            "message",
+            "mb-call",
+            Some("nt-mb"),
+            2,
+            70,
+            30,
+            "2026-10-13T00:00:05.000Z",
+        );
+        conn.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                msg.instance_id,
+                msg.seq,
+                msg.event_id,
+                msg.event.to_string(),
+                msg.observed_at
+            ],
+        )
+        .unwrap();
+        assert!(
+            insert(&conn, &msg),
+            "the message lands on the legacy insert"
+        );
+
+        // A fallback cumulative Session growth point (seq 3).
+        let sess = fallback_journal_record(
+            3,
+            "session",
+            "sess-1",
+            None,
+            1,
+            200,
+            100,
+            "2026-10-13T00:00:06.000Z",
+        );
+        conn.execute(
+            "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                sess.instance_id,
+                sess.seq,
+                sess.event_id,
+                sess.event.to_string(),
+                sess.observed_at
+            ],
+        )
+        .unwrap();
+        assert!(
+            insert(&conn, &sess),
+            "the session point lands on the legacy insert"
+        );
+
+        // (3) Migration recovers and completes.
+        conn.execute_batch("DROP TABLE remuda_test_force_usage_migration_failure;")
+            .unwrap();
+        migrate(&conn).unwrap();
+
+        // The Message row is fully reconstructed from the journal.
+        let (turn_id, source, revision, window) = conn
+            .query_row(
+                "SELECT turn_id, observed_at_source, metric_revision, native_context_window
+                 FROM usage_events WHERE instance_id='ins_r16item8' AND seq=2",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            turn_id.as_deref(),
+            Some("nt-mb"),
+            "native turn id recovered"
+        );
+        assert_eq!(source, "native", "native observation time/source recovered");
+        assert_eq!(revision, 2, "metric revision recovered");
+        assert_eq!(window, Some(200_000), "native context window recovered");
+        assert_eq!(
+            conn.query_row(
+                "SELECT observed_at FROM usage_events WHERE seq=2",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+            "2026-10-13T00:00:05.000Z",
+            "the native call time, not the ingest time, drives rate windows"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT observed_at_source FROM usage_events WHERE seq=3",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+            "native",
+            "the fallback session growth point is native-time stamped"
+        );
+
+        // Totals + attribution: the old Turn (100) and the fallback Message
+        // (100) are two distinct calls, each counted once.
+        let agg = aggregate_instance(&conn, "ins_r16item8").unwrap();
+        assert!(!agg.unavailable);
+        assert_eq!(
+            agg.total_tokens,
+            Some(200),
+            "fallback Message usage is not omitted"
+        );
+        assert_eq!(agg.input_tokens, Some(130), "60 (turn) + 70 (message)");
+        assert_eq!(agg.output_tokens, Some(70), "40 (turn) + 30 (message)");
+        assert!(
+            (agg.cost_usd.unwrap() - 0.06).abs() < 1e-9,
+            "0.01 turn + 0.05 message attribution survives recovery"
+        );
+
+        // Rollup: both calls fold (distinct unmatched-Turn scope id + the
+        // Message's native turn id), no double count; the native window resolves.
+        let req = RollupRequest {
+            instance_id: "ins_r16item8",
+            kind: "codex",
+            spec_model: Some("gpt-5.4"),
+            effective_model: None,
+            profile_id: None,
+        };
+        let rollup = rollup_instance(&conn, &req).unwrap().unwrap();
+        assert_eq!(
+            rollup.turns, 2,
+            "old turn and fallback message each count once"
+        );
+        assert_eq!(
+            rollup.context_window_tokens,
+            Some(200_000),
+            "the fallback message's native window resolves the context chip"
+        );
+
+        // Rate windows see the native-time Message; the old ingest-time Turn is
+        // not native, so a threshold after it keeps only the message's flow.
+        let (flow_in, flow_out) =
+            sum_turn_tokens_since(&conn, "ins_r16item8", "2026-10-13T00:00:04.000Z").unwrap();
+        assert_eq!(
+            flow_in,
+            Some(70),
+            "native fallback message enters the TPM window"
+        );
+        assert_eq!(flow_out, Some(30));
+    }
+
+    #[test]
+    fn the_usage_migration_is_idempotent_across_restart_after_restart() {
+        // c-usagefu r15 item 2: after a SUCCESSFUL migration the next start
+        // must not re-run the journal backfill — it would re-create the
+        // scope ids the disagreeing-buckets collapse intentionally cleared to
+        // NULL while the unique partial index already exists, failing the
+        // migration on every restart. Migrate, restart, restart: no error, the
+        // NULL scope ids and the counted totals stay identical.
+        let home = tempfile::tempdir().unwrap();
+        let at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let one = real_codex_turn_counters(home.path(), "r15idem1", "ta", 1000, 100, &at);
+        let home2 = tempfile::tempdir().unwrap();
+        let two = real_codex_turn_counters(home2.path(), "r15idem2", "tb", 2000, 200, &at);
+        let expected_output = one.output_tokens.unwrap() + two.output_tokens.unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        create_main_shaped_usage_tables(&conn);
+        insert_main_turn_with_journal(&conn, "ins_r15idem", 1, "0", &one, &at);
+        insert_main_turn_with_journal(&conn, "ins_r15idem", 5, "0", &two, &at);
+
+        migrate(&conn).unwrap();
+        let scope_ids_after_first = |conn: &Connection| -> Vec<Option<String>> {
+            let mut stmt = conn
+                .prepare("SELECT scope_id FROM usage_events ORDER BY seq")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            scope_ids_after_first(&conn),
+            vec![None, None],
+            "disagreeing buckets intentionally cleared to NULL by the first migration"
+        );
+        let first_agg = aggregate_instance(&conn, "ins_r15idem").unwrap();
+
+        // Two full restarts: the marker skips the one-time backfill each time.
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            scope_ids_after_first(&conn),
+            vec![None, None],
+            "the cleared scope ids are never re-created into the unique index"
+        );
+        let marker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_schema_meta
+                 WHERE key='scope_consolidation_v1' AND value='applied'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, 1, "the completion marker is persisted");
+        let agg = aggregate_instance(&conn, "ins_r15idem").unwrap();
+        assert_eq!(
+            (agg.events, agg.input_tokens, agg.output_tokens),
+            (
+                first_agg.events,
+                first_agg.input_tokens,
+                first_agg.output_tokens
+            ),
+            "counts are identical after migrate -> restart -> restart"
+        );
+        assert_eq!(agg.output_tokens, Some(expected_output));
+    }
+
+    #[tokio::test]
+    async fn a_failed_usage_migration_leaves_every_instance_api_usable_with_usage_unknown() {
+        // c-usagefu r15 item 1, the endpoint regression: with a PERSISTENT
+        // migration failure (the sabotaged index name collides on every open)
+        // the Hub opens and the instance list/detail/usage paths all SUCCEED —
+        // the detail load runs the real rollup SQL, which must route by the
+        // legacy schema shape and report usage Unknown rather than surface a
+        // SQL error.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hub.sqlite");
+        let at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        {
+            let pre = Connection::open(&db_path).unwrap();
+            create_main_shaped_usage_tables(&pre);
+            let row = real_codex_turn_counters(
+                tempfile::tempdir().unwrap().path(),
+                "r15m1api",
+                "t1",
+                1000,
+                100,
+                &at,
+            );
+            insert_main_turn_with_journal(&pre, "ins_r15m1api", 1, "t1", &row, &at);
+            pre.execute_batch("CREATE TABLE usage_events_turn_dedupe(x TEXT NOT NULL);")
+                .unwrap();
+        }
+
+        let store = crate::store::Store::open(dir.path())
+            .expect("Hub opens despite the persistently failing migration");
+
+        // A real enrolled host and instance so list/detail load actual rows.
+        let host_id: String = remuda_protocol::HostId::new().into();
+        // 64 hex chars: the token-prefix index only covers that shape.
+        let token = "a".repeat(64);
+        store
+            .insert_enroll_token(
+                token.clone(),
+                crate::auth::token_prefix(&token).map(str::to_string),
+                "dev_test".into(),
+                "2099-01-01T00:00:00.000Z".into(),
+            )
+            .await
+            .unwrap();
+        store
+            .authenticate_host(
+                crate::store::HostAuthRequest {
+                    presented: token,
+                    hello_host_id: Some(host_id.clone()),
+                    label: Some("r15m1-node".into()),
+                    node_version: Some("test".into()),
+                },
+                |presented, hash| presented == hash,
+                |_| Ok("test-hash".into()),
+            )
+            .await
+            .expect("host enrolls");
+        let instance = store
+            .insert_instance(
+                host_id,
+                None,
+                "codex".into(),
+                "shell-pty".into(),
+                Some("r15m1 instance".into()),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("instance insert");
+        let instance_id = instance.instance_id.clone();
+
+        // LIST: every row runs rollup_instance inside the load mapping.
+        let listed = store
+            .list_instances(None)
+            .await
+            .expect("instance list succeeds on the legacy usage shape");
+        assert!(
+            listed
+                .iter()
+                .any(|record| record.instance_id == instance_id),
+            "the instance is listed"
+        );
+        assert!(
+            listed.iter().all(|record| record
+                .usage_rollup
+                .as_ref()
+                .is_some_and(|rollup| rollup.unavailable)),
+            "every row carries an explicit Unavailable rollup on the legacy shape"
+        );
+
+        // DETAIL: same load path, single instance.
+        let detail = store
+            .get_instance(instance_id.clone())
+            .await
+            .expect("instance detail succeeds")
+            .expect("the instance exists");
+        assert!(
+            detail
+                .usage_rollup
+                .as_ref()
+                .is_some_and(|rollup| rollup.unavailable),
+            "detail reports an explicit Unavailable rollup on the legacy shape"
+        );
+
+        // USAGE endpoint query: an Unavailable aggregate, never an error.
+        let agg = store
+            .run_named("r15m1_usage", move |conn| {
+                aggregate_instance(conn, &instance_id).map_err(crate::store::StoreError::from)
+            })
+            .await
+            .expect("the usage aggregate query succeeds");
+        assert_eq!(agg.events, 0);
+        assert!(
+            agg.unavailable,
+            "the zero placeholder is explicitly Unavailable, not real zero spend"
+        );
+
+        drop(store);
+        // Reopen still works: the failure persists and is still non-fatal.
+        let reopened = crate::store::Store::open(dir.path()).expect("reopen succeeds");
+        assert!(reopened.list_instances(None).await.is_ok());
+    }
+
+    #[test]
+    fn a_token_growing_point_with_a_reset_lower_cost_is_accepted_without_the_stale_cost() {
+        // r4 item 4: priced turn (session stock 0.50, tokens 1000) -> an
+        // UNPRICED model turn emits no cost (sticky None) -> the next PRICED
+        // turn's driver total restarts at 0.02 while tokens grow. The old
+        // check froze this point until the running total passed 0.50, stalling
+        // the chip; it must be accepted with the reset cost dropped.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(insert(
+            &conn,
+            &priced_session_point(1, "s", 1, 1000, Some("0.50"))
+        ));
+        // Point 2: tokens grew, the priced running total restarted lower.
+        let accepted = insert(&conn, &priced_session_point(2, "s", 2, 2000, Some("0.02")));
+        assert!(
+            accepted,
+            "a cost decrease alongside token growth is a driver reset, not a freeze"
+        );
+
+        // The reset cost was NOT persisted (no sub-0.50 cumulative number).
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT cost_usd FROM usage_events
+                 WHERE instance_id='ins_test' AND seq=2 AND scope='session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None, "the stale reset cost is dropped");
+
+        // A later token-LESS result point with a genuine lower cumulative
+        // cost is still frozen (the result channel stays monotonic).
+        assert!(
+            !insert(&conn, &tokenless_session_record(3, "s", 3, Some("0.01"))),
+            "a token-less cost decrease is still a freeze"
+        );
+    }
+
+    /// A session growth point carrying token counters AND a reported cost.
+    fn priced_session_point(
+        seq: i64,
+        scope_id: &str,
+        revision: i64,
+        input: i64,
+        cost: Option<&str>,
+    ) -> JournalRecord {
+        let mut rec = scoped_record(
+            seq,
+            "ins_test",
+            "session",
+            Some(scope_id),
+            revision,
+            input,
+            0,
+            0,
+            0,
+            None,
+        );
+        rec.event["payload"]["cost"] = match cost {
+            Some(amount) => json!({
+                "state": "known",
+                "value": { "amount": amount, "currency": "USD" }
+            }),
+            None => json!({ "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] }),
+        };
+        rec
+    }
+
+    #[test]
+    fn message_rows_carry_native_time_for_rates_and_last_turn_at() {
+        // c-usagefu r7 item 7: a real CodexAdapter Message observation carries
+        // the token_usage_record's native timestamp; after stamping →
+        // projection → insertion the rollup must report non-NULL 60 s / 5 min
+        // rates and an advanced lastTurnAt (not ingest time).
+        use remuda_driver::adapters::{
+            AdapterHome, AdapterObservation, CodexAdapter, FileSignalAdapter, StampCtx, stamp,
+        };
+        use remuda_protocol::ObservationPayload;
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let session_dir = home_dir.path().join(".codex/sessions/2026/09/15");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let rollout = session_dir.join("rollout-native-time.jsonl");
+        let native_at = "2026-09-15T01:00:00.000Z";
+        std::fs::write(
+            &rollout,
+            format!(
+                "{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"nt\",\"session_id\":\"nt\",\"cwd\":\"/w\",\"timestamp\":\"{native_at}\"}}}}\n\
+                 {{\"ordinal\":1,\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"t1\",\"model\":\"gpt-5.4\"}}}}\n\
+                 {{\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"t1\"}}}}\n\
+                 {{\"ordinal\":3,\"timestamp\":\"{native_at}\",\"type\":\"token_usage_record\",\"payload\":{{\"turn_id\":\"t1\",\"response_id\":\"r1\",\"usage\":{{\"input_tokens\":0,\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":10000,\"reasoning_output_tokens\":0,\"total_tokens\":10000}}}}}}\n\
+                 {{\"ordinal\":4,\"timestamp\":\"{native_at}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut adapter = CodexAdapter::new(AdapterHome {
+            home: home_dir.path().join(".codex"),
+            cwd: "/w".into(),
+            pid: None,
+            launched_at: None,
+            resume_session_id: None,
+        });
+        adapter.bind_rollout("nt", rollout.clone());
+        let observed = adapter.poll().unwrap();
+        let messages: Vec<&AdapterObservation> = observed
+            .iter()
+            .filter(|o| {
+                matches!(&o.payload, ObservationPayload::Usage(u) if u.scope == remuda_protocol::UsageScope::Message)
+            })
+            .collect();
+        assert!(!messages.is_empty(), "a Message usage was emitted");
+        assert!(
+            messages[0].native_at.is_some(),
+            "Message observation carries native_at directly"
+        );
+
+        // Stamp and project.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let stamp_ctx = StampCtx {
+            instance_id: remuda_protocol::InstanceId::new(),
+            host_id: remuda_protocol::HostId::new(),
+            journal_id: remuda_protocol::Id::new("obj").unwrap(),
+            run_id: remuda_protocol::RunId::new(),
+            session_id: "nt".into(),
+        };
+        for (i, obs) in observed.iter().enumerate() {
+            let stamped = stamp(&stamp_ctx, i as u64 + 1, obs).unwrap();
+            if let ObservationPayload::Usage(_) = &stamped.body {
+                let event = serde_json::to_value(&stamped).unwrap();
+                let rec = JournalRecord {
+                    instance_id: "ins_nt".into(),
+                    seq: i as i64 + 1,
+                    event_id: stamped.event_id.as_id().as_str().to_owned(),
+                    event,
+                    observed_at: "2030-01-01T00:00:00.000Z".into(), // far future ingest
+                };
+                let row = project_usage_event(&rec, None, None).unwrap();
+                insert_row(&conn, &row).unwrap();
+            }
+        }
+
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_nt",
+                kind: "codex",
+                spec_model: None,
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        // Rates use NATIVE time (the row is recent relative to the native
+        // timestamp only when run near 2026 — instead assert the row projected
+        // with observed_at_source=native and lastTurnAt equals the native time).
+        assert_eq!(
+            rollup.last_turn_at.as_deref(),
+            Some(native_at),
+            "lastTurnAt advances to the Message's native time, not ingest time"
+        );
+        let source: String = conn
+            .query_row(
+                "SELECT observed_at_source FROM usage_events WHERE scope='message' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source, "native", "Message row projected as native-sourced");
+        // And the observed_at itself is the native timestamp.
+        let at: String = conn
+            .query_row(
+                "SELECT observed_at FROM usage_events WHERE scope='message' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(at, native_at);
+    }
+
+    #[test]
+    fn message_upsert_fills_turn_id_and_native_time_on_replay() {
+        // c-usagefu r8 item 5: the FIRST write of a response lacked turn_id
+        // and carried ingest time (older adapter build); a replayed row with
+        // the same response id supplies them and must UPDATE the stored row,
+        // not be dropped by the unique index.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // First write: no native timestamp (ingest), no turn_id.
+        let first = JournalRecord {
+            instance_id: "ins_upsert".into(),
+            seq: 1,
+            event_id: "e1".into(),
+            event: json!({
+                "kind":"usage",
+                "payload":{
+                    "scope":"message","scopeId":"r1","mode":"snapshot","metricRevision":"1",
+                    "inputTokens":{"state":"known","value":"0"},
+                    "outputTokens":{"state":"known","value":"100"},
+                    "cost":{"state":"known","value":{"amount":"0.10","currency":"USD"}},
+                    "accounting":"estimated",
+                }
+            }),
+            observed_at: "2030-01-01T00:00:00Z".into(),
+        };
+        let first_row = project_usage_event(&first, None, None).unwrap();
+        assert!(insert_row(&conn, &first_row).unwrap());
+        let (turn, source): (Option<String>, String) = conn
+            .query_row(
+                "SELECT turn_id, observed_at_source FROM usage_events WHERE scope_id='r1'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(turn, None);
+        assert_eq!(source, "ingest");
+
+        // Replay with native timestamp + turn_id (new seq).
+        let native = "2026-09-15T00:00:00.000Z";
+        let second = JournalRecord {
+            instance_id: "ins_upsert".into(),
+            seq: 2,
+            event_id: "e2".into(),
+            event: json!({
+                "kind":"usage",
+                "nativeAt":{"state":"known","value":native},
+                "source":{"nativeTurnId":{"state":"known","value":"t7"}},
+                "payload":{
+                    "scope":"message","scopeId":"r1","mode":"snapshot","metricRevision":"1",
+                    "inputTokens":{"state":"known","value":"0"},
+                    "outputTokens":{"state":"known","value":"100"},
+                    "cost":{"state":"known","value":{"amount":"0.10","currency":"USD"}},
+                    "accounting":"estimated",
+                }
+            }),
+            observed_at: "2030-01-01T00:00:00Z".into(),
+        };
+        let second_row = project_usage_event(&second, None, None).unwrap();
+        let changed = insert_row(&conn, &second_row).expect("upsert succeeds");
+        assert!(changed, "the better-attributed replay updated the row");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE scope_id='r1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "still one row");
+        let (turn, source, at): (Option<String>, String, String) = conn
+            .query_row(
+                "SELECT turn_id, observed_at_source, observed_at FROM usage_events WHERE scope_id='r1'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(turn.as_deref(), Some("t7"));
+        assert_eq!(source, "native");
+        assert_eq!(at, native);
+    }
+
+    #[test]
+    fn message_with_complete_attribution_repairs_unknown_cost_on_replay() {
+        // c-usagefu r10 item 8 (Ruling C NULL->known repair): a Message is
+        // ingested with COMPLETE attribution (native turn id + native time) but
+        // an UNKNOWN cost (model not priced yet). A later byte-0 replay with the
+        // same response id but a KNOWN cost must repair cost_usd even though no
+        // attribution field is missing. The row stays singular and keeps its
+        // attribution; a present value is never downgraded.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let native = "2026-09-15T00:00:00.000Z";
+        let record = |seq: i64, cost: serde_json::Value| JournalRecord {
+            instance_id: "ins_repair".into(),
+            seq,
+            event_id: format!("e{seq}"),
+            event: json!({
+                "kind": "usage",
+                "nativeAt": {"state": "known", "value": native},
+                "source": {"nativeTurnId": {"state": "known", "value": "t8"}},
+                "payload": {
+                    "scope": "message", "scopeId": "r8", "mode": "snapshot",
+                    "metricRevision": "1",
+                    "inputTokens": {"state": "known", "value": "0"},
+                    "outputTokens": {"state": "known", "value": "100"},
+                    "cost": cost,
+                    "accounting": "estimated"
+                }
+            }),
+            observed_at: native.into(),
+        };
+        // First ingest: complete attribution, unknown cost.
+        let first = record(
+            1,
+            json!({"state": "unknown", "reason": "unpriced-model", "evidenceEventIds": []}),
+        );
+        let first_row = project_usage_event(&first, Some("pvp_repair"), Some("gpt-5.4")).unwrap();
+        assert!(insert_usage_event(&conn, &first_row).unwrap());
+        let (turn, source, cost): (Option<String>, String, Option<String>) = conn
+            .query_row(
+                "SELECT turn_id, observed_at_source, cost_usd FROM usage_events WHERE scope_id='r8'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(turn.as_deref(), Some("t8"), "attribution already complete");
+        assert_eq!(source, "native");
+        assert_eq!(cost, None, "cost unknown on first ingest");
+
+        // Replay (new seq, same durable response id) now carries a known cost.
+        let replay = record(
+            2,
+            json!({"state": "known", "value": {"amount": "0.10", "currency": "USD"}}),
+        );
+        let replay_row = project_usage_event(&replay, Some("pvp_repair"), Some("gpt-5.4")).unwrap();
+        let changed = insert_usage_event(&conn, &replay_row).unwrap();
+        assert!(changed, "the NULL->known cost repair updates the row");
+
+        let (turn, source, at, cost): (Option<String>, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT turn_id, observed_at_source, observed_at, cost_usd
+                 FROM usage_events WHERE scope_id='r8'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0).unwrap(),
+                        r.get(1).unwrap(),
+                        r.get(2).unwrap(),
+                        r.get(3).unwrap(),
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            turn.as_deref(),
+            Some("t8"),
+            "attribution unchanged by repair"
+        );
+        assert_eq!(source, "native");
+        assert_eq!(at, native);
+        assert_eq!(
+            cost.as_deref(),
+            Some("0.10"),
+            "known cost repaired on replay"
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE scope_id='r8'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "the replay repairs the one durable row");
+
+        // The repair flows through to billing.
+        let agg = aggregate_instance(&conn, "ins_repair").unwrap();
+        assert!(
+            (agg.cost_usd.unwrap() - 0.10).abs() < 1e-9,
+            "repaired cost is billable"
+        );
+    }
+
+    #[test]
+    fn duplicate_message_updates_are_revision_authoritative_for_accounting() {
+        // c-usagefu r11 item 9 (Ruling C1, EXACT) through the public ingest
+        // path: every record is projected from a real usage observation into
+        // the durable Message row r9.
+        //   seq 1, rev 1: output 10 / cost 0.01 / estimated
+        //   seq 2, rev 2: output 20 / cost 0.02 / reported   -> REPLACES, rev 2
+        //   seq 3, rev 1: output 99 / cost 0.99 / estimated  -> OLDER, inert
+        //   seq 4, rev 2: output unknown, cache_read 50, cost unknown
+        //                 -> same-revision NULL->known repair of cache only
+        //   seq 5, rev 3: output 25 / cost 0.03 / reported  -> REPLACES, rev 3
+        // An older revision never downgrades counters, cost or accounting; a
+        // same/newer revision fills a NULL bucket and replaces present
+        // accounting outright.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let native = "2026-09-15T00:00:00.000Z";
+        let known = |v: &str| json!({"state": "known", "value": v});
+        let unknown =
+            json!({"state": "unknown", "reason": "unpriced-model", "evidenceEventIds": []});
+        let record = |seq: i64,
+                      rev: u32,
+                      output: serde_json::Value,
+                      cache_read: Option<u64>,
+                      cost: serde_json::Value,
+                      accounting: &str| JournalRecord {
+            instance_id: "ins_c1live".into(),
+            seq,
+            event_id: format!("e{seq}"),
+            event: json!({
+                "kind": "usage",
+                "nativeAt": {"state": "known", "value": native},
+                "source": {"nativeTurnId": {"state": "known", "value": "t9"}},
+                "payload": {
+                    "scope": "message", "scopeId": "r9", "mode": "snapshot",
+                    "metricRevision": rev.to_string(),
+                    "inputTokens": known("0"),
+                    "outputTokens": output,
+                    "cacheReadTokens": cache_read
+                        .map_or(json!({"state":"unknown"}), |c| known(&c.to_string())),
+                    "cost": cost,
+                    "accounting": accounting
+                }
+            }),
+            observed_at: native.into(),
+        };
+        let ingest = |rec: &JournalRecord| {
+            let row = project_usage_event(rec, Some("pvp_c1"), Some("gpt-5.4")).unwrap();
+            insert_usage_event(&conn, &row).unwrap()
+        };
+        let state = |conn: &Connection| -> (i64, Option<i64>, Option<i64>, Option<String>, String) {
+            conn.query_row(
+                "SELECT metric_revision, output_tokens, cache_read_tokens, cost_usd,
+                            accounting
+                     FROM usage_events WHERE scope_id='r9'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0).unwrap(),
+                        r.get(1).unwrap(),
+                        r.get(2).unwrap(),
+                        r.get(3).unwrap(),
+                        r.get(4).unwrap(),
+                    ))
+                },
+            )
+            .unwrap()
+        };
+
+        assert!(ingest(&record(
+            1,
+            1,
+            known("10"),
+            None,
+            json!({"state":"known","value":{"amount":"0.01","currency":"USD"}}),
+            "estimated"
+        )));
+        assert_eq!(
+            state(&conn),
+            (1, Some(10), None, Some("0.01".into()), "estimated".into())
+        );
+
+        // Newer revision replaces the authoritative accounting.
+        assert!(ingest(&record(
+            2,
+            2,
+            known("20"),
+            None,
+            json!({"state":"known","value":{"amount":"0.02","currency":"USD"}}),
+            "reported"
+        )));
+        assert_eq!(
+            state(&conn),
+            (2, Some(20), None, Some("0.02".into()), "reported".into())
+        );
+
+        // Older revision is entirely inert — no downgrade, no changed row.
+        assert!(
+            !ingest(&record(
+                3,
+                1,
+                known("99"),
+                Some(7),
+                json!({"state":"known","value":{"amount":"0.99","currency":"USD"}}),
+                "estimated"
+            )),
+            "the older duplicate changes nothing"
+        );
+        assert_eq!(
+            state(&conn),
+            (2, Some(20), None, Some("0.02".into()), "reported".into()),
+            "an older revision never replaces even a NULL bucket"
+        );
+
+        // Same revision fills a NULL bucket, imposes nothing via its unknowns.
+        assert!(ingest(&record(
+            4,
+            2,
+            json!({"state":"unknown"}),
+            Some(50),
+            unknown.clone(),
+            "reported"
+        )));
+        assert_eq!(
+            state(&conn),
+            (
+                2,
+                Some(20),
+                Some(50),
+                Some("0.02".into()),
+                "reported".into()
+            ),
+            "same-revision NULL->known repair fills cache_read only"
+        );
+
+        // Newer revision replaces present values again.
+        assert!(ingest(&record(
+            5,
+            3,
+            known("25"),
+            Some(60),
+            json!({"state":"known","value":{"amount":"0.03","currency":"USD"}}),
+            "reported"
+        )));
+        assert_eq!(
+            state(&conn),
+            (
+                3,
+                Some(25),
+                Some(60),
+                Some("0.03".into()),
+                "reported".into()
+            )
+        );
+
+        // One durable row all along.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_events WHERE scope_id='r9'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn duplicate_message_replay_does_not_double_totals() {
+        // c-usagefu r7 item 5: re-promoting Codex replays the rollout from
+        // byte 0 and two fresh adapters emit the SAME Message response ids.
+        // The durable unique index (instance, scope, scope_id) for Message
+        // rows must collapse the replay; totals stay at one set.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        let message_row = |seq: i64, response_id: &str, output: i64| {
+            let rec = JournalRecord {
+                instance_id: "ins_replay".into(),
+                seq,
+                event_id: format!("evt_replay_{seq}"),
+                event: json!({
+                    "kind": "usage",
+                    "source": { "nativeTurnId": { "state": "known", "value": "t1" } },
+                    "payload": {
+                        "scope": "message",
+                        "scopeId": response_id,
+                        "mode": "snapshot",
+                        "metricRevision": "1",
+                        "inputTokens": { "state": "known", "value": "0" },
+                        "outputTokens": { "state": "known", "value": output.to_string() },
+                        "cost": { "state": "known",
+                                   "value": { "amount": "0.10", "currency": "USD" } },
+                        "accounting": "estimated",
+                    }
+                }),
+                observed_at: "2026-09-15T00:00:00.000Z".into(),
+            };
+            project_usage_event(&rec, None, None).unwrap()
+        };
+
+        // First adapter: two message responses (r1=100 out, r2=200 out).
+        let first = insert_row(&conn, &message_row(1, "r1", 100)).unwrap();
+        assert!(first, "first r1 inserted");
+        assert!(insert_row(&conn, &message_row(2, "r2", 200)).unwrap());
+
+        // Second adapter replays the same rollout (different journal seqs but
+        // identical response ids): both must be ignored.
+        assert!(
+            !insert_row(&conn, &message_row(3, "r1", 100)).unwrap(),
+            "replayed r1 is deduped by response id"
+        );
+        assert!(
+            !insert_row(&conn, &message_row(4, "r2", 200)).unwrap(),
+            "replayed r2 is deduped by response id"
+        );
+
+        let agg = aggregate_instance(&conn, "ins_replay").unwrap();
+        assert_eq!(agg.output_tokens, Some(300), "100 + 200, not doubled");
+        assert!(
+            (agg.cost_usd.unwrap() - 0.20).abs() < 1e-9,
+            "two responses at 0.10, replay not billed: {}",
+            agg.cost_usd.unwrap()
+        );
+    }
+
+    #[test]
+    fn message_and_session_cumulative_history_are_never_added() {
+        // c-usagefu r8 item 4: Message per-call rows AND cumulative Session
+        // snapshots describe the SAME calls, in the REAL codex observation
+        // shape — each turn emits one additive Message and one cumulative
+        // Session growth point.
+        //   Message 10 + Session 10 + Message 20 + Session 30 -> 30, not 70.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let t1 = ago(4);
+        let t2 = ago(2);
+        // One projection for either scope: flow rows carry per-call counters,
+        // session rows carry the same counters CUMULATIVELY.
+        let project = |seq: i64,
+                       scope: &str,
+                       scope_id: &str,
+                       rev: i64,
+                       input: i64,
+                       out: i64,
+                       cache_read: i64,
+                       cache_write: i64,
+                       cost: &str,
+                       at: &str,
+                       turn: Option<&str>| {
+            let mut event = json!({
+                "kind":"usage",
+                "nativeAt":{"state":"known","value":at},
+                "payload":{
+                    "scope":scope,"scopeId":scope_id,"mode":"snapshot",
+                    "metricRevision":rev.to_string(),
+                    "inputTokens":{"state":"known","value":input.to_string()},
+                    "outputTokens":{"state":"known","value":out.to_string()},
+                    "cacheReadTokens":{"state":"known","value":cache_read.to_string()},
+                    "cacheWriteTokens":{"state":"known","value":cache_write.to_string()},
+                    "cost":{"state":"known","value":{"amount":cost,"currency":"USD"}},
+                    "accounting":"estimated",
+                }
+            });
+            if let Some(id) = turn {
+                event["source"] = json!({"nativeTurnId":{"state":"known","value":id}});
+            }
+            let rec = JournalRecord {
+                instance_id: "ins_mix".into(),
+                seq,
+                event_id: format!("e{seq}"),
+                event,
+                observed_at: at.into(),
+            };
+            project_usage_event(&rec, Some("pvp_mix"), Some("gpt-5.4")).unwrap()
+        };
+        // Turn 1: additive Message (40/10, cache 100/5) and the cumulative
+        // Session point at the same totals (cost 0.10).
+        insert_row(
+            &conn,
+            &project(
+                1,
+                "message",
+                "r1",
+                1,
+                40,
+                10,
+                100,
+                5,
+                "0.10",
+                &t1,
+                Some("t1"),
+            ),
+        )
+        .unwrap();
+        insert_row(
+            &conn,
+            &project(2, "session", "s1", 1, 40, 10, 100, 5, "0.10", &t1, None),
+        )
+        .unwrap();
+        // Turn 2: additive Message (60/20, cache 150/7) and the Session point
+        // now reporting the CUMULATIVE 100/30 (cache 250/12, cost 0.30).
+        insert_row(
+            &conn,
+            &project(
+                3,
+                "message",
+                "r2",
+                1,
+                60,
+                20,
+                150,
+                7,
+                "0.20",
+                &t2,
+                Some("t2"),
+            ),
+        )
+        .unwrap();
+        insert_row(
+            &conn,
+            &project(4, "session", "s1", 2, 100, 30, 250, 12, "0.30", &t2, None),
+        )
+        .unwrap();
+
+        // Both aggregates: one representation, never flow + cumulative stock.
+        let agg = aggregate_instance(&conn, "ins_mix").unwrap();
+        assert_eq!(
+            agg.input_tokens,
+            Some(100),
+            "40+60 Message, not +140 Session"
+        );
+        assert_eq!(
+            agg.output_tokens,
+            Some(30),
+            "10+20 Message, not 10+10+20+30"
+        );
+        assert!(
+            (agg.cost_usd.unwrap() - 0.30).abs() < 1e-9,
+            "cumulative cost 0.30"
+        );
+        let supply = aggregate_supply(&conn, "pvp_mix", "gpt-5.4").unwrap();
+        assert_eq!(supply.input_tokens, Some(100));
+        assert_eq!(supply.output_tokens, Some(30));
+        assert!((supply.cost_usd.unwrap() - 0.30).abs() < 1e-9);
+
+        // Rollup: one flow representation, session stock used only as the
+        // fallback (here flow covers it). Totals, cache and rates agree.
+        let rollup = rollup_fold(&conn, "ins_mix", "codex", Some("gpt-5.4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_input_tokens, Some(100));
+        assert_eq!(rollup.session_output_tokens, Some(30));
+        assert_eq!(rollup.cache_read_tokens, Some(250), "100+150, not +100+250");
+        assert_eq!(rollup.cache_creation_tokens, Some(12), "5+7, not +5+12");
+        assert_eq!(rollup.tpm_in_60s, Some(100), "flow rate window");
+        assert_eq!(rollup.tpm_out_60s, Some(30));
+        assert_eq!(rollup.tpm_out_5m, Some(6), "30 tokens / 5 minutes");
+    }
+
+    #[test]
+    fn upgraded_dual_message_and_turn_rows_count_once() {
+        // c-usagefu r8 item 4: an upgraded pre-r6 DB has BOTH a Message and a
+        // Turn row (100 output each) per call. The rollup, instance
+        // aggregate, and supply aggregate must all read 100, not 200.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let at = ago(2); // recent enough for the 60 s / 5 min rate windows
+        let at = at.as_str();
+        let project = |seq: i64, scope: &str, scope_id: &str| {
+            let rec = JournalRecord {
+                instance_id: "ins_up".into(),
+                seq,
+                event_id: format!("e{seq}"),
+                event: json!({
+                    "kind":"usage",
+                    "nativeAt":{"state":"known","value":at},
+                    "source":{"nativeTurnId":{"state":"known","value":"t1"}},
+                    "payload":{
+                        "scope":scope,"scopeId":scope_id,"mode":"snapshot","metricRevision":"1",
+                        "inputTokens":{"state":"known","value":"0"},
+                        "outputTokens":{"state":"known","value":"100"},
+                        "cost":{"state":"known","value":{"amount":"0.10","currency":"USD"}},
+                        "accounting":"estimated",
+                    }
+                }),
+                observed_at: at.into(),
+            };
+            project_usage_event(&rec, Some("pvp_up"), Some("gpt-5.4")).unwrap()
+        };
+        insert_row(&conn, &project(1, "message", "r1")).unwrap();
+        insert_row(&conn, &project(2, "turn", "t1")).unwrap();
+
+        assert_eq!(
+            aggregate_instance(&conn, "ins_up").unwrap().output_tokens,
+            Some(100)
+        );
+        assert_eq!(
+            aggregate_supply(&conn, "pvp_up", "gpt-5.4")
+                .unwrap()
+                .output_tokens,
+            Some(100)
+        );
+        let rollup = rollup_fold(&conn, "ins_up", "codex", Some("gpt-5.4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_output_tokens, Some(100));
+        assert_eq!(
+            rollup.tpm_out_60s,
+            Some(100),
+            "rate window also reads one stream"
+        );
+    }
+
+    #[test]
+    fn pre_r6_dual_scope_rows_bill_once_from_message_stream() {
+        // c-usagefu r7 item 4: databases written BEFORE r6 hold BOTH a Message
+        // and a Turn row per priced codex call (the old adapter emitted both).
+        // Token sums must not double and the priced/unpriced/priced cost must
+        // be 0.30 (Message flow), not 0.60 (Message + Turn) and not frozen.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let project =
+            |seq: i64, scope: &str, scope_id: &str, turn_id: Option<&str>, cost: Option<&str>| {
+                let mut event = json!({
+                    "kind": "usage",
+                    "source": { "nativeTurnId": turn_id.map(|t| json!({
+                        "state": "known", "value": t })) },
+                    "payload": {
+                        "scope": scope,
+                        "scopeId": scope_id,
+                        "mode": "snapshot",
+                        "metricRevision": "1",
+                        "inputTokens": { "state": "known", "value": "0" },
+                        "outputTokens": { "state": "known", "value": "10000" },
+                        "cost": if let Some(amount) = cost {
+                            json!({ "state": "known",
+                                     "value": { "amount": amount, "currency": "USD" } })
+                        } else {
+                            json!({ "state": "unknown", "reason": "unpriced-model-or-no-usage",
+                                     "evidenceEventIds": [] })
+                        },
+                        "accounting": "estimated",
+                        "nativeAt": { "state": "known",
+                                       "value": "2026-09-15T00:00:00.000Z" },
+                    }
+                });
+                if turn_id.is_none() {
+                    event["source"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("nativeTurnId");
+                }
+                let rec = JournalRecord {
+                    instance_id: "ins_dual".into(),
+                    seq,
+                    event_id: format!("evt_dual_{seq}"),
+                    event,
+                    observed_at: "2026-09-15T00:00:00.000Z".into(),
+                };
+                project_usage_event(&rec, Some("pvp_dual"), Some("gpt-5.4")).unwrap()
+            };
+        let s1 = |seq: i64, revision: i64, cost: Option<&str>| {
+            let rec = tokenless_session_record_for("ins_dual", seq, "s1", revision, cost);
+            project_usage_event(&rec, Some("pvp_dual"), Some("gpt-5.4")).unwrap()
+        };
+        // Turn 1: Message r1 ($0.10) AND Turn t1 ($0.10).
+        let mut seq = 1i64;
+        insert_row(
+            &conn,
+            &project(seq, "message", "r1", Some("t1"), Some("0.10")),
+        )
+        .unwrap();
+        seq += 1;
+        insert_row(&conn, &project(seq, "turn", "t1", Some("t1"), Some("0.10"))).unwrap();
+        seq += 1;
+        // Session cumulative point priced $0.10.
+        insert_usage_event(&conn, &s1(seq, 1, Some("0.10"))).unwrap();
+        seq += 1;
+        // Turn 2 unpriced: Message + Turn both unknown cost; session NULL.
+        insert_row(&conn, &project(seq, "message", "r2", Some("t2"), None)).unwrap();
+        seq += 1;
+        insert_row(&conn, &project(seq, "turn", "t2", Some("t2"), None)).unwrap();
+        seq += 1;
+        insert_usage_event(&conn, &s1(seq, 2, None)).unwrap();
+        seq += 1;
+        // Turn 3 priced $0.20: Message + Turn + session.
+        insert_row(
+            &conn,
+            &project(seq, "message", "r3", Some("t3"), Some("0.20")),
+        )
+        .unwrap();
+        seq += 1;
+        insert_row(&conn, &project(seq, "turn", "t3", Some("t3"), Some("0.20"))).unwrap();
+        seq += 1;
+        insert_usage_event(&conn, &s1(seq, 3, None)).unwrap();
+
+        let instance = aggregate_instance(&conn, "ins_dual").unwrap();
+        assert!(
+            (instance.cost_usd.unwrap() - 0.30).abs() < 1e-9,
+            "dual-scope rows bill once (Message stream): 0.30, got {}",
+            instance.cost_usd.unwrap()
+        );
+        // Output tokens: 3 Message rows x 10000 = 30000, NOT 60000.
+        assert_eq!(
+            instance.output_tokens,
+            Some(30_000),
+            "tokens are not doubled across Message+Turn"
+        );
+        let supply = aggregate_supply(&conn, "pvp_dual", "gpt-5.4").unwrap();
+        assert!(
+            (supply.cost_usd.unwrap() - 0.30).abs() < 1e-9,
+            "supply also unduplicated, got {}",
+            supply.cost_usd.unwrap()
+        );
+        assert_eq!(supply.output_tokens, Some(30_000));
+    }
+
+    #[test]
+    fn a_null_newest_session_point_switches_the_instance_to_flow_billing() {
+        // r5 item 3 exact regression sequence (r4 sticky-Unknown driver):
+        //   turn 1: priced session stock 0.50 (turn row 0.10)
+        //   turn 2: unpriced model -> session point NULL (turn row unpriced)
+        //   turn 3: priced again -> session point STILL NULL (sticky Unknown),
+        //            turn row 0.20
+        // r4 ranked only priced session rows, so the stock stayed 0.50 and
+        // the instance was excluded from flow: /usage froze and the stop band
+        // was unreachable. Now a NULL newest point makes the instance
+        // stock-LESS and the priced per-call flow (0.10 + 0.20) is the bill.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let project = |rec: &JournalRecord| {
+            project_usage_event(rec, Some("pvp_sticky"), Some("gw/sticky")).unwrap()
+        };
+        // Turn 1: priced stock + priced turn estimate.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project(&priced_turn_record("ins_sticky", 1, "msg_1", "0.10"))
+            )
+            .unwrap()
+        );
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project(&tokenless_session_record_for(
+                    "ins_sticky",
+                    2,
+                    "s1",
+                    1,
+                    Some("0.50")
+                ))
+            )
+            .unwrap()
+        );
+        assert!(
+            (aggregate_instance(&conn, "ins_sticky")
+                .unwrap()
+                .cost_usd
+                .unwrap()
+                - 0.10)
+                .abs()
+                < 1e-9,
+            "eligible flow exists: the priced Turn 0.10 is the bill, stock ignored (r10 item 6)"
+        );
+        // Turn 2: unpriced session point becomes the newest point.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project(&tokenless_session_record_for(
+                    "ins_sticky",
+                    3,
+                    "s1",
+                    2,
+                    None
+                ))
+            )
+            .unwrap()
+        );
+        // Turn 3: session still NULL-cost, but a priced per-call row arrives.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project(&priced_turn_record("ins_sticky", 4, "msg_3", "0.20"))
+            )
+            .unwrap()
+        );
+        // (The NULL point at seq 3 is already the newest session point; a
+        // second identical NULL point is frozen as a duplicate.)
+
+        let agg = aggregate_instance(&conn, "ins_sticky").unwrap();
+        assert!(
+            (agg.cost_usd.unwrap() - 0.30).abs() < 1e-9,
+            "sticky-NULL newest stock -> flow 0.10 + 0.20, got {}",
+            agg.cost_usd.unwrap()
+        );
+        // The supply aggregate follows the same instance-level rule.
+        let supply = aggregate_supply(&conn, "pvp_sticky", "gw/sticky").unwrap();
+        assert!(
+            (supply.cost_usd.unwrap() - 0.30).abs() < 1e-9,
+            "supply advances on flow after the NULL newest point, got {}",
+            supply.cost_usd.unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_null_scope_cost_is_ignored_once_an_instance_has_scoped_sessions() {
+        // r5 item 7: a session that straddled the scopeId upgrade has both
+        // legacy NULL-scope rows and newer scoped rows. The legacy chain and
+        // the scoped partitions are the SAME cumulative session, so summing
+        // both double-counts. Scoped wins (matching the token rule): once any
+        // scoped row exists, NULL-scope stock contributes nothing.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        // Legacy world: NULL scope_id priced at 0.40.
+        let mut legacy = tokenless_session_record(1, "ignored-scope", 1, Some("0.40"));
+        legacy.event["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("scopeId");
+        assert!(insert(&conn, &legacy));
+        // Post-upgrade: scoped cumulative 0.50.
+        assert!(insert(
+            &conn,
+            &tokenless_session_record_for("ins_test", 2, "s1", 1, Some("0.50"))
+        ));
+
+        let agg = aggregate_instance(&conn, "ins_test").unwrap();
+        assert!(
+            (agg.cost_usd.unwrap() - 0.50).abs() < 1e-9,
+            "scoped stock alone counts (no 0.40 + 0.50), got {}",
+            agg.cost_usd.unwrap()
+        );
+
+        // With no scoped rows the legacy NULL-scope chain still works on its
+        // own.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let mut legacy = tokenless_session_record(1, "ignored-scope", 1, Some("0.30"));
+        legacy.event["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("scopeId");
+        assert!(insert(&conn, &legacy));
+        let agg = aggregate_instance(&conn, "ins_test").unwrap();
+        assert!(
+            (agg.cost_usd.unwrap() - 0.30).abs() < 1e-9,
+            "legacy chain still sums"
+        );
+    }
+
+    /// A result-frame session point: no token buckets (the SDK result omits
+    /// per-call counters), just the reported cumulative cost.
+    fn tokenless_session_record(
+        seq: i64,
+        scope_id: &str,
+        revision: i64,
+        cost: Option<&str>,
+    ) -> JournalRecord {
+        let mut payload = serde_json::Map::new();
+        payload.insert("scope".into(), json!("session"));
+        payload.insert("scopeId".into(), json!(scope_id));
+        payload.insert("mode".into(), json!("snapshot"));
+        payload.insert("metricRevision".into(), json!(revision.to_string()));
+        payload.insert(
+            "cost".into(),
+            cost.map_or(
+                json!({ "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] }),
+                |amount| {
+                    json!({
+                        "state": "known",
+                        "value": { "amount": amount, "currency": "USD" }
+                    })
+                },
+            ),
+        );
+        payload.insert("accounting".into(), json!("estimated"));
+        JournalRecord {
+            instance_id: "ins_test".into(),
+            seq,
+            event_id: format!("evt_{seq}"),
+            event: json!({ "kind": "usage", "payload": Value::Object(payload) }),
+            observed_at: "2026-09-15T00:00:00.000Z".into(),
+        }
+    }
+
+    #[test]
+    fn cost_is_the_sum_of_the_newest_stock_per_session_scope_in_one_instance() {
+        // r4 item 1: a single global newest-row stock let one session answer
+        // for the instance. Two native sessions (codex rebind) each carry a
+        // cumulative reported cost; the bill is the newest accepted point per
+        // (instance, scope_id), summed — 0.50 + 0.05, never the interleave of
+        // whichever row landed last. r10 item 6 keeps this ONLY for a
+        // stock-ONLY instance: no per-call eligible flow is present here, so
+        // the cumulative stock is the bill (Ruling B).
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Session s1 reports 0.40 then 0.50 (only the newest counts).
+        assert!(insert(
+            &conn,
+            &tokenless_session_record_for("ins_two", 1, "s1", 1, Some("0.40"))
+        ));
+        assert!(insert(
+            &conn,
+            &tokenless_session_record_for("ins_two", 2, "s2", 1, Some("0.05"))
+        ));
+        assert!(insert(
+            &conn,
+            &tokenless_session_record_for("ins_two", 3, "s1", 2, Some("0.50"))
+        ));
+
+        let agg = aggregate_instance(&conn, "ins_two").unwrap();
+        assert!(
+            (agg.cost_usd.unwrap() - 0.55).abs() < 1e-9,
+            "newest per-session stocks summed (0.50 + 0.05), got {}",
+            agg.cost_usd.unwrap()
+        );
+    }
+
+    #[test]
+    fn supply_cost_sums_session_stocks_across_instances() {
+        // Ten (here two) SDK instances, each reporting a $5 cumulative session
+        // stock on one profile: the profile usage is $10, not $5.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let project = |rec: &JournalRecord| {
+            project_usage_event(rec, Some("pvp_cost"), Some("gw/model-cost")).unwrap()
+        };
+        let r1 = project(&tokenless_session_record_for(
+            "ins_a",
+            1,
+            "s1",
+            1,
+            Some("5.00"),
+        ));
+        let r2 = project(&tokenless_session_record_for(
+            "ins_b",
+            1,
+            "s1",
+            1,
+            Some("5.00"),
+        ));
+        assert!(insert_usage_event(&conn, &r1).unwrap());
+        assert!(insert_usage_event(&conn, &r2).unwrap());
+
+        let supply = aggregate_supply(&conn, "pvp_cost", "gw/model-cost").unwrap();
+        assert!(
+            (supply.cost_usd.unwrap() - 10.0).abs() < 1e-9,
+            "stocks summed across instances, got {}",
+            supply.cost_usd.unwrap()
+        );
+    }
+
+    #[test]
+    fn a_per_call_only_instance_keeps_its_flow_sum_beside_a_priced_instance() {
+        // The flow fallback is keyed per INSTANCE (turn rows carry no session
+        // key): instance B reports only per-call estimates and must not be
+        // wiped because A carries stock. r10 item 6 (Ruling B): COST follows
+        // the eligible-flow decision — A has a priced stock AND its own
+        // eligible per-call Turn, so A bills that FLOW (0.10) and its stock is
+        // ignored; stock-less B contributes its flow 0.02 + 0.01. Total 0.13.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let project = |rec: &JournalRecord| {
+            project_usage_event(rec, Some("pvp_mix"), Some("gw/model-mix")).unwrap()
+        };
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project(&tokenless_session_record_for(
+                    "ins_a",
+                    1,
+                    "s1",
+                    1,
+                    Some("0.50")
+                ))
+            )
+            .unwrap()
+        );
+        // ins_a has eligible flow: its own turn estimate is the bill, not the
+        // 0.50 stock (Ruling B item 6).
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project(&priced_turn_record("ins_a", 2, "ma", "0.10"))
+            )
+            .unwrap()
+        );
+        // ins_b, stock-less, contributes its per-call flow.
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project(&priced_turn_record("ins_b", 1, "mb1", "0.02"))
+            )
+            .unwrap()
+        );
+        assert!(
+            insert_usage_event(
+                &conn,
+                &project(&priced_turn_record("ins_b", 2, "mb2", "0.01"))
+            )
+            .unwrap()
+        );
+
+        let supply = aggregate_supply(&conn, "pvp_mix", "gw/model-mix").unwrap();
+        assert!(
+            (supply.cost_usd.unwrap() - 0.13).abs() < 1e-9,
+            "A's flow 0.10 + B's flow 0.03 (A stock ignored), got {}",
+            supply.cost_usd.unwrap()
+        );
+    }
+
+    #[test]
+    fn priced_flow_cost_is_billed_alongside_an_unmatched_historical_turn_ignoring_stock() {
+        // c-usagefu r10 item 6 (Ruling B): COST follows the exact eligible-flow
+        // decision as tokens. An unmatched historical Turn t1 ($0.10) and a NEW
+        // Message r2 ($0.05, no matching Turn) are both eligible flow; r2
+        // carries a priced cumulative Session snapshot ($0.99). Because an
+        // eligible flow EXISTS, the priced stock must NOT be selected: the bill
+        // is the unmatched Turn 0.10 + the Message 0.05 = 0.15 (and tokens are
+        // the same flow 100 + 50 = 150), never the 0.99 stock.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let project = |seq: i64,
+                       scope: &str,
+                       scope_id: &str,
+                       turn: Option<&str>,
+                       out: i64,
+                       cost: Option<&str>| {
+            let mut event = json!({
+                "kind": "usage",
+                "nativeAt": {"state": "known", "value": "2030-01-01T00:00:00.000Z"},
+                "payload": {
+                    "scope": scope,
+                    "scopeId": scope_id,
+                    "mode": "snapshot",
+                    "metricRevision": "1",
+                    "inputTokens": {"state": "known", "value": "0"},
+                    "outputTokens": {"state": "known", "value": out.to_string()},
+                    "cost": if let Some(amount) = cost {
+                        json!({"state": "known",
+                               "value": {"amount": amount, "currency": "USD"}})
+                    } else {
+                        json!({"state": "unknown", "reason": "unpriced",
+                               "evidenceEventIds": []})
+                    },
+                    "accounting": "estimated"
+                }
+            });
+            if let Some(t) = turn {
+                event["source"] = json!({"nativeTurnId": {"state": "known", "value": t}});
+            }
+            let rec = JournalRecord {
+                instance_id: "ins_cost6".into(),
+                seq,
+                event_id: format!("e{seq}"),
+                event,
+                observed_at: "2030-01-01T00:00:00.000Z".into(),
+            };
+            project_usage_event(&rec, Some("pvp_cost6"), Some("gpt-5.4")).unwrap()
+        };
+        // Historical unmatched Turn t1.
+        insert_row(
+            &conn,
+            &project(1, "turn", "t1", Some("t1"), 100, Some("0.10")),
+        )
+        .unwrap();
+        // New Message r2 for a turn with NO Turn row (eligible flow).
+        insert_row(
+            &conn,
+            &project(2, "message", "resp2", Some("t2"), 50, Some("0.05")),
+        )
+        .unwrap();
+        // A priced cumulative Session snapshot that accompanies r2.
+        let stock = project_usage_event(
+            &tokenless_session_record_for("ins_cost6", 3, "s1", 1, Some("0.99")),
+            Some("pvp_cost6"),
+            Some("gpt-5.4"),
+        )
+        .unwrap();
+        insert_usage_event(&conn, &stock).unwrap();
+
+        let agg = aggregate_instance(&conn, "ins_cost6").unwrap();
+        assert_eq!(
+            agg.output_tokens,
+            Some(150),
+            "flow tokens 100 + 50, stock ignored"
+        );
+        assert!(
+            (agg.cost_usd.unwrap() - 0.15).abs() < 1e-9,
+            "flow cost 0.10 + 0.05, never the 0.99 priced stock, got {}",
+            agg.cost_usd.unwrap()
+        );
+        let supply = aggregate_supply(&conn, "pvp_cost6", "gpt-5.4").unwrap();
+        assert_eq!(supply.output_tokens, Some(150));
+        assert!((supply.cost_usd.unwrap() - 0.15).abs() < 1e-9);
+        let rollup = rollup_fold(&conn, "ins_cost6", "codex", Some("gpt-5.4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.session_output_tokens, Some(150));
+    }
+
+    /// Token-less session growth point with an explicit instance id.
+    fn tokenless_session_record_for(
+        instance_id: &str,
+        seq: i64,
+        scope_id: &str,
+        revision: i64,
+        cost: Option<&str>,
+    ) -> JournalRecord {
+        let mut rec = tokenless_session_record(seq, scope_id, revision, cost);
+        rec.instance_id = instance_id.into();
+        rec
+    }
+
+    /// A priced per-call (turn) row for an arbitrary instance.
+    fn priced_turn_record(
+        instance_id: &str,
+        seq: i64,
+        scope_id: &str,
+        cost: &str,
+    ) -> JournalRecord {
+        let mut rec = usage_record(seq, 100, Some(cost));
+        rec.instance_id = instance_id.into();
+        rec.event["payload"]["scopeId"] = json!(scope_id);
+        rec
+    }
+
+    #[test]
     fn budget_band_uses_estimate_times_tolerance() {
         let agg = UsageAggregate {
             cost_usd: Some(4.9),
@@ -2376,42 +7133,6 @@ mod tests {
         )
     }
 
-    fn row(
-        seq: i64,
-        observed_at: &str,
-        input: Option<i64>,
-        output: Option<i64>,
-        cache_read: Option<i64>,
-        cache_write: Option<i64>,
-    ) -> UsageEventRow {
-        UsageEventRow {
-            instance_id: "ins_test".into(),
-            seq,
-            profile_id: None,
-            model: None,
-            scope: "turn".into(),
-            scope_id: None,
-            mode: "snapshot".into(),
-            metric_revision: 1,
-            source_session_id: None,
-            total_tokens: None,
-            input_tokens: input,
-            output_tokens: output,
-            cache_read_tokens: cache_read,
-            cache_write_tokens: cache_write,
-            cost_usd: None,
-            accounting: "estimated".into(),
-            observed_at: observed_at.into(),
-            observed_at_source: "native".into(),
-        }
-    }
-
-    /// Three real `message.usage` frames recorded from a Claude Code 2.1.x
-    /// transcript on the dev host (assistant records, per turn):
-    ///   `{input_tokens, cache_creation_input_tokens, cache_read_input_tokens, output_tokens}`
-    /// = (4794, 0, 29496, 260), (1839, 0, 33592, 185), (1223, 0, 34616, 144).
-    /// Timestamps are re-anchored to exercise the TPM windows; the counters
-    /// are byte-for-byte the native record.
     #[test]
     fn session_snapshots_are_revision_replaced_not_frozen_or_summmed() {
         // c-ctxusage r4: cumulative session snapshots are append-only GROWTH
@@ -2426,6 +7147,8 @@ mod tests {
             model: Some("grok-x".into()),
             scope: "session".into(),
             scope_id: Some("grok-session".into()),
+            turn_id: None,
+            native_context_window: None,
             mode: "snapshot".into(),
             metric_revision: rev,
             source_session_id: None,
@@ -2471,9 +7194,18 @@ mod tests {
             .unwrap();
         assert_eq!((rev, input, output), (1, 300, 30), "restarted growth wins");
         // Session-only totals roll up from the current stock.
-        let rollup = rollup_instance(&conn, "ins_g", "grok", Some("grok-x"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_g",
+                kind: "grok",
+                spec_model: Some("grok-x"),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(rollup.turns, 0, "session snapshots are not turns");
         assert_eq!(rollup.session_input_tokens, Some(300));
         assert_eq!(rollup.session_output_tokens, Some(30));
@@ -2492,6 +7224,8 @@ mod tests {
             model: Some("codex".to_string()),
             scope: "turn".into(),
             scope_id: Some(format!("turn-{seq}")),
+            turn_id: None,
+            native_context_window: None,
             mode: "snapshot".into(),
             metric_revision: seq,
             // Production Codex turns are qualified to their native session;
@@ -2511,6 +7245,8 @@ mod tests {
         let cumulative = |seq: i64, input: i64, output: i64| UsageEventRow {
             scope: "session".into(),
             scope_id: Some("codex-session".into()),
+            turn_id: None,
+            native_context_window: None,
             metric_revision: seq,
             ..turn(seq + 10, input, output)
         };
@@ -2519,7 +7255,7 @@ mod tests {
         insert_usage_event(&conn, &turn(2, 50, 5)).unwrap();
         insert_usage_event(&conn, &cumulative(2, 150, 15)).unwrap();
 
-        let rollup = rollup_instance(&conn, "ins_c", "codex", Some("codex"))
+        let rollup = rollup_fold(&conn, "ins_c", "codex", Some("codex"))
             .unwrap()
             .unwrap();
         assert_eq!(rollup.turns, 2);
@@ -2558,7 +7294,7 @@ mod tests {
             .unwrap();
         }
 
-        let rollup = rollup_instance(&conn, "ins_test", "claude", None)
+        let rollup = rollup_fold(&conn, "ins_test", "claude", None)
             .unwrap()
             .unwrap();
         assert_eq!(rollup.turns, 3);
@@ -2600,6 +7336,8 @@ mod tests {
                     model: Some("m".into()),
                     scope: "turn".into(),
                     scope_id: Some(scope_id.into()),
+                    turn_id: None,
+                    native_context_window: None,
                     mode: "snapshot".into(),
                     metric_revision: 1,
                     source_session_id: Some(lineage.into()),
@@ -2639,9 +7377,18 @@ mod tests {
             insert_usage_event(&conn, &lineage_turn(21, "turn-b", "beta", 22, 2, ago(3))).unwrap()
         );
 
-        let rollup = rollup_instance(&conn, "ins_tpm", "claude", Some("m"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_tpm",
+                kind: "claude",
+                spec_model: Some("m"),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             rollup.tpm_in_60s,
             Some(22),
@@ -2691,6 +7438,8 @@ mod tests {
                 model: Some("m".into()),
                 scope: "turn".into(),
                 scope_id: Some(scope_id.into()),
+                turn_id: None,
+                native_context_window: None,
                 mode: "snapshot".into(),
                 metric_revision: 1,
                 source_session_id: Some(lineage.into()),
@@ -2724,9 +7473,18 @@ mod tests {
             .unwrap()
         );
 
-        let rollup = rollup_instance(&conn, "ins_tpm_prov", "claude", Some("m"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_tpm_prov",
+                kind: "claude",
+                spec_model: Some("m"),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         // The superseded native alpha row must NOT be resurrected: its 100
         // input / 10 output never enter the 60 s window.
         assert_eq!(rollup.tpm_in_60s, None, "no native-time winner contributes");
@@ -2748,6 +7506,8 @@ mod tests {
             model: Some("m".into()),
             scope: "session".into(),
             scope_id: Some("sess-1".into()),
+            turn_id: None,
+            native_context_window: None,
             mode: "snapshot".into(),
             metric_revision: revision,
             source_session_id: Some("sess-1".into()),
@@ -2799,6 +7559,8 @@ mod tests {
                 model: Some("m".into()),
                 scope: scope.into(),
                 scope_id: Some(scope_id.into()),
+                turn_id: None,
+                native_context_window: None,
                 mode: "snapshot".into(),
                 metric_revision: 1,
                 source_session_id: lineage.map(str::to_string),
@@ -2851,9 +7613,18 @@ mod tests {
         // coverage PER NATIVE SESSION — "covered"'s stock covers only its own
         // turn; the uncovered turn of another session is still added. It used
         // to return 100/10 whenever any session row existed.
-        let rollup = rollup_instance(&conn, "ins_mix", "codex", Some("m"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_mix",
+                kind: "codex",
+                spec_model: Some("m"),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             rollup.session_input_tokens,
             Some(107),
@@ -2876,9 +7647,18 @@ mod tests {
         turn.instance_id = "ins_u1a".into();
         insert_usage_event(&conn, &turn).unwrap();
 
-        let rollup = rollup_instance(&conn, "ins_u1a", "claude", None)
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_u1a",
+                kind: "claude",
+                spec_model: None,
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             rollup.context_used_tokens, None,
             "input 100 with unknown cache buckets is Unknown context"
@@ -2913,9 +7693,18 @@ mod tests {
             json!({ "state": "unknown", "reason": "unreported" });
         assert!(insert(&conn, &point));
 
-        let rollup = rollup_instance(&conn, "ins_u1b", "grok", None)
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_u1b",
+                kind: "grok",
+                spec_model: None,
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             rollup.context_used_tokens, None,
             "stock input 100 with unknown cache is Unknown context"
@@ -2963,9 +7752,18 @@ mod tests {
         assert!(insert(&conn, &s1));
         assert!(insert(&conn, &s2));
 
-        let rollup = rollup_instance(&conn, "ins_u1c", "grok", None)
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_u1c",
+                kind: "grok",
+                spec_model: None,
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             rollup.session_input_tokens, None,
             "s1's 100 cannot total with s2's unknown input"
@@ -3003,9 +7801,18 @@ mod tests {
                 Some(&ago(4))
             )
         ));
-        let rollup = rollup_instance(&conn, "ins_u1c2", "grok", None)
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_u1c2",
+                kind: "grok",
+                spec_model: None,
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(rollup.session_input_tokens, Some(150));
         assert_eq!(rollup.session_output_tokens, Some(15));
     }
@@ -3069,9 +7876,18 @@ mod tests {
             json!({ "state": "unknown", "reason": "unreported" });
         assert!(insert(&conn, &third));
 
-        let rollup = rollup_instance(&conn, "ins_u1d", "grok", None)
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_u1d",
+                kind: "grok",
+                spec_model: None,
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             rollup.tpm_in_60s, None,
             "the known +50 increment can't total past the unknown interval"
@@ -3090,7 +7906,7 @@ mod tests {
         // A Grok-like turn: output only, no input/cache breakdown.
         insert_usage_event(&conn, &row(1, &ago(2), None, Some(420), None, None)).unwrap();
 
-        let rollup = rollup_instance(&conn, "ins_test", "grok", None)
+        let rollup = rollup_fold(&conn, "ins_test", "grok", None)
             .unwrap()
             .unwrap();
         assert_eq!(rollup.turns, 1);
@@ -3105,7 +7921,7 @@ mod tests {
         assert_eq!(rollup.tpm_out_60s, Some(420));
 
         // A generic/terminal kind has no window table either.
-        let rollup = rollup_instance(&conn, "ins_test", "generic", None)
+        let rollup = rollup_fold(&conn, "ins_test", "generic", None)
             .unwrap()
             .unwrap();
         assert_eq!(rollup.context_window_tokens, None);
@@ -3117,32 +7933,237 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         assert!(
-            rollup_instance(&conn, "ins_empty", "claude", None)
-                .unwrap()
-                .is_none()
+            rollup_instance(
+                &conn,
+                &RollupRequest {
+                    instance_id: "ins_empty",
+                    kind: "claude",
+                    spec_model: None,
+                    effective_model: None,
+                    profile_id: None
+                }
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
     #[test]
     fn context_window_resolution_order() {
-        // Explicit [1m] tag wins over everything.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let req = |kind: &'static str,
+                   spec: Option<&'static str>,
+                   eff: Option<&'static str>|
+         -> RollupRequest<'static> {
+            RollupRequest {
+                instance_id: "ins_x",
+                kind,
+                spec_model: spec,
+                effective_model: eff,
+                profile_id: None,
+            }
+        };
+        // Explicit [1m] tag wins over everything, not approximate.
         assert_eq!(
-            context_window_tokens("claude", Some("gw/model_x[1m]")),
-            Some(1_000_000)
+            resolve_context_window(&conn, &req("claude", None, Some("gw/model_x[1m]")), None),
+            (Some(1_000_000), false)
         );
-        // Static catalog row for a real model.
-        assert!(context_window_tokens("claude", Some("claude-opus-5")).is_some());
-        // Kind fallback when the model is unknown.
+        // Catalog row for a real effective model.
+        assert!(
+            resolve_context_window(&conn, &req("claude", None, Some("claude-opus-5")), None)
+                .0
+                .is_some()
+        );
+        // Unknown model keeps the harness-kind fallback and is approximate.
         assert_eq!(
-            context_window_tokens("grok", Some("mystery-model")),
-            Some(128_000)
+            resolve_context_window(&conn, &req("grok", None, Some("mystery-model")), None),
+            (Some(128_000), true)
         );
-        assert_eq!(context_window_tokens("claude", None), Some(200_000));
-        // Nothing to say for a generic PTY.
-        assert_eq!(context_window_tokens("generic", None), None);
+        assert_eq!(
+            resolve_context_window(&conn, &req("claude", None, None), None),
+            (Some(200_000), true)
+        );
+        // Generic/terminal kind has no fallback at all.
+        assert_eq!(
+            resolve_context_window(&conn, &req("generic", None, None), None),
+            (None, false)
+        );
+        // Native report beats every model-based source.
+        assert_eq!(
+            resolve_context_window(&conn, &req("grok", None, Some("mystery")), Some(123_456)),
+            (Some(123_456), false)
+        );
+    }
+
+    #[test]
+    fn provider_profile_window_beats_kind_fallback_and_is_not_approximate() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "CREATE TABLE provider_profiles (
+                id TEXT PRIMARY KEY,
+                models_json TEXT NOT NULL DEFAULT '[]'
+             );",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_profiles (id, models_json) VALUES ('pvp_test', '[{\"id\":\"gw/model-x\",\"enabled\":true,\"contextWindow\":250000}]')",
+            [],
+        )
+        .unwrap();
+        let req = RollupRequest {
+            instance_id: "ins_x",
+            kind: "claude",
+            spec_model: Some("gw/model-x"),
+            effective_model: None,
+            profile_id: Some("pvp_test"),
+        };
+        assert_eq!(
+            resolve_context_window(&conn, &req, None),
+            (Some(250_000), false),
+            "profile-declared window is evidence, not an estimate"
+        );
+    }
+
+    #[test]
+    fn provider_profile_window_beats_the_static_catalog_and_is_exact() {
+        // c-usagefu r2 item 4: a gateway serving a catalog-known model at its
+        // OWN window (models_json contextWindow) must not be overridden by the
+        // catalog row. claude-sonnet-5 is 1,000,000 in the static catalog; the
+        // gateway serves it at 200,000. Old order reported 18% at 180k used;
+        // correct is 90%.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "CREATE TABLE provider_profiles (
+                id TEXT PRIMARY KEY,
+                models_json TEXT NOT NULL DEFAULT '[]'
+             );",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_profiles (id, models_json) VALUES \
+             ('pvp_sonnet', '[{\"id\":\"claude-sonnet-5\",\"enabled\":true,\"contextWindow\":200000}]')",
+            [],
+        )
+        .unwrap();
+        let req = RollupRequest {
+            instance_id: "ins_x",
+            kind: "claude",
+            spec_model: Some("claude-sonnet-5"),
+            effective_model: None,
+            profile_id: Some("pvp_sonnet"),
+        };
+        assert_eq!(
+            resolve_context_window(&conn, &req, None),
+            (Some(200_000), false),
+            "profile's 200k beats the catalog's 1m and is exact, not approximate"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_effective_model_falls_back_approximate_not_to_the_launch_window() {
+        // c-usagefu r2 item 4: after a /model switch to a model the store cannot
+        // resolve, the LAUNCH model's window must not be used as exact. The
+        // effective id is the only candidate; resolving to nothing goes to the
+        // harness-kind fallback marked approximate.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let req = RollupRequest {
+            instance_id: "ins_x",
+            kind: "claude",
+            // Launch model has a known 1m window.
+            spec_model: Some("claude-sonnet-5"),
+            // Switched to something unknown.
+            effective_model: Some("gateway/renamed-thing"),
+            profile_id: None,
+        };
+        assert_eq!(
+            resolve_context_window(&conn, &req, None),
+            (Some(200_000), true),
+            "unknown effective model -> kind fallback, approximate, never the 1m launch window"
+        );
+
+        // With NO effective model, the launch window IS consulted and is exact.
+        let launch_only = RollupRequest {
+            effective_model: None,
+            ..req
+        };
+        assert_eq!(
+            resolve_context_window(&conn, &launch_only, None),
+            (Some(1_000_000), false),
+            "spec model is consulted and exact only when no effective model exists"
+        );
+    }
+
+    #[test]
+    fn one_million_switch_refreshes_the_rollup_window_end_to_end() {
+        // c-usagefu (c): native-time window resolution is what makes a
+        // /model switch to [1m] change the chip percentage on the next read.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        insert_usage_event(
+            &conn,
+            &project_usage_event(
+                &usage_record(1, 50_000, Some("0.01")),
+                None,
+                Some("passthrough/ark/seed-evolving"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let before = rollup_fold(
+            &conn,
+            "ins_test",
+            "claude",
+            Some("passthrough/ark/seed-evolving"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(before.context_window_tokens, Some(200_000));
+        assert!(before.context_pct_approximate);
+        // usage_record(1, 50_000, ..) splits to 25k uncached input.
+        assert_eq!(before.context_pct, Some(13));
+        // A later [1m] effective model flips the window to 1,000,000.
+        let after = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_test",
+                kind: "claude",
+                spec_model: Some("passthrough/ark/seed-evolving"),
+                effective_model: Some("passthrough/ark/seed-evolving[1m]"),
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(after.context_window_tokens, Some(1_000_000));
+        assert!(!after.context_pct_approximate, "[1m] tag is evidence");
+        assert_eq!(after.context_pct, Some(3), "25k/1m = 2.5 -> 3%");
     }
 
     // --- c-ctxusage r3 -----------------------------------------------------
+
+    fn rollup_fold(
+        conn: &Connection,
+        instance_id: &str,
+        kind: &str,
+        model: Option<&str>,
+    ) -> rusqlite::Result<Option<InstanceUsageRollup>> {
+        rollup_instance(
+            conn,
+            &RollupRequest {
+                instance_id,
+                kind,
+                spec_model: model,
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+    }
 
     fn known_u(n: i64) -> Value {
         json!({ "state": "known", "value": n.to_string() })
@@ -3431,6 +8452,9 @@ mod tests {
 
     #[test]
     fn codex_mixed_turn_and_session_rows_use_one_stock_flow_rule() {
+        // r9 items 4/5: eligible per-call Turn flow plus a cumulative
+        // Session snapshot that covers more calls. The flow sums win and
+        // the stock is never a fallback; rates come from the flow alone.
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         let now = time::OffsetDateTime::now_utc();
@@ -3506,15 +8530,18 @@ mod tests {
             )
         ));
 
-        let rollup = rollup_instance(&conn, "ins_mix", "codex", None)
+        let rollup = rollup_fold(&conn, "ins_mix", "codex", None)
             .unwrap()
             .unwrap();
+        // r9 items 4/5: eligible flow exists, so the cumulative stock is
+        // NEVER used as a smaller-flow fallback — totals are the flow sums
+        // (200/100), even when the session snapshot reports more.
         assert_eq!(
             rollup.session_input_tokens,
-            Some(300),
-            "authoritative cumulative stock"
+            Some(200),
+            "eligible flow sum, never the larger cumulative stock fallback"
         );
-        assert_eq!(rollup.session_output_tokens, Some(120));
+        assert_eq!(rollup.session_output_tokens, Some(100));
         assert_eq!(rollup.turns, 2);
         // Context basket = the latest TURN call (input 100), never the
         // cumulative session total (which would be 300+).
@@ -3570,7 +8597,7 @@ mod tests {
                 Some(&recent)
             )
         ));
-        let rollup = rollup_instance(&conn, "ins_grok", "grok", None)
+        let rollup = rollup_fold(&conn, "ins_grok", "grok", None)
             .unwrap()
             .unwrap();
         assert_eq!(rollup.session_input_tokens, Some(200));
@@ -3603,7 +8630,7 @@ mod tests {
                 Some(&newer)
             )
         ));
-        let rollup = rollup_instance(&conn, "ins_grok", "grok", None)
+        let rollup = rollup_fold(&conn, "ins_grok", "grok", None)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3635,7 +8662,7 @@ mod tests {
             !insert(&conn, &historical),
             "a smaller historical stock never clobbers the current one"
         );
-        let rollup = rollup_instance(&conn, "ins_grok", "grok", None)
+        let rollup = rollup_fold(&conn, "ins_grok", "grok", None)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3835,7 +8862,7 @@ mod tests {
 
         // Item 5: everything is historical → totals rise but the rate window is
         // empty and lastTurnAt stays in the past.
-        let rollup = rollup_instance(&conn, &inst_str, "claude", Some("m"))
+        let rollup = rollup_fold(&conn, &inst_str, "claude", Some("m"))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -4012,7 +9039,7 @@ mod tests {
                 Some("2020-01-01T00:00:00.000Z")
             )
         ));
-        let rollup = rollup_instance(&conn, "ins_r4", "claude", None)
+        let rollup = rollup_fold(&conn, "ins_r4", "claude", None)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -4071,7 +9098,7 @@ mod tests {
         let row = project_usage_event(&ingest, None, None).unwrap();
         assert_eq!(row.observed_at_source, "ingest");
         assert!(insert_usage_event(&conn, &row).unwrap());
-        let rollup = rollup_instance(&conn, "ins_r5", "claude", None)
+        let rollup = rollup_fold(&conn, "ins_r5", "claude", None)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -4115,7 +9142,7 @@ mod tests {
         assert_eq!(at, "2020-01-01T00:00:00.000Z");
         assert_eq!(source, "native");
 
-        let rollup = rollup_instance(&conn, "ins_r5", "claude", None)
+        let rollup = rollup_fold(&conn, "ins_r5", "claude", None)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -5136,45 +10163,6 @@ mod tests {
         .unwrap();
     }
 
-    /// The current scope_id stamped on an instance's session row by seq.
-    fn scope_id_at(conn: &Connection, seq: i64) -> Option<String> {
-        conn.query_row(
-            "SELECT scope_id FROM usage_events WHERE seq = ?1 AND scope = 'session'",
-            params![seq],
-            |row| row.get(0),
-        )
-        .unwrap()
-    }
-
-    fn legacy_session_row(
-        seq: i64,
-        instance: &str,
-        input: i64,
-        output: i64,
-        at: &str,
-    ) -> UsageEventRow {
-        UsageEventRow {
-            instance_id: instance.into(),
-            seq,
-            profile_id: None,
-            model: Some("codex".into()),
-            scope: "session".into(),
-            scope_id: None,
-            mode: "snapshot".into(),
-            metric_revision: 1,
-            source_session_id: None,
-            total_tokens: Some(input + output),
-            input_tokens: Some(input),
-            output_tokens: Some(output),
-            cache_read_tokens: Some(0),
-            cache_write_tokens: Some(0),
-            cost_usd: None,
-            accounting: "estimated".into(),
-            observed_at: at.into(),
-            observed_at_source: "native".into(),
-        }
-    }
-
     /// r5 item 3A: codex session s1 then s2 — summed current stocks, boundary
     /// is not a reset increment.
     #[test]
@@ -5217,9 +10205,18 @@ mod tests {
             &conn,
             &s(4, "s2", 150, 15, "2020-01-01T00:00:30.000Z")
         ));
-        let rollup = rollup_instance(&conn, "ins_3a", "codex", Some("codex"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_3a",
+                kind: "codex",
+                spec_model: None,
+                effective_model: None,
+                profile_id: Some("codex"),
+            },
+        )
+        .unwrap()
+        .unwrap();
         // Current stocks summed: 300 (s1) + 150 (s2), not "newest row = 150".
         assert_eq!(rollup.session_input_tokens, Some(450));
         assert_eq!(rollup.session_output_tokens, Some(45));
@@ -5262,10 +10259,22 @@ mod tests {
             0,
             None,
         );
-        assert!(insert(&conn, &current), "growth above the floor appends");
-        let rollup = rollup_instance(&conn, "ins_3b", "codex", Some("codex"))
-            .unwrap()
-            .unwrap();
+        assert!(
+            insert(&conn, &current),
+            "growth above the legacy floor appends"
+        );
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_3b",
+                kind: "codex",
+                spec_model: None,
+                effective_model: None,
+                profile_id: Some("codex"),
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             rollup.session_input_tokens,
             Some(1200),
@@ -5344,9 +10353,18 @@ mod tests {
             ),
             "neither s1's stock nor the unproven legacy row may floor s2"
         );
-        let rollup = rollup_instance(&conn, "ins_8", "codex", Some("codex"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_8",
+                kind: "codex",
+                spec_model: Some("codex"),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             rollup.session_input_tokens,
             Some(1050),
@@ -5402,9 +10420,18 @@ mod tests {
         // stock vanished the instant any scoped row existed, leaving only
         // s2's 100/10. The backfilled identity keeps it in the total:
         // 1000 + 100 = 1100 / 110.
-        let rollup = rollup_instance(&conn, "ins_5b", "codex", Some("codex"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_5b",
+                kind: "codex",
+                spec_model: Some("codex"),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(rollup.session_input_tokens, Some(1100));
         assert_eq!(rollup.session_output_tokens, Some(110));
 
@@ -5426,9 +10453,18 @@ mod tests {
             )
         ));
 
-        let rollup = rollup_instance(&conn, "ins_5b", "codex", Some("codex"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_5b",
+                kind: "codex",
+                spec_model: Some("codex"),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             rollup.session_input_tokens,
             Some(1300),
@@ -5585,9 +10621,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(null_rows, 0);
-        let rollup = rollup_instance(&conn, "ins_r10", "codex", Some("codex"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r10",
+                kind: "codex",
+                spec_model: Some("codex"),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             rollup.session_input_tokens,
             Some(200),
@@ -5692,9 +10737,18 @@ mod tests {
             vec![(200, 20)],
             "the stale smaller replay is normalised away; the high-water stays"
         );
-        let rollup = rollup_instance(&conn, "ins_r11", "codex", Some("codex"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r11",
+                kind: "codex",
+                spec_model: Some("codex"),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             rollup.session_input_tokens,
             Some(200),
@@ -5715,9 +10769,18 @@ mod tests {
             &conn,
             &scoped_record(4, "ins_r11", "session", Some("s1"), 1, 250, 25, 0, 0, None)
         ));
-        let rollup = rollup_instance(&conn, "ins_r11", "codex", Some("codex"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r11",
+                kind: "codex",
+                spec_model: Some("codex"),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(rollup.session_input_tokens, Some(250));
         assert_eq!(rollup.session_output_tokens, Some(25));
 
@@ -5852,9 +10915,18 @@ mod tests {
             .unwrap()
         );
 
-        let rollup = rollup_instance(&conn, "ins_r57", "codex", None)
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r57",
+                kind: "codex",
+                spec_model: None,
+                effective_model: None,
+                profile_id: Some("codex"),
+            },
+        )
+        .unwrap()
+        .unwrap();
         // Totals still count; current windows and lastTurnAt do not.
         assert_eq!(rollup.session_input_tokens, Some(300));
         assert_eq!(rollup.session_output_tokens, Some(30));
@@ -5882,9 +10954,18 @@ mod tests {
             Some(&now), // scoped_record marks nativeAt -> source native
         );
         assert!(insert(&conn, &native));
-        let rollup = rollup_instance(&conn, "ins_r57", "codex", None)
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_r57",
+                kind: "codex",
+                spec_model: None,
+                effective_model: None,
+                profile_id: Some("codex"),
+            },
+        )
+        .unwrap()
+        .unwrap();
         // Only the native 40 is in-window; the ingest rows still count totals.
         assert_eq!(
             rollup.tpm_in_60s,
@@ -5938,9 +11019,18 @@ mod tests {
         );
         assert!(insert(&conn, &replay1));
         assert!(insert(&conn, &replay2));
-        let rollup = rollup_instance(&conn, "ins_live", "claude", None)
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_live",
+                kind: "claude",
+                spec_model: None,
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(rollup.turns, 2, "replayed turns count as turns");
         assert_eq!(
             rollup.session_input_tokens,
@@ -5978,9 +11068,18 @@ mod tests {
             "a stamped live result is a native-time row"
         );
         assert!(insert(&conn, &live));
-        let rollup = rollup_instance(&conn, "ins_live", "claude", None)
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_live",
+                kind: "claude",
+                spec_model: None,
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(rollup.turns, 3);
         assert_eq!(rollup.session_input_tokens, Some(1_450));
         assert_eq!(
@@ -6050,9 +11149,18 @@ mod tests {
             &scoped_record(11, "ins_9", "session", Some("g1"), 3, 140, 14, 0, 0, None)
         ));
 
-        let rollup = rollup_instance(&conn, "ins_9", "grok", None)
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_9",
+                kind: "grok",
+                spec_model: None,
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         // lastTurnAt tracks the native time, never the ingest fallback.
         assert_eq!(
             rollup.last_turn_at.as_deref(),
@@ -6083,9 +11191,18 @@ mod tests {
                 Some(&now)
             )
         ));
-        let rollup = rollup_instance(&conn, "ins_9", "grok", None)
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_9",
+                kind: "grok",
+                spec_model: None,
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             rollup.last_turn_at.as_deref(),
             Some(now.as_str()),
@@ -6195,9 +11312,18 @@ mod tests {
 
         // With a Turn row present the rollup rates come from the per-call
         // turn flow; the session stock stays the current 150/15 regardless.
-        let rollup = rollup_instance(&conn, "ins_cx", "codex", Some("codex"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_cx",
+                kind: "codex",
+                spec_model: Some("codex"),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(rollup.session_input_tokens, Some(150));
         assert_eq!(rollup.session_output_tokens, Some(15));
         assert_eq!(rollup.tpm_in_60s, Some(7));
@@ -6262,9 +11388,18 @@ mod tests {
         assert_eq!(increments[0].output, Some(10));
         assert_eq!(increments[0].end_at, native_at);
 
-        let rollup = rollup_instance(&conn, "ins_o3", "grok", None)
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_o3",
+                kind: "grok",
+                spec_model: None,
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             rollup.session_input_tokens,
             Some(150),
@@ -6325,9 +11460,18 @@ mod tests {
         );
         assert_eq!(increments[0].output, Some(5));
 
-        let rollup = rollup_instance(&conn, "ins_o4", "grok", None)
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_o4",
+                kind: "grok",
+                spec_model: None,
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         // The cumulative stock itself is still reported at 150.
         assert_eq!(rollup.session_input_tokens, Some(150));
         assert_eq!(rollup.session_output_tokens, Some(15));
@@ -6356,6 +11500,8 @@ mod tests {
             model: model.map(str::to_string),
             scope: "turn".into(),
             scope_id: Some(scope_id.into()),
+            turn_id: None,
+            native_context_window: None,
             mode: "snapshot".into(),
             metric_revision: 1,
             source_session_id: None,
@@ -6639,6 +11785,8 @@ mod tests {
             model: Some(model.into()),
             scope: "turn".into(),
             scope_id: None,
+            turn_id: None,
+            native_context_window: None,
             mode: "snapshot".into(),
             metric_revision: 1,
             source_session_id: None,
@@ -6656,12 +11804,16 @@ mod tests {
 
         // Instance B: one unscoped legacy cumulative SESSION row, $2.
         let legacy_session = UsageEventRow {
+            turn_id: None,
+            native_context_window: None,
             instance_id: "ins_legacy_b".into(),
             scope: "session".into(),
             seq: 1,
             ..legacy_turn.clone()
         };
         let legacy_session = UsageEventRow {
+            turn_id: None,
+            native_context_window: None,
             total_tokens: Some(220),
             input_tokens: Some(200),
             output_tokens: Some(20),
@@ -6700,6 +11852,8 @@ mod tests {
             model: Some(model.into()),
             scope: "turn".into(),
             scope_id: Some("msg-1".into()),
+            turn_id: None,
+            native_context_window: None,
             mode: "snapshot".into(),
             metric_revision: 1,
             source_session_id: Some("sess-x".into()),
@@ -6722,6 +11876,8 @@ mod tests {
             seq: 1,
             scope: "session".into(),
             scope_id: Some("sess-x".into()),
+            turn_id: None,
+            native_context_window: None,
             source_session_id: Some("sess-x".into()),
             ..turn.clone()
         };
@@ -6740,6 +11896,8 @@ mod tests {
             seq: 2,
             scope: "session".into(),
             scope_id: Some("sess-x".into()),
+            turn_id: None,
+            native_context_window: None,
             source_session_id: Some("sess-x".into()),
             ..turn
         };
@@ -6894,9 +12052,18 @@ mod tests {
                 "lineage is stamped only from proof"
             );
 
-            let rollup = rollup_instance(&conn, instance, "codex", Some("m-r29"))
-                .unwrap()
-                .unwrap();
+            let rollup = rollup_instance(
+                &conn,
+                &RollupRequest {
+                    instance_id: instance,
+                    kind: "codex",
+                    spec_model: Some("m-r29"),
+                    effective_model: None,
+                    profile_id: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
             let instance_agg = aggregate_instance(&conn, instance).unwrap();
             let supply = aggregate_supply(&conn, "pvp_r29", "m-r29").unwrap();
 
@@ -6948,6 +12115,8 @@ mod tests {
             model: Some(model.into()),
             scope: "session".into(),
             scope_id: None,
+            turn_id: None,
+            native_context_window: None,
             mode: "snapshot".into(),
             metric_revision: 1,
             source_session_id: None,
@@ -6965,9 +12134,18 @@ mod tests {
         // Monotone growth: the second cumulative point is accepted.
         assert!(insert_usage_event(&conn, &row(2, 150, 15)).unwrap());
 
-        let rollup = rollup_instance(&conn, "ins_null2", "codex", Some(model))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: "ins_null2",
+                kind: "codex",
+                spec_model: Some(model),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(rollup.session_input_tokens, Some(150), "newest stock");
         assert_eq!(rollup.session_output_tokens, Some(15));
 
@@ -7115,9 +12293,18 @@ mod tests {
             1,
             "duplicate lineage collapsed"
         );
-        let rollup = rollup_instance(&conn, instance, "codex", Some("m-r29"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: instance,
+                kind: "codex",
+                spec_model: Some("m-r29"),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(rollup.session_input_tokens, Some(100), "100/10, not 200/20");
         assert_eq!(rollup.session_output_tokens, Some(10));
         // The fold winner (newest accepted frame, seq 3, native time) survives.
@@ -7146,9 +12333,18 @@ mod tests {
         // still one row and the same totals.
         migrate(&conn).unwrap();
         assert_eq!(lineage_turn_rows(&conn, instance), 1);
-        let rollup = rollup_instance(&conn, instance, "codex", Some("m-r29"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: instance,
+                kind: "codex",
+                spec_model: Some("m-r29"),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(rollup.session_input_tokens, Some(100));
         assert_eq!(rollup.session_output_tokens, Some(10));
     }
@@ -7188,18 +12384,36 @@ mod tests {
             1,
             "the two restored rows collapse to one"
         );
-        let rollup = rollup_instance(&conn, instance, "codex", Some("m-r29"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: instance,
+                kind: "codex",
+                spec_model: Some("m-r29"),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(rollup.session_input_tokens, Some(100), "counted once");
         assert_eq!(rollup.session_output_tokens, Some(10));
         assert_eq!(rollup.turns, 1);
         // Idempotent re-run.
         migrate(&conn).unwrap();
         assert_eq!(lineage_turn_rows(&conn, instance), 1);
-        let rollup = rollup_instance(&conn, instance, "codex", Some("m-r29"))
-            .unwrap()
-            .unwrap();
+        let rollup = rollup_instance(
+            &conn,
+            &RollupRequest {
+                instance_id: instance,
+                kind: "codex",
+                spec_model: Some("m-r29"),
+                effective_model: None,
+                profile_id: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(rollup.session_input_tokens, Some(100));
         assert_eq!(rollup.session_output_tokens, Some(10));
     }
@@ -7228,6 +12442,8 @@ mod tests {
             model: Some(model_a.into()),
             scope: "turn".into(),
             scope_id: Some("turn-1".into()),
+            turn_id: None,
+            native_context_window: None,
             mode: "snapshot".into(),
             metric_revision: 1,
             source_session_id: Some(session.into()),
@@ -7246,6 +12462,8 @@ mod tests {
             seq: 2,
             scope: "session".into(),
             scope_id: Some(session.into()),
+            turn_id: None,
+            native_context_window: None,
             ..turn_a.clone()
         };
         assert!(insert_usage_event(&conn, &turn_a).unwrap());
@@ -7258,6 +12476,8 @@ mod tests {
             model: Some(model_b.into()),
             scope: "turn".into(),
             scope_id: Some("turn-2".into()),
+            turn_id: None,
+            native_context_window: None,
             metric_revision: 1,
             total_tokens: Some(170),
             input_tokens: Some(150),
@@ -7271,6 +12491,8 @@ mod tests {
             model: Some(model_b.into()),
             scope: "session".into(),
             scope_id: Some(session.into()),
+            turn_id: None,
+            native_context_window: None,
             total_tokens: Some(280),
             input_tokens: Some(250),
             output_tokens: Some(30),
@@ -7343,6 +12565,8 @@ mod tests {
             model: Some(model_a.into()),
             scope: "turn".into(),
             scope_id: None,
+            turn_id: None,
+            native_context_window: None,
             mode: "snapshot".into(),
             metric_revision: 1,
             source_session_id: None,
@@ -7364,6 +12588,8 @@ mod tests {
             model: Some(model_b.into()),
             scope: "session".into(),
             scope_id: Some(session.into()),
+            turn_id: None,
+            native_context_window: None,
             source_session_id: Some(session.into()),
             total_tokens: Some(280),
             input_tokens: Some(250),

@@ -10,7 +10,7 @@
 
 use remuda_driver::adapters::{AdapterHome, FileSignalAdapter, GrokAdapter, StampCtx, stamp};
 use remuda_hub::usage_store_test_support::{
-    JournalRecord, insert_usage_event, migrate, project_usage_event, rollup_instance,
+    JournalRecord, RollupRequest, insert_usage_event, migrate, project_usage_event, rollup_instance,
 };
 use remuda_protocol::{HostId, Id, InstanceId, Knowledge, ObservationPayload, RunId};
 use rusqlite::Connection;
@@ -106,6 +106,8 @@ fn grok_turn_end_native_ts_stamps_usage_and_projects_to_live_rates() {
         home: home.clone(),
         cwd: cwd.clone(),
         pid: None,
+        launched_at: None,
+        resume_session_id: None,
     });
     adapter.bind_session_dir(SESSION_ID, dir.clone());
 
@@ -159,9 +161,18 @@ fn grok_turn_end_native_ts_stamps_usage_and_projects_to_live_rates() {
         assert!(insert_usage_event(&conn, &row).expect("insert usage row"));
     }
 
-    let rollup = rollup_instance(&conn, INSTANCE_ID, "grok", None)
-        .expect("rollup")
-        .expect("rollup exists");
+    let rollup = rollup_instance(
+        &conn,
+        &RollupRequest {
+            instance_id: INSTANCE_ID,
+            kind: "grok",
+            spec_model: None,
+            effective_model: None,
+            profile_id: None,
+        },
+    )
+    .expect("rollup")
+    .expect("rollup exists");
     // Current cumulative stock.
     assert_eq!(rollup.session_input_tokens, Some(110));
     assert_eq!(rollup.session_output_tokens, Some(11));

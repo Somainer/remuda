@@ -66,6 +66,8 @@ fn replay_fixture() -> (tempfile::TempDir, GrokLive) {
             home: dir.path().to_path_buf(),
             cwd,
             pid: Some(24069),
+            launched_at: None,
+            resume_session_id: None,
         }),
         identity(),
     );

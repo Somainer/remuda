@@ -7,7 +7,7 @@
 
 use remuda_driver::StdoutMapper;
 use remuda_hub::usage_store_test_support::{
-    JournalRecord, insert_usage_event, migrate, project_usage_event, rollup_instance,
+    JournalRecord, RollupRequest, insert_usage_event, migrate, project_usage_event, rollup_instance,
 };
 use remuda_protocol::{DriverKind, Observation, ObservationPayload};
 
@@ -61,9 +61,18 @@ fn live_print_result_flows_into_the_tpm_window_end_to_end() {
     assert_eq!(row.observed_at, native_at);
     assert!(insert_usage_event(&conn, &row).unwrap());
 
-    let rollup = rollup_instance(&conn, "ins_live_result", "claude", None)
-        .unwrap()
-        .unwrap();
+    let rollup = rollup_instance(
+        &conn,
+        &RollupRequest {
+            instance_id: "ins_live_result",
+            kind: "claude",
+            spec_model: None,
+            effective_model: None,
+            profile_id: None,
+        },
+    )
+    .unwrap()
+    .unwrap();
     // The native receipt time is "now", so it is inside the 60 s window: the
     // live result's input and output both count.
     assert_eq!(

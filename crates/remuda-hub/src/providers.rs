@@ -1527,6 +1527,19 @@ async fn provider_usage(
         .get_provider(id.clone())
         .await?
         .ok_or(HubError::NotFound)?;
+    // c-usagefu r16 item 7: on the rolled-back usage shape every per-model
+    // aggregate is an Unavailable placeholder (events 0, so it would be
+    // skipped). Carry one explicit flag so the client renders Unknown instead
+    // of reading "no models / zero spend" as real usage.
+    let usage_unavailable = state
+        .store
+        .run_named("provider_usage_schema", |conn| {
+            crate::usage_store::usage_schema_is_current(conn)
+                .map(|current| !current)
+                .map_err(crate::store::StoreError::from)
+        })
+        .await
+        .map_err(map_store)?;
     let models: Vec<Value> = {
         let store = state.store.clone();
         let ids: Vec<String> = profile.models.iter().map(|m| m.id.clone()).collect();
@@ -1573,6 +1586,7 @@ async fn provider_usage(
         "id": profile.id,
         "models": models,
         "budgetStopFactor": crate::usage_store::BUDGET_STOP_FACTOR,
+        "usageUnavailable": usage_unavailable,
         "note": "costs are estimates (估算); hard cap band is estimate x 1.15",
     })))
 }

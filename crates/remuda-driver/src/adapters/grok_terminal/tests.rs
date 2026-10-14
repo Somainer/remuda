@@ -53,6 +53,8 @@ fn new_harness() -> Harness {
         home: dir.path().to_path_buf(),
         cwd: dir.path().to_path_buf(),
         pid: None,
+        launched_at: None,
+        resume_session_id: None,
     });
     adapter.bind_session_dir(SESSION_ID, session_dir);
     Harness {
@@ -773,6 +775,8 @@ fn real_fixture_emits_no_partials_and_keeps_d043_final() {
         home: dir.path().to_path_buf(),
         cwd: dir.path().to_path_buf(),
         pid: None,
+        launched_at: None,
+        resume_session_id: None,
     });
     adapter.bind_session_dir(SESSION_ID, session_dir);
     let mut live = GrokLive::new(adapter, identity());

@@ -430,7 +430,7 @@ export const HomeList = memo(function HomeList() {
                         <span className={css.rowTime} title={row.updatedAt}>
                           {row.timeLabel}
                         </span>
-                        <ContextRing pct={row.contextPct} />
+                        <ContextRing pct={row.contextPct} approximate={row.contextPctApproximate} />
                       </Link>
                       {row.canResume ? (
                         <button

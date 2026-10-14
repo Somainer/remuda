@@ -455,6 +455,7 @@ describe("Composer context usage chip", () => {
     contextUsedTokens: 35_839,
     contextWindowTokens: 200_000,
     contextPct: 18,
+    contextPctApproximate: false,
     sessionInputTokens: 7_856,
     sessionOutputTokens: 589,
     cacheReadTokens: 97_704,
@@ -499,6 +500,63 @@ describe("Composer context usage chip", () => {
     await user.click(screen.getByTestId("context-usage-close"));
     expect(screen.queryByTestId("context-usage-popover")).toBeNull();
     expect(chip).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("marks the chip ≈ when the rollup window is only a kind-fallback estimate", () => {
+    render(
+      <Composer
+        instanceId="ins_rollup_approx"
+        mobile={false}
+        onSend={vi.fn()}
+        usageRollup={{ ...rollup, contextPct: 4, contextPctApproximate: true }}
+      />,
+    );
+    const chip = screen.getByTestId("context-chip");
+    expect(chip).toHaveTextContent("≈4%");
+    expect(chip).toHaveAttribute("data-approximate", "1");
+    expect(chip.getAttribute("aria-label")).toContain("约 ");
+  });
+
+  it("renders Unknown, never the carried percentage or ≈, when usage is unavailable", async () => {
+    // c-usagefu r16 item 7: a rolled-back usage shape sends unavailable:true
+    // (here even with a carried number/flag) — the chip must show "—", never
+    // 42% or a guess, and the popover explains that usage is unavailable.
+    const user = userEvent.setup();
+    render(
+      <Composer
+        instanceId="ins_rollup_unavailable"
+        mobile={false}
+        onSend={vi.fn()}
+        usageRollup={{ ...rollup, unavailable: true, contextPct: 42, contextPctApproximate: true }}
+      />,
+    );
+    const chip = screen.getByTestId("context-chip");
+    expect(chip).toHaveTextContent("—");
+    expect(chip).not.toHaveTextContent("42%");
+    expect(chip).toHaveAttribute("data-approximate", "0");
+    const ring = chip.querySelector("[class*='contextRing']") as HTMLElement;
+    expect(ring.style.getPropertyValue("--ctx-pct")).toBe("0%");
+
+    await user.click(chip);
+    const note = screen.getByTestId("context-usage-empty-note");
+    expect(note).toHaveTextContent(/暂不可用/);
+    expect(screen.getByTestId("context-usage-headline")).toHaveTextContent("—/— (—%)");
+    expect(screen.getByTestId("context-usage-turns")).toHaveTextContent("—");
+  });
+
+  it("does not mark the chip ≈ for an exact native/catalog window", () => {
+    render(
+      <Composer
+        instanceId="ins_rollup_exact"
+        mobile={false}
+        onSend={vi.fn()}
+        usageRollup={{ ...rollup, contextPctApproximate: false }}
+      />,
+    );
+    const chip = screen.getByTestId("context-chip");
+    expect(chip).toHaveTextContent("18%");
+    expect(chip).not.toHaveTextContent("≈");
+    expect(chip).toHaveAttribute("data-approximate", "0");
   });
 
   it("opens the popover on hover for precise pointers and closes on leave", async () => {

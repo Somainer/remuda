@@ -53,6 +53,8 @@ pub mod keys;
 pub mod launch;
 pub mod lifecycle;
 mod promotion;
+#[cfg(test)]
+mod resume_gap_test;
 pub mod send;
 
 pub use launch::{AgentLaunch, CARRIER_ENV, Target, native_carrier_enabled};
@@ -143,6 +145,10 @@ pub struct ShellPtyOptions {
     pub extra_env: std::collections::BTreeMap<String, String>,
     /// Authenticated instance context, injected only after environment filtering.
     pub agent_mcp: Option<crate::agent_mcp::AgentMcpContext>,
+    /// Identity of the Node that built this driver (c-usagefu r18 items 2/3).
+    /// `None` for drivers constructed outside a composed Node (unit tests,
+    /// embedded use): their retained blocks live in the detached bag.
+    pub node_epoch: Option<crate::adapters::codex_discovery::NodeEpoch>,
     /// Initial columns.
     pub cols: u16,
     /// Initial rows.
@@ -268,6 +274,7 @@ impl ShellPtyOptions {
             auto_trust_workspace: false,
             agent: None,
             instance_id: None,
+            node_epoch: None,
             #[cfg(any(test, feature = "test-stub"))]
             fail_after_spawn: false,
         }
@@ -469,7 +476,20 @@ pub struct ShellPtyDriver {
     /// Deterministic transcript binding for the current promotion epoch.
     bindings: promotion::BindingHandle,
     /// Promotion poller, stopped on close.
+    #[cfg(any(test, feature = "test-stub"))]
+    poller: Mutex<Option<promotion::PollerTask>>,
+    #[cfg(not(any(test, feature = "test-stub")))]
     poller: Mutex<Option<JoinHandle<()>>>,
+    /// Cooperative-shutdown signal for the promotion poller and the channel its
+    /// `finish()` completes on (c-ctxusage r5 item 6): close waits for the last
+    /// hydrator finalise instead of aborting mid-pump.
+    poller_shutdown: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    poller_finalised: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// Serializes overlapping `close()` calls (c-usagefu r18 item 1): the first
+    /// close owns the whole teardown; a concurrent close waits for it and then
+    /// finds no state. Held across the ladder (seconds), never across a
+    /// blocking std guard.
+    close_lock: Mutex<()>,
     /// Exit waiter (§5.5), stopped on close.
     waiter: Mutex<Option<JoinHandle<()>>>,
     /// Process table behind detection; a fixture in tests.
@@ -485,6 +505,25 @@ pub struct ShellPtyDriver {
     /// (c-ctxusage r17 item 4), so a prior run's pending refresh never
     /// outlives that run.
     catalog_refresh: Mutex<Option<JoinHandle<()>>>,
+    /// c-usagefu r10 item 1; r11 items 2/3 (Ruling A2): the OWNER guard of the
+    /// codex instance-lifetime cohort for a driver-launched (native/resumed)
+    /// codex, held for the whole run independent of whether its file adapter
+    /// binds (the adapter holds a non-closing witness). The interval is closed
+    /// explicitly in close() only after the stop ladder confirms the process
+    /// is gone (or transferred on resume adoption), so aborting adapters never
+    /// ends it early. None for shells, grok and promoted attaches (the
+    /// promotion poller owns the promoted unknown-boundary cohort).
+    codex_lifetime: Mutex<Option<crate::adapters::codex_discovery::LifetimeGuard>>,
+    /// c-usagefu r12 item 1 (Ruling A2'): OWNER guards of every promoted-codex
+    /// census interval the promotion poller registers, owned by the
+    /// DRIVER/SESSION rather than by the poller or foreground detection. The
+    /// poller only pushes; a demotion never closes. The driver drains the vec
+    /// in close() and closes every interval only after the stop ladder
+    /// confirms the process group terminated (or retains them with Drop-close
+    /// suppressed for the Node's lifetime on a stop-incomplete verdict,
+    /// c-usagefu r17 Ruling W0).
+    promoted_codex_lifetimes:
+        Arc<std::sync::Mutex<Vec<crate::adapters::codex_discovery::LifetimeGuard>>>,
     /// Recipe from the last start, reused by [`Driver::close`] to journal what
     /// it stopped and by the Node to audit what was launched.
     recipe: std::sync::Mutex<Option<LaunchRecipe>>,
@@ -518,6 +557,14 @@ pub struct ShellPtyDriver {
     interrupt_pid: Arc<AtomicI32>,
     interrupt_screen_markers: Arc<std::sync::Mutex<promotion::InterruptBaseline>>,
     seq: Arc<AtomicU64>,
+    /// c-usagefu r17 W0 test seam: when set, close() substitutes this ladder
+    /// outcome (a stop-incomplete naming a survivor the regression controls)
+    /// for the real one AFTER the real ladder has run — its signals and group
+    /// scan are never skipped. Gated `test-stub` so Node integration tests
+    /// (remuda-node pulls the driver in with that feature) can drive the real
+    /// DevNode close/recompose path deterministically.
+    #[cfg(any(test, feature = "test-stub"))]
+    test_stop_outcome: std::sync::Mutex<Option<StopOutcome>>,
 }
 
 /// Master endpoint plus its dup'd writer, carried only between spawn and the
@@ -531,6 +578,68 @@ impl ShellPtyDriver {
         Self::with_process_table(options, Arc::new(SystemProcessTable))
     }
 
+    /// c-usagefu r17 W0 test seam (Node integration tests via `test-stub`):
+    /// force the next close's ladder verdict. The real ladder still runs; only
+    /// its verdict is substituted.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fn test_force_stop_outcome(&self, outcome: lifecycle::StopOutcome) {
+        *self
+            .test_stop_outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+    }
+
+    /// c-usagefu r18 items 2/3 test seam: the spawned child's process group.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fn test_pgid(&self) -> Option<i32> {
+        self.inner.try_lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|state| state.pgid.load(Ordering::SeqCst))
+        })
+    }
+
+    /// c-usagefu r21 item 3 test seam: this driver's poller finalization gate
+    /// (per-spawn, per-invocation acknowledgement).
+    #[cfg(any(test, feature = "test-stub"))]
+    #[cfg(any(test, feature = "test-stub"))]
+    #[cfg(test)]
+    pub(crate) async fn test_poller_gate(&self) -> Option<Arc<promotion::FinalisePublishGate>> {
+        self.poller
+            .lock()
+            .await
+            .as_ref()
+            .map(promotion::PollerTask::gate)
+    }
+
+    /// c-usagefu r19 item 1 test seam: whether the live codex file adapter has
+    /// bound a session yet.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fn test_codex_bound(&self) -> bool {
+        if let Ok(handle) = self.adapters.try_lock()
+            && let Some(handle) = handle.as_ref()
+        {
+            return handle.is_bound();
+        }
+        false
+    }
+
+    /// c-usagefu r20 item 5 test seam: clone the run's event sender so a test
+    /// can deliberately FILL the bounded channel and stall finalization
+    /// publication.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub async fn test_events_sender(&self) -> Option<mpsc::Sender<remuda_protocol::Observation>> {
+        self.events_tx.lock().await.clone()
+    }
+
+    /// c-usagefu r20 item 5 test seam: a stamped throwaway observation used to
+    /// fill the run channel in cancellation tests.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub async fn test_filler_observation(&self) -> Option<remuda_protocol::Observation> {
+        let ctx = self.promote_ctx.lock().await.clone()?;
+        Some(promotion::test_filler_observation(&ctx))
+    }
+
     /// Build a driver whose promotion detection reads `table` instead of the
     /// host process table. Tests drive detection from a fixture this way.
     #[must_use]
@@ -542,12 +651,19 @@ impl ShellPtyDriver {
             status: Arc::new(std::sync::Mutex::new(None)),
             bindings: promotion::BindingHandle::empty(),
             poller: Mutex::new(None),
+            poller_shutdown: Mutex::new(None),
+            poller_finalised: Mutex::new(None),
+            close_lock: Mutex::new(()),
+            #[cfg(any(test, feature = "test-stub"))]
+            test_stop_outcome: std::sync::Mutex::new(None),
             waiter: Mutex::new(None),
             table,
             fallbacks: crate::hook_answer::FallbackLedger::new(),
             hooks: Mutex::new(None),
             adapters: Mutex::new(None),
             catalog_refresh: Mutex::new(None),
+            codex_lifetime: Mutex::new(None),
+            promoted_codex_lifetimes: Arc::new(std::sync::Mutex::new(Vec::new())),
             recipe: std::sync::Mutex::new(None),
             exited: Arc::new(std::sync::Mutex::new(None)),
             effort_bridge: Mutex::new(Arc::new(crate::effort::EffortBridge::new())),
@@ -1112,6 +1228,35 @@ impl ShellPtyDriver {
         let mut hook_ctx = hook_ctx;
         hook_ctx.claude_home = config_dir.clone();
         let cmd = build_command(&self.options, cwd, &recipe, hooks.as_ref())?;
+        // c-usagefu r10 item 1 (Ruling A): register the codex agent's live
+        // interval in its cwd at the agent.start boundary, BEFORE the child
+        // is spawned and independent of the file adapter/hook binding. A
+        // same-cwd generic launch doing prompt-only discovery needs a complete
+        // census that includes THIS native instance; the driver holds one
+        // cohort clone for the whole run and hands another to the adapter.
+        //
+        // c-usagefu r15 item 4 (Ruling L1): this hook-confirmed path is a
+        // production registration too, so the boundary is sampled INSIDE the
+        // LAUNCH_REGISTRATION critical section together with the lifetime
+        // insert (register_confirmed_launch), never on a free-standing clock
+        // before the call — a launch blocked on the lock must decide from the
+        // instant it actually registered. No discovery window opens here: the
+        // hook supplies session identity and with_instance_key must not open
+        // one against the attached lifetime witness.
+        let (native_lifetime, launch_floor) =
+            if self.options.target.agent_kind() == Some(AgentKind::Codex) {
+                let (guard, boundary) = crate::adapters::codex_discovery::register_confirmed_launch(
+                    std::path::Path::new(cwd),
+                    hook_ctx.instance_id.as_id().as_str(),
+                    self.options
+                        .node_epoch
+                        .as_ref()
+                        .map(crate::adapters::codex_discovery::NodeEpoch::id),
+                );
+                (Some(guard), boundary)
+            } else {
+                (None, time::OffsetDateTime::now_utc())
+            };
         let pre_resume_mode: Option<crate::claude_transcript::ResumeMode> =
             match &self.options.target {
                 Target::Agent {
@@ -1365,6 +1510,26 @@ impl ShellPtyDriver {
         // GROK_HOME), follow the child pid, and emit on the instance's one
         // ordered observation channel. Hook-confirmed session identity wins
         // over file discovery (Hook > File) via the adapter confirm path.
+        // The DRIVER keeps the cohort OWNER registered before the child was
+        // spawned; the file adapter receives a non-closing WITNESS. The owner
+        // is closed explicitly in close() only AFTER the stop ladder confirms
+        // the process is gone (Ruling A2), so tearing the adapter down before
+        // the ladder — or a witness dropping at any point — can never close
+        // the interval early (c-usagefu r11 item 3).
+        let adapter_lifetime = native_lifetime.as_ref().map(|guard| guard.witness());
+        if let Some(guard) = native_lifetime {
+            *self.codex_lifetime.lock().await = Some(guard);
+        }
+        // c-usagefu r15 item 3: a `codex resume <id>` continues the session's
+        // EXISTING rollout (whose session_meta predates the resume floor); the
+        // tail adapter binds it by id rather than by timestamp.
+        let resume_session_id = match &self.options.target {
+            Target::Agent {
+                resume: Some(session_id),
+                ..
+            } => Some(session_id.clone()),
+            _ => None,
+        };
         // Fault injection (test/fake-harness only): fail the post-spawn
         // adapter-setup step so the real launch path runs its failure cleanup.
         #[cfg(any(test, feature = "test-stub"))]
@@ -1375,10 +1540,30 @@ impl ShellPtyDriver {
                 "injected post-spawn adapter-setup failure",
             )))
         } else {
-            self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd)
+            self.spawn_adapters(
+                &hooks,
+                &recipe,
+                &hook_ctx,
+                &tx,
+                pgid,
+                cwd,
+                adapter_lifetime,
+                launch_floor,
+                resume_session_id,
+            )
         };
         #[cfg(not(any(test, feature = "test-stub")))]
-        let adapter_setup = self.spawn_adapters(&hooks, &recipe, &hook_ctx, &tx, pgid, cwd);
+        let adapter_setup = self.spawn_adapters(
+            &hooks,
+            &recipe,
+            &hook_ctx,
+            &tx,
+            pgid,
+            cwd,
+            adapter_lifetime,
+            launch_floor,
+            resume_session_id,
+        );
         match adapter_setup {
             Ok(Some(handle)) => *self.adapters.lock().await = Some(handle),
             Ok(None) => {}
@@ -1452,6 +1637,11 @@ impl ShellPtyDriver {
                     socket: session.socket_path.clone(),
                 })
             });
+            // c-ctxusage r5 item 6: cooperative poller shutdown.
+            let (poller_tx, poller_rx) = tokio::sync::watch::channel(false);
+            let (finalised_tx, finalised_rx) = tokio::sync::oneshot::channel();
+            *self.poller_shutdown.lock().await = Some(poller_tx);
+            *self.poller_finalised.lock().await = Some(finalised_rx);
             // The pre-spawn resume boundary (None for a login shell, which
             // bounds a hand-typed resume per detected process instead).
             *self.poller.lock().await = Some(promotion::spawn(
@@ -1466,6 +1656,11 @@ impl ShellPtyDriver {
                 self.options.auto_trust_workspace,
                 Arc::clone(&self.interrupt_pid),
                 Arc::clone(&self.interrupt_screen_markers),
+                Arc::clone(&self.promoted_codex_lifetimes),
+                self.options
+                    .node_epoch
+                    .as_ref()
+                    .map(crate::adapters::codex_discovery::NodeEpoch::id),
                 tx.clone(),
                 Arc::clone(&self.seq),
                 Some(Arc::clone(&effort_bridge)),
@@ -1490,6 +1685,8 @@ impl ShellPtyDriver {
                 // socket the poller probes when a quiet hook tier goes silent
                 // (captured above before `hooks` moved into the poller).
                 silence_paths,
+                poller_rx,
+                finalised_tx,
             ));
             // A login shell has no agent at spawn; once promotion identifies a
             // hand-typed codex/grok, start its file adapter against the native
@@ -1542,6 +1739,7 @@ impl ShellPtyDriver {
     /// wrote, so it only exists when the hook path is live — without hooks
     /// there is no per-session shadow home, and reading the user's real
     /// `~/.codex` from a launched session would cross the §4.2 boundary.
+    #[allow(clippy::too_many_arguments)] // launch wiring passes hooks/recipe/ctx/events/pid/cwd/lifetime.
     fn spawn_adapters(
         &self,
         hooks: &Option<Arc<crate::launch::HookSession>>,
@@ -1550,6 +1748,16 @@ impl ShellPtyDriver {
         events: &mpsc::Sender<remuda_protocol::Observation>,
         pid: Option<i32>,
         cwd: &str,
+        lifetime: Option<crate::adapters::codex_discovery::LifetimeGuard>,
+        // c-usagefu r14 item 5: the agent.start boundary the census lifetime
+        // was registered at (the resume time for a continued run). The tail
+        // adapter uses it as its discovery floor, so a gap rollout created
+        // before the resume is refused by the real discovery path.
+        launch_floor: time::OffsetDateTime,
+        // c-usagefu r15 item 3: native session id of an explicit
+        // `codex resume <id>`; the adapter binds that existing rollout by id
+        // even though its session_meta timestamp predates the resume floor.
+        resume_session_id: Option<String>,
     ) -> DriverResult<Option<crate::adapters::supervisor::AdapterHandle>> {
         let Some(hooks) = hooks else {
             return Ok(None);
@@ -1564,6 +1772,12 @@ impl ShellPtyDriver {
             home: shadow.home.clone(),
             cwd: PathBuf::from(cwd),
             pid: pid.filter(|pid| *pid > 0).map(|pid| pid as u32),
+            // Discovery floor for a shadow-home launch: a SessionStart hook
+            // still wins (tier 1), but without one the REAL cwd/floor/prompt
+            // path decides instead of the newest session_index guess — the
+            // floor is what refuses a pre-resume gap rollout (r14 item 5).
+            launched_at: Some(launch_floor),
+            resume_session_id,
         };
         let stamp = crate::adapters::supervisor::stamp_ctx(
             ctx.instance_id.clone(),
@@ -1584,6 +1798,22 @@ impl ShellPtyDriver {
                 .filter(|model| !model.is_empty()),
             hooks: Some(Arc::clone(hooks)),
             agent_pid: pid,
+            // c-usagefu r7 item 3: claim under the STABLE Remuda instance id,
+            // not a fresh UUID — close/resume re-spawns this adapter and must
+            // reclaim the rollout the previous spawn owned.
+            instance_key: Some(ctx.instance_id.as_id().as_str().to_owned()),
+            // Native-carrier launch relies on the stable instance key
+            // (tier a/c); process-tree probing is not wired for the pty
+            // carrier here (the shell_pty native path is hook-confirmed).
+            ownership: None,
+            agent_pid_roots: None,
+            // r10 item 1: native/resumed launch joins the cwd census with its
+            // known agent.start floor; the driver's cohort clone keeps the
+            // interval open independent of this adapter's binding.
+            lifetime,
+            // Hook-confirmed launch: no prompt-only discovery, hence no
+            // pending window (r12 item 2 applies to generic-pty launches).
+            window: None,
         };
         crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx)
     }
@@ -1613,6 +1843,10 @@ impl ShellPtyDriver {
         let task = tokio::spawn(async move {
             let mut current: Option<remuda_protocol::AgentKind> = None;
             let mut handle: Option<crate::adapters::supervisor::AdapterHandle> = None;
+            // The promoted-codex cwd census is owned by the promotion POLLER,
+            // which registers the unknown-boundary interval BEFORE it publishes
+            // the detection this watch reads (c-usagefu r11 item 2, Ruling A2).
+            // The watch only spawns/ab-spawns the file adapter.
             let mut tick = tokio::time::interval(PROMOTE_POLL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -1649,6 +1883,19 @@ impl ShellPtyDriver {
                         fallback_model: None,
                         hooks: None,
                         agent_pid: Some(found.pid),
+                        // Promoted attaches are per-process: no driver launch
+                        // identity (r7 item 2 gives them a unique lifecycle
+                        // owner); resume of a DRIVER launch goes through the
+                        // native-carrier spawn above with the stable key.
+                        instance_key: None,
+                        ownership: None,
+                        agent_pid_roots: None,
+                        // Census presence is owned by the promotion poller,
+                        // which registers before it publishes the detection;
+                        // the promoted adapter binds by hook/name index only.
+                        lifetime: None,
+                        // Promoted attach: no launch-floor discovery window.
+                        window: None,
                     };
                     match crate::adapters::supervisor::spawn_file_adapters(kind, adapter_ctx) {
                         Ok(Some(started)) => handle = Some(started),
@@ -1660,7 +1907,7 @@ impl ShellPtyDriver {
                 }
             }
         });
-        crate::adapters::supervisor::AdapterHandle { tasks: vec![task] }
+        crate::adapters::supervisor::AdapterHandle::from_tasks(vec![task])
     }
 
     /// Run the stop ladder against this PTY's process group (§5.3).
@@ -1730,6 +1977,22 @@ impl ShellPtyDriver {
             reaper,
         )
         .await?;
+        // Test seam: override ONLY the ladder verdict (simulating a member the
+        // ladder could not kill). The real signals and group scan all run;
+        // nothing substitutes them.
+        #[cfg(any(test, feature = "test-stub"))]
+        let outcome = {
+            let mut outcome = outcome;
+            if let Some(forced) = self
+                .test_stop_outcome
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                outcome = forced;
+            }
+            outcome
+        };
         // The leader can be classified dead while the kernel has not made it
         // reapable yet: on macOS a SIGKILLed session leader sits in `E`
         // (exiting) before it becomes a zombie. `stop_group` correctly reports
@@ -1880,6 +2143,10 @@ impl ShellPtyDriver {
             },
             Arc::clone(&self.table),
         );
+        // c-usagefu r12 item 1: the resumed run's poller registers promoted
+        // codex intervals into the SAME driver-owned slot, so every cohort of
+        // this session closes in one place after the final stop ladder.
+        resumed.promoted_codex_lifetimes = Arc::clone(&self.promoted_codex_lifetimes);
         // The adopted poller/bus must update the same control handles that
         // callers retain on `self`, including native cancel confirmation.
         resumed.promoted = Arc::clone(&self.promoted);
@@ -1897,12 +2164,24 @@ impl ShellPtyDriver {
         // operations have to reach the process that was just started.
         *self.inner.lock().await = resumed.inner.lock().await.take();
         *self.hooks.lock().await = resumed.hooks.lock().await.take();
-        *self.poller.lock().await = resumed.poller.lock().await.take();
+        *self.poller.lock().await = {
+            // Transfer the resumed driver's gate-bearing task whole (the gate
+            // is per-driver; test builds read it through the same field).
+            resumed.poller.lock().await.take()
+        };
+        *self.poller_shutdown.lock().await = resumed.poller_shutdown.lock().await.take();
+        *self.poller_finalised.lock().await = resumed.poller_finalised.lock().await.take();
         *self.waiter.lock().await = resumed.waiter.lock().await.take();
-        // c-ctxusage r17/r24 item 2: adopt the resumed run's file adapters and
-        // catalog-refresh task so the temporary driver dropping does not abort
-        // them.
+        // Run-scoped adoption (c-ctxusage r17/r24): abort/dispose the previous
+        // run's catalog-refresh task and file adapters (bounded) before
+        // adopting the resumed driver's — this is the stricter form of the
+        // usagefu supervisor::adopt_resumed_handle move and covers the catalog
+        // task usagefu does not own.
         self.adopt_run_scoped_handles(&resumed).await;
+        // c-usagefu r10 item 1: adopt the resumed run's live codex census
+        // cohort. The previous run's guard is superseded by a newer epoch, so
+        // dropping it here does not record a close for the continued session.
+        *self.codex_lifetime.lock().await = resumed.codex_lifetime.lock().await.take();
         // §9.1: adopt the resumed run's switch coordination. Its worker and
         // mapper share a bridge, and its event sender is the live one. When a
         // switch was mid-flight at resume, adopt the resumed bridge so the
@@ -1967,18 +2246,18 @@ impl ShellPtyDriver {
     }
 
     async fn adopt_run_scoped_handles(&self, resumed: &ShellPtyDriver) {
+        // c-usagefu r8 item 2: adopt the resumed driver's file-tail adapter
+        // handle with the supervisor's own single-point move (dispose the
+        // previous process's tails first, then move). Do NOT abort the
+        // resumed handle: its tails follow the LIVE process after a resume.
+        // c-ctxusage r17 item 4: separately abort/dispose the previous run's
+        // detached catalog-refresh task before adopting the resumed one.
+        crate::adapters::supervisor::adopt_resumed_handle(&self.adapters, &resumed.adapters).await;
         if let Some(mut previous) = self.catalog_refresh.lock().await.take() {
             previous.abort();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut previous).await;
         }
         *self.catalog_refresh.lock().await = resumed.catalog_refresh.lock().await.take();
-        if let Some(mut previous) = self.adapters.lock().await.take() {
-            previous.abort();
-            for task in &mut previous.tasks {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
-            }
-        }
-        *self.adapters.lock().await = resumed.adapters.lock().await.take();
     }
 }
 
@@ -2238,6 +2517,100 @@ fn provider_source_lifecycle(
             affects_completion: false,
         })),
     )))
+}
+
+/// c-usagefu r18 item 1 deterministic test gate for overlapping closes. With
+/// the permit held, the winning close parks immediately AFTER claiming
+/// teardown ownership and the observation sender and BEFORE the
+/// poller/ladder teardown. Free permit (production and normal tests) is a
+/// pass-through.
+/// Set by a close AFTER it claimed teardown ownership + sender; it then waits
+/// on [`TEST_CLOSE_OWNERSHIP_PARK`] for the test to release it.
+#[cfg(test)]
+static TEST_CLOSE_OWNERSHIP_PARKED: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+    std::sync::LazyLock::new(|| std::sync::atomic::AtomicBool::new(false));
+/// Whether a test has armed the gate. Disarmed by default, so every close in
+/// normal tests and other test binaries passes the seam without touching it.
+#[cfg(test)]
+static TEST_CLOSE_OWNERSHIP_ARMED: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+    std::sync::LazyLock::new(|| std::sync::atomic::AtomicBool::new(false));
+/// Latch used while armed: false parks the winning close until the test opens
+/// it; a late second close after the release (value already true) passes.
+#[cfg(test)]
+static TEST_CLOSE_OWNERSHIP_PARK: std::sync::LazyLock<tokio::sync::watch::Sender<bool>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(true).0);
+
+#[cfg(test)]
+async fn park_after_close_ownership_claim() {
+    if !TEST_CLOSE_OWNERSHIP_ARMED.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let mut rx = TEST_CLOSE_OWNERSHIP_PARK.subscribe();
+    TEST_CLOSE_OWNERSHIP_PARKED.store(true, std::sync::atomic::Ordering::SeqCst);
+    if *rx.borrow() {
+        return;
+    }
+    let _ = rx.changed().await;
+}
+
+#[cfg(not(test))]
+async fn park_after_close_ownership_claim() {}
+
+/// Test seam: arm the gate (clear the arrival flag, close the latch).
+#[cfg(test)]
+pub(crate) fn test_reset_close_ownership_park() {
+    TEST_CLOSE_OWNERSHIP_PARKED.store(false, std::sync::atomic::Ordering::SeqCst);
+    TEST_CLOSE_OWNERSHIP_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+    TEST_CLOSE_OWNERSHIP_PARK.send_replace(false);
+}
+
+/// Test seam: the winning close has reached the gate (ownership + sender
+/// claimed) and is waiting for release.
+#[cfg(test)]
+pub(crate) fn test_close_ownership_park_winner_arrived() -> bool {
+    TEST_CLOSE_OWNERSHIP_PARKED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Test seam: open the latch so every parked (or later-arriving) close passes.
+#[cfg(test)]
+pub(crate) fn test_release_close_ownership_park() {
+    TEST_CLOSE_OWNERSHIP_PARK.send_replace(true);
+}
+
+/// c-usagefu r17 Ruling W0: the operator-facing Diagnostic/Warning emitted
+/// once when a close's stop ladder cannot confirm the process group is gone.
+/// Its census intervals then stay open for the rest of the Node lifetime, so
+/// new sessions in that directory are not auto-attributed until the restart;
+/// this observation is the operator's only signal why. It names both the
+/// instance and the directory.
+pub(crate) fn stop_incomplete_warning_message() -> &'static str {
+    "stop incomplete — new sessions in this directory will not be auto-attributed until the Node \
+     restarts"
+}
+
+fn stop_incomplete_warning_payload(
+    instance: &str,
+    cwd: &str,
+) -> remuda_protocol::ObservationPayload {
+    let mut related = std::collections::BTreeMap::new();
+    related.insert("instance".to_owned(), instance.to_owned());
+    related.insert("cwd".to_owned(), cwd.to_owned());
+    remuda_protocol::ObservationPayload::Lifecycle(Box::new(
+        remuda_protocol::LifecyclePayload::Native(Box::new(remuda_protocol::NativeLifecycle {
+            topic: remuda_protocol::LifecycleTopic::Diagnostic,
+            native_name: "stop-incomplete".to_owned(),
+            native_id: remuda_protocol::Knowledge::Known {
+                value: instance.to_owned(),
+            },
+            status: remuda_protocol::Knowledge::Known {
+                value: stop_incomplete_warning_message().to_owned(),
+            },
+            related_ids: related,
+            data_ref: None,
+            severity: remuda_protocol::Severity::Warning,
+            affects_completion: false,
+        })),
+    ))
 }
 
 /// Write the standalone settings overlay (hooks-off path) when no hook
@@ -2715,6 +3088,22 @@ impl Driver for ShellPtyDriver {
         // half a second per prompt.
         state.await_quiescence().await;
         state.write_bytes(&submit).await?;
+        // c-usagefu r14 item 5: record the dispatched prompt for the codex
+        // file adapter the same way generic-pty does. A shadow-home codex
+        // launch's discovery is then provable through the REAL resume floor
+        // plus prompt evidence (the hook channel only confirms a session the
+        // codex child reports; without dispatched prompt evidence the adapter
+        // had to guess the newest session_index entry). Codex only and keyed
+        // by the stable instance id, so close/resume keeps the evidence.
+        if self.session_kind() == Some(AgentKind::Codex)
+            && let Some(instance_id) = &self.options.instance_id
+        {
+            crate::adapters::codex_discovery::record_input(
+                &self.options.cwd,
+                instance_id.as_id().as_str(),
+                &text,
+            );
+        }
         Ok(DriverAck::transport_written())
     }
 
@@ -2917,6 +3306,14 @@ impl Driver for ShellPtyDriver {
     /// not, that is journaled as `stop-incomplete`; §5.3 step 4 forbids
     /// reporting `exited` over a process tree that is still there.
     async fn close(&self) -> DriverResult<DriverAck> {
+        // c-usagefu r18 item 1: serialize overlapping closes. The winner runs
+        // the whole teardown; a concurrent close waits here and then leaves
+        // immediately (its teardown ownership claim finds nothing). Without
+        // this, one close could take the observation sender and be descheduled
+        // while a second close won the teardown ownership below — the loser of
+        // the ownership race would then hold the only sender and the winner's
+        // stop-incomplete operator warning could never be emitted.
+        let _close_guard = self.close_lock.lock().await;
         // §9.1: stop the effort switch before the PTY it types into goes away.
         self.effort_queue.lock().await.close();
         if let Some(worker) = self.effort_worker.lock().await.take() {
@@ -2932,8 +3329,55 @@ impl Driver for ShellPtyDriver {
             worker.abort();
         }
         self.events_tx.lock().await.take();
+        // c-ctxusage r4 item 2: cooperative poller shutdown. Signal closure
+        // first, then give the poller one window to read the final append and
+        // publish its last turn via `finish()` (an assistant record with usage
+        // and no stop_reason would otherwise never reach usage_events). The
+        // poller holds its own events sender clone, so finalised observations
+        // still reach the RunHandle while it winds down.
+        if let Some(inner) = self.inner.lock().await.as_ref() {
+            inner.closed.store(true, Ordering::SeqCst);
+        }
+        // Wake the poller's select so a close between ticks is observed
+        // immediately, then await its finalise.
+        if let Some(shutdown) = self.poller_shutdown.lock().await.take() {
+            let _ = shutdown.send(true);
+        }
         if let Some(poller) = self.poller.lock().await.take() {
-            poller.abort();
+            // c-ctxusage r5 item 6: the poller may be mid first-bind pump over a
+            // large transcript. It finalises the hydrator AFTER its current
+            // pump returns and signals once that is done; wait for that signal
+            // rather than aborting on a fixed 2 s deadline while `finish()` is
+            // running. 15 s only bounds a genuinely wedged pump; on timeout the
+            // abort is covered by the FinaliseGuard's synchronous best-effort
+            // finish.
+            const PROMOTER_FINALISE_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(15);
+            let finalised = self.poller_finalised.lock().await.take();
+            #[cfg(test)]
+            let mut poller = poller.into_handle();
+            #[cfg(not(test))]
+            let mut poller = poller;
+            let finished = if let Some(finalised) = finalised {
+                tokio::pin!(finalised);
+                tokio::time::timeout(PROMOTER_FINALISE_TIMEOUT, async {
+                    // The finalise signal wins; task completion covers the
+                    // no-hydrator / already-finished paths.
+                    tokio::select! {
+                        _ = &mut finalised => true,
+                        _ = &mut poller => true,
+                    }
+                })
+                .await
+                .is_ok()
+            } else {
+                tokio::time::timeout(PROMOTER_FINALISE_TIMEOUT, &mut poller)
+                    .await
+                    .is_ok()
+            };
+            if !finished {
+                poller.abort();
+            }
         }
         // c-ctxusage r17 item 4: stop the detached catalog-refresh task so it
         // does not keep an event sender alive past close.
@@ -2962,12 +3406,39 @@ impl Driver for ShellPtyDriver {
         if let Some(handle) = self.adapters.lock().await.take() {
             handle.abort();
         }
+        // The codex census interval is NOT released here. close() is only
+        // beginning: the agent process is still live until the stop ladder
+        // below confirms it is gone, and Ruling A2 (c-usagefu r11 item 3)
+        // requires the interval to stay LIVE through this whole window so a
+        // rollout created during close is still attributed under the census.
+        // The file adapter held only a non-closing witness, so aborting it
+        // above changes nothing. The owner is taken and closed after the
+        // ladder. A resume adopted a newer cohort before this point, so the
+        // owner's epoch check protects a continued session regardless.
         self.interrupt_pid.store(0, Ordering::SeqCst);
         // Drop any transcript claim so a respawn starts a fresh epoch.
         self.bindings.demobilize();
-        let Some(state) = self.inner.lock().await.take() else {
-            return Ok(DriverAck::not_dispatched());
+        // Claim teardown ownership AND the run's observation channel in ONE
+        // critical section (c-usagefu r18 item 1). The sender is needed only
+        // after the ladder (the stop-incomplete warning), but taking it here
+        // with the inner state guarantees the close that owns the teardown is
+        // also the only close that ever held the sender — a concurrent closer
+        // is already parked on `close_lock`, so the winner cannot end up
+        // senderless. A second close after completion finds no state and leaves.
+        let close_events;
+        let close_ctx;
+        let claimed = {
+            let Some(state) = self.inner.lock().await.take() else {
+                return Ok(DriverAck::not_dispatched());
+            };
+            close_events = self.events_tx.lock().await.take();
+            close_ctx = self.promote_ctx.lock().await.clone();
+            state
         };
+        let state = claimed;
+        // c-usagefu r18 item 1 test gate (no-op in production): park with
+        // teardown ownership and the sender already claimed.
+        park_after_close_ownership_claim().await;
         // Set before the ladder runs so the exit waiter reads this exit as the
         // ladder working rather than as an unexplained crash.
         state.closed.store(true, Ordering::SeqCst);
@@ -2975,8 +3446,10 @@ impl Driver for ShellPtyDriver {
         if let Some(waiter) = self.waiter.lock().await.take() {
             waiter.abort();
         }
-        match outcome {
+        let mut group_gone = false;
+        match &outcome {
             Ok(outcome) if outcome.group_gone => {
+                group_gone = true;
                 tracing::info!(
                     rung = outcome.rung.label(),
                     pgid = outcome.pgid,
@@ -2985,14 +3458,108 @@ impl Driver for ShellPtyDriver {
             }
             Ok(outcome) => {
                 // §5.3 step 4: say so rather than claiming a clean stop.
+                // The survivor may be a group member that outlived SIGKILL or
+                // a setsid descendant that escaped the group kill (r14 item 4).
                 tracing::error!(
                     rung = outcome.rung.label(),
                     pgid = outcome.pgid,
                     survivors = ?outcome.survivors,
-                    "stop-incomplete: the process group outlived SIGKILL"
+                    "stop-incomplete: survivor processes outlived the stop ladder"
                 );
             }
             Err(error) => tracing::error!(%error, "pty stop ladder failed"),
+        }
+        // Ruling A2/A2': close the census intervals only AFTER the process has
+        // actually stopped — a record the agent writes while this teardown was
+        // in flight must find a live census. This covers BOTH the
+        // driver-launched cohort and every promoted-codex interval the poller
+        // handed the session (r12 item 1: a demotion never closes one).
+        //
+        // c-usagefu r17 COORDINATOR RULING W0 (replaces the r13–r16 watcher /
+        // registry / process-identity machinery): when the ladder CANNOT
+        // confirm the group is gone, the owner guards are suppressed and
+        // retained for the rest of this Node's lifetime — the intervals stay
+        // OPEN and same-cwd prompt-only discovery keeps refusing, exactly as
+        // while the agent was live. Nothing probes the survivor or closes the
+        // intervals later on this Node; Node shutdown drops the guards without
+        // recording a close. The one operator-visible consequence is the
+        // lifecycle/Warning below. A confirmed group exit closes every interval
+        // here, exactly as before.
+        let mut unconfirmed = Vec::new();
+        if let Some(lifetime) = self.codex_lifetime.lock().await.take() {
+            if group_gone {
+                lifetime.close_interval();
+            } else {
+                unconfirmed.push(lifetime);
+            }
+        }
+        let promoted_guards = self
+            .promoted_codex_lifetimes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect::<Vec<_>>();
+        for lifetime in promoted_guards {
+            if group_gone {
+                lifetime.close_interval();
+            } else {
+                unconfirmed.push(lifetime);
+            }
+        }
+        if !group_gone && !unconfirmed.is_empty() {
+            // c-usagefu r18 Ruling W0': an incomplete close while the owning
+            // Node is shutting down needs only this tracing warn! — its block
+            // ends with this Node (the epoch retirement drops the intervals
+            // below) and the pumps/workers are already stopped, so the operator
+            // observation is neither required nor worth reordering shutdown
+            // for. A LIVE Node's incomplete close additionally emits the
+            // lifecycle/Warning observation below.
+            let node_shutting_down = self
+                .options
+                .node_epoch
+                .as_ref()
+                .is_some_and(crate::adapters::codex_discovery::NodeEpoch::is_shutting_down);
+            let cwd = unconfirmed
+                .first()
+                .map(|guard| guard.cwd().display().to_string())
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            let instance = close_ctx
+                .as_ref()
+                .map(|ctx| ctx.instance_id.as_id().to_string())
+                .or_else(|| {
+                    self.options
+                        .instance_id
+                        .as_ref()
+                        .map(|id| id.as_id().to_string())
+                })
+                .unwrap_or_else(|| "<unknown>".to_owned());
+            tracing::warn!(
+                instance = %instance,
+                cwd = %cwd,
+                node_shutting_down,
+                "stop-incomplete: the census interval stays open until the Node restarts"
+            );
+            crate::adapters::codex_discovery::retain_unconfirmed_guards(unconfirmed);
+            // Live Node only: surface the condition to the operator exactly
+            // once (close runs once per instance) via a Diagnostic/Warning
+            // lifecycle naming the instance and cwd. Best-effort — the run
+            // channel may already be gone during teardown; the retained
+            // intervals are what enforce the conservative behaviour, not this
+            // emission.
+            if !node_shutting_down
+                && let (Some(events), Some(ctx)) = (close_events.as_ref(), close_ctx.as_ref())
+                && let Err(error) = promotion::emit_payload(
+                    events,
+                    &self.seq,
+                    ctx,
+                    remuda_protocol::SourceChannel::Runtime,
+                    remuda_protocol::Completeness::Structured,
+                    stop_incomplete_warning_payload(&instance, &cwd),
+                )
+                .await
+            {
+                tracing::debug!(%error, "stop-incomplete warning not journaled");
+            }
         }
         Ok(DriverAck::not_dispatched())
     }
@@ -3032,6 +3599,21 @@ impl Driver for ShellPtyDriver {
             ));
         }
         self.start_resumed_inner(Some(spec), session_id).await
+    }
+
+    #[cfg(any(test, feature = "test-stub"))]
+    fn test_force_stop_outcome(&self, outcome: lifecycle::StopOutcome) {
+        ShellPtyDriver::test_force_stop_outcome(self, outcome);
+    }
+
+    #[cfg(any(test, feature = "test-stub"))]
+    fn test_pgid(&self) -> Option<i32> {
+        ShellPtyDriver::test_pgid(self)
+    }
+
+    #[cfg(any(test, feature = "test-stub"))]
+    fn test_codex_bound(&self) -> bool {
+        ShellPtyDriver::test_codex_bound(self)
     }
 }
 
@@ -3679,8 +4261,9 @@ mod tests {
             "/unused/b",
         )));
         *resumed.catalog_refresh.lock().await = Some(tokio::spawn(std::future::pending::<()>()));
-        *resumed.adapters.lock().await =
-            Some(crate::adapters::supervisor::AdapterHandle { tasks: vec![] });
+        *resumed.adapters.lock().await = Some(
+            crate::adapters::supervisor::AdapterHandle::from_tasks(vec![]),
+        );
 
         current.adopt_run_scoped_handles(&resumed).await;
 
@@ -5592,8 +6175,1330 @@ mod tests {
         Driver::close(&driver).await.unwrap();
     }
 
-    /// A driver whose PTY runs an inert process, carrying `kind` as its
-    /// session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_promoted_codex_registers_its_census_interval_before_publishing_detection() {
+        // c-usagefu r11 item 2 (Ruling A2), tightened by r12 item 1 (A2'):
+        // the promotion poller registers the promoted codex's unknown-boundary
+        // lifetime BEFORE it publishes the detection into the `promoted` slot,
+        // and the OWNER guard is handed to the driver. The r10 shape
+        // registered it one file-adapter-watch tick (~800 ms) later, leaving a
+        // window in which a same-cwd generic launch saw a promoted codex
+        // invisible to the census.
+        //
+        // Deterministic phase control on a two-worker runtime: the fake table
+        // blocks EVERY poller sample on a per-call ticket the test releases on
+        // a wall-clock schedule, while the watch keeps its own 800 ms grid. The
+        // poller's promote sample is released at 1100 ms (the watch's 800 ms
+        // tick has already read None; its next tick is at 1600 ms), so a
+        // registration performed by the watch cannot exist at the publish
+        // instant. The demote sample is released at 1900 ms (watch next runs
+        // at 2400 ms): under A2' demotion must NOT close the interval — it
+        // stays live until the driver's stop ladder runs at test end.
+        struct GatedTable {
+            ticket: std::sync::Mutex<u64>,
+            released_until: Arc<AtomicU64>,
+            cv: Arc<std::sync::Condvar>,
+            lock: Arc<std::sync::Mutex<()>>,
+            codex: Arc<AtomicBool>,
+        }
+        impl crate::promote::ProcessTable for GatedTable {
+            fn process_group(&self, pgid: i32) -> Vec<crate::promote::ProcessRow> {
+                if pgid > 0 {
+                    let mine = {
+                        let mut ticket = self
+                            .ticket
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *ticket += 1;
+                        *ticket
+                    };
+                    let mut guard = self
+                        .lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    while self.released_until.load(Ordering::SeqCst) < mine {
+                        guard = self
+                            .cv
+                            .wait(guard)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    if self.codex.load(Ordering::SeqCst) {
+                        return vec![crate::promote::ProcessRow {
+                            pid: pgid,
+                            args: "codex".into(),
+                        }];
+                    }
+                }
+                Vec::new()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let released_until = Arc::new(AtomicU64::new(0));
+        let codex = Arc::new(AtomicBool::new(false));
+        let table = Arc::new(GatedTable {
+            ticket: std::sync::Mutex::new(0),
+            released_until: Arc::clone(&released_until),
+            cv: Arc::new(std::sync::Condvar::new()),
+            lock: Arc::new(std::sync::Mutex::new(())),
+            codex: Arc::clone(&codex),
+        });
+        // Ticket releases after spawn: t=0 sample immediately; the promote
+        // sample at ~1100 ms (between watch ticks 800/1600); the demote sample
+        // at ~1900 ms (between 1600/2400); everything thereafter is open so
+        // driver shutdown never blocks in a sample.
+        let cv = Arc::clone(&table.cv);
+        let lock = Arc::clone(&table.lock);
+        let releaser = {
+            let released_until = Arc::clone(&released_until);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                released_until.store(1, Ordering::SeqCst);
+                cv.notify_all();
+                std::thread::sleep(std::time::Duration::from_millis(1080));
+                released_until.store(2, Ordering::SeqCst);
+                cv.notify_all();
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                released_until.store(3, Ordering::SeqCst);
+                cv.notify_all();
+                std::thread::sleep(std::time::Duration::from_millis(700));
+                released_until.store(u64::MAX, Ordering::SeqCst);
+                let _guard = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cv.notify_all();
+            })
+        };
+
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 60".into()];
+        options.promote = true;
+        let driver = ShellPtyDriver::with_process_table(
+            options,
+            table as Arc<dyn crate::promote::ProcessTable>,
+        );
+        let _events = driver.spawn().await.unwrap().into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0, "the test shell owns a foreground process group");
+        let owner = format!("promoted-codex-{pgid}");
+        let census_present = || crate::adapters::codex_discovery::census_contains(&cwd, &owner);
+        assert!(!census_present(), "nothing registered before a detection");
+
+        // Arm codex before the poller's 800 ms sample (released at 1100).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        codex.store(true, Ordering::SeqCst);
+        for _ in 0..3000 {
+            if driver
+                .promoted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|found| found.kind == AgentKind::Codex)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            driver
+                .promoted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|found| found.kind == AgentKind::Codex),
+            "the codex detection was published"
+        );
+        assert!(
+            census_present(),
+            "registered at the publish instant, not at the watch's next 800 ms tick"
+        );
+
+        // Demote before the poller's 1600 ms sample (released at 1900).
+        codex.store(false, Ordering::SeqCst);
+        for _ in 0..3000 {
+            if driver.promoted.lock().unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            driver.promoted.lock().unwrap().is_none(),
+            "demotion published"
+        );
+        // r12 item 1 (Ruling A2'): demotion only forgets the pid — the poller
+        // no longer closes the interval. Ownership is the driver/session's and
+        // the interval stays LIVE until the stop ladder confirms the process
+        // terminated. Give any (now incorrect) poller-side close a generous
+        // window to show itself: the interval must remain live throughout.
+        for _ in 0..100 {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+                "a demotion must NOT close the promoted interval (r12 A2')"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            census_present(),
+            "and it stays registered for a competing same-cwd discovery"
+        );
+
+        releaser.join().unwrap();
+        Driver::close(&driver).await.unwrap();
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "the driver closes the promoted interval only after the stop ladder"
+        );
+        assert!(
+            census_present(),
+            "closed-but-retained for pending discovery decisions"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_promoted_codex_rollout_after_a_demotion_is_never_attributed_to_a_competitor() {
+        // c-usagefu r12 item 1 (Ruling A2'): a promoted codex leaves the
+        // foreground (demotion) while its process is still alive in the PTY.
+        // r11 CLOSED the census interval on demotion, so a competing
+        // driver-launched codex that dispatched the same prompt afterwards
+        // became the sole live instance over [its launch, rollout creation]
+        // and bound a rollout the promoted session actually owned — even one
+        // created while close was stopping the promoted process. The promoted
+        // lifetime is now owned by the DRIVER/SESSION: a demotion leaves it
+        // LIVE and it closes only after the stop ladder confirms termination.
+        //
+        // The competitor runs the REAL production discovery path
+        // (CodexAdapter::discover over an actual rollout fixture), never a
+        // test-only census helper.
+        struct Item1Table {
+            codex: Arc<AtomicBool>,
+        }
+        impl crate::promote::ProcessTable for Item1Table {
+            fn process_group(&self, pgid: i32) -> Vec<crate::promote::ProcessRow> {
+                if pgid > 0 && self.codex.load(Ordering::SeqCst) {
+                    vec![crate::promote::ProcessRow {
+                        pid: pgid,
+                        args: "codex".into(),
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let codex = Arc::new(AtomicBool::new(false));
+        let table = Arc::new(Item1Table {
+            codex: Arc::clone(&codex),
+        });
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 60".into()];
+        options.promote = true;
+        let driver = ShellPtyDriver::with_process_table(
+            options,
+            table as Arc<dyn crate::promote::ProcessTable>,
+        );
+        let _events = driver.spawn().await.unwrap().into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        let owner = format!("promoted-codex-{pgid}");
+
+        codex.store(true, Ordering::SeqCst);
+        for _ in 0..3000 {
+            if driver
+                .promoted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|found| found.kind == AgentKind::Codex)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(crate::adapters::codex_discovery::census_contains(
+            &cwd, &owner
+        ));
+
+        // The codex leaves the foreground — but its sleep-60 process is still
+        // running in the PTY group.
+        codex.store(false, Ordering::SeqCst);
+        for _ in 0..3000 {
+            if driver.promoted.lock().unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(driver.promoted.lock().unwrap().is_none(), "demoted");
+        assert!(
+            crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "r12 A2': demotion does NOT close the promoted lifetime"
+        );
+
+        // A competing driver-launched codex starts in the same cwd AFTER the
+        // demotion, dispatches a prompt, and a rollout carrying that prompt is
+        // created in its CODEX_HOME (the lazily-written real fixture layout).
+        let competitor_home = tempfile::tempdir().unwrap();
+        let floor = time::OffsetDateTime::now_utc();
+        let mut competitor = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+            home: competitor_home.path().to_path_buf(),
+            cwd: cwd.clone(),
+            pid: None,
+            launched_at: Some(floor),
+            resume_session_id: None,
+        })
+        .with_instance_key(Some("r12-item1-competitor".to_owned()));
+        let prompt = "competitor prompt that must not win";
+        crate::adapters::codex_discovery::record_input(&cwd, "r12-item1-competitor", prompt);
+        let started = time::OffsetDateTime::now_utc();
+        let date_dir = format!(
+            "{:04}/{:02}/{:02}",
+            started.year(),
+            u8::from(started.month()),
+            started.day()
+        );
+        let month_dir = competitor_home.path().join("sessions").join(date_dir);
+        std::fs::create_dir_all(&month_dir).unwrap();
+        let started_rfc = started
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        std::fs::write(
+            month_dir.join("rollout-r12competitor.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{started_rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"r12competitor\",\"session_id\":\"r12competitor\",\"cwd\":\"{}\",\"timestamp\":\"{started_rfc}\"}}}}\n\
+                 {{\"timestamp\":\"{started_rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+
+        // Production discovery (the public poll entry point runs discover):
+        // the promoted session's LIVE unknown-boundary interval overlaps
+        // [competitor launch, creation], so prompt-only attribution is
+        // refused and the rejection is permanently remembered.
+        use crate::adapters::FileSignalAdapter as _;
+        let observed = competitor.poll().unwrap();
+        assert!(observed.is_empty(), "a refused candidate emits nothing");
+        assert!(competitor.binding().is_none());
+
+        // The driver now closes: the stop ladder kills the still-running
+        // process and only then closes the promoted interval. Close is
+        // deterministic here (plain sleep), so bound it loosely.
+        Driver::close(&driver).await.unwrap();
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "closed after confirmed termination"
+        );
+        assert!(
+            crate::adapters::codex_discovery::census_contains(&cwd, &owner),
+            "the closed interval is retained while the competitor decision is pending"
+        );
+        let observed = competitor.poll().unwrap();
+        assert!(observed.is_empty(), "still refused after close");
+        assert!(competitor.binding().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_fresh_rollout_created_while_the_stop_ladder_runs_is_refused_before_closure() {
+        // c-usagefu r13 item 4: the r12 promoted-close regression built and
+        // rejected its rollout BEFORE close() even started. The live window
+        // that actually matters is WHILE THE REAL STOP LADDER IS RUNNING with
+        // the promoted process still alive: a rollout freshly created there and
+        // a competitor's FIRST discovery in that window must be refused, and
+        // only after termination is confirmed does the promoted interval close.
+        //
+        // Moving the lifetime close to the START of close() makes this test
+        // bind: the competitor's launch floor is sampled inside close (after
+        // the early close), so the already-closed unknown-boundary interval no
+        // longer overlaps its [launch, creation] window and it becomes the sole
+        // live instance.
+        use crate::adapters::FileSignalAdapter as _;
+        struct Item4Table {
+            codex: Arc<AtomicBool>,
+        }
+        impl crate::promote::ProcessTable for Item4Table {
+            fn process_group(&self, pgid: i32) -> Vec<crate::promote::ProcessRow> {
+                if pgid > 0 && self.codex.load(Ordering::SeqCst) {
+                    vec![crate::promote::ProcessRow {
+                        pid: pgid,
+                        args: "codex".into(),
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let codex = Arc::new(AtomicBool::new(true));
+        let table = Arc::new(Item4Table {
+            codex: Arc::clone(&codex),
+        });
+        // Ignores SIGINT/SIGHUP like every agent TUI: the group stays alive
+        // through the interrupt and hangup graces (~4 s window) and is reaped
+        // only by SIGKILL.
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap '' INT HUP TERM; exec sleep 60".into(),
+        ];
+        options.promote = true;
+        let driver = ShellPtyDriver::with_process_table(
+            options,
+            table as Arc<dyn crate::promote::ProcessTable>,
+        );
+        let _events = driver.spawn().await.unwrap().into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        let owner = format!("promoted-codex-{pgid}");
+
+        for _ in 0..3000 {
+            if driver
+                .promoted
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|found| found.kind == AgentKind::Codex)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(crate::adapters::codex_discovery::census_contains(
+            &cwd, &owner
+        ));
+
+        // close() runs concurrently with this test future (borrowed, not
+        // 'static): the promoted process is genuinely alive throughout the
+        // ladder graces. The gate future finishes its in-flight discovery while
+        // close keeps advancing, and join waits for termination to complete.
+        let (close_result, mut competitor) = tokio::join!(Driver::close(&driver), async {
+            // Gate on being INSIDE close teardown (the promoted slot is
+            // cleared before the ladder) while the process group is still
+            // live.
+            let gate_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let in_teardown = driver.promoted.lock().unwrap().is_none();
+                let alive = lifecycle::group_has_live_member(pgid);
+                if in_teardown && alive {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < gate_deadline,
+                    "never observed close teardown while the group was alive"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+                "the promoted interval is LIVE while the ladder is running"
+            );
+
+            // The competitor launches NOW — floor strictly inside close —
+            // and a FRESH rollout carrying its prompt is created in the
+            // same window.
+            let competitor_home = tempfile::tempdir().unwrap();
+            let floor = time::OffsetDateTime::now_utc();
+            let competitor_owner = "r13-item4-competitor";
+            let mut competitor = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+                home: competitor_home.path().to_path_buf(),
+                cwd: cwd.clone(),
+                pid: None,
+                launched_at: Some(floor),
+                resume_session_id: None,
+            })
+            .with_instance_key(Some(competitor_owner.to_owned()));
+            let prompt = "r13 item 4 rollout born during close";
+            crate::adapters::codex_discovery::record_input(&cwd, competitor_owner, prompt);
+            let started = time::OffsetDateTime::now_utc();
+            assert!(
+                started >= floor,
+                "the rollout is created after the competitor launch"
+            );
+            let date_dir = format!(
+                "{:04}/{:02}/{:02}",
+                started.year(),
+                u8::from(started.month()),
+                started.day()
+            );
+            let month_dir = competitor_home.path().join("sessions").join(date_dir);
+            std::fs::create_dir_all(&month_dir).unwrap();
+            let started_rfc = started
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            std::fs::write(
+                    month_dir.join("rollout-r13item4.jsonl"),
+                    format!(
+                        "{{\"timestamp\":\"{started_rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"r13item4\",\"session_id\":\"r13item4\",\"cwd\":\"{}\",\"timestamp\":\"{started_rfc}\"}}}}\n\
+                         {{\"timestamp\":\"{started_rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
+                        cwd.display()
+                    ),
+                )
+                .unwrap();
+
+            // FIRST discovery, still while the process is alive in the
+            // ladder: the LIVE unknown-boundary interval overlaps the
+            // competitor's whole window — refused, and the rejection
+            // sticks.
+            assert!(
+                lifecycle::group_has_live_member(pgid),
+                "rollout + first discovery genuinely precede termination"
+            );
+            let observed = competitor.poll().unwrap();
+            assert!(
+                observed.is_empty(),
+                "a rollout born while the promoted process is alive is refused"
+            );
+            assert!(
+                competitor.binding().is_none(),
+                "the competitor must not bind a rollout the live promoted instance owns"
+            );
+            competitor
+        });
+        close_result.unwrap();
+
+        // Termination finished inside join: the interval closed only AFTER it,
+        // and stays retained while the competitor decision window is open.
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, &owner),
+            "closed only after the stop ladder confirmed termination"
+        );
+        assert!(
+            crate::adapters::codex_discovery::census_contains(&cwd, &owner),
+            "retained for the still-open competitor decision"
+        );
+        // A1: the in-window refusal is permanent; the cleaner census after
+        // close does not reverse it.
+        let observed = competitor.poll().unwrap();
+        assert!(observed.is_empty(), "still refused after confirmed closure");
+        assert!(competitor.binding().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_codex_census_interval_stays_live_until_the_process_has_stopped() {
+        // c-usagefu r11 item 3 (Ruling A2): the lifetime interval closes only
+        // AFTER the agent process has stopped, not when close() begins. r10
+        // dropped the driver's guard BEFORE the stop ladder even ran (while the
+        // aborted adapter's clone also went away), so a rollout the agent
+        // created during teardown found a closed census and a later same-cwd
+        // launch could become its owner.
+        //
+        // The child ignores SIGINT and SIGHUP (ignored dispositions survive
+        // the exec); on this box the group still answers throughout the 2 s
+        // interrupt grace and dies during the later hangup grace (~3.5 s into
+        // the ladder, when the master closes). A 2.5 s observation window sits
+        // fully inside that: it proves the interval is LIVE throughout close,
+        // including after a witness clone drops mid-ladder. The old code
+        // dropped the guard before the first rung, failing the first sample.
+        // After close returns (group gone) the interval is closed-but-retained.
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let owner = "native-codex-close-order";
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap '' INT HUP TERM; exec sleep 60".into(),
+        ];
+        let driver = ShellPtyDriver::new(options);
+        let _run = driver.spawn().await.expect("spawns");
+
+        // Exactly what a Target::Agent Codex spawn does: the driver slot owns
+        // the cohort; the adapter side is a non-closing witness.
+        let lifetime = crate::adapters::codex_discovery::begin_lifetime(
+            &cwd,
+            owner,
+            Some(time::OffsetDateTime::now_utc()),
+        );
+        let witness = lifetime.witness();
+        let mut witness = Some(witness);
+        *driver.codex_lifetime.lock().await = Some(lifetime);
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let closer = tokio::spawn(async move {
+            let ok = Driver::close(&driver).await.is_ok();
+            let _ = done_tx.send(());
+            ok
+        });
+
+        for tick in 0..250u32 {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+                "the census must stay LIVE while close is stopping the process (tick {tick})"
+            );
+            // The adapter witness vanishes ~1 s into the ladder (it was
+            // aborted before the ladder started); the owner keeps it live.
+            if tick == 100 {
+                witness.take();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        done_rx.await.unwrap();
+        assert!(closer.await.unwrap(), "close completes on the killed group");
+        assert!(
+            !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+            "closed only once the process group is actually gone"
+        );
+        assert!(
+            crate::adapters::codex_discovery::census_contains(&cwd, owner),
+            "the closed interval is retained for pending discovery decisions"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_incomplete_teardown_keeps_the_census_open_for_the_node_lifetime() {
+        // c-usagefu r17 COORDINATOR RULING W0 (replaces the r13–r16 watcher /
+        // registry / process-identity machinery): when the stop ladder cannot
+        // CONFIRM the group is gone, the codex census intervals stay OPEN for
+        // the rest of this Node's lifetime — no watcher, no registry, no
+        // survivor probing. The operator is told exactly once through a
+        // lifecycle/Warning naming the instance and cwd, a later same-cwd
+        // prompt-only discovery keeps REFUSING even after the survivor exits,
+        // and Node shutdown drops the retained guards without recording a
+        // close.
+        use crate::adapters::FileSignalAdapter as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let canonical_cwd = std::fs::canonicalize(&cwd).unwrap().display().to_string();
+
+        // The survivor: a REAL process in its OWN group, the identity a
+        // stop-incomplete verdict names. The forced verdict only substitutes
+        // the ladder's conclusion; the real ladder still runs. The test kills
+        // the survivor after close.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let survivor_pid = i32::try_from(child.id()).unwrap();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        assert!(
+            lifecycle::group_has_live_member(survivor_pid),
+            "the external survivor is live in its own process group"
+        );
+
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        let driver = ShellPtyDriver::new(options);
+        let mut events = driver.spawn().await.expect("spawns").into_events();
+
+        // The driver-owned (native launch) cohort AND a promoted (unknown
+        // boundary) cohort, exactly as production registers them. c-usagefu r18
+        // item 3: they carry this test's Node epoch so the epoch-scoped
+        // shutdown seam below retires them.
+        let epoch = crate::adapters::codex_discovery::NodeEpoch::mint();
+        let native_owner = "r17-w0-native";
+        let promoted_owner = "r17-w0-promoted";
+        *driver.codex_lifetime.lock().await =
+            Some(crate::adapters::codex_discovery::begin_lifetime_for_epoch(
+                &cwd,
+                native_owner,
+                Some(time::OffsetDateTime::now_utc()),
+                Some(epoch.id()),
+            ));
+        driver.promoted_codex_lifetimes.lock().unwrap().push(
+            crate::adapters::codex_discovery::begin_lifetime_for_epoch(
+                &cwd,
+                promoted_owner,
+                None,
+                Some(epoch.id()),
+            ),
+        );
+
+        // Force the stop-incomplete verdict AFTER the real ladder, naming the
+        // genuinely live external survivor.
+        *driver.test_stop_outcome.lock().unwrap() = Some(lifecycle::StopOutcome {
+            rung: lifecycle::StopRung::Kill,
+            group_gone: false,
+            pgid: Some(survivor_pid),
+            survivors: vec![survivor_pid],
+        });
+        Driver::close(&driver).await.unwrap();
+
+        // The operator warning: exactly one Diagnostic/Warning lifecycle,
+        // naming the instance and the cwd and carrying the W0 message.
+        let mut stop_warnings = Vec::new();
+        while let Ok(observation) = events.try_recv() {
+            if let remuda_protocol::ObservationPayload::Lifecycle(payload) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = &**payload
+                && native.topic == remuda_protocol::LifecycleTopic::Diagnostic
+                && native.severity == remuda_protocol::Severity::Warning
+                && native.native_name == "stop-incomplete"
+            {
+                stop_warnings.push(native.clone());
+            }
+        }
+        assert_eq!(
+            stop_warnings.len(),
+            1,
+            "the stop-incomplete warning is emitted exactly once"
+        );
+        let warning = &stop_warnings[0];
+        let instance = warning
+            .related_ids
+            .get("instance")
+            .expect("names the instance");
+        assert!(!instance.is_empty(), "the named instance is not empty");
+        assert_eq!(
+            warning.related_ids.get("cwd").map(String::as_str),
+            Some(canonical_cwd.as_str()),
+            "the warning names the census cwd"
+        );
+        assert_eq!(
+            warning.native_id,
+            remuda_protocol::Knowledge::Known {
+                value: instance.clone()
+            },
+            "the native id is the named instance"
+        );
+        assert_eq!(
+            warning.status,
+            remuda_protocol::Knowledge::Known {
+                value: super::stop_incomplete_warning_message().to_owned()
+            }
+        );
+
+        // Both intervals are LIVE immediately after the incomplete close.
+        for owner in [native_owner, promoted_owner] {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+                "{owner}: the interval stays live after a stop-incomplete close"
+            );
+        }
+
+        // The survivor exits later — nothing is watching, so both intervals
+        // stay LIVE.
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(survivor_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lifecycle::group_has_live_member(survivor_pid) {
+            assert!(tokio::time::Instant::now() < deadline, "the survivor exits");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        for owner in [native_owner, promoted_owner] {
+            assert!(
+                crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+                "{owner}: a survivor exit after close never closes the interval (W0)"
+            );
+        }
+
+        // A LATER same-cwd, prompt-only launch is refused through the REAL
+        // discovery path and the rejection sticks (Ruling A1): the live
+        // intervals overlap its whole decision window.
+        let next_home = tempfile::tempdir().unwrap();
+        let floor = time::OffsetDateTime::now_utc();
+        let next_owner = "r17-w0-competitor";
+        let mut next = crate::adapters::CodexAdapter::new(crate::adapters::AdapterHome {
+            home: next_home.path().to_path_buf(),
+            cwd: cwd.clone(),
+            pid: None,
+            launched_at: Some(floor),
+            resume_session_id: None,
+        })
+        .with_instance_key(Some(next_owner.to_owned()));
+        let prompt = "r17 W0 later launch prompt";
+        crate::adapters::codex_discovery::record_input(&cwd, next_owner, prompt);
+        let started = floor;
+        let date_dir = format!(
+            "{:04}/{:02}/{:02}",
+            started.year(),
+            u8::from(started.month()),
+            started.day()
+        );
+        let month_dir = next_home.path().join("sessions").join(date_dir);
+        std::fs::create_dir_all(&month_dir).unwrap();
+        let started_rfc = started
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        std::fs::write(
+            month_dir.join("rollout-r17w0.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{started_rfc}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"r17w0\",\"session_id\":\"r17w0\",\"cwd\":\"{}\",\"timestamp\":\"{started_rfc}\"}}}}\n\
+                 {{\"timestamp\":\"{started_rfc}\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"m_user\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{prompt}\"}}],\"internal_chat_message_metadata_passthrough\":{{\"content_item_kinds\":[\"user.text\"]}}}}}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+        for attempt in 0..2 {
+            let observed = next.poll().unwrap();
+            assert!(
+                observed.is_empty(),
+                "same-cwd prompt-only discovery refuses while a stop-incomplete interval is live \
+                 (attempt {attempt})"
+            );
+            assert!(
+                next.binding().is_none(),
+                "no bind after refusal (attempt {attempt})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(next);
+
+        // Node shutdown (the exact seam DevNode::shutdown calls, c-usagefu r18
+        // item 3): the retained guards drop WITHOUT a recorded close and their
+        // still-open census SEGMENTS are retired (removed, not closed), so a
+        // fresh Node epoch can attribute in this cwd again.
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(Some(&epoch));
+        for owner in [native_owner, promoted_owner] {
+            assert!(
+                !crate::adapters::codex_discovery::census_lifetime_is_live(&cwd, owner),
+                "{owner}: this Node's shutdown retires its block without recording a close"
+            );
+        }
+        crate::adapters::codex_discovery::forget_lifetime(&cwd, next_owner);
+    }
+
+    /// Collect every observation of one body type from the receiver (drains
+    /// without blocking).
+    fn drain_observations<T>(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+        mut select: impl FnMut(&remuda_protocol::ObservationPayload) -> Option<T>,
+    ) -> Vec<T> {
+        let mut out = Vec::new();
+        while let Ok(observation) = events.try_recv() {
+            if let Some(value) = select(&observation.body) {
+                out.push(value);
+            }
+        }
+        out
+    }
+
+    fn stop_incomplete_warnings(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+    ) -> Vec<remuda_protocol::NativeLifecycle> {
+        drain_observations(events, |body| match body {
+            remuda_protocol::ObservationPayload::Lifecycle(payload) => match &**payload {
+                remuda_protocol::LifecyclePayload::Native(native)
+                    if native.topic == remuda_protocol::LifecycleTopic::Diagnostic
+                        && native.severity == remuda_protocol::Severity::Warning
+                        && native.native_name == "stop-incomplete" =>
+                {
+                    Some((**native).clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
+    /// c-usagefu r18 Ruling W0': an incomplete close performed as part of the
+    /// owning Node's shutdown emits only a tracing warn! — no operator
+    /// lifecycle/Warning observation — because the block ends with that Node.
+    /// A live Node's incomplete close still emits the observation (covered by
+    /// the r17 W0 test).
+    #[tokio::test]
+    async fn a_shutdown_incomplete_close_emits_no_lifecycle_warning() {
+        use std::os::unix::process::CommandExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let survivor_pid = i32::try_from(child.id()).unwrap();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        let epoch = crate::adapters::codex_discovery::NodeEpoch::mint();
+        epoch.begin_shutdown();
+        let mut options = ShellPtyOptions::login(cwd.clone());
+        options.args = vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()];
+        options.node_epoch = Some(epoch.clone());
+        let driver = ShellPtyDriver::new(options);
+        let mut events = driver.spawn().await.unwrap().into_events();
+        *driver.test_stop_outcome.lock().unwrap() = Some(lifecycle::StopOutcome {
+            rung: lifecycle::StopRung::Kill,
+            group_gone: false,
+            pgid: Some(survivor_pid),
+            survivors: vec![survivor_pid],
+        });
+        *driver.codex_lifetime.lock().await =
+            Some(crate::adapters::codex_discovery::begin_lifetime_for_epoch(
+                &cwd,
+                "r18-item2-owner",
+                Some(time::OffsetDateTime::now_utc()),
+                driver
+                    .options
+                    .node_epoch
+                    .as_ref()
+                    .map(crate::adapters::codex_discovery::NodeEpoch::id),
+            ));
+        Driver::close(&driver).await.unwrap();
+
+        // Draining every observation is the assertion: a stop-incomplete
+        // lifecycle/Warning here fails the test above. The channel may carry
+        // unrelated observations (or be empty); only the warning is gated.
+        while let Ok(observation) = events.try_recv() {
+            if let remuda_protocol::ObservationPayload::Lifecycle(payload) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Native(native) = &**payload
+                && native.topic == remuda_protocol::LifecycleTopic::Diagnostic
+                && native.severity == remuda_protocol::Severity::Warning
+                && native.native_name == "stop-incomplete"
+            {
+                panic!("a shutdown incomplete close must not emit the lifecycle warning");
+            }
+        }
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(survivor_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(Some(&epoch));
+    }
+
+    #[tokio::test]
+    async fn overlapping_closes_winner_emits_the_single_stop_incomplete_warning() {
+        // c-usagefu r18 item 1: two overlapping close() calls on one driver.
+        // The close that wins teardown ownership must also be the one holding
+        // the observation sender; otherwise — as before — close A takes the
+        // sender and parks in the poller-finalise wait, close B wins the
+        // teardown, runs the incomplete stop and has NO sender: the operator
+        // warning is silently lost. The close lock serializes the two, so
+        // exactly one warning is ever emitted, by the winner.
+        use std::os::unix::process::CommandExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+
+        // External survivor named by the forced verdict.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let survivor_pid = i32::try_from(child.id()).unwrap();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        let args = Arc::new(std::sync::Mutex::new("claude".to_owned()));
+        let driver = Arc::new(r7_login_driver(&cwd, &dir.path().join("home"), args));
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        // Let the promotion poller reach its select before arming the gate.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        *driver.test_stop_outcome.lock().unwrap() = Some(lifecycle::StopOutcome {
+            rung: lifecycle::StopRung::Kill,
+            group_gone: false,
+            pgid: Some(survivor_pid),
+            survivors: vec![survivor_pid],
+        });
+        // The owner guard a codex launch registers (the table here is a
+        // promoted claude login; the guard is what makes the warning fire).
+        *driver.codex_lifetime.lock().await =
+            Some(crate::adapters::codex_discovery::begin_lifetime(
+                &cwd,
+                "r18-item1-owner",
+                Some(time::OffsetDateTime::now_utc()),
+            ));
+
+        // Arm the deterministic gate: the winning close parks immediately
+        // after claiming teardown ownership and the sender, so B's overlap is
+        // driven while the teardown is still in flight.
+        test_reset_close_ownership_park();
+
+        let driver_a = Arc::clone(&driver);
+        let driver_b = Arc::clone(&driver);
+        let closer_a = tokio::spawn(async move { Driver::close(&*driver_a).await });
+
+        // Wait until A has claimed ownership and the sender.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        while !test_close_ownership_park_winner_arrived() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "A parks at the ownership gate"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            driver.events_tx.lock().await.is_none(),
+            "A has taken the observation sender before B starts"
+        );
+
+        // B starts while A is parked. Under the fix it waits on close_lock;
+        // without the fix it overtakes through the poller teardown, wins the
+        // (later) ownership claim and has NO sender.
+        let closer_b = tokio::spawn(async move { Driver::close(&*driver_b).await });
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // Release A; both closes then settle (A completes the teardown; B
+        // finds no state).
+        test_release_close_ownership_park();
+        closer_a.await.unwrap().unwrap();
+        closer_b.await.unwrap().unwrap();
+
+        let warnings = stop_incomplete_warnings(&mut events);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one stop-incomplete warning is emitted, by the winning close"
+        );
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(survivor_pid),
+            Some(nix::sys::signal::Signal::SIGKILL),
+        )
+        .unwrap();
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
+    }
+
+    /// c-usagefu r18 item 5 helper: a promoted login driver whose real poller
+    /// has bound the transcript and is buffering one open-turn usage record
+    /// (counters present, stop_reason null) that no poll has published.
+    async fn driver_with_buffered_open_turn(
+        dir: &Path,
+    ) -> (
+        ShellPtyDriver,
+        mpsc::Receiver<remuda_protocol::Observation>,
+        PathBuf,
+        &'static str,
+    ) {
+        let home = dir.join("claude-home");
+        let cwd = dir.to_path_buf();
+        let slug = crate::claude_transcript::project_dir(&home, &cwd);
+        std::fs::create_dir_all(&slug).unwrap();
+        let session: &'static str = "01234567-89ab-cdef-0123-456789abcdef";
+        let args = Arc::new(std::sync::Mutex::new(format!(
+            "claude --session-id {session}"
+        )));
+        let driver = r7_login_driver(&cwd, &home, args);
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        // Hook binds before the transcript exists (Fresh), then the prompt and
+        // one open assistant turn land.
+        let path = slug.join(format!("{session}.jsonl"));
+        r7_send_session_start(&hooks, pgid, session, &path).await;
+        std::fs::write(
+            &path,
+            format!(
+                "{}{}",
+                r7_user(session, "open-prompt", "working now"),
+                r7_record(
+                    session,
+                    serde_json::json!({
+                        "type": "assistant",
+                        "uuid": "open-assistant",
+                        "timestamp": "2026-10-14T00:00:00.000Z",
+                        "isSidechain": false,
+                        "message": {
+                            "type": "message",
+                            "role": "assistant",
+                            "id": "msg_open_turn",
+                            "model": "claude-opus-5-5",
+                            "content": [{"type": "text", "text": "working on it"}],
+                            "stop_reason": null,
+                            "usage": {
+                                "input_tokens": 5,
+                                "cache_read_input_tokens": 6000,
+                                "cache_creation_input_tokens": 9,
+                                "output_tokens": 13
+                            }
+                        }
+                    })
+                )
+            ),
+        )
+        .unwrap();
+        // Bind + at least two pumps: conversation hydrates, the open usage
+        // stays buffered.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if drain_observations(&mut events, |body| {
+                matches!(body, remuda_protocol::ObservationPayload::Message(_)).then_some(())
+            })
+            .is_empty()
+            {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            } else {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            drain_observations(&mut events, |body| {
+                matches!(body, remuda_protocol::ObservationPayload::Usage(_)).then_some(())
+            })
+            .is_empty(),
+            "the open turn usage is buffered in the live hydrator"
+        );
+        (driver, events, cwd, session)
+    }
+
+    fn buffered_usage_payloads(
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+    ) -> Vec<remuda_protocol::UsagePayload> {
+        drain_observations(events, |body| match body {
+            remuda_protocol::ObservationPayload::Usage(payload) => Some((**payload).clone()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn an_aborted_poller_publishes_the_live_hydrators_buffered_usage_exactly_once() {
+        // c-usagefu r18 item 5: close's finalise deadline aborts a wedged
+        // poller. Before the fix the abort guard was constructed with
+        // hydrator: None and only received the hydrator on the NORMAL disarm
+        // path, so the abort dropped the live mapper and its buffered usage.
+        // The guard now owns the live hydrator for the whole loop; its Drop
+        // runs finish_sync into a channel with free capacity.
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
+
+        let park = promotion::test_acquire_final_finalise_park().await;
+        // Signal exactly what close signals before waiting on the poller: the
+        // closed bit and the cooperative watch. The poller breaks its loop and
+        // parks at the gate before its final finalise.
+        driver
+            .state()
+            .await
+            .unwrap()
+            .closed
+            .store(true, Ordering::SeqCst);
+        if let Some(shutdown) = driver.poller_shutdown.lock().await.take() {
+            let _ = shutdown.send(true);
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        while !promotion::test_final_finalise_park_held() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the poller parks at the gate"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Channel has free capacity: drain anything queued.
+        let _ = drain_observations(&mut events, |body| Some(body.clone())).len();
+
+        // Deterministic abort, exactly like close's deadline path.
+        let poller = driver
+            .poller
+            .lock()
+            .await
+            .take()
+            .expect("the real poller handle")
+            .into_handle();
+        poller.abort();
+        let _ = poller.await;
+        drop(park);
+
+        // The guard's Drop finish_sync delivered the buffered usage.
+        let payloads = buffered_usage_payloads(&mut events);
+        assert_eq!(payloads.len(), 1, "buffered usage survives the abort once");
+        let known = |value: &remuda_protocol::Knowledge<remuda_protocol::U64>| match value {
+            remuda_protocol::Knowledge::Known { value } => value.0,
+            other => panic!("expected Known counter, got {other:?}"),
+        };
+        assert_eq!(known(&payloads[0].input_tokens), 5);
+        assert_eq!(known(&payloads[0].cache_read_tokens), 6_000);
+        assert_eq!(known(&payloads[0].cache_write_tokens), 9);
+        assert_eq!(known(&payloads[0].output_tokens), 13);
+
+        // The real close afterwards (poller already gone) publishes nothing
+        // more: the aborted hydrator owned the only copy.
+        Driver::close(&driver).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            buffered_usage_payloads(&mut events).is_empty(),
+            "no second usage publication after the abort finalise"
+        );
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
+    }
+
+    /// c-usagefu r20 item 5 shared harness: fill the bounded run channel so the
+    /// next awaited publication parks, then free exactly one slot on demand.
+    /// Dummy observations are tagged so the test can ignore them when reading.
+    async fn fill_event_channel(
+        sender: &mpsc::Sender<remuda_protocol::Observation>,
+        filler: &remuda_protocol::Observation,
+    ) {
+        while sender.capacity() > 0 {
+            sender
+                .send(filler.clone())
+                .await
+                .expect("fill the run channel");
+        }
+    }
+
+    /// True iff an observation is the buffered open turn's usage payload.
+    fn is_open_turn_usage(observation: &remuda_protocol::Observation) -> bool {
+        match &observation.body {
+            remuda_protocol::ObservationPayload::Usage(payload) => {
+                payload.output_tokens == remuda_protocol::Knowledge::Known { value: U64(13) }
+            }
+            _ => false,
+        }
+    }
+
+    /// Shared helper for the r21 cancellation regressions: drive the poller to
+    /// release into a pending reserve(), abort, free one slot and join. Returns
+    /// the observations delivered after the abort.
+    #[allow(clippy::too_many_lines)]
+    async fn abort_at_pending_reservation(
+        driver: &ShellPtyDriver,
+        events: &mut mpsc::Receiver<remuda_protocol::Observation>,
+        rebind: Option<(&crate::launch::HookSession, i32, &std::path::Path)>,
+    ) -> Vec<remuda_protocol::Observation> {
+        let sender = driver.test_events_sender().await.expect("run sender");
+        let filler = driver.test_filler_observation().await.expect("filler");
+        // Per-driver, per-invocation permit (c-usagefu r21 item 3).
+        let gate = driver.test_poller_gate().await.expect("poller gate");
+        let mut permit = gate.permit().await;
+
+        if let Some((hooks, pgid, second)) = rebind {
+            std::fs::write(second, b"{}").unwrap();
+            r7_send_session_start(hooks, pgid, "r20-second-session", second).await;
+        } else {
+            driver
+                .state()
+                .await
+                .unwrap()
+                .closed
+                .store(true, Ordering::SeqCst);
+            if let Some(shutdown) = driver.poller_shutdown.lock().await.take() {
+                let _ = shutdown.send(true);
+            }
+        }
+        // Wait for THIS poller's invocation to reach the gate after
+        // production (no sleep: acknowledgement is per-spawn).
+        permit.wait_entered().await;
+        // Fill the bounded channel while publication is still gated off.
+        fill_event_channel(&sender, &filler).await;
+        // Release the poller toward reserve() on the FULL channel.
+        permit.release_to_pending_reserve().await;
+        // c-usagefu r22 item 1: on a current-thread runtime the barrier's last
+        // participant returns before the poller resumes. Wait for the ack from
+        // polling the ACTUAL reservation future (a poll returned Pending) so
+        // the abort below cannot land while the poller is still before
+        // reserve() — which let pop-before-reserve regressions pass.
+        permit.wait_reserve_pending().await;
+
+        // Abort while full, then free exactly ONE slot and join.
+        // current_thread: the poller is parked on reserve(); abort schedules a
+        // cancellation poll; freeing the slot wakes it. The two compete, but
+        // both converge to exactly-once: the woken send delivers and Drop sees
+        // an empty queue, OR the cancellation drops the future first and Drop
+        // try_sends the queued observation into the freed slot. The assertion
+        // is exactly one either way; reverting reserve-before-pop leaves
+        // NOTHING in the queue for Drop and the woken future is cancelled.
+        let handle = driver
+            .poller
+            .lock()
+            .await
+            .take()
+            .expect("the real poller handle")
+            .into_handle();
+        handle.abort();
+        // Free one slot SYNCHRONOUSLY (try_recv releases the semaphore permit
+        // and wakes the queued sender without polling the runtime), then yield
+        // the current-thread runtime exactly ONCE: either the queued send
+        // completes (observation delivered, queue empty) or the cancel poll
+        // runs (future dropped, guard try_sends) — both exactly-once. Multiple
+        // yields would let the woken send race the cancel poll; one yield is
+        // sufficient because the cancel is already scheduled.
+        let freed = events.try_recv().expect("one filler drains synchronously");
+        let _ = freed;
+        tokio::task::yield_now().await;
+        let _ = handle.await;
+
+        let mut delivered = Vec::new();
+        while let Ok(Some(observation)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await
+        {
+            if is_open_turn_usage(&observation) {
+                delivered.push(observation);
+            }
+        }
+        delivered
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abort_during_a_full_channel_finalize_delivers_usage_exactly_once() {
+        // c-usagefu r21 item 3 — CLOSE path, per-spawn acknowledgement: abort
+        // lands on THIS invocation's pending reservation; the buffered open
+        // turn is delivered exactly once.
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
+
+        let delivered = abort_at_pending_reservation(&driver, &mut events, None).await;
+        assert_eq!(
+            delivered.len(),
+            1,
+            "buffered usage survives abort during a full-channel finalize, once"
+        );
+
+        Driver::close(&driver).await.unwrap();
+        assert!(
+            buffered_usage_payloads(&mut events).is_empty(),
+            "no second usage publication"
+        );
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abort_during_a_full_channel_rebind_delivers_usage_exactly_once() {
+        // c-usagefu r21 item 3 — REBIND path: a second authenticated
+        // SessionStart finalizes the old hydrator; the per-spawn gate proves
+        // THIS invocation parked (no other poller can satisfy it); abort at its
+        // pending reservation delivers the old turn once.
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+        let home = dir.path().join("claude-home");
+        let slug = crate::claude_transcript::project_dir(&home, dir.path());
+        std::fs::create_dir_all(&slug).unwrap();
+        let second = slug.join("r20-second-session.jsonl");
+
+        let delivered =
+            abort_at_pending_reservation(&driver, &mut events, Some((&hooks, pgid, &second))).await;
+        assert_eq!(
+            delivered.len(),
+            1,
+            "the rebound hydrator's buffered usage survives abort, once"
+        );
+        Driver::close(&driver).await.unwrap();
+        assert!(
+            buffered_usage_payloads(&mut events).is_empty(),
+            "no second usage publication after the abort rebind"
+        );
+        crate::adapters::codex_discovery::shutdown_unconfirmed_guards(None);
+    }
+
+    #[tokio::test]
+    async fn a_normal_close_with_guard_owned_hydrator_publishes_buffered_usage_once() {
+        // c-usagefu r18 item 5 normal-path half: with the guard owning the
+        // hydrator, the cooperative close finalises it and marks the guard
+        // done, so the Drop finish_sync never re-emits the same group.
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, mut events, _cwd, _session) = driver_with_buffered_open_turn(dir.path()).await;
+
+        Driver::close(&driver).await.unwrap();
+        // Give any (incorrect) second publication time to land.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let payloads = buffered_usage_payloads(&mut events);
+        assert_eq!(
+            payloads.len(),
+            1,
+            "normal close publishes the open usage once"
+        );
+    }
+
     ///
     /// Promoted rather than launched: §1.0 makes the two the same session to
     /// everything below the spawn, and the promoted shape needs no materializer
@@ -6324,6 +8229,124 @@ mod tests {
         );
         assert!(r7_conversation_has(&after, "after the resume"));
         assert!(bridge.has_pending());
+
+        Driver::close(&driver).await.unwrap();
+    }
+
+    /// c-usagefu r17 item 2: an authenticated native-session rebind in the
+    /// SAME foreground pid (an in-TUI `/clear` reports a new SessionStart)
+    /// must finalize and publish the OLD hydrator's buffered group before
+    /// discarding it. The open turn's usage is emitted only by
+    /// mapper.finish(); `hydrator = None` dropped it silently, so every token
+    /// of the pre-/clear turn never reached the Hub.
+    #[tokio::test]
+    async fn a_native_session_rebind_publishes_the_old_hydrators_buffered_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("claude-home");
+        let cwd = dir.path().to_path_buf();
+        let slug = crate::claude_transcript::project_dir(&home, &cwd);
+        std::fs::create_dir_all(&slug).unwrap();
+        let args = Arc::new(std::sync::Mutex::new(format!(
+            "claude --session-id {R7_S1}"
+        )));
+        let driver = r7_login_driver(dir.path(), &home, Arc::clone(&args));
+        let mut events = driver.spawn().await.expect("spawn").into_events();
+        let pgid = driver.state().await.unwrap().pgid.load(Ordering::SeqCst);
+        assert!(pgid > 0);
+        let hooks = driver.hooks.lock().await.clone().expect("hook session");
+
+        // S1 reports at boot, before its transcript exists (measured Fresh).
+        let s1_path = slug.join(format!("{R7_S1}.jsonl"));
+        r7_send_session_start(&hooks, pgid, R7_S1, &s1_path).await;
+        r7_collect(&mut events, std::time::Duration::from_millis(1000)).await;
+
+        // The prompt and one assistant turn land: real counters but NO
+        // stop_reason, so the usage stays buffered in the hydrator across
+        // ordinary poll flushes (published only by finish()).
+        let open_turn = r7_record(
+            R7_S1,
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": "s1-open-assistant",
+                "timestamp": "2026-10-14T00:00:00.000Z",
+                "isSidechain": false,
+                "message": {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_s1_open",
+                    "model": "claude-opus-5-5",
+                    "content": [{"type": "text", "text": "working on it"}],
+                    "stop_reason": null,
+                    "usage": {
+                        "input_tokens": 3,
+                        "cache_read_input_tokens": 4000,
+                        "cache_creation_input_tokens": 7,
+                        "output_tokens": 11
+                    }
+                }
+            }),
+        );
+        std::fs::write(
+            &s1_path,
+            format!("{}{open_turn}", r7_user(R7_S1, "s1-prompt", "first prompt")),
+        )
+        .unwrap();
+        // Bind + at least one poll: the conversation hydrates, the buffered
+        // usage does NOT publish yet.
+        let before_rebind = r7_collect(&mut events, std::time::Duration::from_millis(1800)).await;
+        assert!(
+            !before_rebind
+                .iter()
+                .any(|o| matches!(o.body, remuda_protocol::ObservationPayload::Usage(_))),
+            "the open turn's usage stays buffered across poll flushes"
+        );
+
+        // /clear in the same pid: a second authenticated SessionStart names
+        // the new session S2, whose transcript already holds history (sized
+        // from the authenticated report; that history is gated, not current).
+        let s2_path = slug.join(format!("{R7_Z}.jsonl"));
+        std::fs::write(&s2_path, r7_user(R7_Z, "s2-history", "old cleared turn")).unwrap();
+        r7_send_session_start(&hooks, pgid, R7_Z, &s2_path).await;
+        let rebound = r7_collect(&mut events, std::time::Duration::from_millis(2600)).await;
+
+        // The OLD session's buffered usage is finalised as part of the rebind,
+        // before the new hydrator opens — the counters are the open turn's.
+        let buffered: Vec<_> = rebound
+            .iter()
+            .filter_map(|o| match &o.body {
+                remuda_protocol::ObservationPayload::Usage(payload) => Some(payload),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            buffered.len(),
+            1,
+            "the rebind publishes the old hydrator's buffered usage exactly once"
+        );
+        let known = |value: &remuda_protocol::Knowledge<remuda_protocol::U64>| match value {
+            remuda_protocol::Knowledge::Known { value } => value.0,
+            other => panic!("expected Known counter, got {other:?}"),
+        };
+        assert_eq!(known(&buffered[0].input_tokens), 3);
+        assert_eq!(known(&buffered[0].cache_read_tokens), 4_000);
+        assert_eq!(known(&buffered[0].cache_write_tokens), 7);
+        assert_eq!(known(&buffered[0].output_tokens), 11);
+        // The gated history never hydrates as conversation.
+        assert!(!r7_conversation_has(&rebound, "old cleared turn"));
+
+        // After the rebind, S2 continues in its OWN hydrator: bytes appended
+        // past the anchor hydrate as current conversation.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&s2_path)
+            .unwrap()
+            .write_all(r7_user(R7_Z, "s2-prompt", "after clear").as_bytes())
+            .unwrap();
+        let after = r7_collect(&mut events, std::time::Duration::from_millis(1800)).await;
+        assert!(
+            r7_conversation_has(&after, "after clear"),
+            "the rebound session continues in a fresh hydrator"
+        );
 
         Driver::close(&driver).await.unwrap();
     }

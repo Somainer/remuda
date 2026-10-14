@@ -852,6 +852,9 @@ async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
         let _ = std::fs::set_permissions(&options.socket, std::fs::Permissions::from_mode(0o600));
     }
     eprintln!("api socket: {}", options.socket.display());
+    let trace_path = std::env::var_os("FAKE_HERDR_TRACE")
+        .map(PathBuf::from)
+        .or_else(|| Some(options.socket.with_extension("trace.jsonl")));
     let state = Arc::new(Mutex::new(State::new(
         options.script,
         options.agent_start_delay,
@@ -868,6 +871,7 @@ async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
         options.subscribe_never_acks,
         options.refuse_shell_exit_send_text,
         options.refuse_close_subscribes_marker.clone(),
+        trace_path,
     )));
     // Only the scripted shutdown window (`exit_after_unavailable`) stops the
     // accept loop. Parent death is handled by the outer `parent_watch`
@@ -949,6 +953,11 @@ struct State {
     control_dispatch_record_file: Option<PathBuf>,
     /// Bumped by the simulated restart; surfaced in `ping` capabilities.
     server_generation: u32,
+    /// JSONL append target recording the `env` map every `workspace.create`
+    /// and `pane.split` actually received — the only place a driver test can
+    /// assert on the pane environment the launch produced (the recipe's
+    /// allowlist is a different, earlier layer).
+    trace_path: Option<PathBuf>,
 }
 
 impl State {
@@ -969,12 +978,14 @@ impl State {
         subscribe_never_acks: bool,
         refuse_shell_exit_send_text: bool,
         refuse_close_subscribes_marker: Option<PathBuf>,
+        trace_path: Option<PathBuf>,
     ) -> Self {
         Self {
             script,
             agent_start_delay,
             unavailable_calls,
             exit_after_unavailable,
+            trace_path,
             next_ws: 1,
             next_tab: 1,
             next_pane: 1,
@@ -1239,6 +1250,36 @@ fn lock_state(
         .map_err(|_| FakeHerdrError::Args("state poisoned".into()))
 }
 
+/// Append `{method, env}` for one pane-creating RPC so driver tests can assert
+/// on the environment the fake herdr actually received (the pane env is the
+/// layer a harness-home pin would ride, not the recipe allowlist).
+fn trace_pane_env(st: &State, method: &str, params: &Value) {
+    let Some(path) = &st.trace_path else {
+        return;
+    };
+    // An omitted env field IS an empty pane env (HashMap::is_empty skips
+    // serializing); record {} explicitly so a trace always carries an object.
+    let line = serde_json::json!({
+        "method": method,
+        "env": params.get("env").cloned().unwrap_or_else(|| json!({}))
+    });
+    let mut text = serde_json::to_string(&line).unwrap_or_else(|_| "{}".into());
+    text.push('\n');
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("fake-herdr: trace mkdir failed: {error}");
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = Write::write_all(&mut file, text.as_bytes());
+    }
+}
+
 fn handle_rpc(
     state: &Arc<Mutex<State>>,
     req: &WireRequest,
@@ -1249,7 +1290,10 @@ fn handle_rpc(
     match req.method.as_str() {
         "ping" => serde_json::to_value(pong(&st)).map_err(json_err),
         "session.snapshot" => snapshot(&st),
-        "workspace.create" => workspace_create(&mut st, &req.params),
+        "workspace.create" => {
+            trace_pane_env(&st, "workspace.create", &req.params);
+            workspace_create(&mut st, &req.params)
+        }
         "workspace.list" => serde_json::to_value(WorkspaceList {
             kind: "workspace_list".into(),
             workspaces: st.workspaces.values().cloned().collect(),
@@ -1263,7 +1307,10 @@ fn handle_rpc(
         .map_err(json_err),
         "tab.close" => tab_close(&mut st, &req.params),
         "workspace.close" => workspace_close(&mut st, &req.params),
-        "pane.split" => pane_split(&mut st, &req.params),
+        "pane.split" => {
+            trace_pane_env(&st, "pane.split", &req.params);
+            pane_split(&mut st, &req.params)
+        }
         "pane.close" => pane_close(&mut st, &req.params),
         "pane.read" => pane_read(&st, &req.params),
         "pane.send_text" => pane_send_text(&mut st, &req.params),

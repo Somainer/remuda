@@ -35,7 +35,6 @@ use crate::launch::HookSession;
 pub const ADAPTER_POLL: Duration = Duration::from_millis(250);
 
 /// Everything the supervisor needs to stamp and route observations.
-#[derive(Clone)]
 pub struct AdapterCtx {
     /// Instance identity shared with the hook bus.
     pub stamp: StampCtx,
@@ -56,11 +55,42 @@ pub struct AdapterCtx {
     /// different process sharing this home (same rule as
     /// `remuda_node::signal::binds_instance`).
     pub agent_pid: Option<i32>,
+    /// Stable per-launch identity for process-wide codex discovery
+    /// (prompt registry + rollout claims, c-usagefu r6 item 1). `None` for a
+    /// promoted attach to a process this Node did not launch: its claim is
+    /// released when the adapter closes.
+    pub instance_key: Option<String>,
+    /// c-usagefu r8 item 1 tier b: process-tree ownership probe + the live
+    /// agent pid roots (refreshed by the driver). A rollout held open by a
+    /// process in one of these trees is attributed to THIS instance without
+    /// relying on prompt text. `None` for promoted attaches.
+    pub ownership: Option<Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>>,
+    /// c-usagefu r8 item 1 tier b: live agent pid roots refreshed by the
+    /// driver while the pane is live.
+    pub agent_pid_roots: Option<std::sync::Arc<std::sync::Mutex<Vec<u32>>>>,
+    /// c-usagefu r9 item 1: instance lifetime registered BEFORE the agent
+    /// launch. The codex adapter holds a clone so its interval stays open
+    /// through bind and is closed with the driver. `None` for promoted /
+    /// hook-confirmed / non-codex launches.
+    pub(crate) lifetime: Option<crate::adapters::codex_discovery::LifetimeGuard>,
+    /// c-usagefu r12 item 2 (Ruling A2'): pending-discovery window the launch
+    /// site opened TOGETHER with the lifetime BEFORE the process started. The
+    /// codex adapter takes ownership of it instead of opening its own at
+    /// construction, so the gap between agent.start and adapter construction
+    /// (generic-pty settlement, up to 60 s) is covered by a live discovery
+    /// window and another window's release cannot prune intervals this
+    /// launch's pending decision still needs.
+    pub(crate) window: Option<crate::adapters::codex_discovery::DiscoveryWindow>,
 }
 
 /// Handle to a running adapter task. Dropping/aborting it stops the poll loop.
 pub struct AdapterHandle {
     pub(crate) tasks: Vec<JoinHandle<()>>,
+    /// Set the first time a file adapter's poll reports it bound a session
+    /// (c-usagefu r19/r20 item 6 test seam; compiled out of release builds
+    /// together with its accessor).
+    #[cfg(any(test, feature = "test-stub"))]
+    bound: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AdapterHandle {
@@ -71,11 +101,49 @@ impl AdapterHandle {
             task.abort();
         }
     }
+
+    /// Test seam: whether any adapter in this handle has bound a session.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub fn is_bound(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.bound.load(Ordering::SeqCst)
+    }
+
+    /// Construct a handle for an externally spawned (non-file-adapter) task.
+    pub(crate) fn from_tasks(tasks: Vec<JoinHandle<()>>) -> Self {
+        Self {
+            tasks,
+            #[cfg(any(test, feature = "test-stub"))]
+            bound: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
 }
 
 impl Drop for AdapterHandle {
     fn drop(&mut self) {
         self.abort();
+    }
+}
+
+/// Adopt a resumed driver's file-tail handle into the LIVE driver's slot
+/// (c-usagefu r8 item 2). `start_resumed_inner` spawns a fresh driver whose
+/// adapter tasks live in ITS slot; when that scratch driver is consumed at
+/// the end of resume, simply dropping the slot would abort the new tails
+/// (the supervisor.rs `Drop` aborts every task).
+///
+/// Order matters: the resumed handle is MOVED into the live slot FIRST
+/// (before the previous handle is disposed), so the scratch driver's
+/// subsequent drop aborts nothing while the adopted tasks keep emitting on
+/// the live driver. The previous process's handle is disposed AFTER the move
+/// (its tails follow a dead pid). The live slot holds exactly the adopted
+/// handle afterwards.
+pub(crate) async fn adopt_resumed_handle(
+    live: &tokio::sync::Mutex<Option<AdapterHandle>>,
+    resumed: &tokio::sync::Mutex<Option<AdapterHandle>>,
+) {
+    if let Some(moved) = resumed.lock().await.take() {
+        let old = live.lock().await.replace(moved);
+        drop(old);
     }
 }
 
@@ -104,11 +172,26 @@ pub fn stamp_ctx(
 /// watcher without a second spawn site.
 pub fn spawn_file_adapters(
     kind: AgentKind,
-    ctx: AdapterCtx,
+    mut ctx: AdapterCtx,
 ) -> DriverResult<Option<AdapterHandle>> {
     match kind {
         AgentKind::Codex => {
             let mut adapter = CodexAdapter::new(ctx.home.clone());
+            // r9 item 1: attach the pre-launch lifetime BEFORE the instance
+            // key so its floor is not re-registered at adapter construction.
+            if let Some(lifetime) = ctx.lifetime.take() {
+                adapter = adapter.with_lifetime(lifetime);
+            }
+            // r12 item 2 (A2'): take the window opened before the process
+            // started, if the launch site pre-registered one; with_instance_key
+            // then skips opening a late window of its own.
+            if let Some(window) = ctx.window.take() {
+                adapter = adapter.with_window(window);
+            }
+            let mut adapter = adapter.with_instance_key(ctx.instance_key.clone());
+            if let Some(probe) = &ctx.ownership {
+                adapter = adapter.with_ownership(probe.clone(), ctx.agent_pid_roots.clone());
+            }
             if let Some(model) = &ctx.fallback_model {
                 adapter = adapter.with_fallback_model(model.clone());
             }
@@ -130,58 +213,72 @@ pub fn spawn_file_adapters(
 }
 
 fn run<A: FileSignalAdapter + 'static>(mut adapter: A, ctx: AdapterCtx) -> AdapterHandle {
-    let task = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(ADAPTER_POLL);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tick.tick().await;
-            if ctx.events.is_closed() {
-                break;
-            }
-            // Hook > File: a SessionStart bound to the agent pid confirms the
-            // adapter's session before file discovery guesses.
-            if let Some(hooks) = &ctx.hooks
-                && let Some(binding) = hooks.binding()
-                && let Some(session_id) =
-                    confirmed_session(binding.pid, ctx.agent_pid, &binding.session_id)
-            {
-                adapter.confirm_session(&session_id);
-            }
-            let polled = adapter.poll();
-            // Resolve every synchronous result before an `.await`: the adapter
-            // is `Send` but not `Sync`, so a borrow of it may not cross an
-            // await inside a `tokio::spawn`ed task.
-            let (observations, session_id) = match polled {
-                Ok(observations) => {
-                    let session_id = adapter
-                        .session_id()
-                        .map_or(ctx.stamp.session_id.clone(), str::to_owned);
-                    (observations, session_id)
+    #[cfg(any(test, feature = "test-stub"))]
+    let bound = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task = tokio::spawn({
+        #[cfg(any(test, feature = "test-stub"))]
+        let bound = Arc::clone(&bound);
+        async move {
+            let mut tick = tokio::time::interval(ADAPTER_POLL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if ctx.events.is_closed() {
+                    break;
                 }
-                Err(error) => {
-                    // A tail error is retried next tick (the file may simply
-                    // not exist yet). Persistent errors are debug-logged, never
-                    // fatal: losing the file channel must degrade, not crash.
-                    tracing::debug!(%error, kind = ?adapter.kind(), "file adapter poll failed");
+                // Hook > File: a SessionStart bound to the agent pid confirms the
+                // adapter's session before file discovery guesses.
+                if let Some(hooks) = &ctx.hooks
+                    && let Some(binding) = hooks.binding()
+                    && let Some(session_id) =
+                        confirmed_session(binding.pid, ctx.agent_pid, &binding.session_id)
+                {
+                    adapter.confirm_session(&session_id);
+                }
+                let polled = adapter.poll();
+                // Resolve every synchronous result before an `.await`: the adapter
+                // is `Send` but not `Sync`, so a borrow of it may not cross an
+                // await inside a `tokio::spawn`ed task.
+                let (observations, session_id) = match polled {
+                    Ok(observations) => {
+                        let session_id = adapter
+                            .session_id()
+                            .map_or(ctx.stamp.session_id.clone(), str::to_owned);
+                        if adapter.session_id().is_some() {
+                            #[cfg(any(test, feature = "test-stub"))]
+                            bound.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        (observations, session_id)
+                    }
+                    Err(error) => {
+                        // A tail error is retried next tick (the file may simply
+                        // not exist yet). Persistent errors are debug-logged, never
+                        // fatal: losing the file channel must degrade, not crash.
+                        tracing::debug!(%error, kind = ?adapter.kind(), "file adapter poll failed");
+                        continue;
+                    }
+                };
+                if observations.is_empty() {
                     continue;
                 }
-            };
-            if observations.is_empty() {
-                continue;
-            }
-            let stamp = StampCtx {
-                session_id,
-                ..ctx.stamp.clone()
-            };
-            if forward_all(observations, &stamp, &ctx.events, &ctx.seq)
-                .await
-                .is_err()
-            {
-                break;
+                let stamp = StampCtx {
+                    session_id,
+                    ..ctx.stamp.clone()
+                };
+                if forward_all(observations, &stamp, &ctx.events, &ctx.seq)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
         }
     });
-    AdapterHandle { tasks: vec![task] }
+    AdapterHandle {
+        tasks: vec![task],
+        #[cfg(any(test, feature = "test-stub"))]
+        bound,
+    }
 }
 
 /// Stamp and send every adapter observation. Free of adapter borrows so the
@@ -215,7 +312,18 @@ pub fn promoted_home(kind: AgentKind, cwd: PathBuf, pid: Option<u32>) -> Option<
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(dot)))?;
-    Some(AdapterHome { home, cwd, pid })
+    Some(AdapterHome {
+        home,
+        cwd,
+        pid,
+        // A promoted session was launched by the operator before we attached;
+        // there is no launch floor, so its adapter keeps the name-index
+        // discovery path. Only a driver launch (generic_pty) supplies one.
+        launched_at: None,
+        // The operator attached to a running session; there is no resume
+        // instruction to bind by id (c-usagefu r15 item 3).
+        resume_session_id: None,
+    })
 }
 
 /// The session id a file adapter should follow given a hook-confirmed binding.

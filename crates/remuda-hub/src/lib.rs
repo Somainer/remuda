@@ -33,14 +33,23 @@ pub use interactions::delegated_decisions_test_support;
 /// Test-only seam for the D-057 continuation-resume race.
 #[doc(hidden)]
 pub use store::lineage_test_support;
-/// Test-only seam: project real driver observations through the Hub usage
-/// pipeline (driver close/finalise tests in remuda-node).
 #[doc(hidden)]
 pub mod usage_store_test_support {
+    use rusqlite::Connection;
+
     pub use crate::store::JournalRecord;
     pub use crate::usage_store::{
-        insert_usage_event, migrate, project_usage_event, rollup_instance,
+        RollupRequest, aggregate_instance, aggregate_supply, insert_usage_event, migrate,
+        project_usage_event, rollup_instance,
     };
+
+    /// An in-memory, fully migrated Hub DB for projection/rollup tests that do
+    /// not need a running Hub or the writer/reader split.
+    pub fn migrated_memory() -> rusqlite::Result<Connection> {
+        let conn = Connection::open_in_memory()?;
+        crate::usage_store::migrate(&conn)?;
+        Ok(conn)
+    }
 }
 mod inventory;
 mod maintenance;

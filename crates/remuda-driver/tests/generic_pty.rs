@@ -116,6 +116,9 @@ async fn fake_herdr_codex_start_send_wait_read_stop() {
         agent_start_timeout_ms: 5_000,
         liveness_timeout_ms: 5_000,
         line_matcher: Some("^DONE ".into()),
+        instance_id: None,
+        file_adapter_home: None,
+        node_epoch: None,
     });
 
     let mut requested = spec(&cwd, AgentKind::Codex);
@@ -232,6 +235,9 @@ async fn fake_herdr_start_failure_emits_error_lifecycle() {
         agent_start_timeout_ms: 5_000,
         liveness_timeout_ms: 5_000,
         line_matcher: None,
+        instance_id: None,
+        file_adapter_home: None,
+        node_epoch: None,
     });
 
     let spec = spec(&cwd, AgentKind::Grok);
@@ -307,6 +313,9 @@ async fn fake_herdr_slow_start_emits_ready_lifecycle() {
         agent_start_timeout_ms: 5_000,
         liveness_timeout_ms: 5_000,
         line_matcher: None,
+        instance_id: None,
+        file_adapter_home: None,
+        node_epoch: None,
     });
 
     let started_at = tokio::time::Instant::now();
@@ -380,6 +389,9 @@ async fn fake_herdr_send_before_start_defers_without_blocking_control() {
         agent_start_timeout_ms: 5_000,
         liveness_timeout_ms: 5_000,
         line_matcher: Some("^DONE".into()),
+        instance_id: None,
+        file_adapter_home: None,
+        node_epoch: None,
     }));
     fs::create_dir_all(tmp.path().join("home")).unwrap();
 
@@ -431,6 +443,9 @@ async fn fake_herdr_journals_bounded_screen_snapshot() {
         agent_start_timeout_ms: 5_000,
         liveness_timeout_ms: 5_000,
         line_matcher: Some("^DONE".into()),
+        instance_id: None,
+        file_adapter_home: None,
+        node_epoch: None,
     });
 
     let mut handle = driver
@@ -530,4 +545,189 @@ async fn agent_origin_bypass_create_uses_non_yolo_preset() {
         Some("bypassPermissions")
     );
     driver.close().await.unwrap();
+}
+
+/// c-usagefu (d) + r2 item 1: Hub dispatch forces Grok onto generic-pty, so
+/// the codex/grok file adapters must spawn there too — but the pane is never
+/// pinned to the empty per-instance home (that would lose the operator's
+/// login). The harness reads and writes its REAL home; the file adapter tails
+/// that same home, and a registered session whose `updates.jsonl` carries
+/// usage yields `Usage` observations on the launch's observation channel.
+#[tokio::test]
+async fn generic_pty_grok_spawns_file_adapter_and_emits_usage() {
+    const SESSION_ID: &str = "01a09c24-usage-7a03-9c89-88f1bc00bd0c";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.path().join("herdr");
+    fs::create_dir_all(&socket_dir).unwrap();
+    let socket = socket_dir.join("herdr.sock");
+    let fake_bin = ensure_workspace_bin("fake-herdr");
+    let _fake = FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap();
+
+    let cwd = tmp.path().join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    let cwd = cwd.canonicalize().unwrap();
+    let launch = tmp.path().join("launch");
+    // The Node-registered per-instance home: created empty, exactly like
+    // `prepare_workspace` leaves it. It must never become the pane's
+    // GROK_HOME.
+    let native_home = tmp.path().join("native-home");
+    fs::create_dir_all(&native_home).unwrap();
+    // The operator's REAL grok home (what `$HOME/.grok` or `$GROK_HOME`
+    // resolves to in the Node/herdr process). The adapter resolves this in
+    // production; the test injects it because process-env mutation is
+    // forbidden workspace-wide.
+    let real_home = tmp.path().join("real-grok-home");
+    fs::create_dir_all(&real_home).unwrap();
+    let bin = stub_bin(tmp.path(), "grok");
+
+    // Native Grok home as a real TUI would leave it: an active_sessions.json
+    // registry and a session directory keyed by encoded cwd.
+    let session_dir = real_home
+        .join("sessions")
+        .join(remuda_driver::grok_session::encode_session_cwd(&cwd))
+        .join(SESSION_ID);
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/usage/grok-updates-usage.jsonl"),
+        session_dir.join("updates.jsonl"),
+    )
+    .expect("seed updates.jsonl");
+    fs::write(
+        real_home.join("active_sessions.json"),
+        serde_json::json!([{
+            "session_id": SESSION_ID,
+            "pid": std::process::id(),
+            "cwd": cwd,
+            "opened_at": "2026-09-13T18:21:00.000Z"
+        }])
+        .to_string(),
+    )
+    .unwrap();
+
+    let instance = remuda_protocol::InstanceId::new();
+    let real_home_str = real_home.to_string_lossy().into_owned();
+    let mut options = GenericPtyOptions {
+        profile: profile(),
+        launch_dir: launch,
+        native_home: native_home.clone(),
+        binary: BinarySource::Pinned(pin_binary(&bin).unwrap()),
+        origin: LaunchOrigin::Human,
+        session_name: "remuda-test".into(),
+        socket_dir: Some(socket_dir),
+        herdr_binary: Some(fake_bin),
+        broker: std::sync::Arc::new(remuda_driver::EnvFileSecretBroker::env_only()),
+        extra_env: Default::default(),
+        agent_mcp: None,
+        agent_start_timeout_ms: 5_000,
+        liveness_timeout_ms: 5_000,
+        line_matcher: Some("^DONE".into()),
+        instance_id: Some(instance.clone()),
+        file_adapter_home: Some(real_home),
+        node_epoch: None,
+    };
+    // OpenAI-shaped test profile; the grok usage counters are priced
+    // independently, this only satisfies launch materialization.
+    options.profile = ProviderProfile {
+        kind: ProviderKind::OpenaiResponses,
+        ..options.profile
+    };
+
+    let driver = GenericPtyDriver::new(options);
+    let mut requested = spec(&cwd, AgentKind::Grok);
+    if let remuda_protocol::PermissionMode::Claude(permission) = &mut requested.permission_mode {
+        permission.mode = remuda_protocol::ClaudePermissionMode::BypassPermissions;
+    }
+    let mut handle = driver.start(requested).await.expect("grok start");
+
+    // r2 item 1: the launch must not pin GROK_HOME (or CODEX_HOME) at the
+    // empty per-instance native home — that would put the harness at a login
+    // screen and lose the operator's provider config.
+    //
+    // r3 item 4: the allowlist assertion alone passed against the REVERTED
+    // code — the old pin rode the pane env map sent in workspace.create /
+    // pane.split, not recipe().env_allowlist. The fake herdr traces the env
+    // it received; assert there on BOTH calls.
+    assert!(
+        handle
+            .recipe()
+            .env_allowlist
+            .iter()
+            .all(|entry| entry.name != "GROK_HOME" && entry.name != "CODEX_HOME"),
+        "generic-pty grok launch must not pin a harness home: {:?}",
+        handle.recipe().env_allowlist
+    );
+    assert_ne!(
+        handle.recipe().native_home,
+        real_home_str,
+        "the per-instance native home is not the operator's real home"
+    );
+    let trace = fs::read_to_string(socket.with_extension("trace.jsonl"))
+        .expect("fake herdr traces the pane env it receives");
+    let traced: Vec<serde_json::Value> = trace
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("trace line is JSON"))
+        .collect();
+    let methods: Vec<&str> = traced
+        .iter()
+        .map(|row| row["method"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        methods,
+        vec!["workspace.create", "pane.split"],
+        "both pane-creating RPCs are traced"
+    );
+    for row in &traced {
+        let env = row["env"]
+            .as_object()
+            .expect("the pane env map is recorded on the trace");
+        for pinned in ["GROK_HOME", "CODEX_HOME"] {
+            assert!(
+                !env.contains_key(pinned),
+                "{} env must not pin {} at the empty native home: {env:?}",
+                row["method"].as_str().unwrap_or("rpc"),
+                pinned
+            );
+        }
+    }
+
+    // The file adapter polls every 250 ms; a Usage observation from the
+    // seeded updates.jsonl must arrive on the same channel as the pane's own
+    // observations. Two `turn_completed` frames stream in, so the last Session
+    // snapshot is cumulative for both (output 40 + 60 = 100); keep collecting
+    // briefly so the assertion reads the final revision, not the first.
+    let mut last_usage = None;
+    let mut stamped_instance = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Some(obs)) = tokio::time::timeout(Duration::from_millis(500), handle.recv()).await
+        else {
+            if last_usage.is_some() {
+                break;
+            }
+            continue;
+        };
+        if let ObservationPayload::Usage(payload) = &obs.body {
+            assert_eq!(payload.scope, remuda_protocol::UsageScope::Session);
+            last_usage = Some(payload.clone());
+            stamped_instance = Some(obs.instance_id.clone());
+        }
+    }
+    let payload =
+        last_usage.expect("grok generic-pty launch must tail updates.jsonl and emit usage");
+    // Both turns folded into one cumulative session snapshot.
+    let output = match &payload.output_tokens {
+        Knowledge::Known { value } => value.0,
+        other => panic!("expected known output tokens, got {other:?}"),
+    };
+    assert_eq!(output, 100, "cumulative session output across two turns");
+    assert_eq!(
+        stamped_instance.as_ref(),
+        Some(&instance),
+        "usage stamped with the Hub-issued instance id"
+    );
+
+    driver.close().await.expect("stop");
 }

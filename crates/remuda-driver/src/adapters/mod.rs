@@ -21,6 +21,8 @@
 //! [grok-signals-1](../../../docs/design/evidence/grok-signals-1.md).
 
 pub mod codex_adapter;
+pub mod codex_discovery;
+pub(crate) mod codex_ownership;
 pub mod grok_adapter;
 pub mod grok_live;
 pub mod grok_terminal;
@@ -122,6 +124,22 @@ pub struct AdapterHome {
     /// Agent process pid when known (launch child, or promoted foreground
     /// leader). Grok's `active_sessions.json` matches on it.
     pub pid: Option<u32>,
+    /// When THIS driver launched the agent (generic-pty dispatch: no hooks, no
+    /// child pid), the wall-clock floor for file discovery. A native session
+    /// may bind only if its `session_meta.timestamp` is at/after it and its
+    /// cwd matches — without the floor, an unconfirmed adapter could bind an
+    /// older, unrelated session sharing the operator's real harness home
+    /// (c-usagefu r3 item 1). `None` for a promoted/foreign-launched process,
+    /// whose session legitimately predates our attachment.
+    pub launched_at: Option<time::OffsetDateTime>,
+    /// The native session id an explicit `codex resume <id>` continues
+    /// (c-usagefu r15 item 3). A real resume APPENDS to the existing rollout,
+    /// whose `session_meta.timestamp` is the ORIGINAL start and therefore
+    /// predates [`Self::launched_at`]; discovery binds that rollout BY ID
+    /// (cwd still verified) and never falls through to timestamp/cwd guessing,
+    /// which could bind a different pre-floor file. `None` for an ordinary
+    /// launch, where the timestamp floor remains the discovery rule.
+    pub resume_session_id: Option<String>,
 }
 
 /// A session the adapter should follow.

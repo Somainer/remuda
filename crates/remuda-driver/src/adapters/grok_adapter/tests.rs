@@ -33,6 +33,8 @@ fn write_real_session(dir: &Path, cwd: &Path, pid: u32, session: &str) -> GrokAd
         home: dir.to_path_buf(),
         cwd: cwd.to_path_buf(),
         pid: Some(pid),
+        launched_at: None,
+        resume_session_id: None,
     })
 }
 
@@ -129,6 +131,8 @@ fn chunks_stream_append_then_close_with_the_full_text() {
         home: dir.path().to_path_buf(),
         cwd,
         pid: Some(11),
+        launched_at: None,
+        resume_session_id: None,
     });
     let observed = adapter.poll().unwrap();
     let messages: Vec<_> = observed
@@ -199,6 +203,8 @@ fn a_cancelled_turn_closes_its_message_as_interrupted() {
         home: dir.path().to_path_buf(),
         cwd,
         pid: Some(12),
+        launched_at: None,
+        resume_session_id: None,
     });
     let observed = adapter.poll().unwrap();
     let close = observed
@@ -273,6 +279,8 @@ fn adapter_for_updates(updates: &str) -> (tempfile::TempDir, GrokAdapter) {
         home: dir.path().to_path_buf(),
         cwd,
         pid: Some(4242),
+        launched_at: None,
+        resume_session_id: None,
     });
     adapter.bind_session_dir(session, session_dir);
     (dir, adapter)
@@ -966,6 +974,8 @@ fn discovery_falls_back_from_pid_to_cwd() {
         home: dir.path().to_path_buf(),
         cwd,
         pid: Some(42), // wrong pid; cwd must save discovery
+        launched_at: None,
+        resume_session_id: None,
     });
     assert!(adapter.poll().unwrap().is_empty());
     assert!(

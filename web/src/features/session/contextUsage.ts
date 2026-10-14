@@ -7,12 +7,31 @@ import { formatListTime } from "../../lib/format";
  * adapters report only subsets, and the UI must render `—`, never a fake 0.
  */
 export type UsageRollup = {
+  /**
+   * True when the Hub store is on the rolled-back/legacy usage shape: the
+   * migration did not complete, so NONE of these counters could be projected.
+   * The UI renders Unknown everywhere — never a zero, never a guessed
+   * percentage (c-usagefu r16 item 7). Distinct from `null` rollup (no usage
+   * channel yet) and from counters that are individually `null`.
+   *
+   * Optional in the type so hand-built fixtures can omit it, but EVERY rollup
+   * from the Hub passes through {@link coerceUsageRollup}, which always emits a
+   * concrete boolean (default false); all consumers read it with `=== true`.
+   */
+  unavailable?: boolean;
   /** Last turn's fresh input + cache read + cache creation. */
   contextUsedTokens: number | null;
   /** Context window ([1m] tag / model catalog / harness kind). */
   contextWindowTokens: number | null;
   /** 0..100; null until both sides are known. */
   contextPct: number | null;
+  /**
+   * True when `contextPct` is computed against a window only GUESSED from the
+   * harness kind fallback (an unknown model / no native report / no catalog
+   * row). The UI marks such a percentage with `≈`; a native/model/profile
+   * window is exact and leaves this false.
+   */
+  contextPctApproximate: boolean;
   /** Session sum of fresh (uncached) input. */
   sessionInputTokens: number | null;
   /** Session sum of output. */
@@ -44,9 +63,11 @@ type RawRollup = Partial<Record<keyof UsageRollup, unknown>>;
  * zero-token observation (which still reports known channels).
  */
 export const EMPTY_USAGE_ROLLUP: UsageRollup = {
+  unavailable: false,
   contextUsedTokens: null,
   contextWindowTokens: null,
   contextPct: null,
+  contextPctApproximate: false,
   sessionInputTokens: null,
   sessionOutputTokens: null,
   cacheReadTokens: null,
@@ -62,6 +83,13 @@ export const EMPTY_USAGE_ROLLUP: UsageRollup = {
 /** Empty-state headline for the context chip / card when no rollup exists. */
 export const EMPTY_USAGE_NOTE = "harness 未上报 usage";
 
+/**
+ * c-usagefu r16 item 7: the Hub opened on the rolled-back/legacy usage shape,
+ * so usage is explicitly Unavailable — distinct from "the harness has not
+ * reported yet". Every number renders Unknown, never zero or an estimate.
+ */
+export const USAGE_UNAVAILABLE_NOTE = "usage 数据暂不可用（存储未升级到用量 schema）";
+
 
 /** Numbers come over the wire as JSON integers (the OpenAPI shape); anything
  *  else (string, missing, NaN) is treated as unknown, never coerced to 0. */
@@ -76,9 +104,14 @@ export function coerceUsageRollup(raw: unknown): UsageRollup | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as RawRollup;
   return {
+    // Only an explicit boolean `true` marks the rollup Unavailable (r16 item 7).
+    unavailable: r.unavailable === true,
     contextUsedTokens: asCount(r.contextUsedTokens),
     contextWindowTokens: asCount(r.contextWindowTokens),
     contextPct: asCount(r.contextPct),
+    // Only an explicit boolean `true` marks an estimate; absent/loose values
+    // render the percentage as exact (the Hub defaults the flag to false).
+    contextPctApproximate: r.contextPctApproximate === true,
     sessionInputTokens: asCount(r.sessionInputTokens),
     sessionOutputTokens: asCount(r.sessionOutputTokens),
     cacheReadTokens: asCount(r.cacheReadTokens),
@@ -114,6 +147,7 @@ export type UsageCell = {
 };
 
 const MISSING: Record<string, string> = {
+  unavailable: "Hub 运行在旧版 usage 存储形状（迁移已回滚），本次用量暂时无法统计",
   context: "需要 harness 在 usage 观察中上报本轮的 input / cacheRead / cacheCreation token",
   window: "需要 model 目录、[1m] 后缀或 harness 默认窗口提供上下文长度",
   input: "需要 harness 在 usage 观察中上报 inputTokens（非缓存输入）",
@@ -128,23 +162,37 @@ const MISSING: Record<string, string> = {
 
 export function contextHeadline(rollup: UsageRollup): {
   text: string;
+  approximate: boolean;
   missing: string | null;
 } {
+  if (rollup.unavailable) {
+    // c-usagefu r16 item 7: the store could not project usage. Never show a
+    // number or a percentage — both sides read Unknown and the bar stays empty.
+    return {
+      text: "—/— (—%)",
+      approximate: false,
+      missing: MISSING.unavailable,
+    };
+  }
   if (rollup.contextUsedTokens == null || rollup.contextWindowTokens == null) {
     return {
       text: `${formatTokenCount(rollup.contextUsedTokens)}/${formatTokenCount(
         rollup.contextWindowTokens,
       )} (—%)`,
+      approximate: false,
       missing: rollup.contextUsedTokens == null ? MISSING.context : MISSING.window,
     };
   }
   const pct =
     rollup.contextPct ??
     Math.round((rollup.contextUsedTokens / rollup.contextWindowTokens) * 100);
+  // A kind-fallback window (unknown model) is only an estimate.
+  const approximate = rollup.contextPctApproximate;
   return {
     text: `${formatTokenCount(rollup.contextUsedTokens)}/${formatTokenCount(
       rollup.contextWindowTokens,
-    )} (${pct}%)`,
+    )} (${approximate ? "≈" : ""}${pct}%)`,
+    approximate,
     missing: null,
   };
 }

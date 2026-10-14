@@ -31,7 +31,8 @@
 //!   channel (P5); the rollout only shows the resulting rejection string.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use remuda_protocol::{AgentKind, Id, ObservationPayload, Timestamp, ToolOutcome, UsageScope};
 
@@ -43,7 +44,8 @@ use crate::adapters::{
     thought_payload, tool_call_payload, tool_result_payload, turn_lifecycle,
 };
 use crate::codex_rollout::{
-    CodexRolloutEvent, RolloutTail, locate_rollout_in, parse_rollout_line_at,
+    CodexRolloutEvent, CwdRollout, RolloutTail, locate_rollout_by_cwd, locate_rollout_in,
+    parse_rollout_line_at,
 };
 use crate::error::DriverResult;
 use crate::usage::codex::CodexUsage;
@@ -52,10 +54,22 @@ use crate::usage::{UsageAggregator, to_usage_payload};
 /// File-tail adapter for one codex TUI session.
 pub struct CodexAdapter {
     home: AdapterHome,
-    /// Hook-confirmed session id, when the hook channel reached us first.
+    /// Stable identity of the driver launch owning this adapter. Every prompt
+    /// it may bind to was dispatched under this exact key (c-usagefu r6 item
+    /// 1); `None` for promoted/hook-attached adapters (whose claim is
+    /// released on close).
+    instance_key: Option<String>,
+    /// Session id established by the HOOK channel (channel A). It stays
+    /// distinct from a tentative cwd-discovery guess (r6 item 2).
     confirmed: Option<String>,
+    /// Session id established by cwd discovery, recorded ONLY after a claim
+    /// succeeded — a claim loser must never shortcut on the id it scanned.
+    discovered: Option<String>,
     /// Bound session + its rollout tail.
     binding: Option<AdapterBinding>,
+    /// Exact claim key recorded at bind for promoted adapters (r7 item 6):
+    /// released verbatim on Drop even when the file/symlink is gone.
+    claim_key: Option<Arc<PathBuf>>,
     tail: Option<RolloutTail>,
     /// Native id → journal node id (messages, thoughts, tool calls).
     nodes: HashMap<String, Id>,
@@ -68,44 +82,168 @@ pub struct CodexAdapter {
     started_turns: HashSet<String>,
     /// Turns already announced as ended (complete or aborted).
     ended_turns: HashSet<String>,
-    /// Per-turn usage snapshot revisions (§5.5: snapshot replaces).
-    usage_revisions: HashMap<String, u64>,
     session_usage_revision: u64,
     /// Additive usage extractor + aggregator (refuses cumulative snapshots).
     usage: CodexUsage,
     usage_totals: UsageAggregator,
     /// Optional fallback model for usage records whose turn had no context.
     fallback_model: Option<String>,
+    /// Discovery proven impossible: TWO unclaimed valid rollouts exist at
+    /// once for this same cwd and this input (duplicate own prompts —
+    /// genuinely indistinguishable), or a claim race left two identical
+    /// candidates. A transient "another window overlaps" does NOT latch: the
+    /// adapter keeps discovering until it binds or the instance closes, and
+    /// the window is released either way (c-usagefu r5 item 1).
+    discovery_gave_up: bool,
+    /// Process-wide same-cwd launch window for a driver launch. None for a
+    /// promoted/attach adapter (no launch floor); released on bind/give-up.
+    window: Option<crate::adapters::codex_discovery::DiscoveryWindow>,
+    /// r9 item 1: the instance's live interval in its cwd, registered BEFORE
+    /// launch (production) and retained through close independent of binding.
+    /// The live driver slot owns the cohort and closes it only after the
+    /// process stops (Ruling A2, r11 item 3); the adapter's clone is a
+    /// non-closing witness that can be torn down before the stop ladder
+    /// without ending the interval. None for a promoted/attach adapter and
+    /// for non-codex launches.
+    lifetime: Option<crate::adapters::codex_discovery::LifetimeGuard>,
+    /// r8 item 1 tier b: process-tree ownership probe + live agent roots.
+    ownership: Option<std::sync::Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>>,
+    agent_pid_roots: Option<std::sync::Arc<std::sync::Mutex<Vec<u32>>>>,
+    /// Unique lifecycle owner for this adapter (r7 item 2). Every adapter —
+    /// promoted included — gets its own UUID at construction so two promoted
+    /// adapters never share the `hook:S` owner for the same indexed session.
+    lifecycle_owner: String,
 }
 
 impl CodexAdapter {
     /// Create an unbound adapter for a shadow `CODEX_HOME`.
     #[must_use]
     pub fn new(home: AdapterHome) -> Self {
+        // The discovery window opens in with_instance_key so its owner matches
+        // the instance key (r7 item 1).
         Self {
             home,
+            instance_key: None,
             confirmed: None,
+            discovered: None,
             binding: None,
+            claim_key: None,
             tail: None,
             nodes: HashMap::new(),
             announced_tools: HashSet::new(),
             results: HashSet::new(),
             started_turns: HashSet::new(),
             ended_turns: HashSet::new(),
-            usage_revisions: HashMap::new(),
             session_usage_revision: 0,
             usage: CodexUsage::new(),
             usage_totals: UsageAggregator::new(),
             fallback_model: None,
+            discovery_gave_up: false,
+            window: None,
+            lifetime: None,
+            ownership: None,
+            agent_pid_roots: None,
+            lifecycle_owner: uuid::Uuid::new_v4().to_string(),
         }
+    }
+
+    /// Attach the stable per-launch identity used for prompt matching and
+    /// rollout claims (c-usagefu r6 item 1). Opens the discovery window for a
+    /// driver-launched adapter so live cross-owner exclusivity works (r7
+    /// item 1).
+    ///
+    /// r9 item 1: also registers the instance's live interval (begins at the
+    /// adapter's launch floor). Production registers it BEFORE spawning the
+    /// agent and attaches the existing guard through
+    /// [`Self::with_lifetime`]; in that case this does not open a second
+    /// interval NOR a second window (c-usagefu r15 item 4): a
+    /// hook-confirmed shell-pty launch carries a lifetime but performs no
+    /// prompt-only discovery, so the launch site's claim that "no window
+    /// opens" must hold. The generic-pty pending bundle likewise attaches the
+    /// window it opened before the spawn via [`Self::with_window`].
+    #[must_use]
+    pub fn with_instance_key(mut self, key: Option<String>) -> Self {
+        if let Some(ref key) = key
+            && self.window.is_none()
+            && self.lifetime.is_none()
+            && let Some(launched_at) = self.home.launched_at
+        {
+            self.window = Some(crate::adapters::codex_discovery::DiscoveryWindow::open(
+                &self.home.cwd,
+                key.clone(),
+            ));
+            self.lifetime = Some(crate::adapters::codex_discovery::begin_lifetime(
+                &self.home.cwd,
+                key,
+                Some(launched_at),
+            ));
+        }
+        self.instance_key = key;
+        self
+    }
+
+    /// Attach the lifetime guard registered BEFORE this agent was launched
+    /// (generic-pty, r9 item 1). Must be applied before
+    /// [`Self::with_instance_key`] so the pre-launch interval floor is kept.
+    #[must_use]
+    pub(crate) fn with_lifetime(
+        mut self,
+        lifetime: crate::adapters::codex_discovery::LifetimeGuard,
+    ) -> Self {
+        self.lifetime = Some(lifetime);
+        self
+    }
+
+    /// Attach a discovery window the LAUNCH site opened TOGETHER with the
+    /// lifetime BEFORE the agent process started (c-usagefu r12 item 2,
+    /// Ruling A2'). Generic-pty waits out agent settlement (up to 60 s) before
+    /// it can construct this adapter; had the window opened only here, another
+    /// window releasing during that gap would be seen as the cwd's LAST window
+    /// and prune the closed intervals / prompt evidence a registered but
+    /// not-yet-adapted launch's later discovery decision still needs. Must be
+    /// applied before [`Self::with_instance_key`], which then does not open a
+    /// second window (its `self.window.is_none()` guard).
+    #[must_use]
+    pub(crate) fn with_window(
+        mut self,
+        window: crate::adapters::codex_discovery::DiscoveryWindow,
+    ) -> Self {
+        self.window = Some(window);
+        self
+    }
+
+    /// Test seam: record this instance's close at `at` when the adapter
+    /// drops, instead of wall-clock time (deterministic lifetime overlaps).
+    #[cfg(test)]
+    pub(crate) fn close_lifetime_at(&self, at: time::OffsetDateTime) {
+        use crate::adapters::codex_discovery::LifetimeGuardClock as _;
+        if let Some(lifetime) = &self.lifetime {
+            lifetime.close_lifetime_at(at);
+        }
+    }
+
+    /// Attach the process-tree ownership evidence for tier-b discovery (r8
+    /// item 1).
+    #[must_use]
+    pub(crate) fn with_ownership(
+        mut self,
+        probe: std::sync::Arc<dyn crate::adapters::codex_ownership::RolloutOwnership>,
+        roots: Option<std::sync::Arc<std::sync::Mutex<Vec<u32>>>>,
+    ) -> Self {
+        self.ownership = Some(probe);
+        self.agent_pid_roots = roots;
+        self
     }
 
     /// Seed a model used to price usage when `turn_context` never reported one.
     #[must_use]
     pub fn with_fallback_model(mut self, model: impl Into<String>) -> Self {
+        // Replace in place: CodexAdapter has a Drop impl, so moving the usage
+        // field out of `&mut self` is not allowed.
+        let previous = std::mem::replace(&mut self.usage, CodexUsage::new());
         let model = model.into();
         self.fallback_model = Some(model.clone());
-        self.usage = self.usage.with_fallback_model(model);
+        self.usage = previous.with_fallback_model(model);
         self
     }
 
@@ -127,49 +265,251 @@ impl CodexAdapter {
     pub fn bind_rollout(&mut self, session_id: &str, path: PathBuf) {
         if !session_id.trim().is_empty() {
             self.confirmed = Some(session_id.trim().to_owned());
-            self.bind(session_id.trim().to_owned(), path);
+            self.bind(session_id.trim().to_owned(), path, true);
         }
     }
 
-    /// Bind the rollout tail for a discovered session.
-    fn bind(&mut self, session_id: String, path: PathBuf) {
-        self.tail = Some(RolloutTail::new(path.clone()));
+    /// Bind the rollout tail for a discovered or hook-confirmed session.
+    ///
+    /// Claims the file process-wide (no other adapter may bind it) and, for a
+    /// driver launch, releases the same-cwd discovery window so a later
+    /// launch is not tainted by this instance (c-usagefu r5 item 1).
+    fn bind(&mut self, session_id: String, path: PathBuf, strict_launch: bool) -> bool {
+        // Owner of the claim: the driver launch's instance key when present;
+        // promoted attaches use their unique lifecycle_owner UUID (r7 item 2),
+        // so two promoted adapters never co-claim the same indexed session.
+        let owner = self
+            .instance_key
+            .clone()
+            .unwrap_or_else(|| self.lifecycle_owner.clone());
+        // Two adapters polling in parallel can race for the same file; a lost
+        // claim means the candidate is someone else's — don't bind and don't
+        // remember the id (r6 item 2).
+        let cwd_for_claim = self.home.cwd.clone();
+        if !crate::adapters::codex_discovery::claim_session(
+            &path,
+            &owner,
+            Some((&cwd_for_claim, &session_id)),
+        ) {
+            return false;
+        }
+        // Tail position:
+        // - promoted / hook-confirmed attaches (no launch floor): byte zero
+        //   with durable dedupe;
+        // - a STRICTLY post-launch session (session_meta.timestamp >=
+        //   launched_at): byte zero too — codex 0.154 creates the rollout
+        //   lazily on the first turn, so every record (task_started,
+        //   turn_context, prompt, usage) belongs to THIS instance;
+        // - an in-slack match (crash-loop possible): current EOF, so a prior
+        //   session's records never replay (r4 item 3).
+        let from_start = self.home.launched_at.is_none() || strict_launch;
+        let tail = if from_start {
+            RolloutTail::new(path.clone())
+        } else {
+            RolloutTail::new_at_end(path.clone()).unwrap_or_else(|_| RolloutTail::new(path.clone()))
+        };
+        self.tail = Some(tail);
+        // r8 item 6: remember the exact PathBuf claim_session inserted (it
+        // canonicalizes the incoming path once). Drop must release THAT key
+        // verbatim — it never re-canonicalizes, so removing the file/symlink
+        // after bind cannot change the key and leak the claim.
+        let exact_claim_key =
+            std::sync::Arc::new(crate::adapters::codex_discovery::canonical_claim_key(&path));
         self.binding = Some(AdapterBinding {
             session_id: session_id.clone(),
-            directory: path.parent().map(|parent| parent.to_path_buf()),
+            directory: path.parent().map(std::path::Path::to_path_buf),
             main_file: Some(path),
         });
+        self.claim_key = Some(exact_claim_key);
+        // Bound: stop counting against later launches in this cwd.
+        if let Some(mut window) = self.window.take() {
+            window.release();
+        }
+        true
     }
 
     /// Find the session's rollout.
     ///
-    /// Preference order: the hook-confirmed id (P1 channel A), then the newest
-    /// `session_index.jsonl` name entry. `locate_rollout_in` then verifies the
-    /// file's `session_meta.id` and refuses ambiguous matches — the index is a
-    /// name index, not a PID registry (§A4 [V]).
+    /// Three evidence tiers:
+    ///
+    /// 1. **Hook-confirmed id** (channel A): the supervisor hands this only to
+    ///    an adapter whose agent pid matches, so the file for exactly that id
+    ///    may bind; a missing file means "wait", never "guess".
+    /// 2. **Driver launch with a launch floor** (generic-pty: no hooks, no
+    ///    child pid, real operator home): the ONLY acceptable match is a
+    ///    unique rollout whose `session_meta.cwd` is the launch cwd and whose
+    ///    session started at/after launch. Zero matches keeps polling for the
+    ///    adapter's WHOLE life (codex 0.154 creates the rollout lazily on the
+    ///    first turn; the locator's mtime/date pruning keeps that cheap); two
+    ///    or more matches at once fail closed forever (see item 3 for the
+    ///    cross-instance race). The `session_index.jsonl` recency guess is
+    ///    deliberately NOT used here: it is a name index over EVERY project
+    ///    and its last line is whatever thread the operator renamed last,
+    ///    anywhere — binding that journals a foreign project's transcript,
+    ///    tool calls, usage and cost under this instance (c-usagefu r3 item 1).
+    /// 3. **Promoted/foreign-launched attach** (no launch floor): the session
+    ///    predates us, so the name-index recency guess remains the last
+    ///    resort, exactly as before.
     fn discover(&mut self) -> DriverResult<bool> {
-        if let Some(id) = self
-            .confirmed
-            .clone()
-            .or_else(|| newest_indexed(&self.home.home))
-            && let Some(path) = locate_rollout_in(&self.home.home, &id)
-        {
-            self.bind(id, path);
-            return Ok(true);
+        // A prior poll proved ambiguity: never rescan and never reverse.
+        if self.discovery_gave_up {
+            return Ok(false);
         }
-        Ok(false)
+        // c-usagefu r15 item 3: an explicit `codex resume <id>` continues an
+        // EXISTING session. codex appends new turns to that session's original
+        // rollout, whose session_meta.timestamp is the ORIGINAL start (before
+        // this launch's resume floor), so the timestamp rule can never bind it
+        // and the continued session would be lost. Locate it BY ID instead —
+        // the cwd is still verified — and refuse EVERY other file: there is no
+        // fallback to anonymous cwd/index guessing on a resumed launch. The
+        // file can appear/flush late, so not-found waits for the adapter's
+        // whole life, like every other discovery tier.
+        if let Some(resume_id) = self.home.resume_session_id.clone() {
+            let Some(path) = crate::codex_rollout::locate_rollout_in(&self.home.home, &resume_id)
+            else {
+                return Ok(false);
+            };
+            if !crate::codex_rollout::rollout_cwd_matches(&path, &self.home.cwd) {
+                // The named session belongs to a different cwd: fail closed,
+                // never bind any other rollout.
+                return Ok(false);
+            }
+            if self.bind(resume_id.clone(), path, true) {
+                // Remember the id the claim succeeded for; later polls take
+                // the same by-id shortcut above the floor scan.
+                self.discovered = Some(resume_id);
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        // Tier 1: a HOOK-confirmed id (channel A) — distinct from a cwd guess.
+        if let Some(id) = self.confirmed.clone() {
+            if let Some(path) = locate_rollout_in(&self.home.home, &id)
+                && self.bind(id, path, true)
+            {
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        // A cwd discovery id is remembered only after its claim succeeded
+        // (set below); a claim loser reaches here every poll and keeps
+        // scanning, never shortcutting on an id it failed to claim.
+        if let Some(id) = self.discovered.clone() {
+            if let Some(path) = locate_rollout_in(&self.home.home, &id)
+                && self.bind(id, path, true)
+            {
+                return Ok(true);
+            }
+            // The claimed file vanished before bind; forget the guess.
+            self.discovered = None;
+        }
+        let Some(launched_at) = self.home.launched_at else {
+            if let Some(id) = newest_indexed(&self.home.home)
+                && let Some(path) = locate_rollout_in(&self.home.home, &id)
+                && self.bind(id, path, true)
+            {
+                return Ok(true);
+            }
+            return Ok(false);
+        };
+        // No time deadline: the rollout can appear on a first prompt minutes
+        // after launch. Old pre-launch rollouts are filtered by timestamp AND
+        // skipped cheaply via mtime/date pruning in the locator.
+        // Prompts are authorized per INSTANCE, and files already owned by a
+        // different instance are excluded.
+        let owner = self.instance_key.clone().unwrap_or_default();
+        let cwd = self.home.cwd.clone();
+        // r8 item 1 tier b: clone the process-ownership evidence so the gate
+        // closure needs no self borrow.
+        let probe = self.ownership.clone();
+        let pid_roots = self.agent_pid_roots.clone();
+        let process_owns = move |path: &Path| -> bool {
+            let (Some(probe), Some(roots)) = (&probe, &pid_roots) else {
+                return false;
+            };
+            let roots = roots.lock().map(|r| r.clone()).unwrap_or_default();
+            roots
+                .iter()
+                .any(|root| probe.file_held_in_tree(path, *root))
+        };
+        match locate_rollout_by_cwd(
+            &self.home.home,
+            &cwd,
+            launched_at,
+            &|path: &Path| crate::adapters::codex_discovery::is_claimed_by_other(path, &owner),
+            &|path, started, first_prompt, metadata| {
+                use crate::codex_rollout::CandidateTier;
+                // TIER A (r9 item 2 ordering): re-recognition by id of a
+                // session THIS owner already claimed (the hook-confirmed id
+                // itself is handled before the cwd scan).
+                if metadata["id"]
+                    .as_str()
+                    .is_some_and(|id| crate::adapters::codex_discovery::owned_by(&cwd, &owner, id))
+                {
+                    return Some(CandidateTier::Hook);
+                }
+                // TIER B: the rollout file is open in THIS instance's agent
+                // process tree — attribution independent of prompt text and
+                // immune to identical prompts / closed owners.
+                if process_owns(path) {
+                    return Some(CandidateTier::Process);
+                }
+                // TIER C (r9 item 1): prompt text ONLY when the rollout was
+                // created at/after this instance's ACTUAL launch (no
+                // pre-launch slack) and this was the sole live instance in
+                // the cwd over the whole [launch, creation] interval —
+                // including since-closed instances whose lifetime the
+                // registry retained. Anything else waits.
+                crate::adapters::codex_discovery::prompt_candidate_matches(
+                    &cwd,
+                    &owner,
+                    path,
+                    first_prompt,
+                    started,
+                )
+                .then_some(CandidateTier::Prompt)
+            },
+        ) {
+            CwdRollout::Found { id, path, strict } => {
+                if self.bind(id.clone(), path, strict) {
+                    // Remember the discovery id only NOW (post-claim).
+                    self.discovered = Some(id);
+                    Ok(true)
+                } else {
+                    // Lost a claim race: stay in discovery and scan again.
+                    Ok(false)
+                }
+            }
+            // r8 item 1: NEVER give up while a stronger tier (hook / process
+            // ownership) can still arrive — keep polling.
+            CwdRollout::Ambiguous | CwdRollout::NotYet => Ok(false),
+        }
     }
 
     /// Map one parsed rollout line to zero or more observations.
-    fn on_line(&mut self, ordinal: u64, line: &str) -> Vec<AdapterObservation> {
+    ///
+    /// `file_identity` is the stable identity of the rollout file and
+    /// `byte_offset` the record's first-byte position in it (replay-stable),
+    /// not a per-poll line counter (Ruling B2).
+    fn on_line(
+        &mut self,
+        ordinal: u64,
+        file_identity: &str,
+        byte_offset: u64,
+        line: &str,
+    ) -> Vec<AdapterObservation> {
         let Ok(record) = parse_rollout_line_at(line, ordinal) else {
             return Vec::new();
         };
         // Usage first: the extractor is stateful (turn→model map) and must see
         // records in file order regardless of what else they map to.
-        if let Some(event) = self.usage.on_record(&record) {
-            self.usage_totals.push(&event);
-        }
+        let usage_event = self.usage.on_record(&record);
+        // c-usagefu r8 item 5: only keep/emit a usage event the in-memory
+        // aggregator ACCEPTS (it rejects duplicate request ids and cumulative
+        // token_count rows). A rejected event would still carry a durable
+        // response id the Hub would dedupe, but suppressing it at the source
+        // keeps the adapter and the Hub consistent on a replay.
+        let usage_event = usage_event.filter(|event| self.usage_totals.push(event));
         let turn = turn_id(&record);
         match &record.event {
             CodexRolloutEvent::SessionMeta { session_id, .. } => {
@@ -252,9 +592,49 @@ impl CodexAdapter {
             }
             CodexRolloutEvent::Message { .. }
             | CodexRolloutEvent::Reasoning { .. }
-            | CodexRolloutEvent::TokenUsage { .. }
             | CodexRolloutEvent::TurnContext { .. }
             | CodexRolloutEvent::Compacted => Vec::new(),
+            CodexRolloutEvent::TokenUsage { .. } => {
+                // c-usagefu (b): one Message-scoped snapshot PER MODEL
+                // RESPONSE, keyed on the native response_id. A turn may hold
+                // several responses (retries/steers), and the end-of-turn
+                // snapshot SUMS them — fine for session totals, but the
+                // context ring asks "what does the next request carry", which
+                // is the latest single response's input+cache counters.
+                // Cumulative `token_count` snapshots (a different source) are
+                // ignored here as they are in the aggregator.
+                let Some(event) = usage_event.as_ref().filter(|event| {
+                    event.source == crate::usage::UsageSource::CodexTokenUsageRecord
+                }) else {
+                    return Vec::new();
+                };
+                let effective_turn = event.turn_id.clone().or_else(|| turn_id(&record));
+                // c-usagefu r12 item 3 (Ruling B2'): EVERY counted record's
+                // coverage identity is the ROLLOUT FILE IDENTITY plus the
+                // record's first-byte OFFSET in that file — including records
+                // that carry a native response_id. The response_id stays an
+                // in-memory attribute the additive aggregator dedupes with,
+                // but it is never the durable identity: the Hub's complete-
+                // coverage proof keys entirely on this marker, so a turn that
+                // mixes pre-r12 response_id identities with these new ones
+                // falls back to counting its Turn row instead.
+                let response_id = durable_response_scope_id(file_identity, byte_offset);
+                let mut totals = crate::usage::UsageTotals::default();
+                totals.add(event);
+                // Stamp the native turn id so the Hub rollup can count
+                // distinct turns from Message rows (r6 item 5).
+                let mut obs = AdapterObservation::structured(ObservationPayload::Usage(Box::new(
+                    to_usage_payload(UsageScope::Message, response_id, 1, None, &totals),
+                )))
+                // r7 item 7: stamp the record's own timestamp so the Hub
+                // native-time rate SQL (60 s / 5 min TPM) and lastTurnAt use
+                // the real model-call time instead of ingest time.
+                .with_native_at(native_timestamp(record.timestamp.as_deref()));
+                if let Some(turn) = effective_turn {
+                    obs = obs.with_turn(turn);
+                }
+                vec![obs]
+            }
             // The merged parser types the abort; only an explicit interruption
             // is a turn end here — a future/unknown abort reason must not
             // silently mean "interrupted" (A5: the only observed value is
@@ -400,31 +780,6 @@ impl CodexAdapter {
             }
         }
         out.push(AdapterObservation::structured(turn_lifecycle(name, "idle")).with_turn(turn_id));
-        // Per-turn usage snapshot (replaces prior revisions for the turn).
-        if let Some(totals) = self.usage_totals.turn(turn_id)
-            && totals.events > 0
-        {
-            let revision = {
-                let entry = self.usage_revisions.entry(turn_id.to_owned()).or_insert(0);
-                *entry += 1;
-                *entry
-            };
-            let payload = to_usage_payload(
-                UsageScope::Turn,
-                turn_id.to_owned(),
-                revision,
-                self.binding
-                    .as_ref()
-                    .map(|binding| binding.session_id.as_str()),
-                totals,
-            );
-            out.push(
-                AdapterObservation::structured(ObservationPayload::Usage(Box::new(payload)))
-                    .with_turn(turn_id)
-                    .with_native_at(native_at.clone()),
-            );
-        }
-        // Session snapshot each turn end as well (monotonic revision).
         self.session_usage_revision += 1;
         let payload = to_usage_payload(
             UsageScope::Session,
@@ -441,6 +796,27 @@ impl CodexAdapter {
                 .with_native_at(native_at),
         );
         out
+    }
+}
+
+impl Drop for CodexAdapter {
+    fn drop(&mut self) {
+        // Driver-launch claims (instance_key present) OUTLIVE the adapter: a
+        // rollout a closed Remuda instance owned must never be re-bound by a
+        // different idle instance (r6 item 1). A PROMOTED attach
+        // (instance_key None) owns nothing durable — release its claim with
+        // the exact key recorded at claim time (r6 item 7), so a deleted or
+        // symlinked file leaves no ghost.
+        if self.instance_key.is_none()
+            && let Some(binding) = self.binding.take()
+            && let Some(key) = self.claim_key.take()
+        {
+            let _ = binding;
+            // Release the EXACT key stored at bind time (r7 item 6) — never
+            // re-canonicalize: a removed symlink/file would resolve to a
+            // different (or fallback lexical) key and leak the claim.
+            crate::adapters::codex_discovery::release_claim_key(&key, &self.lifecycle_owner);
+        }
     }
 }
 
@@ -467,13 +843,14 @@ impl FileSignalAdapter for CodexAdapter {
             return Ok(Vec::new());
         };
         let lines = tail.poll()?;
+        let file_identity = rollout_file_identity(tail.path());
         let mut out = Vec::new();
-        // Physical line index: the tail returns only non-empty lines, so use the
-        // parser's own ordinal when present and a running counter otherwise.
+        // Physical non-empty line index: only the parser metadata ordinal; the
+        // durable response identity is the byte offset, not this counter.
         let mut ordinal = 0;
-        for line in lines {
+        for (byte_offset, line) in lines {
             ordinal += 1;
-            out.extend(self.on_line(ordinal, &line));
+            out.extend(self.on_line(ordinal, &file_identity, byte_offset, &line));
         }
         Ok(out)
     }
@@ -489,6 +866,40 @@ fn turn_id(record: &crate::codex_rollout::CodexRolloutRecord) -> Option<String> 
         | TurnContext { turn_id, .. } => turn_id.clone(),
         _ => None,
     }
+}
+
+/// Durable identity of a rollout FILE for the per-response scope id
+/// (c-usagefu r11 item 7; r12 item 3 Ruling B2'): the canonical path
+/// verbatim. It is replay-stable (a byte-0 replay tails the same file) and
+/// distinguishes two rollouts within one instance.
+fn rollout_file_identity(path: &Path) -> String {
+    crate::adapters::codex_discovery::canonical_claim_key(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Marker prefix for a codex per-response usage Message whose durable
+/// coverage identity is the rollout file identity + record byte offset
+/// (c-usagefu r12 item 3, Ruling B2'). The Hub's complete-coverage proof
+/// recognizes this prefix: EVERY counted record of a turn must carry it
+/// before the Turn may be suppressed in favour of the Messages.
+///
+/// r11 minted these ids only for records WITHOUT a native response_id; r12
+/// makes the pair the identity of EVERY counted record. The versioned prefix
+/// (`:v2:`) is what lets the Hub tell a pre-r12 response_id identity apart
+/// from a durable one on an upgraded database.
+pub const CODEX_DURABLE_RESPONSE_SCOPE_PREFIX: &str = "_remuda_codex_response:v2:";
+
+/// Durable synthetic per-response scope id for EVERY codex
+/// `token_usage_record` (Ruling B2', r12 item 3). It is the exact pair the
+/// ruling names — the rollout FILE IDENTITY and the record's first-byte
+/// OFFSET in that file. Both halves are replay-stable: an incremental tail
+/// across many poll cycles and a fresh byte-0 re-tail produce the same id, so
+/// the Hub dedupes the replay instead of double counting. The distinct prefix
+/// keeps a durable id from ever colliding with a real native response id (and
+/// marks the persisted row as carrying the durable identity).
+fn durable_response_scope_id(file_identity: &str, byte_offset: u64) -> String {
+    format!("{CODEX_DURABLE_RESPONSE_SCOPE_PREFIX}{byte_offset}:{file_identity}")
 }
 
 /// Extract text from a message item, joining its content blocks.

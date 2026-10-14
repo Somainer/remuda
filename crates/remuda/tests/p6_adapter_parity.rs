@@ -99,6 +99,8 @@ fn run_codex(dir: &Path) -> Value {
         home,
         cwd: dir.to_path_buf(),
         pid: None,
+        launched_at: None,
+        resume_session_id: None,
     });
     let all = drain(&mut adapter);
     hub_dump(all)
@@ -119,6 +121,8 @@ fn run_grok(dir: &Path) -> Value {
         home,
         cwd,
         pid: Some(24069),
+        launched_at: None,
+        resume_session_id: None,
     });
     let all = drain(&mut adapter);
     hub_dump(all)

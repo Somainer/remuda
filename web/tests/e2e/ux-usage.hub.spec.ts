@@ -77,6 +77,9 @@ async function createReadySession(page: Page): Promise<string> {
   const res = await creating;
   expect(res.ok(), `instance create failed: ${res.status()}`).toBe(true);
   const instanceId = (await res.json()).instance.instanceId as string;
+  // Register for guaranteed cleanup BEFORE any later step that could fail
+  // (navigation/approval waits). The DELETE is idempotent.
+  created.push(instanceId);
   await expect(page).toHaveURL(new RegExp(`/s/${instanceId}`), { timeout: 20_000 });
 
   // The create-time approval keeps the composer disabled until answered.
@@ -213,8 +216,29 @@ test("context chip: ring percentage and popover rollup over three turns", async 
   await chip.click();
   const popover = page.getByTestId("context-usage-popover");
   await expect(popover).toBeVisible();
+  // data-has-popover is static (RC3 empty card opens too), so wait for a
+  // ROLLUP-DERIVED signal before reading numbers: the turn row paints and
+  // the empty-state note unmounts at the rollup-hydrated commit.
   await expect(page.getByTestId("context-usage-turns")).toHaveText("1", { timeout: 10_000 });
   await expect(page.getByTestId("context-usage-empty-note")).toHaveCount(0);
+  // The card (not the chip beneath) is the topmost thing at its own centre:
+  // the element at the point must be the popover or one of its descendants.
+  const popoverBox = await popover.boundingBox();
+  expect(popoverBox).not.toBeNull();
+  const popoverHit = await page.evaluate(
+    ({ x, y }) => {
+      const el = document.elementFromPoint(x, y);
+      return !!el?.closest('[data-testid="context-usage-popover"]');
+    },
+    {
+      x: popoverBox!.x + popoverBox!.width / 2,
+      y: popoverBox!.y + popoverBox!.height / 2,
+    },
+  );
+  expect(
+    popoverHit,
+    "panel centre must hit the popover, not the chip beneath",
+  ).toBe(true);
   await expect(page.getByTestId("context-usage-headline")).toHaveText(
     "上下文 34.3k/200.0k (17%)",
   );
@@ -294,11 +318,23 @@ test("context chip popover becomes a sheet at 390 px touch width", async ({ brow
     await chip.click();
     const sheet = narrow.getByTestId("context-usage-popover");
     await expect(sheet).toBeVisible();
-    // Same rollup-derived gate as desktop: data-has-popover is static and
-    // cannot observe the 2 s poll, so wait for the turn row inside the sheet.
+    // Same rollup-derived gate as desktop: wait for the turn row inside the
+    // sheet and for the empty-state note to unmount.
     await expect(sheet.getByTestId("context-usage-turns")).toHaveText("1", { timeout: 10_000 });
     await expect(narrow.getByTestId("context-usage-empty-note")).toHaveCount(0);
-    expect(sheet).toHaveAttribute("data-mobile", "1");
+    await expect(sheet).toHaveAttribute("data-mobile", "1");
+    // The sheet (not composer/chip beneath) is topmost near its top: the hit
+    // element must be the sheet or a descendant.
+    const sheetBox = await sheet.boundingBox();
+    expect(sheetBox).not.toBeNull();
+    const sheetHit = await narrow.evaluate(
+      ({ x, y }) => {
+        const el = document.elementFromPoint(x, y);
+        return !!el?.closest('[data-testid="context-usage-popover"]');
+      },
+      { x: sheetBox!.x + sheetBox!.width / 2, y: sheetBox!.y + 24 },
+    );
+    expect(sheetHit, "sheet must be topmost over composer").toBe(true);
     // Close affordance exists and dismisses the sheet.
     await narrow.getByTestId("context-usage-close").click();
     await expect(sheet).toHaveCount(0);

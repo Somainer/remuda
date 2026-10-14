@@ -1,0 +1,16 @@
+[package]
+name = "remuda-unix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# NOTE: deliberately NO `[lints] workspace = true`: this crate exists to wrap
+# the small set of libc process primitives that require `unsafe` (and that nix
+# 0.28 does not expose on every supported platform — its waitid is gated off
+# macOS). The wrappers are the ONLY place those syscalls are made; every
+# surrounding workspace crate keeps `unsafe_code = "forbid"`.
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

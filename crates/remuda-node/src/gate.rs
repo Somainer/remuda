@@ -2681,8 +2681,9 @@ trait WaitWithOutputPiped {
         stdout: Option<tokio::process::ChildStdout>,
     ) -> Option<std::process::Output>;
 
-    /// r19 item 3 / R6: wait until the leader EXITS. On unix the exit is
-    /// observed WITHOUT reaping (`waitid(WNOHANG|WNOWAIT)`) so the owner can
+    /// r19 item 3 / R6, r20 R8(b)/(c): wait until the leader EXITS. On unix
+    /// the exit is observed WITHOUT reaping
+    /// (`waitid(WEXITED|WNOHANG|WNOWAIT)`, portable via libc) so the owner can
     /// clean surviving same-group members while the leader is still unreaped
     /// and only then reap; other platforms reap here and report `Reaped`.
     async fn observe_exit_piped(
@@ -2731,14 +2732,23 @@ impl WaitWithOutputPiped for tokio::process::Child {
         let leader_pid = self.id()? as i32;
         loop {
             // waitid must run off the async worker: spawn_blocking per poll.
+            // R8(c): a failed/aborted blocking task is `None` — NOT an exit
+            // observation — exactly like an EINVAL/ECHILD from waitid: the
+            // owner keeps waiting (the land budget bounds the loop) and may
+            // never conclude the leader exited on an infrastructure error.
             let observed =
                 tokio::task::spawn_blocking(move || leader_exit_observed_unreaped(leader_pid))
                     .await
-                    .unwrap_or(true);
-            if observed {
-                return Some(ObservedExit::Unreaped(stdout_bytes));
+                    .ok()
+                    .flatten();
+            match observed {
+                Some(LeaderExitObservation::Exited) => {
+                    return Some(ObservedExit::Unreaped(stdout_bytes));
+                }
+                Some(LeaderExitObservation::StillRunning) | None => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -2753,23 +2763,43 @@ impl WaitWithOutputPiped for tokio::process::Child {
     }
 }
 
-/// Non-reaping exit observation (r19 item 3): `waitid(WNOHANG|WNOWAIT)`
-/// reports the leader's exit without consuming the zombie. `StillAlive` means
-/// still running; any other status means it transitioned and is left unreaped
-/// so its unique owner can signal the group before reaping. ECHILD means it is
-/// already gone — the owner's later `wait` sorts that out.
+/// What one non-reaping `waitid` poll established about the land leader.
 #[cfg(unix)]
-fn leader_exit_observed_unreaped(pid: i32) -> bool {
-    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
-    use nix::unistd::Pid;
-    match waitid(
-        Id::Pid(Pid::from_raw(pid)),
-        WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
-    ) {
-        Ok(WaitStatus::StillAlive) => false,
-        Ok(_) => true,
-        Err(nix::errno::Errno::EINTR) => false,
-        Err(_) => true,
+#[derive(Debug)]
+enum LeaderExitObservation {
+    /// The leader EXITED; the zombie is deliberately left unreaped (WNOWAIT)
+    /// so the unique owner can clean the group before reaping it.
+    Exited,
+    /// The kernel reported the leader still running (WNOHANG, no event).
+    StillRunning,
+}
+
+/// Non-reaping exit observation (r19 item 3; r20 item 1 / R8(c)):
+/// `waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)` reports the leader's exit
+/// WITHOUT consuming the zombie.
+///
+/// The syscall lives in the `remuda-unix` crate because nix 0.28 gates
+/// `waitid`/`Id` off Apple targets (they do not link on macOS), while the libc
+/// call is supported on both Linux and macOS.
+///
+/// Result discipline (R8(c)): `StillRunning` means the kernel said the leader
+/// is alive; `Exited` means waitid reported THIS pid's exit. Any other error
+/// (`EINVAL` from bad flags, `ECHILD` because it is not ours, …) is `None`:
+/// NOT an exit observation. The owner keeps waiting and may NEVER treat an
+/// observation error as an exit (the old code mapped EINVAL to "exited": on
+/// Linux an event selector is REQUIRED, so WNOHANG|WNOWAIT alone returned
+/// EINVAL and a live leader whose stdout had closed got TERM/KILLed).
+#[cfg(unix)]
+fn leader_exit_observed_unreaped(pid: i32) -> Option<LeaderExitObservation> {
+    match remuda_unix::observe_exit_without_reaping(pid as u32) {
+        Ok(remuda_unix::ObservedChildExit::Exited) => Some(LeaderExitObservation::Exited),
+        Ok(remuda_unix::ObservedChildExit::StillRunning) => {
+            Some(LeaderExitObservation::StillRunning)
+        }
+        Err(error) => {
+            tracing::debug!(%error, pid, "non-reaping leader exit observation failed");
+            None
+        }
     }
 }
 
@@ -6396,6 +6426,58 @@ Running 8 tests across 2 projects
         }
         assert!(marker.exists(), "TERM-ignoring leader never became ready");
         child
+    }
+
+    /// r20 item 1 / R8(c): the portable non-reaping observer distinguishes the
+    /// three cases the old nix form conflated:
+    ///  - a LIVE leader -> StillRunning, and WNOWAIT leaves it unreaped;
+    ///  - an exited leader -> Exited while its zombie is STILL unreaped (the
+    ///    owner's own try_wait then collects it — proving it was left behind);
+    ///  - after that reap -> ECHILD -> None, NEVER "exited" (an observation
+    ///    error must not authorize a signal against a possibly-reused pid).
+    #[cfg(unix)]
+    #[test]
+    fn waitid_non_reaping_distinguishes_live_exited_and_error() {
+        let mut live = spawn_grouped("sleep", &["47.42"]);
+        let pid = live.id() as i32;
+        for _ in 0..5 {
+            match super::leader_exit_observed_unreaped(pid) {
+                Some(super::LeaderExitObservation::StillRunning) => {}
+                other => panic!("a live leader must read StillRunning, got {other:?}"),
+            }
+            assert!(
+                live.try_wait().unwrap().is_none(),
+                "WNOWAIT must never consume the live leader"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = live.kill();
+        let mut saw_exit = false;
+        let kill_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < kill_deadline {
+            if matches!(
+                super::leader_exit_observed_unreaped(pid),
+                Some(super::LeaderExitObservation::Exited)
+            ) {
+                saw_exit = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_exit, "the killed leader must eventually report Exited");
+        // The Exited observation was WNOWAIT: the zombie remains until THIS
+        // owner reaps it.
+        let status = live
+            .try_wait()
+            .expect("try_wait after the WNOWAIT observation")
+            .expect("the exited leader is still unreaped, waiting for its owner");
+        assert!(!status.success(), "the leader died from the test's SIGKILL");
+        // Reaped: waitid now answers ECHILD, which is an observation ERROR
+        // (None), never an exit.
+        assert!(
+            super::leader_exit_observed_unreaped(pid).is_none(),
+            "ECHILD after the reap must be None, not an exit observation"
+        );
     }
 
     #[test]

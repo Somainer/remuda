@@ -9087,10 +9087,10 @@ it("GATE43 item 1 (ii): successful login A parked, login B invalidates it and th
   }
 });
 
-it("GATE43 item 2: cold reload with cached session, Hub unreachable and a failing initial outbox read settles the cached-session state", async () => {
+it("GATE44 item 2 (ruling U): unavailable outbox storage still installs the connection machine; it recovers live and a degraded send uses the keyed fallback", async () => {
   vi.useFakeTimers();
-  vi.setSystemTime(1_420_000);
-  const I = "ins_g43_2";
+  vi.setSystemTime(1_440_000);
+  const I = "ins_g44_2";
   const originalNavigator = globalThis.navigator;
   Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
   localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
@@ -9098,8 +9098,8 @@ it("GATE43 item 2: cold reload with cached session, Hub unreachable and a failin
     for (let i = 0; i < n; i += 1) await Promise.resolve();
   };
   try {
-    sessionStorage.setItem("remuda-outbox-owner", "owner_g43_2");
-    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "dev_g43_2", name: "X" }));
+    sessionStorage.setItem("remuda-outbox-owner", "owner_g44_2");
+    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "dev_g44_2", name: "X" }));
     const { api, hubStore } = await fresh();
     vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
     vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
@@ -9110,42 +9110,70 @@ it("GATE43 item 2: cold reload with cached session, Hub unreachable and a failin
     vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
     vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
     vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
-    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    // Real startPoll (not stubbed): recovery to live must come from the
+    // CONNECTION MACHINE's own reconnect, never from a test stub.
     vi.spyOn(api, "instanceList").mockResolvedValue({
       items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
       nextCursor: null,
     } as never);
     vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
-    // Hub unreachable: the health request fails transiently (offline reload).
+    // Hub initially unreachable (offline cold reload).
     const { RestNetworkError } = await import("./api");
     vi.spyOn(api, "hello").mockRejectedValue(new RestNetworkError("offline"));
-    // IndexedDB opens and the write probe succeeds, but the initial getAll read
-    // rejects (gate 43 item 2 seam).
+
+    // IndexedDB opens and the write probe succeeds, but the initial getAll at
+    // storage.all() rejects (seam lives AT the read call).
     const outboxMod = await import("./outbox");
     outboxMod.__setOutboxLoadAllFailsForTest(true);
 
+    const addSpy = vi.spyOn(window, "addEventListener");
+    const send = vi.spyOn(api, "instanceSend").mockImplementation(
+      (async (_i: string, _p: string, _x?: unknown, _m?: unknown, commandId?: string) => ({
+        relatedCommandIds: [],
+        command: { commandId, id: commandId, state: "accepted", revision: "1", dispatch: "native-acknowledged", resolution: "clear" },
+      })) as unknown as Api["instanceSend"],
+    );
+
     const h = hubStore as unknown as {
       bootstrap: () => Promise<void>;
+      send: (i: string, p: string) => Promise<boolean>;
       connection: unknown;
       state: { ready: boolean; authed: boolean; connection: string };
     };
     await h.bootstrap();
     await pump(4_000);
 
-    // Settled cached-session state: NOT stuck on the loading screen.
+    // Ruling U: settled with a real machine even though no outbox opened.
     expect(h.state.ready).toBe(true);
     expect(h.state.authed).toBe(true);
-    // No machine (storage unavailable), but polling/recovery was started.
-    expect(h.connection).toBeNull();
-    expect((hubStore as unknown as { startPoll: ReturnType<typeof vi.fn> }).startPoll).toHaveBeenCalled();
+    expect(h.connection).not.toBeNull();
+    // The machine published the offline connection state itself.
+    expect(h.state.connection).toBe("offline");
+    // Listeners for the machine's real recovery are installed.
+    expect(addSpy.mock.calls.filter((c) => c[0] === "online")).toHaveLength(1);
+    expect(addSpy.mock.calls.filter((c) => c[0] === "offline")).toHaveLength(1);
+
+    // A send while degraded carries a command id through the keyed DIRECT
+    // fallback (no outbox) — never an id-less POST.
+    const sent = await h.send(I, "g44 2 degraded send");
+    expect(sent).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[4]).toMatch(/^cmd_/);
+
+    // The Hub comes back. The MACHINE's own reconnect (not startPoll) drives
+    // the published state offline -> recovering -> live.
+    vi.mocked(api.hello).mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await pump(4_000);
+    expect(h.state.connection).toBe("live");
   } finally {
-    const outboxMod = await import("./outbox");
-    outboxMod.__setOutboxLoadAllFailsForTest(false);
+    const outboxMod2 = await import("./outbox");
+    outboxMod2.__setOutboxLoadAllFailsForTest(false);
     vi.useRealTimers();
     Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
     sessionStorage.removeItem("remuda-outbox-owner");
   }
-});
+});;
 
 it("GATE44 item 1: a credential generation superseding a parked storage install is classified obsolete — status ok with the outbox disposed never fulfils as unavailable", async () => {
   vi.useFakeTimers();

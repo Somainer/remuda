@@ -1020,10 +1020,13 @@ export class Outbox {
 
   static async load(storage: OutboxStorage, owner?: Id): Promise<Outbox> {
     const box = new Outbox(storage, owner ?? Outbox.tabOwner());
-    // c-reconnfu gate 43 item 2 test seam: open succeeded but the initial read
-    // fails — load must reject so the store's installer reports "unavailable".
-    if (loadAllFailsForTest) throw new Error("test: outbox getAll failed");
-    for (const rec of (await storage.all()).filter((r) => commandIdFromKey(r.commandId))) {
+    // c-reconnfu gate 43 item 2 / gate 44 item 2 test seam: open and the write
+    // probe have already succeeded, but the initial getAll/READ rejects AT the
+    // storage.all() call itself (post-open read failure).
+    const rows = loadAllFailsForTest
+      ? await Promise.reject(new Error("test: outbox storage.all() failed"))
+      : await storage.all();
+    for (const rec of rows.filter((r) => commandIdFromKey(r.commandId))) {
       box.cache.set(rec.commandId, rec);
     }
     const now = Date.now();

@@ -3059,7 +3059,7 @@ class HubStore {
     // Gate 39: an "obsolete" result (the caller's epoch moved while waiting on
     // an open transition) stops this install entirely — never adopt the box the
     // NEW identity created.
-    const status = await this.ensureOutbox(epoch);
+    await this.ensureOutbox(epoch);
     // Gate 44 item 1: revalidate BOTH identity coordinates immediately after
     // the storage await, before classifying availability (see installGen).
     if (!sameIdentity()) return "obsolete";
@@ -3072,42 +3072,46 @@ class HubStore {
     if (this.connection && this.connectionInstallEpoch === epoch) {
       return "installed";
     }
-    // Storage genuinely unavailable for the CURRENT generation. Item 1 keeps
-    // this as a distinct result; gate 44 item 2 installs a machine anyway.
-    if (status === "unavailable" || !this.outbox) return "unavailable";
+    // Gate 44 ruling U: storage UNAVAILABLE for the CURRENT generation still
+    // installs the connection machine (and listeners) WITHOUT an outbox, so the
+    // published connection state always comes from a live machine and the UI is
+    // never stuck on the initial "recovering". Sends use the keyed direct
+    // fallback; durable rows stay in storage and restore on the next reload —
+    // there is deliberately NO in-page storage retry machinery here.
     const box = this.outbox;
 
-    // Reload: restore unsent rows as bubbles, keyed to their stored instances.
-    // Gate 39/44 R-b: identity-publishing/resource work — revalidate
-    // synchronously before the restore emit and machine creation.
-    if (!sameIdentity()) return "obsolete";
-    const restored = box.unresolved();
-    if (restored.length) {
-      // Offline reload never ran the instance list. Restore the LAST KNOWN
-      // complete instance projection persisted with each row (no fabricated
-      // stubs/casts); SessionPage renders the real shape with its capabilities
-      // and nativeRef intact. The next successful list refresh replaces these.
-      const restoredInstances: Instance[] = [];
-      for (const r of restored) {
-        if (this.state.instances.some((i) => i.id === r.instanceId)) continue;
-        const known =
-          r.instanceSnapshot ?? restoredInstances.find((i) => i.id === r.instanceId);
-        if (known) restoredInstances.push(known);
-      }
-      this.emit({
-        instances: [...this.state.instances, ...restoredInstances],
-        bubbles: [
-          ...restored.map((r) => this.bubbleFromOutbox(r)),
-          ...this.state.bubbles,
-        ],
-      });
-      // A forwarded-but-unresolved row ("reconciling", including a forward
-      // whose response was lost and read back as queued+unknown) is
-      // non-deliverable, so the flush cannot settle it: restart its bounded
-      // GET reconciliation instead of leaving 状态待确认 on the row forever.
-      // Never re-POSTs — the Hub already recorded the forward.
-      for (const r of restored) {
-        if (r.state === "reconciling") this.reconcileReconcilingRow(r.instanceId, r.commandId, box);
+    // Durable bubble restoration exists only when the box opened. Recheck
+    // identity synchronously before the restore emit and machine creation.
+    if (box && !sameIdentity()) return "obsolete";
+    if (box) {
+      const restored = box.unresolved();
+      if (restored.length) {
+        // Offline reload never ran the instance list. Restore the LAST KNOWN
+        // complete instance projection persisted with each row (no fabricated
+        // stubs/casts); SessionPage renders the real shape with its capabilities
+        // and nativeRef intact. The next successful list refresh replaces these.
+        const restoredInstances: Instance[] = [];
+        for (const r of restored) {
+          if (this.state.instances.some((i) => i.id === r.instanceId)) continue;
+          const known =
+            r.instanceSnapshot ?? restoredInstances.find((i) => i.id === r.instanceId);
+          if (known) restoredInstances.push(known);
+        }
+        this.emit({
+          instances: [...this.state.instances, ...restoredInstances],
+          bubbles: [
+            ...restored.map((r) => this.bubbleFromOutbox(r)),
+            ...this.state.bubbles,
+          ],
+        });
+        // A forwarded-but-unresolved row ("reconciling", including a forward
+        // whose response was lost and read back as queued+unknown) is
+        // non-deliverable, so the flush cannot settle it: restart its bounded
+        // GET reconciliation instead of leaving 状态待确认 on the row forever.
+        // Never re-POSTs — the Hub already recorded the forward.
+        for (const r of restored) {
+          if (r.state === "reconciling") this.reconcileReconcilingRow(r.instanceId, r.commandId, box);
+        }
       }
     }
 
@@ -3115,7 +3119,7 @@ class HubStore {
     // the connection machine; a retirement between the outbox install and here
     // stops the machine from being built or published.
     if (!sameIdentity()) {
-      box.dispose();
+      box?.dispose();
       return "obsolete";
     }
     const machine = new ConnectionMachine({
@@ -3127,7 +3131,7 @@ class HubStore {
         // and replaced (peer logout mid-probe, then a healthy re-login) must
         // never overwrite the installed machine's published state.
         if (this.connection !== machine) return;
-        this.emit({ connection: state, outboxPending: box.pendingCount() });
+        this.emit({ connection: state, outboxPending: box?.pendingCount() ?? 0 });
         // A socket-level recovery is also a moment to deliver the queue.
         if (state === "live") void this.flushAllOutbox();
       },
@@ -3168,6 +3172,15 @@ class HubStore {
     // A failed bootstrap starts the offline reconnect loop instead.
     if (offline) machine.setStateOffline();
     else machine.bootstrapLive();
+    // Ruling U: publish the machine's CURRENT state at install when the machine
+    // did not emit it itself. It starts "offline" and setStateOffline is a
+    // no-op when the state already matches, so without this the store kept its
+    // INITIAL "recovering" value forever on an offline-with-unavailable-storage
+    // reload. (bootstrapLive already emitted on the recovering/offline->live
+    // change, so this is skipped in the healthy path.)
+    if (this.state.connection !== machine.state) {
+      this.emit({ connection: machine.state, outboxPending: box?.pendingCount() ?? 0 });
+    }
 
     if (typeof window !== "undefined") {
       window.addEventListener("online", this.onConnOnline);
@@ -3180,8 +3193,12 @@ class HubStore {
     }
 
     // Send anything already due (e.g. rows left inflight when the tab closed).
-    void this.flushAllOutbox();
-    return "installed";
+    // No-op without an outbox (ruling U).
+    if (box) void this.flushAllOutbox();
+    // Ruling U: a machine installed with no outbox reports "unavailable" —
+    // callers are fulfilled (machine + listeners own connection state), sends
+    // use the keyed direct fallback and durable rows restore on next reload.
+    return box ? "installed" : "unavailable";
   }
 
   private onConnOnline = () => this.connection?.dispatch({ type: "online" });
@@ -4687,15 +4704,11 @@ class HubStore {
       // polls here). "unavailable" falls through to the settled degraded state.
       const install = await this.initConnection(false, extAtBoot);
       if (!extLive()) return "obsolete";
-      if (install === "installed") {
-        this.startPoll();
-        this.installDevHandle();
-        return "installed";
-      }
       if (install === "obsolete") return "obsolete";
-      this.publishCachedSessionSettled(null);
+      // installed OR unavailable (ruling U): the machine owns connection state.
       this.startPoll();
-      return "unavailable";
+      this.installDevHandle();
+      return install;
     } catch (err) {
       // Gate 41 item 1: RETIREMENT FIRST. If an external change (logout/401/
       // peer) advanced the epoch while the health/list request was parked —

@@ -1044,8 +1044,20 @@ pub fn project_usage_event(
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageAggregate {
-    /// Rows folded.
+    /// Proven contributing rows folded (latest winning stocks + proven
+    /// uncovered turns + other-scope events). Ambiguous turns are NOT rows
+    /// here — they cannot be summed — but see [`Self::ambiguous`].
     pub events: i64,
+    /// Rows that exist in retained data but cannot be proven to belong to a
+    /// native session (NULL lineage) in an instance that HAS scoped stock.
+    /// They contribute no numeric value (U1: the fold cannot certify their
+    /// buckets), but they must never be silently dropped from reporting: a
+    /// provider model whose only usage is such a turn still gets a row with
+    /// Unknown totals/budget (c-ctxusage r34 item 1).
+    pub ambiguous_events: i64,
+    /// Whether any ambiguous turn exists anywhere in this fold's instances —
+    /// used by the per-instance totals, which sum across models.
+    pub ambiguous: bool,
     /// Summed total tokens; Unknown when any contributing row omitted it.
     pub total_tokens: Option<i64>,
     /// Summed input tokens; Unknown when any contributing row omitted it.
@@ -1059,15 +1071,20 @@ pub struct UsageAggregate {
 }
 
 impl UsageAggregate {
-    /// Budget status against an estimated cap. `Unknown` when the bill itself
-    /// is Unknown (at least one contributing turn could not be priced): an
-    /// unknown cost can never be certified under budget, so it is never Ok
-    /// (U1, c-ctxusage r16 item 4).
+    /// Budget status against a cap. `Unknown` when the bill itself is Unknown
+    /// — either because at least one contributing turn could not be priced (U1,
+    /// c-ctxusage r16 item 4) or because unprovable (ambiguous-lineage) usage
+    /// exists and can neither be included nor certified absent (c-ctxusage r34
+    /// item 1). An unknown bill can never be certified under budget, so it is
+    /// never Ok.
     #[must_use]
     pub fn budget_status(&self, max_usd: Option<f64>) -> BudgetStatus {
         let Some(cost) = self.cost_usd else {
             return BudgetStatus::Unknown;
         };
+        if self.ambiguous {
+            return BudgetStatus::Unknown;
+        }
         let Some(max) = max_usd.filter(|v| *v > 0.0) else {
             return BudgetStatus::Ok;
         };
@@ -1114,11 +1131,29 @@ pub fn aggregate_instance(
     conn: &Connection,
     instance_id: &str,
 ) -> rusqlite::Result<UsageAggregate> {
+    let fold = FOLD_CTES_SQL
+        .replace("{domain_l}", "l.instance_id = ?1")
+        .replace("{domain}", "instance_id = ?1");
     conn.query_row(
         &format!(
-            "WITH {fold_ctes}
+            "WITH {fold},
+             contributions AS (
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM scoped_sessions
+                 UNION ALL
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM legacy_stock
+                 UNION ALL
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM proven_turns
+                 UNION ALL
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM usage_events
+                 WHERE instance_id = ?1 AND scope NOT IN ('turn', 'session')
+             )
              SELECT
-                 COUNT(*),
+                 (SELECT COUNT(*) FROM contributions),
+                 (SELECT COUNT(*) FROM ambiguous_turns),
                  CASE WHEN NOT EXISTS (
                           SELECT 1 FROM ambiguous_turns WHERE total_tokens IS NOT NULL
                       ) AND COUNT(*) = COUNT(total_tokens)
@@ -1135,32 +1170,19 @@ pub fn aggregate_instance(
                           SELECT 1 FROM ambiguous_turns WHERE cost_usd IS NOT NULL
                       ) AND COUNT(*) = COUNT(cost_usd)
                       THEN SUM(CAST(cost_usd AS REAL)) END
-             FROM (
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM scoped_sessions
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM legacy_stock
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM proven_turns
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM usage_events
-                 WHERE instance_id = ?1 AND scope NOT IN ('turn', 'session')
-             )",
-            fold_ctes = FOLD_CTES_SQL
-                .replace("{domain_l}", "l.instance_id = ?1")
-                .replace("{domain}", "instance_id = ?1")
+             FROM contributions",
+            fold = fold
         ),
         params![instance_id],
         |row| {
             Ok(UsageAggregate {
                 events: row.get(0)?,
-                total_tokens: row.get(1)?,
-                input_tokens: row.get(2)?,
-                output_tokens: row.get(3)?,
-                cost_usd: row.get(4)?,
+                ambiguous_events: row.get(1)?,
+                ambiguous: row.get::<_, i64>(1)? != 0,
+                total_tokens: row.get(2)?,
+                input_tokens: row.get(3)?,
+                output_tokens: row.get(4)?,
+                cost_usd: row.get(5)?,
             })
         },
     )
@@ -1182,11 +1204,30 @@ pub fn aggregate_supply(
     profile_id: &str,
     model: &str,
 ) -> rusqlite::Result<UsageAggregate> {
+    let fold = FOLD_CTES_SQL
+        .replace("{domain_l}", "l.profile_id = ?1 AND l.model = ?2")
+        .replace("{domain}", "profile_id = ?1 AND model = ?2");
     conn.query_row(
         &format!(
-            "WITH {fold_ctes}
+            "WITH {fold},
+             contributions AS (
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM scoped_sessions
+                 UNION ALL
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM legacy_stock
+                 UNION ALL
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM proven_turns
+                 UNION ALL
+                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
+                 FROM usage_events
+                 WHERE profile_id = ?1 AND model = ?2
+                   AND scope NOT IN ('turn', 'session')
+             )
              SELECT
-                 COUNT(*),
+                 (SELECT COUNT(*) FROM contributions),
+                 (SELECT COUNT(*) FROM ambiguous_turns),
                  CASE WHEN NOT EXISTS (
                           SELECT 1 FROM ambiguous_turns WHERE total_tokens IS NOT NULL
                       ) AND COUNT(*) = COUNT(total_tokens)
@@ -1203,33 +1244,19 @@ pub fn aggregate_supply(
                           SELECT 1 FROM ambiguous_turns WHERE cost_usd IS NOT NULL
                       ) AND COUNT(*) = COUNT(cost_usd)
                       THEN SUM(CAST(cost_usd AS REAL)) END
-             FROM (
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM scoped_sessions
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM legacy_stock
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM proven_turns
-                 UNION ALL
-                 SELECT total_tokens, input_tokens, output_tokens, cost_usd
-                 FROM usage_events
-                 WHERE profile_id = ?1 AND model = ?2
-                   AND scope NOT IN ('turn', 'session')
-             )",
-            fold_ctes = FOLD_CTES_SQL
-                .replace("{domain_l}", "l.profile_id = ?1 AND l.model = ?2")
-                .replace("{domain}", "profile_id = ?1 AND model = ?2")
+             FROM contributions",
+            fold = fold
         ),
         params![profile_id, model],
         |row| {
             Ok(UsageAggregate {
                 events: row.get(0)?,
-                total_tokens: row.get(1)?,
-                input_tokens: row.get(2)?,
-                output_tokens: row.get(3)?,
-                cost_usd: row.get(4)?,
+                ambiguous_events: row.get(1)?,
+                ambiguous: row.get::<_, i64>(1)? != 0,
+                total_tokens: row.get(2)?,
+                input_tokens: row.get(3)?,
+                output_tokens: row.get(4)?,
+                cost_usd: row.get(5)?,
             })
         },
     )
@@ -7289,5 +7316,109 @@ mod tests {
         );
         assert_eq!(supply_b.input_tokens, instance_agg.input_tokens);
         assert_eq!(supply_b.cost_usd, instance_agg.cost_usd);
+    }
+
+    /// c-ctxusage r34 item 1: the unprovable-lineage migration shape combined
+    /// with a model change. A retained NULL-lineage turn under model A (100 /
+    /// $1) sits beside a scoped model-B cumulative stock (250 / $3). Global
+    /// coverage makes the A turn AMBIGUOUS (its session cannot be proven), so
+    /// it must not enter numeric sums — but supply(A) must carry the explicit
+    /// ambiguity flag with zero proven events so the provider endpoint emits
+    /// an Unknown-budget row instead of dropping the model entirely.
+    #[test]
+    fn ambiguous_only_model_usage_is_flagged_not_dropped_in_supply() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let profile = "pvp_ambig_model";
+        let model_a = "model-a";
+        let model_b = "model-b";
+        let instance = "ins_ambig_model";
+        let session = "sess-b-scoped";
+
+        // Retained model-A turn with NULL lineage (the unprovable shape).
+        let ambiguous_turn = UsageEventRow {
+            instance_id: instance.into(),
+            seq: 1,
+            profile_id: Some(profile.into()),
+            model: Some(model_a.into()),
+            scope: "turn".into(),
+            scope_id: None,
+            mode: "snapshot".into(),
+            metric_revision: 1,
+            source_session_id: None,
+            total_tokens: Some(110),
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            cost_usd: Some("1.00".into()),
+            accounting: "estimated".into(),
+            observed_at: "2026-10-14T00:00:00.000Z".into(),
+            observed_at_source: "ingest".into(),
+        };
+        assert!(insert_usage_event(&conn, &ambiguous_turn).unwrap());
+
+        // Scoped model-B cumulative stock (contains whatever B ran).
+        let stock_b = UsageEventRow {
+            seq: 2,
+            model: Some(model_b.into()),
+            scope: "session".into(),
+            scope_id: Some(session.into()),
+            source_session_id: Some(session.into()),
+            total_tokens: Some(280),
+            input_tokens: Some(250),
+            output_tokens: Some(30),
+            cost_usd: Some("3.00".into()),
+            ..ambiguous_turn.clone()
+        };
+        assert!(insert_usage_event(&conn, &stock_b).unwrap());
+
+        // Instance totals: one proven stock; the ambiguous turn poisons the
+        // numeric buckets (it reported values that cannot be certified absent
+        // or covered).
+        let instance_agg = aggregate_instance(&conn, instance).unwrap();
+        assert_eq!(instance_agg.events, 1, "only the stock is a proven row");
+        assert_eq!(instance_agg.ambiguous_events, 1);
+        assert!(instance_agg.ambiguous);
+        assert_eq!(
+            instance_agg.input_tokens, None,
+            "the ambiguous turn keeps instance input Unknown"
+        );
+        assert_eq!(instance_agg.cost_usd, None);
+
+        // Supply(A): ZERO proven events, but the ambiguity is carried so the
+        // provider endpoint still emits the model row with Unknown totals.
+        let supply_a = aggregate_supply(&conn, profile, model_a).unwrap();
+        assert_eq!(supply_a.events, 0);
+        assert_eq!(supply_a.ambiguous_events, 1);
+        assert!(supply_a.ambiguous, "model A is ambiguous-only, not absent");
+        assert_eq!(supply_a.input_tokens, None);
+        assert_eq!(supply_a.cost_usd, None);
+        assert_eq!(
+            supply_a.budget_status(Some(10.0)),
+            BudgetStatus::Unknown,
+            "an ambiguous bill can never be certified Ok under budget"
+        );
+
+        // Supply(B): the proven stock only.
+        let supply_b = aggregate_supply(&conn, profile, model_b).unwrap();
+        assert_eq!(supply_b.events, 1);
+        assert_eq!(supply_b.ambiguous_events, 0);
+        assert!(!supply_b.ambiguous);
+        assert_eq!(supply_b.input_tokens, Some(250));
+        assert_eq!(supply_b.cost_usd, Some(3.0));
+        assert_eq!(supply_b.budget_status(Some(10.0)), BudgetStatus::Ok);
+
+        // Endpoint emission predicate: A is not dropped despite events == 0.
+        let endpoint_emits = |agg: &UsageAggregate| agg.events != 0 || agg.ambiguous;
+        assert!(
+            endpoint_emits(&supply_a),
+            "ambiguous-only model row is emitted"
+        );
+        assert!(endpoint_emits(&supply_b));
+        assert!(
+            !endpoint_emits(&aggregate_supply(&conn, profile, "model-absent").unwrap()),
+            "a model with genuinely no usage still produces no row"
+        );
     }
 }

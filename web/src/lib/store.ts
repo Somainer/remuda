@@ -4367,8 +4367,10 @@ class HubStore {
         dropDeviceCookie();
       }
       // Gate 38: an external change observed WHILE this bootstrap was in
-      // flight retired the run above — publish/install nothing on it.
-      if (!extLive()) return;
+      // flight retires the run. The explicit 401 branch above is THIS run's
+      // own logout signal and still emits logged-out below; a transient/network
+      // failure that landed stale (peer/local logout) publishes nothing.
+      if (!unauth && !extLive()) return;
       // A network failure WITH a device session still on disk is an offline
       // reload, not a logout: keep the (cached) authed UI, restore the outbox,
       // and let the connection machine reconnect. Only a real 401 logs out.

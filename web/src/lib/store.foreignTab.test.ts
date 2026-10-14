@@ -9111,3 +9111,320 @@ it("GATE44 item 2 (ruling U): unavailable outbox storage installs the connection
     sessionStorage.removeItem("remuda-outbox-owner");
   }
 })
+it("GATE47 item 2(a) (S3): a same-tab login waits for a held bootstrap to settle; a delayed 401 cannot clear the later login and stale list results never publish over its session (401 and stale-success variants)", async () => {
+  for (const variant of ["delayed-401", "stale-success"] as const) {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_490_000 + (variant === "stale-success" ? 1 : 0));
+    const I = `ins_g47_2a_${variant}`;
+    const originalNavigator = globalThis.navigator;
+    Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+    localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+    const pump = async (n = 5_000) => {
+      for (let i = 0; i < n; i += 1) await Promise.resolve();
+    };
+    try {
+      sessionStorage.setItem(`remeda-outbox-owner-g47-2a-${variant}`, "owner");
+      localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g47_2a", name: "A" }));
+      const { api, hubStore } = await fresh();
+      vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+      vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+      vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+      vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+      vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+      vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+      vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+      vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+      const hasSession = vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+      vi.spyOn(api, "instanceList").mockImplementation(
+        (() =>
+          Promise.resolve({
+            items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+            nextCursor: null,
+          })) as unknown as Api["instanceList"],
+      );
+
+      // Hold bootstrap A's health request.
+      let releaseHello: ((v: unknown) => void) | null = null;
+      let rejectHello: ((e: unknown) => void) | null = null;
+      let helloCalls = 0;
+      vi.spyOn(api, "hello").mockImplementation(
+        () =>
+          new Promise((resolve, reject) => {
+            helloCalls += 1;
+            if (helloCalls === 1) {
+              releaseHello = (v) => resolve(v as never);
+              rejectHello = reject;
+            } else {
+              resolve({} as Awaited<ReturnType<Api["hello"]>>);
+            }
+          }),
+      );
+
+      const h = hubStore as unknown as {
+        bootstrap: () => Promise<void>;
+        login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+        state: { authed: boolean; session: { deviceId: string } | null; instances: Array<{ id: string }> };
+      };
+      const extAtStart = (hubStore as unknown as { extEpochForTest: number }).extEpochForTest;
+      const bootA = h.bootstrap();
+      for (let i = 0; i < 200 && !rejectHello; i += 1) await Promise.resolve();
+      expect(rejectHello).not.toBeNull();
+
+      // Issue login B WHILE A is held; it must queue and not send yet.
+      let bootASettled = false;
+      void bootA.then(() => { bootASettled = true; });
+      let bRequestStarted = false;
+      let bootSettledAtBRequest: boolean | null = null;
+      vi.spyOn(api, "login").mockImplementation((() =>
+        new Promise((resolve) => {
+          bRequestStarted = true;
+          bootSettledAtBRequest = bootASettled;
+          resolve({ deviceId: "devB_g47_2a", token: "tokB", name: "B" });
+        })) as unknown as Api["login"]);
+      const loginB = h.login("bootstrap", "secretB", "devB_g47_2a");
+      await pump(300);
+      expect(bRequestStarted).toBe(false); // B waits for A — S3 serialization
+      expect(bootASettled).toBe(false);
+
+      // Settle A: delayed 401 (external epoch bump, R-c logout) or a stale
+      // successful list page for A's old session.
+      if (variant === "delayed-401") {
+        const { HubHttpError } = await import("./httpError");
+        rejectHello!(new HubHttpError(401, "unauthorized", "Unauthorized"));
+      } else {
+        releaseHello!({} as Awaited<ReturnType<Api["hello"]>>);
+      }
+      for (let i = 0; i < 2_000 && !bRequestStarted; i += 1) await Promise.resolve();
+
+      // B's credential request starts ONLY after A's whole op settled.
+      expect(bRequestStarted).toBe(true);
+      expect(bootSettledAtBRequest).toBe(true);
+      // In the 401 variant B runs at the NEW epoch (queued credentials are
+      // fresh auth intent across a bootstrap 401, not cancelled).
+      if (variant === "delayed-401") {
+        expect((hubStore as unknown as { extEpochForTest: number }).extEpochForTest).toBe(extAtStart + 1);
+      }
+
+      await loginB;
+      await bootA;
+      await pump(4_000);
+
+      // B ends authed on B's OWN session in both variants; A's delayed 401
+      // could not clear a session whose request had not even been sent, and
+      // A's stale list projection never remains over B's session.
+      expect(h.state.authed).toBe(true);
+      expect(h.state.session?.deviceId).toBe("devB_g47_2a");
+      expect(h.state.instances.map((i) => i.id)).toContain(I);
+      expect(localStorage.getItem("runtime.device-session")).toContain("devB_g47_2a");
+      // Exactly ONE credential request (B); A never sent a login in this
+      // cached-session variant.
+      expect(vi.mocked(api.login)).toHaveBeenCalledTimes(1);
+      void hasSession;
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+      sessionStorage.removeItem(`remuda-outbox-owner-g47-2a-${variant}`);
+    }
+  }
+});;
+
+it("GATE47 item 2(b) (S3): a nested-microtask subscriber starts login B at A's machine-state publication — the public bootstrap promise settles before B's request starts and B's own bootstrap fulfils B", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_491_000);
+  const I = "ins_g47_2b";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner-g47-2b", "owner");
+    localStorage.setItem("runtime.device-session", JSON.stringify({ deviceId: "devA_g47_2b", name: "A" }));
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+
+    // B's credential request is held — but it must not even START until A has
+    // fully settled.
+    let releaseB: () => void = () => undefined;
+    let bBodyPending = false;
+    let bootSettledAtBRequest: boolean | null = null;
+    let bootASettled = false;
+    vi.spyOn(api, "login").mockImplementation((() =>
+      new Promise((resolve) => {
+        bBodyPending = true;
+        bootSettledAtBRequest = bootASettled;
+        releaseB = () => {
+          bBodyPending = false;
+          resolve({ deviceId: "devB_g47_2b", token: "tokB", name: "B" });
+        };
+      })) as unknown as Api["login"]);
+
+    const h = hubStore as unknown as {
+      bootstrap: () => Promise<void>;
+      subscribe: (cb: () => void) => () => void;
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      connection: unknown;
+      state: { authed: boolean; connection: string; session: { deviceId: string } | null };
+    };
+
+    // ONE-SHOT REAL store subscriber on the machine-state publication (the
+    // connection state change emitted from inside A's initConnection): starts
+    // login B via NESTED microtasks — the gate-46 return window.
+    let prevConn = (hubStore as unknown as { state: { connection: string } }).state.connection;
+    let unsub = (): void => {};
+    unsub = h.subscribe(() => {
+      const s = hubStore as unknown as { state: { connection: string }; connection: unknown };
+      const conn = s.state.connection;
+      if (conn === prevConn || !s.connection) return;
+      prevConn = conn;
+      unsub();
+      queueMicrotask(() => {
+        queueMicrotask(() => {
+          void h.login("bootstrap", "secretB", "devB_g47_2b");
+        });
+      });
+    });
+
+    const bootA = h.bootstrap();
+    const bootA2 = h.bootstrap(); // StrictMode duplicate — same single-flight op
+    void bootA.then(() => { bootASettled = true; });
+    for (let i = 0; i < 4_000 && !bBodyPending; i += 1) await Promise.resolve();
+    expect(bBodyPending).toBe(true);
+    // A's PUBLIC promise had already settled when B's request went out —
+    // B waited on A's queue gate, even across the nested-microtask schedule.
+    expect(bootSettledAtBRequest).toBe(true);
+    releaseB();
+    await bootA;
+    await bootA2;
+    await pump(4_000);
+    expect(h.state.authed).toBe(true);
+    expect(h.state.session?.deviceId).toBe("devB_g47_2b");
+    expect(h.connection).not.toBeNull();
+    expect(bBodyPending).toBe(false);
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remuda-outbox-owner-g47-2b");
+  }
+});;
+
+it("GATE47 item 2(c) (S3): logout while B's credential body is held retires the QUEUED C immediately (no credentials sent, no 15 s wait) and a fresh login D is not blocked behind B", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_492_000);
+  const I = "ins_g47_2c";
+  const originalNavigator = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, writable: true, value: { locks: fifoWebLocks().locks } });
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([]));
+  const pump = async (n = 5_000) => {
+    for (let i = 0; i < n; i += 1) await Promise.resolve();
+  };
+  try {
+    sessionStorage.setItem("remuda-outbox-owner-g47-2c", "owner");
+    localStorage.setItem("runtime.logged-out", "1");
+    const { api, hubStore } = await fresh();
+    vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+    vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+    vi.spyOn(api, "instanceGet").mockResolvedValue({ id: I, journalId: JOURNAL } as never);
+    vi.spyOn(api, "eventsSubscribe").mockResolvedValue(g26Subscription() as never);
+    vi.spyOn(api, "hostList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
+    vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+    vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+    vi.spyOn(api, "instanceList").mockResolvedValue({
+      items: [{ id: I, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+      nextCursor: null,
+    } as never);
+    vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+    vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+
+    const deviceNames: string[] = [];
+    let bBodyPending = false;
+    // Behavior keyed on DEVICE NAME (not mock chain position): a retired
+    // waiter never invokes its factory, so a once-positioned C stub would
+    // otherwise be consumed by D.
+    vi.spyOn(api, "login").mockImplementation(
+      ((_secret: string, deviceName: string) => {
+        deviceNames.push(deviceName);
+        if (deviceName === "devB_g47_2c") {
+          // B stays held for the ENTIRE test (the real REST write timeout,
+          // 15 s, is what bounds this body in production); it is never released.
+          return new Promise(() => {
+            bBodyPending = true;
+          });
+        }
+        if (deviceName === "devC_g47_2c") {
+          // C must never send: fail loudly if it does.
+          return Promise.reject(new Error("C retired waiter sent credentials"));
+        }
+        return Promise.resolve({ deviceId: "devD_g47_2c", token: "tokD", name: "D" });
+      }) as unknown as Api["login"],
+    );
+
+    const h = hubStore as unknown as {
+      login: (k: "bootstrap", s: string, d: string) => Promise<void>;
+      logout: () => void;
+      connection: unknown;
+      outbox: unknown;
+      state: { ready: boolean; authed: boolean; session: { deviceId: string } | null };
+    };
+    const pB = h.login("bootstrap", "b", "devB_g47_2c");
+    const pC = h.login("bootstrap", "c", "devC_g47_2c");
+    for (let i = 0; i < 1_000 && !bBodyPending; i += 1) await Promise.resolve();
+    expect(bBodyPending).toBe(true); // B running, held; C queued behind B
+
+    // EXPLICIT logout while B is held and C is queued.
+    let cSettled = false;
+    void pC.then(() => { cSettled = true; });
+    h.logout();
+    await pump(300);
+
+    // C retired IMMEDIATELY while B's body is still held — no waiting on B's
+    // REST write timeout, and C's credential request was never sent (only B's).
+    expect(cSettled).toBe(true);
+    expect(bBodyPending).toBe(true);
+    expect(deviceNames).toEqual(["devB_g47_2c"]);
+    expect(vi.mocked(api.login)).toHaveBeenCalledTimes(1);
+    expect(h.state.authed).toBe(false);
+    expect(h.connection).toBeNull();
+    expect(h.outbox).toBeNull();
+
+    // A FRESH login D after the logout is not blocked behind the retired, still
+    // held B: it acquires at once, sends its request and completes — B is
+    // never released.
+    const pD = h.login("bootstrap", "d", "devD_g47_2c");
+    for (let i = 0; i < 1_000 && deviceNames.length < 2; i += 1) await Promise.resolve();
+    expect(deviceNames).toEqual(["devB_g47_2c", "devD_g47_2c"]);
+    await pD;
+    await pump(4_000);
+    expect(h.state.authed).toBe(true);
+    expect(h.state.session?.deviceId).toBe("devD_g47_2c");
+    expect(h.connection).not.toBeNull();
+    expect(h.outbox).not.toBeNull();
+    expect(vi.mocked(api.login)).toHaveBeenCalledTimes(2); // B and D — never C
+    void pB; // B stays parked to the end (the real 15 s write timeout bounds it)
+  } finally {
+    vi.useRealTimers();
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: originalNavigator });
+    sessionStorage.removeItem("remeda-outbox-owner-g47-2c");
+  }
+});

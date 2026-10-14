@@ -22,7 +22,7 @@ type OutboxInternal = {
 };
 
 type Internal = {
-  ensureOutbox: () => Promise<boolean>;
+  ensureOutboxForTest: () => Promise<boolean>;
   flushAllOutbox: () => Promise<void>;
   rearmLeaseWakeups: () => Promise<void>;
   unloadClearTimer: ReturnType<typeof setTimeout> | null;
@@ -71,7 +71,7 @@ async function boot(api: Api, hubStore: Store) {
   });
   vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
   await hubStore.bootstrap();
-  expect(await internalOf(hubStore).ensureOutbox()).toBe("ok");
+  expect(await internalOf(hubStore).ensureOutboxForTest()).toBe("ok");
 }
 
 function foreignInflightRow(until: number): OutboxRecord {

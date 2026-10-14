@@ -1690,11 +1690,11 @@ it("GATE18 item 2 (gate 20): aligned deadline wakes on two instances — a held 
       })) as unknown as Api["instanceSend"]);
     await bootLive(api, hubStore);
     const internal = hubStore as unknown as {
-      ensureOutbox: () => Promise<boolean>;
+      ensureOutboxForTest: () => Promise<boolean>;
       flushAllOutbox: () => Promise<void>;
       outbox: { pendingLeaseWakeups: () => string[] };
     };
-    expect(await internal.ensureOutbox()).toBe("ok");
+    expect(await internal.ensureOutboxForTest()).toBe("ok");
     await internal.flushAllOutbox();
 
     const cmd1 = "cmd_g18_i2_held";
@@ -1814,7 +1814,7 @@ it("GATE18 item 3 (gate 20): a command's deadline fire reconciles ANOTHER comman
       })) as unknown as Api["instanceSend"]);
     await bootLive(api, hubStore);
     const internal = hubStore as unknown as {
-      ensureOutbox: () => Promise<boolean>;
+      ensureOutboxForTest: () => Promise<boolean>;
       flushAllOutbox: () => Promise<void>;
       outbox: {
         ownerId: string;
@@ -1823,7 +1823,7 @@ it("GATE18 item 3 (gate 20): a command's deadline fire reconciles ANOTHER comman
         leaseWakeAt: (id: string) => number | undefined;
       };
     };
-    expect(await internal.ensureOutbox()).toBe("ok");
+    expect(await internal.ensureOutboxForTest()).toBe("ok");
     await internal.flushAllOutbox();
     expect(send).not.toHaveBeenCalled();
 
@@ -3563,8 +3563,8 @@ it("GATE22 item 6: a flush queued across logout/reinit releases its tokens and e
     hubStore.logout();
     expect(boxOf()).toBeNull();
     const reopened = await (
-      hubStore as unknown as { ensureOutbox: () => Promise<boolean> }
-    ).ensureOutbox();
+      hubStore as unknown as { ensureOutboxForTest: () => Promise<boolean> }
+    ).ensureOutboxForTest();
     expect(reopened).toBe("ok");
     const newBox = boxOf()!;
     const newEnd = vi.spyOn(
@@ -4976,8 +4976,8 @@ it("GATE27 item 2: an OLD-epoch acceptance arriving only AFTER logout/reinit (th
     // dies with it); reinit creates a NEW outbox with a new lifetime id.
     a.logout();
     const reopened = await (
-      a as unknown as { ensureOutbox: () => Promise<boolean> }
-    ).ensureOutbox();
+      a as unknown as { ensureOutboxForTest: () => Promise<boolean> }
+    ).ensureOutboxForTest();
     expect(reopened).toBe("ok");
     const lifeB = (a as unknown as { outbox: { lifetime: string } }).outbox.lifetime;
     expect(lifeB).not.toBe(lifeA);
@@ -5125,7 +5125,7 @@ it("GATE28 a: a claim that fails before commit stamps no issuer — the stale co
 
     // Logout disposes the outbox; reinit creates a new outbox (new lifetime).
     a.logout();
-    const reopened = await (a as unknown as { ensureOutbox: () => Promise<boolean> }).ensureOutbox();
+    const reopened = await (a as unknown as { ensureOutboxForTest: () => Promise<boolean> }).ensureOutboxForTest();
     expect(reopened).toBe("ok");
     const boxB = () => (a as unknown as { outbox: { isDeliveryExhausted: (i: string) => boolean; pendingLeaseWakeups: () => string[] } | null }).outbox;
 
@@ -5511,7 +5511,8 @@ it("GATE28 d / GATE30 single-writer: after a reload of the same login a restored
       connectionBoundTo: unknown;
       connectionBoundJournal: unknown;
       connectionBindGen: number;
-      initConnection: (offline?: boolean) => Promise<void>;
+      initConnection: (offline: boolean, ext: number) => Promise<void>;
+      extEpochForTest: number;
     };
     // Drop the connection machine too so initConnection rebuilds it (a reload).
     // Same login, but the new page gets a NEW outbox lifetime.
@@ -5528,7 +5529,7 @@ it("GATE28 d / GATE30 single-writer: after a reload of the same login a restored
     // orphaned old loop (if its parked GET resolves) is rejected by the origin
     // check.
     (hubStore as unknown as { reconcilingInFlight: Set<string> }).reconcilingInFlight.delete(cId);
-    await reloader.initConnection();
+    await reloader.initConnection(false, reloader.extEpochForTest);
     // Let the recreated connection machine certify live against the mocked
     // Hub (probe + ready follow) as it would on a real reload.
     await pump(3_000);
@@ -5860,7 +5861,7 @@ it("GATE32 item 1a: logout/reinit disposes the Outbox — the new outbox has a f
 
     // Logout then reinit (same page): a NEW outbox with a NEW lifetime.
     hubStore.logout();
-    const reopened = await (hubStore as unknown as { ensureOutbox: () => Promise<boolean> }).ensureOutbox();
+    const reopened = await (hubStore as unknown as { ensureOutboxForTest: () => Promise<boolean> }).ensureOutboxForTest();
     expect(reopened).toBe("ok");
     const newLife = boxOf()!.lifetime;
     expect(newLife).not.toBe(oldLife);
@@ -6021,7 +6022,7 @@ it("GATE33 item 1: every session mutation (logout) bumps the auth generation and
     expect(boxAt()).toBeNull();
 
     // reinit under the new identity: a fresh outbox/lifetime.
-    const reopened = await (hubStore as unknown as { ensureOutbox: () => Promise<boolean> }).ensureOutbox();
+    const reopened = await (hubStore as unknown as { ensureOutboxForTest: () => Promise<boolean> }).ensureOutboxForTest();
     expect(reopened).toBe("ok");
     const l2 = boxAt()!.lifetime;
     expect(l2).not.toBe(l1);
@@ -6066,7 +6067,7 @@ it("GATE33 item 2: an Outbox initializer whose auth generation goes stale before
       authGenForTest: number;
       setOutboxOpenGateForTest: (g: ((r: () => void) => void) | null) => void;
       applyAuthIdentityChangeForTest: () => void;
-      ensureOutbox: () => Promise<boolean>;
+      ensureOutboxForTest: () => Promise<boolean>;
       flushAllOutbox: () => Promise<void>;
     };
 
@@ -6075,7 +6076,7 @@ it("GATE33 item 2: an Outbox initializer whose auth generation goes stale before
     h.setOutboxOpenGateForTest((resolve) => {
       releaseOld = resolve;
     });
-    const firstInit = h.ensureOutbox();
+    const firstInit = h.ensureOutboxForTest();
     await pump(50);
     expect(h.outbox).toBeNull(); // still opening
 
@@ -6093,7 +6094,7 @@ it("GATE33 item 2: an Outbox initializer whose auth generation goes stale before
 
     // The CURRENT identity's initializer (no gate) installs a fresh outbox.
     h.setOutboxOpenGateForTest(null);
-    const ok = await h.ensureOutbox();
+    const ok = await h.ensureOutboxForTest();
     expect(ok).toBe("ok");
     expect(h.outbox).not.toBeNull();
     expect(h.authGenForTest).toBe(genAfter);
@@ -6140,7 +6141,7 @@ it("GATE34 item 1: once a public send() commits C durably, an auth disposal befo
     const h = hubStore as unknown as {
       logout: () => void;
       send: (i: string, p: string) => Promise<boolean>;
-      ensureOutbox: () => Promise<string>;
+      ensureOutboxForTest: () => Promise<string>;
       setOutboxEnqueueGateForTest: (g: ((r: () => void) => void) | null) => void;
       flushAllOutbox: () => Promise<void>;
     };
@@ -6171,7 +6172,7 @@ it("GATE34 item 1: once a public send() commits C durably, an auth disposal befo
     // Re-auth implicitly via a fresh outbox (simulating the post-change page):
     // ensureOutbox installs the current-generation box and the flush delivers
     // the committed C EXACTLY once, carrying its own command id.
-    const status = await h.ensureOutbox();
+    const status = await h.ensureOutboxForTest();
     expect(status).toBe("ok");
     await h.flushAllOutbox();
     await pump(2_000);
@@ -6257,7 +6258,7 @@ it("GATE34 item 2 (Fence B): a flush delivery whose box is disposed while awaiti
 
     // The current-generation box claims the released row (released by L1's
     // finally) and delivers it exactly once.
-    const ok = await (hubStore as unknown as { ensureOutbox: () => Promise<string> }).ensureOutbox();
+    const ok = await (hubStore as unknown as { ensureOutboxForTest: () => Promise<string> }).ensureOutboxForTest();
     expect(ok).toBe("ok");
     await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
     await pump(3_000);
@@ -6310,7 +6311,7 @@ it("GATE34 item 3 (Fence A): during a login whose body is delayed, no old-lifeti
     hubStore.setConnectionStateForTest("offline");
     const h = hubStore as unknown as {
       login: (k: "bootstrap", s: string, d: string) => Promise<void>;
-      ensureOutbox: () => Promise<string>;
+      ensureOutboxForTest: () => Promise<string>;
       flushAllOutbox: () => Promise<void>;
       authTransitionOpenForTest: boolean;
       outbox: { lifetime: string } | null;
@@ -6344,7 +6345,7 @@ it("GATE34 item 3 (Fence A): during a login whose body is delayed, no old-lifeti
     // ensureOutbox must BLOCK during the transition — it cannot resolve to an
     // installed box while the credential body is pending.
     let ensureSettled = false;
-    const ensureP = h.ensureOutbox().then((r) => { ensureSettled = true; return r; });
+    const ensureP = h.ensureOutboxForTest().then((r) => { ensureSettled = true; return r; });
     await pump(1_000);
     expect(ensureSettled).toBe(false);
 
@@ -6376,7 +6377,7 @@ it("GATE34 item 3 (Fence A): during a login whose body is delayed, no old-lifeti
     await pump(200);
     expect(h.authTransitionOpenForTest).toBe(true);
     let ensure2 = false;
-    const p2 = h.ensureOutbox().then((r) => { ensure2 = true; return r; });
+    const p2 = h.ensureOutboxForTest().then((r) => { ensure2 = true; return r; });
     await pump(500);
     expect(ensure2).toBe(false); // blocked during the failed transition
     failLogin();

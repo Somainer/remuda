@@ -403,11 +403,11 @@ async function bootLiveWithFaultableStorage(api: Api, hubStore: Store) {
   );
   hubStore.setConnectionStateForTest("live");
   const internals = hubStore as unknown as {
-    ensureOutbox: () => Promise<boolean>;
+    ensureOutboxForTest: () => Promise<boolean>;
     flushAllOutbox: () => Promise<void>;
     outbox: { storage: FaultableOutboxStorage } | null;
   };
-  expect(await internals.ensureOutbox()).toBe("ok");
+  expect(await internals.ensureOutboxForTest()).toBe("ok");
   // Settle the empty boot flush BEFORE faults are armed so its reads cannot
   // consume the one-shot faults below.
   await internals.flushAllOutbox();
@@ -805,7 +805,7 @@ it("GATE22 item 2: a live steer whose rejected finishing write aborts once is re
   const steerPrompt = "gate22 2 steer";
   const internalsOf = (s: Store) =>
     s as unknown as {
-      ensureOutbox: () => Promise<boolean>;
+      ensureOutboxForTest: () => Promise<boolean>;
       flushAllOutbox: () => Promise<void>;
       outbox: {
         ownerId: string;
@@ -819,7 +819,7 @@ it("GATE22 item 2: a live steer whose rejected finishing write aborts once is re
     stubPostSend(api);
     hubStore.setConnectionStateForTest("live");
     const internals = internalsOf(hubStore);
-    expect(await internals.ensureOutbox()).toBe("ok");
+    expect(await internals.ensureOutboxForTest()).toBe("ok");
     await internals.flushAllOutbox(); // settle the empty boot flush
     const storage = internals.outbox!.storage;
 

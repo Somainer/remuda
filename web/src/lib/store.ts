@@ -1681,12 +1681,12 @@ class HubStore {
    *    the legacy direct POST may run, but ALWAYS carrying the client command
    *    id as its dedupe id.
    */
-  private async ensureOutbox(ext?: number): Promise<"ok" | "obsolete" | "unavailable"> {
-    // Gate 39 R-b: `ext` is the epoch the CALLER captured at ITS public entry.
-    // Production callers always pass it; the helper never adopts a fresh epoch
-    // on their behalf. The parameter is optional ONLY for the private test
-    // seam.
-    const epoch = ext ?? this.extEpoch;
+  private async ensureOutbox(ext: number): Promise<"ok" | "obsolete" | "unavailable"> {
+    // Gate 39/40 R-b: `ext` is REQUIRED — the epoch the CALLER captured at ITS
+    // public entry before its first await. This helper never adopts a fresh
+    // epoch on a caller's behalf (no default). The current-identity test seam
+    // is {@link ensureOutboxForTest}.
+    const epoch = ext;
     // c-reconnfu gate 35 item 2: LOOP while any credential transition is open.
     // Overlapping logins are serialized: each release can be followed by a
     // queued transition acquiring, so re-await until the chain fully settles.
@@ -2971,10 +2971,11 @@ class HubStore {
    * at offline instead of an optimistic live, so cached UI shows an honest
    * state and the outbox still restores/flushes on recovery.
    */
-  private async initConnection(offline = false, ext?: number) {
-    // Gate 39 R-b: the CALLER's external epoch (captured at its public entry)
-    // gates every install here. Optional ONLY for the private test seam.
-    const epoch = ext ?? this.extEpoch;
+  private async initConnection(offline: boolean, ext: number) {
+    // Gate 39/40 R-b: the CALLER's external epoch (captured at its public
+    // entry before its first await) is REQUIRED; this installer never reads a
+    // fresh epoch for the caller.
+    const epoch = ext;
     const live = () => this.extEpoch === epoch;
     // c-reconnfu gate 34 item 4: a REPLACEMENT login keeps this.connection but
     // the old box was disposed by runAuthIdentityChange. Ensure a current-
@@ -3256,12 +3257,24 @@ class HubStore {
   get authGenForTest(): number {
     return this.authGen;
   }
+  /** Test seam: current external-identity epoch (gate 40 item 3). */
+  get extEpochForTest(): number {
+    return this.extEpoch;
+  }
   applyAuthIdentityChangeForTest(): void {
     this.applyAuthIdentityChange(true);
   }
   /** Test seam: true while a Fence-A credential transition is open. */
   get authTransitionOpenForTest(): boolean {
     return this.authTransition !== null;
+  }
+  /**
+   * Test seam (gate 40 item 3): ensure the outbox for the CURRENT identity.
+   * Production callers must call {@link ensureOutbox} with the epoch they
+   * captured before their first await; tests act as the current identity.
+   */
+  ensureOutboxForTest(): Promise<"ok" | "obsolete" | "unavailable"> {
+    return this.ensureOutbox(this.extEpoch);
   }
 
   private outboxOpenGateForTest: ((resolve: () => void) => void) | null = null;

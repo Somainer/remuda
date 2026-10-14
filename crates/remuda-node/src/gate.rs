@@ -700,6 +700,21 @@ pub(crate) struct LandDrainSeams {
     /// first non-empty read, exercising the "a failed drain is uncertainty"
     /// arm without a real OS read failure.
     pub(crate) stderr_read_fault: bool,
+    /// r22 item 4: one-shot hold parked AFTER both pipe joins completed but
+    /// BEFORE the final drain-acceptance deadline latch, so a test can let the
+    /// original absolute deadline expire with both drains already finished and
+    /// then require uncertainty (tokio's timeout polls the inner join first).
+    pub(crate) final_accept_hold: Option<Arc<FinalDrainHold>>,
+}
+
+/// r22 item 4 test-only hold at the granted-land owner's final drain
+/// acceptance.
+#[cfg(any(test, feature = "test-faults"))]
+pub struct FinalDrainHold {
+    /// Notified once the owner reaches the parked point.
+    pub(crate) entered: Arc<tokio::sync::Notify>,
+    /// The owner parks on this until the test notifies release.
+    pub(crate) release: Arc<tokio::sync::Notify>,
 }
 
 /// Lane locks, running jobs and the per-Node event uplink.
@@ -887,6 +902,33 @@ impl GateRegistry {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .stderr_read_fault
+    }
+
+    /// r22 item 4 test-only: arm the one-shot final drain-acceptance hold.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub(crate) fn arm_final_drain_accept_hold(&self, hold: Arc<FinalDrainHold>) {
+        self.land_drain_seams
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .final_accept_hold = Some(hold);
+    }
+
+    /// r22 item 4 test-only: take (and park on) the armed final-acceptance
+    /// hold. Returns None when no hold is armed.
+    #[cfg(any(test, feature = "test-faults"))]
+    async fn take_final_drain_accept_hold(&self) -> Option<Arc<FinalDrainHold>> {
+        let hold = {
+            self.land_drain_seams
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .final_accept_hold
+                .take()
+        }?;
+        hold.entered.notify_one();
+        // Suspend on a Notify (registered before the test can release), never
+        // block an async worker on a condvar.
+        hold.release.notified().await;
+        Some(hold)
     }
 
     #[cfg(any(test, feature = "test-faults"))]
@@ -1348,6 +1390,14 @@ impl DevNode {
     #[cfg(any(test, feature = "test-faults"))]
     pub async fn gate_test_set_land_stderr_read_fault(&self, on: bool) {
         self.gate_registry().set_land_stderr_read_fault(on);
+    }
+
+    /// Test-only (r22 item 4): arm the one-shot hold at the granted-land
+    /// owner's final drain acceptance.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-faults"))]
+    pub async fn gate_test_arm_final_drain_accept_hold(&self, hold: Arc<FinalDrainHold>) {
+        self.gate_registry().arm_final_drain_accept_hold(hold);
     }
 
     /// Dispatch one Hub→Node gate RPC by method name.
@@ -2520,6 +2570,13 @@ impl DevNode {
                     } else {
                         Some(Vec::new())
                     };
+                    // r22 item 4: LATCH after the first joined step. Tokio's
+                    // timeout POLLS THE INNER FUTURE FIRST, so an already
+                    // complete join can resolve even at/after a zero remaining
+                    // budget; the clock is re-checked explicitly here.
+                    if std::time::Instant::now() >= land_deadline {
+                        drain_ok = false;
+                    }
                     if drain_ok && let Some(task) = land_stderr_task.take() {
                         match tokio::time::timeout(remaining(land_deadline), task).await {
                             // Joined and drained to EOF.
@@ -2529,6 +2586,20 @@ impl DevNode {
                             // are partial or the pipe is still held.
                             _ => drain_ok = false,
                         }
+                    }
+                    // r22 item 4 deterministic seam: park at FINAL drain
+                    // acceptance (both joins done) so a test can expire the
+                    // original deadline with both drains already finished.
+                    #[cfg(any(test, feature = "test-faults"))]
+                    registry.take_final_drain_accept_hold().await;
+                    // r22 item 4: LATCH immediately BEFORE accepting any
+                    // definitive outcome — a drain that completed only after
+                    // the absolute deadline expired (while the owner was
+                    // descheduled, behind on the blocking pool, or parked at
+                    // the seam) does not un-expire the deadline; the land is
+                    // uncertain even if every join returned Ok.
+                    if std::time::Instant::now() >= land_deadline {
+                        drain_ok = false;
                     }
                     let land_output = match (land_status, stdout_bytes, drain_ok) {
                         (Some(status), Some(stdout), true) => Some(std::process::Output {
@@ -6011,6 +6082,71 @@ echo "{\"exitCode\":0,\"status\":\"landed\",\"merged\":\"$head\",\"currentMain\"
         assert_eq!(
             result.status, "landed",
             "a full raw-byte drain tolerates invalid UTF-8 and keeps the verdict: {result:?}"
+        );
+        assert_eq!(origin_main(&fixture), base_main, "push=false moves nothing");
+    }
+
+    /// r22 item 4: the absolute deadline is LATCHED at final drain acceptance.
+    /// The leader exits 0 with a valid landed report and both pipes close at
+    /// exit, so BOTH reader joins complete successfully — but the owner is
+    /// parked at the injected final-acceptance seam until AFTER the original
+    /// absolute deadline has expired. Tokio's `timeout` polls the (already
+    /// complete) inner join first and would return Ok regardless; without the
+    /// explicit post-join clock latch the owner would accept a definitive
+    /// `landed`. The verdict must be UNCERTAIN, and it must return promptly
+    /// after release (not wait out anything else).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drain_completed_only_after_the_deadline_is_latched_uncertain() {
+        let fixture = fixture(RAW_STDERR_LAND_SCRIPT);
+        let base_main = origin_main(&fixture);
+        let mut p = params(&fixture, "land");
+        p.push = false;
+        p.job_id = "gjb_late_drain_latch".into();
+        p.generation = 1;
+        // Soft budget 0.5 s + the fixed 3.25 s owner cleanup allowance = a
+        // 3.75 s absolute deadline.
+        fixture
+            .node
+            .gate_test_set_land_timeout(Duration::from_millis(500))
+            .await;
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        fixture
+            .node
+            .gate_test_arm_final_drain_accept_hold(Arc::new(FinalDrainHold {
+                entered: entered.clone(),
+                release: release.clone(),
+            }))
+            .await;
+
+        let node = fixture.node.clone();
+        let run = tokio::spawn(async move { node.run_gate_typed(p).await });
+        // Both joins complete once the leader exits; wait for the owner to
+        // reach final acceptance, then let the ORIGINAL absolute deadline
+        // expire while it is parked.
+        entered.notified().await;
+        tokio::time::sleep(Duration::from_millis(4_200)).await;
+        let before_release = std::time::Instant::now();
+        release.notify_one();
+        let result = run.await.expect("run task panicked").unwrap();
+
+        assert_eq!(
+            result.status, "uncertain",
+            "a complete drain accepted only after the absolute deadline must be latched \
+             uncertain, got: {result:?}"
+        );
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|t| t.contains("drain")),
+            "the uncertainty names the late/incomplete drain: {:?}",
+            result.reason
+        );
+        assert!(
+            before_release.elapsed() < Duration::from_secs(2),
+            "the latched owner must return promptly after release"
         );
         assert_eq!(origin_main(&fixture), base_main, "push=false moves nothing");
     }

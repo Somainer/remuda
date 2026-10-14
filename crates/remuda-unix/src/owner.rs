@@ -338,7 +338,22 @@ pub fn run_owned_process(
     // (r22 item 3), never a Completed result.
     let stdout = join_drained_until(out_handle, deadline);
     let stderr = join_drained_until(err_handle, deadline);
-    let drains_done = matches!(stdout, Some(Ok(_))) && matches!(stderr, Some(Ok(_)));
+    let mut drains_done = matches!(stdout, Some(Ok(_))) && matches!(stderr, Some(Ok(_)));
+
+    // r22 item 4 deterministic seam: park at FINAL drain acceptance (after
+    // both joins returned) so a test can expire the original deadline with
+    // both drains already finished.
+    #[cfg(test)]
+    test_support::maybe_hold_after_drains();
+
+    // r22 item 4 LATCH: the two `join_drained_until` checks are each a
+    // check-then-poll, so after the SECOND one the owner can deschedule and
+    // the deadline expire before the Completed decision. Re-check the clock
+    // immediately BEFORE accepting a definitive outcome — completion observed
+    // after expiry is Unknown even when both joins returned Some(Ok).
+    if drains_done && Instant::now() >= deadline {
+        drains_done = false;
+    }
     let output = Output {
         status,
         stdout: stdout.and_then(|result| result.ok()).unwrap_or_default(),
@@ -392,19 +407,109 @@ mod test_support {
         ARMED.store(false, Ordering::Release);
         HOLD_CONDVAR.notify_all();
     }
+
+    // ── r22 item 4: hold at FINAL drain acceptance ─────────────────────────
+    // All three flags live behind the SAME mutex that the condvar waits on, so
+    // a release can never be missed (the lost-wakeup shape the post-exit hold
+    // still has until r22 item 7). The hold is ONE-SHOT and scoped to the
+    // single owner invocation that consumes it.
+    struct DrainHold {
+        armed: bool,
+        entered: bool,
+        released: bool,
+    }
+    static DRAIN_STATE: Mutex<DrainHold> = Mutex::new(DrainHold {
+        armed: false,
+        entered: false,
+        released: false,
+    });
+    static DRAIN_CONDVAR: Condvar = Condvar::new();
+
+    /// Park the owner AFTER both drain joins, before the final deadline latch
+    /// and the Completed decision.
+    pub(super) fn maybe_hold_after_drains() {
+        let mut guard = DRAIN_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !guard.armed {
+            return;
+        }
+        guard.entered = true;
+        DRAIN_CONDVAR.notify_all();
+        while !guard.released {
+            guard = DRAIN_CONDVAR
+                .wait(guard)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        // One-shot: only the invocation that consumed the hold parked.
+        *guard = DrainHold {
+            armed: false,
+            entered: false,
+            released: false,
+        };
+    }
+
+    /// Arm the post-drain hold.
+    pub fn arm_after_drains_hold() {
+        let mut guard = DRAIN_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *guard = DrainHold {
+            armed: true,
+            entered: false,
+            released: false,
+        };
+        DRAIN_CONDVAR.notify_all();
+    }
+
+    /// Block until the owner has entered the post-drain hold.
+    pub fn wait_after_drains_entered() {
+        let mut guard = DRAIN_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while !guard.entered {
+            guard = DRAIN_CONDVAR
+                .wait(guard)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+    }
+
+    /// Release the parked owner.
+    pub fn release_after_drains_hold() {
+        let mut guard = DRAIN_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        guard.released = true;
+        DRAIN_CONDVAR.notify_all();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{OwnedRun, drain_pipe, join_drained_until, run_owned_process, test_support};
     use std::process::Command;
+    use std::sync::{Mutex, MutexGuard};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// The owner test seams are PROCESS-GLOBAL static state and park whichever
+    /// owner thread enters while armed. Serialize every test that spawns an
+    /// owned process, so a concurrent foreign `run_owned_process` can never
+    /// enter (and re-arm) a hold another test armed. The two pure-reader tests
+    /// below do not spawn and need no guard.
+    static OWNER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn owner_test_guard() -> MutexGuard<'static, ()> {
+        OWNER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
 
     /// A child that exits before the soft cap yields Completed with its own
     /// exit status and drained bytes; its leader was reaped exactly once.
     #[test]
     fn a_quick_child_completes() {
+        let _guard = owner_test_guard();
         let mut command = Command::new("sh");
         command.args(["-c", "echo hi; exit 0"]);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -473,12 +578,48 @@ mod tests {
         }
     }
 
+    /// r22 item 4 — the FINAL latch: both pipe drains complete successfully
+    /// (an immediately-exiting child closes both pipes), but the owner is held
+    /// AFTER the joins until the absolute deadline expires. The post-join
+    /// check-then-poll could otherwise accept the already-finished drains as a
+    /// Completed result; completion after expiry must be TimedOut (Unknown).
+    #[test]
+    fn drains_completed_after_the_deadline_are_latched_timed_out() {
+        let _guard = owner_test_guard();
+        test_support::arm_after_drains_hold();
+        let command = Command::new("true");
+        // `true` has no surviving members, so cleanup/reap/drains finish in a
+        // few milliseconds; the deadline only has to outlive THAT, then expire
+        // while the owner is parked at the post-drain hold.
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let owner =
+            thread::spawn(move || run_owned_process(command, Duration::from_secs(10), deadline));
+        test_support::wait_after_drains_entered();
+        // Both drains joined while parked; let the ORIGINAL deadline expire.
+        thread::sleep(Duration::from_millis(2200));
+        let before_release = Instant::now();
+        test_support::release_after_drains_hold();
+        let run = owner
+            .join()
+            .expect("owner thread panicked")
+            .expect("the corpse was reaped in time");
+        assert!(
+            run.timed_out(),
+            "drains accepted only after the absolute deadline must be Unknown, got {run:?}"
+        );
+        assert!(
+            before_release.elapsed() < Duration::from_secs(2),
+            "the latched owner must return promptly after release"
+        );
+    }
+
     /// A still-running leader at the soft cap is SIGKILLed whole-group while
     /// unreaped and the run is TimedOut (signal 9), well inside the absolute
     /// deadline. Portable: the assertion is on the leader's status, not on
     /// process enumeration.
     #[test]
     fn a_leader_past_the_soft_cap_is_killed_and_times_out() {
+        let _guard = owner_test_guard();
         let mut command = Command::new("sh");
         command.args(["-c", "exec sleep 47.03"]);
         let started = Instant::now();
@@ -501,6 +642,7 @@ mod tests {
     /// no-leftover-process check is Linux (/proc) only.
     #[test]
     fn normal_exit_cleans_survivors_and_keeps_the_leader_status() {
+        let _guard = owner_test_guard();
         let mut command = Command::new("sh");
         command.args(["-c", "(sleep 47.04) & exit 42"]);
         let started = Instant::now();
@@ -534,6 +676,7 @@ mod tests {
     /// independent — no descendant, no pipe pressure, no /proc.
     #[test]
     fn completion_after_the_deadline_is_latched_unknown() {
+        let _guard = owner_test_guard();
         test_support::arm_after_exit_hold();
         let command = Command::new("true");
         let deadline = Instant::now() + Duration::from_millis(300);

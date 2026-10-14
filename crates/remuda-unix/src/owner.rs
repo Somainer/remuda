@@ -375,54 +375,96 @@ pub fn run_owned_process(
 /// unsynchronised background shells.
 #[cfg(test)]
 mod test_support {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Condvar, Mutex};
 
-    static ARMED: AtomicBool = AtomicBool::new(false);
-    static HOLD_LOCK: Mutex<()> = Mutex::new(());
-    static HOLD_CONDVAR: Condvar = Condvar::new();
+    /// r22 item 7: state for a ONE-SHOT owner hold. All three flags live behind
+    /// the SAME mutex the condvar waits on, so a release notification can never
+    /// be lost: the releaser must hold the lock when it flips `released`, and
+    /// the waiter re-checks `released` under that lock before/after waiting
+    /// (the old atomic-based exit hold had the releaser notify WITHOUT the
+    /// lock, so a notification between the atomic read and `wait` parked the
+    /// owner forever). `entered` is the acknowledgement a test waits on to
+    /// prove the owner has actually parked before it releases. Resetting to
+    /// all-false on release SCOPES the hold to the single owner invocation that
+    /// consumed it — a concurrent owner can never re-park on a stale arming.
+    struct Hold {
+        armed: bool,
+        entered: bool,
+        released: bool,
+    }
+
+    impl Hold {
+        const fn new() -> Self {
+            Self {
+                armed: false,
+                entered: false,
+                released: false,
+            }
+        }
+    }
+
+    // ── hold between exit observation and cleanup/reap/drains ──────────────
+    static EXIT_STATE: Mutex<Hold> = Mutex::new(Hold::new());
+    static EXIT_CONDVAR: Condvar = Condvar::new();
 
     /// Park the owner after the exit-observation phase until released.
     pub(super) fn maybe_hold_after_exit_observed() {
-        if !ARMED.load(Ordering::Acquire) {
-            return;
-        }
-        let mut guard = HOLD_LOCK
+        let mut guard = EXIT_STATE
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        while ARMED.load(Ordering::Acquire) {
-            guard = HOLD_CONDVAR
+        if !guard.armed {
+            return;
+        }
+        guard.entered = true;
+        EXIT_CONDVAR.notify_all();
+        while !guard.released {
+            guard = EXIT_CONDVAR
+                .wait(guard)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        // One-shot: only the invocation that consumed the hold parked.
+        *guard = Hold::new();
+    }
+
+    /// Arm the post-exit hold (resets the entered/released state).
+    pub fn arm_after_exit_hold() {
+        let mut guard = EXIT_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *guard = Hold {
+            armed: true,
+            entered: false,
+            released: false,
+        };
+        EXIT_CONDVAR.notify_all();
+    }
+
+    /// Block until the owner has parked in the post-exit hold.
+    pub fn wait_after_exit_entered() {
+        let mut guard = EXIT_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while !guard.entered {
+            guard = EXIT_CONDVAR
                 .wait(guard)
                 .unwrap_or_else(|poison| poison.into_inner());
         }
     }
 
-    /// Arm the post-exit hold (resets the released state).
-    pub fn arm_after_exit_hold() {
-        ARMED.store(true, Ordering::Release);
-    }
-
-    /// Release an owner parked in [`maybe_hold_after_exit_observed`].
+    /// Release an owner parked in [`maybe_hold_after_exit_observed`]. The flag
+    /// is flipped and the notification sent while HOLDING the lock, so the
+    /// waiter cannot miss it.
     pub fn release_after_exit_hold() {
-        ARMED.store(false, Ordering::Release);
-        HOLD_CONDVAR.notify_all();
+        let mut guard = EXIT_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        guard.released = true;
+        EXIT_CONDVAR.notify_all();
     }
 
-    // ── r22 item 4: hold at FINAL drain acceptance ─────────────────────────
-    // All three flags live behind the SAME mutex that the condvar waits on, so
-    // a release can never be missed (the lost-wakeup shape the post-exit hold
-    // still has until r22 item 7). The hold is ONE-SHOT and scoped to the
-    // single owner invocation that consumes it.
-    struct DrainHold {
-        armed: bool,
-        entered: bool,
-        released: bool,
-    }
-    static DRAIN_STATE: Mutex<DrainHold> = Mutex::new(DrainHold {
-        armed: false,
-        entered: false,
-        released: false,
-    });
+    // ── hold at FINAL drain acceptance (r22 item 4) ────────────────────────
+    // Same one-shot, entered-acknowledged, lossless shape as the exit hold.
+    static DRAIN_STATE: Mutex<Hold> = Mutex::new(Hold::new());
     static DRAIN_CONDVAR: Condvar = Condvar::new();
 
     /// Park the owner AFTER both drain joins, before the final deadline latch
@@ -442,11 +484,7 @@ mod test_support {
                 .unwrap_or_else(|poison| poison.into_inner());
         }
         // One-shot: only the invocation that consumed the hold parked.
-        *guard = DrainHold {
-            armed: false,
-            entered: false,
-            released: false,
-        };
+        *guard = Hold::new();
     }
 
     /// Arm the post-drain hold.
@@ -454,7 +492,7 @@ mod test_support {
         let mut guard = DRAIN_STATE
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        *guard = DrainHold {
+        *guard = Hold {
             armed: true,
             entered: false,
             released: false,
@@ -668,26 +706,38 @@ mod tests {
         }
     }
 
-    /// r21 items 3/7 — THE LATCH: a child that exits immediately with no pipe
-    /// holders is held AFTER the exit observation until the absolute deadline
-    /// has expired. Cleanup, the reap and both drains can then finish
-    /// INSTANTLY, but completion after expiry must be Unknown: an error (the
-    /// corpse moves to the detached reaper), never Completed. Platform
+    /// r21 items 3/7, r22 item 7 — THE LATCH: a child that exits immediately
+    /// with no pipe holders is held AFTER the exit observation until the
+    /// absolute deadline has expired. Cleanup, the reap and both drains can then
+    /// finish INSTANTLY, but completion after expiry must be Unknown: an error
+    /// (the corpse moves to the detached reaper), never Completed. Platform
     /// independent — no descendant, no pipe pressure, no /proc.
+    ///
+    /// r22 item 7: parking is confirmed by the hold's ENTERED acknowledgement
+    /// (`wait_after_exit_entered`) rather than a fixed sleep, and the release
+    /// is lossless (predicate and notification share one mutex), so the owner
+    /// can never miss the release and hang at `owner.join()`.
     #[test]
     fn completion_after_the_deadline_is_latched_unknown() {
         let _guard = owner_test_guard();
         test_support::arm_after_exit_hold();
         let command = Command::new("true");
         let deadline = Instant::now() + Duration::from_millis(300);
+        let expire_at = deadline + Duration::from_millis(200);
         let owner =
             thread::spawn(move || run_owned_process(command, Duration::from_secs(10), deadline));
-        // Let the absolute deadline expire while the owner is parked after the
-        // (immediate) exit observation.
-        thread::sleep(Duration::from_millis(700));
+        // Deterministically wait until the owner has actually parked in the
+        // post-exit hold — not a guessed sleep.
+        test_support::wait_after_exit_entered();
+        // Parked before cleanup; now let the ORIGINAL absolute deadline expire.
+        while Instant::now() < expire_at {
+            thread::sleep(Duration::from_millis(10));
+        }
         test_support::release_after_exit_hold();
         let started = Instant::now();
-        let result = owner.join().expect("owner thread panicked");
+        let result = owner.join().expect(
+            "the owner missed its release notification (lost-wakeup) and is parked forever",
+        );
         assert!(
             result.is_err(),
             "a reap/drain sequence completed only after the absolute deadline must be Unknown, \
@@ -697,6 +747,59 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "the latched owner must return promptly after release"
         );
+    }
+
+    /// r22 item 7: the post-exit hold's release can never be lost. The arm →
+    /// parked → released cycle is driven many times; the ENTERED
+    /// acknowledgement proves the owner has reached the condvar wait before the
+    /// release flips the predicate. A notification that raced the wait (the
+    /// old atomic-predicate / lock-free-notify shape) would leave the owner
+    /// parked and the bounded channel receive below would time out.
+    #[test]
+    fn the_exit_hold_never_loses_its_release() {
+        let _guard = owner_test_guard();
+        for _ in 0..100 {
+            test_support::arm_after_exit_hold();
+            let (sent, got) = std::sync::mpsc::channel();
+            let owner = thread::spawn(move || {
+                test_support::maybe_hold_after_exit_observed();
+                let _ = sent.send(());
+            });
+            test_support::wait_after_exit_entered();
+            test_support::release_after_exit_hold();
+            got.recv_timeout(Duration::from_secs(5)).expect(
+                "the parked owner missed its release notification (lost wakeup) and is stuck",
+            );
+            owner.join().expect("owner thread panicked");
+        }
+    }
+
+    /// r22 item 7: the seam is one-shot and scoped. With no arming it never
+    /// parks an unrelated owner invocation; after a full cycle the state resets
+    /// so a LATER invocation also returns immediately (never re-parks on the
+    /// stale arming that caught the intended invocation).
+    #[test]
+    fn the_exit_hold_is_unarmed_by_default_and_one_shot_after_release() {
+        let _guard = owner_test_guard();
+        // No arming: an unrelated owner invocation passes straight through.
+        test_support::maybe_hold_after_exit_observed();
+
+        // One full armed/parked/released cycle.
+        test_support::arm_after_exit_hold();
+        let (sent, got) = std::sync::mpsc::channel();
+        let owner = thread::spawn(move || {
+            test_support::maybe_hold_after_exit_observed();
+            let _ = sent.send(());
+        });
+        test_support::wait_after_exit_entered();
+        test_support::release_after_exit_hold();
+        got.recv_timeout(Duration::from_secs(5))
+            .expect("the armed owner did not return after release");
+        owner.join().expect("owner thread panicked");
+
+        // The arming was consumed by that one invocation; a later invocation
+        // must not park on it.
+        test_support::maybe_hold_after_exit_observed();
     }
 
     /// Count LIVE (non-zombie) processes whose /proc/<pid>/cmdline carries the
